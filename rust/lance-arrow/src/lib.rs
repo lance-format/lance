@@ -1182,9 +1182,39 @@ fn merge_list_child_values(
     }
 }
 
-// Helper function to adjust child array validity based on parent struct validity
-// When parent struct is null, propagates null to child array
-// Optimized with fast paths and SIMD operations
+/// Combines a child's validity with its parent's null rows.
+///
+/// `NullBuffer::union` intersects the two validity bitmaps. A typed null
+/// buffer keeps its own bit offset; pad it only when Arrow's raw-buffer
+/// validation requires more backing bytes at the child's offset.
+pub(crate) fn compose_child_validity(
+    child: &dyn Array,
+    parent_validity: Option<&arrow_buffer::NullBuffer>,
+) -> Option<arrow_buffer::NullBuffer> {
+    let Some(parent_validity) = parent_validity.filter(|parent| parent.null_count() > 0) else {
+        return child.nulls().cloned();
+    };
+
+    // DataType::Null arrays are always entirely null and cannot carry a
+    // validity bitmap.
+    if child.data_type() == &DataType::Null {
+        return None;
+    }
+
+    let required_null_bytes = arrow_buffer::bit_util::ceil(child.offset() + child.len(), 8);
+    NullBuffer::union(child.nulls(), Some(parent_validity)).map(|validity| {
+        if validity.validity().len() >= required_null_bytes {
+            validity
+        } else {
+            let mut builder = BooleanBufferBuilder::new(child.offset() + child.len());
+            builder.append_n(child.offset(), true);
+            builder.append_buffer(validity.inner());
+            NullBuffer::new(builder.build().slice(child.offset(), child.len()))
+        }
+    })
+}
+
+// Adjust child array validity based on parent struct validity.
 fn adjust_child_validity(
     child: &ArrayRef,
     parent_validity: Option<&arrow_buffer::NullBuffer>,
@@ -1202,19 +1232,7 @@ fn adjust_child_validity(
         return child.clone();
     }
 
-    // NullBuffer keeps its own bit offset. Only pad when the backing bitmap
-    // is too short for ArrayData's check against the child's offset.
-    let required_null_bytes = arrow_buffer::bit_util::ceil(child.offset() + child.len(), 8);
-    let new_validity = NullBuffer::union(child.nulls(), Some(parent_validity)).map(|validity| {
-        if validity.validity().len() >= required_null_bytes {
-            validity
-        } else {
-            let mut builder = BooleanBufferBuilder::new(child.offset() + child.len());
-            builder.append_n(child.offset(), true);
-            builder.append_buffer(validity.inner());
-            NullBuffer::new(builder.build().slice(child.offset(), child.len()))
-        }
-    });
+    let new_validity = compose_child_validity(child.as_ref(), Some(parent_validity));
     arrow_array::make_array(
         child
             .to_data()

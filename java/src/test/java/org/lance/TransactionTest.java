@@ -367,6 +367,7 @@ public class TransactionTest {
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         dataset.initializeMemWal(new InitializeMemWalParams().withUnsharded());
+        String dirId = dataset.memWalIndexDetails().orElseThrow().dirId();
         CompactedSsTable sstable = new CompactedSsTable(UUID.randomUUID().toString(), 7);
         try (Transaction transaction =
                 new Transaction.Builder()
@@ -374,6 +375,7 @@ public class TransactionTest {
                     .operation(
                         UpdateMemWalState.builder()
                             .compactedSstables(Collections.singletonList(sstable))
+                            .dirId(dirId)
                             .build())
                     .build();
             Dataset committed = new CommitBuilder(dataset).execute(transaction);
@@ -382,6 +384,7 @@ public class TransactionTest {
           assertEquals(
               UpdateMemWalState.builder()
                   .compactedSstables(Collections.singletonList(sstable))
+                  .dirId(dirId)
                   .build(),
               operation);
           assertEquals(1, operation.getCompactedSstables().size());
@@ -516,6 +519,7 @@ public class TransactionTest {
         assertEquals(expectedBasePath.isDatasetRoot(), readBasePath.isDatasetRoot());
 
         dataset.initializeMemWal(new InitializeMemWalParams().withUnsharded());
+        String dirId = dataset.memWalIndexDetails().orElseThrow().dirId();
         KeyExistenceFilter filter = KeyExistenceFilter.exact(new int[] {0}, new long[] {42});
         CompactedSsTable compacted = new CompactedSsTable(UUID.randomUUID().toString(), 8);
         try (Transaction update =
@@ -524,6 +528,7 @@ public class TransactionTest {
                     .operation(
                         Update.builder()
                             .compactedSstables(Collections.singletonList(compacted))
+                            .memWalDirId(dirId)
                             .insertedRowsFilter(filter)
                             .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
                             .build())
@@ -538,6 +543,7 @@ public class TransactionTest {
           CompactedSsTable readCompacted = updateOperation.getCompactedSstables().get(0);
           assertEquals(compacted.getShardId(), readCompacted.getShardId());
           assertEquals(compacted.getGeneration(), readCompacted.getGeneration());
+          assertEquals(Optional.of(dirId), updateOperation.memWalDirId());
         }
       }
     }

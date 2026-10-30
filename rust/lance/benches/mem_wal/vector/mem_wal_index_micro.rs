@@ -402,11 +402,12 @@ async fn measure_flush(
     let manifest_store = Arc::new(ShardManifestStore::new(
         store.clone(),
         &base_path,
+        "",
         shard_id,
         2,
     ));
     let (epoch, _) = manifest_store.claim_epoch(0).await?;
-    let flusher = MemTableFlusher::new(store, base_path, uri, shard_id, manifest_store);
+    let flusher = MemTableFlusher::new(store, base_path, uri, "", shard_id, manifest_store);
 
     // total_batches WAL entries were stamped at positions 1..=total_batches
     // by the loop above (1-based positions).

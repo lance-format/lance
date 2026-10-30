@@ -3,6 +3,7 @@
 
 //! Metadata for index
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::Arc;
@@ -61,7 +62,8 @@ pub struct IndexMetadata {
     ///
     /// These ids also appear in [`Self::fields`]. That is deliberate: every
     /// consumer that reads `fields` as the index's dependency set then covers
-    /// them with no change.
+    /// them with no change. Dependency checks read
+    /// [`Self::dependency_fields`], which does not rely on that repetition.
     pub covering_fields: Vec<i32>,
 
     /// Human readable index name
@@ -272,8 +274,8 @@ impl IndexMetadata {
     /// The prefix of [`Self::fields`] this index is keyed on, with the carried
     /// columns of [`Self::covering_fields`] removed.
     ///
-    /// Only this prefix decides which column an index answers for; the full
-    /// `fields` vector answers what invalidates it. Empty for a system index
+    /// Only this prefix decides which column an index answers for;
+    /// [`Self::dependency_fields`] answers what invalidates it. Empty for a system index
     /// that declares no fields, and empty for a declaration longer than
     /// `fields`: decoding validates, but metadata built by a caller this build
     /// never validated does not, and failing closed beats an underflow.
@@ -292,6 +294,55 @@ impl IndexMetadata {
             [only] => Some(*only),
             _ => None,
         }
+    }
+
+    /// Every field whose change can leave this index stale: [`Self::fields`],
+    /// then each of [`Self::covering_fields`] that `fields` does not list,
+    /// once.
+    ///
+    /// The suffix contract repeats every carried column in `fields`, and then
+    /// this borrows `fields`. A declaration whose `fields` holds only keyed
+    /// columns lists the carried ones in `covering_fields` alone, so a
+    /// dependency check that reads `fields` would miss them.
+    ///
+    /// ```
+    /// use lance_table::format::IndexMetadata;
+    ///
+    /// let mut index = IndexMetadata {
+    ///     uuid: uuid::Uuid::new_v4(),
+    ///     name: "vector_idx".to_string(),
+    ///     fields: vec![0, 1],
+    ///     covering_fields: vec![1],
+    ///     dataset_version: 1,
+    ///     fragment_bitmap: None,
+    ///     index_details: None,
+    ///     index_version: 0,
+    ///     created_at: None,
+    ///     base_id: None,
+    ///     files: None,
+    ///     clustering_id: None,
+    ///     metadata: Default::default(),
+    /// };
+    /// assert_eq!(index.dependency_fields().as_ref(), &[0, 1]);
+    ///
+    /// index.fields = vec![0];
+    /// assert_eq!(index.dependency_fields().as_ref(), &[0, 1]);
+    /// ```
+    pub fn dependency_fields(&self) -> Cow<'_, [i32]> {
+        if self
+            .covering_fields
+            .iter()
+            .all(|field| self.fields.contains(field))
+        {
+            return Cow::Borrowed(&self.fields);
+        }
+        let mut fields = self.fields.clone();
+        for field in &self.covering_fields {
+            if !fields.contains(field) {
+                fields.push(*field);
+            }
+        }
+        Cow::Owned(fields)
     }
 
     /// Check the covering declaration against [`Self::fields`].
@@ -881,6 +932,27 @@ mod tests {
 
         assert_eq!(metadata.keyed_fields(), expected_keyed.as_slice());
         assert_eq!(metadata.keyed_field(), expected_single);
+    }
+
+    /// The dependency set is the same whether or not `fields` repeats the
+    /// carried columns, and borrows `fields` when it does.
+    #[rstest]
+    #[case::not_covered(vec![7], vec![], vec![7], true)]
+    #[case::suffix(vec![7, 11], vec![11], vec![7, 11], true)]
+    #[case::keys_only(vec![7], vec![11], vec![7, 11], false)]
+    #[case::partial_overlap(vec![7, 11], vec![11, 13], vec![7, 11, 13], false)]
+    #[case::duplicate_carried(vec![7], vec![11, 11], vec![7, 11], false)]
+    fn test_dependency_fields(
+        #[case] fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+        #[case] expected: Vec<i32>,
+        #[case] borrows: bool,
+    ) {
+        let metadata = index_metadata_with(fields, covering_fields);
+        let dependency_fields = metadata.dependency_fields();
+
+        assert_eq!(dependency_fields.as_ref(), expected.as_slice());
+        assert_eq!(matches!(dependency_fields, Cow::Borrowed(_)), borrows);
     }
 
     fn index_metadata_with(fields: Vec<i32>, covering_fields: Vec<i32>) -> IndexMetadata {

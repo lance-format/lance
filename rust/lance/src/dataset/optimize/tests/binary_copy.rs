@@ -404,7 +404,7 @@ async fn do_test_binary_copy_skipped_after_metadata_only_add_column(version: Lan
 #[tokio::test]
 async fn test_binary_copy_empty_string_scalar_index() {
     for version in NON_LEGACY_VERSIONS {
-        do_test_binary_copy_empty_string_scalar_index(version).await;
+        Box::pin(do_test_binary_copy_empty_string_scalar_index(version)).await;
     }
 }
 

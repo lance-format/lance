@@ -1306,6 +1306,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let affected_rows_holder = self.affected_rows.clone();
         let inserted_rows_filter_holder = self.inserted_rows_filter.clone();
         let compacted_sstables = self.params.compacted_sstables.clone();
+        let mem_wal_dir_id = self.params.mem_wal_dir_id.clone();
         let source_skipped_duplicates = self.source_skipped_duplicates.clone();
         let source_blob_columns = self.source_blob_columns.clone();
         let created_blob_payloads = self.created_blob_payloads.clone();
@@ -1424,6 +1425,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 new_fragments,
                 fields_modified: vec![], // No fields are modified in schema for upsert
                 compacted_sstables,
+                mem_wal_dir_id,
                 // Use the full pre-order field list (not just top-level `fields`) so
                 // that nested leaf field ids are included. A merge_insert rewrites whole
                 // rows, so every field is potentially modified; omitting nested ids would

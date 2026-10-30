@@ -296,7 +296,13 @@ pub(super) fn quantize_4bit_distance_table(
     let mut max_sum = 0u32;
     for table in tables {
         let min = reduce_16(table, min_of);
-        let codes = table.map(|d| ((d - min) * scale + 0.5).floor().min(u8::MAX as f32) as u8);
+        // A loop rather than `table.map(..)`: with several codegen units the
+        // `array::map` instance can be left out of line, which cost up to 5%
+        // of a 1024-row partition scan.
+        let mut codes = [0u8; NUM_CENTROIDS];
+        for (code, &d) in codes.iter_mut().zip(table) {
+            *code = ((d - min) * scale + 0.5).floor().min(u8::MAX as f32) as u8;
+        }
         // The minimum entry quantizes to 0 with no error, so the largest error
         // is `>= 0` and the smallest `<= 0`. `code * step` and, short of a
         // 29-bit exponent gap, `d - min` are exact in `f64`.

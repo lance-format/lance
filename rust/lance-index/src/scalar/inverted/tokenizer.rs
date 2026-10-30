@@ -1096,10 +1096,14 @@ impl InvertedIndexParams {
         }
         let tokenizer = builder.build();
 
-        match self.lance_tokenizer {
-            Some(ref t) if t == "text" => Ok(Box::new(TextTokenizer::new(tokenizer))),
-            Some(ref t) if t == "json" => Ok(Box::new(JsonTokenizer::new(tokenizer))),
-            None => Ok(Box::new(TextTokenizer::new(tokenizer))),
+        match self.lance_tokenizer.as_deref() {
+            Some("text") | None => {
+                let mut tokenizer = TextTokenizer::new(tokenizer);
+                tokenizer.discount_overlaps =
+                    self.base_tokenizer == "code" && self.split_identifiers;
+                Ok(Box::new(tokenizer))
+            }
+            Some("json") => Ok(Box::new(JsonTokenizer::new(tokenizer))),
             _ => Err(Error::invalid_input(format!(
                 "unknown lance tokenizer {}",
                 self.lance_tokenizer.as_ref().unwrap()

@@ -7,13 +7,16 @@ use chrono::{DateTime, Utc};
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
-use lance_table::io::commit::CommitHandler;
+use lance_table::io::commit::{CommitHandler, VERSIONS_DIR};
+use lance_table::io::deletion::DELETIONS_DIR;
 use object_store::{Error as ObjectStoreError, path::Path};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::dataset::branch_location::BranchLocation;
+use crate::dataset::mem_wal::util::is_mem_wal_dir_name;
 use crate::dataset::refs::Ref::{Tag, Version, VersionNumber};
+use crate::dataset::{BLOBS_DIR, DATA_DIR, FRAG_REUSE_DIR, INDICES_DIR, TRANSACTIONS_DIR};
 use crate::utils::temporal::utc_now;
 use crate::{Error, Result};
 use serde::de::DeserializeOwned;
@@ -697,6 +700,23 @@ impl Branches<'_> {
             relative_dir = deleted_branch.segments[0].to_string();
         }
 
+        // Older releases allowed branches like `a/data`, which share
+        // `a`'s data directory. Don't delete the parent's files.
+        let target = BranchRelativePath::new(&relative_dir);
+        if let Some(owner) = remaining_branches.iter().find(|remaining| {
+            let remaining = BranchRelativePath::new(remaining);
+            remaining.is_parent(&target)
+                && is_dataset_dir(target.segments[remaining.segments.len()])
+        }) {
+            log::warn!(
+                "Keeping {} after deleting branch {}, since it lies in a dataset directory of branch {}",
+                relative_dir,
+                branch,
+                owner
+            );
+            return Ok(None);
+        }
+
         let absolute_dir = base_location.find_branch(Some(relative_dir.as_str()))?;
         Ok(Some(absolute_dir.path))
     }
@@ -1059,6 +1079,43 @@ pub fn check_valid_branch(branch_name: &str) -> Result<()> {
     Ok(())
 }
 
+// Nested branches cannot use these names because they overlap
+// directories owned by their ancestors.
+const DATASET_DIRS: &[&str] = &[
+    DATA_DIR,
+    VERSIONS_DIR,
+    TRANSACTIONS_DIR,
+    DELETIONS_DIR,
+    INDICES_DIR,
+    BLOBS_DIR,
+    FRAG_REUSE_DIR,
+];
+
+fn is_dataset_dir(segment: &str) -> bool {
+    DATASET_DIRS
+        .iter()
+        .any(|directory| segment.eq_ignore_ascii_case(directory))
+        || is_mem_wal_dir_name(segment)
+}
+
+/// Only restrict new branches so older branch names remain accessible.
+pub(crate) fn check_new_branch(branch_name: &str) -> Result<()> {
+    check_valid_branch(branch_name)?;
+    if let Some(segment) = branch_name
+        .split('/')
+        .skip(1)
+        .find(|segment| is_dataset_dir(segment))
+    {
+        return Err(Error::InvalidRef {
+            message: format!(
+                "Branch '{}' cannot use reserved directory '{}' after the first segment",
+                branch_name, segment
+            ),
+        });
+    }
+    Ok(())
+}
+
 pub fn check_valid_tag(s: &str) -> Result<()> {
     if s.is_empty() {
         return Err(Error::InvalidRef {
@@ -1164,7 +1221,9 @@ mod tests {
             "normal",
             "with-dash",
             "with_underscore",
-            "with.dot"
+            "with.dot",
+            "data",
+            "_versions/child"
         )]
         branch_name: &str,
     ) {
@@ -1173,6 +1232,31 @@ mod tests {
             "Branch name '{}' should be valid",
             branch_name
         );
+        assert!(
+            check_new_branch(branch_name).is_ok(),
+            "Branch name '{}' should be creatable",
+            branch_name
+        );
+    }
+
+    #[rstest]
+    #[case::data("outer/data")]
+    #[case::data_case_alias("outer/Data")]
+    #[case::versions("outer/_versions")]
+    #[case::transactions("outer/_transactions")]
+    #[case::deletions("outer/_deletions")]
+    #[case::indices("outer/_indices")]
+    #[case::blobs("outer/_blobs")]
+    #[case::frag_reuse("outer/_fri")]
+    #[case::mem_wal("outer/_mem_wal")]
+    #[case::dir_id_mem_wal("outer/_a1b2c3d4_mem_wal")]
+    #[case::below_a_nested_branch("a/b/_indices")]
+    #[case::above_another_segment("a/data/b")]
+    fn new_branch_cannot_nest_in_a_dataset_directory(#[case] branch_name: &str) {
+        check_valid_branch(branch_name).unwrap();
+        let error = check_new_branch(branch_name).unwrap_err();
+        assert!(matches!(error, Error::InvalidRef { .. }), "{error}");
+        assert_contains!(error.to_string(), "after the first segment");
     }
 
     #[rstest]
@@ -1399,6 +1483,12 @@ mod tests {
     #[case("feature/auth/module", &["feature/other"], Some("feature/auth"))]
     #[case("feature/dev", &["bugfix", "hotfix"], Some("feature"))]
     #[case("branch1", &["dev/branch2", "feature/nathan/branch3", "branch4"], Some("branch1"))]
+    #[case::data_directory_of_a_remaining_parent("outer/data", &["outer"], None)]
+    #[case::dir_id_mem_wal_directory_of_a_remaining_parent("outer/_a1b2c3d4_mem_wal", &["outer"], None)]
+    #[case::versions_directory_of_a_nested_parent("a/b/_versions", &["a", "a/b", "c"], None)]
+    #[case::inside_the_data_directory_of_a_remaining_ancestor("a/data/x", &["a", "a/data/y"], None)]
+    #[case::directory_name_without_a_remaining_parent("outer/data", &["other"], Some("outer"))]
+    #[case::ordinary_name_below_a_directory_name("outer/data/x", &["outer/data"], Some("outer/data/x"))]
     fn test_get_cleanup_path(
         #[case] branch_to_delete: &str,
         #[case] remaining_branches: &[&str],

@@ -1082,37 +1082,31 @@ impl<'a> RabitDistCalculator<'a> {
         let simd_len = n - remainder;
         // Past `SAFE_U16_CODE_LEN` a full-range LUT overflows the `u16`
         // accumulator; the wide sum is what the narrow one would have produced.
-        // Storage construction proves the code and table layouts, and the
-        // reserved output has exactly one slot per SIMD row.
         let is_wide = code_len > simd::dist_table::SAFE_U16_CODE_LEN;
         if is_wide {
             hacc_quantized_dists.clear();
             hacc_quantized_dists.reserve(simd_len);
-            unsafe {
-                simd::dist_table::sum_4bit_dist_table_u32_uninit(
-                    simd_len,
-                    code_len,
-                    self.codes,
-                    quantized_dists_table,
-                    &mut hacc_quantized_dists.spare_capacity_mut()[..simd_len],
-                );
-                // The kernel initialized every SIMD output slot.
-                hacc_quantized_dists.set_len(simd_len);
-            }
+            simd::dist_table::sum_4bit_dist_table_u32_uninit(
+                simd_len,
+                code_len,
+                self.codes,
+                quantized_dists_table,
+                &mut hacc_quantized_dists.spare_capacity_mut()[..simd_len],
+            );
+            // SAFETY: the kernel initialized every SIMD output slot.
+            unsafe { hacc_quantized_dists.set_len(simd_len) };
         } else {
             quantized_dists.clear();
             quantized_dists.reserve(simd_len);
-            unsafe {
-                simd::dist_table::sum_4bit_dist_table_uninit(
-                    simd_len,
-                    code_len,
-                    self.codes,
-                    quantized_dists_table,
-                    &mut quantized_dists.spare_capacity_mut()[..simd_len],
-                );
-                // The kernel initialized every SIMD output slot.
-                quantized_dists.set_len(simd_len);
-            }
+            simd::dist_table::sum_4bit_dist_table_uninit(
+                simd_len,
+                code_len,
+                self.codes,
+                quantized_dists_table,
+                &mut quantized_dists.spare_capacity_mut()[..simd_len],
+            );
+            // SAFETY: the kernel initialized every SIMD output slot.
+            unsafe { quantized_dists.set_len(simd_len) };
         }
 
         let range = (qmax - qmin) / 255.0;
@@ -1178,19 +1172,15 @@ impl<'a> RabitDistCalculator<'a> {
         let simd_len = n - remainder;
         quantized_dists.clear();
         quantized_dists.reserve(simd_len);
-        unsafe {
-            // Storage construction proves the code and table layouts, and the
-            // reserved output has exactly one slot per SIMD row.
-            simd::dist_table::sum_4bit_hacc_dist_table_uninit(
-                simd_len,
-                code_len,
-                self.codes,
-                hacc_dist_table,
-                &mut quantized_dists.spare_capacity_mut()[..simd_len],
-            );
-            // The high-accuracy kernel initialized every SIMD output slot.
-            quantized_dists.set_len(simd_len);
-        }
+        simd::dist_table::sum_4bit_hacc_dist_table_uninit(
+            simd_len,
+            code_len,
+            self.codes,
+            hacc_dist_table,
+            &mut quantized_dists.spare_capacity_mut()[..simd_len],
+        );
+        // SAFETY: the high-accuracy kernel initialized every SIMD output slot.
+        unsafe { quantized_dists.set_len(simd_len) };
 
         let range = (qmax - qmin) / u16::MAX as f32;
         let num_tables = quantized_dist_table.len() / SEGMENT_NUM_CODES;
@@ -1291,19 +1281,16 @@ impl<'a> RabitDistCalculator<'a> {
                     );
                     quantized_dists.clear();
                     quantized_dists.reserve(fastscan_len);
-                    unsafe {
-                        // The packed ex-code layout and table size are fixed at
-                        // construction, and the output reserves one slot per row.
-                        simd::dist_table::sum_4bit_dist_table_uninit(
-                            fastscan_len,
-                            fastscan_code_len,
-                            packed_ex_codes,
-                            quantized_dists_table,
-                            &mut quantized_dists.spare_capacity_mut()[..fastscan_len],
-                        );
-                        // The distance-table kernel initialized every fast-scan slot.
-                        quantized_dists.set_len(fastscan_len);
-                    }
+                    simd::dist_table::sum_4bit_dist_table_uninit(
+                        fastscan_len,
+                        fastscan_code_len,
+                        packed_ex_codes,
+                        quantized_dists_table,
+                        &mut quantized_dists.spare_capacity_mut()[..fastscan_len],
+                    );
+                    // SAFETY: the distance-table kernel initialized every
+                    // fast-scan slot.
+                    unsafe { quantized_dists.set_len(fastscan_len) };
 
                     let range = (qmax - qmin) / quantization_max;
                     let num_tables = quantized_dists_table.len() / SEGMENT_NUM_CODES;

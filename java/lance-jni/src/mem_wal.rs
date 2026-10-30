@@ -296,6 +296,8 @@ pub extern "system" fn Java_org_lance_memwal_ShardWriter_nativeLsmScanner<'local
     )
 }
 
+/// Build an LSM scanner over `shard_snapshots` plus this writer's own snapshot
+/// and in-memory memtables.
 fn inner_writer_lsm_scanner<'local>(
     env: &mut JNIEnv<'local>,
     this: JObject<'local>,
@@ -303,7 +305,7 @@ fn inner_writer_lsm_scanner<'local>(
 ) -> Result<JObject<'local>> {
     let mut snapshots = read_shard_snapshots(env, &shard_snapshots)?;
 
-    let (in_memory_memtables, writer_snapshot, dataset, shard_id, pk_columns) = {
+    let (in_memory_memtables, writer_snapshot, dataset, shard_id, pk_columns, dir_id) = {
         let guard =
             unsafe { env.get_rust_field::<_, _, BlockingShardWriter>(&this, NATIVE_SHARD_WRITER) }?;
         let pk_columns = get_pk_columns(&guard.dataset)?;
@@ -320,6 +322,7 @@ fn inner_writer_lsm_scanner<'local>(
             guard.dataset.clone(),
             guard.shard_id,
             pk_columns,
+            guard.writer.config().dir_id.clone(),
         )
     };
 
@@ -327,6 +330,7 @@ fn inner_writer_lsm_scanner<'local>(
     snapshots.push(writer_snapshot);
 
     let scanner = LsmScanner::new(dataset, snapshots, pk_columns)
+        .with_mem_wal_dir_id(dir_id)
         .with_in_memory_memtables(shard_id, in_memory_memtables);
     attach_lsm_scanner(env, scanner)
 }
@@ -363,6 +367,7 @@ pub extern "system" fn Java_org_lance_memwal_LsmScanner_createFromSnapshots<'loc
     )
 }
 
+/// Build an LSM scanner over `dataset` and `shard_snapshots`.
 fn inner_lsm_scanner_from_snapshots<'local>(
     env: &mut JNIEnv<'local>,
     dataset: JObject<'local>,
@@ -375,8 +380,15 @@ fn inner_lsm_scanner_from_snapshots<'local>(
         Arc::new(guard.inner.clone())
     };
     let pk_columns = get_pk_columns(&dataset)?;
-    let scanner = LsmScanner::new(dataset, snapshots, pk_columns);
+    let dir_id = mem_wal_dir_id(&dataset)?;
+    let scanner = LsmScanner::new(dataset, snapshots, pk_columns).with_mem_wal_dir_id(dir_id);
     attach_lsm_scanner(env, scanner)
+}
+
+/// The dataset's MemWAL `dir_id`; empty when it has no MemWAL.
+fn mem_wal_dir_id(dataset: &LanceDataset) -> Result<String> {
+    let details = block_on(dataset.mem_wal_index_details())?;
+    Ok(details.map(|details| details.dir_id).unwrap_or_default())
 }
 
 fn attach_lsm_scanner<'local>(
@@ -755,6 +767,7 @@ pub extern "system" fn Java_org_lance_memwal_LsmPointLookupPlanner_nativeCreate(
     );
 }
 
+/// Build a point-lookup planner over `shard_snapshots` and attach it to `this`.
 fn inner_create_lookup_planner(
     env: &mut JNIEnv,
     this: JObject,
@@ -778,7 +791,8 @@ fn inner_create_lookup_planner(
     // resolves its columns by id; `base_schema` carries none. Built before the
     // collector takes the dataset.
     let identity_schema = Arc::new(arrow_schema_with_field_ids(dataset.schema()));
-    let collector = LsmDataSourceCollector::new(dataset, snapshots);
+    let collector = LsmDataSourceCollector::new(dataset.clone(), snapshots)
+        .with_mem_wal_dir_id(mem_wal_dir_id(&dataset)?);
     let planner = LsmPointLookupPlanner::new(collector, pk_columns.clone(), base_schema.clone())?
         .with_identity_schema(identity_schema);
 
@@ -871,6 +885,7 @@ pub extern "system" fn Java_org_lance_memwal_LsmVectorSearchPlanner_nativeCreate
     );
 }
 
+/// Build a vector-search planner over `shard_snapshots` and attach it to `this`.
 #[allow(clippy::too_many_arguments)]
 fn inner_create_vector_planner(
     env: &mut JNIEnv,
@@ -906,7 +921,8 @@ fn inner_create_vector_planner(
         .map(|filter| parse_lsm_filter_expr(base_schema.as_ref(), filter).map_err(Error::from))
         .transpose()?;
 
-    let collector = LsmDataSourceCollector::new(dataset.clone(), snapshots);
+    let collector = LsmDataSourceCollector::new(dataset.clone(), snapshots)
+        .with_mem_wal_dir_id(mem_wal_dir_id(&dataset)?);
     let mut planner = LsmVectorSearchPlanner::new(
         collector,
         pk_columns,
@@ -1410,6 +1426,7 @@ fn box_u64_opt<'a>(env: &mut JNIEnv<'a>, value: Option<usize>) -> Result<JObject
     }
 }
 
+/// Convert `details` to a Java `MemWalIndexDetails`.
 fn index_details_to_java<'a>(
     env: &mut JNIEnv<'a>,
     details: &MemWalIndexDetails,
@@ -1428,15 +1445,17 @@ fn index_details_to_java<'a>(
         )?;
     }
 
+    let dir_id = env.new_string(&details.dir_id)?;
     Ok(env.new_object(
         "org/lance/memwal/MemWalIndexDetails",
-        "(JLjava/util/List;ZLjava/util/Map;Ljava/util/List;)V",
+        "(JLjava/util/List;ZLjava/util/Map;Ljava/util/List;Ljava/lang/String;)V",
         &[
             JValueGen::Long(details.num_shards as i64),
             JValueGen::Object(&maintained_indexes),
             JValueGen::Bool(u8::from(details.maintain_all_indexes)),
             JValueGen::Object(&writer_config_defaults),
             JValueGen::Object(&sharding_specs),
+            JValueGen::Object(&dir_id),
         ],
     )?)
 }
