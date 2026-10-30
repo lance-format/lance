@@ -196,6 +196,7 @@ impl Normalize for f64 {
 }
 
 /// L2 norm for f64, using the best kernel the host supports.
+#[deprecated(note = "use norm_l2, which selects the same kernel")]
 #[inline]
 pub fn norm_l2_f64_simd(vector: &[f64]) -> f32 {
     f64::norm_l2(vector)
@@ -219,13 +220,46 @@ lance_core::dispatch! {
     };
 }
 
-#[cfg(target_arch = "x86_64")]
 lance_core::target_kernel! {
     #[target_features()]
     #[candidate(NORM_L2_F64_PORTABLE: NormKernel<f64>)]
+    /// The x86_64 fallback below AVX, and the only kernel elsewhere. On
+    /// x86_64 `simd::f64` requires AVX, so this body is plain Rust there;
+    /// elsewhere `simd::f64` is backed by the baseline NEON or LSX. As in
+    /// `COSINE_F64_PORTABLE`, `_PORTABLE` marks a per-architecture body, while
+    /// `NORM_L2_F32_SCALAR` is plain Rust everywhere.
     #[inline]
     fn norm_l2_f64_portable(vector: &[f64]) -> f32 {
-        vector.iter().map(|v| v * v).sum::<f64>().sqrt() as f32
+        #[cfg(target_arch = "x86_64")]
+        {
+            vector.iter().map(|v| v * v).sum::<f64>().sqrt() as f32
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            use crate::simd::f64::{f64x4, f64x8};
+            use crate::simd::{FloatSimd, SIMD};
+
+            let dim = vector.len();
+            let unrolled_len = dim / 8 * 8;
+
+            let mut acc8 = f64x8::zeros();
+            for i in (0..unrolled_len).step_by(8) {
+                // SAFETY: `i + 8 <= dim`, which is in bounds.
+                let v = unsafe { f64x8::load_unaligned(vector.as_ptr().add(i)) };
+                acc8.multiply_add(v, v);
+            }
+
+            let aligned_len = dim / 4 * 4;
+            let mut acc4 = f64x4::zeros();
+            for i in (unrolled_len..aligned_len).step_by(4) {
+                // SAFETY: `i + 4 <= dim`, which is in bounds.
+                let v = unsafe { f64x4::load_unaligned(vector.as_ptr().add(i)) };
+                acc4.multiply_add(v, v);
+            }
+
+            let tail: f64 = vector[aligned_len..].iter().map(|&v| v * v).sum();
+            (acc8.reduce_sum() + acc4.reduce_sum() + tail).sqrt() as f32
+        }
     }
 }
 
@@ -379,39 +413,6 @@ mod x86 {
             // SAFETY: AVX is enabled for this function.
             (unsafe { hsum256_ps(acc) } + tail).sqrt()
         }
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-lance_core::target_kernel! {
-    #[target_features()]
-    #[candidate(NORM_L2_F64_PORTABLE: NormKernel<f64>)]
-    /// `simd::f64` is backed by the baseline NEON or LSX on these architectures.
-    #[inline]
-    fn norm_l2_f64_portable(vector: &[f64]) -> f32 {
-        use crate::simd::f64::{f64x4, f64x8};
-        use crate::simd::{FloatSimd, SIMD};
-
-        let dim = vector.len();
-        let unrolled_len = dim / 8 * 8;
-
-        let mut acc8 = f64x8::zeros();
-        for i in (0..unrolled_len).step_by(8) {
-            // SAFETY: `i + 8 <= dim`, which is in bounds.
-            let v = unsafe { f64x8::load_unaligned(vector.as_ptr().add(i)) };
-            acc8.multiply_add(v, v);
-        }
-
-        let aligned_len = dim / 4 * 4;
-        let mut acc4 = f64x4::zeros();
-        for i in (unrolled_len..aligned_len).step_by(4) {
-            // SAFETY: `i + 4 <= dim`, which is in bounds.
-            let v = unsafe { f64x4::load_unaligned(vector.as_ptr().add(i)) };
-            acc4.multiply_add(v, v);
-        }
-
-        let tail: f64 = vector[aligned_len..].iter().map(|&v| v * v).sum();
-        (acc8.reduce_sum() + acc4.reduce_sum() + tail).sqrt() as f32
     }
 }
 

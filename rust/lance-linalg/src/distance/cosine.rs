@@ -609,7 +609,11 @@ mod x86 {
                 y_norm8.multiply_add(yv, yv);
             }
             // Inlined rather than the dispatched `norm_l2`, which is an
-            // indirect call unless the baseline covers its best candidate.
+            // indirect call unless the baseline covers its best candidate. On
+            // a tail this short every norm candidate computes the same sum.
+            // The tail `dot` keeps its dispatched call, as in the
+            // `cosine_with_norms` kernels: it was dispatched before `norm_l2`
+            // was, so inlining it would be a separate change to all of them.
             let tail_norm = norm_l2_impl::<f32, f32, 16>(&other[aligned_len..]);
             let y_norm = y_norm16.reduce_sum() + y_norm8.reduce_sum() + tail_norm.powi(2);
             let xy =
@@ -931,6 +935,7 @@ lance_core::target_kernel! {
             xy8.multiply_add(xv, yv);
             y_norm8.multiply_add(yv, yv);
         }
+        // See the x86 `cosine_f32_avx_fma` for `norm_l2_impl`.
         let tail_norm = norm_l2_impl::<f32, f32, 16>(&other[aligned_len..]);
         let y_norm = y_norm16.reduce_sum() + y_norm8.reduce_sum() + tail_norm.powi(2);
         let xy = xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &other[aligned_len..]);
