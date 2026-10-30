@@ -20,12 +20,14 @@ use crate::encodings::physical::axis_delta::AxisDeltaDecompressor;
 pub use crate::encodings::physical::axis_delta::try_tensor_per_value;
 #[cfg(feature = "bitpacking")]
 use crate::encodings::physical::bitpacking::{InlineBitpacking, OutOfLineBitpacking};
+#[cfg(feature = "pcodec")]
+use crate::encodings::physical::pcodec::{PcodecMiniBlockDecompressor, PcodecMiniBlockEncoder};
 use crate::{
     buffer::LanceBuffer,
     compression_config::{AlpMode, BssMode, CompressionFieldParams},
     constants::{
         ALP_META_KEY, BSS_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY,
-        RLE_THRESHOLD_META_KEY,
+        PCODEC_COMPRESSION, RLE_THRESHOLD_META_KEY,
     },
     data::{
         DataBlock, DataBlockBuilder, FixedSizeListBlock, FixedWidthDataBlock, VariableWidthBlock,
@@ -740,6 +742,53 @@ pub fn try_alp_miniblock(
         return None;
     };
     try_alp_for_mini_block(field, data, params)
+}
+
+/// Select pcodec compression when the field requests `compression=pcodec`.
+///
+/// pcodec applies to float32/float64 values and fixed-size lists of them. A
+/// request for any other type is rejected instead of silently ignored.
+pub fn try_pcodec_miniblock(
+    field: &Field,
+    data: &DataBlock,
+    params: &CompressionFieldParams,
+) -> Result<Option<Box<dyn MiniBlockCompressor>>> {
+    if params.compression.as_deref() != Some(PCODEC_COMPRESSION) {
+        return Ok(None);
+    }
+    let mut item_type = field.data_type();
+    while let DataType::FixedSizeList(item, _) = item_type {
+        item_type = item.data_type().clone();
+    }
+    if !matches!(item_type, DataType::Float32 | DataType::Float64) {
+        return Err(Error::invalid_input(format!(
+            "pcodec compression requires float32 or float64 values or fixed-size lists of them, \
+             but field '{}' has type {}",
+            field.name,
+            field.data_type()
+        )));
+    }
+    if let DataBlock::FixedSizeList(fsl) = data
+        && fsl.clone().try_into_flat().is_none()
+    {
+        log::warn!(
+            "Field '{}' requests pcodec but has null list items; storing the page uncompressed",
+            field.name
+        );
+        return Ok(None);
+    }
+    #[cfg(feature = "pcodec")]
+    {
+        Ok(Some(Box::new(PcodecMiniBlockEncoder::try_new(
+            params.compression_level,
+        )?)))
+    }
+    #[cfg(not(feature = "pcodec"))]
+    {
+        Err(Error::not_supported_source(
+            "package was not built with pcodec support".into(),
+        ))
+    }
 }
 
 /// Select the original fixed-u8 RLE miniblock grammar.
@@ -1466,8 +1515,13 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Compression::Alp(description) => Ok(Box::new(
                 AlpMiniBlockDecompressor::from_description(description)?,
             )),
+            #[cfg(feature = "pcodec")]
+            Compression::Pcodec(description) => Ok(Box::new(
+                PcodecMiniBlockDecompressor::from_description(description)?,
+            )),
+            #[cfg(not(feature = "pcodec"))]
             Compression::Pcodec(_) => Err(Error::not_supported_source(
-                "pcodec decoding is not yet implemented".into(),
+                "package was not built with pcodec support".into(),
             )),
             Compression::General(general) => {
                 // Create inner decompressor

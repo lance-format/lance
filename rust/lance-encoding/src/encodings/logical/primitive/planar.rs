@@ -10,7 +10,10 @@ use super::structural_encoder::{
 };
 use super::*;
 use crate::compression::CompressionStrategy;
-use crate::constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_SPARSE};
+use crate::constants::{
+    COMPRESSION_META_KEY, PCODEC_COMPRESSION, STRUCTURAL_ENCODING_META_KEY,
+    STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_SPARSE,
+};
 use crate::decoder::{PageEncoding, PageInfo};
 use crate::format::planar::from_dense_execution;
 use crate::repdef::NormalizedStructuralPlan;
@@ -246,6 +249,23 @@ impl PrimitivePageEncodingBehavior for PlanarPrimitiveEncoding {
         {
             let mut metadata = (*dense_ctx.encoding_metadata).clone();
             metadata.remove(STRUCTURAL_ENCODING_META_KEY);
+            dense_ctx.encoding_metadata = Arc::new(metadata);
+        }
+        // pcodec compresses runs of rows, which the per-value full-zip layout
+        // cannot provide, so wide pcodec values use mini-block as well.
+        if dense_ctx
+            .encoding_metadata
+            .get(COMPRESSION_META_KEY)
+            .is_some_and(|v| v == PCODEC_COMPRESSION)
+            && !dense_ctx
+                .encoding_metadata
+                .contains_key(STRUCTURAL_ENCODING_META_KEY)
+        {
+            let mut metadata = (*dense_ctx.encoding_metadata).clone();
+            metadata.insert(
+                STRUCTURAL_ENCODING_META_KEY.to_string(),
+                STRUCTURAL_ENCODING_MINIBLOCK.to_string(),
+            );
             dense_ctx.encoding_metadata = Arc::new(metadata);
         }
         let mut encoded = match PrimitiveStructuralEncoder::encode_dense_page(
