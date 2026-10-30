@@ -762,17 +762,24 @@ impl Branches<'_> {
             return Ok(true);
         };
         for remaining in remaining_paths {
-            let Some(canonical_remaining) = &remaining.canonical_path else {
-                return Ok(true);
-            };
-            let Ok(relative) = canonical_path.strip_prefix(canonical_remaining) else {
-                continue;
-            };
-            let Some(component) = relative.components().next() else {
-                continue;
-            };
-            if component.as_os_str().to_str().is_some_and(is_dataset_dir) {
-                return Ok(true);
+            let entries = self
+                .object_store()
+                .list_with_delimiter(Some(&remaining.path))
+                .await?;
+            for dataset_path in entries.common_prefixes {
+                if !dataset_path.filename().is_some_and(is_dataset_dir) {
+                    continue;
+                }
+                let Some(canonical_dataset) = self
+                    .object_store()
+                    .canonicalize_local_path(&dataset_path)
+                    .await?
+                else {
+                    continue;
+                };
+                if canonical_path.starts_with(&canonical_dataset) {
+                    return Ok(true);
+                }
             }
         }
         Ok(false)

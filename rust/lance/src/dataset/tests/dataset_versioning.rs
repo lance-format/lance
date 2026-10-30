@@ -1637,6 +1637,64 @@ async fn test_delete_branch_preserves_unicode_aliased_parent_data() {
     assert_eq!(parent.count_rows(None).await.unwrap(), 3);
 }
 
+#[cfg(unix)]
+#[rstest]
+#[case::direct(false)]
+#[case::object_store(true)]
+#[tokio::test]
+async fn test_delete_branch_preserves_relocated_parent_data(#[case] use_object_store: bool) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        format!("file-object-store://{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    let mut parent = root.create_branch("A", 1, None).await.unwrap();
+    parent.append(id_rows(10, 1), None).await.unwrap();
+
+    let data_path = tempdir.std_path().join("tree/A/data");
+    let relocated_data = tempdir.std_path().join("relocated-data");
+    std::fs::rename(&data_path, &relocated_data).unwrap();
+    std::os::unix::fs::symlink(&relocated_data, &data_path).unwrap();
+    let alias = tempdir.std_path().join("tree/a");
+    if !alias.exists() {
+        std::os::unix::fs::symlink(tempdir.std_path().join("tree/A"), &alias).unwrap();
+    }
+    create_branch_before_name_check(&parent, "a/data").await;
+    create_branch_before_name_check(&root, "a/data/x").await;
+
+    let before = Dataset::open(&uri)
+        .await
+        .unwrap()
+        .checkout_branch("A")
+        .await
+        .unwrap();
+    assert_eq!(
+        before.scan().try_into_batch().await.unwrap()["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .as_ref(),
+        &[0, 10]
+    );
+
+    root.delete_branch("a/data").await.unwrap();
+
+    let after = Dataset::open(&uri)
+        .await
+        .unwrap()
+        .checkout_branch("A")
+        .await
+        .unwrap();
+    assert_eq!(
+        after.scan().try_into_batch().await.unwrap()["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .as_ref(),
+        &[0, 10]
+    );
+}
+
 #[tokio::test]
 async fn test_branch() {
     let tempdir = TempDir::default();
