@@ -1791,7 +1791,8 @@ impl Dataset {
         write_config: &ManifestWriteConfig,
         commit_config: &CommitConfig,
     ) -> Result<()> {
-        let (manifest, manifest_location) = commit_transaction(
+        // Keep the retry and rebase state machine out of every caller's future.
+        let (manifest, manifest_location) = Box::pin(commit_transaction(
             self,
             self.object_store.as_ref(),
             self.commit_handler.as_ref(),
@@ -1801,7 +1802,7 @@ impl Dataset {
             default_commit_retry_timeout(),
             self.manifest_location.naming_scheme,
             None,
-        )
+        ))
         .await?;
 
         self.set_manifest(Arc::new(manifest), manifest_location);
@@ -2748,6 +2749,23 @@ impl Dataset {
         index: &IndexMetadata,
     ) -> Result<Arc<ObjectStore>> {
         self.object_store(index.base_id).await
+    }
+
+    /// This table as a reader of `manifest`, another manifest of it, sees its
+    /// files: through that manifest's base paths, with base stores opened
+    /// afresh when those differ, since `base_object_stores` caches by id alone.
+    pub(crate) fn with_manifest_view(&self, manifest: Arc<Manifest>) -> Self {
+        let base_object_stores = if manifest.base_paths == self.manifest.base_paths {
+            self.base_object_stores.clone()
+        } else {
+            Default::default()
+        };
+        Self {
+            fragment_bitmap: Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect()),
+            manifest,
+            base_object_stores,
+            ..self.clone()
+        }
     }
 
     pub(crate) fn dataset_dir_for_deletion(&self, deletion_file: &DeletionFile) -> Result<Path> {
