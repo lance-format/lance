@@ -11,6 +11,9 @@
 //! segment covering only part of a rewrite group, or an NGram segment, must
 //! be rebuilt over the destinations; a segment off the lineage keeps the
 //! eager rule.
+//!
+//! Each case runs with the rewrite committed as a legacy `Rewrite` and as an
+//! action set recording the same transition, and gets the same outcome.
 
 use super::*;
 use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
@@ -47,6 +50,70 @@ async fn stage(
         .await
         .unwrap();
     (stale, segment)
+}
+
+/// How the segment built before the rewrite is committed.
+#[derive(Debug, Clone, Copy)]
+enum Form {
+    /// Through `commit_existing_index_segments`, as a legacy `CreateIndex`.
+    Legacy,
+    /// As an action set holding one `AddIndexSegment`.
+    Actions,
+}
+
+/// Commit `segment` from `stale`'s read version, leaving `stale` at the
+/// version it committed.
+async fn commit_segment(
+    stale: &mut Dataset,
+    column: &str,
+    segment: IndexMetadata,
+    form: Form,
+) -> Result<()> {
+    match form {
+        Form::Legacy => {
+            stale
+                .commit_existing_index_segments("idx", column, vec![segment])
+                .await
+        }
+        Form::Actions => {
+            let add = lance_table::transaction::action::AddIndexSegment {
+                uuid: segment.uuid,
+                name: segment.name,
+                fields: segment
+                    .fields
+                    .iter()
+                    .copied()
+                    .map(FieldRef::Committed)
+                    .collect(),
+                covering_fields: Vec::new(),
+                index_details: segment.index_details,
+                index_version: segment.index_version,
+                covered_fragments: segment.fragment_bitmap.map(|ids| {
+                    ids.iter()
+                        .map(|id| ActionRef::Committed(id as u64))
+                        .collect()
+                }),
+                files: segment.files.unwrap_or_default(),
+                base: None,
+                created_at: segment.created_at,
+                dataset_version: Some(segment.dataset_version),
+                data_change: false,
+            };
+            let transaction = Transaction::new(
+                stale.manifest.version,
+                Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                    "index",
+                    vec![TxnAction::AddIndexSegment(add)],
+                )])),
+                None,
+            );
+            *stale = CommitBuilder::new(Arc::new(stale.clone()))
+                .with_experimental_composite_operations(true)
+                .execute(transaction)
+                .await?;
+            Ok(())
+        }
+    }
 }
 
 /// Sorted `i` values under a predicate, with or without the scalar index.
@@ -97,16 +164,19 @@ fn stored_bitmap(indices: &[IndexMetadata]) -> RoaringBitmap {
         .unwrap()
 }
 
+#[rstest::rstest]
 #[tokio::test]
 #[serial_test::serial(frag_reuse_maintenance)]
-async fn index_built_before_a_stable_partition_lands_translating() {
+async fn index_built_before_a_stable_partition_lands_translating(
+    #[values(Form::Legacy, Form::Actions)] form: Form,
+    #[values(CompactionForm::Legacy, CompactionForm::Actions)] compaction: CompactionForm,
+) {
     let dir = TempStrDir::default();
     let dataset = fixture(dir.as_str()).await;
     let (mut stale, segment) = stage(&dataset, "i", IndexType::BTree, vec![0, 1]).await;
-    let tagged = make_tagged(dataset).await;
+    let tagged = make_tagged_as(dataset, compaction).await;
 
-    stale
-        .commit_existing_index_segments("idx", "i", vec![segment.clone()])
+    commit_segment(&mut stale, "i", segment.clone(), form)
         .await
         .unwrap();
     assert_eq!(stale.manifest.version, tagged.manifest.version + 1);
@@ -135,16 +205,19 @@ async fn index_built_before_a_stable_partition_lands_translating() {
 /// The segment covers fragment 0 but not fragment 1, and the rewrite
 /// consumed both: it lands with that provenance and claims nothing for the
 /// partition (the reader scans it), which a later optimize repairs.
+#[rstest::rstest]
 #[tokio::test]
 #[serial_test::serial(frag_reuse_maintenance)]
-async fn index_covering_part_of_a_partition_lands_claiming_nothing() {
+async fn index_covering_part_of_a_partition_lands_claiming_nothing(
+    #[values(Form::Legacy, Form::Actions)] form: Form,
+    #[values(CompactionForm::Legacy, CompactionForm::Actions)] compaction: CompactionForm,
+) {
     let dir = TempStrDir::default();
     let dataset = fixture(dir.as_str()).await;
     let (mut stale, segment) = stage(&dataset, "i", IndexType::BTree, vec![0]).await;
-    let tagged = make_tagged(dataset).await;
+    let tagged = make_tagged_as(dataset, compaction).await;
 
-    stale
-        .commit_existing_index_segments("idx", "i", vec![segment.clone()])
+    commit_segment(&mut stale, "i", segment.clone(), form)
         .await
         .unwrap();
     assert_eq!(stale.manifest.version, tagged.manifest.version + 1);
@@ -168,16 +241,19 @@ async fn index_covering_part_of_a_partition_lands_claiming_nothing() {
 
 /// An NGram segment over retired sources is refused by the committed-segment
 /// check, so the conflict asks for the rebuild up front.
+#[rstest::rstest]
 #[tokio::test]
 #[serial_test::serial(frag_reuse_maintenance)]
-async fn ngram_index_built_before_a_stable_partition_retries() {
+async fn ngram_index_built_before_a_stable_partition_retries(
+    #[values(Form::Legacy, Form::Actions)] form: Form,
+    #[values(CompactionForm::Legacy, CompactionForm::Actions)] compaction: CompactionForm,
+) {
     let dir = TempStrDir::default();
     let dataset = fixture(dir.as_str()).await;
     let (mut stale, segment) = stage(&dataset, "text", IndexType::NGram, vec![0, 1]).await;
-    make_tagged(dataset).await;
+    make_tagged_as(dataset, compaction).await;
 
-    let error = stale
-        .commit_existing_index_segments("idx", "text", vec![segment])
+    let error = commit_segment(&mut stale, "text", segment, form)
         .await
         .unwrap_err();
     assert!(
@@ -188,9 +264,13 @@ async fn ngram_index_built_before_a_stable_partition_retries() {
 
 /// A segment over a fragment the rewrite never touched lands untouched: the
 /// group is off the segment's bitmap, so neither rule fires.
+#[rstest::rstest]
 #[tokio::test]
 #[serial_test::serial(frag_reuse_maintenance)]
-async fn index_off_the_rewritten_fragments_lands_directly() {
+async fn index_off_the_rewritten_fragments_lands_directly(
+    #[values(Form::Legacy, Form::Actions)] form: Form,
+    #[values(CompactionForm::Legacy, CompactionForm::Actions)] compaction: CompactionForm,
+) {
     let dir = TempStrDir::default();
     let dataset = fixture(dir.as_str()).await;
     let batch = lance_datagen::gen_batch()
@@ -214,24 +294,9 @@ async fn index_off_the_rewritten_fragments_lands_directly() {
 
     let mut dataset = dataset;
     reserve(&mut dataset, 20).await;
-    let old_fragments: Vec<Fragment> = dataset
-        .fragments()
-        .iter()
-        .filter(|f| f.id < 2)
-        .cloned()
-        .collect();
-    let (transition, destinations) = prepare_partition(&dataset, &[0, 1], 10).await;
-    let version = dataset.manifest.version;
-    let tagged = commit_sp(
-        &dataset,
-        version,
-        tagged_rewrite(&dataset, old_fragments, destinations, vec![transition]).await,
-    )
-    .await
-    .unwrap();
+    let (tagged, _) = commit_partition(&dataset, &[0, 1], 10, compaction).await;
 
-    stale
-        .commit_existing_index_segments("idx", "i", vec![segment])
+    commit_segment(&mut stale, "i", segment, form)
         .await
         .unwrap();
     assert_eq!(stale.manifest.version, tagged.manifest.version + 1);
@@ -255,6 +320,8 @@ async fn index_off_the_rewritten_fragments_lands_directly() {
 async fn index_built_before_a_stable_partition_and_a_column_rewrite_preserves_valid_coverage(
     #[case] indexed_column: &str,
     #[case] withdrawn: bool,
+    #[values(Form::Legacy, Form::Actions)] form: Form,
+    #[values(CompactionForm::Legacy, CompactionForm::Actions)] compaction: CompactionForm,
 ) {
     use crate::dataset::{MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched};
     use lance_index::optimize::OptimizeOptions;
@@ -262,7 +329,7 @@ async fn index_built_before_a_stable_partition_and_a_column_rewrite_preserves_va
     let dir = TempStrDir::default();
     let dataset = fixture(dir.as_str()).await;
     let (mut stale, segment) = stage(&dataset, indexed_column, IndexType::BTree, vec![0, 1]).await;
-    let tagged = make_tagged(dataset).await;
+    let tagged = make_tagged_as(dataset, compaction).await;
 
     // Patch `text` of the row `i = 3` (fragment 11) in place. The payload
     // index becomes stale, while the preserved join key remains indexed.
@@ -293,8 +360,7 @@ async fn index_built_before_a_stable_partition_and_a_column_rewrite_preserves_va
         "rewritten in place"
     );
 
-    stale
-        .commit_existing_index_segments("idx", indexed_column, vec![segment.clone()])
+    commit_segment(&mut stale, indexed_column, segment.clone(), form)
         .await
         .unwrap();
     let mut dataset = fresh_session(dir.as_str()).await;
@@ -355,16 +421,20 @@ async fn index_built_before_a_stable_partition_and_a_column_rewrite_preserves_va
 /// it yet). A cast rewrites the column under a new field id, so the merge
 /// arm sees the field the index keys on removed from the schema and the
 /// commit retries against the new field.
+#[rstest::rstest]
 #[tokio::test]
 #[serial_test::serial(frag_reuse_maintenance)]
-async fn index_built_before_a_stable_partition_and_a_cast_retries() {
+async fn index_built_before_a_stable_partition_and_a_cast_retries(
+    #[values(Form::Legacy, Form::Actions)] form: Form,
+    #[values(CompactionForm::Legacy, CompactionForm::Actions)] compaction: CompactionForm,
+) {
     use crate::dataset::ColumnAlteration;
     use arrow_schema::DataType;
 
     let dir = TempStrDir::default();
     let dataset = fixture(dir.as_str()).await;
     let (mut stale, segment) = stage(&dataset, "i", IndexType::BTree, vec![0, 1]).await;
-    let mut tagged = make_tagged(dataset).await;
+    let mut tagged = make_tagged_as(dataset, compaction).await;
     tagged
         .alter_columns(&[ColumnAlteration::new("i".into()).cast_to(DataType::Int64)])
         .await
@@ -375,8 +445,7 @@ async fn index_built_before_a_stable_partition_and_a_cast_retries() {
         "cast in place"
     );
 
-    let error = stale
-        .commit_existing_index_segments("idx", "i", vec![segment])
+    let error = commit_segment(&mut stale, "i", segment, form)
         .await
         .unwrap_err();
     assert!(

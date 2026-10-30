@@ -4070,21 +4070,10 @@ mod composite {
         indexed
     }
 
-    /// A real segment over `val`, staged before a legacy in-place rewrite of
-    /// `val` in fragment 0 lands, commits with fragment 0 pruned from its
-    /// coverage, and the index then answers from the new values.
-    #[tokio::test]
-    async fn test_an_index_segment_rebases_over_a_legacy_column_rewrite() {
-        let mut dataset = two_fragment_dataset().await;
-        let staged = dataset
-            .create_index_builder(&["val"], IndexType::BTree, &ScalarIndexParams::default())
-            .name("val_idx".into())
-            .execute_uncommitted()
-            .await
-            .unwrap();
-        let stale = Arc::new(dataset.clone());
-
-        // `val` in fragment 0 becomes `a * 10 + 1`.
+    /// Commit a legacy in-place rewrite of `val` in `fragment`, setting it to
+    /// `a * 10 + 1` for the rows with `a` in 0..5.
+    async fn rewrite_val_in_place(dataset: &Dataset, fragment: usize) -> Dataset {
+        let rows = 0..5;
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int32, false),
             Field::new("val", DataType::Int32, false),
@@ -4092,13 +4081,13 @@ mod composite {
         let updates = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(Int32Array::from_iter_values(0..5)),
-                Arc::new(Int32Array::from_iter_values((0..5).map(|a| a * 10 + 1))),
+                Arc::new(Int32Array::from_iter_values(rows.clone())),
+                Arc::new(Int32Array::from_iter_values(rows.map(|a| a * 10 + 1))),
             ],
         )
         .unwrap();
         let rewritten = dataset
-            .get_fragment(0)
+            .get_fragment(fragment)
             .unwrap()
             .update_columns_with_offsets(
                 arrow_array::RecordBatchIterator::new(vec![Ok(updates)], schema),
@@ -4123,10 +4112,27 @@ mod composite {
             },
             None,
         );
-        CommitBuilder::new(Arc::new(dataset))
+        CommitBuilder::new(Arc::new(dataset.clone()))
             .execute(update)
             .await
+            .unwrap()
+    }
+
+    /// A real segment over `val`, staged before a legacy in-place rewrite of
+    /// `val` in fragment 0 lands, commits with fragment 0 pruned from its
+    /// coverage, and the index then answers from the new values.
+    #[tokio::test]
+    async fn test_an_index_segment_rebases_over_a_legacy_column_rewrite() {
+        let mut dataset = two_fragment_dataset().await;
+        let staged = dataset
+            .create_index_builder(&["val"], IndexType::BTree, &ScalarIndexParams::default())
+            .name("val_idx".into())
+            .execute_uncommitted()
+            .await
             .unwrap();
+        let stale = Arc::new(dataset.clone());
+
+        rewrite_val_in_place(&dataset, 0).await;
 
         let committed = commit_from_stale(stale, vec![add_built_segment(staged)])
             .await
@@ -4189,6 +4195,78 @@ mod composite {
         assert_eq!(index_coverage(&committed, "val_idx").await, vec![compacted]);
         assert_eq!(indexed_a(&committed, "val = 30").await, vec![3]);
         assert_eq!(indexed_a(&committed, "val >= 70").await, vec![7, 8, 9]);
+    }
+
+    /// After the compaction, a column rewrite lands on the fragment the
+    /// compaction made. A segment built before both still covers the sources,
+    /// which the reader translates onto that fragment, so it has to give them
+    /// up if it was built from the rewritten column, as a legacy `CreateIndex`
+    /// does. A segment over another column keeps translating.
+    #[rstest::rstest]
+    #[case::indexed_column_rewritten("val", true)]
+    #[case::other_column_rewritten("a", false)]
+    #[tokio::test]
+    async fn test_an_index_segment_gives_up_a_compaction_whose_output_was_rewritten(
+        #[case] indexed_column: &str,
+        #[case] withdrawn: bool,
+    ) {
+        let mut dataset = two_fragment_dataset().await;
+        // An index already there, so the compaction records its moves in a
+        // fragment reuse index rather than remapping nothing.
+        dataset
+            .create_index(
+                &["a"],
+                IndexType::BTree,
+                Some("a_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let staged = dataset
+            .create_index_builder(
+                &[indexed_column],
+                IndexType::BTree,
+                &ScalarIndexParams::default(),
+            )
+            .name("staged_idx".into())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let stale = Arc::new(dataset.clone());
+
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions {
+                target_rows_per_fragment: 1_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let compacted = dataset.fragments()[0].id;
+        let dataset = rewrite_val_in_place(&dataset, compacted as usize).await;
+        assert_eq!(
+            dataset.fragments()[0].id,
+            compacted,
+            "precondition: rewritten in place"
+        );
+
+        let committed = commit_from_stale(stale, vec![add_built_segment(staged)])
+            .await
+            .expect("the segment lands over the compaction and the rewrite");
+
+        let coverage = index_coverage(&committed, "staged_idx").await;
+        if withdrawn {
+            assert_eq!(coverage, Vec::<u32>::new());
+        } else {
+            assert_eq!(coverage, vec![compacted as u32]);
+        }
+        assert_eq!(indexed_a(&committed, "val = 11").await, vec![1]);
+        assert_eq!(indexed_a(&committed, "val = 10").await, Vec::<i32>::new());
+        assert_eq!(indexed_a(&committed, "a = 3").await, vec![3]);
     }
 
     /// Without a fragment reuse index nothing translates the segment's
@@ -5328,6 +5406,80 @@ mod composite {
                 recorded_transitions(&dataset).await.is_some(),
                 record_transition
             );
+            assert_each_value_once(&dataset, 0..4 * ROWS_PER_FRAGMENT).await;
+        }
+
+        /// A legacy `CreateIndex` and an action compaction of the fragments it
+        /// covers. Built first, the segment is carried along by whatever the
+        /// compaction records. Built second, it rebases through a recorded
+        /// transition, as legacy does over a deferred compaction, and conflicts
+        /// over an unrecorded one, as legacy does over an eager one.
+        #[rstest::rstest]
+        #[case::build_lands_first_with_transition(true, true)]
+        #[case::build_lands_first_without_transition(true, false)]
+        #[case::compaction_lands_first_with_transition(false, true)]
+        #[case::compaction_lands_first_without_transition(false, false)]
+        #[tokio::test]
+        async fn test_a_create_index_and_an_action_compaction(
+            #[case] build_lands_first: bool,
+            #[case] record_transition: bool,
+        ) {
+            let dataset = four_fragments().await;
+            let read_version = dataset.version().version;
+            let stale = Arc::new(dataset.clone());
+            let segment = build_segment(&dataset, vec![0, 1]).await;
+            let create_index = Transaction::new(
+                read_version,
+                Operation::CreateIndex {
+                    new_indices: vec![segment],
+                    removed_indices: vec![],
+                },
+                None,
+            );
+            let compact = compaction(&dataset, &[0, 1], record_transition).await;
+
+            let dataset = if build_lands_first {
+                let dataset = CommitBuilder::new(Arc::new(dataset))
+                    .execute(create_index)
+                    .await
+                    .unwrap();
+                drop(dataset);
+                commit_from_stale(stale, compact).await.unwrap()
+            } else {
+                let dataset = commit(dataset, compact).await;
+                let landed = CommitBuilder::new(stale)
+                    .with_experimental_composite_operations(true)
+                    .execute(create_index)
+                    .await;
+                if !record_transition {
+                    assert!(
+                        matches!(landed, Err(Error::RetryableCommitConflict { .. })),
+                        "{landed:?}"
+                    );
+                    return;
+                }
+                drop(dataset);
+                landed.unwrap()
+            };
+
+            let destination = newest_fragment(&dataset);
+            let served = dataset
+                .load_indices_by_name("a_idx")
+                .await
+                .unwrap()
+                .iter()
+                .flat_map(|segment| segment.fragment_bitmap.clone().unwrap_or_default())
+                .collect::<RoaringBitmap>();
+            assert_eq!(
+                served.contains(destination),
+                record_transition,
+                "{served:?}"
+            );
+            if record_transition {
+                for value in 0..2 * ROWS_PER_FRAGMENT {
+                    assert_eq!(indexed_matches(&dataset, value).await, 1, "a = {value}");
+                }
+            }
             assert_each_value_once(&dataset, 0..4 * ROWS_PER_FRAGMENT).await;
         }
 

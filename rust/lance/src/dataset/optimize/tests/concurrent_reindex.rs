@@ -13,10 +13,14 @@ use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use futures::future::BoxFuture;
 
 use super::*;
+use crate::dataset::CommitBuilder;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::cleanup::CleanupPolicyBuilder;
 use crate::dataset::{MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched};
 use crate::session::Session;
+use lance_table::transaction::action::{
+    Action, AddIndexSegment, CompositeOperation, FieldRef, Ref, UserStep,
+};
 
 const ROWS_PER_FRAGMENT: i32 = 6;
 
@@ -69,6 +73,50 @@ async fn build_index(dataset: &mut Dataset, column: &str, name: &str, replace: b
         )
         .await
         .map(|_| ())
+}
+
+/// [`build_index`], committing the segment as an action set holding one
+/// `AddIndexSegment` instead of a `CreateIndex`.
+async fn build_index_as_actions(dataset: &mut Dataset, column: &str, name: &str) -> Result<()> {
+    let segment = dataset
+        .create_index_builder(&[column], IndexType::BTree, &ScalarIndexParams::default())
+        .name(name.into())
+        .execute_uncommitted()
+        .await?;
+    let add = AddIndexSegment {
+        uuid: segment.uuid,
+        name: segment.name,
+        fields: segment
+            .fields
+            .iter()
+            .copied()
+            .map(FieldRef::Committed)
+            .collect(),
+        covering_fields: Vec::new(),
+        index_details: segment.index_details,
+        index_version: segment.index_version,
+        covered_fragments: segment
+            .fragment_bitmap
+            .map(|ids| ids.iter().map(|id| Ref::Committed(id as u64)).collect()),
+        files: segment.files.unwrap_or_default(),
+        base: None,
+        created_at: segment.created_at,
+        dataset_version: Some(segment.dataset_version),
+        data_change: false,
+    };
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+            "index",
+            vec![Action::AddIndexSegment(add)],
+        )])),
+        None,
+    );
+    *dataset = CommitBuilder::new(Arc::new(dataset.clone()))
+        .with_experimental_composite_operations(true)
+        .execute(transaction)
+        .await?;
+    Ok(())
 }
 
 /// Compacts into fragments of `fragments_per_group` inputs, deferring the remap.
@@ -469,14 +517,22 @@ enum Fold {
 }
 
 /// An overlay newer than the index, folded into a compaction's output, leaves
-/// nothing to mask the stale values, so the group is withdrawn.
+/// nothing to mask the stale values, so the group is withdrawn. The same holds
+/// for an index committed as an action set.
 #[rstest]
-#[case::by_the_compaction(Fold::ByTheCompaction, false)]
-#[case::by_the_compaction_same_process(Fold::ByTheCompaction, true)]
-#[case::by_a_later_compaction(Fold::ByALaterCompaction, false)]
-#[case::never(Fold::Never, false)]
+#[case::by_the_compaction(Fold::ByTheCompaction, false, false)]
+#[case::by_the_compaction_same_process(Fold::ByTheCompaction, true, false)]
+#[case::by_a_later_compaction(Fold::ByALaterCompaction, false, false)]
+#[case::never(Fold::Never, false, false)]
+#[case::by_the_compaction_as_actions(Fold::ByTheCompaction, false, true)]
+#[case::by_a_later_compaction_as_actions(Fold::ByALaterCompaction, false, true)]
+#[case::never_as_actions(Fold::Never, false, true)]
 #[tokio::test]
-async fn test_index_withdraws_a_folded_overlay(#[case] fold: Fold, #[case] same_process: bool) {
+async fn test_index_withdraws_a_folded_overlay(
+    #[case] fold: Fold,
+    #[case] same_process: bool,
+    #[case] as_actions: bool,
+) {
     let dir = TempStrDir::default();
     let uri = dir.as_str();
     let mut table = indexed_table(uri, 4).await;
@@ -500,9 +556,12 @@ async fn test_index_withdraws_a_folded_overlay(#[case] fold: Fold, #[case] same_
         assert!(table.fragments().iter().all(|f| f.overlays.is_empty()));
     }
 
-    build_index(&mut builder, "val", "val_idx", false)
-        .await
-        .unwrap();
+    if as_actions {
+        build_index_as_actions(&mut builder, "val", "val_idx").await
+    } else {
+        build_index(&mut builder, "val", "val_idx", false).await
+    }
+    .unwrap();
 
     assert_lookups_match_scan(uri, probes(24, [999])).await;
     let folded = (!matches!(fold, Fold::Never)).then_some(0);

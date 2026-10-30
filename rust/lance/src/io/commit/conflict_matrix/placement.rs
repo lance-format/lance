@@ -87,18 +87,19 @@ impl Cell {
 ///
 /// Regenerate with the `discover_placements` test below.
 const PLACEMENT_MATRIX: &str = "\
-                             | dl      df      ur      uc      ov      dr      ci      rw      vd      vf      vu
-delete                       | R/-/L   R/-/L   L/-/L   R/R/L   L/L/L   R/R/L   L/-/L   R/-/L   R/-/L   R/-/L   L/-/L
-delete_whole_fragment        | R/-/L   R/-/L   R/-/L   R/R/L   L/L/L   R/R/L   L/-/L   R/-/L   R/-/L   R/-/L   R/-/L
-update_rewrite_rows          | L/-/L   R/-/L   R/-/L   R/R/L   R/R/L   R/R/L   L/-/L   R/-/L   L/-/L   R/-/L   R/-/L
-update_rewrite_columns       | R/-/L   R/-/L   R/-/L   R/R/L   R/L/L   R/R/L   L/-/L   R/-/L   R/-/L   R/-/L   R/-/L
-data_overlay                 | L/-/L   R/-/L   R/-/L   L/L/L   L/L/L   L/L/L   L/-/L   R/-/L   L/-/L   R/-/L   R/-/L
-data_replacement             | L/-/L   X/-/L   R/-/L   R/L/L   L/L/L   R/L/L   L/-/L   R/-/L   L/-/L   R/-/L   R/-/L
-create_index                 | L/-/L   L/-/L   L/-/L   L/L/L   L/L/L   L/L/L   R/-/R   R/-/L   L/-/L   L/-/L   L/-/L
-rewrite                      | R/-/L   R/-/L   R/-/L   R/R/L   R/R/L   R/R/L   R/-/L   R/-/L   R/-/L   R/-/L   R/-/L
-action_delete                | R/-/L   R/-/L   L/-/L   L/L/L   L/L/L   L/L/L   L/-/L   R/-/L   R/-/L   R/-/L   L/-/L
-action_delete_whole_fragment | R/-/L   R/-/L   R/-/L   R/R/L   L/L/L   R/R/L   L/-/L   R/-/L   R/-/L   R/-/L   R/-/L
-action_update                | L/-/L   R/-/L   R/-/L   R/R/L   R/R/L   R/R/L   L/-/L   R/-/L   L/-/L   R/-/L   R/-/L
+                             | dl      df      ur      uc      ov      dr      ci      rw      vd      vf      vu      vw
+delete                       | R/-/L   R/-/L   L/-/L   R/R/L   L/L/L   R/R/L   L/-/L   R/-/L   R/-/L   R/-/L   L/-/L   R/-/L
+delete_whole_fragment        | R/-/L   R/-/L   R/-/L   R/R/L   L/L/L   R/R/L   L/-/L   R/-/L   R/-/L   R/-/L   R/-/L   R/-/L
+update_rewrite_rows          | L/-/L   R/-/L   R/-/L   R/R/L   R/R/L   R/R/L   L/-/L   R/-/L   L/-/L   R/-/L   R/-/L   R/-/L
+update_rewrite_columns       | R/-/L   R/-/L   R/-/L   R/R/L   R/L/L   R/R/L   L/-/L   R/-/L   R/-/L   R/-/L   R/-/L   R/-/L
+data_overlay                 | L/-/L   R/-/L   R/-/L   L/L/L   L/L/L   L/L/L   L/-/L   R/-/L   L/-/L   R/-/L   R/-/L   R/-/L
+data_replacement             | L/-/L   X/-/L   R/-/L   R/L/L   L/L/L   R/L/L   L/-/L   R/-/L   L/-/L   R/-/L   R/-/L   R/-/L
+create_index                 | L/-/L   L/-/L   L/-/L   L/L/L   L/L/L   L/L/L   R/-/R   R/-/L   L/-/L   L/-/L   L/-/L   R/-/L
+rewrite                      | R/-/L   R/-/L   R/-/L   R/R/L   R/R/L   R/R/L   R/-/L   R/-/L   R/-/L   R/-/L   R/-/L   R/-/L
+action_delete                | R/-/L   R/-/L   L/-/L   L/L/L   L/L/L   L/L/L   L/-/L   R/-/L   R/-/L   R/-/L   L/-/L   R/-/L
+action_delete_whole_fragment | R/-/L   R/-/L   R/-/L   R/R/L   L/L/L   R/R/L   L/-/L   R/-/L   R/-/L   R/-/L   R/-/L   R/-/L
+action_update                | L/-/L   R/-/L   R/-/L   R/R/L   R/R/L   R/R/L   L/-/L   R/-/L   L/-/L   R/-/L   R/-/L   R/-/L
+action_rewrite               | R/-/L   R/-/L   R/-/L   R/R/L   R/R/L   R/R/L   L/-/L   R/-/L   R/-/L   R/-/L   R/-/L   R/-/L
 ";
 
 /// The level [`PLACEMENT_MATRIX`] was observed under.
@@ -203,6 +204,7 @@ fn parse() -> HashMap<(Scenario, Scenario, Placement), Cell> {
 #[case::action_delete(Scenario::ActionDelete)]
 #[case::action_delete_whole_fragment(Scenario::ActionDeleteWholeFragment)]
 #[case::action_update(Scenario::ActionUpdate)]
+#[case::action_rewrite(Scenario::ActionRewrite)]
 #[tokio::test]
 async fn placement_row(#[case] ours: Scenario) {
     for theirs in scoped() {

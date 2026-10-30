@@ -36,7 +36,7 @@ use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use roaring::RoaringBitmap;
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -591,16 +591,10 @@ impl<'a> TransactionRebase<'a> {
     pub async fn load_current_lineage(&mut self, dataset: &Dataset) -> Result<()> {
         match &self.transaction.operation {
             Operation::CreateIndex { .. } => {}
-            // An action set gets the untagged history only: a segment it adds
-            // over fragments a tagged history retired conflicts instead.
             Operation::CompositeOperation(composite_operation)
                 if composite_operation
                     .iter_actions()
-                    .any(|action| matches!(action, Action::AddIndexSegment(_))) =>
-            {
-                let indices = crate::index::load_all_indices(dataset).await?;
-                return self.load_untagged_reuse(dataset, &indices).await;
-            }
+                    .any(|action| matches!(action, Action::AddIndexSegment(_))) => {}
             _ => return Ok(()),
         }
         let indices = crate::index::load_all_indices(dataset).await?;
@@ -814,16 +808,23 @@ impl<'a> TransactionRebase<'a> {
         };
         let ours = Footprint::pending(&self.transaction, read);
         let theirs = Footprint::committed(other_transaction, before, after);
-        let overlaps = match ours.compare(&theirs) {
-            Verdict::Compatible => return Ok(()),
-            Verdict::Rebase(overlaps) => overlaps,
-            Verdict::Conflict => {
-                return Err(self.retryable_conflict_err(other_transaction, other_version));
-            }
-        };
+        let overlaps =
+            match ours.compare_through_moves(&theirs, &|fragment| self.moved_to(fragment)) {
+                Verdict::Compatible => Vec::new(),
+                Verdict::Rebase(overlaps) => overlaps,
+                Verdict::Conflict => {
+                    return Err(self.retryable_conflict_err(other_transaction, other_version));
+                }
+            };
+        // Also when the footprints are compatible: a compaction of an earlier
+        // compaction's output names none of the fragments the segment covers.
+        let overlaps = self.withdraw_folded_overlays(overlaps, before, other_transaction);
+        if overlaps.is_empty() {
+            return Ok(());
+        }
         if !overlaps
             .iter()
-            .all(|overlap| self.can_rebase_past(overlap, before, other_transaction))
+            .all(|overlap| self.can_rebase_past(overlap, other_transaction))
         {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
@@ -901,29 +902,48 @@ impl<'a> TransactionRebase<'a> {
         true
     }
 
-    /// Whether the rebase can resolve `overlap`, given the manifest `before`
-    /// the commit it overlaps.
+    /// The fragments the latest fragment reuse index records `fragment`'s
+    /// rows as moved into, following one compaction after another: empty
+    /// when it records no move of `fragment`, and `None` when a tagged
+    /// history has it on its lineage but cannot be walked.
+    ///
+    /// Only a move out of `fragment` counts, never one into it, so a
+    /// compaction of a fragment some recorded move produced, which recorded
+    /// nothing itself, is not taken for a recorded one.
+    fn moved_to(&self, fragment: u64) -> Option<Vec<u64>> {
+        let Ok(fragment) = u32::try_from(fragment) else {
+            return Some(Vec::new());
+        };
+        let moved = if let Some(lineage) = &self.current_lineage {
+            if !lineage.contains(fragment) {
+                return Some(Vec::new());
+            }
+            lineage.destinations_of(fragment)?
+        } else if let Some(reuse) = &self.untagged_reuse {
+            reuse.moved_to(fragment)
+        } else {
+            Vec::new()
+        };
+        Some(moved.into_iter().map(u64::from).collect())
+    }
+
+    /// Whether the rebase can resolve `overlap`, which `committed` caused.
     ///
     /// A compaction under a legacy `CreateIndex`'s segment is resolvable only
     /// as legacy resolves it: the move deferred its index remap and the latest
-    /// untagged fragment reuse index still records it, so a reader translates
-    /// the segment's coverage. An action set's segment follows the reuse
-    /// history's own rule instead, that removal isn't staleness: its coverage
-    /// of the moved rows translates through a recorded transition, or is lost
-    /// and the rows are scanned. Either way, an NGram segment refuses retired
-    /// coverage at query time, and an overlay newer than the segment that the
-    /// compaction folded into base data would no longer be masked out of it;
-    /// legacy withdraws the latter from coverage, and this conflicts instead.
+    /// fragment reuse index, untagged or tagged, still records it, so a reader
+    /// translates the segment's coverage. An action set's segment follows the
+    /// reuse history's own rule instead, that removal isn't staleness: its
+    /// coverage of the moved rows translates through a recorded transition, or
+    /// is lost and the rows are scanned. Either way, an NGram segment refuses
+    /// retired coverage at query time. A compaction that folded in a newer
+    /// overlay was already turned into a withdrawal by
+    /// [`Self::withdraw_folded_overlays`].
     ///
     /// Rows this transaction moved out from under an overlay `committed`
     /// added are resolvable where they miss the overlay's coverage, as
     /// `check_update_txn` decides it for a named `Update`.
-    fn can_rebase_past(
-        &self,
-        overlap: &Overlap,
-        before: &Manifest,
-        committed: &Transaction,
-    ) -> bool {
+    fn can_rebase_past(&self, overlap: &Overlap, committed: &Transaction) -> bool {
         let (segment, fragment) = match overlap {
             Overlap::CompactedUnderIndex { segment, fragment } => (segment, fragment),
             Overlap::RowsMovedUnderOverlay { fragment }
@@ -936,32 +956,105 @@ impl<'a> TransactionRebase<'a> {
         let Some(built) = added_segment(&self.transaction, *segment) else {
             return false;
         };
-        let recorded = matches!(self.transaction.operation, Operation::CompositeOperation(_))
-            || self.untagged_reuse.as_deref().is_some_and(|reuse| {
-                reuse
-                    .groups
-                    .iter()
-                    .any(|sources| sources.contains(fragment))
-            });
         let is_ngram = built
             .index_details
             .as_ref()
             .is_some_and(|details| details.type_url.ends_with("NGramIndexDetails"));
-        let folds_newer_overlay = before
-            .fragments
-            .iter()
-            .find(|candidate| candidate.id == *fragment)
-            .is_some_and(|compacted| {
-                compacted.overlays.iter().any(|overlay| {
-                    overlay_affects_index(
-                        overlay,
-                        &built.fields,
-                        built.dataset_version,
-                        &before.schema,
-                    )
+        self.records_move_of(*fragment) && !is_ngram
+    }
+
+    /// Whether the segment this transaction adds over `fragment` can keep
+    /// covering it once a compaction moves its rows: always for an action
+    /// set's segment, and for a legacy `CreateIndex`'s only where the fragment
+    /// reuse history recorded the move.
+    fn records_move_of(&self, fragment: u64) -> bool {
+        matches!(self.transaction.operation, Operation::CompositeOperation(_))
+            || match (&self.current_lineage, &self.untagged_reuse) {
+                (Some(_), _) => self
+                    .moved_to(fragment)
+                    .is_some_and(|moved| !moved.is_empty()),
+                (None, Some(reuse)) => reuse
+                    .groups
+                    .iter()
+                    .any(|sources| sources.contains(&fragment)),
+                (None, None) => false,
+            }
+    }
+
+    /// Withdraw a segment this transaction adds from the fragments whose rows
+    /// `committed` compacted together with an overlay newer than the segment,
+    /// folding the overlay into base data: nothing is left to mask the stale
+    /// values the segment holds for those rows. Legacy withdraws the rewrite
+    /// group; here that is every covered fragment whose rows reach a fragment
+    /// the folded one moved into, which also catches an overlay that landed on
+    /// an earlier compaction's output and is folded by a later one. Coverage
+    /// loss is always legal; the rows are scanned.
+    ///
+    /// Only where the move would otherwise translate, so a legacy
+    /// `CreateIndex` over an unrecorded compaction still conflicts.
+    fn withdraw_folded_overlays(
+        &self,
+        overlaps: Vec<Overlap>,
+        before: &Manifest,
+        committed: &Transaction,
+    ) -> Vec<Overlap> {
+        let mut withdrawn = BTreeSet::new();
+        for (segment, covered) in added_segment_coverage(&self.transaction) {
+            let Some(built) = added_segment(&self.transaction, segment) else {
+                continue;
+            };
+            let folded: HashSet<u64> = before
+                .fragments
+                .iter()
+                .filter(|fragment| {
+                    moves_rows_out_of(&committed.operation, fragment.id)
+                        && fragment.overlays.iter().any(|overlay| {
+                            overlay_affects_index(
+                                overlay,
+                                &built.fields,
+                                built.dataset_version,
+                                &before.schema,
+                            )
+                        })
                 })
-            });
-        recorded && !is_ngram && !folds_newer_overlay
+                .map(|fragment| fragment.id)
+                .collect();
+            if folded.is_empty() {
+                continue;
+            }
+            let mut reached_by_folded = folded.clone();
+            for fragment in &folded {
+                reached_by_folded.extend(self.moved_to(*fragment).unwrap_or_default());
+            }
+            for fragment in covered {
+                let reaches_folded = match self.moved_to(fragment) {
+                    Some(moved) => moved
+                        .into_iter()
+                        .chain([fragment])
+                        .any(|reached| reached_by_folded.contains(&reached)),
+                    None => true,
+                };
+                if reaches_folded && self.records_move_of(fragment) {
+                    withdrawn.insert((segment, fragment));
+                }
+            }
+        }
+        let mut overlaps: Vec<Overlap> = overlaps
+            .into_iter()
+            .filter(|overlap| match overlap {
+                Overlap::CompactedUnderIndex { segment, fragment }
+                | Overlap::UpdatedUnderIndex { segment, fragment } => {
+                    !withdrawn.contains(&(*segment, *fragment))
+                }
+                _ => true,
+            })
+            .collect();
+        overlaps.extend(
+            withdrawn
+                .into_iter()
+                .map(|(segment, fragment)| Overlap::UpdatedUnderIndex { segment, fragment }),
+        );
+        overlaps
     }
 
     /// Whether the rows this transaction moved out of `fragment` miss every
@@ -3932,6 +4025,60 @@ fn overlay_coverage(operation: &Operation, fragment: u64) -> Option<RoaringBitma
     coverage.into_iter().reduce(|union, more| union | more)
 }
 
+/// Each segment `transaction` adds, with the committed fragments it covers.
+/// A segment with no stated coverage covers nothing a commit could fold.
+fn added_segment_coverage(transaction: &Transaction) -> Vec<(uuid::Uuid, Vec<u64>)> {
+    match &transaction.operation {
+        Operation::CreateIndex { new_indices, .. } => new_indices
+            .iter()
+            .map(|index| {
+                let covered = index
+                    .fragment_bitmap
+                    .iter()
+                    .flat_map(|bitmap| bitmap.iter().map(u64::from))
+                    .collect();
+                (index.uuid, covered)
+            })
+            .collect(),
+        Operation::CompositeOperation(composite_operation) => composite_operation
+            .iter_actions()
+            .filter_map(|action| match action {
+                Action::AddIndexSegment(segment) => Some((
+                    segment.uuid,
+                    segment
+                        .covered_fragments
+                        .iter()
+                        .flatten()
+                        .filter_map(|fragment| fragment.committed())
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether `operation` moves the rows of committed `fragment` into fragments of
+/// its own, as a compaction does, rather than deleting them.
+fn moves_rows_out_of(operation: &Operation, fragment: u64) -> bool {
+    match operation {
+        Operation::Rewrite { groups, .. } => groups
+            .iter()
+            .any(|group| group.old_fragments.iter().any(|old| old.id == fragment)),
+        Operation::CompositeOperation(composite_operation) => {
+            composite_operation.iter_actions().any(|action| {
+                matches!(
+                    action,
+                    Action::RemoveFragment(remove)
+                        if remove.fragment == ActionRef::Committed(fragment) && !remove.data_change
+                )
+            })
+        }
+        _ => false,
+    }
+}
+
 /// What a rebase needs to know about a segment a transaction adds.
 struct AddedSegment {
     fields: Vec<i32>,
@@ -4019,6 +4166,22 @@ impl UntaggedReuse {
                 self.groups
                     .contains(sorted_ids(group.old_fragments.iter().map(|f| f.id)).as_slice())
             })
+    }
+
+    /// Every fragment a recorded group moved `fragment`'s rows into, through
+    /// later groups that compacted those in turn.
+    fn moved_to(&self, fragment: u32) -> Vec<u32> {
+        let mut reached = Vec::new();
+        let mut pending = vec![fragment];
+        while let Some(id) = pending.pop() {
+            for (output, sources) in &self.sources {
+                if sources.contains(&u64::from(id)) && !reached.contains(output) {
+                    reached.push(*output);
+                    pending.push(*output);
+                }
+            }
+        }
+        reached
     }
 
     fn compacted_from(&self, fragment: u32) -> RoaringBitmap {
@@ -8566,6 +8729,9 @@ mod tests {
         };
         use lance_table::system_index::frag_reuse::FragDigest;
         use lance_table::system_index::frag_reuse::ledger::{FragReuseLedger, Mapping};
+        use lance_table::transaction::action::{
+            AddDataFile, AppendFragReuseTransition, FragReuseMapping,
+        };
         use prost::Message;
         use roaring::{RoaringBitmap, RoaringTreemap};
 
@@ -9614,8 +9780,12 @@ mod tests {
         /// ledger validates. Overlap is rejected earlier and non-retryably
         /// by the double-consumption rule, so what reaches reassembly is
         /// proven disjoint.
+        #[rstest::rstest]
         #[tokio::test]
-        async fn sp_vs_sp_disjoint_merges_fresh_session() {
+        async fn sp_vs_sp_disjoint_merges_fresh_session(
+            #[values(CompactionForm::Legacy, CompactionForm::Actions)] first: CompactionForm,
+            #[values(CompactionForm::Legacy, CompactionForm::Actions)] second: CompactionForm,
+        ) {
             let dir = TempStrDir::default();
             let mut writer_a = disk_fixture(dir.as_str(), 4, 4).await;
             writer_a
@@ -9632,40 +9802,12 @@ mod tests {
             let base_version = writer_a.manifest.version;
 
             let writer_b = fresh_session(dir.as_str()).await;
-            let b_old: Vec<Fragment> = writer_b
-                .fragments()
-                .iter()
-                .filter(|f| f.id < 2)
-                .cloned()
-                .collect();
-            let (b_transition, b_destinations) = prepare_partition(&writer_b, &[0, 1], 10).await;
-            let read_version = writer_b.manifest.version;
-            assert_eq!(read_version, base_version);
+            assert_eq!(writer_b.manifest.version, base_version);
 
-            let a_old: Vec<Fragment> = writer_a
-                .fragments()
-                .iter()
-                .filter(|f| f.id >= 2)
-                .cloned()
-                .collect();
-            let (a_transition, a_destinations) = prepare_partition(&writer_a, &[2, 3], 20).await;
-            let a_version = writer_a.manifest.version;
-            commit_sp(
-                &writer_a,
-                a_version,
-                tagged_rewrite(&writer_a, a_old, a_destinations, vec![a_transition.clone()]).await,
-            )
-            .await
-            .unwrap();
+            let (_, a_transition) = commit_partition(&writer_a, &[2, 3], 20, first).await;
 
             // No caller-visible error: the in-loop rebase merges.
-            let committed = commit_sp(
-                &writer_b,
-                read_version,
-                tagged_rewrite(&writer_b, b_old, b_destinations, vec![b_transition.clone()]).await,
-            )
-            .await
-            .unwrap();
+            let (committed, b_transition) = commit_partition(&writer_b, &[0, 1], 10, second).await;
             // Exactly two commits landed on top of the shared base.
             assert_eq!(committed.manifest.version, base_version + 2);
 
@@ -10086,18 +10228,131 @@ mod tests {
 
         /// A tagged table with one stable-partition transition (fragments
         /// 10 and 11) built through the real commit path.
-        async fn make_tagged(mut dataset: Dataset) -> Dataset {
+        async fn make_tagged(dataset: Dataset) -> Dataset {
+            make_tagged_as(dataset, CompactionForm::Legacy).await
+        }
+
+        /// How a stable-partition compaction is committed.
+        #[derive(Debug, Clone, Copy)]
+        enum CompactionForm {
+            /// A `Rewrite` carrying the appended fragment reuse entry.
+            Legacy,
+            /// An action set whose `AppendFragReuseTransition` records the move.
+            Actions,
+        }
+
+        /// [`make_tagged`], committing the compaction in `form`.
+        async fn make_tagged_as(mut dataset: Dataset, form: CompactionForm) -> Dataset {
             reserve(&mut dataset, 40).await;
-            let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
-            let (transition, destinations) = prepare(&dataset).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            commit_partition(&dataset, &source_ids, 10, form).await.0
+        }
+
+        /// Partition `source_ids` into two fragments numbered from
+        /// `dest_base_id`, which an earlier reservation must cover, committing
+        /// the compaction in `form` from `dataset`'s version. Returns the
+        /// committed dataset and the transition recorded.
+        async fn commit_partition(
+            dataset: &Dataset,
+            source_ids: &[u64],
+            dest_base_id: u64,
+            form: CompactionForm,
+        ) -> (Dataset, Transition) {
+            let old_fragments: Vec<Fragment> = dataset
+                .fragments()
+                .iter()
+                .filter(|f| source_ids.contains(&f.id))
+                .cloned()
+                .collect();
+            let (transition, destinations) =
+                prepare_partition(dataset, source_ids, dest_base_id).await;
             let version = dataset.manifest.version;
-            commit_sp(
-                &dataset,
-                version,
-                tagged_rewrite(&dataset, old_fragments, destinations, vec![transition]).await,
-            )
-            .await
-            .unwrap()
+            let operation = match form {
+                CompactionForm::Legacy => {
+                    tagged_rewrite(
+                        dataset,
+                        old_fragments,
+                        destinations,
+                        vec![transition.clone()],
+                    )
+                    .await
+                }
+                CompactionForm::Actions => {
+                    action_partition(&old_fragments, &destinations, transition.clone())
+                }
+            };
+            let committed = CommitBuilder::new(Arc::new(dataset.clone()))
+                .with_experimental_composite_operations(true)
+                .execute(Transaction::new(version, operation, None))
+                .await
+                .unwrap();
+            (committed, transition)
+        }
+
+        /// The action-set form of a stable-partition compaction: the sources
+        /// removed as moved, the destinations added at their reserved ids, and
+        /// the move recorded as a transition.
+        fn action_partition(
+            sources: &[Fragment],
+            destinations: &[Fragment],
+            transition: Transition,
+        ) -> Operation {
+            let Some(transition::Mapping::StablePartition(partition)) = transition.mapping else {
+                panic!("a stable-partition transition");
+            };
+            let mut actions: Vec<TxnAction> = sources
+                .iter()
+                .map(|source| {
+                    TxnAction::RemoveFragment(RemoveFragment {
+                        fragment: ActionRef::Committed(source.id),
+                        data_change: false,
+                    })
+                })
+                .collect();
+            for destination in destinations {
+                actions.push(TxnAction::AddFragment(AddFragment {
+                    id: ActionRef::Committed(destination.id),
+                    physical_rows: destination.physical_rows.unwrap() as u64,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: false,
+                }));
+                for file in &destination.files {
+                    actions.push(TxnAction::AddDataFile(AddDataFile {
+                        fragment: ActionRef::Committed(destination.id),
+                        field_ids: file
+                            .fields
+                            .iter()
+                            .copied()
+                            .map(FieldRef::Committed)
+                            .collect(),
+                        file: DataFile {
+                            fields: Arc::from([]),
+                            ..file.clone()
+                        },
+                        data_change: false,
+                        base: None,
+                    }));
+                }
+            }
+            actions.push(TxnAction::AppendFragReuseTransition(
+                AppendFragReuseTransition {
+                    sources: sources
+                        .iter()
+                        .map(|source| ActionRef::Committed(source.id))
+                        .collect(),
+                    destinations: destinations
+                        .iter()
+                        .map(|destination| ActionRef::Committed(destination.id))
+                        .collect(),
+                    mapping: FragReuseMapping::StablePartition(partition),
+                },
+            ));
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                "partition",
+                actions,
+            )]))
         }
 
         async fn tagged_fixture() -> Dataset {

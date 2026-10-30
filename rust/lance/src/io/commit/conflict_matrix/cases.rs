@@ -45,34 +45,35 @@ use crate::{Dataset, Error};
 /// change; do not hand-edit a cell to make a failing test pass. When isolation
 /// levels become configurable this grows a grid per level.
 const MATRIX: &str = "\
-                             | ap dl df ur uc ov dr pj pa mg ma ci rw ow rs cf va vc v+ vn vr vm vi vj vd vf vu
-append                       | L  L  L  L  L  L  L  L  R  L  R  L  L  X  X  L  L  L  L  L  L  L  L  L  L  L  L
-delete                       | L  R  R  L  R  L  R  L  L  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L  R  R  L
-delete_whole_fragment        | L  R  R  R  R  L  R  L  L  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L  R  R  R
-update_rewrite_rows          | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L  L  R  R
-update_rewrite_columns       | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L  R  R  R
-data_overlay                 | L  L  R  R  L  L  L  !  R  R  R  L  R  X  X  L  L  L  L  L  L  L  L  L  L  R  R
-data_replacement             | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L  L  L  L  L  R  L  L  L  L  R  R
-project                      | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  L  L  R* R* R  L  R  L  L  L  L  L
-project_alter_nullability    | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  L  L  R* R  R  L  R  L  L  L  L  L
-merge                        | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R  R  R  R  L  R  R  R  R
-merge_alter_nullability      | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R  R  R  R  L  R  R  R  R
-create_index                 | L  L  L  L  L  L  L  L  L  L  L  R  R  X  X  L  L  L  L  L  L  L  R  R  L  L  L
-rewrite                      | L  R  R  R  R  R  R  L  L  R  R  R  R  X  X  L  L  L  L  R  R  L  R  R  R  R  R
-overwrite                    | L  L  L  L  L  L  L  L  L  L  L  L  L  R  L  L  L  L  L  L  L  L  L  L  L  L  L
-restore                      | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  X  L  R  R  L  L  L  L  L  L  L  L
-update_config                | L  L  L  L  L  L  L  L  L  R  R  L  L  X  X  X  L  R  R  L  L  L  L  L  L  L  L
-action_append                | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  L  L  L  L  L  L  L  L  L  L  L  L
-action_update_config         | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  R  L  R  R  L  L  L  L  L  L  L  L
-action_append_and_config     | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  R  L  R  R  L  L  L  L  L  L  L  L
-action_add_column            | L  L  R  R  L  L  R  L  L  R  R  L  R  R  R  L  L  L  L  R  L  L  L  L  L  R  R
-action_replace_column        | L  L  R  R  R  L  R  R  R  R  R  L  R  R  R  L  L  L  L  L  R  L  L  L  L  R  R
-action_rename_column         | L  L  L  L  L  L  L  R  R  R  R  L  L  R  R  L  L  L  L  L  L  R  L  L  L  L  L
-action_create_index          | L  L  L  L  L  L  L  L  L  L  L  R  L  R  R  L  L  L  L  L  L  L  R  R  L  L  L
-action_append_and_index      | L  L  L  L  L  L  L  L  L  L  L  R  L  R  R  L  L  L  L  L  L  L  R  R  L  L  L
-action_delete                | L  R  R  L  L  L  L  L  L  L  L  L  R  R  R  L  L  L  L  L  L  L  L  L  R  R  L
-action_delete_whole_fragment | L  R  R  R  R  L  R  L  L  L  L  L  R  R  R  L  L  L  L  R  R  L  L  L  R  R  R
-action_update                | L  L  R  R  R  R  R  L  L  L  L  L  R  R  R  L  L  L  L  R  R  L  L  L  L  R  R
+                             | ap dl df ur uc ov dr pj pa mg ma ci rw ow rs cf va vc v+ vn vr vm vi vj vd vf vu vw
+append                       | L  L  L  L  L  L  L  L  R  L  R  L  L  X  X  L  L  L  L  L  L  L  L  L  L  L  L  L
+delete                       | L  R  R  L  R  L  R  L  L  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L  R  R  L  R
+delete_whole_fragment        | L  R  R  R  R  L  R  L  L  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L  R  R  R  R
+update_rewrite_rows          | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L  L  R  R  R
+update_rewrite_columns       | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L  R  R  R  R
+data_overlay                 | L  L  R  R  L  L  L  !  R  R  R  L  R  X  X  L  L  L  L  L  L  L  L  L  L  R  R  R
+data_replacement             | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L  L  L  L  L  R  L  L  L  L  R  R  R
+project                      | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  L  L  R* R* R  L  R  L  L  L  L  L  L
+project_alter_nullability    | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  L  L  R* R  R  L  R  L  L  L  L  L  L
+merge                        | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R  R  R  R  L  R  R  R  R  R
+merge_alter_nullability      | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R  R  R  R  L  R  R  R  R  R
+create_index                 | L  L  L  L  L  L  L  L  L  L  L  R  R  X  X  L  L  L  L  L  L  L  R  R  L  L  L  R
+rewrite                      | L  R  R  R  R  R  R  L  L  R  R  R  R  X  X  L  L  L  L  R  R  L  R  R  R  R  R  R
+overwrite                    | L  L  L  L  L  L  L  L  L  L  L  L  L  R  L  L  L  L  L  L  L  L  L  L  L  L  L  L
+restore                      | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  X  L  R  R  L  L  L  L  L  L  L  L  L
+update_config                | L  L  L  L  L  L  L  L  L  R  R  L  L  X  X  X  L  R  R  L  L  L  L  L  L  L  L  L
+action_append                | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  L  L  L  L  L  L  L  L  L  L  L  L  L
+action_update_config         | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  R  L  R  R  L  L  L  L  L  L  L  L  L
+action_append_and_config     | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  R  L  R  R  L  L  L  L  L  L  L  L  L
+action_add_column            | L  L  R  R  L  L  R  L  L  R  R  L  R  R  R  L  L  L  L  R  L  L  L  L  L  R  R  R
+action_replace_column        | L  L  R  R  R  L  R  R  R  R  R  L  R  R  R  L  L  L  L  L  R  L  L  L  L  R  R  R
+action_rename_column         | L  L  L  L  L  L  L  R  R  R  R  L  L  R  R  L  L  L  L  L  L  R  L  L  L  L  L  L
+action_create_index          | L  L  L  L  L  L  L  L  L  L  L  R  L  R  R  L  L  L  L  L  L  L  R  R  L  L  L  L
+action_append_and_index      | L  L  L  L  L  L  L  L  L  L  L  R  L  R  R  L  L  L  L  L  L  L  R  R  L  L  L  L
+action_delete                | L  R  R  L  L  L  L  L  L  L  L  L  R  R  R  L  L  L  L  L  L  L  L  L  R  R  L  R
+action_delete_whole_fragment | L  R  R  R  R  L  R  L  L  L  L  L  R  R  R  L  L  L  L  R  R  L  L  L  R  R  R  R
+action_update                | L  L  R  R  R  R  R  L  L  L  L  L  R  R  R  L  L  L  L  R  R  L  L  L  L  R  R  R
+action_rewrite               | L  R  R  R  R  R  R  L  L  R  R  L  R  R  R  L  L  L  L  R  R  L  L  L  R  R  R  R
 ";
 
 /// The level [`MATRIX`] was observed under.
@@ -347,6 +348,7 @@ pub(super) fn run(
 #[case::action_delete(Scenario::ActionDelete)]
 #[case::action_delete_whole_fragment(Scenario::ActionDeleteWholeFragment)]
 #[case::action_update(Scenario::ActionUpdate)]
+#[case::action_rewrite(Scenario::ActionRewrite)]
 #[tokio::test]
 async fn matrix_row(#[case] ours: Scenario) {
     for theirs in Scenario::ALL {
@@ -421,6 +423,7 @@ async fn matrix_row(#[case] ours: Scenario) {
 #[case::action_delete(Scenario::ActionDelete)]
 #[case::action_delete_whole_fragment(Scenario::ActionDeleteWholeFragment)]
 #[case::action_update(Scenario::ActionUpdate)]
+#[case::action_rewrite(Scenario::ActionRewrite)]
 #[tokio::test]
 async fn scenario_lands_uncontended(#[case] scenario: Scenario) {
     let base = fixture().await;

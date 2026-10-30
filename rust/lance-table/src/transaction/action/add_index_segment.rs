@@ -1426,6 +1426,44 @@ mod tests {
         assert!(!reencode.conflicts_with(&build));
     }
 
+    /// A covered fragment a recorded compaction moved before the rewrite is
+    /// read through the fragment it became, so a rewrite of that fragment
+    /// replaced values the segment describes. Where the move is not known,
+    /// a rewrite of the column anywhere might have been one of those.
+    #[test]
+    fn test_a_build_gives_up_a_covered_fragment_whose_rows_moved_into_a_rewrite() {
+        let segment = covering("by_a", Some(vec![0, 1]));
+        let uuid = segment.uuid;
+        let build = index_footprint(segment);
+        let moved_into_five = |fragment: u64| Some(if fragment == 0 { vec![5] } else { vec![] });
+
+        assert_eq!(
+            overlaps(build.compare_through_moves(&rewrite(5, 0), &moved_into_five)),
+            vec![Overlap::UpdatedUnderIndex {
+                segment: uuid,
+                fragment: 0
+            }]
+        );
+        assert!(matches!(
+            build.compare_through_moves(&rewrite(5, 7), &moved_into_five),
+            Verdict::Compatible
+        ));
+        assert!(matches!(build.compare(&rewrite(5, 0)), Verdict::Compatible));
+        assert_eq!(
+            overlaps(build.compare_through_moves(&rewrite(5, 0), &|_| None)),
+            vec![
+                Overlap::UpdatedUnderIndex {
+                    segment: uuid,
+                    fragment: 0
+                },
+                Overlap::UpdatedUnderIndex {
+                    segment: uuid,
+                    fragment: 1
+                }
+            ]
+        );
+    }
+
     /// A rewrite of a column the segment merely carries invalidates it just as
     /// a keyed one does -- the segment would answer from an obsolete carried
     /// value. `covering_fields` is independent of `fields`, so the build is
