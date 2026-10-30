@@ -522,6 +522,28 @@ impl VectorIndexParams {
         }
     }
 
+    /// Create index parameters with `IVF`, `HNSW` and `RQ` parameters, respectively.
+    /// This is used for `IVF_HNSW_RQ` index.
+    pub fn with_ivf_hnsw_rq_params(
+        metric_type: MetricType,
+        ivf: IvfBuildParams,
+        hnsw: HnswBuildParams,
+        rq: RQBuildParams,
+    ) -> Self {
+        let stages = vec![
+            StageParams::Ivf(ivf),
+            StageParams::Hnsw(hnsw),
+            StageParams::RQ(rq),
+        ];
+        Self {
+            stages,
+            metric_type,
+            version: IndexFileVersion::V3,
+            skip_transpose: false,
+            runtime_hints: HashMap::new(),
+        }
+    }
+
     pub fn index_type(&self) -> IndexType {
         let len = self.stages.len();
         match (len, self.stages.get(1), self.stages.last()) {
@@ -533,6 +555,7 @@ impl VectorIndexParams {
             (2, _, Some(StageParams::Hnsw(_))) => IndexType::IvfHnswFlat,
             (3, Some(StageParams::Hnsw(_)), Some(StageParams::PQ(_))) => IndexType::IvfHnswPq,
             (3, Some(StageParams::Hnsw(_)), Some(StageParams::SQ(_))) => IndexType::IvfHnswSq,
+            (3, Some(StageParams::Hnsw(_)), Some(StageParams::RQ(_))) => IndexType::IvfHnswRq,
             _ => IndexType::Vector,
         }
     }
@@ -2529,6 +2552,17 @@ mod tests {
     use lance_index::vector::ivf::builder::IvfBuildParams;
     use lance_linalg::distance::MetricType;
     use roaring::RoaringTreemap;
+
+    #[test]
+    fn test_ivf_hnsw_rq_params_index_type() {
+        let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+            MetricType::L2,
+            IvfBuildParams::default(),
+            HnswBuildParams::default(),
+            RQBuildParams::default(),
+        );
+        assert_eq!(params.index_type(), IndexType::IvfHnswRq);
+    }
 
     #[tokio::test]
     async fn test_nullable_vector_count_stops_at_threshold() {
