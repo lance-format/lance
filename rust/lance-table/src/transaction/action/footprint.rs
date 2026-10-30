@@ -16,8 +16,10 @@
 //! Which coordinates an action writes is decided by that action, in its own
 //! module. This module holds the coordinate space and the comparison; the
 //! footprints of the named operations, which have no actions to ask, are in
-//! `legacy`.
+//! `legacy`, and what a committed one changed is read from its manifests in
+//! `diff`.
 
+mod diff;
 mod legacy;
 
 use super::query_contract::QueryContract;
@@ -45,10 +47,21 @@ pub enum Coordinate {
     FragmentDeletions(u64),
     /// A committed fragment's per-row version sequences.
     FragmentRowVersions(u64),
-    /// The data backing one field within one committed fragment.
+    /// Which data files a committed fragment holds. Every file edit in the
+    /// fragment writes part of it; a set that restates the list whole, or that
+    /// moves the fragment's rows elsewhere, writes all of it. It is what makes a
+    /// column written for a field no concurrent writer can name collide with
+    /// those.
+    FragmentFiles(u64),
+    /// The base data backing one field within one committed fragment.
     FieldData { fragment: u64, field: i32 },
-    /// A field's definition in the schema.
-    FieldDefinition(i32),
+    /// The overlays shadowing one field's base data within one committed
+    /// fragment. Apart from [`Coordinate::FieldData`] because a column rewrite
+    /// and an overlay commute: whichever lands second, the overlay is the newer
+    /// value and stays on top.
+    FieldOverlays { fragment: u64, field: i32 },
+    /// One facet of a field's definition in the schema.
+    FieldDefinition { field: i32, facet: FieldFacet },
     /// The schema new rows are written in. Every set that adds rows requires
     /// it, because a writer prepares rows against the schema it read: a row
     /// minted later carries no value for a non-nullable column added in
@@ -81,6 +94,30 @@ pub enum Coordinate {
     IndexSegment(Uuid),
 }
 
+/// A part of a field's definition that writers change independently.
+///
+/// Split so that each dependent requires only what it relies on. A rename
+/// changes no value, so data written concurrently stays valid; a tightened
+/// nullability invalidates new values that may be null but not a re-encode of
+/// the values it was checked against; and a drop leaves new rows' values for
+/// the field unread rather than wrong, as legacy does when an Append lands
+/// over a Project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FieldFacet {
+    /// Whether the field is in the schema. A drop writes it; anything that
+    /// names the field in a committed fragment or in the schema requires it.
+    Existence,
+    /// The type values are encoded in. A cast writes it; every write of
+    /// values, and every index over them, requires it.
+    Type,
+    /// Whether the field may hold nulls. Required by writes of new values,
+    /// which may be null.
+    Nullability,
+    /// The field's own name. Uniqueness among names is
+    /// [`Coordinate::FieldName`]'s.
+    Name,
+}
+
 /// One of the string maps a manifest carries.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ConfigMap {
@@ -108,9 +145,12 @@ impl Coordinate {
         match self {
             Self::FragmentExistence(id)
             | Self::FragmentDeletions(id)
-            | Self::FragmentRowVersions(id) => Some(*id),
-            Self::FieldData { fragment, .. } => Some(*fragment),
-            Self::FieldDefinition(_)
+            | Self::FragmentRowVersions(id)
+            | Self::FragmentFiles(id) => Some(*id),
+            Self::FieldData { fragment, .. } | Self::FieldOverlays { fragment, .. } => {
+                Some(*fragment)
+            }
+            Self::FieldDefinition { .. }
             | Self::NewRowSchema
             | Self::FieldName(_)
             | Self::BaseName(_)
@@ -127,6 +167,27 @@ impl Coordinate {
             Self::ConfigEntry { map, .. } => Some(map),
             _ => None,
         }
+    }
+
+    /// Whether this coordinate is part of the schema: a field's definition or
+    /// name, the schema new rows are written in, or the metadata the schema
+    /// carries.
+    fn in_schema(&self) -> bool {
+        match self {
+            Self::FieldDefinition { .. }
+            | Self::FieldName(_)
+            | Self::NewRowSchema
+            | Self::UnenforcedKey(_) => true,
+            Self::ConfigEntry { map, .. } => map.in_schema(),
+            _ => false,
+        }
+    }
+}
+
+impl ConfigMap {
+    /// Whether the schema carries this map, and so restates it.
+    fn in_schema(&self) -> bool {
+        matches!(self, Self::SchemaMetadata | Self::Field(_))
     }
 }
 
@@ -157,10 +218,9 @@ enum Mode {
     /// Writes some of the coordinate and leaves the rest as it was. An overlay
     /// is the case: new values for a subset of one field's cells in one
     /// fragment. Two of these commute -- both land, the newer wins where they
-    /// overlap -- which is what sets it apart from a full write. So does a
-    /// move: it keeps every physical row where it was and leaves the overlays
-    /// alone, so the overlay's offsets still address its cells and the newer
-    /// overlay still wins them.
+    /// overlap -- which is what sets it apart from a full write. Overlays
+    /// claim [`Coordinate::FieldOverlays`], not the base data a move or a
+    /// column rewrite claims, so they commute with both.
     ///
     /// It also serves as a conflict marker on a coordinate the set does not
     /// change at all, where it needs exactly this row and column of the table:
@@ -169,10 +229,9 @@ enum Mode {
     /// [`Footprint::write_part_of_deletions`].
     WritesPart,
     /// Replaces how the coordinate is stored without changing its values: a
-    /// re-encode with `data_change` false. It collides with a full write and
-    /// with another move, but not with a partial write or a requirement -- an
-    /// overlay still shadows the moved values, and an index segment built over
-    /// them still describes them.
+    /// re-encode with `data_change` false. It collides with any write, as a
+    /// write does, but not with a requirement -- an index segment built over
+    /// the values still describes them after they move.
     Moves,
     /// Replaces the coordinate. Two of these on one coordinate never commute.
     Writes,
@@ -197,6 +256,10 @@ enum Region {
     Fragment(u64),
     /// One of the manifest's string maps, every key included.
     Map(ConfigMap),
+    /// The whole schema, as a legacy `Merge` or `Project` installs it: every
+    /// field's definition and name, the schema new rows are written in, and
+    /// the schema-level and per-field metadata.
+    Schema,
 }
 
 impl Region {
@@ -204,6 +267,15 @@ impl Region {
         match self {
             Self::Fragment(id) => coordinate.fragment() == Some(*id),
             Self::Map(map) => coordinate.config_map() == Some(map),
+            Self::Schema => coordinate.in_schema(),
+        }
+    }
+
+    /// Whether the two regions share a coordinate.
+    fn overlaps(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Schema, Self::Map(map)) | (Self::Map(map), Self::Schema) => map.in_schema(),
+            _ => self == other,
         }
     }
 }
@@ -215,8 +287,8 @@ impl Region {
 /// | committing \ committed | Writes   | Moves    | WritesPart | Requires | RequiresUnlessRemoved |
 /// |------------------------|----------|----------|------------|----------|-----------------------|
 /// | Writes                 | conflict | conflict | conflict   | ok       | ok                    |
-/// | Moves                  | conflict | conflict | ok         | ok       | ok                    |
-/// | WritesPart             | conflict | ok       | ok         | ok       | ok                    |
+/// | Moves                  | conflict | conflict | conflict   | ok       | ok                    |
+/// | WritesPart             | conflict | conflict | ok         | ok       | ok                    |
 /// | Requires               | conflict | ok       | ok         | ok       | ok                    |
 /// | RequiresUnlessRemoved  | conflict | ok       | ok         | ok       | ok                    |
 ///
@@ -241,10 +313,9 @@ impl Region {
 fn pair_conflicts(committing: Mode, committed: Mode) -> bool {
     match (committing, committed) {
         (_, Mode::Writes) => true,
-        (Mode::Writes, Mode::Moves | Mode::WritesPart) => true,
-        (Mode::Moves, Mode::Moves) => true,
-        (Mode::Moves, Mode::WritesPart) => false,
-        (Mode::WritesPart, Mode::Moves | Mode::WritesPart) => false,
+        (Mode::Writes | Mode::Moves, Mode::Moves | Mode::WritesPart) => true,
+        (Mode::WritesPart, Mode::Moves) => true,
+        (Mode::WritesPart, Mode::WritesPart) => false,
         (Mode::Requires | Mode::RequiresUnlessRemoved, Mode::Moves | Mode::WritesPart) => false,
         (_, Mode::Requires | Mode::RequiresUnlessRemoved) => false,
     }
@@ -286,10 +357,11 @@ pub struct Footprint {
     /// touches it in.
     ///
     /// There is no region for a dropped field, the way there is for a removed
-    /// fragment. Dropping a field writes its definition, and anything that
-    /// depends on the field -- data written for it, its metadata, a child added
-    /// under it -- requires that definition, so the drop-then-write order is a
-    /// `Requires`-vs-`Writes` collision. The write-then-drop order is safe,
+    /// fragment. Dropping a field writes its existence, and anything that
+    /// names the field in the schema or a committed fragment -- data written
+    /// for it there, its metadata, a child added under it -- requires that, so
+    /// the drop-then-write order is a `Requires`-vs-`Writes` collision. The
+    /// write-then-drop order is safe,
     /// because [`DropField`](super::DropField) applies to every fragment the
     /// manifest holds by then, including one a concurrent set just added, and
     /// tombstones the field out of each.
@@ -408,16 +480,17 @@ impl CellAssertion {
             .iter()
             .filter(|(_, mode)| **mode >= Mode::WritesPart)
             .any(|(coordinate, _)| match coordinate {
-                Coordinate::FieldData { fragment, field } => {
+                Coordinate::FieldData { fragment, field }
+                | Coordinate::FieldOverlays { fragment, field } => {
                     self.fragments.contains(fragment) && self.fields.contains(field)
                 }
-                Coordinate::FieldDefinition(field) => self.fields.contains(field),
+                Coordinate::FieldDefinition { field, .. } => self.fields.contains(field),
                 Coordinate::FragmentExistence(fragment) => self.fragments.contains(fragment),
                 _ => false,
             });
         let removed_a_fragment = committed.regions.keys().any(|region| match region {
             Region::Fragment(fragment) => self.fragments.contains(fragment),
-            Region::Map(_) => false,
+            Region::Map(_) | Region::Schema => false,
         });
         wrote_a_cell || removed_a_fragment
     }
@@ -512,18 +585,19 @@ impl Footprint {
     /// comes straight from the operation, with post-image semantics: whatever
     /// part of the manifest it restates it is taken to replace.
     pub fn pending(transaction: &Transaction, read: &Manifest) -> Self {
-        Self::of_operation(&transaction.operation, &read.schema)
+        Self::of_operation(&transaction.operation, read)
     }
 
     /// The footprint of `transaction`, which committed `after` on top of
     /// `before`.
     ///
-    /// Both forms are read from the transaction, as in [`Self::pending`]; the
-    /// manifests are what a named operation's footprint will be diffed from,
-    /// so that it claims what the commit changed rather than everything it
-    /// restated.
-    pub fn committed(transaction: &Transaction, before: &Manifest, _after: &Manifest) -> Self {
-        Self::of_operation(&transaction.operation, &before.schema)
+    /// An action set's footprint comes from its actions, as in
+    /// [`Self::pending`]. A named operation's is what the commit changed
+    /// between the two manifests, plus what only the operation knows: the keys
+    /// it inserted, whether its new rows are new, and the indices it touched.
+    /// A post-image it installed claims only what differed from `before`.
+    pub fn committed(transaction: &Transaction, before: &Manifest, after: &Manifest) -> Self {
+        Self::of_committed_operation(&transaction.operation, before, after)
     }
 
     /// What it takes for this set to land on top of `committed`, a set that
@@ -619,8 +693,8 @@ impl Footprint {
     ///
     /// Every pair is enumerated from this side's point of view: our claims
     /// against their claims and their regions, their claims against our
-    /// regions, and our regions against theirs. A region only matches a region
-    /// that is equal to it; containment is between a region and a coordinate.
+    /// regions, and our regions against theirs. Containment is between a
+    /// region and a coordinate; two regions collide when they overlap.
     fn claims_conflict_with(&self, committed: &Self) -> bool {
         let ours_against_theirs = self.claims.iter().flat_map(|(coordinate, ours)| {
             let same_coordinate = committed.claims.get(coordinate).copied();
@@ -641,12 +715,16 @@ impl Footprint {
                 .filter(|(region, _)| region.contains(coordinate))
                 .map(move |(_, ours)| (*ours, *theirs))
         });
-        let same_region = self.regions.iter().filter_map(|(region, ours)| {
-            committed.regions.get(region).map(|theirs| (*ours, *theirs))
+        let overlapping_regions = self.regions.iter().flat_map(|(region, ours)| {
+            committed
+                .regions
+                .iter()
+                .filter(|(theirs, _)| region.overlaps(theirs))
+                .map(move |(_, theirs)| (*ours, *theirs))
         });
         ours_against_theirs
             .chain(theirs_inside_our_regions)
-            .chain(same_region)
+            .chain(overlapping_regions)
             .any(|(ours, theirs)| pair_conflicts(ours, theirs))
     }
 
@@ -727,7 +805,7 @@ impl Footprint {
             .iter()
             .filter(|(_, mode)| **mode >= Mode::WritesPart)
             .any(|(coordinate, _)| match coordinate {
-                Coordinate::FieldData { field, .. } => {
+                Coordinate::FieldData { field, .. } | Coordinate::FieldOverlays { field, .. } => {
                     fields.contains(&FieldRef::Committed(*field))
                 }
                 _ => false,
@@ -771,74 +849,64 @@ impl Footprint {
     /// would otherwise discard the new column's cells for those rows, and the
     /// replacement fragment would read them back as null.
     ///
-    /// Every committed field's definition is required. Values are written in
-    /// the type the schema names, so a concurrent
-    /// [`AlterField`](super::AlterField) changing its definition could leave the
-    /// manifest describing these values as something they are not, and a
-    /// concurrent [`DropField`](super::DropField) would leave a file carrying
-    /// data for a field the manifest no longer has. Both write the definition,
-    /// so both are caught when they land first. Landing second, a drop tombstones the field
-    /// out of every fragment's files, so it needs no symmetric check. A
+    /// Each committed field's type is required, since values are written in
+    /// the type the schema names and a concurrent cast landing first would
+    /// leave the manifest describing them as something they are not. New
+    /// values (`data_change`) also require the nullability, which a concurrent
+    /// tightening landing first was checked against values that did not
+    /// include these. A re-encode writes the values the tightening saw.
+    ///
+    /// In a committed fragment the field's existence is required too: a
+    /// concurrent drop landing first tombstoned the field out of the fragment,
+    /// and a file written for it now would put the column back. Rows in a
+    /// fragment this operation mints were never tombstoned, so a dropped
+    /// field's column is left in their file unread, as legacy does when an
+    /// Append lands over a Project. Landing second, a drop tombstones the
+    /// field out of every fragment's files, so it needs no symmetric check. A
     /// replacement does, because it rewrites the values it read; see
     /// [`Footprint`]'s `From<&CompositeOperation>`.
     ///
-    /// This requires the whole definition, not the type alone, so it also
-    /// rejects a concurrent rename or nullability change that would not have
-    /// invalidated the data. That matches the granularity of the coordinate:
-    /// `AlterField` writes one `FieldDefinition` whichever facet it sets.
+    /// No facet of the name is required, so a concurrent rename never
+    /// invalidates the data.
     pub(super) fn write_field_data(
         &mut self,
         fragment: Ref,
         fields: impl IntoIterator<Item = FieldRef>,
-    ) {
-        let fields: Vec<FieldRef> = fields.into_iter().collect();
-        self.values_written
-            .extend(fields.iter().copied().filter_map(committed_field));
-        self.claim_field_data(fragment, fields, Mode::Writes);
-    }
-
-    /// The data of each field within `fragment`, moved to new files without
-    /// changing any value: one half of a re-encode with `data_change` false.
-    ///
-    /// The same claims as [`Self::write_field_data`], except that no values
-    /// count as written, so a concurrent change that makes one of the fields
-    /// required is not invalidated by it, and the data is claimed as
-    /// [`Mode::Moves`], so a concurrent index build over it is not either.
-    pub(super) fn move_field_data(
-        &mut self,
-        fragment: Ref,
-        fields: impl IntoIterator<Item = FieldRef>,
-    ) {
-        self.claim_field_data(fragment, fields, Mode::Moves);
-    }
-
-    fn claim_field_data(
-        &mut self,
-        fragment: Ref,
-        fields: impl IntoIterator<Item = FieldRef>,
-        mode: Mode,
+        data_change: bool,
     ) {
         let fields: Vec<i32> = fields.into_iter().filter_map(committed_field).collect();
         for field in fields.iter().copied() {
-            self.require(Coordinate::FieldDefinition(field));
+            self.require_facet(field, FieldFacet::Type);
+            if data_change {
+                self.require_facet(field, FieldFacet::Nullability);
+                self.values_written.insert(field);
+            }
         }
         let Some(fragment) = fragment.committed() else {
             return;
         };
         self.require_fragment(fragment);
+        self.write_part(Coordinate::FragmentFiles(fragment));
+        // A re-encode moves the values without changing them, so an index
+        // segment built over them concurrently still describes them.
+        let mode = if data_change {
+            Mode::Writes
+        } else {
+            Mode::Moves
+        };
         for field in fields {
+            self.require_facet(field, FieldFacet::Existence);
             self.claim(Coordinate::FieldData { fragment, field }, mode);
         }
     }
 
-    /// Record that this set writes some of the cells of each of `fields` in
+    /// Record that this set overlays some of the cells of each of `fields` in
     /// `fragment`, leaving the rest as they were.
     ///
-    /// As [`Self::write_field_data`], the definition of every committed field
-    /// is required and the values count as written whichever fragment they go
-    /// in, so a minted fragment still depends on the schema it was prepared
-    /// against. Only a committed fragment has cells a concurrent writer can
-    /// name.
+    /// An overlay is always new values, so as [`Self::write_field_data`]
+    /// requires for those, plus the field's existence in any fragment: an
+    /// overlay may supply a field the fragment's base files do not. Only a
+    /// committed fragment has overlays a concurrent writer can name.
     pub(super) fn write_partial_field_data(
         &mut self,
         fragment: Ref,
@@ -846,10 +914,16 @@ impl Footprint {
     ) {
         let committed_fragment = fragment.committed();
         for field in fields.into_iter().filter_map(committed_field) {
-            self.require(Coordinate::FieldDefinition(field));
+            for facet in [
+                FieldFacet::Existence,
+                FieldFacet::Type,
+                FieldFacet::Nullability,
+            ] {
+                self.require_facet(field, facet);
+            }
             self.values_written.insert(field);
             if let Some(fragment) = committed_fragment {
-                self.write_part(Coordinate::FieldData { fragment, field });
+                self.write_part(Coordinate::FieldOverlays { fragment, field });
             }
         }
     }
@@ -884,6 +958,11 @@ impl Footprint {
     /// this set read or wrote.
     pub(super) fn add_required_column(&mut self) {
         self.write(Coordinate::NewRowSchema);
+        self.require_no_rows_added();
+    }
+
+    /// Record that this set only holds if no rows were added since it read.
+    fn require_no_rows_added(&mut self) {
         self.preconditions.push(Precondition::NoRowsAdded);
     }
 
@@ -932,19 +1011,24 @@ impl Footprint {
         }
     }
 
-    /// A field's entry in the schema.
-    pub(super) fn write_field_definition(&mut self, field: FieldRef) {
+    /// Record that this set changes `facet` of `field`'s definition.
+    pub(super) fn write_field_facet(&mut self, field: FieldRef, facet: FieldFacet) {
         if let Some(field) = committed_field(field) {
-            self.write(Coordinate::FieldDefinition(field));
+            self.write(Coordinate::FieldDefinition { field, facet });
         }
     }
 
-    /// Record that this set depends on `field` still being defined as it was,
-    /// without redefining it: a child added under it, metadata written on it.
-    pub(super) fn require_field_definition(&mut self, field: FieldRef) {
+    /// Record that this set depends on `facet` of `field`'s definition still
+    /// being what it read, without changing it: a child added under the field
+    /// needs it to exist, an index over it needs its type.
+    pub(super) fn require_field_facet(&mut self, field: FieldRef, facet: FieldFacet) {
         if let Some(field) = committed_field(field) {
-            self.require(Coordinate::FieldDefinition(field));
+            self.require_facet(field, facet);
         }
+    }
+
+    fn require_facet(&mut self, field: i32, facet: FieldFacet) {
+        self.require(Coordinate::FieldDefinition { field, facet });
     }
 
     /// Note that this set only works if `fragment` is still part of the dataset,
@@ -1040,6 +1124,11 @@ impl Footprint {
             .insert(Region::Fragment(fragment), Mode::Writes);
     }
 
+    /// Record that this set installs the whole schema as it read it.
+    fn replace_schema(&mut self) {
+        self.regions.insert(Region::Schema, Mode::Writes);
+    }
+
     /// Record an edit to one of the manifest's string maps: the keys it names,
     /// or the whole map when it replaces rather than merges.
     pub(super) fn write_map_update(&mut self, map: ConfigMap, update: &UpdateMap) {
@@ -1076,6 +1165,29 @@ impl Footprint {
         self.resets_table = true;
         self.rewrite_index(MEM_WAL_INDEX_NAME.to_string());
     }
+
+    /// Record that this set drops `field` from the schema.
+    ///
+    /// Only the field's existence is written, and only the named field's: a
+    /// footprint has no schema to expand a struct with. A concurrent write to
+    /// a child of a dropped struct requires the child's existence, which this
+    /// does not write, so it is not caught here and fails when it is applied
+    /// against the version where the child no longer exists.
+    pub(super) fn remove_field(&mut self, field: FieldRef) {
+        self.write_field_facet(field, FieldFacet::Existence);
+    }
+
+    /// Record that this set drops `field` to add another in its place, with
+    /// data rewritten from the values it read.
+    ///
+    /// A plain drop leaves a concurrent append's values for the field unread.
+    /// A replacement hands the name to a field those rows carry no values
+    /// for, so the type is written too, and values written since it read
+    /// would be missing from the rewrite.
+    fn replace_field(&mut self, field: FieldRef) {
+        self.write_field_facet(field, FieldFacet::Type);
+        self.require_no_values_written(field);
+    }
 }
 
 /// A schema field id a concurrent writer could also be naming, or `None` for
@@ -1084,6 +1196,15 @@ impl Footprint {
 /// adds, so no concurrent writer can name it either.
 fn committed_field(reference: FieldRef) -> Option<i32> {
     reference.committed().filter(|id| *id >= 0)
+}
+
+/// The committed fields among `fields`. A negative id is a tombstone, which
+/// names no field.
+fn field_refs(fields: &[i32]) -> impl Iterator<Item = FieldRef> + '_ {
+    fields
+        .iter()
+        .filter(|field| **field >= 0)
+        .map(|field| FieldRef::Committed(*field))
 }
 
 fn committed_fragments(fragments: impl IntoIterator<Item = Ref>) -> HashSet<u64> {
@@ -1112,7 +1233,7 @@ impl From<&CompositeOperation> for Footprint {
         if adds_field {
             for action in composite_operation.iter_actions() {
                 if let Action::DropField(drop) = action {
-                    footprint.require_no_values_written(drop.field);
+                    footprint.replace_field(drop.field);
                 }
             }
         }
@@ -1413,14 +1534,6 @@ mod tests {
         vec![rename_field(1, "a")],
         false,
     )]
-    // Whichever lands second, the overlay stays on top: as an overlay it is
-    // newer than the rewrite, and as the rewrite it was committed after the
-    // rewrite read, so the rewrite does not tombstone it.
-    #[case::a_column_rewrite_and_an_overlay_of_the_field(
-        reencode(0, 1, true),
-        vec![add_overlays(0, 1)],
-        false,
-    )]
     #[case::an_overlay_on_a_fragment_a_concurrent_set_removes(
         vec![add_overlays(0, 1)],
         vec![remove_fragment(0)],
@@ -1566,8 +1679,9 @@ mod tests {
         vec![add_data_file(Ref::Committed(7), &[2])],
         false,
     )]
-    // The reverse order is already caught: the append requires the definition
-    // the replacement drops.
+    // The reverse order is caught too: unlike a plain drop, a replacement
+    // writes the type the append's values require, since it hands the name to
+    // a field those rows carry no values for.
     #[case::an_append_landing_after_a_replacement(
         append(1),
         vec![drop_field(1), add_field(0, "a", None)],
@@ -1659,13 +1773,12 @@ mod tests {
         append(1),
         false,
     )]
-    // An append's rows are new, so the drop never tombstoned the field out of
-    // them; the field's column is left in their file unread, as legacy leaves
-    // it when an Append lands over a Project.
+    // Apply rejects a file naming a field the schema no longer has, even in a
+    // fragment the append mints.
     #[case::an_append_landing_after_a_drop(
         vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[1])],
         vec![drop_field(1)],
-        false,
+        true,
     )]
     #[case::altering_a_field_landing_after_its_drop(
         vec![set_nullability(1, true)],

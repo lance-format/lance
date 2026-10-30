@@ -131,7 +131,7 @@ pub use assert_unique_keys::AssertUniqueKeys;
 pub use config_update::{ConfigUpdate, FieldMetadataUpdate};
 pub use drop_field::DropField;
 pub use drop_index::DropIndex;
-pub use footprint::{ConfigMap, Coordinate, Footprint, Overlap, Verdict};
+pub use footprint::{ConfigMap, Coordinate, FieldFacet, Footprint, Overlap, Verdict};
 pub use refresh_row_version_metadata::RefreshRowVersionMetadata;
 pub use remove_fragment::RemoveFragment;
 pub use remove_index_segment::RemoveIndexSegment;

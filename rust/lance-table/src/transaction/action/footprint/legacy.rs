@@ -3,30 +3,36 @@
 
 //! Footprints of the named [`Operation`]s.
 //!
-//! A named operation has no actions to ask, so its footprint is read straight
-//! off the operation. The mapping is coarse on purpose. Several operations
-//! carry post-images -- a fragment restated whole, as `Delete` and `Update` do
-//! -- and applying one replaces everything in the fragment it names, not just
-//! the part the operation meant to change. So a fragment an operation restates
-//! is claimed whole, and an operation whose post-image is the whole schema is
-//! not described at all and fails closed.
+//! A named operation has no actions to ask. Pending, its footprint is read
+//! straight off the operation, and the mapping is coarse on purpose. Several
+//! operations carry post-images -- a fragment restated whole, as `Delete` and
+//! `Update` do, or the whole schema, as `Merge` and `Project` do -- and
+//! applying one replaces everything it names, not just the part the operation
+//! meant to change. So whatever an operation restates is claimed whole.
 //!
-//! Lowering an operation to actions instead would under-claim for exactly that
-//! reason: the actions describe the intended delta, the apply installs the
-//! post-image.
+//! Committed, the post-image is installed, and the manifests either side of it
+//! say exactly what it changed (see `diff`). The operation supplies only what
+//! the manifests cannot: the keys it inserted, whether the rows it added are
+//! new, and the indices it touched.
+//!
+//! Lowering an operation to actions instead would under-claim on the pending
+//! side for exactly that reason: the actions describe the intended delta, the
+//! apply installs the post-image.
 
-use super::{ConfigMap, Coordinate, FieldRef, Footprint, Ref};
-use crate::format::{BasePath, Fragment, IndexMetadata};
+use super::{ConfigMap, Coordinate, FieldFacet, FieldRef, Footprint, Ref, field_refs};
+use crate::format::key_existence::KeyExistenceFilter;
+use crate::format::{BasePath, Fragment, IndexMetadata, Manifest};
 use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
-use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
-use crate::transaction::Operation;
-use crate::transaction::action::{AddBase, ConfigUpdate, FieldMetadataUpdate};
+use crate::system_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
+use crate::transaction::action::{AddBase, AddOverlays, ConfigUpdate, FieldMetadataUpdate};
+use crate::transaction::{Operation, RewriteGroup, RewrittenIndex};
 use lance_core::datatypes::Schema;
+use std::collections::HashSet;
 
 impl Footprint {
-    /// The footprint of `operation`, which read `read_schema`. An action set's
+    /// The footprint of `operation`, pending against `read`. An action set's
     /// is its actions'.
-    pub(super) fn of_operation(operation: &Operation, read_schema: &Schema) -> Self {
+    pub(super) fn of_operation(operation: &Operation, read: &Manifest) -> Self {
         let mut footprint = Self::default();
         match operation {
             Operation::CompositeOperation(composite_operation) => {
@@ -61,23 +67,18 @@ impl Footprint {
                     footprint.replace_fragment(fragment.id);
                     // Already inside the fragment's region, but named so a key
                     // assertion over one of these columns sees the rewrite.
-                    footprint.write_field_data(
-                        Ref::Committed(fragment.id),
-                        fields_modified
-                            .iter()
-                            .map(|field| FieldRef::Committed(*field as i32)),
-                    );
+                    if !fields_modified.is_empty() {
+                        footprint.write_field_data(
+                            Ref::Committed(fragment.id),
+                            fields_modified
+                                .iter()
+                                .map(|field| FieldRef::Committed(*field as i32)),
+                            true,
+                        );
+                    }
                 }
                 footprint.append(new_fragments);
-                if let Some(filter) = inserted_rows_filter {
-                    footprint.assert_unique_keys(
-                        field_refs(&filter.field_ids).collect(),
-                        filter.clone(),
-                    );
-                }
-                if !compacted_sstables.is_empty() {
-                    footprint.rewrite_index(MEM_WAL_INDEX_NAME.to_string());
-                }
+                footprint.update_facts(inserted_rows_filter.as_ref(), compacted_sstables);
             }
             Operation::DataReplacement { replacements } => {
                 for replacement in replacements {
@@ -85,57 +86,47 @@ impl Footprint {
                     footprint.write_field_data(
                         Ref::Committed(replacement.0),
                         field_refs(&replacement.1.fields),
+                        true,
                     );
                 }
             }
+            // Overlays are appended to the fragment as it is at commit, not
+            // installed from a post-image, so this is the same edit as the
+            // action's.
             Operation::DataOverlay { groups } => {
                 for group in groups {
-                    footprint.replace_fragment(group.fragment_id);
-                    for overlay in &group.overlays {
-                        footprint.write_partial_field_data(
-                            Ref::Committed(group.fragment_id),
-                            field_refs(&overlay.data_file.fields),
-                        );
+                    AddOverlays {
+                        fragment: Ref::Committed(group.fragment_id),
+                        overlays: group.overlays.clone(),
+                        data_change: true,
                     }
+                    .footprint(&mut footprint);
                 }
             }
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,
-            } => {
-                for index in new_indices {
-                    footprint.create_index(index);
-                }
-                for index in removed_indices {
-                    footprint.write(Coordinate::IndexSegment(index.uuid));
-                    footprint.rewrite_index(index.name.clone());
-                }
-            }
+            } => footprint.index_changes(new_indices, removed_indices),
             Operation::Rewrite {
                 groups,
                 rewritten_indices,
                 frag_reuse_index,
             } => {
-                for group in groups {
-                    for fragment in &group.old_fragments {
-                        footprint.remove_fragment(fragment.id);
-                        footprint.remaps_indices_over.insert(fragment.id);
+                for fragment in groups.iter().flat_map(|group| &group.old_fragments) {
+                    footprint.remove_fragment(fragment.id);
+                }
+                // The rows are moved, not written, so the values are not new;
+                // but they are still laid out in the types they were read in.
+                for file in groups
+                    .iter()
+                    .flat_map(|group| &group.new_fragments)
+                    .flat_map(|fragment| &fragment.files)
+                {
+                    for field in field_refs(&file.fields) {
+                        footprint.require_field_facet(field, FieldFacet::Type);
                     }
-                    // The rows are moved, not written, so the values are not
-                    // new; but they are still laid out in the types they were
-                    // read in.
-                    for file in group.new_fragments.iter().flat_map(|f| &f.files) {
-                        for field in field_refs(&file.fields) {
-                            footprint.require_field_definition(field);
-                        }
-                    }
                 }
-                for index in rewritten_indices {
-                    footprint.write(Coordinate::IndexSegment(index.old_id));
-                }
-                if frag_reuse_index.is_some() {
-                    footprint.rewrite_index(FRAG_REUSE_INDEX_NAME.to_string());
-                }
+                footprint.rewrite_facts(groups, rewritten_indices, frag_reuse_index.is_some());
             }
             Operation::Overwrite {
                 config_upsert_values,
@@ -161,7 +152,7 @@ impl Footprint {
             Operation::Restore { .. } => {
                 footprint.reset_table();
                 footprint.write_map(ConfigMap::SchemaMetadata);
-                for field in read_schema.fields_pre_order() {
+                for field in read.schema.fields_pre_order() {
                     footprint.write_map(ConfigMap::Field(field.id));
                 }
             }
@@ -198,16 +189,123 @@ impl Footprint {
             // A clone commits into a dataset of its own, and legacy finds it
             // compatible with every operation.
             Operation::Clone { .. } => {}
-            // A merge or projection restates the whole schema, and the MemWAL
-            // state is checked against the data it compacted; neither is
-            // described by coordinates yet. An unknown operation may touch
+            // A merge installs the schema and the fragment list it carries,
+            // built from what it read. Every fragment it read is restated, and
+            // one added since is dropped, as is every field added since.
+            Operation::Merge {
+                fragments, schema, ..
+            } => {
+                footprint.replace_schema();
+                footprint.schema_changes(&read.schema, schema);
+                for fragment in read.fragments.iter() {
+                    footprint.replace_fragment(fragment.id);
+                }
+                footprint.require_no_rows_added();
+                footprint.append(&merged_fragments_added(fragments, read));
+            }
+            // A projection installs the schema it carries, but prunes the files
+            // of the fields it drops from the fragments as they are at commit.
+            Operation::Project { schema, .. } => {
+                footprint.replace_schema();
+                footprint.schema_changes(&read.schema, schema);
+            }
+            // The MemWAL state is checked against the data it compacted, which
+            // no coordinate describes yet. An unknown operation may touch
             // anything.
-            Operation::Merge { .. }
-            | Operation::Project { .. }
-            | Operation::UpdateMemWalState { .. }
-            | Operation::Unknown { .. } => footprint.opaque = true,
+            Operation::UpdateMemWalState { .. } | Operation::Unknown { .. } => {
+                footprint.opaque = true
+            }
         }
         footprint
+    }
+
+    /// The footprint of `operation`, which committed `after` on top of
+    /// `before`.
+    pub(super) fn of_committed_operation(
+        operation: &Operation,
+        before: &Manifest,
+        after: &Manifest,
+    ) -> Self {
+        match operation {
+            Operation::CompositeOperation(composite_operation) => Self::from(composite_operation),
+            // A reset conflicts with every set that read before it, so what
+            // else it changed adds nothing. The rest change nothing the
+            // manifests show, or cannot be described by them.
+            Operation::Overwrite { .. }
+            | Operation::Restore { .. }
+            | Operation::Clone { .. }
+            | Operation::ReserveFragments { .. }
+            | Operation::UpdateMemWalState { .. }
+            | Operation::Unknown { .. } => Self::of_operation(operation, before),
+            _ => {
+                let moves_rows = matches!(operation, Operation::Rewrite { .. });
+                let mut footprint = Self::of_manifest_change(before, after, moves_rows);
+                footprint.operation_facts(operation);
+                footprint
+            }
+        }
+    }
+
+    /// What a committed operation did that the manifests either side of it
+    /// do not show.
+    fn operation_facts(&mut self, operation: &Operation) {
+        match operation {
+            Operation::Append { fragments } => {
+                if !fragments.is_empty() {
+                    self.insert_rows();
+                }
+            }
+            Operation::Update {
+                updated_fragments,
+                new_fragments,
+                fields_modified,
+                inserted_rows_filter,
+                compacted_sstables,
+                ..
+            } => {
+                // The columns it rewrote, named whether or not the rewrite
+                // changed which file backs them, so a key assertion over one
+                // sees the new values.
+                if !fields_modified.is_empty() {
+                    for fragment in updated_fragments {
+                        self.write_field_data(
+                            Ref::Committed(fragment.id),
+                            fields_modified
+                                .iter()
+                                .map(|field| FieldRef::Committed(*field as i32)),
+                            true,
+                        );
+                    }
+                }
+                if !new_fragments.is_empty() {
+                    self.insert_rows();
+                    // A row-moving update deletes rows from these fragments and
+                    // writes them anew elsewhere, taking the values as they
+                    // were. A column written into one of them since it read
+                    // misses the moved rows, so the move writes the whole of
+                    // what the fragment's files hold.
+                    for fragment in updated_fragments {
+                        self.write(Coordinate::FragmentFiles(fragment.id));
+                    }
+                }
+                self.update_facts(inserted_rows_filter.as_ref(), compacted_sstables);
+            }
+            Operation::Merge { .. } => {
+                if self.rows_added {
+                    self.insert_rows();
+                }
+            }
+            Operation::CreateIndex {
+                new_indices,
+                removed_indices,
+            } => self.index_changes(new_indices, removed_indices),
+            Operation::Rewrite {
+                groups,
+                rewritten_indices,
+                frag_reuse_index,
+            } => self.rewrite_facts(groups, rewritten_indices, frag_reuse_index.is_some()),
+            _ => {}
+        }
     }
 
     /// Fragments added with rows that were not in the dataset before. Their
@@ -219,7 +317,67 @@ impl Footprint {
         self.add_rows();
         self.insert_rows();
         for file in fragments.iter().flat_map(|fragment| &fragment.files) {
-            self.write_field_data(Ref::Local(0), field_refs(&file.fields));
+            self.write_field_data(Ref::Local(0), field_refs(&file.fields), true);
+        }
+    }
+
+    /// The fields a schema installed over `read` drops, and the ones it
+    /// tightens to non-nullable. A tightening was checked against the values
+    /// the operation read, so it holds only if none were written since.
+    fn schema_changes(&mut self, read: &Schema, installed: &Schema) {
+        for field in read.fields_pre_order() {
+            let reference = FieldRef::Committed(field.id);
+            match installed.field_by_id(field.id) {
+                None => self.remove_field(reference),
+                Some(kept) if field.nullable && !kept.nullable => {
+                    self.require_no_values_written(reference);
+                    self.require_no_rows_added();
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    /// The key assertion and MemWAL compaction an `Update` carries.
+    fn update_facts(
+        &mut self,
+        inserted_rows_filter: Option<&KeyExistenceFilter>,
+        compacted_sstables: &[CompactedSsTable],
+    ) {
+        if let Some(filter) = inserted_rows_filter {
+            self.assert_unique_keys(field_refs(&filter.field_ids).collect(), filter.clone());
+        }
+        if !compacted_sstables.is_empty() {
+            self.rewrite_index(MEM_WAL_INDEX_NAME.to_string());
+        }
+    }
+
+    /// The segments a `CreateIndex` adds and removes.
+    fn index_changes(&mut self, new_indices: &[IndexMetadata], removed_indices: &[IndexMetadata]) {
+        for index in new_indices {
+            self.create_index(index);
+        }
+        for index in removed_indices {
+            self.write(Coordinate::IndexSegment(index.uuid));
+            self.rewrite_index(index.name.clone());
+        }
+    }
+
+    /// What a `Rewrite` does to the indices over the rows it moves.
+    fn rewrite_facts(
+        &mut self,
+        groups: &[RewriteGroup],
+        rewritten_indices: &[RewrittenIndex],
+        writes_frag_reuse_index: bool,
+    ) {
+        for fragment in groups.iter().flat_map(|group| &group.old_fragments) {
+            self.remaps_indices_over.insert(fragment.id);
+        }
+        for index in rewritten_indices {
+            self.write(Coordinate::IndexSegment(index.old_id));
+        }
+        if writes_frag_reuse_index {
+            self.rewrite_index(FRAG_REUSE_INDEX_NAME.to_string());
         }
     }
 
@@ -232,14 +390,15 @@ impl Footprint {
             .chain(field_refs(&index.covering_fields))
             .collect();
         for field in fields.iter().copied() {
-            self.require_field_definition(field);
+            self.require_field_facet(field, FieldFacet::Existence);
+            self.require_field_facet(field, FieldFacet::Type);
         }
         for fragment in index.fragment_bitmap.iter().flatten() {
             self.require_field_data_unless_removed(u64::from(fragment), fields.iter().copied());
         }
     }
 
-    fn add_base(&mut self, base: &BasePath) {
+    pub(super) fn add_base(&mut self, base: &BasePath) {
         AddBase {
             local: 0,
             base: base.clone(),
@@ -248,13 +407,17 @@ impl Footprint {
     }
 }
 
-/// The committed fields among `fields`. A negative id is a tombstone, which
-/// names no field.
-fn field_refs(fields: &[i32]) -> impl Iterator<Item = FieldRef> + '_ {
-    fields
+/// The fragments in a merge's list that are not the merged form of one it
+/// read. As the apply decides it: the first occurrence of a read id is that
+/// fragment, and everything else is new.
+fn merged_fragments_added(fragments: &[Fragment], read: &Manifest) -> Vec<Fragment> {
+    let read_ids: HashSet<u64> = read.fragments.iter().map(|fragment| fragment.id).collect();
+    let mut seen = HashSet::new();
+    fragments
         .iter()
-        .filter(|field| **field >= 0)
-        .map(|field| FieldRef::Committed(*field))
+        .filter(|fragment| !read_ids.contains(&fragment.id) || !seen.insert(fragment.id))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -356,7 +519,7 @@ mod tests {
             }),
             Action::AddDataFile(AddDataFile {
                 fragment: Ref::Local(0),
-                file: data_file(),
+                file: without_fields(data_file()),
                 field_ids: vec![FieldRef::Committed(0)],
                 data_change: true,
                 base: None,
@@ -387,13 +550,25 @@ mod tests {
     /// Whether `ours`, read at the sample manifest, conflicts with `theirs`,
     /// which committed on top of it.
     fn conflicts(ours: &Operation, theirs: &Operation) -> bool {
-        let manifest = sample_manifest();
-        let pending = Footprint::pending(&Transaction::new(1, ours.clone(), None), &manifest);
-        let committed = Footprint::committed(
-            &Transaction::new(1, theirs.clone(), None),
-            &manifest,
-            &manifest,
-        );
+        let mut before = sample_manifest();
+        before.fragments = Arc::new(vec![fragment(0), fragment(1)]);
+        let pending = Footprint::pending(&Transaction::new(1, ours.clone(), None), &before);
+        // These never build a manifest here: a restore is built from the one
+        // it restores, a clone commits elsewhere, a MemWAL state update needs
+        // a MemWAL the sample lacks, and an unknown operation cannot be built
+        // at all. None of their footprints look at one.
+        let committed = if matches!(
+            theirs,
+            Operation::Restore { .. }
+                | Operation::Clone { .. }
+                | Operation::UpdateMemWalState { .. }
+                | Operation::Unknown { .. }
+        ) {
+            Footprint::committed(&Transaction::new(1, theirs.clone(), None), &before, &before)
+        } else {
+            let (transaction, after) = commit(&before, theirs.clone());
+            Footprint::committed(&transaction, &before, &after)
+        };
         match pending.compare(&committed) {
             Verdict::Compatible => false,
             Verdict::Conflict => true,
@@ -407,8 +582,8 @@ mod tests {
     /// An action set doing what a legacy `Append` and a legacy `UpdateConfig`
     /// do, in one commit, against every named operation in both orders. It is
     /// at least as permissive as those two legacy operations would be, except
-    /// against the operations that restate the whole schema, which no
-    /// coordinate describes yet.
+    /// that a projection landing second conflicts with the schema-metadata
+    /// edit its read schema would discard, where legacy discards it.
     #[rstest]
     #[case::append(Operation::Append { fragments: vec![fragment(0)] }, false, false)]
     #[case::delete(
@@ -437,7 +612,7 @@ mod tests {
         false
     )]
     #[case::data_replacement(
-        Operation::DataReplacement { replacements: vec![DataReplacementGroup(0, data_file())] },
+        Operation::DataReplacement { replacements: vec![DataReplacementGroup(0, field_file("replacement", 0))] },
         false,
         false
     )]
@@ -498,16 +673,16 @@ mod tests {
     )]
     #[case::merge(
         Operation::Merge {
-            fragments: vec![],
+            fragments: vec![fragment(0), fragment(1)],
             schema: sample_manifest().schema,
             preserves_nullability: true,
         },
-        true,
+        false,
         true
     )]
     #[case::project(
         Operation::Project { schema: sample_manifest().schema, preserves_nullability: true },
-        true,
+        false,
         true
     )]
     #[case::update_mem_wal_state(
@@ -634,6 +809,14 @@ mod tests {
         fragment
     }
 
+    /// `file` as an [`AddDataFile`] carries it: its field list is the action's.
+    fn without_fields(file: DataFile) -> DataFile {
+        DataFile {
+            fields: Default::default(),
+            ..file
+        }
+    }
+
     fn field_file(name: &str, field: i32) -> DataFile {
         DataFile::new(
             format!("data/{name}.lance"),
@@ -679,7 +862,7 @@ mod tests {
             }),
             Action::AddDataFile(AddDataFile {
                 fragment: Ref::Committed(fragment),
-                file: field_file("c-new", 1),
+                file: without_fields(field_file("c-new", 1)),
                 field_ids: vec![FieldRef::Committed(1)],
                 data_change,
                 base: None,
@@ -704,7 +887,7 @@ mod tests {
             }),
             Action::AddDataFile(AddDataFile {
                 fragment: Ref::Committed(0),
-                file: field_file("e-0", 2),
+                file: without_fields(field_file("e-0", 2)),
                 field_ids: vec![FieldRef::Local(0)],
                 data_change: true,
                 base: None,
@@ -724,7 +907,7 @@ mod tests {
             }),
             Action::AddDataFile(AddDataFile {
                 fragment: Ref::Local(0),
-                file: field_file("new", 0),
+                file: without_fields(field_file("new", 0)),
                 field_ids: vec![FieldRef::Committed(0), FieldRef::Committed(1)],
                 data_change: true,
                 base: None,
@@ -834,9 +1017,10 @@ mod tests {
     /// A committed named operation is held to what its commit changed, not to
     /// everything it restated.
     #[rstest]
-    // A legacy append landing over a projection lands; the dropped column is
-    // left in the new fragment's file unread.
-    #[case::an_append_over_a_project(append_a_and_c(), project_without_c(&two_column_manifest()), false)]
+    // Legacy lands an append over a projection, leaving the dropped column in
+    // the new fragment's file unread, but an action append naming the dropped
+    // field is rejected at apply, so it has to conflict.
+    #[case::an_append_over_a_project(append_a_and_c(), project_without_c(&two_column_manifest()), true)]
     #[case::a_rename_over_an_update_restating_the_fragment(
         vec![rename_c()],
         update(vec![{

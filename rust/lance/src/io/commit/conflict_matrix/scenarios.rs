@@ -24,7 +24,7 @@ use lance_select::RowAddrTreeMap;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::transaction::action::{
     Action, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation, ConfigUpdate,
-    FieldRef, Ref, TombstoneFieldData, UserStep,
+    FieldRef, Ref, RefreshRowVersionMetadata, TombstoneFieldData, UserStep,
 };
 use lance_table::transaction::{UpdateMap, UpdateMapEntry};
 
@@ -368,7 +368,7 @@ impl Scenario {
             Self::ActionAppendAndConfig => stage_action_append(dataset, true).await,
             Self::ActionAddColumn => stage_action_add_column(dataset).await,
             Self::ActionReplaceColumn => stage_action_replace_column(dataset).await,
-            Self::ActionRenameColumn => Ok(stage_action_rename_column(dataset)),
+            Self::ActionRenameColumn => stage_action_rename_column(dataset),
         }
     }
 }
@@ -594,7 +594,31 @@ async fn stage_action_add_column(dataset: &Arc<Dataset>) -> Result<Staged> {
             base: None,
         }));
     }
+    refresh_row_versions(dataset, &mut actions);
     Ok(stage_action_set(dataset, actions))
+}
+
+/// Restamp every fragment `actions` writes changed data into, as legacy
+/// `Merge` does, which a dataset with stable row ids requires.
+fn refresh_row_versions(dataset: &Dataset, actions: &mut Vec<Action>) {
+    if !dataset.manifest.uses_stable_row_ids() {
+        return;
+    }
+    let mut fragment_ids: Vec<u64> = actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(id),
+                data_change: true,
+                ..
+            }) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    fragment_ids.dedup();
+    actions.push(Action::RefreshRowVersionMetadata(
+        RefreshRowVersionMetadata { fragment_ids },
+    ));
 }
 
 /// [`stage_data_replacement`]'s new file for `c` in fragment 0, installed by
@@ -607,7 +631,7 @@ async fn stage_action_replace_column(dataset: &Arc<Dataset>) -> Result<Staged> {
     else {
         unreachable!("a data replacement stages Operation::DataReplacement");
     };
-    let field = FieldRef::Committed(dataset.schema().field("c").unwrap().id);
+    let field = FieldRef::Committed(field_id(dataset, "c")?);
     let mut actions = Vec::new();
     for DataReplacementGroup(fragment, mut file) in replacements {
         file.fields = Default::default();
@@ -624,18 +648,30 @@ async fn stage_action_replace_column(dataset: &Arc<Dataset>) -> Result<Staged> {
             base: None,
         }));
     }
+    refresh_row_versions(dataset, &mut actions);
     Ok(stage_action_set(dataset, actions))
 }
 
-fn stage_action_rename_column(dataset: &Dataset) -> Staged {
-    stage_action_set(
+fn stage_action_rename_column(dataset: &Dataset) -> Result<Staged> {
+    Ok(stage_action_set(
         dataset,
         vec![Action::AlterField(AlterField {
-            field: FieldRef::Committed(dataset.schema().field("c").unwrap().id),
+            field: FieldRef::Committed(field_id(dataset, "c")?),
             name: Some("c_renamed".into()),
             nullable: None,
         })],
-    )
+    ))
+}
+
+/// The id of the field called `name`. An error rather than a panic, so a
+/// scenario staged after a concurrent rename or drop reports that it cannot be
+/// staged, which the oracle's serial run takes as nothing to compare.
+fn field_id(dataset: &Dataset, name: &str) -> Result<i32> {
+    dataset
+        .schema()
+        .field(name)
+        .map(|field| field.id)
+        .ok_or_else(|| crate::Error::invalid_input(format!("the schema has no field {name:?}")))
 }
 
 /// A merge insert that matches the whole schema, which is the production
@@ -671,7 +707,7 @@ async fn stage_update_rewrite_columns(
     field: &str,
 ) -> Result<Staged> {
     let mut fragment = dataset.fragments()[fragment_index].clone();
-    let field_id = dataset.schema().field(field).unwrap().id;
+    let field_id = field_id(dataset, field)?;
     let replacement = write_value_file(dataset, "update_columns", &[field], &[7, 7, 7]).await?;
     // Replace the file carrying the field rather than appending one, so the
     // fragment keeps exactly one file per field.
@@ -751,7 +787,7 @@ async fn stage_data_replacement(
     fragment: usize,
     field: &str,
 ) -> Result<Staged> {
-    let field_id = dataset.schema().field(field).unwrap().id;
+    let field_id = field_id(dataset, field)?;
     let existing = dataset.fragments()[fragment]
         .files
         .iter()
@@ -796,7 +832,7 @@ async fn stage_merge(dataset: &Arc<Dataset>, preserves_nullability: bool) -> Res
     // data the way a merge that omits a column does. See `stage_project` for
     // why `d` stays.
     let schema = dataset.schema().project(&["a", "b", "d"])?;
-    let field_c = dataset.schema().field("c").unwrap().id;
+    let field_c = field_id(dataset, "c")?;
     let fragments = dataset
         .fragments()
         .iter()

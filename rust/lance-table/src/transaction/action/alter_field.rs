@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::proto::required;
-use super::{Coordinate, FieldRef, Footprint};
+use super::{Coordinate, FieldFacet, FieldRef, Footprint};
 use crate::format::pb_actions;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -58,8 +58,9 @@ impl AlterField {
         false
     }
 
-    /// The field's definition, and the name a rename takes -- a name is a
-    /// coordinate whether a field is added under it or moved to it.
+    /// The facets of the field's definition this sets, the field's existence,
+    /// and the name a rename takes -- a name is a coordinate whether a field is
+    /// added under it or moved to it.
     ///
     /// Tightening to non-nullable is only valid against the values it read,
     /// and applying it does not look at any. Values written since, or rows
@@ -68,12 +69,16 @@ impl AlterField {
     /// stale append whether or not that append names the field -- including a
     /// field minted in this set, which no other writer can name.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.write_field_definition(self.field);
+        footprint.require_field_facet(self.field, FieldFacet::Existence);
+        if self.nullable.is_some() {
+            footprint.write_field_facet(self.field, FieldFacet::Nullability);
+        }
         if self.nullable == Some(false) {
             footprint.require_no_values_written(self.field);
             footprint.add_required_column();
         }
         if let Some(name) = &self.name {
+            footprint.write_field_facet(self.field, FieldFacet::Name);
             footprint.write(Coordinate::FieldName(name.clone()));
         }
     }
