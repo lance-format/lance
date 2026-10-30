@@ -1878,20 +1878,20 @@ async fn test_delete_branch_preserves_aliased_main_dataset(
 }
 
 #[derive(Debug)]
-struct GateUppercaseRefsStore {
+struct GateSpelledRefsStore {
     inner: Arc<dyn OSObjectStore>,
     root: Path,
-    uppercase: bool,
+    spelling: &'static str,
 }
 
-impl std::fmt::Display for GateUppercaseRefsStore {
+impl std::fmt::Display for GateSpelledRefsStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "GateUppercaseRefsStore")
+        write!(f, "GateSpelledRefsStore")
     }
 }
 
 #[async_trait::async_trait]
-impl OSObjectStore for GateUppercaseRefsStore {
+impl OSObjectStore for GateSpelledRefsStore {
     async fn put_opts(
         &self,
         path: &Path,
@@ -1926,10 +1926,10 @@ impl OSObjectStore for GateUppercaseRefsStore {
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
         let mut entries = self.inner.list_with_delimiter(prefix).await?;
-        if self.uppercase && prefix == Some(&self.root) {
+        if prefix == Some(&self.root) {
             for directory in &mut entries.common_prefixes {
                 if directory.filename() == Some("_refs") {
-                    *directory = self.root.clone().join("_REFS");
+                    *directory = self.root.clone().join(self.spelling);
                 }
             }
         }
@@ -2021,10 +2021,13 @@ async fn test_delete_branch_preserves_shared_refs(
 
 #[cfg(unix)]
 #[rstest]
+#[case::normal("_refs")]
+#[case::uppercase("_REFS")]
+#[case::unicode("_ref\u{017f}")]
 #[tokio::test]
 async fn test_gatekeeper_case_spelled_shared_refs(
+    #[case] spelling: &'static str,
     #[values(false, true)] use_object_store: bool,
-    #[values(false, true)] uppercase: bool,
 ) {
     let tempdir = TempDir::default();
     let uri = if use_object_store {
@@ -2064,10 +2067,10 @@ async fn test_gatekeeper_case_spelled_shared_refs(
     );
 
     let mut store = root.object_store.as_ref().clone();
-    store.inner = Arc::new(GateUppercaseRefsStore {
+    store.inner = Arc::new(GateSpelledRefsStore {
         inner: store.inner.clone(),
         root: root.refs.root().unwrap().path,
-        uppercase,
+        spelling,
     });
     let store = Arc::new(store);
     root.object_store = store.clone();
