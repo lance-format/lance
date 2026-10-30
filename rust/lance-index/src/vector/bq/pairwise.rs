@@ -26,7 +26,10 @@ use lance_linalg::distance::{DistanceType, dot_u8::dot_u8_u64};
 use super::{
     builder::RabitQuantizer,
     ex_dot::{blocked_ex_code_bytes, unpack_blocked_row},
-    storage::{RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_CODE_COLUMN, RabitQueryEstimator, unpack_codes},
+    storage::{
+        RABIT_BLOCKED_EX_CODE_COLUMN, RABIT_CODE_COLUMN, RabitQuantizationMetadata,
+        RabitQueryEstimator, unpack_codes,
+    },
     transform::{EX_SCALE_FACTORS_COLUMN, SCALE_FACTORS_COLUMN},
 };
 use crate::vector::pairwise::{
@@ -40,6 +43,7 @@ const CODE_NORM: &str = "__pairwise_rq_code_norm";
 const CENTER_DOT: &str = "__pairwise_rq_center_dot";
 
 /// Partition-local RQ code scoring.
+#[derive(Clone, Debug)]
 pub struct RQPairScorer {
     dim: usize,
     bits: u8,
@@ -57,7 +61,23 @@ impl RQPairScorer {
         centroid: ArrayRef,
         metric: DistanceType,
     ) -> Result<Self> {
-        let meta = rq.metadata_ref();
+        let mut scorer = Self::from_metadata(rq.metadata_ref(), metric)?;
+        if metric != DistanceType::L2 {
+            let dim = centroid.len();
+            scorer.centroid = rq.rotate_fsl_to_f32(&FixedSizeListArray::try_new_from_values(
+                centroid, dim as i32,
+            )?)?;
+            scorer.centroid_norm = scorer.centroid.iter().map(|v| v * v).sum();
+        }
+        Ok(scorer)
+    }
+
+    /// A scorer without a centroid, which is only correct for l2, where the
+    /// centroid cancels. Dot and cosine scorers must be built with [`Self::new`].
+    pub(crate) fn from_metadata(
+        meta: &RabitQuantizationMetadata,
+        metric: DistanceType,
+    ) -> Result<Self> {
         if !(1..=9).contains(&meta.num_bits)
             || meta.rotated_dim() == 0
             || !meta.rotated_dim().is_multiple_of(8)
@@ -81,22 +101,13 @@ impl RQPairScorer {
                 "RQ pair scoring with {metric} distance"
             )));
         }
-        let centroid = if metric == DistanceType::L2 {
-            Vec::new()
-        } else {
-            let dim = centroid.len();
-            rq.rotate_fsl_to_f32(&FixedSizeListArray::try_new_from_values(
-                centroid, dim as i32,
-            )?)?
-        };
-        let centroid_norm = centroid.iter().map(|v| v * v).sum();
         Ok(Self {
             dim: meta.rotated_dim(),
             bits: meta.num_bits,
             packed: meta.packed,
             metric,
-            centroid,
-            centroid_norm,
+            centroid: Vec::new(),
+            centroid_norm: 0.0,
         })
     }
 

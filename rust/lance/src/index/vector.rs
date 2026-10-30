@@ -1330,6 +1330,17 @@ async fn build_vector_index_impl(
         )));
     }
 
+    // HNSW over RQ codes compares stored rows, which is only supported for l2
+    // (cosine is stored as l2 over normalized vectors).
+    if index_type == IndexType::IvfHnswRq
+        && !matches!(params.metric_type, DistanceType::L2 | DistanceType::Cosine)
+    {
+        return Err(Error::index(format!(
+            "Build Vector Index: {} does not support the {} metric",
+            index_type, params.metric_type
+        )));
+    }
+
     let explicit_target = ivf_params.target_partition_size;
     let num_partitions = ivf_params.num_partitions.unwrap_or(0);
     let summary = match index_type {
@@ -2595,6 +2606,41 @@ mod tests {
             RQBuildParams::default(),
         );
         assert_eq!(params.index_type(), IndexType::IvfHnswRq);
+    }
+
+    #[rstest::rstest]
+    #[case::l2(MetricType::L2, true)]
+    #[case::cosine(MetricType::Cosine, true)]
+    #[case::dot(MetricType::Dot, false)]
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_rq_index(#[case] metric_type: MetricType, #[case] builds: bool) {
+        let batch = lance_datagen::gen_batch()
+            .col("v", array::rand_vec::<Float32Type>(64.into()))
+            .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
+        let mut dataset = Dataset::write(batch, "memory://", Some(WriteParams::default()))
+            .await
+            .unwrap();
+        let ivf = IvfBuildParams {
+            num_partitions: Some(2),
+            ..Default::default()
+        };
+        let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+            metric_type,
+            ivf,
+            HnswBuildParams::default(),
+            RQBuildParams::default(),
+        );
+
+        let result = dataset
+            .create_index(&["v"], IndexType::IvfHnswRq, None, &params, false)
+            .await;
+
+        if builds {
+            result.unwrap();
+        } else {
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("does not support the"), "{err}");
+        }
     }
 
     #[tokio::test]

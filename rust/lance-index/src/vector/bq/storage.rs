@@ -51,6 +51,7 @@ use crate::vector::bq::ex_dot::{
     EX_DOT_BLOCK_DIMS, ExDotFn, blocked_ex_code_bytes, ex_dot_kernel, pad_query_into,
     padded_query_len, repack_sequential_row, sequential_matches_blocked,
 };
+use crate::vector::bq::pairwise::{RQKernel, RQPairScorer};
 use crate::vector::bq::prune::{PRUNE_LANES, ScaledLowerBoundTerms, scaled_prune_mask_kernel};
 use crate::vector::bq::rotation::{apply_fast_rotation, apply_fast_rotation_in_place};
 use crate::vector::bq::transform::{
@@ -62,6 +63,7 @@ use crate::vector::bq::{
     validate_rq_num_bits,
 };
 use crate::vector::graph::{OrderedFloat, OrderedNode};
+use crate::vector::pairwise::{PairKernel, PairScorer};
 use crate::vector::pq::storage::transpose;
 use crate::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use crate::vector::storage::{
@@ -556,6 +558,9 @@ pub struct RabitQuantizationStorage {
     packed_ex_codes: Option<FixedSizeListArray>,
     ex_add_factors: Option<Float32Array>,
     ex_scale_factors: Option<Float32Array>,
+    // Rows staged for code-to-code scoring, built on first use: only HNSW graph
+    // construction compares stored codes with each other, queries never do.
+    staged_rows: OnceLock<(RQPairScorer, RecordBatch)>,
 }
 
 impl DeepSizeOf for RabitQuantizationStorage {
@@ -571,6 +576,30 @@ impl DeepSizeOf for RabitQuantizationStorage {
 }
 
 impl RabitQuantizationStorage {
+    /// Stage every row for code-to-code scoring on first use.
+    ///
+    /// Only l2 is supported: the scorer needs the partition centroid for dot,
+    /// and cosine indexes are stored as l2 over normalized vectors.
+    fn staged_rows(&self) -> Result<&(RQPairScorer, RecordBatch)> {
+        if let Some(staged) = self.staged_rows.get() {
+            return Ok(staged);
+        }
+        if self.distance_type != DistanceType::L2 {
+            return Err(Error::not_supported(format!(
+                "RQ code-to-code distance supports only l2 storage, got {}",
+                self.distance_type
+            )));
+        }
+        let scorer = RQPairScorer::from_metadata(&self.metadata, DistanceType::L2)?;
+        let columns = scorer.stage(&self.batch, 0..self.batch.num_rows())?;
+        let staged = RecordBatch::try_from_iter(
+            columns
+                .into_iter()
+                .map(|(field, column)| (field.name().clone(), column)),
+        )?;
+        Ok(self.staged_rows.get_or_init(|| (scorer, staged)))
+    }
+
     fn code_dim(&self) -> usize {
         self.metadata.code_dim()
     }
@@ -963,6 +992,32 @@ pub struct RabitDistCalculator<'a> {
 
     sum_q: f32,
     sqrt_d: f32,
+
+    // Set for a calculator anchored on a stored row, which scores the other
+    // stored rows from their codes. All the query fields above are then unused.
+    code_anchor: Option<CodeAnchor<'a>>,
+}
+
+/// One stored row, scored against the other rows of its partition by
+/// [`RQKernel`] from the codes alone.
+struct CodeAnchor<'a> {
+    kernel: RQKernel<'a>,
+    row: usize,
+    num_rows: usize,
+}
+
+impl CodeAnchor<'_> {
+    fn distance(&self, id: usize) -> f32 {
+        let mut dist = [0.0];
+        self.kernel.distances(self.row, id..id + 1, &mut dist);
+        dist[0]
+    }
+
+    fn distance_all(&self, dists: &mut Vec<f32>) {
+        dists.clear();
+        dists.resize(self.num_rows, 0.0);
+        self.kernel.distances(self.row, 0..self.num_rows, dists);
+    }
 }
 
 impl<'a> RabitDistCalculator<'a> {
@@ -1011,7 +1066,33 @@ impl<'a> RabitDistCalculator<'a> {
             add_factor_offset: 0.0,
             sqrt_d: (dim as f32 * num_bits as f32).sqrt(),
             sum_q,
+            code_anchor: None,
         }
+    }
+
+    fn anchored(dim: usize, num_bits: u8, anchor: CodeAnchor<'a>) -> Self {
+        let mut calculator = Self::new(
+            dim,
+            num_bits,
+            RabitQueryEstimator::RawQuery,
+            Cow::Borrowed(&[]),
+            Cow::Borrowed(&[]),
+            0.0,
+            &[],
+            None,
+            0,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            0.0,
+            0.0,
+            ApproxMode::default(),
+        );
+        calculator.code_anchor = Some(anchor);
+        calculator
     }
 
     /// `sum_d query[d] * ex_code[d]` for the candidate's packed ex codes.
@@ -1912,6 +1993,9 @@ impl DistCalculator for RabitDistCalculator<'_> {
     #[inline(always)]
     fn distance(&self, id: u32) -> f32 {
         let id = id as usize;
+        if let Some(anchor) = &self.code_anchor {
+            return anchor.distance(id);
+        }
         let code_len = rabit_binary_code_bytes(self.dim);
         let num_vectors = self.codes.len() / code_len;
         let dist =
@@ -1975,6 +2059,10 @@ impl DistCalculator for RabitDistCalculator<'_> {
         quantized_dists_table: &mut Vec<u8>,
         hacc_quantized_dists: &mut Vec<u32>,
     ) {
+        if let Some(anchor) = &self.code_anchor {
+            anchor.distance_all(dists);
+            return;
+        }
         let code_len = rabit_binary_code_bytes(self.dim);
         let n = self.codes.len() / code_len;
         if n == 0 {
@@ -2355,10 +2443,24 @@ impl VectorStore for RabitQuantizationStorage {
         })
     }
 
-    // TODO: implement this
-    // This method is required for HNSW, we can't support HNSW_RABIT before this is implemented
-    fn dist_calculator_from_id(&self, _: u32) -> Self::DistanceCalculator<'_> {
-        unimplemented!("RabitQ does not support dist_calculator_from_id")
+    fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
+        // The trait cannot return an error. Staging fails only for non-l2
+        // storage or an old index, which IVF_HNSW_RQ creation rejects up front.
+        let (scorer, staged) = self
+            .staged_rows()
+            .expect("RQ code-to-code distance requires an l2, current-format index");
+        let kernel = scorer
+            .kernel(staged, staged)
+            .expect("staged RQ rows always bind to their own scorer");
+        RabitDistCalculator::anchored(
+            self.code_dim(),
+            self.metadata.num_bits,
+            CodeAnchor {
+                kernel,
+                row: id as usize,
+                num_rows: self.len(),
+            },
+        )
     }
 }
 
@@ -2706,6 +2808,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             packed_ex_codes,
             ex_add_factors,
             ex_scale_factors,
+            staged_rows: OnceLock::new(),
         };
 
         match build_frag_reuse_mapping(fri.as_deref(), &storage.row_ids) {
@@ -2810,6 +2913,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             packed_ex_codes,
             ex_add_factors,
             ex_scale_factors,
+            staged_rows: OnceLock::new(),
             row_ids: new_row_ids,
         })
     }
@@ -2935,6 +3039,7 @@ mod tests {
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
 
+    use crate::vector::bq::ex_dot::packed_ex_code_value;
     use crate::vector::bq::{RQRotationType, builder::RabitQuantizer};
     use crate::vector::quantizer::{Quantization, QuantizerStorage};
 
@@ -5185,5 +5290,86 @@ mod tests {
                  error {error} over the {quantization_bound} quantization bound",
             );
         }
+    }
+    #[rstest]
+    #[case::rq1(1)]
+    #[case::rq2(2)]
+    #[case::rq5(5)]
+    #[case::rq9(9)]
+    fn test_dist_calculator_from_id_matches_decoded_rows(#[case] num_bits: u8) {
+        // 40 rows cover a full packed group of 32 plus its partial tail.
+        let (rows, code_dim) = (40usize, 64usize);
+        let sign_codes = make_test_codes(rows, code_dim as i32);
+        let ex_bits = rabit_ex_bits(num_bits).unwrap();
+        let mut metadata = make_test_metadata(code_dim);
+        metadata.num_bits = num_bits;
+        let (batch, ex_codes, scale_offset) = if ex_bits == 0 {
+            (make_test_batch(sign_codes.clone()), None, 0.5)
+        } else {
+            let ex_codes = make_test_ex_codes(rows, code_dim, num_bits);
+            (
+                make_test_batch_with_ex(sign_codes.clone(), ex_codes.clone()),
+                Some(ex_codes),
+                1.5,
+            )
+        };
+        let storage =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+                .unwrap();
+
+        // Stored scale factors are `-2s`; a code decodes to `s * (code - (2^bits - 1) / 2)`.
+        let sign_bytes = sign_codes.values().as_primitive::<UInt8Type>().values();
+        let ex_bytes = ex_codes
+            .as_ref()
+            .map(|codes| codes.values().as_primitive::<UInt8Type>().values());
+        let ex_row_bytes = ex_codes
+            .as_ref()
+            .map(|codes| codes.value_length() as usize)
+            .unwrap_or_default();
+        let mask = ((1u32 << num_bits) - 1) as f64;
+        let decoded: Vec<Vec<f64>> = (0..rows)
+            .map(|row| {
+                let scale = -(row as f64 + scale_offset) / 2.0;
+                (0..code_dim)
+                    .map(|d| {
+                        let sign = (sign_bytes[row * code_dim / 8 + d / 8] >> (d % 8)) & 1;
+                        let ex = ex_bytes.map_or(0, |bytes| {
+                            packed_ex_code_value(
+                                &bytes[row * ex_row_bytes..(row + 1) * ex_row_bytes],
+                                d,
+                                ex_bits,
+                            )
+                        });
+                        let code = (u32::from(sign) << ex_bits) + u32::from(ex);
+                        scale * (f64::from(code) - mask / 2.0)
+                    })
+                    .collect()
+            })
+            .collect();
+        let expected = |u: usize, v: usize| -> f64 {
+            decoded[u]
+                .iter()
+                .zip(&decoded[v])
+                .map(|(a, b)| (a - b).powi(2))
+                .sum()
+        };
+
+        for u in [0, 1, 17, 31, 32, 39] {
+            let calc = storage.dist_calculator_from_id(u as u32);
+            let all = calc.distance_all(0);
+            assert_eq!(all.len(), rows);
+            for v in 0..rows {
+                let want = expected(u, v);
+                let tolerance = 1e-4 * (expected(u, 0) + expected(v, 0)) + 1e-3;
+                assert!(
+                    (f64::from(calc.distance(v as u32)) - want).abs() <= tolerance,
+                    "bits={num_bits} u={u} v={v}"
+                );
+                assert_eq!(all[v], calc.distance(v as u32));
+            }
+            assert_eq!(calc.distance(u as u32), 0.0);
+        }
+        // `dist_between` is symmetric.
+        assert_eq!(storage.dist_between(3, 35), storage.dist_between(35, 3));
     }
 }
