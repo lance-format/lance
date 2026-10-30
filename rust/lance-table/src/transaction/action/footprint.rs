@@ -676,10 +676,25 @@ impl Footprint {
     /// What it takes for this set to land on top of `committed`, a set that
     /// landed after this one read.
     pub fn compare(&self, committed: &Self) -> Verdict {
+        self.compare_through_moves(committed, &|_| Some(Vec::new()))
+    }
+
+    /// [`Self::compare`], where `moved_to` names the fragments a recorded
+    /// compaction moved a committed fragment's rows into since this set read,
+    /// or `None` where that is not known.
+    ///
+    /// A reader translates an index segment's coverage of a moved fragment
+    /// onto the fragments it became, so a segment this set adds is also built
+    /// from what those hold.
+    pub fn compare_through_moves(
+        &self,
+        committed: &Self,
+        moved_to: &dyn Fn(u64) -> Option<Vec<u64>>,
+    ) -> Verdict {
         if self.conflicts_with(committed) {
             return Verdict::Conflict;
         }
-        let mut overlaps = self.index_overlaps(committed);
+        let mut overlaps = self.index_overlaps(committed, moved_to);
         overlaps.extend(self.dropped_field_overlaps(committed));
         overlaps.extend(self.row_overlaps(committed));
         if overlaps.is_empty() {
@@ -720,9 +735,29 @@ impl Footprint {
     /// Nor does an overlay: the segment is stamped with the version it read,
     /// the overlay with the later one it committed at, and the read path masks
     /// overlaid cells out of any segment older than the overlay.
-    fn index_overlaps(&self, committed: &Self) -> Vec<Overlap> {
+    ///
+    /// A covered fragment whose rows `moved_to` says moved elsewhere is
+    /// rewritten where any fragment it moved into is. Where the move is not
+    /// known, a rewrite of the segment's columns in any fragment counts.
+    fn index_overlaps(
+        &self,
+        committed: &Self,
+        moved_to: &dyn Fn(u64) -> Option<Vec<u64>>,
+    ) -> Vec<Overlap> {
         let mut overlaps = Vec::new();
         for build in &self.index_builds {
+            let rewritten_in: HashSet<u64> = committed
+                .claims
+                .iter()
+                .filter_map(|(coordinate, mode)| match coordinate {
+                    Coordinate::FieldData { fragment, field }
+                        if *mode == Mode::Writes && build.fields.contains(field) =>
+                    {
+                        Some(*fragment)
+                    }
+                    _ => None,
+                })
+                .collect();
             for fragment in build.fragments.iter().copied() {
                 let segment = build.segment;
                 let removed = committed
@@ -735,12 +770,13 @@ impl Footprint {
                     }
                     continue;
                 }
-                let rewritten = build.fields.iter().any(|field| {
-                    committed.claims.get(&Coordinate::FieldData {
-                        fragment,
-                        field: *field,
-                    }) == Some(&Mode::Writes)
-                });
+                let rewritten = rewritten_in.contains(&fragment)
+                    || match moved_to(fragment) {
+                        Some(destinations) => destinations
+                            .iter()
+                            .any(|destination| rewritten_in.contains(destination)),
+                        None => !rewritten_in.is_empty(),
+                    };
                 if rewritten {
                     overlaps.push(Overlap::UpdatedUnderIndex { segment, fragment });
                 }

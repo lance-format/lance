@@ -591,16 +591,10 @@ impl<'a> TransactionRebase<'a> {
     pub async fn load_current_lineage(&mut self, dataset: &Dataset) -> Result<()> {
         match &self.transaction.operation {
             Operation::CreateIndex { .. } => {}
-            // An action set gets the untagged history only: a segment it adds
-            // over fragments a tagged history retired conflicts instead.
             Operation::CompositeOperation(composite_operation)
                 if composite_operation
                     .iter_actions()
-                    .any(|action| matches!(action, Action::AddIndexSegment(_))) =>
-            {
-                let indices = crate::index::load_all_indices(dataset).await?;
-                return self.load_untagged_reuse(dataset, &indices).await;
-            }
+                    .any(|action| matches!(action, Action::AddIndexSegment(_))) => {}
             _ => return Ok(()),
         }
         let indices = crate::index::load_all_indices(dataset).await?;
@@ -814,13 +808,14 @@ impl<'a> TransactionRebase<'a> {
         };
         let ours = Footprint::pending(&self.transaction, read);
         let theirs = Footprint::committed(other_transaction, before, after);
-        let overlaps = match ours.compare(&theirs) {
-            Verdict::Compatible => return Ok(()),
-            Verdict::Rebase(overlaps) => overlaps,
-            Verdict::Conflict => {
-                return Err(self.retryable_conflict_err(other_transaction, other_version));
-            }
-        };
+        let overlaps =
+            match ours.compare_through_moves(&theirs, &|fragment| self.moved_to(fragment)) {
+                Verdict::Compatible => return Ok(()),
+                Verdict::Rebase(overlaps) => overlaps,
+                Verdict::Conflict => {
+                    return Err(self.retryable_conflict_err(other_transaction, other_version));
+                }
+            };
         if !overlaps
             .iter()
             .all(|overlap| self.can_rebase_past(overlap, before, other_transaction))
@@ -901,19 +896,45 @@ impl<'a> TransactionRebase<'a> {
         true
     }
 
+    /// The fragments the latest fragment reuse index records `fragment`'s
+    /// rows as moved into, following one compaction after another: empty
+    /// when it records no move of `fragment`, and `None` when a tagged
+    /// history has it on its lineage but cannot be walked.
+    ///
+    /// Only a move out of `fragment` counts, never one into it, so a
+    /// compaction of a fragment some recorded move produced, which recorded
+    /// nothing itself, is not taken for a recorded one.
+    fn moved_to(&self, fragment: u64) -> Option<Vec<u64>> {
+        let Ok(fragment) = u32::try_from(fragment) else {
+            return Some(Vec::new());
+        };
+        let moved = if let Some(lineage) = &self.current_lineage {
+            if !lineage.contains(fragment) {
+                return Some(Vec::new());
+            }
+            lineage.destinations_of(fragment)?
+        } else if let Some(reuse) = &self.untagged_reuse {
+            reuse.moved_to(fragment)
+        } else {
+            Vec::new()
+        };
+        Some(moved.into_iter().map(u64::from).collect())
+    }
+
     /// Whether the rebase can resolve `overlap`, given the manifest `before`
     /// the commit it overlaps.
     ///
     /// A compaction under a legacy `CreateIndex`'s segment is resolvable only
     /// as legacy resolves it: the move deferred its index remap and the latest
-    /// untagged fragment reuse index still records it, so a reader translates
-    /// the segment's coverage. An action set's segment follows the reuse
-    /// history's own rule instead, that removal isn't staleness: its coverage
-    /// of the moved rows translates through a recorded transition, or is lost
-    /// and the rows are scanned. Either way, an NGram segment refuses retired
-    /// coverage at query time, and an overlay newer than the segment that the
-    /// compaction folded into base data would no longer be masked out of it;
-    /// legacy withdraws the latter from coverage, and this conflicts instead.
+    /// fragment reuse index, untagged or tagged, still records it, so a reader
+    /// translates the segment's coverage. An action set's segment follows the
+    /// reuse history's own rule instead, that removal isn't staleness: its
+    /// coverage of the moved rows translates through a recorded transition, or
+    /// is lost and the rows are scanned. Either way, an NGram segment refuses
+    /// retired coverage at query time, and an overlay newer than the segment
+    /// that the compaction folded into base data would no longer be masked out
+    /// of it; legacy withdraws the latter from coverage, and this conflicts
+    /// instead.
     ///
     /// Rows this transaction moved out from under an overlay `committed`
     /// added are resolvable where they miss the overlay's coverage, as
@@ -937,12 +958,16 @@ impl<'a> TransactionRebase<'a> {
             return false;
         };
         let recorded = matches!(self.transaction.operation, Operation::CompositeOperation(_))
-            || self.untagged_reuse.as_deref().is_some_and(|reuse| {
-                reuse
+            || match (&self.current_lineage, &self.untagged_reuse) {
+                (Some(_), _) => self
+                    .moved_to(*fragment)
+                    .is_some_and(|moved| !moved.is_empty()),
+                (None, Some(reuse)) => reuse
                     .groups
                     .iter()
-                    .any(|sources| sources.contains(fragment))
-            });
+                    .any(|sources| sources.contains(fragment)),
+                (None, None) => false,
+            };
         let is_ngram = built
             .index_details
             .as_ref()
@@ -4019,6 +4044,22 @@ impl UntaggedReuse {
                 self.groups
                     .contains(sorted_ids(group.old_fragments.iter().map(|f| f.id)).as_slice())
             })
+    }
+
+    /// Every fragment a recorded group moved `fragment`'s rows into, through
+    /// later groups that compacted those in turn.
+    fn moved_to(&self, fragment: u32) -> Vec<u32> {
+        let mut reached = Vec::new();
+        let mut pending = vec![fragment];
+        while let Some(id) = pending.pop() {
+            for (output, sources) in &self.sources {
+                if sources.contains(&u64::from(id)) && !reached.contains(output) {
+                    reached.push(*output);
+                    pending.push(*output);
+                }
+            }
+        }
+        reached
     }
 
     fn compacted_from(&self, fragment: u32) -> RoaringBitmap {
