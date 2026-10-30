@@ -788,7 +788,7 @@ async fn prepare_vector_segment_build(
     }
 
     let index_type = params.index_type();
-    if index_type == IndexType::IvfRq {
+    if matches!(index_type, IndexType::IvfRq | IndexType::IvfHnswRq) {
         let Some(StageParams::RQ(rq_params)) = stages.last() else {
             return Err(Error::index(format!(
                 "{mode}: invalid stages: {:?}",
@@ -1321,7 +1321,9 @@ async fn build_vector_index_impl(
 
     // RaBitQ encodes against L2 or dot residuals, and its transform rejects
     // anything else, but only after the IVF model has been trained on a sample.
-    if index_type == IndexType::IvfRq && params.metric_type == DistanceType::Hamming {
+    if matches!(index_type, IndexType::IvfRq | IndexType::IvfHnswRq)
+        && params.metric_type == DistanceType::Hamming
+    {
         return Err(Error::index(format!(
             "Build Vector Index: {} does not support the {} metric",
             index_type, params.metric_type
@@ -1565,6 +1567,37 @@ async fn build_vector_index_impl(
                 shuffler,
                 Some(ivf_params),
                 Some(pq_params.clone()),
+                hnsw_params.clone(),
+                frag_reuse_index,
+            )?
+            .with_optional_fragment_filter(fragment_ids)
+            .with_train_only(train_only)
+            .with_progress(progress.clone())
+            .build()
+            .await?;
+            Ok(summary)
+        }
+        IndexType::IvfHnswRq => {
+            let StageParams::Hnsw(hnsw_params) = &stages[1] else {
+                return Err(Error::index(format!(
+                    "Build Vector Index: invalid stages: {:?}",
+                    stages
+                )));
+            };
+            let StageParams::RQ(rq_params) = &stages[2] else {
+                return Err(Error::index(format!(
+                    "Build Vector Index: invalid stages: {:?}",
+                    stages
+                )));
+            };
+            let summary = IvfIndexBuilder::<HNSW, RabitQuantizer>::new(
+                dataset.clone(),
+                column.to_owned(),
+                dataset.indices_dir().clone().join(uuid.to_string()),
+                params.metric_type,
+                shuffler,
+                Some(ivf_params),
+                Some(rq_params.clone()),
                 hnsw_params.clone(),
                 frag_reuse_index,
             )?
