@@ -95,9 +95,14 @@ impl Footprint {
         if before.deletion_file != after.deletion_file {
             self.write(Coordinate::FragmentDeletions(id));
         }
+        // Added overlays restamp the rows they cover, as an `AddOverlays` does
+        // without claiming the sequence: the restamp composes with a refresh in
+        // either order, since each sets the rows it stamps and the later
+        // version wins.
+        let restamped = before.last_updated_at_version_meta != after.last_updated_at_version_meta;
         if before.row_id_meta != after.row_id_meta
-            || before.last_updated_at_version_meta != after.last_updated_at_version_meta
             || before.created_at_version_meta != after.created_at_version_meta
+            || (restamped && !adds_overlays(before, after))
         {
             self.write(Coordinate::FragmentRowVersions(id));
         }
@@ -135,8 +140,7 @@ impl Footprint {
         before: &[DataOverlayFile],
         after: &[DataOverlayFile],
     ) {
-        let key =
-            |overlay: &DataOverlayFile| (overlay.data_file.path.clone(), overlay.committed_version);
+        let key = overlay_key;
         let before_by_key: HashMap<_, &DataOverlayFile> = before
             .iter()
             .map(|overlay| (key(overlay), overlay))
@@ -265,6 +269,20 @@ fn backing(fragment: &Fragment) -> HashMap<i32, (&str, Option<i32>)> {
                 })
         })
         .collect()
+}
+
+/// What tells one overlay of a fragment from another across two manifests.
+fn overlay_key(overlay: &DataOverlayFile) -> (&str, u64) {
+    (overlay.data_file.path.as_str(), overlay.committed_version)
+}
+
+/// Whether `after` holds an overlay `before` did not.
+fn adds_overlays(before: &Fragment, after: &Fragment) -> bool {
+    let before_keys: HashSet<_> = before.overlays.iter().map(overlay_key).collect();
+    after
+        .overlays
+        .iter()
+        .any(|overlay| !before_keys.contains(&overlay_key(overlay)))
 }
 
 /// Whether `field` was in the schema the commit started from, and so is a

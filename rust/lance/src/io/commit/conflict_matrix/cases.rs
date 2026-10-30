@@ -62,7 +62,7 @@ update_config             | L  L  L  L  L  L  L  L  L  R  R  L  L  X  X  X  L  R
 action_append             | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  L  L  L  L  L  L  L
 action_update_config      | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  R  L  R  R  L  L  L
 action_append_and_config  | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  R  L  R  R  L  L  L
-action_add_column         | L  L  R  R  L  R  R  L  L  R  R  L  R  R  R  L  L  L  L  R  R  L
+action_add_column         | L  L  R  R  L  L  R  L  L  R  R  L  R  R  R  L  L  L  L  R  R  L
 action_replace_column     | L  L  R  R  R  L  R  R  R  R  R  L  R  R  R  L  L  L  L  R  R  L
 action_rename_column      | L  L  L  L  L  L  L  R  R  R  R  L  L  R  R  L  L  L  L  L  L  R
 ";

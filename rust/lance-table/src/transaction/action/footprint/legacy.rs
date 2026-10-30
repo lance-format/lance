@@ -1100,6 +1100,52 @@ mod tests {
         );
     }
 
+    /// A committed overlay restamps the rows it covers, which composes with a
+    /// refresh of the fragment as an action `AddOverlays` does. A restamp with
+    /// no overlay behind it is a write of the sequence.
+    #[rstest]
+    #[case::with_an_overlay(true, false)]
+    #[case::without_one(false, true)]
+    fn test_a_refresh_over_a_committed_restamp(#[case] adds_overlay: bool, #[case] expected: bool) {
+        use crate::rowids::version::RowDatasetVersionMeta;
+        use crate::transaction::action::RefreshRowVersionMetadata;
+
+        let before = two_column_manifest();
+        let mut after = before.clone();
+        after.version += 1;
+        let mut fragment = after.fragments[0].clone();
+        fragment.last_updated_at_version_meta = Some(RowDatasetVersionMeta::Inline(Arc::from(
+            [1u8, 2, 3].as_slice(),
+        )));
+        if adds_overlay {
+            fragment.overlays.push(overlay_with_field(1, after.version));
+        }
+        after.fragments = Arc::new(vec![fragment, after.fragments[1].clone()]);
+        let overlay = Transaction::new(
+            before.version,
+            Operation::DataOverlay { groups: vec![] },
+            None,
+        );
+
+        let refresh = Footprint::pending(
+            &Transaction::new(
+                before.version,
+                actions(vec![Action::RefreshRowVersionMetadata(
+                    RefreshRowVersionMetadata {
+                        fragment_ids: vec![0],
+                    },
+                )]),
+                None,
+            ),
+            &before,
+        );
+        let committed = Footprint::committed(&overlay, &before, &after);
+        assert_eq!(
+            matches!(refresh.compare(&committed), Verdict::Conflict),
+            expected
+        );
+    }
+
     /// The footprint read from a commit's manifests never claims less than the
     /// operation itself names: every coordinate it writes, fragment it removes,
     /// field it writes values for, row it adds, key it asserts and index it
