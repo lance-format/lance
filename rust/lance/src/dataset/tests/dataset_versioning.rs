@@ -1463,10 +1463,18 @@ async fn test_delete_branch_with_shared_directory(
     );
 }
 
+#[rstest]
 #[tokio::test]
-async fn test_delete_branch_preserves_case_aliased_shared_directories() {
+async fn test_delete_branch_preserves_case_aliased_shared_directories(
+    #[values(false, true)] use_object_store: bool,
+) {
     let tempdir = TempDir::default();
-    let uri = tempdir.path_str();
+    let uri = if use_object_store {
+        let path_prefix = if cfg!(windows) { "/" } else { "" };
+        format!("file-object-store://{path_prefix}{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
     let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
     let mut deleted = root.create_branch("a", 1, None).await.unwrap();
     deleted.append(id_rows(10, 1), None).await.unwrap();

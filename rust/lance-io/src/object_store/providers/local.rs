@@ -43,7 +43,7 @@ impl LocalDirOperations for FileSystemDirOperations {
 
     async fn canonicalize(&self, path: &Path) -> Result<Option<std::path::PathBuf>> {
         let local_path = self.local_file_system.path_to_filesystem(path)?;
-        Ok(tokio::fs::canonicalize(local_path).await.ok())
+        crate::object_store::canonicalize_local_io_result(tokio::fs::canonicalize(local_path).await)
     }
 }
 
