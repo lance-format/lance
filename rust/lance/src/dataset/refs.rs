@@ -654,7 +654,7 @@ impl Branches<'_> {
 
         let has_local_paths =
             self.object_store().is_local() || self.object_store().scheme() == "file-object-store";
-        let mut remaining_paths = Vec::with_capacity(remaining_branches.len());
+        let mut remaining_paths = Vec::with_capacity(remaining_branches.len() + 1);
         for remaining in &remaining_branches {
             let path = self.refs.base_location.find_branch(Some(remaining))?.path;
             let canonical_path = self.object_store().canonicalize_local_path(&path).await?;
@@ -664,9 +664,41 @@ impl Branches<'_> {
                 );
                 return Ok(());
             }
+            let canonical_dataset_dirs = if has_local_paths {
+                match self.collect_canonical_dataset_dirs(&path, branch).await? {
+                    Some(dirs) => dirs,
+                    None => return Ok(()),
+                }
+            } else {
+                Vec::new()
+            };
             remaining_paths.push(RemainingBranchPath {
                 path,
                 canonical_path,
+                canonical_dataset_dirs,
+                is_named_branch: true,
+            });
+        }
+
+        if has_local_paths {
+            let path = self.refs.root()?.path;
+            let canonical_path = self.object_store().canonicalize_local_path(&path).await?;
+            if canonical_path.is_none() {
+                log::warn!(
+                    "Keeping branch directories after deleting {branch}: cannot resolve main dataset at {path}"
+                );
+                return Ok(());
+            }
+            let Some(canonical_dataset_dirs) =
+                self.collect_canonical_dataset_dirs(&path, branch).await?
+            else {
+                return Ok(());
+            };
+            remaining_paths.push(RemainingBranchPath {
+                path,
+                canonical_path,
+                canonical_dataset_dirs,
+                is_named_branch: false,
             });
         }
 
@@ -675,15 +707,6 @@ impl Branches<'_> {
                 BranchCleanup::Recursive(path) | BranchCleanup::Selective(path) => path,
                 BranchCleanup::Skip => return Ok(()),
             };
-            if self
-                .overlaps_local_dataset_dir(path, &remaining_paths)
-                .await?
-            {
-                log::warn!(
-                    "Keeping branch directory after deleting {branch}: cleanup path overlaps a surviving parent's dataset directory"
-                );
-                return Ok(());
-            }
             cleanup = match self
                 .classify_shared_branch_path(path, &remaining_paths)
                 .await?
@@ -697,6 +720,16 @@ impl Branches<'_> {
         match cleanup {
             BranchCleanup::Skip => Ok(()),
             BranchCleanup::Recursive(path) => {
+                if has_local_paths
+                    && self
+                        .recursive_delete_would_touch_retained_data(&path, &remaining_paths)
+                        .await?
+                {
+                    log::warn!(
+                        "Keeping branch directory after deleting {branch}: recursive deletion below {path} would reach retained dataset data"
+                    );
+                    return Ok(());
+                }
                 if let Err(e) = self.object_store().remove_dir_all(path).await {
                     match &e {
                         Error::NotFound { .. } => {
@@ -757,6 +790,19 @@ impl Branches<'_> {
                             }
                         }
                         SharedBranchPath::Unrelated => {
+                            if has_local_paths
+                                && self
+                                    .recursive_delete_would_touch_retained_data(
+                                        &path,
+                                        &remaining_paths,
+                                    )
+                                    .await?
+                            {
+                                log::warn!(
+                                    "Keeping aliased branch subtree {path}: recursive deletion would reach retained dataset data"
+                                );
+                                continue;
+                            }
                             if let Err(e) = self.object_store().remove_dir_all(path).await {
                                 match &e {
                                     Error::NotFound { .. } => {
@@ -773,33 +819,54 @@ impl Branches<'_> {
         }
     }
 
-    async fn overlaps_local_dataset_dir(
+    async fn collect_canonical_dataset_dirs(
+        &self,
+        path: &Path,
+        deleted_branch: &str,
+    ) -> Result<Option<Vec<PathBuf>>> {
+        let mut canonical_dataset_dirs = Vec::with_capacity(DATASET_DIRS.len());
+        for name in self.object_store().read_dir(path.clone()).await? {
+            if !is_dataset_dir(&name) {
+                continue;
+            }
+            let dataset_path = path.clone().join(name);
+            let Some(canonical_dir) = self
+                .object_store()
+                .canonicalize_local_path(&dataset_path)
+                .await?
+            else {
+                log::warn!(
+                    "Keeping branch directories after deleting {deleted_branch}: cannot resolve surviving dataset directory at {dataset_path}"
+                );
+                return Ok(None);
+            };
+            canonical_dataset_dirs.push(canonical_dir);
+        }
+        Ok(Some(canonical_dataset_dirs))
+    }
+
+    async fn recursive_delete_would_touch_retained_data(
         &self,
         path: &Path,
         remaining_paths: &[RemainingBranchPath],
     ) -> Result<bool> {
-        let Some(canonical_path) = self.object_store().canonicalize_local_path(path).await? else {
-            return Ok(true);
-        };
-        for remaining in remaining_paths {
-            let entries = self
+        let mut entries = self.object_store().read_dir_all(path.clone(), None);
+        while let Some(entry) = entries.next().await {
+            let entry = entry?;
+            let Some(canonical_file) = self
                 .object_store()
-                .list_with_delimiter(Some(&remaining.path))
-                .await?;
-            for dataset_path in entries.common_prefixes {
-                if !dataset_path.filename().is_some_and(is_dataset_dir) {
-                    continue;
-                }
-                let Some(canonical_dataset) = self
-                    .object_store()
-                    .canonicalize_local_path(&dataset_path)
-                    .await?
-                else {
-                    continue;
-                };
-                if canonical_path.starts_with(&canonical_dataset) {
-                    return Ok(true);
-                }
+                .canonicalize_local_path(&entry.location)
+                .await?
+            else {
+                continue;
+            };
+            if remaining_paths.iter().any(|remaining| {
+                remaining
+                    .canonical_dataset_dirs
+                    .iter()
+                    .any(|directory| canonical_file.starts_with(directory))
+            }) {
+                return Ok(true);
             }
         }
         Ok(false)
@@ -887,12 +954,27 @@ impl Branches<'_> {
             {
                 return Ok(SharedBranchPath::Remaining);
             }
-            let is_logical_descendant = remaining.path.prefix_matches(path);
+            if remaining.canonical_dataset_dirs.iter().any(|directory| {
+                canonical_path
+                    .as_ref()
+                    .is_some_and(|current| current.starts_with(directory))
+            }) {
+                return Ok(SharedBranchPath::Remaining);
+            }
+            let is_logical_descendant =
+                remaining.is_named_branch && remaining.path.prefix_matches(path);
             let is_physical_descendant = canonical_path
                 .as_ref()
                 .zip(remaining.canonical_path.as_ref())
                 .is_some_and(|(path, remaining)| remaining.starts_with(path));
-            is_ancestor |= is_logical_descendant || is_physical_descendant;
+            let has_dataset_dir_descendant = canonical_path.as_ref().is_some_and(|current| {
+                remaining
+                    .canonical_dataset_dirs
+                    .iter()
+                    .any(|directory| directory.starts_with(current))
+            });
+            is_ancestor |=
+                is_logical_descendant || is_physical_descendant || has_dataset_dir_descendant;
         }
         if is_ancestor {
             Ok(SharedBranchPath::Ancestor)
@@ -916,6 +998,8 @@ impl Branches<'_> {
 struct RemainingBranchPath {
     path: Path,
     canonical_path: Option<PathBuf>,
+    canonical_dataset_dirs: Vec<PathBuf>,
+    is_named_branch: bool,
 }
 
 enum SharedBranchPath {

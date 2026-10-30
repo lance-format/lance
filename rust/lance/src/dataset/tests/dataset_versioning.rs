@@ -1639,10 +1639,132 @@ async fn test_delete_branch_preserves_unicode_aliased_parent_data() {
 
 #[cfg(unix)]
 #[rstest]
+#[case::direct_nested(false, true)]
+#[case::object_store_nested(true, true)]
+#[case::direct_alias(false, false)]
+#[case::object_store_alias(true, false)]
+#[tokio::test]
+async fn test_gatekeeper_delete_contains_surviving_data(
+    #[case] use_object_store: bool,
+    #[case] relocate_into_deleted: bool,
+    #[values(false, true)] deep_alias: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        format!("file-object-store://{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    let mut parent = root.create_branch("A", 1, None).await.unwrap();
+    parent.append(id_rows(10, 1), None).await.unwrap();
+    root.create_branch("a", 1, None).await.unwrap();
+    root.create_branch("a/b", 1, None).await.unwrap();
+
+    let parent_data = tempdir.std_path().join("tree/A/data");
+    let container = if deep_alias {
+        "tree/a/container"
+    } else {
+        "tree/a"
+    };
+    std::fs::create_dir_all(tempdir.std_path().join(container)).unwrap();
+    let nested_data = tempdir.std_path().join(container).join("parent-data");
+    if relocate_into_deleted {
+        std::fs::rename(&parent_data, &nested_data).unwrap();
+        std::os::unix::fs::symlink(&nested_data, &parent_data).unwrap();
+    } else {
+        std::os::unix::fs::symlink(&parent_data, &nested_data).unwrap();
+    }
+
+    let before = Dataset::open(&uri)
+        .await
+        .unwrap()
+        .checkout_branch("A")
+        .await
+        .unwrap();
+    let batch = before.scan().try_into_batch().await.unwrap();
+    assert_eq!(
+        batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+        &[0, 10]
+    );
+
+    root.delete_branch("a").await.unwrap();
+
+    let after = Dataset::open(&uri)
+        .await
+        .unwrap()
+        .checkout_branch("A")
+        .await
+        .unwrap();
+    let batch = after.scan().try_into_batch().await.unwrap();
+    assert_eq!(
+        batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+        &[0, 10]
+    );
+}
+
+#[cfg(unix)]
+#[rstest]
 #[case::direct(false)]
 #[case::object_store(true)]
 #[tokio::test]
-async fn test_delete_branch_preserves_relocated_parent_data(#[case] use_object_store: bool) {
+async fn test_gatekeeper_delete_alias_preserves_main_data(#[case] use_object_store: bool) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        format!("file-object-store://{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    root.append(id_rows(10, 1), None).await.unwrap();
+    std::fs::create_dir_all(tempdir.std_path().join("tree")).unwrap();
+    std::os::unix::fs::symlink(
+        tempdir.std_path().join("data"),
+        tempdir.std_path().join("tree/a"),
+    )
+    .unwrap();
+    root.create_branch("a", 1, None).await.unwrap();
+    root.create_branch("a/b", 1, None).await.unwrap();
+
+    let before = Dataset::open(&uri)
+        .await
+        .unwrap()
+        .scan()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        before["id"].as_primitive::<Int32Type>().values().as_ref(),
+        &[0, 10]
+    );
+
+    root.delete_branch("a").await.unwrap();
+
+    let after = Dataset::open(&uri)
+        .await
+        .unwrap()
+        .scan()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        after["id"].as_primitive::<Int32Type>().values().as_ref(),
+        &[0, 10]
+    );
+}
+
+#[cfg(unix)]
+#[rstest]
+#[case::data("data", "data")]
+#[case::unicode_versions("_versions", "_ver\u{017f}ions")]
+#[tokio::test]
+async fn test_delete_branch_preserves_relocated_parent_data(
+    #[case] dataset_dir: &str,
+    #[case] alias: &str,
+    #[values(false, true)] use_object_store: bool,
+    #[values(false, true)] has_child: bool,
+    #[values(false, true)] has_sibling: bool,
+) {
     let tempdir = TempDir::default();
     let uri = if use_object_store {
         format!("file-object-store://{}", tempdir.path_str())
@@ -1653,46 +1775,72 @@ async fn test_delete_branch_preserves_relocated_parent_data(#[case] use_object_s
     let mut parent = root.create_branch("A", 1, None).await.unwrap();
     parent.append(id_rows(10, 1), None).await.unwrap();
 
-    let data_path = tempdir.std_path().join("tree/A/data");
-    let relocated_data = tempdir.std_path().join("relocated-data");
-    std::fs::rename(&data_path, &relocated_data).unwrap();
-    std::os::unix::fs::symlink(&relocated_data, &data_path).unwrap();
-    let alias = tempdir.std_path().join("tree/a");
-    if !alias.exists() {
-        std::os::unix::fs::symlink(tempdir.std_path().join("tree/A"), &alias).unwrap();
+    let owned_path = tempdir.std_path().join("tree/A").join(dataset_dir);
+    let relocated_path = tempdir.std_path().join("relocated");
+    std::fs::rename(&owned_path, &relocated_path).unwrap();
+    std::os::unix::fs::symlink(&relocated_path, &owned_path).unwrap();
+    let alias_path = tempdir.std_path().join("tree/A").join(alias);
+    if !alias_path.exists() {
+        std::os::unix::fs::symlink(&owned_path, &alias_path).unwrap();
     }
-    create_branch_before_name_check(&parent, "a/data").await;
-    create_branch_before_name_check(&root, "a/data/x").await;
-
-    let before = Dataset::open(&uri)
-        .await
-        .unwrap()
-        .checkout_branch("A")
-        .await
+    if !tempdir.std_path().join("tree/a").exists() {
+        std::os::unix::fs::symlink(
+            tempdir.std_path().join("tree/A"),
+            tempdir.std_path().join("tree/a"),
+        )
         .unwrap();
-    assert_eq!(
-        before.scan().try_into_batch().await.unwrap()["id"]
-            .as_primitive::<Int32Type>()
-            .values()
-            .as_ref(),
-        &[0, 10]
-    );
+    }
+    let deleted_branch = format!("a/{alias}");
+    create_branch_before_name_check(&parent, &deleted_branch).await;
+    if has_sibling {
+        // Keep recursive cleanup rooted at the dataset directory without a child branch.
+        root.create_branch("a/sibling", 1, None).await.unwrap();
+    }
+    let child_branch = format!("{deleted_branch}/x");
+    if has_child {
+        create_branch_before_name_check(&root, &child_branch).await;
+    }
 
-    root.delete_branch("a/data").await.unwrap();
-
-    let after = Dataset::open(&uri)
-        .await
-        .unwrap()
-        .checkout_branch("A")
-        .await
-        .unwrap();
-    assert_eq!(
-        after.scan().try_into_batch().await.unwrap()["id"]
-            .as_primitive::<Int32Type>()
-            .values()
-            .as_ref(),
-        &[0, 10]
-    );
+    for after_deletion in [false, true] {
+        if after_deletion {
+            root.delete_branch(&deleted_branch).await.unwrap();
+            let branches = root.list_branches().await.unwrap();
+            assert!(!branches.contains_key(&deleted_branch));
+            assert!(branches.contains_key("A"));
+            assert_eq!(branches.contains_key("a/sibling"), has_sibling);
+            assert_eq!(branches.contains_key(&child_branch), has_child);
+        }
+        let mut parent = Dataset::open(&uri)
+            .await
+            .unwrap()
+            .checkout_branch("A")
+            .await
+            .unwrap();
+        let batch = parent.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+            &[0, 10]
+        );
+        if after_deletion {
+            parent.append(id_rows(20, 1), None).await.unwrap();
+            assert_eq!(parent.count_rows(None).await.unwrap(), 3);
+        }
+    }
+    for branch in [
+        has_sibling.then_some("a/sibling"),
+        has_child.then_some(child_branch.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let mut survivor = root.checkout_branch(branch).await.unwrap();
+        survivor.append(id_rows(30, 1), None).await.unwrap();
+        let batch = survivor.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+            &[0, 30]
+        );
+    }
 }
 
 #[cfg(unix)]
