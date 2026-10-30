@@ -68,8 +68,8 @@ action_append_and_config     | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  R  L
 action_add_column            | L  L  R  R  L  L  R  L  L  R  R  L  R  R  R  L  L  L  L  R  L  L  L  L  L  R  R  R
 action_replace_column        | L  L  R  R  R  L  R  R  R  R  R  L  R  R  R  L  L  L  L  L  R  L  L  L  L  R  R  R
 action_rename_column         | L  L  L  L  L  L  L  R  R  R  R  L  L  R  R  L  L  L  L  L  L  R  L  L  L  L  L  L
-action_create_index          | L  L  L  L  L  L  L  L  L  L  L  R  L  R  R  L  L  L  L  L  L  L  R  R  L  L  L  R
-action_append_and_index      | L  L  L  L  L  L  L  L  L  L  L  R  L  R  R  L  L  L  L  L  L  L  R  R  L  L  L  R
+action_create_index          | L  L  L  L  L  L  L  L  L  L  L  R  L  R  R  L  L  L  L  L  L  L  R  R  L  L  L  L
+action_append_and_index      | L  L  L  L  L  L  L  L  L  L  L  R  L  R  R  L  L  L  L  L  L  L  R  R  L  L  L  L
 action_delete                | L  R  R  L  L  L  L  L  L  L  L  L  R  R  R  L  L  L  L  L  L  L  L  L  R  R  L  R
 action_delete_whole_fragment | L  R  R  R  R  L  R  L  L  L  L  L  R  R  R  L  L  L  L  R  R  L  L  L  R  R  R  R
 action_update                | L  L  R  R  R  R  R  L  L  L  L  L  R  R  R  L  L  L  L  R  R  L  L  L  L  R  R  R
