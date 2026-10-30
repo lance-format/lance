@@ -1538,13 +1538,50 @@ mod tests {
         Ok(())
     }
 
+    /// Also checks that each f16 batch kernel matches its tier's pair kernel
+    /// bit for bit.
     #[rstest::rstest]
     fn test_l2_f16_kernels_match_reference(
         #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
     ) {
         run_vector_pair_proptest(arbitrary_f16, dimension_shard(shard), |x, y| {
-            check_half_l2_kernels(&L2_F16, &x, &y)
+            check_half_l2_kernels(&L2_F16, &x, &y)?;
+            let batch = [&y[..], &x[..]].concat();
+            for (pair, batch_candidate) in L2_F16.candidates().iter().zip(L2_F16_BATCH.candidates())
+            {
+                let (Some(pair_kernel), Some(batch_kernel)) =
+                    (pair.kernel(), batch_candidate.kernel())
+                else {
+                    continue;
+                };
+                let mut got = [f32::NAN; 2];
+                batch_kernel.call(&x, &batch, x.len(), &mut got);
+                let want = [pair_kernel.call(&x, &y), pair_kernel.call(&x, &x)];
+                prop_assert!(
+                    got.map(f32::to_bits) == want.map(f32::to_bits),
+                    "{} at dim {}: {got:?} != {want:?}",
+                    batch_candidate.name(),
+                    x.len()
+                );
+            }
+            Ok(())
         });
+    }
+
+    #[test]
+    fn test_l2_f16_batch_candidates_mirror_pair_candidates() {
+        let pairs = L2_F16.candidates();
+        let batches = L2_F16_BATCH.candidates();
+        assert_eq!(pairs.len(), batches.len());
+        for (pair, batch) in pairs.iter().zip(batches) {
+            assert_eq!(
+                pair.features(),
+                batch.features(),
+                "{} vs {}",
+                pair.name(),
+                batch.name()
+            );
+        }
     }
 
     #[rstest::rstest]
