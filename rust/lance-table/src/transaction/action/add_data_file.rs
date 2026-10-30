@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::proto::{data_change_from_wire, data_change_to_wire, required};
-use super::{FieldFacet, FieldRef, Footprint, Ref};
+use super::{FieldRef, Footprint, Ref};
 use crate::format::{DataFile, pb, pb_actions};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -146,15 +146,33 @@ impl AddDataFile {
         self.data_change
     }
 
+    /// Stop binding `field`, leaving its column in the file unread, the way a
+    /// drop leaves the column of a fragment it finds already committed.
+    /// Returns whether the file still binds any field.
+    pub(super) fn forget_field(&mut self, field: FieldRef) -> bool {
+        let kept = |position: usize| self.field_ids.get(position) != Some(&field);
+        // Columns past the field list are bound by no field, and stay. An
+        // empty list is a v1 file, which binds columns by field id rather
+        // than position.
+        let column_indices: Vec<i32> = (0..self.file.column_indices.len())
+            .filter(|position| kept(*position))
+            .map(|position| self.file.column_indices[position])
+            .collect();
+        self.file.column_indices = column_indices.into();
+        self.field_ids.retain(|id| *id != field);
+        !self.field_ids.is_empty()
+    }
+
     /// The data of every committed field the file backs, in the fragment it is
     /// attached to. A file backing only minted fields writes nothing.
     ///
-    /// Each committed field's existence is required in a minted fragment too:
-    /// apply rejects a file naming a field the schema no longer has, so a
-    /// concurrent drop landing first has to be a conflict, not a failed apply.
+    /// In a fragment this set mints, a committed field's existence is not
+    /// required: apply rejects a file naming a field the schema no longer has,
+    /// so a concurrent drop landing first is rebased past instead, by leaving
+    /// the field out of the file (see [`Self::forget_field`]).
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        for field in self.field_ids.iter().copied() {
-            footprint.require_field_facet(field, FieldFacet::Existence);
+        if self.fragment.committed().is_none() {
+            footprint.write_into_new_fragment(self.field_ids.iter().copied());
         }
         footprint.write_field_data(
             self.fragment,
@@ -250,6 +268,96 @@ mod tests {
             error.to_string().contains("local fragment token 3"),
             "unexpected error: {error}"
         );
+    }
+
+    /// A drop that landed after an append read is rebased past by leaving the
+    /// field out of the append's new file, whose column then sits unread.
+    #[test]
+    fn test_rebasing_past_a_drop_leaves_the_field_out_of_new_files() {
+        use crate::transaction::action::{CompositeOperation, DropField, Overlap, UserStep};
+        use crate::transaction::test_support::default_build_config;
+        use crate::transaction::{Operation, ReadVersionState, Transaction};
+
+        let read = apply(
+            &unbacked_manifest(),
+            vec![Action::AddField(AddField {
+                local: 0,
+                parent: None,
+                def: added_field("dropped"),
+            })],
+        )
+        .unwrap();
+        let current = apply(
+            &read,
+            vec![Action::DropField(DropField {
+                field: FieldRef::Committed(1),
+            })],
+        )
+        .unwrap();
+        let file = |fields: &[i32]| {
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(0),
+                file: DataFile {
+                    column_indices: (0..).take(fields.len()).collect(),
+                    ..DataFile::new_unstarted("data/new.lance", ConcreteFileVersion::V2_0)
+                },
+                field_ids: fields.iter().copied().map(FieldRef::Committed).collect(),
+                data_change: true,
+                base: None,
+            })
+        };
+        let mut append = CompositeOperation::new(vec![UserStep::new(
+            "append",
+            vec![
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 10,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                file(&[0, 1]),
+                file(&[1]),
+            ],
+        )]);
+        let land = |append: &CompositeOperation| {
+            Transaction::new(
+                read.version,
+                Operation::CompositeOperation(append.clone()),
+                None,
+            )
+            .build_manifest_with_read_version(
+                Some(&current),
+                vec![],
+                "tx.txn",
+                &default_build_config(),
+                Some(ReadVersionState {
+                    manifest: &read,
+                    indices: &[],
+                }),
+            )
+            .map(|(manifest, _)| manifest)
+        };
+
+        let error = land(&append).unwrap_err();
+        assert!(
+            error.to_string().contains("which does not exist"),
+            "unexpected error: {error}"
+        );
+
+        append
+            .rebase(&[Overlap::FieldDropped { field: 1 }])
+            .unwrap();
+        let manifest = land(&append).unwrap();
+        let added = manifest.fragments.last().unwrap();
+        assert_eq!(
+            added.files.len(),
+            1,
+            "a file left binding nothing is dropped"
+        );
+        assert_eq!(added.files[0].fields.as_ref(), &[0]);
+        assert_eq!(added.files[0].column_indices.as_ref(), &[0]);
     }
 
     /// `field_ids` is the only field list on the wire; a second one in the
