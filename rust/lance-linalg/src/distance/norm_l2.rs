@@ -537,46 +537,52 @@ mod tests {
     }
 
     /// Every host-supported f32 kernel must agree with an f64 reference.
+    /// Prefixes of length 0 to 3 are all tail.
     #[rstest::rstest]
     fn test_norm_l2_f32_kernels_match_reference(
         #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
     ) {
         run_vector_proptest(arbitrary_f32, dimension_shard(shard), |data| {
-            let want = norm_l2_reference(&data.iter().map(|&v| v as f64).collect::<Vec<_>>());
-            for candidate in NORM_L2_F32.candidates() {
-                let Some(kernel) = candidate.kernel() else {
-                    continue;
-                };
-                let got = kernel.call(&data);
-                prop_assert!(
-                    approx::relative_eq!(got, want, max_relative = 1e-3),
-                    "{} at dim {}: {got} != {want}",
-                    candidate.name(),
-                    data.len()
-                );
+            for data in [0, 1, 2, 3, data.len()].map(|dim| &data[..dim]) {
+                let want = norm_l2_reference(&data.iter().map(|&v| v as f64).collect::<Vec<_>>());
+                for candidate in NORM_L2_F32.candidates() {
+                    let Some(kernel) = candidate.kernel() else {
+                        continue;
+                    };
+                    let got = kernel.call(data);
+                    prop_assert!(
+                        approx::relative_eq!(got, want, max_relative = 1e-3),
+                        "{} at dim {}: {got} != {want}",
+                        candidate.name(),
+                        data.len()
+                    );
+                }
             }
             Ok(())
         });
     }
 
     /// Every host-supported f64 kernel must agree with an f64 reference.
+    /// Prefixes of length 0 to 3 are all tail.
     #[rstest::rstest]
     fn test_norm_l2_f64_kernels_match_reference(
         #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
     ) {
         run_vector_proptest(arbitrary_f64, dimension_shard(shard), |data| {
-            let want = norm_l2_reference(&data);
-            for candidate in NORM_L2_F64.candidates() {
-                let Some(kernel) = candidate.kernel() else {
-                    continue;
-                };
-                let got = kernel.call(&data);
-                prop_assert!(
-                    approx::relative_eq!(got, want, max_relative = 1e-6),
-                    "{} at dim {}: {got} != {want}",
-                    candidate.name(),
-                    data.len()
-                );
+            for data in [0, 1, 2, 3, data.len()].map(|dim| &data[..dim]) {
+                let want = norm_l2_reference(data);
+                for candidate in NORM_L2_F64.candidates() {
+                    let Some(kernel) = candidate.kernel() else {
+                        continue;
+                    };
+                    let got = kernel.call(data);
+                    prop_assert!(
+                        approx::relative_eq!(got, want, max_relative = 1e-6),
+                        "{} at dim {}: {got} != {want}",
+                        candidate.name(),
+                        data.len()
+                    );
+                }
             }
             Ok(())
         });
