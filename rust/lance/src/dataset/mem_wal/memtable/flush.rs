@@ -480,12 +480,13 @@ impl MemTableFlusher {
         let reader =
             RecordBatchIterator::new(batches.into_iter().map(Ok), memtable.schema().clone());
 
-        // Use very large max_rows_per_file to ensure 1 fragment per SSTable.
+        // A fragment stores its physical row count as u32, so this is the
+        // largest limit that still guarantees one fragment per SSTable.
         // Inherit the base dataset's storage version so the SSTable
         // matches it (a 2.2 base also fixes the v2.1 miniblock 32 KiB chunk cap
         // that the dense HNSW graph List columns overflow at scale).
         let write_params = WriteParams {
-            max_rows_per_file: usize::MAX,
+            max_rows_per_file: u32::MAX as usize,
             data_storage_version: Some(storage_version.to_selector()),
             // Write the generation through the base's store params + session so it
             // uses the same store the base was opened with. Adapted for the

@@ -587,7 +587,11 @@ impl Transaction {
                     for (fragment, fields) in &rewrites {
                         if fields.iter().any(|field| {
                             i32::try_from(*field).is_ok_and(|field| {
-                                field_affects_index(field, &index.fields, &manifest.schema)
+                                field_affects_index(
+                                    field,
+                                    &index.dependency_fields(),
+                                    &manifest.schema,
+                                )
                             })
                         }) {
                             return Err(Error::invalid_input(format!(

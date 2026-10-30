@@ -5011,18 +5011,26 @@ async fn test_fts_9058_modest_indexed_corpus_with_tail(
 async fn test_fts_9058_reuses_optimized_physical_plan(
     #[values(false, true)] stable_row_ids: bool,
     #[values(false, true)] select_fragment: bool,
+    #[values(false, true)] combined: bool,
 ) {
     let fragments = restricted_match_fragments(&[&[0, 1, 2], &[3, 4], &[5, 6, 7]]);
     let dataset = restricted_match_dataset(&fragments, 1, stable_row_ids).await;
-    let query = MatchQuery::new("alpha beta".to_owned())
-        .with_column(Some("text".to_owned()))
-        .with_fuzziness(Some(0))
-        .with_document_granularity(DocumentGranularity::Row);
+    let query = if combined {
+        FtsQuery::CombinedFields(
+            CombinedFieldsQuery::try_new("alpha beta".to_owned(), vec!["text".to_owned()]).unwrap(),
+        )
+    } else {
+        MatchQuery::new("alpha beta".to_owned())
+            .with_column(Some("text".to_owned()))
+            .with_fuzziness(Some(0))
+            .with_document_granularity(DocumentGranularity::Row)
+            .into()
+    };
     let mut scanner = dataset.scan();
     scanner
         .project(&["id"])
         .unwrap()
-        .full_text_search(FullTextSearchQuery::new_query(query.into()))
+        .full_text_search(FullTextSearchQuery::new_query(query))
         .unwrap()
         .limit(Some(1), None)
         .unwrap();
@@ -5040,14 +5048,22 @@ async fn test_fts_9058_reuses_optimized_physical_plan(
     let explanation = DisplayableExecutionPlan::new(plan.as_ref())
         .indent(false)
         .to_string();
-    assert!(explanation.contains("MatchCorpus"), "{explanation}");
-    assert!(
-        explanation
-            .lines()
-            .any(|line| line.trim_start().starts_with("MatchQuery:")),
-        "{explanation}"
-    );
-    assert!(explanation.contains("FlatMatchQuery:"), "{explanation}");
+    if combined {
+        assert!(
+            explanation.contains("CombinedFieldsCorpus"),
+            "{explanation}"
+        );
+        assert!(explanation.contains("FlatCombinedFields:"), "{explanation}");
+    } else {
+        assert!(explanation.contains("MatchCorpus"), "{explanation}");
+        assert!(
+            explanation
+                .lines()
+                .any(|line| line.trim_start().starts_with("MatchQuery:")),
+            "{explanation}"
+        );
+        assert!(explanation.contains("FlatMatchQuery:"), "{explanation}");
+    }
     let context = get_session_context(&LanceExecutionOptions::default()).task_ctx();
     let (_, mut expected) = raw_match_oracle(&RESTRICTED_MATCH_CORPUS, "alpha beta");
     expected.retain(|(id, _)| *id < if select_fragment { 3 } else { 2 });
@@ -5097,7 +5113,7 @@ enum RestrictedMatchControl {
 
 #[rstest]
 #[tokio::test]
-async fn test_fts_9058_other_query_paths_keep_candidate_filtering(
+async fn test_fts_9058_match_planner_domains(
     #[values(
         RestrictedMatchControl::Unfiltered,
         RestrictedMatchControl::Postfilter,
@@ -5168,13 +5184,31 @@ async fn test_fts_9058_other_query_paths_keep_candidate_filtering(
         "ids": ids.as_ref(),
         "scores": scores.as_ref(),
     });
+    if matches!(
+        control,
+        RestrictedMatchControl::Unfiltered | RestrictedMatchControl::Postfilter
+    ) {
+        assert!(explanation.contains("MatchCorpus"), "{evidence:#}");
+        let (_, mut expected) = raw_match_oracle(&RESTRICTED_MATCH_CORPUS, "alpha beta");
+        expected.truncate(1);
+        if matches!(control, RestrictedMatchControl::Postfilter) {
+            expected.retain(|(id, _)| *id < 2);
+        }
+        assert_eq!(batch.num_rows(), expected.len(), "{evidence:#}");
+        for ((id, score), (expected_id, expected_score)) in ids.iter().zip(scores).zip(expected) {
+            assert_eq!(*id, expected_id, "{evidence:#}");
+            assert!(
+                (f64::from(*score) - expected_score).abs() < 1e-5,
+                "{evidence:#}"
+            );
+        }
+        return;
+    }
     assert!(
         !explanation.contains("MatchCorpus"),
         "unrelated query acquired restricted corpus execution: {evidence:#}"
     );
-    // The original flat paths have one input and apply any candidate predicate
-    // before scoring. A separate emission-selection child belongs only to the
-    // corrected restricted exact root Match path.
+    // Fuzzy and Boolean queries keep their existing candidate filtering paths.
     assert!(
         !flat_child_counts.is_empty(),
         "missing flat path: {evidence:#}"
@@ -5183,22 +5217,9 @@ async fn test_fts_9058_other_query_paths_keep_candidate_filtering(
         flat_child_counts.iter().all(|count| *count == 1),
         "unrelated query acquired corpus emission filtering: {evidence:#}"
     );
-    // Postfiltering happens after global top-k. In this unchanged mixed path,
-    // residual id 6 wins that top-k and is then excluded by id < 2.
-    let expected_rows = usize::from(!matches!(control, RestrictedMatchControl::Postfilter));
-    assert_eq!(
-        batch.num_rows(),
-        expected_rows,
-        "wrong candidates: {evidence:#}"
-    );
+    assert_eq!(batch.num_rows(), 1, "wrong candidates: {evidence:#}");
     assert!(scores.iter().all(|score| score.is_finite()), "{evidence:#}");
-    if !matches!(control, RestrictedMatchControl::Unfiltered) {
-        assert!(ids.iter().all(|id| *id < 2), "filter leaked: {evidence:#}");
-    }
-    if matches!(control, RestrictedMatchControl::Unfiltered) {
-        assert!(explanation.contains("MatchQuery:"), "{evidence:#}");
-        assert!(!explanation.contains("CompoundFtsScorer"), "{evidence:#}");
-    }
+    assert!(ids.iter().all(|id| *id < 2), "filter leaked: {evidence:#}");
 }
 
 #[tokio::test]

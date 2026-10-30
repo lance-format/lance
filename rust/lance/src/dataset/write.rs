@@ -552,6 +552,8 @@ impl Default for AutoCleanupParams {
 #[derive(Debug, Clone)]
 pub struct WriteParams {
     /// Max number of records per file.
+    ///
+    /// Must not exceed `u32::MAX`, the row capacity of a fragment.
     pub max_rows_per_file: usize,
 
     /// Max number of rows per row group.
@@ -1030,13 +1032,44 @@ where
                 let active_writer = writer.as_mut().ok_or_else(|| {
                     Error::internal("Writer was not initialized before writing a batch")
                 })?;
-                active_writer.write(&batch_chunk).await?;
+                let batch_chunk_rows =
+                    batch_chunk.iter().map(RecordBatch::num_rows).sum::<usize>();
+                let reaches_row_limit = if has_file_row_counts {
+                    rows_remaining_in_planned_file == Some(batch_chunk_rows)
+                } else {
+                    num_rows_in_current_file + batch_chunk_rows >= params.max_rows_per_file
+                };
+                let input_memory = batch_chunk
+                    .iter()
+                    .map(RecordBatch::get_array_memory_size)
+                    .sum::<usize>();
+                let data_cache_bytes = params
+                    .file_writer_options
+                    .as_ref()
+                    .and_then(|options| options.data_cache_bytes)
+                    .unwrap_or(8 * 1024 * 1024);
+                let flush_last =
+                    reaches_row_limit && input_memory > data_cache_bytes as usize;
+                if flush_last {
+                    let (last, prefix) = batch_chunk
+                        .split_last()
+                        .ok_or_else(|| Error::internal("empty writer batch chunk"))?;
+                    if !prefix.is_empty() {
+                        active_writer.write(prefix).await?;
+                    }
+                    active_writer.prepare_for_flush();
+                    active_writer.write(std::slice::from_ref(last)).await?;
+                } else {
+                    active_writer.write(&batch_chunk).await?;
+                }
                 for batch in &batch_chunk {
                     seeds.observe(batch)?;
                 }
-                let batch_chunk_rows =
-                    batch_chunk.iter().map(RecordBatch::num_rows).sum::<usize>();
-                num_rows_in_current_file += batch_chunk_rows as u32;
+                num_rows_in_current_file += batch_chunk_rows;
+                // The writer owns the values it needs (either borrowed for an
+                // immediate page or detached into the queue).  Do not keep the
+                // input's parent buffers alive through the file finish below.
+                drop(batch_chunk);
 
                 let reached_planned_file_boundary = if has_file_row_counts {
                     let rows_remaining =
@@ -1080,7 +1113,7 @@ where
                 let reached_row_limit = if has_file_row_counts {
                     reached_planned_file_boundary
                 } else {
-                    num_rows_in_current_file >= params.max_rows_per_file as u32
+                    num_rows_in_current_file >= params.max_rows_per_file
                 };
                 let reached_byte_limit = current_file_bytes >= params.max_bytes_per_file as u64;
 
@@ -1115,7 +1148,7 @@ where
                     seeds.flush(w.as_mut()).await?;
                     let (num_rows, data_file) = w.finish().await?;
                     info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_CREATE, r#type=AUDIT_TYPE_DATA, path = &data_file.path);
-                    debug_assert_eq!(num_rows, num_rows_in_current_file);
+                    debug_assert_eq!(num_rows as usize, num_rows_in_current_file);
                     bytes_completed += data_file.file_size_bytes.get().map_or(0, |s| s.get());
                     rows_completed += num_rows as u64;
                     files_written += 1;
@@ -1962,6 +1995,8 @@ fn legacy_blob_field_path(schema: &Schema) -> Option<String> {
 pub trait GenericWriter: Send {
     /// Write the given batches to the file
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()>;
+    /// Mark the next batch as ending the current file page.
+    fn prepare_for_flush(&mut self) {}
     /// Get the file path and base ID for the data file being written.
     fn data_file_path(&self) -> (&str, Option<u32>);
     /// Get the current position in the file
@@ -2030,7 +2065,13 @@ where
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
         let summary = self.writer.finish().await?;
         Ok((
-            summary.num_rows as u32,
+            u32::try_from(summary.num_rows).map_err(|_| {
+                Error::internal(format!(
+                    "data file has {} rows, exceeding the fragment capacity of {} rows",
+                    summary.num_rows,
+                    u32::MAX
+                ))
+            })?,
             DataFile::new_legacy(
                 self.path.clone(),
                 self.writer.schema(),
@@ -2148,6 +2189,9 @@ impl GenericWriter for V2WriterAdapter {
         }
         Ok(())
     }
+    fn prepare_for_flush(&mut self) {
+        self.writer.prepare_for_flush();
+    }
     async fn write_column(&mut self, column_index: usize, array: ArrayRef) -> Result<()> {
         if self.preprocessor.is_some() {
             // The preprocessor rewrites a batch as a whole, splitting blob
@@ -2189,7 +2233,14 @@ impl GenericWriter for V2WriterAdapter {
         data_file.fields = field_ids.into();
         data_file.column_indices = column_indices.into();
         data_file.file_size_bytes = NonZero::new(write_summary.size_bytes).into();
-        Ok((write_summary.num_rows as u32, data_file))
+        let num_rows = u32::try_from(write_summary.num_rows).map_err(|_| {
+            Error::internal(format!(
+                "data file has {} rows, exceeding the fragment capacity of {} rows",
+                write_summary.num_rows,
+                u32::MAX
+            ))
+        })?;
+        Ok((num_rows, data_file))
     }
 
     async fn add_global_buffer(&mut self, buffer: Bytes) -> Result<u32> {
@@ -2625,7 +2676,7 @@ mod tests {
 
     use arrow_array::{
         Int32Array, LargeBinaryArray, RecordBatchIterator, RecordBatchReader, StringArray,
-        StringViewArray, StructArray,
+        StringViewArray, StructArray, UInt64Array,
     };
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
@@ -3010,6 +3061,37 @@ mod tests {
                 .map(|fragment| fragment.physical_rows.unwrap())
                 .collect::<Vec<_>>(),
             [1, 1, 5, 4, 4]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_rows_per_file_rejects_fragment_row_overflow() {
+        let tmpdir = lance_core::utils::tempfile::TempStrDir::default();
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(UInt64Array::from_iter_values(0..4)) as ArrayRef,
+        )])
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+
+        let error = Dataset::write(
+            reader,
+            tmpdir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: u32::MAX as usize + 1,
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_0),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot exceed the fragment row capacity"),
+            "{error}"
         );
     }
 
@@ -5562,6 +5644,67 @@ mod tests {
         assert_eq!(file_bases, vec![None, Some(1), Some(2)]);
         let reopened = Dataset::open(&create_uri).await.unwrap();
         assert_eq!(scan_sorted_ids(&reopened).await, (0..9).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn test_file_boundary_keeps_one_page_per_file() {
+        use lance_file::reader::FileReaderOptions;
+        use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+        use lance_io::utils::CachedFileSize;
+
+        let tmpdir = lance_core::utils::tempfile::TempStrDir::default();
+        let values = Arc::new(UInt64Array::from_iter_values(0..4096));
+        let batches = (0..12)
+            .map(|batch_index| {
+                let slice = values.slice(batch_index * 32, 32);
+                RecordBatch::try_from_iter([("value", Arc::new(slice) as ArrayRef)]).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let schema = batches[0].schema();
+        let reader =
+            RecordBatchIterator::new(batches.into_iter().map(Ok).collect::<Vec<_>>(), schema);
+        let params = WriteParams {
+            max_rows_per_file: 128,
+            max_rows_per_group: 32,
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_0),
+            file_writer_options: Some(FileWriterOptions {
+                data_cache_bytes: Some(4096),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, tmpdir.as_str(), Some(params))
+            .await
+            .unwrap();
+
+        let scheduler = ScanScheduler::new(
+            dataset.object_store.clone(),
+            SchedulerConfig::max_bandwidth(&dataset.object_store),
+        );
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 3);
+        for fragment in fragments {
+            let data_file = fragment.metadata.files.first().unwrap();
+            let path = dataset
+                .base
+                .clone()
+                .join(super::DATA_DIR)
+                .join(data_file.path.as_str());
+            let file_scheduler = scheduler
+                .open_file(&path, &CachedFileSize::unknown())
+                .await
+                .unwrap();
+            let reader = lance_file::reader::FileReader::try_open(
+                file_scheduler,
+                None,
+                Default::default(),
+                &dataset.metadata_cache.file_metadata_cache(&path),
+                FileReaderOptions::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(reader.metadata().column_infos[0].page_infos.len(), 1);
+        }
     }
 
     #[tokio::test]

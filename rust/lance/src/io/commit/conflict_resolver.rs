@@ -1260,10 +1260,10 @@ impl<'a> TransactionRebase<'a> {
                         return Err(self.retryable_conflict_err(other_transaction, other_version));
                     }
                     // A merge that removed or retyped a field our index keys
-                    // on (an `alter_columns` cast rewrites the column under a
-                    // new field id) leaves the index describing a column that
-                    // no longer exists on a tagged table's destinations; the
-                    // build is redone against the new field.
+                    // on or carries (an `alter_columns` cast rewrites the
+                    // column under a new field id) leaves the index describing
+                    // a column that no longer exists on a tagged table's
+                    // destinations; the build is redone against the new field.
                     if self.current_lineage.is_some()
                         && let Some(read_schema) = self.read_schema.as_ref()
                     {
@@ -1276,10 +1276,12 @@ impl<'a> TransactionRebase<'a> {
                             })
                             .map(|field| field.id)
                             .collect();
-                        if new_indices
-                            .iter()
-                            .any(|index| index.fields.iter().any(|field| gone.contains(field)))
-                        {
+                        if new_indices.iter().any(|index| {
+                            index
+                                .dependency_fields()
+                                .iter()
+                                .any(|field| gone.contains(field))
+                        }) {
                             return Err(self.retryable_conflict_err(other_transaction, other_version));
                         }
                     }
@@ -1291,7 +1293,7 @@ impl<'a> TransactionRebase<'a> {
                     // a fragment that did not exist then (a destination the
                     // rewrite produced afterwards) shows an in-place rewrite
                     // by a tombstoned field in its files, and is then treated
-                    // as rewritten in every indexed field.
+                    // as rewritten in every dependency field.
                     if let (Some(lineage), Some(live), Some(read_fragments)) = (
                         self.current_lineage.as_ref(),
                         self.current_live.as_ref(),
@@ -1304,10 +1306,10 @@ impl<'a> TransactionRebase<'a> {
                         );
                         let read_ids: HashSet<u64> =
                             read_fragments.iter().map(|fragment| fragment.id).collect();
-                        let every_indexed: Vec<u32> = new_indices
+                        let every_dependency_field: Vec<u32> = new_indices
                             .iter()
-                            .flat_map(|index| index.fields.iter())
-                            .filter_map(|field| u32::try_from(*field).ok())
+                            .flat_map(|index| index.dependency_fields().into_owned())
+                            .filter_map(|field| u32::try_from(field).ok())
                             .collect();
                         rewrites.extend(
                             fragments
@@ -1321,7 +1323,7 @@ impl<'a> TransactionRebase<'a> {
                                         })
                                     })
                                 })
-                                .map(|fragment| (fragment.id, every_indexed.clone())),
+                                .map(|fragment| (fragment.id, every_dependency_field.clone())),
                         );
                         Transaction::withdraw_in_place_rewrites(
                             new_indices,
@@ -1479,8 +1481,8 @@ impl<'a> TransactionRebase<'a> {
                 Operation::UpdateConfig { .. } => Ok(()),
                 Operation::DataReplacement { replacements } => {
                     // A data replacement only conflicts if it is updating a field the
-                    // index depends on -- whether keyed on or merely carried, since
-                    // `fields` lists both (see `IndexMetadata::covering_fields`).
+                    // index depends on -- whether keyed on or merely carried (see
+                    // `IndexMetadata::dependency_fields`).
                     // On a tagged table the replaced column's coverage is
                     // withdrawn along the lineage instead, like the Update arm.
                     if let (Some(lineage), Some(live), Some(schema)) = (
@@ -1504,8 +1506,7 @@ impl<'a> TransactionRebase<'a> {
                     }
                     let mut newly_depended_fields = new_indices
                         .iter()
-                        .flat_map(|idx| idx.fields.iter())
-                        .copied()
+                        .flat_map(|idx| idx.dependency_fields().into_owned())
                         .collect::<Vec<_>>();
                     newly_depended_fields.sort_unstable();
                     newly_depended_fields.dedup();
@@ -2039,8 +2040,8 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::CreateIndex { new_indices, .. } => {
                     // A data replacement only conflicts if it is updating a field the
-                    // index depends on -- whether keyed on or merely carried, since
-                    // `fields` lists both (see `IndexMetadata::covering_fields`).
+                    // index depends on -- whether keyed on or merely carried (see
+                    // `IndexMetadata::dependency_fields`).
                     //
                     // TODO: We could potentially just drop the fragments being replaced from
                     // the index's fragment bitmap, which would lead to fewer conflicts.  However
@@ -2048,11 +2049,11 @@ impl<'a> TransactionRebase<'a> {
                     // yet.  For now, we don't allow this case.
                     let newly_depended_fields = new_indices
                         .iter()
-                        .flat_map(|idx| idx.fields.iter())
+                        .flat_map(|idx| idx.dependency_fields().into_owned())
                         .collect::<HashSet<_>>();
                     for replacement in replacements {
                         for field in replacement.1.fields.iter() {
-                            if newly_depended_fields.contains(&field) {
+                            if newly_depended_fields.contains(field) {
                                 return Err(
                                     self.retryable_conflict_err(other_transaction, other_version)
                                 );
@@ -3468,11 +3469,12 @@ impl UntaggedReuse {
     ) -> bool {
         for group in groups {
             for index in indices.iter_mut() {
+                let dependency_fields = index.dependency_fields();
                 let folded = group.old_fragments.iter().any(|fragment| {
                     fragment.overlays.iter().any(|overlay| {
                         overlay_affects_index(
                             overlay,
-                            &index.fields,
+                            &dependency_fields,
                             index.dataset_version,
                             &self.manifest.schema,
                         )
@@ -5651,6 +5653,190 @@ mod tests {
             new_indices[0].fragment_bitmap.as_ref().unwrap(),
             &RoaringBitmap::from_iter(expected_fragment_ids)
         );
+    }
+
+    const KEYED: i32 = 0;
+    const CARRIED: i32 = 1;
+    const UNRELATED: i32 = 2;
+
+    /// Released writers repeat each carried column at the end of `fields`;
+    /// the keys-only shape lists it in `covering_fields` alone.
+    #[derive(Debug, Clone, Copy)]
+    enum CoveringShape {
+        Suffix,
+        KeysOnly,
+    }
+
+    impl CoveringShape {
+        fn index(self) -> IndexMetadata {
+            IndexMetadata {
+                uuid: Uuid::new_v4(),
+                name: "covered".to_string(),
+                fields: match self {
+                    Self::Suffix => vec![KEYED, CARRIED],
+                    Self::KeysOnly => vec![KEYED],
+                },
+                covering_fields: vec![CARRIED],
+                dataset_version: 1,
+                fragment_bitmap: Some(RoaringBitmap::from_iter([0])),
+                index_details: None,
+                index_version: 0,
+                created_at: None,
+                base_id: None,
+                files: None,
+                clustering_id: None,
+                metadata: Default::default(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum CoveringConflictSite {
+        /// The index, on a tagged table, over an `alter_columns` cast.
+        IndexOverCast,
+        IndexOverDataReplacement,
+        DataReplacementOverIndex,
+        IndexOverFoldedOverlay,
+    }
+
+    impl CoveringConflictSite {
+        /// Whether the rebase retries, or withdraws the index's coverage of
+        /// fragment 0, when the concurrent change reaches field `changed`.
+        fn invalidates(self, index: IndexMetadata, changed: i32) -> bool {
+            let schema = lance_core::datatypes::Schema::try_from(&Schema::new(
+                ["keyed", "carried", "unrelated"]
+                    .map(|name| Field::new(name, DataType::Int32, false))
+                    .to_vec(),
+            ))
+            .unwrap();
+            let rebase_of = |ours: Operation| TransactionRebase {
+                transaction: Transaction::new(1, ours, None),
+                initial_fragments: HashMap::new(),
+                modified_fragment_ids: HashSet::new(),
+                affected_rows: None,
+                frag_reuse_base: None,
+                conflicting_mem_wal_compacted_sstables: Vec::new(),
+                current_lineage: None,
+                untagged_reuse: None,
+                current_live: None,
+                current_schema: None,
+                read_fragments: None,
+                read_schema: None,
+                reuse: Default::default(),
+                staged_replay: false,
+            };
+            let create_index = Operation::CreateIndex {
+                new_indices: vec![index],
+                removed_indices: vec![],
+            };
+            let replacement = Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(
+                    0,
+                    DataFile::new_legacy_from_fields("replaced.lance", vec![changed], None),
+                )],
+            };
+            let (mut rebase, theirs) = match self {
+                Self::IndexOverCast => {
+                    let mut rebase = rebase_of(create_index);
+                    let history = IndexMetadata {
+                        uuid: Uuid::new_v4(),
+                        name: FRAG_REUSE_INDEX_NAME.to_string(),
+                        fields: vec![],
+                        covering_fields: vec![],
+                        dataset_version: 1,
+                        fragment_bitmap: None,
+                        index_details: None,
+                        index_version: 1,
+                        created_at: None,
+                        base_id: None,
+                        files: None,
+                        clustering_id: None,
+                        metadata: Default::default(),
+                    };
+                    rebase.current_lineage = Some(TaggedLineage::new(&history, None));
+                    rebase.read_schema = Some(schema.clone());
+                    let kept: Vec<i32> = [KEYED, CARRIED, UNRELATED]
+                        .into_iter()
+                        .filter(|field| *field != changed)
+                        .collect();
+                    // A cast moves the column to a new field id.
+                    let cast = Operation::Merge {
+                        fragments: vec![],
+                        schema: schema.project_by_ids(&kept, true),
+                        preserves_nullability: true,
+                    };
+                    (rebase, cast)
+                }
+                Self::IndexOverDataReplacement => (rebase_of(create_index), replacement),
+                Self::DataReplacementOverIndex => (rebase_of(replacement), create_index),
+                Self::IndexOverFoldedOverlay => {
+                    let mut rebase = rebase_of(create_index);
+                    rebase.untagged_reuse = Some(Box::new(UntaggedReuse {
+                        groups: HashSet::from([Arc::from([0u64])]),
+                        sources: HashMap::from([(7, Arc::from([0u64]))]),
+                        manifest: Arc::new(lance_table::format::Manifest::new(
+                            schema,
+                            Arc::new(vec![]),
+                            Default::default(),
+                            HashMap::new(),
+                        )),
+                    }));
+                    let mut overlaid = Fragment::new(0);
+                    overlaid.overlays = vec![lance_table::format::overlay::DataOverlayFile {
+                        data_file: DataFile::new_legacy_from_fields(
+                            "overlay.lance",
+                            vec![changed],
+                            None,
+                        ),
+                        coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+                        committed_version: 2,
+                    }];
+                    let compaction = Operation::Rewrite {
+                        groups: vec![RewriteGroup {
+                            old_fragments: vec![overlaid],
+                            new_fragments: vec![Fragment::new(7)],
+                        }],
+                        rewritten_indices: vec![],
+                        frag_reuse_index: None,
+                    };
+                    (rebase, compaction)
+                }
+            };
+            match rebase.check_txn(&Transaction::new(1, theirs, None), 2) {
+                Err(Error::RetryableCommitConflict { .. }) => true,
+                Err(error) => panic!("{self:?}: {error}"),
+                Ok(()) => match &rebase.transaction.operation {
+                    Operation::CreateIndex { new_indices, .. } => {
+                        !new_indices[0].fragment_bitmap.as_ref().unwrap().contains(0)
+                    }
+                    _ => false,
+                },
+            }
+        }
+    }
+
+    /// A concurrent change to a new index's keyed or carried column makes
+    /// the rebase retry or withdraw coverage, whether or not `fields`
+    /// repeats the carried column; a change to another column does not.
+    #[rstest::rstest]
+    #[case::index_over_cast(CoveringConflictSite::IndexOverCast)]
+    #[case::index_over_data_replacement(CoveringConflictSite::IndexOverDataReplacement)]
+    #[case::data_replacement_over_index(CoveringConflictSite::DataReplacementOverIndex)]
+    #[case::index_over_folded_overlay(CoveringConflictSite::IndexOverFoldedOverlay)]
+    fn test_covering_dependency(#[case] site: CoveringConflictSite) {
+        for shape in [CoveringShape::Suffix, CoveringShape::KeysOnly] {
+            for (column, changed, invalidates) in [
+                ("keyed", KEYED, true),
+                ("carried", CARRIED, true),
+                ("unrelated", UNRELATED, false),
+            ] {
+                assert_eq!(
+                    site.invalidates(shape.index(), changed),
+                    invalidates,
+                    "{site:?}, {shape:?}: a change to the {column} column"
+                );
+            }
+        }
     }
 
     /// A restore rewinds schema and field metadata with the rest of the

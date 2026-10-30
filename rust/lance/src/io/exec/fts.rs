@@ -2588,18 +2588,24 @@ impl<S: Send + Sync + 'static> Drop for SharedFtsScorerProducer<S> {
     }
 }
 
-/// Owns one restricted Match plan's scorer lifecycle. Each execution gets a
+/// Owns one mixed FTS plan's scorer lifecycle. Each execution gets a
 /// fresh producer/consumer pair, including after failure or child replacement.
 /// Re-execution still requires replayable children: an overlay-stale scalar
 /// prefilter can contain a consumable `OneShotExec` that this owner cannot replay.
 #[derive(Debug)]
 pub(crate) struct SharedFtsScorerExec {
     input: Arc<dyn ExecutionPlan>,
-    scorer: Arc<SharedFtsScorer>,
+    scorer: SharedFtsCorpus,
     /// Retain metric handles, never a finished execution's task-owning plan.
     /// Concurrent executions have independent scorers. Rebound metrics describe
     /// the latest execution; template-retained counters keep their existing semantics.
     metrics: Arc<Mutex<SharedFtsExecutionMetrics>>,
+}
+
+#[derive(Debug, Clone)]
+enum SharedFtsCorpus {
+    Match(Arc<SharedFtsScorer>),
+    Combined(Arc<SharedFtsScorer<CombinedFieldsBM25Scorer>>),
 }
 
 #[derive(Debug)]
@@ -2626,13 +2632,24 @@ impl Drop for SharedFtsMetricsGuard {
                 metrics.active = None;
             }
             Ok(_) => {}
-            Err(error) => log::warn!("could not retain restricted Match runtime metrics: {error}"),
+            Err(error) => log::warn!("could not retain FTS runtime metrics: {error}"),
         }
     }
 }
 
 impl SharedFtsScorerExec {
     pub(crate) fn new(input: Arc<dyn ExecutionPlan>, scorer: Arc<SharedFtsScorer>) -> Self {
+        Self::with_corpus(input, SharedFtsCorpus::Match(scorer))
+    }
+
+    pub(crate) fn new_combined(
+        input: Arc<dyn ExecutionPlan>,
+        scorer: Arc<SharedFtsScorer<CombinedFieldsBM25Scorer>>,
+    ) -> Self {
+        Self::with_corpus(input, SharedFtsCorpus::Combined(scorer))
+    }
+
+    fn with_corpus(input: Arc<dyn ExecutionPlan>, scorer: SharedFtsCorpus) -> Self {
         Self {
             metrics: Arc::new(Mutex::new(SharedFtsExecutionMetrics {
                 execution: Arc::new(()),
@@ -2645,71 +2662,106 @@ impl SharedFtsScorerExec {
     }
 
     fn prepare_execution(&self) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let scorer = Arc::new(SharedFtsScorer::new());
+        let fresh = match &self.scorer {
+            SharedFtsCorpus::Match(_) => SharedFtsCorpus::Match(Arc::new(SharedFtsScorer::new())),
+            SharedFtsCorpus::Combined(_) => {
+                SharedFtsCorpus::Combined(Arc::new(SharedFtsScorer::new()))
+            }
+        };
         let mut consumers = 0;
         let mut producers = 0;
         // Reset other execution state too, particularly a previous top-k sort's
-        // score threshold. This owner only encloses the restricted root Match.
+        // score threshold. Each execution owns its corpus independently.
         let input = reset_plan_states(self.input.clone())?;
         let input = input
             .transform_up(|plan| {
-                if let Some(node) = plan.downcast_ref::<MatchQueryExec>()
-                    && node
-                        .shared_scorer
-                        .as_ref()
-                        .is_some_and(|shared| Arc::ptr_eq(shared, &self.scorer))
+                if let (SharedFtsCorpus::Match(template), SharedFtsCorpus::Match(scorer)) =
+                    (&self.scorer, &fresh)
                 {
-                    consumers += 1;
-                    return Ok(Transformed::yes(Arc::new(MatchQueryExec {
-                        dataset: node.dataset.clone(),
-                        query: node.query.clone(),
-                        tokenized_query: node.tokenized_query.clone(),
-                        params: node.params.clone(),
-                        prefilter_source: node.prefilter_source.clone(),
-                        base_scorer: node.base_scorer.clone(),
-                        prepared_query: node.prepared_query.clone(),
-                        shared_scorer: Some(scorer.clone()),
-                        segment_selection: node.segment_selection.clone(),
-                        overlay_block: node.overlay_block.clone(),
-                        document_granularity: node.document_granularity,
-                        schema: node.schema.clone(),
-                        external_mask: node.external_mask.clone(),
-                        properties: node.properties.clone(),
-                        metrics: node.metrics.clone(),
-                    })
-                        as Arc<dyn ExecutionPlan>));
+                    if let Some(node) = plan.downcast_ref::<MatchQueryExec>()
+                        && node
+                            .shared_scorer
+                            .as_ref()
+                            .is_some_and(|shared| Arc::ptr_eq(shared, template))
+                    {
+                        consumers += 1;
+                        return Ok(Transformed::yes(Arc::new(MatchQueryExec {
+                            dataset: node.dataset.clone(),
+                            query: node.query.clone(),
+                            tokenized_query: node.tokenized_query.clone(),
+                            params: node.params.clone(),
+                            prefilter_source: node.prefilter_source.clone(),
+                            base_scorer: node.base_scorer.clone(),
+                            prepared_query: node.prepared_query.clone(),
+                            shared_scorer: Some(scorer.clone()),
+                            segment_selection: node.segment_selection.clone(),
+                            overlay_block: node.overlay_block.clone(),
+                            document_granularity: node.document_granularity,
+                            schema: node.schema.clone(),
+                            external_mask: node.external_mask.clone(),
+                            properties: node.properties.clone(),
+                            metrics: node.metrics.clone(),
+                        })
+                            as Arc<dyn ExecutionPlan>));
+                    }
+                    if let Some(node) = plan.downcast_ref::<FlatMatchQueryExec>()
+                        && node
+                            .shared_scorer
+                            .as_ref()
+                            .is_some_and(|shared| Arc::ptr_eq(shared, template))
+                    {
+                        producers += 1;
+                        return Ok(Transformed::yes(Arc::new(FlatMatchQueryExec {
+                            dataset: node.dataset.clone(),
+                            query: node.query.clone(),
+                            tokenized_query: node.tokenized_query.clone(),
+                            params: node.params.clone(),
+                            unindexed_input: node.unindexed_input.clone(),
+                            candidate_filter: node.candidate_filter.clone(),
+                            base_scorer: node.base_scorer.clone(),
+                            shared_scorer: Some(scorer.clone()),
+                            preset_segments: node.preset_segments.clone(),
+                            document_granularity: node.document_granularity,
+                            document_column: node.document_column.clone(),
+                            schema: node.schema.clone(),
+                            properties: node.properties.clone(),
+                            metrics: node.metrics.clone(),
+                        })
+                            as Arc<dyn ExecutionPlan>));
+                    }
                 }
-                if let Some(node) = plan.downcast_ref::<FlatMatchQueryExec>()
-                    && node
-                        .shared_scorer
-                        .as_ref()
-                        .is_some_and(|shared| Arc::ptr_eq(shared, &self.scorer))
+                if let (SharedFtsCorpus::Combined(template), SharedFtsCorpus::Combined(scorer)) =
+                    (&self.scorer, &fresh)
                 {
-                    producers += 1;
-                    return Ok(Transformed::yes(Arc::new(FlatMatchQueryExec {
-                        dataset: node.dataset.clone(),
-                        query: node.query.clone(),
-                        tokenized_query: node.tokenized_query.clone(),
-                        params: node.params.clone(),
-                        unindexed_input: node.unindexed_input.clone(),
-                        candidate_filter: node.candidate_filter.clone(),
-                        base_scorer: node.base_scorer.clone(),
-                        shared_scorer: Some(scorer.clone()),
-                        preset_segments: node.preset_segments.clone(),
-                        document_granularity: node.document_granularity,
-                        document_column: node.document_column.clone(),
-                        schema: node.schema.clone(),
-                        properties: node.properties.clone(),
-                        metrics: node.metrics.clone(),
-                    })
-                        as Arc<dyn ExecutionPlan>));
+                    if let Some(node) = plan.downcast_ref::<CombinedFieldsQueryExec>()
+                        && node
+                            .shared_scorer
+                            .as_ref()
+                            .is_some_and(|shared| Arc::ptr_eq(shared, template))
+                    {
+                        consumers += 1;
+                        let mut node = node.clone();
+                        node.shared_scorer = Some(scorer.clone());
+                        return Ok(Transformed::yes(Arc::new(node) as Arc<dyn ExecutionPlan>));
+                    }
+                    if let Some(node) = plan.downcast_ref::<FlatCombinedFieldsExec>()
+                        && node
+                            .shared_scorer
+                            .as_ref()
+                            .is_some_and(|shared| Arc::ptr_eq(shared, template))
+                    {
+                        producers += 1;
+                        let mut node = node.clone();
+                        node.shared_scorer = Some(scorer.clone());
+                        return Ok(Transformed::yes(Arc::new(node) as Arc<dyn ExecutionPlan>));
+                    }
                 }
                 Ok(Transformed::no(plan))
             })?
             .data;
         if consumers != 1 || producers != 1 {
             return Err(DataFusionError::Internal(format!(
-                "restricted Match corpus requires one scorer consumer and producer, got {consumers} and {producers}"
+                "FTS corpus requires one scorer consumer and producer, got {consumers} and {producers}"
             )));
         }
         Ok(input)
@@ -2765,7 +2817,10 @@ impl SharedFtsScorerExec {
 
 impl DisplayAs for SharedFtsScorerExec {
     fn fmt_as(&self, _format: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "MatchCorpus")
+        f.write_str(match &self.scorer {
+            SharedFtsCorpus::Match(_) => "MatchCorpus",
+            SharedFtsCorpus::Combined(_) => "CombinedFieldsCorpus",
+        })
     }
 }
 
@@ -2803,14 +2858,14 @@ impl ExecutionPlan for SharedFtsScorerExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Internal(format!(
-                "restricted Match corpus requires one input, got {}",
+                "FTS corpus requires one input, got {}",
                 children.len()
             )));
         }
-        let input = children.pop().ok_or_else(|| {
-            DataFusionError::Internal("restricted Match corpus input is missing".to_string())
-        })?;
-        Ok(Arc::new(Self::new(input, self.scorer.clone())))
+        let input = children
+            .pop()
+            .ok_or_else(|| DataFusionError::Internal("FTS corpus input is missing".to_string()))?;
+        Ok(Arc::new(Self::with_corpus(input, self.scorer.clone())))
     }
 
     fn execute(
@@ -2820,20 +2875,20 @@ impl ExecutionPlan for SharedFtsScorerExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         if partition != 0 {
             return Err(DataFusionError::Internal(format!(
-                "restricted Match corpus requires partition 0, got {partition}"
+                "FTS corpus requires partition 0, got {partition}"
             )));
         }
         let input = self.prepare_execution()?;
         if input.output_partitioning().partition_count() != 1 {
             return Err(DataFusionError::Internal(
-                "restricted Match corpus input must have one output partition".to_string(),
+                "FTS corpus input must have one output partition".to_string(),
             ));
         }
         let execution = Arc::new(());
         let result = input.execute(partition, context);
         let snapshot = Self::execution_metrics(self.input.as_ref(), input.as_ref());
         *self.metrics.lock().map_err(|_| {
-            DataFusionError::Internal("restricted Match runtime lock was poisoned".to_string())
+            DataFusionError::Internal("FTS runtime lock was poisoned".to_string())
         })? = SharedFtsExecutionMetrics {
             execution: execution.clone(),
             active: Some(Arc::downgrade(&input)),
@@ -3615,7 +3670,7 @@ impl ExecutionPlan for MatchQueryExec {
 /// scan so term statistics are shared across fields. Per-column boosts are baked
 /// into the blended term frequency, so there is no post-scan boost multiplier or
 /// `AggregateExec(max)`. Emits `(ROW_ID, SCORE)` in [`FTS_SCHEMA`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CombinedFieldsQueryExec {
     dataset: Arc<Dataset>,
     query: CombinedFieldsQuery,
@@ -5048,7 +5103,7 @@ pub enum FlatStatsScope {
 /// planner, exactly as the single-column match path does.
 ///
 /// The input must carry `_rowid` plus every target column of the query.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FlatCombinedFieldsExec {
     dataset: Arc<Dataset>,
     query: CombinedFieldsQuery,
