@@ -438,8 +438,9 @@ ordering of the data will be preserved.
 
 !!! note
 
-    Compaction creates a new version of the table. It does not delete the old
-    version of the table and the files referenced by it.
+    Compaction creates a new version of the table, or two when it both
+    rewrites fragments and repacks columns (see below). It does not delete the
+    old versions of the table and the files referenced by them.
 
 ```python
 import lance
@@ -457,6 +458,38 @@ affected files are no longer part of any ANN index if they were before. Because
 of this, it's recommended to rewrite files before re-building indices.
 
 <!-- TODO: remove this last comment once stable row ids are default. -->
+
+#### Repack columns
+
+Each `add_columns` backfill gives every fragment one more data file, and no
+compaction trigger counts data files, so those files pile up and slow down
+scans and random reads. Compaction can repack a fragment's columns into
+fewer data files instead. A repack moves no rows, so fragment ids, row
+addresses, deletions, data overlays and index coverage stay as they are.
+
+Repacking is off by default. Set `max_data_files_per_fragment`, as a
+`compact_files` argument or as the table config key
+`lance.compaction.max_data_files_per_fragment`, to repack a fragment that holds
+its columns in more files than this.
+
+`scope` limits a run to one kind of work: `"rewrite_fragments"`,
+`"repack_columns"`, or `"all"` (the default).
+
+```python
+dataset.optimize.compact_files(max_data_files_per_fragment=2)
+
+# Only repack.
+dataset.optimize.compact_files(max_data_files_per_fragment=1, scope="repack_columns")
+
+# Per fragment: live data files, file sizes, fields per file, dead-slot ratio,
+# overlay count.
+dataset.stats.column_layout_stats()
+```
+
+A repack only merges files it can empty. Files holding a blob column, a column
+only partly present in the fragment, or spilled row lineage stay as they are,
+so a fragment can stay above the limit. Fragments with legacy (V1) data files
+are not repacked.
 
 ### Cleanup old versions
 

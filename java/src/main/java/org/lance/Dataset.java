@@ -1632,6 +1632,24 @@ public class Dataset implements Closeable {
   private native FragmentStatistics nativeGetFragmentStatistics();
 
   /**
+   * Get per-fragment column-layout statistics for this dataset version: how many data files hold a
+   * column of the schema, each file's size and schema field count, the share of dead field slots,
+   * and how many overlay files each fragment carries. Only manifest metadata is read.
+   *
+   * <p>This is an experimental API. It may change at any time.
+   *
+   * @return column-layout statistics as parallel arrays, in manifest order
+   */
+  public ColumnLayoutStatistics getColumnLayoutStatistics() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetColumnLayoutStatistics();
+    }
+  }
+
+  private native ColumnLayoutStatistics nativeGetColumnLayoutStatistics();
+
+  /**
    * Gets the arrow schema of the dataset.
    *
    * @return the arrow schema

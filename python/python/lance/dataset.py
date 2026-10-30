@@ -6834,9 +6834,15 @@ class LanceOperation:
     class DataReplacement(BaseOperation):
         """
         Operation that replaces existing datafiles in the dataset.
+
+        ``data_change=False`` declares that the new files hold the same values
+        as the files they replace (compaction moved them). Indices then keep
+        their coverage, overlays keep shadowing, and no row is reported as
+        updated.
         """
 
         replacements: List[LanceOperation.DataReplacementGroup]
+        data_change: bool = True
 
     @dataclass
     class DataOverlayFile:
@@ -7975,6 +7981,8 @@ class DatasetOptimizer:
         max_source_bytes: Optional[int] = None,
         excluded_fragment_ids: Optional[list[int]] = None,
         data_storage_version: Optional[str] = None,
+        max_data_files_per_fragment: Optional[int] = None,
+        scope: Optional[Literal["all", "rewrite_fragments", "repack_columns"]] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -7982,6 +7990,8 @@ class DatasetOptimizer:
          * Removes deleted rows from fragments
          * Removes dropped columns from fragments
          * Merges small fragments into larger ones
+         * Repacks a fragment's columns into fewer data files, when
+           ``max_data_files_per_fragment`` asks for it
 
         This method preserves the insertion order of the dataset. This may mean
         it leaves small fragments in the dataset if they are not adjacent to
@@ -8009,6 +8019,7 @@ class DatasetOptimizer:
         ``lance.compaction.max_source_fragments``,
         ``lance.compaction.max_source_rows``,
         ``lance.compaction.max_source_bytes``,
+        ``lance.compaction.max_data_files_per_fragment``,
         ``lance.compaction.data_storage_version``.
 
         Parameters
@@ -8090,6 +8101,18 @@ class DatasetOptimizer:
             Uses the compaction config target when set, otherwise the dataset's
             default write version. Does not change that default or the versions
             of unselected files. V1/V2 cross-family targets are rejected.
+        max_data_files_per_fragment: int, optional
+            Maximum number of data files a fragment may hold columns in before
+            its columns are repacked into fewer files. Each ``add_columns``
+            backfill adds one file per fragment. A repack rewrites only the
+            columns that move and keeps rows, fragment ids and indices as they
+            are. If not specified, uses the manifest config value, or no limit.
+        scope: str, optional
+            Which tasks to plan: ``"rewrite_fragments"`` only rewrites
+            fragments, ``"repack_columns"`` only repacks columns, and
+            ``"all"`` (the default) does both. A run that does both commits
+            the rewrites and the repacks separately; if the repack commit
+            fails, the dataset is left at the rewrite's version.
 
         Returns
         -------
@@ -8118,6 +8141,8 @@ class DatasetOptimizer:
                 max_source_bytes=max_source_bytes,
                 excluded_fragment_ids=excluded_fragment_ids,
                 data_storage_version=data_storage_version,
+                max_data_files_per_fragment=max_data_files_per_fragment,
+                scope=scope,
             ).items()
             if v is not None
         }
@@ -8366,6 +8391,24 @@ class DatasetStats(TypedDict):
     num_small_files: int
 
 
+class FragmentColumnLayoutStats(TypedDict):
+    fragment_id: int
+    #: Data files holding at least one column of the schema. A file holding
+    #: only tombstones, dropped columns, or spilled row lineage is not counted.
+    live_file_count: int
+    #: Recorded size in bytes of each data file, in the fragment's file order;
+    #: ``None`` when the manifest has no size for the file.
+    file_sizes: List[Optional[int]]
+    #: Number of schema fields each data file holds, in the fragment's file order.
+    fields_per_file: List[int]
+    #: Share of the fragment's field slots holding no live data (tombstoned by a
+    #: column update or repack, or left by a dropped column). Spilled row
+    #: lineage is not counted. A fragment rewrite reclaims these slots.
+    dead_slot_ratio: float
+    #: Data overlay files attached to the fragment.
+    overlay_count: int
+
+
 class LanceStats:
     """
     Statistics about a LanceDataset.
@@ -8401,6 +8444,15 @@ class LanceStats:
         Statistics about the data in the dataset.
         """
         return self._ds.data_stats()
+
+    def column_layout_stats(self) -> List[FragmentColumnLayoutStats]:
+        """
+        How each fragment's columns are laid out across data files, in
+        manifest fragment order. Only manifest metadata is read.
+
+        This is an experimental API. It may change at any time.
+        """
+        return self._ds.column_layout_stats()
 
 
 def write_dataset(

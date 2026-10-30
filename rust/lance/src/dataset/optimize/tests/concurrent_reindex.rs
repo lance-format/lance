@@ -1107,6 +1107,7 @@ async fn commit_data_replacement(uri: &str, column: &str, values: ArrayRef) {
         crate::dataset::WriteDestination::Dataset(Arc::new(table)),
         Operation::DataReplacement {
             replacements: vec![replacement],
+            data_change: true,
         },
         Some(read_version),
         None,

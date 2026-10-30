@@ -1881,6 +1881,7 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_packe
         uuid: Uuid::new_v4().hyphenated().to_string(),
         operation: Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, data_file)],
+            data_change: true,
         },
         tag: None,
         transaction_properties: None,
@@ -2062,6 +2063,7 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_neste
         uuid: Uuid::new_v4().hyphenated().to_string(),
         operation: Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, data_file)],
+            data_change: true,
         },
         tag: None,
         transaction_properties: None,

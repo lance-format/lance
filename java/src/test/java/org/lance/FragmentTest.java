@@ -574,6 +574,37 @@ public class FragmentTest {
   }
 
   @Test
+  void testColumnLayoutStatistics(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("column_layout_statistics").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      FragmentMetadata frag1 = testDataset.createNewFragment(10);
+      FragmentMetadata frag2 = testDataset.createNewFragment(5);
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(frag1, frag2));
+      try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
+        ColumnLayoutStatistics stats = dataset.getColumnLayoutStatistics();
+        assertEquals(2, stats.size());
+        assertArrayEquals(
+            dataset.getFragments().stream().mapToLong(f -> f.getId()).toArray(),
+            stats.getFragmentIds());
+        assertArrayEquals(new int[] {1, 1}, stats.getLiveFileCounts());
+        assertArrayEquals(new int[] {2}, stats.getFieldsPerFile()[0]);
+        assertTrue(stats.getFileSizes()[0][0] > 0);
+        assertArrayEquals(new double[] {0.0, 0.0}, stats.getDeadSlotRatios());
+        assertArrayEquals(new int[] {0, 0}, stats.getOverlayCounts());
+
+        // Dropping a column leaves its id in the file that held it.
+        dataset.dropColumns(Collections.singletonList("name"));
+        ColumnLayoutStatistics dropped = dataset.getColumnLayoutStatistics();
+        assertArrayEquals(new int[] {1}, dropped.getFieldsPerFile()[1]);
+        assertArrayEquals(new double[] {0.5, 0.5}, dropped.getDeadSlotRatios());
+      }
+    }
+  }
+
+  @Test
   void testFragmentStatisticsPreservesLegacyMissingRowCount() {
     String historicalPath =
         Path.of("..", "test_data", "v0.7.5", "with_deletions")

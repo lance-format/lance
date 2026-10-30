@@ -2202,6 +2202,7 @@ mod tests {
                 let read_version = dataset.manifest.version;
                 let operation = Operation::DataReplacement {
                     replacements: vec![replacement],
+                    data_change: true,
                 };
                 dataset = Dataset::commit(
                     Arc::new(dataset),
@@ -2676,7 +2677,10 @@ mod tests {
                     let read_version = self.dataset.manifest.version;
                     self.dataset = Dataset::commit(
                         Arc::new(self.dataset.clone()),
-                        Operation::DataReplacement { replacements },
+                        Operation::DataReplacement {
+                            replacements,
+                            data_change: true,
+                        },
                         Some(read_version),
                         None,
                         None,
