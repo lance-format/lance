@@ -206,6 +206,10 @@ impl QuickCacheBackend {
 
 #[async_trait]
 impl CacheBackend for QuickCacheBackend {
+    fn uses_entry_sizes(&self) -> bool {
+        self.capacity > 0
+    }
+
     async fn get_resident(&self, key: &InternalCacheKey) -> Option<CacheEntry> {
         self.priority
             .lock()
