@@ -258,7 +258,7 @@ fn leaf_plan_input(leaf: &PreparedCrossColumnLeaf) -> Result<CompoundLeafPlanInp
     let mut costs_by_position = HashMap::<u32, usize>::new();
     let tokens = leaf.query.tokens();
     for token_index in 0..tokens.len() {
-        let position = tokens.position(token_index);
+        let position = tokens.position_for_query(token_index, leaf.params.phrase_slop.is_some());
         let token = tokens.get_token(token_index);
         if seen_terms.insert((position, token.to_owned())) {
             let frequency = leaf.query.scorer().num_docs_containing_token(token);
@@ -555,7 +555,11 @@ async fn prepare_column_leaves(
                 union_terms.push(token.clone());
             }
         }
-        let has_all_positions = has_all_query_positions(&tokens, final_tokens.as_ref());
+        let has_all_positions = has_all_query_positions(
+            &tokens,
+            final_tokens.as_ref(),
+            effective_params.phrase_slop.is_some(),
+        );
         leaf_metadata.push((
             *leaf_ordinal,
             final_tokens,
@@ -1920,42 +1924,66 @@ mod tests {
         assert_eq!(leaves, vec![(0, 100), (2, 100), (1, 10), (3, 10)]);
     }
 
+    #[rstest::rstest]
+    #[case::aliases(false, false, 10)]
+    #[case::ngram_match(true, false, 3)]
+    #[case::ngram_phrase(true, true, 1010)]
     #[test]
-    fn estimates_generator_cost_by_unique_query_positions() {
+    fn estimates_generator_cost_by_unique_query_positions(
+        #[case] has_independent_groups: bool,
+        #[case] is_phrase_query: bool,
+        #[case] expected_cost: usize,
+    ) {
         let tokens = Tokens::with_positions(
             vec![
                 "rare".to_owned(),
                 "rare_alt".to_owned(),
                 "common".to_owned(),
             ],
-            vec![0, 0, 1],
+            if has_independent_groups {
+                vec![0, 0, 0]
+            } else {
+                vec![0, 0, 1]
+            },
             DocType::Text,
-        );
+        )
+        .with_term_groups(if has_independent_groups {
+            vec![0, 1, 2]
+        } else {
+            vec![0, 0, 1]
+        });
         let leaf = prepared_leaf(
             vec![tokens.clone(), tokens],
             Operator::And,
-            None,
+            is_phrase_query.then_some(0),
             10_000,
             [("rare", 7), ("rare_alt", 3), ("common", 1_000)],
         );
         let input = leaf_plan_input(&leaf).unwrap();
         assert!(input.possible);
-        assert_eq!(input.cost, 10);
+        assert_eq!(input.cost, expected_cost);
         assert_eq!(input.bounds.lower(), 0.0);
         assert_eq!(input.bounds.upper(), f32::INFINITY);
 
         let missing = prepared_leaf(
-            vec![Tokens::with_positions(
-                vec!["rare".to_owned(), "missing".to_owned()],
-                vec![0, 1],
-                DocType::Text,
-            )],
+            vec![
+                Tokens::with_positions(
+                    vec!["rare".to_owned(), "missing".to_owned()],
+                    if has_independent_groups {
+                        vec![0, 0]
+                    } else {
+                        vec![0, 1]
+                    },
+                    DocType::Text,
+                )
+                .with_term_groups(vec![0, 1]),
+            ],
             Operator::And,
-            None,
+            is_phrase_query.then_some(0),
             10_000,
             [("rare", 7), ("missing", 0)],
         );
-        assert!(!leaf_plan_input(&missing).unwrap().possible);
+        assert_eq!(leaf_plan_input(&missing).unwrap().possible, is_phrase_query);
     }
 
     #[test]
