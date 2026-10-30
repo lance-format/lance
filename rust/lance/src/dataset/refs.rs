@@ -21,7 +21,7 @@ use crate::utils::temporal::utc_now;
 use crate::{Error, Result};
 use serde::de::DeserializeOwned;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Formatter;
 use std::path::PathBuf;
@@ -664,8 +664,8 @@ impl Branches<'_> {
                 );
                 return Ok(());
             }
-            let canonical_dataset_dirs = if has_local_paths {
-                match self.collect_canonical_dataset_dirs(&path, branch).await? {
+            let canonical_retained_dirs = if has_local_paths {
+                match self.collect_canonical_retained_dirs(&path, branch).await? {
                     Some(dirs) => dirs,
                     None => return Ok(()),
                 }
@@ -675,7 +675,7 @@ impl Branches<'_> {
             remaining_paths.push(RemainingBranchPath {
                 path,
                 canonical_path,
-                canonical_dataset_dirs,
+                canonical_retained_dirs,
                 is_named_branch: true,
             });
         }
@@ -689,15 +689,15 @@ impl Branches<'_> {
                 );
                 return Ok(());
             }
-            let Some(canonical_dataset_dirs) =
-                self.collect_canonical_dataset_dirs(&path, branch).await?
+            let Some(canonical_retained_dirs) =
+                self.collect_canonical_retained_dirs(&path, branch).await?
             else {
                 return Ok(());
             };
             remaining_paths.push(RemainingBranchPath {
                 path,
                 canonical_path,
-                canonical_dataset_dirs,
+                canonical_retained_dirs,
                 is_named_branch: false,
             });
         }
@@ -819,30 +819,60 @@ impl Branches<'_> {
         }
     }
 
-    async fn collect_canonical_dataset_dirs(
+    async fn collect_canonical_retained_dirs(
         &self,
         path: &Path,
         deleted_branch: &str,
     ) -> Result<Option<Vec<PathBuf>>> {
-        let mut canonical_dataset_dirs = Vec::with_capacity(DATASET_DIRS.len());
+        let mut canonical_retained_dirs = HashSet::with_capacity(DATASET_DIRS.len() + 1);
         for name in self.object_store().read_dir(path.clone()).await? {
-            if !is_dataset_dir(&name) {
+            if name != REFS_DIR && !is_dataset_dir(&name) {
                 continue;
             }
             let dataset_path = path.clone().join(name);
-            let Some(canonical_dir) = self
-                .object_store()
-                .canonicalize_local_path(&dataset_path)
+            if !self
+                .collect_retained_dir_tree(
+                    &dataset_path,
+                    deleted_branch,
+                    &mut canonical_retained_dirs,
+                )
                 .await?
-            else {
-                log::warn!(
-                    "Keeping branch directories after deleting {deleted_branch}: cannot resolve surviving dataset directory at {dataset_path}"
-                );
+            {
                 return Ok(None);
-            };
-            canonical_dataset_dirs.push(canonical_dir);
+            }
         }
-        Ok(Some(canonical_dataset_dirs))
+        Ok(Some(canonical_retained_dirs.into_iter().collect()))
+    }
+
+    async fn collect_retained_dir_tree(
+        &self,
+        path: &Path,
+        deleted_branch: &str,
+        retained: &mut HashSet<PathBuf>,
+    ) -> Result<bool> {
+        let Some(canonical) = self.object_store().canonicalize_local_path(path).await? else {
+            log::warn!(
+                "Keeping branch directories after deleting {deleted_branch}: cannot resolve retained directory at {path}"
+            );
+            return Ok(false);
+        };
+        if !retained.insert(canonical) {
+            return Ok(true);
+        }
+        let entries = self.object_store().list_with_delimiter(Some(path)).await?;
+        for child in entries
+            .common_prefixes
+            .into_iter()
+            .filter(|child| child != &path && child.prefix_matches(&path))
+        {
+            if !self
+                .collect_retained_dir_tree(&child, deleted_branch, retained)
+                .await?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     async fn recursive_delete_would_touch_retained_data(
@@ -862,7 +892,7 @@ impl Branches<'_> {
             };
             if remaining_paths.iter().any(|remaining| {
                 remaining
-                    .canonical_dataset_dirs
+                    .canonical_retained_dirs
                     .iter()
                     .any(|directory| canonical_file.starts_with(directory))
             }) {
@@ -954,7 +984,7 @@ impl Branches<'_> {
             {
                 return Ok(SharedBranchPath::Remaining);
             }
-            if remaining.canonical_dataset_dirs.iter().any(|directory| {
+            if remaining.canonical_retained_dirs.iter().any(|directory| {
                 canonical_path
                     .as_ref()
                     .is_some_and(|current| current.starts_with(directory))
@@ -969,7 +999,7 @@ impl Branches<'_> {
                 .is_some_and(|(path, remaining)| remaining.starts_with(path));
             let has_dataset_dir_descendant = canonical_path.as_ref().is_some_and(|current| {
                 remaining
-                    .canonical_dataset_dirs
+                    .canonical_retained_dirs
                     .iter()
                     .any(|directory| directory.starts_with(current))
             });
@@ -998,7 +1028,7 @@ impl Branches<'_> {
 struct RemainingBranchPath {
     path: Path,
     canonical_path: Option<PathBuf>,
-    canonical_dataset_dirs: Vec<PathBuf>,
+    canonical_retained_dirs: Vec<PathBuf>,
     is_named_branch: bool,
 }
 
@@ -1371,6 +1401,8 @@ pub fn check_valid_branch(branch_name: &str) -> Result<()> {
     }
     Ok(())
 }
+
+const REFS_DIR: &str = "_refs";
 
 // Nested branches cannot use these names because they overlap
 // directories owned by their ancestors.

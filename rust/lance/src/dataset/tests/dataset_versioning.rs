@@ -1913,6 +1913,289 @@ async fn test_delete_branch_preserves_symlink_routed_child_namespace() {
     }
 }
 
+#[cfg(unix)]
+#[rstest]
+#[case::direct_nested(false, true)]
+#[case::object_store_nested(true, true)]
+#[case::direct_alias(false, false)]
+#[case::object_store_alias(true, false)]
+#[tokio::test]
+async fn test_delete_branch_preserves_nested_dataset_data(
+    #[case] use_object_store: bool,
+    #[case] relocate_into_deleted: bool,
+    #[values(false, true)] deep_alias: bool,
+    #[values(false, true)] has_child: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        format!("file-object-store://{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    let mut parent = root.create_branch("parent", 1, None).await.unwrap();
+    let mut deleted = root.create_branch("a", 1, None).await.unwrap();
+    deleted.append(id_rows(20, 1), None).await.unwrap();
+    if has_child {
+        root.create_branch("a/b", 1, None).await.unwrap();
+    }
+    parent.append(id_rows(10, 1), None).await.unwrap();
+
+    let parent_data = tempdir.std_path().join("tree/parent/data");
+    let container = tempdir.std_path().join(if deep_alias {
+        "tree/a/container"
+    } else {
+        "tree/a"
+    });
+    std::fs::create_dir_all(&container).unwrap();
+    let nested_data = container.join("parent-data");
+    if relocate_into_deleted {
+        std::fs::rename(&parent_data, &nested_data).unwrap();
+        std::os::unix::fs::symlink(&nested_data, &parent_data).unwrap();
+    } else {
+        std::os::unix::fs::symlink(&parent_data, &nested_data).unwrap();
+    }
+
+    for after_deletion in [false, true] {
+        if after_deletion {
+            root.delete_branch("a").await.unwrap();
+            assert!(!root.list_branches().await.unwrap().contains_key("a"));
+        }
+        let mut parent = Dataset::open(&uri)
+            .await
+            .unwrap()
+            .checkout_branch("parent")
+            .await
+            .unwrap();
+        let batch = parent.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+            &[0, 10]
+        );
+        if after_deletion {
+            parent.append(id_rows(30, 1), None).await.unwrap();
+            assert_eq!(parent.count_rows(None).await.unwrap(), 3);
+        }
+    }
+    let error = root.checkout_branch("a").await.unwrap_err();
+    assert!(matches!(
+        error,
+        Error::NotFound { .. } | Error::DatasetNotFound { .. }
+    ));
+    assert!(
+        error
+            .to_string()
+            .replace('\\', "/")
+            .contains(deleted.base.as_ref()),
+        "{error}"
+    );
+    let mut recreated = root.create_branch("a", 1, None).await.unwrap();
+    recreated.append(id_rows(40, 1), None).await.unwrap();
+    assert_eq!(recreated.count_rows(None).await.unwrap(), 2);
+    if has_child {
+        let mut child = root.checkout_branch("a/b").await.unwrap();
+        child.append(id_rows(50, 1), None).await.unwrap();
+        let batch = child.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+            &[0, 50]
+        );
+    }
+}
+
+#[cfg(unix)]
+#[rstest]
+#[case::data("data")]
+#[case::versions("_versions")]
+#[tokio::test]
+async fn test_delete_branch_preserves_aliased_main_dataset(
+    #[case] dataset_dir: &str,
+    #[values(false, true)] use_object_store: bool,
+    #[values(false, true)] has_child: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        format!("file-object-store://{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    root.append(id_rows(10, 1), None).await.unwrap();
+    std::fs::create_dir_all(tempdir.std_path().join("tree")).unwrap();
+    std::os::unix::fs::symlink(
+        tempdir.std_path().join(dataset_dir),
+        tempdir.std_path().join("tree/a"),
+    )
+    .unwrap();
+    root.create_branch("a", 1, None).await.unwrap();
+    if has_child {
+        root.create_branch("a/b", 1, None).await.unwrap();
+    }
+
+    for after_deletion in [false, true] {
+        if after_deletion {
+            root.delete_branch("a").await.unwrap();
+            assert!(!root.list_branches().await.unwrap().contains_key("a"));
+        }
+        let mut main = Dataset::open(&uri).await.unwrap();
+        let batch = main.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+            &[0, 10]
+        );
+        if after_deletion {
+            main.append(id_rows(20, 1), None).await.unwrap();
+            let batch = main.scan().try_into_batch().await.unwrap();
+            assert_eq!(
+                batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+                &[0, 10, 20]
+            );
+        }
+    }
+    if has_child {
+        let mut child = root.checkout_branch("a/b").await.unwrap();
+        child.append(id_rows(30, 1), None).await.unwrap();
+        let batch = child.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values().as_ref(),
+            &[0, 30]
+        );
+    }
+}
+
+#[cfg(unix)]
+#[rstest]
+#[tokio::test]
+async fn test_gatekeeper_delete_alias_preserves_shared_refs(
+    #[values(false, true)] use_object_store: bool,
+    #[values(false, true)] deep_alias: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        format!("file-object-store://{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    root.tags().create("checkpoint", 1).await.unwrap();
+    let mut survivor = root.create_branch("survivor", 1, None).await.unwrap();
+    survivor.append(id_rows(10, 1), None).await.unwrap();
+    if !deep_alias {
+        std::os::unix::fs::symlink(
+            tempdir.std_path().join("_refs"),
+            tempdir.std_path().join("tree/a"),
+        )
+        .unwrap();
+    }
+    root.create_branch("a", 1, None).await.unwrap();
+    root.create_branch("a/b", 1, None).await.unwrap();
+    if deep_alias {
+        let container = tempdir.std_path().join("tree/a/container");
+        std::fs::create_dir_all(&container).unwrap();
+        std::os::unix::fs::symlink(
+            tempdir.std_path().join("_refs"),
+            container.join("shared-refs"),
+        )
+        .unwrap();
+    }
+    assert!(root.list_branches().await.unwrap().contains_key("survivor"));
+    assert!(root.list_branches().await.unwrap().contains_key("a/b"));
+    assert!(root.tags().list().await.unwrap().contains_key("checkpoint"));
+    assert_eq!(
+        Dataset::open(&uri)
+            .await
+            .unwrap()
+            .checkout_branch("survivor")
+            .await
+            .unwrap()
+            .scan()
+            .try_into_batch()
+            .await
+            .unwrap()["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .as_ref(),
+        &[0, 10],
+    );
+
+    root.delete_branch("a").await.unwrap();
+
+    let fresh = Dataset::open(&uri).await.unwrap();
+    let branches = fresh.list_branches().await.unwrap();
+    let tags = fresh.tags().list().await.unwrap();
+    assert!(
+        branches.contains_key("survivor")
+            && branches.contains_key("a/b")
+            && tags.contains_key("checkpoint"),
+        "surviving refs lost: branches={:?}, tags={:?}",
+        branches.keys().collect::<Vec<_>>(),
+        tags.keys().collect::<Vec<_>>(),
+    );
+}
+
+#[cfg(unix)]
+#[rstest]
+#[tokio::test]
+async fn test_gatekeeper_delete_preserves_nested_blob_target(
+    #[values(false, true)] use_object_store: bool,
+    #[values(false, true)] relocate_owned_child: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        format!("file-object-store://{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let owned_path = tempdir.std_path().join("_blobs/nested");
+    std::fs::create_dir_all(&owned_path).unwrap();
+    std::fs::write(owned_path.join("payload.blob"), b"payload").unwrap();
+    let mut values = crate::blob::BlobDescriptorArrayBuilder::new("blob");
+    values
+        .push(crate::blob::BlobDescriptor::Managed {
+            base_id: None,
+            uri: "_blobs/nested/payload.blob".to_string(),
+            offset: 0,
+            size: 7,
+        })
+        .unwrap();
+    let (field, values) = values.finish().unwrap().into_parts();
+    let schema = Arc::new(crate::dataset::blob::test_util::managed_blob_schema(vec![
+        field,
+    ]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
+    let mut root = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    root.create_branch("a", 1, None).await.unwrap();
+    root.create_branch("a/b", 1, None).await.unwrap();
+    let container = tempdir.std_path().join("tree/a/container");
+    std::fs::create_dir_all(&container).unwrap();
+    let target = container.join("blob-payload");
+    if relocate_owned_child {
+        std::fs::rename(&owned_path, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &owned_path).unwrap();
+    } else {
+        std::os::unix::fs::symlink(&owned_path, &target).unwrap();
+    }
+
+    for after_deletion in [false, true] {
+        if after_deletion {
+            root.delete_branch("a").await.unwrap();
+        }
+        let fresh = Arc::new(Dataset::open(&uri).await.unwrap());
+        let handles = fresh.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        let bytes = handles[0].as_ref().unwrap().read().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"payload");
+    }
+}
+
 #[tokio::test]
 async fn test_branch() {
     let tempdir = TempDir::default();
