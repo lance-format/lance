@@ -1121,8 +1121,9 @@ impl<'a> IntoIterator for &'a Tokens {
 
 pub fn collect_query_tokens(text: &str, tokenizer: &mut Box<dyn LanceTokenizer>) -> Tokens {
     let token_type = tokenizer.doc_type();
+    let has_independent_query_tokens = tokenizer.query_tokens_are_independent();
     let stream = tokenizer.token_stream_for_search(text);
-    collect_tokens(stream, token_type)
+    collect_tokens(stream, token_type, has_independent_query_tokens)
 }
 
 /// Tokenize search text, returning tokenizer-specific query syntax errors.
@@ -1131,23 +1132,29 @@ pub fn try_collect_query_tokens(
     tokenizer: &mut Box<dyn LanceTokenizer>,
 ) -> Result<Tokens> {
     let token_type = tokenizer.doc_type();
+    let has_independent_query_tokens = tokenizer.query_tokens_are_independent();
     let stream = tokenizer.token_stream_for_search(text);
-    try_collect_tokens(stream, token_type)
+    try_collect_tokens(stream, token_type, has_independent_query_tokens)
 }
 
-fn collect_tokens(mut stream: lance_tokenizer::BoxTokenStream<'_>, token_type: DocType) -> Tokens {
+fn collect_tokens(
+    mut stream: lance_tokenizer::BoxTokenStream<'_>,
+    token_type: DocType,
+    has_independent_query_tokens: bool,
+) -> Tokens {
     let mut tokens = Vec::new();
     let mut positions = Vec::new();
     while let Some(token) = stream.next() {
         tokens.push(token.text.clone());
         positions.push(token.position as u32);
     }
-    finish_tokens(tokens, positions, token_type)
+    finish_tokens(tokens, positions, token_type, has_independent_query_tokens)
 }
 
 fn try_collect_tokens(
     mut stream: lance_tokenizer::BoxTokenStream<'_>,
     token_type: DocType,
+    has_independent_query_tokens: bool,
 ) -> Result<Tokens> {
     let mut tokens = Vec::new();
     let mut positions = Vec::new();
@@ -1158,10 +1165,23 @@ fn try_collect_tokens(
         tokens.push(token.text.clone());
         positions.push(token.position as u32);
     }
-    Ok(finish_tokens(tokens, positions, token_type))
+    Ok(finish_tokens(
+        tokens,
+        positions,
+        token_type,
+        has_independent_query_tokens,
+    ))
 }
 
-fn finish_tokens(tokens: Vec<String>, mut positions: Vec<u32>, token_type: DocType) -> Tokens {
+fn finish_tokens(
+    tokens: Vec<String>,
+    mut positions: Vec<u32>,
+    token_type: DocType,
+    has_independent_query_tokens: bool,
+) -> Tokens {
+    if has_independent_query_tokens {
+        return Tokens::new(tokens, token_type);
+    }
     if let Some(min_position) = positions.iter().copied().min() {
         // Token streams such as Jieba's search mode may emit overlapping terms out of position
         // order. Rebase from the minimum so every position remains valid while preserving gaps.
@@ -1286,6 +1306,41 @@ pub fn fill_fts_query_column(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[rstest::rstest]
+    #[case::ngram(
+        crate::scalar::inverted::InvertedIndexParams::default()
+            .base_tokenizer("ngram".into()).ngram_min_length(2).ngram_max_length(2),
+        "abcd", vec!["ab", "bc", "cd"], vec![0, 1, 2], vec![0, 0, 0]
+    )]
+    #[case::code(
+        crate::scalar::inverted::InvertedIndexParams::code().split_identifiers(true),
+        "getUserName", vec!["getusername", "get", "user", "name"],
+        vec![0, 0, 1, 2], vec![0, 0, 1, 2]
+    )]
+    #[test]
+    fn test_collect_query_tokens_independent_terms_and_alternatives(
+        #[case] params: crate::scalar::inverted::InvertedIndexParams,
+        #[case] query: &str,
+        #[case] expected_tokens: Vec<&str>,
+        #[case] expected_query_positions: Vec<u32>,
+        #[case] expected_doc_positions: Vec<usize>,
+    ) {
+        let mut tokenizer = params.build().unwrap();
+        for tokens in [
+            collect_query_tokens(query, &mut tokenizer),
+            try_collect_query_tokens(query, &mut tokenizer).unwrap(),
+        ] {
+            assert_eq!(tokens.tokens, expected_tokens);
+            assert_eq!(tokens.positions, expected_query_positions);
+        }
+        let mut stream = tokenizer.token_stream_for_doc(query);
+        let mut doc_positions = Vec::new();
+        while let Some(token) = stream.next() {
+            doc_positions.push(token.position);
+        }
+        assert_eq!(doc_positions, expected_doc_positions);
+    }
 
     #[cfg(feature = "tokenizer-jieba")]
     #[test]
