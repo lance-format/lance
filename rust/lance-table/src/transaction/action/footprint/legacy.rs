@@ -45,7 +45,7 @@ impl Footprint {
                 ..
             } => {
                 for fragment in updated_fragments {
-                    footprint.replace_fragment(fragment.id);
+                    footprint.restate_with_deletions_added(fragment.id);
                 }
                 for fragment in deleted_fragment_ids {
                     footprint.remove_fragment(*fragment);
@@ -62,9 +62,13 @@ impl Footprint {
             } => {
                 for fragment in removed_fragment_ids {
                     footprint.remove_fragment(*fragment);
+                    // Every row moved out, rather than deleted.
+                    if !new_fragments.is_empty() {
+                        footprint.relocate_rows_out_of(*fragment);
+                    }
                 }
                 for fragment in updated_fragments {
-                    footprint.replace_fragment(fragment.id);
+                    footprint.restate_with_deletions_added(fragment.id);
                     // Already inside the fragment's region, but named so a key
                     // assertion over one of these columns sees the rewrite.
                     if !fields_modified.is_empty() {
@@ -80,9 +84,10 @@ impl Footprint {
                 footprint.append(new_fragments);
                 footprint.update_facts(inserted_rows_filter.as_ref(), compacted_sstables);
             }
+            // The replacement swaps files in the fragment as it is at commit,
+            // not in a post-image of it.
             Operation::DataReplacement { replacements } => {
                 for replacement in replacements {
-                    footprint.replace_fragment(replacement.0);
                     footprint.write_field_data(
                         Ref::Committed(replacement.0),
                         field_refs(&replacement.1.fields),
@@ -113,7 +118,7 @@ impl Footprint {
                 frag_reuse_index,
             } => {
                 for fragment in groups.iter().flat_map(|group| &group.old_fragments) {
-                    footprint.remove_fragment(fragment.id);
+                    footprint.move_rows_out_of(fragment.id);
                 }
                 // The rows are moved, not written, so the values are not new;
                 // but they are still laid out in the types they were read in.
@@ -257,6 +262,7 @@ impl Footprint {
             }
             Operation::Update {
                 updated_fragments,
+                removed_fragment_ids,
                 new_fragments,
                 fields_modified,
                 inserted_rows_filter,
@@ -281,11 +287,12 @@ impl Footprint {
                     self.insert_rows();
                     // A row-moving update deletes rows from these fragments and
                     // writes them anew elsewhere, taking the values as they
-                    // were. A column written into one of them since it read
-                    // misses the moved rows, so the move writes the whole of
-                    // what the fragment's files hold.
-                    for fragment in updated_fragments {
-                        self.write(Coordinate::FragmentFiles(fragment.id));
+                    // were.
+                    for fragment in updated_fragments.iter().map(|fragment| fragment.id) {
+                        self.relocate_rows_out_of(fragment);
+                    }
+                    for fragment in removed_fragment_ids {
+                        self.relocate_rows_out_of(*fragment);
                     }
                 }
                 self.update_facts(inserted_rows_filter.as_ref(), compacted_sstables);
@@ -306,6 +313,16 @@ impl Footprint {
             } => self.rewrite_facts(groups, rewritten_indices, frag_reuse_index.is_some()),
             _ => {}
         }
+    }
+
+    /// A fragment a `Delete` or `Update` restates whole from its read version,
+    /// with deletions added. The restatement is what legacy merges a
+    /// concurrent deletion into, row by row (see
+    /// [`Overlap::Deletions`](super::Overlap::Deletions)), so the deletions
+    /// inside the restated region are taken as an addition.
+    fn restate_with_deletions_added(&mut self, fragment: u64) {
+        self.replace_fragment(fragment);
+        self.deletions_added.insert(fragment);
     }
 
     /// Fragments added with rows that were not in the dataset before. Their
@@ -432,7 +449,7 @@ mod tests {
     use crate::transaction::action::test_support::added_field;
     use crate::transaction::action::{
         Action, AddDataFile, AddField, AddFragment, AddIndexSegment, AlterField, AssertUniqueKeys,
-        CompositeOperation, TombstoneFieldData, UserStep, Verdict,
+        CompositeOperation, Overlap, SetDeletionFile, TombstoneFieldData, UserStep, Verdict,
     };
     use crate::transaction::test_support::{
         default_build_config, overlay_with_field, sample_index_metadata, sample_manifest,
@@ -1210,6 +1227,63 @@ mod tests {
             num_deleted_rows: Some(1),
             base_id: None,
         }
+    }
+
+    /// A legacy `Delete` of fragment 0 that leaves it `deletion_file`.
+    fn delete_leaving(deletion_file: Option<DeletionFile>) -> Operation {
+        let mut restated = two_column_fragment(0);
+        restated.deletion_file = deletion_file;
+        Operation::Delete {
+            updated_fragments: vec![restated],
+            deleted_fragment_ids: vec![],
+            predicate: "a = 0".into(),
+        }
+    }
+
+    /// Deletions added to one fragment merge row by row whichever side is a
+    /// named operation, as two legacy deletes do. One that clears the
+    /// fragment's deletions collides instead.
+    #[test]
+    fn test_additions_to_deletions_rebase_across_forms() {
+        let before = two_column_manifest();
+        let add_deletions = actions(vec![Action::SetDeletionFile(SetDeletionFile {
+            fragment: 0,
+            deletion_file: Some(deletion_file()),
+            data_change: true,
+            base: None,
+        })]);
+        let merged = [Overlap::Deletions { fragment: 0 }];
+        let verdict = |ours: &Operation, theirs: Operation| {
+            let (transaction, after) = commit(&before, theirs);
+            Footprint::pending(&Transaction::new(2, ours.clone(), None), &before)
+                .compare(&Footprint::committed(&transaction, &before, &after))
+        };
+
+        let legacy_over_actions = verdict(
+            &delete_leaving(Some(deletion_file())),
+            add_deletions.clone(),
+        );
+        assert!(
+            matches!(&legacy_over_actions, Verdict::Rebase(overlaps) if overlaps == &merged),
+            "{legacy_over_actions:?}"
+        );
+        let actions_over_legacy = verdict(&add_deletions, delete_leaving(Some(deletion_file())));
+        assert!(
+            matches!(&actions_over_legacy, Verdict::Rebase(overlaps) if overlaps == &merged),
+            "{actions_over_legacy:?}"
+        );
+
+        let mut cleared = before.clone();
+        let mut fragment = two_column_fragment(0);
+        fragment.deletion_file = Some(deletion_file());
+        cleared.fragments = Arc::new(vec![fragment, two_column_fragment(1)]);
+        let (transaction, after) = commit(&cleared, delete_leaving(None));
+        let over_a_clear = Footprint::pending(&Transaction::new(2, add_deletions, None), &cleared)
+            .compare(&Footprint::committed(&transaction, &cleared, &after));
+        assert!(
+            matches!(over_a_clear, Verdict::Conflict),
+            "{over_a_clear:?}"
+        );
     }
 
     /// A committed named operation is held to what its commit changed, not to

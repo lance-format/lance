@@ -77,8 +77,18 @@ impl SetDeletionFile {
 
     /// The fragment's deletions, which is a distinct coordinate from the data of
     /// any field in it: deleting rows and re-encoding a column commute.
+    ///
+    /// A new deletion file is taken to add deletions, which merge with another
+    /// set's row by row (see [`Overlap::Deletions`](super::Overlap::Deletions));
+    /// the rebase reads both files and refuses one that dropped a deletion.
+    /// Clearing the file removes deletions, and collides with any other change
+    /// to them.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        footprint.write(Coordinate::FragmentDeletions(self.fragment));
+        if self.deletion_file.is_some() {
+            footprint.add_deletions(self.fragment);
+        } else {
+            footprint.write(Coordinate::FragmentDeletions(self.fragment));
+        }
     }
 }
 

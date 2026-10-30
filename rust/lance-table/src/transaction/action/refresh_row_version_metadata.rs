@@ -61,22 +61,14 @@ impl RefreshRowVersionMetadata {
         false
     }
 
-    /// Each fragment's version sequence, whole. The sequence is one value per
-    /// fragment, restamped for every row at once, so two sets refreshing the
-    /// same fragment collide even when the column rewrites that prompted them
-    /// touched different fields. Over-strict, and cheap: the alternative is a
-    /// sequence that records which columns each row's version speaks for.
-    ///
-    /// An [`AddOverlays`](super::AddOverlays) restamps the same sequence
-    /// without claiming it, so the two do not collide: the overlay sets only
-    /// the rows it covers and keeps whatever the rest hold when it applies,
-    /// which composes with a refresh in either order. Two refreshes would
-    /// compose too -- each stamps every row, and the later version wins -- so
-    /// their conflict is part of the same over-strictness, tracked in
-    /// <https://github.com/lance-format/lance/issues/10189>.
+    /// Part of each fragment's version sequences. The refresh restamps every
+    /// row with the version its commit produces, at apply, so two refreshes of
+    /// one fragment compose in either order: each row ends up stamped with the
+    /// later commit, which is when it last changed. A set that installs the
+    /// sequences whole still collides with it.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         for fragment_id in &self.fragment_ids {
-            footprint.write(Coordinate::FragmentRowVersions(*fragment_id));
+            footprint.write_part(Coordinate::FragmentRowVersions(*fragment_id));
         }
     }
 }
@@ -108,7 +100,8 @@ mod tests {
         apply, backed_manifest, footprint, one_column_file,
     };
     use crate::transaction::action::{
-        Action, AddDataFile, AddFragment, FieldRef, Ref, RemoveFragment, TombstoneFieldData,
+        Action, AddDataFile, AddFragment, CompositeOperation, FieldRef, Ref, RemoveFragment,
+        TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::make_stable_row_id_manifest;
     use lance_file::version::ConcreteFileVersion;
@@ -223,18 +216,33 @@ mod tests {
         );
     }
 
+    /// Two refreshes of one fragment land in either order with every row
+    /// stamped by the later commit, which is what landing them one after the
+    /// other gives, so they do not conflict.
     #[test]
-    fn test_two_writers_refreshing_the_same_fragment_conflict() {
+    fn test_two_writers_refreshing_the_same_fragment_compose() {
+        let footprint = |actions| {
+            Footprint::from(&CompositeOperation::new(vec![UserStep::new(
+                "step", actions,
+            )]))
+        };
         let ours = footprint(vec![refresh(vec![0])]);
         let same = footprint(vec![refresh(vec![0, 1])]);
-        let other = footprint(vec![refresh(vec![1])]);
+        assert!(!ours.conflicts_with(&same));
+        assert!(!same.conflicts_with(&ours));
 
-        assert!(ours.conflicts_with(&same));
-        assert!(!ours.conflicts_with(&other));
+        let manifest = manifest_with_rows(3);
+        let once = apply(&manifest, vec![refresh(vec![0])]).unwrap();
+        let twice = apply(&once, vec![refresh(vec![0])]).unwrap();
+        assert_eq!(
+            last_updated_versions(&twice.fragments[0]),
+            vec![manifest.version + 2; 3]
+        );
     }
 
-    /// The version sequence lives in the fragment, so a concurrent removal of
-    /// it leaves nothing to restamp, in either order.
+    /// The version sequence lives in the fragment, so a removal landing first
+    /// leaves nothing to restamp. Landing second, the removal discards the
+    /// restamp along with the fragment.
     #[test]
     fn test_refreshing_a_fragment_a_concurrent_writer_removes_conflicts() {
         let ours = footprint(vec![refresh(vec![0])]);
@@ -246,7 +254,7 @@ mod tests {
         };
 
         assert!(ours.conflicts_with(&removal(0)));
-        assert!(removal(0).conflicts_with(&ours));
+        assert!(!removal(0).conflicts_with(&ours));
         assert!(!ours.conflicts_with(&removal(1)));
         assert!(!removal(1).conflicts_with(&ours));
     }

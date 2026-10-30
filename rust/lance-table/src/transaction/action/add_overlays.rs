@@ -112,9 +112,8 @@ impl AddOverlays {
         self.data_change
     }
 
-    /// A partial write of each overlaid field's overlays in the fragment, a
-    /// requirement on each of those fields' definitions, and a partial write of
-    /// the fragment's deletions.
+    /// A partial write of each overlaid field's overlays in the fragment, and a
+    /// requirement on each of those fields' definitions.
     ///
     /// Partial, because two concurrent overlays over the same cells both land
     /// and the newer `committed_version` decides which value wins. A full
@@ -130,26 +129,19 @@ impl AddOverlays {
     /// no longer has. A fragment this operation mints still requires it, since
     /// the overlay may supply a field the fragment's base files do not.
     ///
-    /// The overlay leaves the fragment's deletions alone, but marks them as a
-    /// conflict point (see [`Footprint::write_part_of_deletions`]): the marker
-    /// collides with any full deletion write on the fragment, in either order,
-    /// and commutes with other overlays. It exists for the row-moving update
-    /// race. An update deletes rows from the fragment and re-adds them in a new
-    /// fragment built from the pre-overlay base, so the overlay's values for
-    /// those rows are lost whichever commits first. A plain delete conflicts
-    /// too, because the footprint cannot tell it from a row-moving update.
+    /// A plain delete of overlaid rows leaves the overlay inert over them, so
+    /// the two commute. A concurrent row-moving update does not: it re-creates
+    /// the rows it moves in another fragment, from the base the overlay never
+    /// touched, losing the overlay's values for them. That is decided row by
+    /// row, as [`Overlap::RowsMovedUnderOverlay`](super::Overlap::RowsMovedUnderOverlay).
     ///
-    /// TODO(https://github.com/lance-format/lance/issues/10189): that is an
-    /// over-conflict next to the legacy resolver's row-level check of moved
-    /// rows against overlay coverage; restore it as part of conflict parity.
-    ///
-    /// A fragment this operation mints has no cells or deletions a concurrent
-    /// writer can name.
+    /// A fragment this operation mints has no cells or rows a concurrent writer
+    /// can name.
     ///
     /// The rows' last-updated versions are restamped without a claim on
-    /// [`Coordinate::FragmentRowVersions`](super::Coordinate::FragmentRowVersions);
-    /// see [`RefreshRowVersionMetadata`](super::RefreshRowVersionMetadata)'s
-    /// footprint for why.
+    /// [`Coordinate::FragmentRowVersions`](super::Coordinate::FragmentRowVersions):
+    /// the overlay sets only the rows it covers and keeps whatever the rest
+    /// hold when it applies, which composes with a refresh in either order.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         let fields = self
             .overlays
@@ -160,9 +152,6 @@ impl AddOverlays {
             .filter(|field| *field >= 0)
             .map(FieldRef::Committed);
         footprint.write_partial_field_data(self.fragment, fields);
-        if let Some(fragment) = self.fragment.committed() {
-            footprint.write_part_of_deletions(fragment);
-        }
     }
 }
 
@@ -200,7 +189,10 @@ impl TryFrom<pb_actions::AddOverlays> for AddOverlays {
 mod tests {
     use super::*;
     use crate::format::overlay::OverlayCoverage;
-    use crate::format::{DataFile, Manifest, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowIdMeta};
+    use crate::format::{
+        DataFile, DeletionFile, DeletionFileType, Manifest, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+        RowIdMeta,
+    };
     use crate::rowids::version::{
         LoadedRowLineage, RowDatasetVersionMeta, RowDatasetVersionSequence, SpilledRowLineage,
         refresh_row_latest_update_meta_for_full_frag_rewrite_cols,
@@ -211,8 +203,8 @@ mod tests {
     };
     use crate::transaction::action::{
         Action, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage, AlterField,
-        CompositeOperation, DropField, FieldRef, RemoveFragment, SetDeletionFile,
-        TombstoneFieldData, UserStep,
+        CompositeOperation, DropField, FieldRef, Overlap, RemoveFragment, SetDeletionFile,
+        TombstoneFieldData, UserStep, Verdict,
     };
     use crate::transaction::test_support::{default_build_config, make_stable_row_id_manifest};
     use crate::transaction::{Operation, Transaction};
@@ -744,28 +736,69 @@ mod tests {
         );
     }
 
-    /// A concurrent row-moving update deletes rows from the fragment and
-    /// re-creates them in a new one built from the pre-overlay base, so the
-    /// overlay's values for them would be lost. The footprint cannot tell a
-    /// move from a plain delete, so any deletion-file change on the fragment
-    /// collides, in both orders -- not a requirement, because the update
-    /// landing second is the lossy order. Two overlays still commute.
+    /// A plain delete of overlaid rows leaves the overlay inert over them, in
+    /// either order, as legacy lets a `DataOverlay` and a `Delete` land
+    /// together. A row-moving update re-creates the rows it moves in a new
+    /// fragment, built from the base the overlay never touched, so the two
+    /// overlap, row by row, in either order.
     #[test]
-    fn test_an_overlay_conflicts_with_a_deletion_of_the_same_fragment() {
-        let delete = |fragment: u64| {
-            footprint(vec![Action::SetDeletionFile(SetDeletionFile {
-                fragment,
-                deletion_file: None,
+    fn test_an_overlay_against_deletions_of_the_same_fragment() {
+        let delete = footprint(vec![Action::SetDeletionFile(SetDeletionFile {
+            fragment: 0,
+            deletion_file: Some(DeletionFile {
+                read_version: 1,
+                id: 1,
+                file_type: DeletionFileType::Array,
+                num_deleted_rows: Some(1),
+                base_id: None,
+            }),
+            data_change: true,
+            base: None,
+        })]);
+        let mut moving_update = vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 1,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            Action::SetDeletionFile(SetDeletionFile {
+                fragment: 0,
+                deletion_file: Some(DeletionFile {
+                    read_version: 1,
+                    id: 1,
+                    file_type: DeletionFileType::Array,
+                    num_deleted_rows: Some(1),
+                    base_id: None,
+                }),
                 data_change: true,
                 base: None,
-            })])
-        };
+            }),
+        ];
         let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
 
-        assert!(overlaid.conflicts_with(&delete(0)));
-        assert!(delete(0).conflicts_with(&overlaid));
-        assert!(!overlaid.conflicts_with(&delete(1)));
-        assert!(!delete(1).conflicts_with(&overlaid));
+        assert!(matches!(overlaid.compare(&delete), Verdict::Compatible));
+        assert!(matches!(delete.compare(&overlaid), Verdict::Compatible));
+
+        let moved = [Overlap::RowsMovedUnderOverlay { fragment: 0 }];
+        let update = footprint(moving_update.clone());
+        assert!(
+            matches!(overlaid.compare(&update), Verdict::Rebase(overlaps) if overlaps == moved)
+        );
+        assert!(
+            matches!(update.compare(&overlaid), Verdict::Rebase(overlaps) if overlaps == moved)
+        );
+
+        moving_update[1] = Action::SetDeletionFile(SetDeletionFile {
+            fragment: 1,
+            deletion_file: None,
+            data_change: true,
+            base: None,
+        });
+        let elsewhere = footprint(moving_update);
+        assert!(matches!(overlaid.compare(&elsewhere), Verdict::Compatible));
     }
 
     #[test]
@@ -820,16 +853,24 @@ mod tests {
         assert!(tighten.conflicts_with(&overlaid));
     }
 
+    /// An overlay cannot land on a fragment that was removed. A delete that
+    /// removes the fragment landing after the overlay discards it along with
+    /// the rows it covered, as legacy lets a `Delete` land over a
+    /// `DataOverlay`; a move (a compaction) carries the rows over without it.
     #[test]
-    fn test_overlaying_a_fragment_a_concurrent_writer_removes_conflicts() {
-        let ours = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
-        let theirs = footprint(vec![Action::RemoveFragment(RemoveFragment {
-            fragment: Ref::Committed(0),
-            data_change: true,
-        })]);
+    fn test_overlaying_a_fragment_a_concurrent_writer_removes() {
+        let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
+        let removal = |data_change| {
+            footprint(vec![Action::RemoveFragment(RemoveFragment {
+                fragment: Ref::Committed(0),
+                data_change,
+            })])
+        };
 
-        assert!(ours.conflicts_with(&theirs));
-        assert!(theirs.conflicts_with(&ours));
+        assert!(overlaid.conflicts_with(&removal(true)));
+        assert!(overlaid.conflicts_with(&removal(false)));
+        assert!(!removal(true).conflicts_with(&overlaid));
+        assert!(removal(false).conflicts_with(&overlaid));
     }
 
     /// Unlike a rewrite, an overlay does not invalidate a widened segment: a

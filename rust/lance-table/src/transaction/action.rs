@@ -143,6 +143,7 @@ pub use tombstone_field_data::TombstoneFieldData;
 pub use trim_frag_reuse::TrimFragReuse;
 pub use update_compacted_sstables::UpdateCompactedSsTables;
 
+use crate::format::DeletionFile;
 use apply::ApplyState;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
@@ -371,6 +372,15 @@ impl CompositeOperation {
                     }
                 }
                 Overlap::FieldDropped { field } => self.forget_new_fragment_field(*field),
+                // The merged deletion file depends on every deletion landed by
+                // the time this operation does, not just the one overlapping
+                // set's, so it is written once the latest version is known and
+                // installed through `set_merged_deletions`.
+                Overlap::Deletions { fragment } => {
+                    self.deletion_file_set_on(*fragment)?;
+                }
+                // Decided by which rows moved; nothing here changes.
+                Overlap::RowsMovedUnderOverlay { .. } => {}
             }
         }
         Ok(())
@@ -387,6 +397,48 @@ impl CompositeOperation {
                 _ => true,
             });
         }
+    }
+
+    /// Install `merged`, a deletion file holding the rows this operation
+    /// deletes from `fragment` and every row deleted from it since it read, in
+    /// place of the one it set. `None` means every row of the fragment is now
+    /// deleted, so the fragment is removed instead.
+    pub fn set_merged_deletions(
+        &mut self,
+        fragment: u64,
+        merged: Option<DeletionFile>,
+    ) -> Result<()> {
+        let action = self.deletion_file_set_on(fragment)?;
+        match merged {
+            Some(deletion_file) => {
+                if let Action::SetDeletionFile(set) = action {
+                    set.deletion_file = Some(deletion_file);
+                }
+            }
+            None => {
+                *action = Action::RemoveFragment(RemoveFragment {
+                    fragment: Ref::Committed(fragment),
+                    data_change: true,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The action that sets `fragment`'s deletion file.
+    fn deletion_file_set_on(&mut self, fragment: u64) -> Result<&mut Action> {
+        self.steps
+            .iter_mut()
+            .flat_map(|step| step.actions.iter_mut())
+            .find(
+                |action| matches!(action, Action::SetDeletionFile(set) if set.fragment == fragment),
+            )
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "an overlap names the deletions of fragment {fragment}, which this \
+                     operation does not set"
+                ))
+            })
     }
 
     fn added_index_segment(&mut self, uuid: Uuid) -> Result<&mut AddIndexSegment> {

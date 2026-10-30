@@ -12,7 +12,10 @@ use rstest::rstest;
 
 use super::invariants;
 use super::oracle;
-use super::scenarios::{OVERLAY_VALUE, Placement, Scenario, Staged, fixture};
+use super::scenarios::{
+    OVERLAY_VALUE, Placement, Scenario, Staged, as_action_set, fixture, stage_delete_row,
+    stage_update_row,
+};
 use super::{Isolation, Outcome};
 use crate::{Dataset, Error};
 
@@ -42,31 +45,34 @@ use crate::{Dataset, Error};
 /// change; do not hand-edit a cell to make a failing test pass. When isolation
 /// levels become configurable this grows a grid per level.
 const MATRIX: &str = "\
-                          | ap dl df ur uc ov dr pj pa mg ma ci rw ow rs cf va vc v+ vn vr vm vi vj
-append                    | L  L  L  L  L  L  L  L  R  L  R  L  L  X  X  L  L  L  L  L  L  L  L  L
-delete                    | L  R  R  L  R  L  R  L  L  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L
-delete_whole_fragment     | L  R  R  R  R  L  R  L  L  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L
-update_rewrite_rows       | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L
-update_rewrite_columns    | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L
-data_overlay              | L  L  R  R  L  L  L  !  R  R  R  L  R  X  X  L  L  L  L  L  L  L  L  L
-data_replacement          | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L
-project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  L  L  R* R* R  L  R  L  L
-project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  L  L  R* R  R  L  R  L  L
-merge                     | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R  R  R  R  L  R
-merge_alter_nullability   | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R  R  R  R  L  R
-create_index              | L  L  L  L  L  L  L  L  L  L  L  R  R  X  X  L  L  L  L  L  L  L  R  R
-rewrite                   | L  R  R  R  R  R  R  L  L  R  R  R  R  X  X  L  L  L  L  R  R  L  R  R
-overwrite                 | L  L  L  L  L  L  L  L  L  L  L  L  L  R  L  L  L  L  L  L  L  L  L  L
-restore                   | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  X  L  R  R  L  L  L  L  L
-update_config             | L  L  L  L  L  L  L  L  L  R  R  L  L  X  X  X  L  R  R  L  L  L  L  L
-action_append             | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  L  L  L  L  L  L  L  L  L
-action_update_config      | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  R  L  R  R  L  L  L  L  L
-action_append_and_config  | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  R  L  R  R  L  L  L  L  L
-action_add_column         | L  L  R  R  L  L  R  L  L  R  R  L  R  R  R  L  L  L  L  R  R  L  L  L
-action_replace_column     | L  L  R  R  R  L  R  R  R  R  R  L  R  R  R  L  L  L  L  R  R  L  L  L
-action_rename_column      | L  L  L  L  L  L  L  R  R  R  R  L  L  R  R  L  L  L  L  L  L  R  L  L
-action_create_index       | L  L  L  L  L  L  L  L  L  L  L  R  L  R  R  L  L  L  L  L  L  L  R  R
-action_append_and_index   | L  L  L  L  L  L  L  L  L  L  L  R  L  R  R  L  L  L  L  L  L  L  R  R
+                             | ap dl df ur uc ov dr pj pa mg ma ci rw ow rs cf va vc v+ vn vr vm vi vj vd vf vu
+append                       | L  L  L  L  L  L  L  L  R  L  R  L  L  X  X  L  L  L  L  L  L  L  L  L  L  L  L
+delete                       | L  R  R  L  R  L  R  L  L  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L  R  R  L
+delete_whole_fragment        | L  R  R  R  R  L  R  L  L  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L  R  R  R
+update_rewrite_rows          | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L  L  R  R
+update_rewrite_columns       | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L  R  R  R
+data_overlay                 | L  L  R  R  L  L  L  !  R  R  R  L  R  X  X  L  L  L  L  L  L  L  L  L  L  R  R
+data_replacement             | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L  L  L  L  L  R  L  L  L  L  R  R
+project                      | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  L  L  R* R* R  L  R  L  L  L  L  L
+project_alter_nullability    | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  L  L  R* R  R  L  R  L  L  L  L  L
+merge                        | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R  R  R  R  L  R  R  R  R
+merge_alter_nullability      | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R  R  R  R  L  R  R  R  R
+create_index                 | L  L  L  L  L  L  L  L  L  L  L  R  R  X  X  L  L  L  L  L  L  L  R  R  L  L  L
+rewrite                      | L  R  R  R  R  R  R  L  L  R  R  R  R  X  X  L  L  L  L  R  R  L  R  R  R  R  R
+overwrite                    | L  L  L  L  L  L  L  L  L  L  L  L  L  R  L  L  L  L  L  L  L  L  L  L  L  L  L
+restore                      | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  X  L  R  R  L  L  L  L  L  L  L  L
+update_config                | L  L  L  L  L  L  L  L  L  R  R  L  L  X  X  X  L  R  R  L  L  L  L  L  L  L  L
+action_append                | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  L  L  L  L  L  L  L  L  L  L  L  L
+action_update_config         | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  R  L  R  R  L  L  L  L  L  L  L  L
+action_append_and_config     | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  R  L  R  R  L  L  L  L  L  L  L  L
+action_add_column            | L  L  R  R  L  L  R  L  L  R  R  L  R  R  R  L  L  L  L  R  L  L  L  L  L  R  R
+action_replace_column        | L  L  R  R  R  L  R  R  R  R  R  L  R  R  R  L  L  L  L  L  R  L  L  L  L  R  R
+action_rename_column         | L  L  L  L  L  L  L  R  R  R  R  L  L  R  R  L  L  L  L  L  L  R  L  L  L  L  L
+action_create_index          | L  L  L  L  L  L  L  L  L  L  L  R  L  R  R  L  L  L  L  L  L  L  R  R  L  L  L
+action_append_and_index      | L  L  L  L  L  L  L  L  L  L  L  R  L  R  R  L  L  L  L  L  L  L  R  R  L  L  L
+action_delete                | L  R  R  L  L  L  L  L  L  L  L  L  R  R  R  L  L  L  L  L  L  L  L  L  R  R  L
+action_delete_whole_fragment | L  R  R  R  R  L  R  L  L  L  L  L  R  R  R  L  L  L  L  R  R  L  L  L  R  R  R
+action_update                | L  L  R  R  R  R  R  L  L  L  L  L  R  R  R  L  L  L  L  R  R  L  L  L  L  R  R
 ";
 
 /// The level [`MATRIX`] was observed under.
@@ -338,6 +344,9 @@ pub(super) fn run(
 #[case::action_rename_column(Scenario::ActionRenameColumn)]
 #[case::action_create_index(Scenario::ActionCreateIndex)]
 #[case::action_append_and_index(Scenario::ActionAppendAndIndex)]
+#[case::action_delete(Scenario::ActionDelete)]
+#[case::action_delete_whole_fragment(Scenario::ActionDeleteWholeFragment)]
+#[case::action_update(Scenario::ActionUpdate)]
 #[tokio::test]
 async fn matrix_row(#[case] ours: Scenario) {
     for theirs in Scenario::ALL {
@@ -409,6 +418,9 @@ async fn matrix_row(#[case] ours: Scenario) {
 #[case::action_rename_column(Scenario::ActionRenameColumn)]
 #[case::action_create_index(Scenario::ActionCreateIndex)]
 #[case::action_append_and_index(Scenario::ActionAppendAndIndex)]
+#[case::action_delete(Scenario::ActionDelete)]
+#[case::action_delete_whole_fragment(Scenario::ActionDeleteWholeFragment)]
+#[case::action_update(Scenario::ActionUpdate)]
 #[tokio::test]
 async fn scenario_lands_uncontended(#[case] scenario: Scenario) {
     let base = fixture().await;
@@ -729,6 +741,125 @@ async fn overlay_must_not_keep_a_concurrently_dropped_column() {
             );
         }
     }
+}
+
+/// A change that deletes one row of fragment 0, by the row's `a`, which in the
+/// fixture is also its offset.
+#[derive(Debug, Clone, Copy)]
+enum RowChange {
+    Delete(i32),
+    /// Moves the row out to a new fragment with `b = a * 10`.
+    Update(i32),
+}
+
+impl RowChange {
+    async fn stage(self, base: &Arc<Dataset>, as_actions: bool) -> Staged {
+        let staged = match self {
+            Self::Delete(row) => stage_delete_row(base, row).await,
+            Self::Update(row) => stage_update_row(base, row).await,
+        }
+        .unwrap();
+        if as_actions {
+            as_action_set(base, staged).unwrap()
+        } else {
+            staged
+        }
+    }
+
+    fn row(self) -> i32 {
+        match self {
+            Self::Delete(row) | Self::Update(row) => row,
+        }
+    }
+}
+
+/// Two changes that delete different rows of one fragment both land, whether
+/// each side is a legacy operation or an action set, and the fragment's
+/// deletion vector ends up holding both sides' rows.
+#[rstest]
+#[tokio::test]
+async fn deletions_of_different_rows_merge(
+    #[values(false, true)] ours_as_actions: bool,
+    #[values(false, true)] theirs_as_actions: bool,
+    #[values(
+        (RowChange::Delete(0), RowChange::Delete(1)),
+        (RowChange::Delete(0), RowChange::Update(2)),
+        (RowChange::Update(2), RowChange::Delete(0))
+    )]
+    changes: (RowChange, RowChange),
+) {
+    let (ours, theirs) = changes;
+    let base = fixture().await;
+    let staged = ours.stage(&base, ours_as_actions).await;
+    theirs
+        .stage(&base, theirs_as_actions)
+        .await
+        .commit(&base)
+        .await
+        .unwrap();
+
+    let committed = staged.commit(&base).await.unwrap();
+
+    let deleted = committed
+        .get_fragment(0)
+        .unwrap()
+        .get_deletion_vector()
+        .await
+        .unwrap()
+        .expect("both sides deleted rows from fragment 0");
+    let deleted: Vec<u32> = roaring::RoaringBitmap::from(deleted.as_ref())
+        .into_iter()
+        .collect();
+    let mut expected = vec![ours.row() as u32, theirs.row() as u32];
+    expected.sort_unstable();
+    assert_eq!(deleted, expected);
+
+    let rows = committed.scan().try_into_batch().await.unwrap();
+    let mut a_and_b: Vec<(i32, i32)> = int_column(&rows, "a")
+        .into_iter()
+        .zip(int_column(&rows, "b"))
+        .collect();
+    a_and_b.sort_unstable();
+    let wanted: Vec<(i32, i32)> = (0..6)
+        .filter_map(
+            |a| match [ours, theirs].into_iter().find(|change| change.row() == a) {
+                Some(RowChange::Delete(_)) => None,
+                Some(RowChange::Update(_)) => Some((a, a * 10)),
+                None => Some((a, 0)),
+            },
+        )
+        .collect();
+    assert_eq!(a_and_b, wanted);
+}
+
+/// Two changes that delete the same row conflict, whatever form each takes.
+#[rstest]
+#[tokio::test]
+async fn deletions_of_the_same_row_conflict(
+    #[values(false, true)] ours_as_actions: bool,
+    #[values(false, true)] theirs_as_actions: bool,
+    #[values(
+        (RowChange::Delete(0), RowChange::Delete(0)),
+        (RowChange::Delete(2), RowChange::Update(2)),
+        (RowChange::Update(2), RowChange::Delete(2))
+    )]
+    changes: (RowChange, RowChange),
+) {
+    let (ours, theirs) = changes;
+    let base = fixture().await;
+    let staged = ours.stage(&base, ours_as_actions).await;
+    theirs
+        .stage(&base, theirs_as_actions)
+        .await
+        .commit(&base)
+        .await
+        .unwrap();
+
+    let result = staged.commit(&base).await;
+    assert!(
+        matches!(result, Err(Error::RetryableCommitConflict { .. })),
+        "{result:?}"
+    );
 }
 
 fn int_column(batch: &arrow_array::RecordBatch, name: &str) -> Vec<i32> {
