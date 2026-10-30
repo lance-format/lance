@@ -63,7 +63,7 @@ action_append             | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  L  L  L
 action_update_config      | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  R  L  R  R  L  L  L
 action_append_and_config  | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  R  L  R  R  L  L  L
 action_add_column         | L  L  R  R  L  R  R  L  L  R  R  L  R  R  R  L  L  L  L  R  R  L
-action_replace_column     | L  L  R  R  R  R* R  R  R  R  R  L  R  R  R  L  L  L  L  R  R  L
+action_replace_column     | L  L  R  R  R  L  R  R  R  R  R  L  R  R  R  L  L  L  L  R  R  L
 action_rename_column      | L  L  L  L  L  L  L  R  R  R  R  L  L  R  R  L  L  L  L  L  L  R
 ";
 
@@ -200,13 +200,7 @@ pub(super) fn known_bug(ours: Scenario, theirs: Scenario) -> Option<&'static str
 const PARITY_GAPS: &[(Scenario, &str)] = &[
     (Scenario::Project, SCHEMA_METADATA_REVERTED),
     (Scenario::ProjectAlterNullability, SCHEMA_METADATA_REVERTED),
-    (Scenario::ActionReplaceColumn, OVERLAY_RESTAMP_CLAIMED),
 ];
-
-const OVERLAY_RESTAMP_CLAIMED: &str = "a column rewrite on a dataset with stable row ids carries a \
-     RefreshRowVersionMetadata, and a committed legacy DataOverlay is judged by what its manifest \
-     changed, which counts its restamp of the same fragment as a write of the version sequence. \
-     Legacy lands the pair; an action AddOverlays composes with the refresh";
 
 const SCHEMA_METADATA_REVERTED: &str = "a legacy Project installs the schema it read, metadata \
      included, so landing it over a concurrent schema-metadata edit discards the edit. Legacy \
