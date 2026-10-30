@@ -1647,6 +1647,7 @@ async fn test_delete_branch_preserves_relocated_parent_data(
     #[case] alias: &str,
     #[values(false, true)] use_object_store: bool,
     #[values(false, true)] has_child: bool,
+    #[values(false, true)] has_sibling: bool,
 ) {
     let tempdir = TempDir::default();
     let uri = if use_object_store {
@@ -1675,8 +1676,10 @@ async fn test_delete_branch_preserves_relocated_parent_data(
     }
     let deleted_branch = format!("a/{alias}");
     create_branch_before_name_check(&parent, &deleted_branch).await;
-    // Keep cleanup rooted at the dataset directory even without a child branch.
-    root.create_branch("a/sibling", 1, None).await.unwrap();
+    if has_sibling {
+        // Keep recursive cleanup rooted at the dataset directory without a child branch.
+        root.create_branch("a/sibling", 1, None).await.unwrap();
+    }
     let child_branch = format!("{deleted_branch}/x");
     if has_child {
         create_branch_before_name_check(&root, &child_branch).await;
@@ -1688,7 +1691,7 @@ async fn test_delete_branch_preserves_relocated_parent_data(
             let branches = root.list_branches().await.unwrap();
             assert!(!branches.contains_key(&deleted_branch));
             assert!(branches.contains_key("A"));
-            assert!(branches.contains_key("a/sibling"));
+            assert_eq!(branches.contains_key("a/sibling"), has_sibling);
             assert_eq!(branches.contains_key(&child_branch), has_child);
         }
         let mut parent = Dataset::open(&uri)
@@ -1708,7 +1711,7 @@ async fn test_delete_branch_preserves_relocated_parent_data(
         }
     }
     for branch in [
-        Some("a/sibling"),
+        has_sibling.then_some("a/sibling"),
         has_child.then_some(child_branch.as_str()),
     ]
     .into_iter()
