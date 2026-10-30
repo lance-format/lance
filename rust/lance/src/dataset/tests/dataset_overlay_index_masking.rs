@@ -455,6 +455,35 @@ async fn test_overlay_visibility_is_snapshot_scoped(#[values(false, true)] stabl
     );
 }
 
+#[rstest]
+#[tokio::test]
+async fn test_overlay_replay_does_not_duplicate_uncovered_fragments(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
+    for (column, name, fragment) in [("age", "age_idx", 0), ("id", "id_idx", 1)] {
+        let segment = CreateIndexBuilder::new(
+            &mut dataset,
+            &[column],
+            IndexType::BTree,
+            &ScalarIndexParams::default(),
+        )
+        .name(name.to_string())
+        .fragments(vec![fragment])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+        dataset
+            .commit_existing_index_segments(name, column, vec![segment])
+            .await
+            .unwrap();
+    }
+    let dataset = overlay_age(dataset, "uncovered_age", 0, &[(2, Some(999))]).await;
+    // Neither fragment has all leaves of this expression. The full scan already
+    // reads the overlaid row, so a separate replay would duplicate its identity.
+    assert_ids_match_oracle(&dataset, "age = 999 OR id = 7", &[2, 7]).await;
+}
+
 /// The scalar-index stale-row replay is a second read branch. A physical row selection must
 /// constrain it too, otherwise an overlaid row outside the requested slice can be reintroduced.
 #[rstest]

@@ -46,6 +46,7 @@ use roaring::RoaringBitmap;
 use crate::index::DatasetIndexExt;
 use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::scalar_logical::scalar_index_fragment_bitmap;
+use crate::index::visibility::IndexVisibility;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
@@ -1017,7 +1018,7 @@ impl Scanner {
         &self,
         index_expr: &ScalarIndexExpr,
         fragments: Arc<Vec<Fragment>>,
-    ) -> Result<(Vec<Fragment>, Vec<Fragment>, HashMap<u32, RoaringBitmap>)> {
+    ) -> Result<(Vec<Fragment>, Vec<Fragment>, IndexVisibility)> {
         let covered_frags = self.fragments_covered_by_index_query(index_expr).await?;
         let stale_rows = self
             .overlay_stale_index_rows(index_expr, &fragments)

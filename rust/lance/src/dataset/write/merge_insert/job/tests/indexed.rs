@@ -98,7 +98,7 @@ async fn test_indexed_merge_insert_overlay_staleness(
         .await
         .unwrap();
     assert_eq!(
-        stale_rows,
+        stale_rows.physical_selection(),
         if is_stale {
             RowAddrTreeMap::from_iter([1u64])
         } else {
