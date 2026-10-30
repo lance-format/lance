@@ -92,6 +92,7 @@ pub mod optimize;
 pub mod prefilter;
 pub mod scalar;
 pub(crate) mod scalar_logical;
+pub(crate) mod segment_coverage;
 pub mod vector;
 
 use self::frag_reuse_with_stable_row_ids::{
@@ -1120,6 +1121,8 @@ pub(crate) async fn build_index_metadata_from_segments(
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
         .validate_covering_fields()?;
         if segment.fields() != expected_fields.as_slice()
@@ -1157,6 +1160,8 @@ pub(crate) async fn build_index_metadata_from_segments(
         .await?;
 
     let new_indices = futures::stream::iter(segments.into_iter().map(|segment| async move {
+        let clustering_id = segment.clustering_id();
+        let metadata = segment.metadata().clone();
         let (
             uuid,
             fragment_bitmap,
@@ -1180,6 +1185,8 @@ pub(crate) async fn build_index_metadata_from_segments(
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: None,
+                clustering_id,
+                metadata: metadata.clone(),
             };
             crate::index::scalar::inverted::finalize_segment_files_if_needed(dataset, &metadata)
                 .await?;
@@ -1201,6 +1208,8 @@ pub(crate) async fn build_index_metadata_from_segments(
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(files),
+            clustering_id,
+            metadata,
         })
     }))
     .buffered(dataset.object_store.io_parallelism())
@@ -2134,6 +2143,7 @@ pub(crate) async fn remap_index(
                             &TrainingCriteria::new(TrainingOrdering::None),
                             None,
                             true, // Legacy reindexing should always train
+                            None,
                             None,
                         )
                         .await?;
@@ -5217,6 +5227,7 @@ mod tests {
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
+    use crate::index::vector::details::target_partition_size_from_details;
     use crate::session::Session;
     use crate::utils::test::{
         DatagenExt, FragmentCount, FragmentRowCount, compact_into_two, copy_test_data_to_tmp,
@@ -5307,6 +5318,8 @@ mod tests {
                 size_bytes: payload.len() as u64,
                 file_metadata_size_bytes: None,
             }]),
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -5885,6 +5898,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         // The shape every merge_segments impl builds: keyed field only, carried
@@ -7686,6 +7701,84 @@ mod tests {
 
         // 300 / 256 = 1, not the 1000 requested.
         assert_eq!(trained_partitions(&dataset).await, vec![1]);
+
+        // The target recorded is the 300 vectors the one partition holds, not
+        // 300 / 1000, which would have optimize split it apart.
+        let details = dataset.load_indices().await.unwrap()[0]
+            .index_details
+            .clone()
+            .unwrap();
+        assert_eq!(target_partition_size_from_details(&details), Some(300));
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(trained_partitions(&dataset).await, vec![1]);
+    }
+
+    /// An index built from a partition count, or from centroids that fix one,
+    /// records the vectors per partition it was built at and keeps its
+    /// partitions through an optimize with nothing new to index. With no target
+    /// partition size recorded, optimize joined every partition under a quarter
+    /// of the index type's default, and 500 vectors a partition is under that
+    /// for every IVF type. Null rows are not indexed, so they do not count: a
+    /// target taken from 50,000 rows would join partitions under 625.
+    #[rstest]
+    #[case::num_partitions(VectorIndexParams::ivf_flat(20, DistanceType::L2))]
+    #[case::centroids(ivf_flat_from_centroids(20))]
+    #[tokio::test]
+    async fn test_optimize_keeps_trained_partitions(
+        #[case] params: VectorIndexParams,
+        #[values(0, 40_000)] null_rows: usize,
+    ) {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset =
+            partly_null_vector_dataset(test_dir.path(), 10_000 + null_rows, 10_000).await;
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        assert_eq!(trained_partitions(&dataset).await, vec![20]);
+        let details = dataset.load_indices().await.unwrap()[0]
+            .index_details
+            .clone()
+            .unwrap();
+        assert_eq!(target_partition_size_from_details(&details), Some(500));
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(trained_partitions(&dataset).await, vec![20]);
+    }
+
+    /// IVF_FLAT params carrying `partitions` precomputed centroids and no
+    /// partition count. The centroids are trained on a fresh sample of the
+    /// distribution `vector_reader` draws from, so the partitions they cut are
+    /// balanced; random centroids could leave one under the join threshold.
+    fn ivf_flat_from_centroids(partitions: usize) -> VectorIndexParams {
+        let dimension = 16;
+        let sample = generate_random_array(partitions * 256 * dimension as usize);
+        let centroids = train_kmeans::<Float32Type>(
+            &sample,
+            KMeansParams::new(None, 10, 1, DistanceType::L2),
+            dimension as usize,
+            partitions,
+            256,
+        )
+        .unwrap()
+        .centroids
+        .as_primitive::<Float32Type>()
+        .clone();
+        let centroids =
+            Arc::new(FixedSizeListArray::try_new_from_values(centroids, dimension).unwrap());
+        VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            IvfBuildParams {
+                centroids: Some(centroids),
+                ..Default::default()
+            },
+        )
     }
 
     /// Partition counts for a trained logical vector index, one per segment.
@@ -7950,7 +8043,8 @@ mod tests {
             .unwrap()
     }
 
-    /// A dataset of `rows` rows where only the first `non_null` hold a vector.
+    /// A dataset of `rows` rows where only the first `non_null` hold a vector,
+    /// each random.
     async fn partly_null_vector_dataset(
         dir: &std::path::Path,
         rows: usize,
@@ -7970,11 +8064,13 @@ mod tests {
             arrow_array::builder::Float32Builder::new(),
             dimensions,
         );
+        let values = generate_random_array(non_null * dimensions as usize);
         for row in 0..rows {
             if row < non_null {
-                for value in 0..dimensions {
-                    builder.values().append_value(value as f32);
-                }
+                let start = row * dimensions as usize;
+                builder
+                    .values()
+                    .append_slice(&values.values()[start..start + dimensions as usize]);
                 builder.append(true);
             } else {
                 for _ in 0..dimensions {
@@ -9488,6 +9584,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
@@ -9529,6 +9627,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
@@ -12490,6 +12590,8 @@ mod tests {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: seg0.files.clone(),
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let err = dataset
@@ -15375,6 +15477,8 @@ mod tests {
                     .filter(|fragment| covered.contains(fragment.id as u32))
                     .cloned()
                     .collect(),
+                output_clustering_id: None,
+                output_metadata: Default::default(),
             }],
             read_version: dataset.version().version,
             options: CompactionOptions::default(),
@@ -15491,6 +15595,8 @@ mod tests {
         let plan = CompactionPlan {
             tasks: vec![TaskData {
                 fragments: dataset.fragments().as_ref().clone(),
+                output_clustering_id: None,
+                output_metadata: Default::default(),
             }],
             read_version: dataset.version().version,
             options: CompactionOptions::default(),

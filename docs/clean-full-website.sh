@@ -8,8 +8,6 @@ docs_src="$script_dir/src"
 rm -rf "$docs_src/format/catalog"
 rm -rf "$docs_src/format/namespace"
 rm -f "$docs_src/format/layout.png"
-rm -f "$docs_src/format/overview.png"
-rm -f "$docs_src/format/java-sdk-example.png"
 rm -rf "$docs_src/integrations/huggingface"
 rm -rf "$docs_src/integrations/duckdb"
 rm -rf "$docs_src/integrations/spark"
@@ -180,4 +178,59 @@ cat > "$docs_src/format/namespace/supported-catalogs/template.md" <<'EOF'
 # Template
 
 This placeholder page keeps the local website buildable when external namespace docs are not available.
+EOF
+
+mkdir -p "$docs_src/integrations/spark/operations/dql"
+mkdir -p "$docs_src/integrations/duckdb"
+mkdir -p "$docs_src/integrations/ray"
+mkdir -p "$docs_src/integrations/trino"
+mkdir -p "$docs_src/integrations/huggingface"
+
+cat > "$docs_src/integrations/spark/index.md" <<'EOF'
+# Apache Spark Integration
+
+This placeholder page keeps the local website buildable when external `lance-spark` docs are not available.
+Run `docs/make-full-website.sh` with `LANCE_SPARK_REPO` pointing at a local [lance-format/lance-spark](https://github.com/lance-format/lance-spark) checkout to populate the full documentation.
+EOF
+
+cat > "$docs_src/integrations/spark/config.md" <<'EOF'
+# Apache Spark Configuration
+
+This placeholder page keeps the local website buildable when external `lance-spark` docs are not available.
+See [lance-format/lance-spark](https://github.com/lance-format/lance-spark) for configuration details.
+EOF
+
+cat > "$docs_src/integrations/spark/operations/dql/vector-search.md" <<'EOF'
+# Spark Vector Search
+
+This placeholder page keeps the local website buildable when external `lance-spark` docs are not available.
+See [lance-format/lance-spark](https://github.com/lance-format/lance-spark) for `VECTOR_SEARCH` details.
+EOF
+
+cat > "$docs_src/integrations/duckdb/index.md" <<'EOF'
+# DuckDB Integration
+
+This placeholder page keeps the local website buildable when external `lance-duckdb` docs are not available.
+See [lance-format/lance-duckdb](https://github.com/lance-format/lance-duckdb) or run `docs/make-full-website.sh` with `LANCE_DUCKDB_REPO` set.
+EOF
+
+cat > "$docs_src/integrations/ray/index.md" <<'EOF'
+# Ray Integration
+
+This placeholder page keeps the local website buildable when external `lance-ray` docs are not available.
+See [lance-format/lance-ray](https://github.com/lance-format/lance-ray) or run `docs/make-full-website.sh` with `LANCE_RAY_REPO` set.
+EOF
+
+cat > "$docs_src/integrations/trino/index.md" <<'EOF'
+# Trino Integration
+
+This placeholder page keeps the local website buildable when external `lance-trino` docs are not available.
+See [lance-format/lance-trino](https://github.com/lance-format/lance-trino) or run `docs/make-full-website.sh` with `LANCE_TRINO_REPO` set.
+EOF
+
+cat > "$docs_src/integrations/huggingface/index.md" <<'EOF'
+# Hugging Face Integration
+
+This placeholder page keeps the local website buildable when external `lance-huggingface` docs are not available.
+See [lance-format/lance-huggingface](https://github.com/lance-format/lance-huggingface) or run `docs/make-full-website.sh` with `LANCE_HUGGINGFACE_REPO` set.
 EOF

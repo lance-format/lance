@@ -1684,6 +1684,7 @@ impl IndexWorker {
         doc_index: &[u32],
     ) -> Result<()> {
         let with_position = self.has_position();
+        let discount_overlaps = self.tokenizer.discount_overlaps();
         let builder_was_empty = self.builder.docs.is_empty();
         let old_temporary_memory_size = self.temporary_memory_size();
         let old_token_memory_size = self.builder.tokens.memory_size() as u64;
@@ -1708,6 +1709,7 @@ impl IndexWorker {
                 let mut process_text = |text: &str| -> Result<()> {
                     doc_length_bytes += text.len();
                     let mut token_stream = tokenizer.token_stream_for_doc(text);
+                    let mut last_position = None;
                     while token_stream.advance() {
                         let token = token_stream.token();
                         let position = Self::checked_token_position(row_id, token.position)?;
@@ -1740,7 +1742,14 @@ impl IndexWorker {
                         let new_posting_memory_size = posting_list.size();
                         posting_memory_delta +=
                             new_posting_memory_size as i64 - old_posting_memory_size as i64;
-                        token_num += 1;
+                        if !discount_overlaps || last_position != Some(token.position) {
+                            token_num = token_num.checked_add(1).ok_or_else(|| {
+                                Error::invalid_input(format!(
+                                    "document length overflow for row_id={row_id}"
+                                ))
+                            })?;
+                        }
+                        last_position = Some(token.position);
                     }
                     Ok(())
                 };
@@ -1766,21 +1775,31 @@ impl IndexWorker {
                 let tokenizer = &mut self.tokenizer;
                 let builder = &mut self.builder;
                 let token_ids = &mut self.token_ids;
-                let mut process_text = |text: &str| {
+                let mut process_text = |text: &str| -> Result<()> {
                     doc_length_bytes += text.len();
                     let mut token_stream = tokenizer.token_stream_for_doc(text);
+                    let mut last_position = None;
                     while token_stream.advance() {
-                        let token_id = builder.tokens.get_or_add(&token_stream.token().text);
+                        let token = token_stream.token();
+                        let token_id = builder.tokens.get_or_add(&token.text);
                         token_ids.push(token_id);
-                        token_num += 1;
+                        if !discount_overlaps || last_position != Some(token.position) {
+                            token_num = token_num.checked_add(1).ok_or_else(|| {
+                                Error::invalid_input(format!(
+                                    "document length overflow for row_id={row_id}"
+                                ))
+                            })?;
+                        }
+                        last_position = Some(token.position);
                     }
+                    Ok(())
                 };
 
                 match document {
-                    DocumentSource::Text(doc) => process_text(doc),
+                    DocumentSource::Text(doc) => process_text(doc)?,
                     DocumentSource::StringList(elements) => {
                         let doc = Self::materialize_string_list(elements);
-                        process_text(&doc);
+                        process_text(&doc)?;
                     }
                 }
             }

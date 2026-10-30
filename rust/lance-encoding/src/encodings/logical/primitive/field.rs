@@ -23,9 +23,9 @@ use log::{debug, trace};
 
 use crate::EncodingsIo;
 use crate::compression::DecompressionStrategy;
-use crate::data::concat_decoded_arrays;
+use crate::data::{concat_decoded_arrays, dictionary_batch_limit};
 use crate::decoder::{
-    ColumnInfo, DecodePageTask, DecodedArray, FilterExpression, IO_REQUEST_BATCH_BYTES,
+    ColumnInfo, DecodePageTask, DecodedArray, DrainLimit, FilterExpression, IO_REQUEST_BATCH_BYTES,
     LoadedPageShard, MessageType, PageEncoding, PageInfo, RequestBatch, ScheduledScanLine,
     SchedulerContext, StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
     StructuralPageDecoder, StructuralSchedulingJob, UnloadedPageShard,
@@ -377,8 +377,8 @@ impl StructuralPrimitiveFieldScheduler {
                 let def_meaning = constant_layout
                     .layers
                     .iter()
-                    .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
-                    .collect::<Vec<_>>();
+                    .map(|l| EncodingUtils::try_repdef_layer_to_def_interp(*l))
+                    .collect::<Result<Vec<_>>>()?;
                 let has_scalar_value = constant_layout.inline_value.is_some()
                     || page_info.buffer_offsets_and_sizes.len() == 1
                     || page_info.buffer_offsets_and_sizes.len() == 3;
@@ -426,8 +426,8 @@ impl StructuralPrimitiveFieldScheduler {
                 let def_meaning = blob
                     .layers
                     .iter()
-                    .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
-                    .collect::<Vec<_>>();
+                    .map(|l| EncodingUtils::try_repdef_layer_to_def_interp(*l))
+                    .collect::<Result<Vec<_>>>()?;
                 if matches!(target_field.data_type(), DataType::Struct(_)) {
                     // User wants to decode blob into struct
                     Box::new(BlobDescriptionPageScheduler::new(
@@ -999,6 +999,20 @@ impl StructuralPrimitiveFieldDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
+    fn max_rows_to_drain(&self, num_rows: u64, _byte_budget: u64) -> Result<DrainLimit> {
+        let dictionary_rows = self
+            .page_decoders
+            .iter()
+            .filter_map(|page| page.dictionary_len())
+            .filter_map(|len| dictionary_batch_limit(self.field.data_type(), len))
+            .min();
+        Ok(DrainLimit {
+            rows: num_rows,
+            bytes: 0,
+            dictionary_rows,
+        })
+    }
+
     fn accept_page(&mut self, child: LoadedPageShard) -> Result<()> {
         assert!(child.path.is_empty());
         self.page_decoders.push_back(child.decoder);

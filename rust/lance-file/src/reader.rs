@@ -705,6 +705,12 @@ impl FileReader {
 
     async fn read_tail(scheduler: &FileScheduler) -> Result<(Bytes, u64)> {
         let file_size = scheduler.reader().size().await? as u64;
+        if file_size == 0 {
+            return Err(Error::corrupt_file(
+                scheduler.reader().path().clone(),
+                "Invalid format: data file is empty",
+            ));
+        }
         let begin = if file_size < scheduler.reader().block_size() as u64 {
             0
         } else {
@@ -720,6 +726,15 @@ impl FileReader {
         scheduler: &FileScheduler,
         range: Range<u64>,
     ) -> Result<Bytes> {
+        if range.start > range.end {
+            return Err(Error::corrupt_file_named(
+                "footer",
+                format!(
+                    "Invalid byte range {}..{}: start is after end",
+                    range.start, range.end
+                ),
+            ));
+        }
         let tail_end = tail_offset + tail_bytes.len() as u64;
         if range.start >= tail_offset && range.end <= tail_end {
             let rel_start = (range.start - tail_offset) as usize;
@@ -811,6 +826,41 @@ impl FileReader {
         })
     }
 
+    /// Validates the footer offsets against each other and the file length.
+    ///
+    /// A footer is read from the file, so none of its offsets can be trusted.  A valid
+    /// file lays out `[data][column metadata][CMO table][GBO table][footer]`.
+    fn validate_footer(footer: &Footer, file_len: u64) -> Result<()> {
+        if footer.column_meta_start > footer.column_meta_offsets_start {
+            return Err(Error::corrupt_file_named(
+                "footer",
+                format!(
+                    "Column metadata start {} is after the column metadata offsets table start {}",
+                    footer.column_meta_start, footer.column_meta_offsets_start
+                ),
+            ));
+        }
+        if footer.column_meta_offsets_start > footer.global_buff_offsets_start {
+            return Err(Error::corrupt_file_named(
+                "footer",
+                format!(
+                    "Column metadata offsets table start {} is after the global buffer offsets table start {}",
+                    footer.column_meta_offsets_start, footer.global_buff_offsets_start
+                ),
+            ));
+        }
+        if footer.global_buff_offsets_start > file_len {
+            return Err(Error::corrupt_file_named(
+                "footer",
+                format!(
+                    "Global buffer offsets table start {} is beyond the file size {}",
+                    footer.global_buff_offsets_start, file_len
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn current_file_version(footer: &Footer) -> Result<ConcreteFileVersion> {
         let version =
             ConcreteFileVersion::from_footer_numbers(footer.major_version, footer.minor_version)?;
@@ -849,8 +899,18 @@ impl FileReader {
         column_metadata_offsets
             .iter()
             .map(|(position, length)| {
-                let normalized_position = (*position - column_metadata_start) as usize;
+                let normalized_position =
+                    (*position - column_metadata_start) as usize;
                 let normalized_end = normalized_position + (*length as usize);
+                if normalized_end > column_metadata_bytes.len() {
+                    return Err(Error::corrupt_file_named(
+                        "column_metadata",
+                        format!(
+                            "Column metadata range {normalized_position}..{normalized_end} is outside the {} bytes of column metadata",
+                            column_metadata_bytes.len()
+                        ),
+                    ));
+                }
                 Ok(pbfile::ColumnMetadata::decode(
                     &column_metadata_bytes[normalized_position..normalized_end],
                 )?)
@@ -930,6 +990,29 @@ impl FileReader {
     fn do_decode_gbo_table(gbo_bytes: &Bytes, footer: &Footer) -> Result<Vec<BufferDescriptor>> {
         let mut global_bufs_cursor = Cursor::new(gbo_bytes);
 
+        let expected_bytes = (footer.num_global_buffers as usize)
+            .checked_mul(16)
+            .ok_or_else(|| {
+                Error::corrupt_file_named(
+                    "footer",
+                    format!(
+                        "Global buffer count {} overflows the table size",
+                        footer.num_global_buffers
+                    ),
+                )
+            })?;
+        if gbo_bytes.len() < expected_bytes {
+            return Err(Error::corrupt_file_named(
+                "footer",
+                format!(
+                    "Global buffer offsets table has {} bytes but {} buffers need {} bytes",
+                    gbo_bytes.len(),
+                    footer.num_global_buffers,
+                    expected_bytes
+                ),
+            ));
+        }
+
         let mut global_buffers = Vec::with_capacity(footer.num_global_buffers as usize);
         for _ in 0..footer.num_global_buffers {
             let buf_pos = global_bufs_cursor.read_u64::<LittleEndian>()?;
@@ -978,7 +1061,9 @@ impl FileReader {
 
     fn decode_schema(schema_bytes: Bytes) -> Result<(u64, lance_core::datatypes::Schema)> {
         let file_descriptor = pb::FileDescriptor::decode(schema_bytes)?;
-        let pb_schema = file_descriptor.schema.unwrap();
+        let pb_schema = file_descriptor.schema.ok_or_else(|| {
+            Error::corrupt_file_named("file_descriptor", "File descriptor is missing its schema")
+        })?;
         let num_rows = file_descriptor.length;
         let fields_with_meta = FieldsWithMeta {
             fields: Fields(pb_schema.fields),
@@ -993,7 +1078,9 @@ impl FileReader {
     ) -> Result<RawFileMetadataOpen> {
         let (tail_bytes, file_len) = Self::read_tail(scheduler).await?;
         let tail_offset = file_len - tail_bytes.len() as u64;
-        let footer = Self::decode_footer(&tail_bytes)?;
+        let footer = Self::decode_footer(&tail_bytes).map_err(|error| {
+            Error::corrupt_file(scheduler.reader().path().clone(), error.to_string())
+        })?;
         let version =
             ConcreteFileVersion::from_footer_numbers(footer.major_version, footer.minor_version)?;
         if version == ConcreteFileVersion::V1 {
@@ -1002,6 +1089,7 @@ impl FileReader {
                 minor_version: footer.minor_version,
             });
         }
+        Self::validate_footer(&footer, file_len)?;
 
         let gbo_table =
             Self::decode_gbo_table(&tail_bytes, file_len, scheduler, &footer, version).await?;
@@ -1023,18 +1111,62 @@ impl FileReader {
         })?;
         let all_metadata_bytes =
             Self::optimistic_tail_read(&tail_bytes, schema_start, scheduler, file_len).await?;
-        let schema_bytes = all_metadata_bytes.slice(0..schema_size as usize);
+        let schema_size = usize::try_from(schema_size).map_err(|_| {
+            Error::corrupt_file_named(
+                "footer",
+                format!("Schema buffer size {schema_size} is too large"),
+            )
+        })?;
+        if schema_size > all_metadata_bytes.len() {
+            return Err(Error::corrupt_file_named(
+                "footer",
+                format!(
+                    "Schema buffer of {schema_size} bytes at {schema_start} extends beyond the file"
+                ),
+            ));
+        }
+        let schema_bytes = all_metadata_bytes.slice(0..schema_size);
         let (num_rows, schema) = Self::decode_schema(schema_bytes)?;
 
-        let column_metadata_start = (footer.column_meta_start - schema_start) as usize;
-        let column_metadata_end = (footer.global_buff_offsets_start - schema_start) as usize;
+        if footer.column_meta_start < schema_start {
+            return Err(Error::corrupt_file_named(
+                "footer",
+                format!(
+                    "Column metadata start {} precedes the schema at {}",
+                    footer.column_meta_start, schema_start
+                ),
+            ));
+        }
+        let column_metadata_start = usize::try_from(footer.column_meta_start - schema_start)
+            .map_err(|_| {
+                Error::corrupt_file_named("footer", "Column metadata start is too large")
+            })?;
+        let column_metadata_end = usize::try_from(footer.global_buff_offsets_start - schema_start)
+            .map_err(|_| Error::corrupt_file_named("footer", "Column metadata end is too large"))?;
+        if column_metadata_start > column_metadata_end
+            || column_metadata_end > all_metadata_bytes.len()
+        {
+            return Err(Error::corrupt_file_named(
+                "footer",
+                format!(
+                    "Column metadata region {column_metadata_start}..{column_metadata_end} is outside the {} bytes after the schema",
+                    all_metadata_bytes.len()
+                ),
+            ));
+        }
         let column_metadata_bytes =
             all_metadata_bytes.slice(column_metadata_start..column_metadata_end);
         let column_metadatas = Self::read_all_column_metadata(column_metadata_bytes, &footer)?;
 
-        let num_global_buffer_bytes = gbo_table.iter().map(|buf| buf.size).sum::<u64>();
-        let num_data_bytes = footer.column_meta_start - num_global_buffer_bytes;
-        let num_column_metadata_bytes = footer.global_buff_offsets_start - footer.column_meta_start;
+        let num_global_buffer_bytes = gbo_table
+            .iter()
+            .fold(0u64, |total, buf| total.saturating_add(buf.size));
+        let num_data_bytes = footer
+            .column_meta_start
+            .saturating_sub(num_global_buffer_bytes);
+        let num_column_metadata_bytes = footer
+            .global_buff_offsets_start
+            .saturating_sub(footer.column_meta_start);
         // The tail read above already pulled in any global buffer that lives within
         // the captured window. Copy those user buffers (index >= 1; the schema at 0
         // is decoded above and never fetched via read_global_buffer) out of the tail
@@ -1071,9 +1203,12 @@ impl FileReader {
     ) -> Result<FileMetadataIndex> {
         let (tail_bytes, file_len) = Self::read_tail(scheduler).await?;
         let tail_offset = file_len - tail_bytes.len() as u64;
-        let footer = Self::decode_footer(&tail_bytes)?;
+        let footer = Self::decode_footer(&tail_bytes).map_err(|error| {
+            Error::corrupt_file(scheduler.reader().path().clone(), error.to_string())
+        })?;
 
         let file_version = Self::current_file_version(&footer)?;
+        Self::validate_footer(&footer, file_len)?;
 
         let gbo_table =
             Self::decode_gbo_table(&tail_bytes, file_len, scheduler, &footer, file_version).await?;
@@ -2415,6 +2550,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
     {
         let footer = FileReader::decode_footer(&bytes)?;
         let file_version = FileReader::current_file_version(&footer)?;
+        FileReader::validate_footer(&footer, bytes.len() as u64)?;
         let projection = versions::reader_projection_from_whole_schema(schema, file_version);
 
         // Next, read the metadata for the columns
@@ -2447,6 +2583,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
         let file_version = FileReader::current_file_version(&footer)?;
 
         let file_len = bytes.len() as u64;
+        FileReader::validate_footer(&footer, file_len)?;
         let gbo_table = FileReader::do_decode_gbo_table(
             &bytes.slice(footer.global_buff_offsets_start as usize..),
             &footer,
@@ -5235,6 +5372,83 @@ mod tests {
         assert!(
             message.contains(&format!("{:?}", super::MAGIC)),
             "error should still report the expected magic, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_validate_footer_rejects_out_of_order_offsets() {
+        let footer = crate::reader::Footer {
+            column_meta_start: 300,
+            column_meta_offsets_start: 200,
+            global_buff_offsets_start: 400,
+            num_global_buffers: 1,
+            num_columns: 1,
+            major_version: 2,
+            minor_version: 2,
+        };
+        let error = FileReader::validate_footer(&footer, 1024)
+            .expect_err("out-of-order footer offsets must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("is after the column metadata offsets table start"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_validate_footer_rejects_offset_past_end() {
+        let footer = crate::reader::Footer {
+            column_meta_start: 100,
+            column_meta_offsets_start: 200,
+            global_buff_offsets_start: 2048,
+            num_global_buffers: 1,
+            num_columns: 1,
+            major_version: 2,
+            minor_version: 2,
+        };
+        let error =
+            FileReader::validate_footer(&footer, 1024).expect_err("offset past the file end");
+        assert!(
+            error.to_string().contains("beyond the file size"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_decode_schema_rejects_missing_schema() {
+        use prost::Message;
+
+        let descriptor = crate::format::pb::FileDescriptor {
+            length: 0,
+            schema: None,
+        };
+        let error = FileReader::decode_schema(Bytes::from(descriptor.encode_to_vec()))
+            .expect_err("a file descriptor without a schema must fail");
+        assert!(
+            error.to_string().contains("missing its schema"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_decode_gbo_table_rejects_impossible_buffer_count() {
+        let footer = crate::reader::Footer {
+            column_meta_start: 0,
+            column_meta_offsets_start: 0,
+            global_buff_offsets_start: 0,
+            num_global_buffers: u32::MAX,
+            num_columns: 0,
+            major_version: 2,
+            minor_version: 2,
+        };
+        let error = FileReader::do_decode_gbo_table(&Bytes::new(), &footer)
+            .expect_err("an impossible global buffer count must fail before allocating");
+        assert!(
+            error
+                .to_string()
+                .contains("Global buffer offsets table has"),
+            "unexpected error: {error}"
         );
     }
 

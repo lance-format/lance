@@ -295,14 +295,22 @@ mod zstd {
             let mut len_buf = [0u8; LENGTH_PREFIX_SIZE];
             len_buf.copy_from_slice(&input_buf[..LENGTH_PREFIX_SIZE]);
 
-            let uncompressed_len = u64::from_le_bytes(len_buf) as usize;
+            let uncompressed_len = usize::try_from(u64::from_le_bytes(len_buf)).map_err(|_| {
+                Error::invalid_input("Zstd declared output length does not fit usize")
+            })?;
 
             let start = output_buf.len();
-            output_buf.reserve(uncompressed_len);
+            // The prefix comes from the file, so a corrupt one must fail to reserve
+            // rather than panic or abort the process.
+            output_buf.try_reserve(uncompressed_len).map_err(|error| {
+                Error::invalid_input(format!(
+                    "Zstd could not reserve {uncompressed_len} output bytes: {error}"
+                ))
+            })?;
             let compressed_data = &input_buf[LENGTH_PREFIX_SIZE..];
             let written = decompress_frame_into(compressed_data, output_buf)?;
             if written != uncompressed_len {
-                // `reserve` may over-allocate, so a frame longer than its prefix can
+                // `try_reserve` may over-allocate, so a frame longer than its prefix can
                 // still fit; drop whatever it appended so an error leaves the
                 // buffer exactly as the caller passed it.
                 output_buf.truncate(start);
@@ -451,10 +459,28 @@ mod lz4 {
                 u32::from_le_bytes([input_buf[0], input_buf[1], input_buf[2], input_buf[3]])
                     as usize;
 
+            // A match length grows by at most 255 per input byte, so no LZ4 block
+            // decodes to more than 255 times its size, and the decoder refuses any
+            // size `compress_bound` rejects. A larger prefix is corrupt and must not
+            // make us allocate and zero-fill up to 4 GiB.
+            if uncompressed_size > input_buf.len().saturating_mul(255)
+                || ::lz4::block::compress_bound(uncompressed_size).is_err()
+            {
+                return Err(Error::invalid_input(format!(
+                    "LZ4 declares {uncompressed_size} output bytes for a {}-byte payload",
+                    input_buf.len()
+                )));
+            }
+
             // Remember the starting position
             let start_pos = output_buf.len();
 
-            // Resize to ensure we have the exact space needed
+            // Reserve fallibly, then size the buffer for the decoder
+            output_buf.try_reserve(uncompressed_size).map_err(|error| {
+                Error::invalid_input(format!(
+                    "LZ4 could not reserve {uncompressed_size} output bytes: {error}"
+                ))
+            })?;
             output_buf.resize(start_pos + uncompressed_size, 0);
 
             // Now decompress directly into the buffer slice
@@ -1022,6 +1048,19 @@ mod tests {
             }
         }
 
+        /// A length prefix too large to allocate is an error, not a panic or an abort.
+        #[test]
+        fn test_zstd_decompress_rejects_unallocatable_length_prefix() {
+            let compressor = ZstdBufferCompressor::new(0);
+            let mut bad = reference_frame(b"bounded", 3);
+            for declared in [u64::MAX, isize::MAX as u64] {
+                bad[..8].copy_from_slice(&declared.to_le_bytes());
+                let mut output = b"keep".to_vec();
+                assert!(compressor.decompress(&bad, &mut output).is_err());
+                assert_eq!(output, b"keep");
+            }
+        }
+
         /// Corrupted or truncated frames fail without exposing any bytes.
         #[test]
         fn test_zstd_decompress_corrupt_frame_errors_and_preserves_buffer() {
@@ -1305,6 +1344,32 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains("declares"));
             assert!(output.is_empty());
+        }
+
+        /// A length prefix beyond what the payload can decode to is rejected before
+        /// any output is allocated, while the most compressible input still decodes.
+        #[test]
+        fn test_lz4_decompress_bounds_length_prefix() {
+            let compressor = Lz4BufferCompressor::default();
+            let mut compressed = Vec::new();
+            compressor.compress(b"bounded", &mut compressed).unwrap();
+            compressed[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+            // A payload large enough that 255x its size exceeds any u32 is still bounded
+            // by the largest size LZ4 handles.
+            let mut large = vec![0u8; 17 << 20];
+            large[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+            for bad in [compressed, large] {
+                let mut output = Vec::new();
+                assert!(compressor.decompress(&bad, &mut output).is_err());
+                assert_eq!(output.capacity(), 0);
+            }
+
+            let zeros = vec![0u8; 16 << 20];
+            let mut compressed = Vec::new();
+            compressor.compress(&zeros, &mut compressed).unwrap();
+            let mut output = Vec::new();
+            compressor.decompress(&compressed, &mut output).unwrap();
+            assert!(output == zeros);
         }
 
         #[test]

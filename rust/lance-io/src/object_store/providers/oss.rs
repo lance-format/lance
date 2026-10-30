@@ -137,6 +137,7 @@ impl ObjectStoreProvider for OssStoreProvider {
             scheme: "oss".to_string(),
             inner,
             local_dir_operations: None,
+            local_fsync: false,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,

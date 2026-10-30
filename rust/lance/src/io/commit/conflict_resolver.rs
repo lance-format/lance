@@ -23,7 +23,7 @@ use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
 use lance_table::format::overlay::OverlayCoverage;
-use lance_table::format::overlay::staleness::overlay_affects_index;
+use lance_table::format::overlay::staleness::{field_affects_index, overlay_affects_index};
 use lance_table::format::pb::fragment_reuse_index_details::{InlineContent, Transition};
 use lance_table::system_index::frag_reuse::FragReuseVersion;
 use lance_table::system_index::frag_reuse::lineage::TaggedLineage;
@@ -1502,13 +1502,22 @@ impl<'a> TransactionRebase<'a> {
                         );
                         return Ok(());
                     }
-                    let newly_depended_fields = new_indices
+                    let mut newly_depended_fields = new_indices
                         .iter()
                         .flat_map(|idx| idx.fields.iter())
-                        .collect::<HashSet<_>>();
+                        .copied()
+                        .collect::<Vec<_>>();
+                    newly_depended_fields.sort_unstable();
+                    newly_depended_fields.dedup();
                     for replacement in replacements {
                         for field in replacement.1.fields.iter() {
-                            if newly_depended_fields.contains(&field) {
+                            // A packed parent's file also replaces the indexed
+                            // values of its children.
+                            if newly_depended_fields.contains(field)
+                                || self.read_schema.as_ref().is_some_and(|schema| {
+                                    field_affects_index(*field, &newly_depended_fields, schema)
+                                })
+                            {
                                 return Err(
                                     self.retryable_conflict_err(other_transaction, other_version)
                                 );
@@ -2919,12 +2928,12 @@ impl<'a> TransactionRebase<'a> {
                         new_entry,
                         current_entry,
                     } => {
-                        *new_indices = vec![new_entry];
-                        *removed_indices = vec![current_entry];
+                        *new_indices = vec![*new_entry];
+                        *removed_indices = vec![*current_entry];
                     }
                     TaggedTrimOutcome::Delete { current_entry } => {
                         new_indices.clear();
-                        *removed_indices = vec![current_entry];
+                        *removed_indices = vec![*current_entry];
                     }
                 }
                 return Ok(self.transaction);
@@ -3351,6 +3360,64 @@ fn overlay_group_coverage(group: &DataOverlayGroup) -> RoaringBitmap {
     union
 }
 
+/// Refuse a concurrent transaction that could hand one of an allocating
+/// clustering submission's key field ids to another column.
+///
+/// A definition keys on field ids the writer resolved in `read_schema`, a
+/// snapshot that still used reusable ids. Until the allocation itself
+/// activates the non-reusable contract, a schema replacement in the window
+/// (an overwrite, a drop, a restore, or a merge that does not keep every read
+/// field under its id with the same name, parent and type) may reassign an id,
+/// and a drop followed by a re-add with the same name and type hides that in
+/// the final shape. So the transaction, not the landing schema, is judged.
+/// Appends, deletes, updates, index builds and additive merges rebase as usual.
+pub(crate) fn refuse_field_identity_change(
+    read_schema: &lance_core::datatypes::Schema,
+    other_transaction: &Transaction,
+    other_version: u64,
+) -> Result<()> {
+    let may_change_identity = match &other_transaction.operation {
+        Operation::Overwrite { .. } | Operation::Project { .. } | Operation::Restore { .. } => true,
+        Operation::Merge { schema, .. } => !keeps_every_field_identity(read_schema, schema),
+        _ => false,
+    };
+    if may_change_identity {
+        return Err(Error::incompatible_transaction_source(
+            format!(
+                "This UpdateConfig allocates clustering definitions keyed on field ids read \
+                 before concurrent transaction {} at version {other_version}, which may have \
+                 given one of those ids to another column; reload the table and rebuild the list.",
+                other_transaction.operation
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Every field of `read` is still the same field under the same id in
+/// `landing`: same name, logical type and parent. Since every read field is
+/// checked, a parent's own identity covers the path above it, and a child's
+/// covers the shape below. Added fields are fine; a missing, renamed, moved
+/// or retyped one is not, while metadata and nullability edits are. One map
+/// of the landing fields keeps this linear on wide schemas.
+fn keeps_every_field_identity(
+    read: &lance_core::datatypes::Schema,
+    landing: &lance_core::datatypes::Schema,
+) -> bool {
+    let landed: HashMap<i32, &lance_core::datatypes::Field> = landing
+        .fields_pre_order()
+        .map(|field| (field.id, field))
+        .collect();
+    read.fields_pre_order().all(|field| {
+        landed.get(&field.id).is_some_and(|other| {
+            other.name == field.name
+                && other.logical_type == field.logical_type
+                && other.parent_id == field.parent_id
+        })
+    })
+}
+
 fn wrong_operation_err(op: &Operation) -> Error {
     Error::internal(format!("function called against a wrong operation: {}", op))
 }
@@ -3443,6 +3510,52 @@ fn sorted_ids(ids: impl Iterator<Item = u64>) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The first-activation fence judges each read field by its own identity:
+    /// a child added under a struct the writer read is fine, while a child of
+    /// that struct renamed, retyped or moved is not.
+    #[test]
+    fn additive_merge_keeps_every_read_field_but_a_changed_child_does_not() {
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        let schema = |children: Vec<Field>| {
+            lance_core::datatypes::Schema::try_from(&ArrowSchema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("info", DataType::Struct(children.into()), true),
+            ]))
+            .unwrap()
+        };
+        let zip = Field::new("zip", DataType::Int32, true);
+        let read = schema(vec![zip.clone()]);
+        // Added child under the read struct: every read field keeps its identity.
+        let added = schema(vec![zip, Field::new("note", DataType::Utf8, true)]);
+        assert!(keeps_every_field_identity(&read, &added));
+        // Renamed, retyped or missing child: not the same field any more.
+        assert!(!keeps_every_field_identity(
+            &read,
+            &schema(vec![Field::new("postcode", DataType::Int32, true)])
+        ));
+        assert!(!keeps_every_field_identity(
+            &read,
+            &schema(vec![Field::new("zip", DataType::Int64, true)])
+        ));
+        assert!(!keeps_every_field_identity(&read, &schema(vec![])));
+        // Moved: the same name and type under a different parent.
+        let moved = lance_core::datatypes::Schema::try_from(&ArrowSchema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("info", DataType::Struct(Vec::<Field>::new().into()), true),
+            Field::new("zip", DataType::Int32, true),
+        ]))
+        .unwrap();
+        let mut moved = moved;
+        // Give the moved column the read child's id so only its parent differs.
+        let read_zip = read.field("info.zip").unwrap().id;
+        for field in moved.fields.iter_mut() {
+            if field.name == "zip" {
+                field.id = read_zip;
+            }
+        }
+        assert!(!keeps_every_field_identity(&read, &moved));
+    }
     use std::{num::NonZero, sync::Arc};
 
     use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
@@ -3508,6 +3621,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let operation = Operation::Rewrite {
             groups: vec![],
@@ -3723,6 +3838,7 @@ mod tests {
             removed_fragment_ids: vec![],
             new_fragments: vec![],
             fields_modified: vec![],
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,
@@ -3736,6 +3852,7 @@ mod tests {
                 removed_fragment_ids: vec![2],
                 new_fragments: vec![],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
@@ -3752,6 +3869,7 @@ mod tests {
                 updated_fragments: vec![Fragment::new(4)],
                 new_fragments: vec![],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
@@ -3839,6 +3957,7 @@ mod tests {
             removed_fragment_ids: vec![],
             new_fragments: vec![],
             fields_modified: vec![],
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,
@@ -3927,6 +4046,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![sample_file.clone()],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
@@ -3943,6 +4063,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![sample_file],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
@@ -4073,6 +4194,7 @@ mod tests {
                     removed_fragment_ids: vec![0],
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
+                    mem_wal_dir_id: None,
                     compacted_sstables: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
@@ -4087,6 +4209,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![sample_file.clone()],
                     fields_modified: vec![],
+                    mem_wal_dir_id: None,
                     compacted_sstables: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
@@ -4204,6 +4327,8 @@ mod tests {
             created_at: None, // Test index, not setting timestamp
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);
@@ -4250,6 +4375,7 @@ mod tests {
                 updated_fragments: vec![fragment0.clone()],
                 new_fragments: vec![fragment2.clone()],
                 fields_modified: vec![0],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
@@ -4458,6 +4584,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![fragment2],
                     fields_modified: vec![0],
+                    mem_wal_dir_id: None,
                     compacted_sstables: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
@@ -4743,6 +4870,7 @@ mod tests {
             updated_fragments: vec![],
             new_fragments: vec![],
             fields_modified: vec![],
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,
@@ -4762,6 +4890,7 @@ mod tests {
             updated_fragments: updated,
             new_fragments: new,
             fields_modified: vec![],
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteRows),
@@ -4773,6 +4902,7 @@ mod tests {
             updated_fragments: updated,
             new_fragments: vec![],
             fields_modified: vec![0],
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
@@ -4890,6 +5020,7 @@ mod tests {
             ),
             (
                 Operation::UpdateMemWalState {
+                    dir_id: String::new(),
                     compacted_sstables: vec![],
                 },
                 NotCompatible,
@@ -5028,6 +5159,7 @@ mod tests {
                 updated_fragments: vec![Fragment::new(1)],
                 new_fragments,
                 fields_modified: vec![0],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode,
@@ -5233,6 +5365,7 @@ mod tests {
                     updated_fragments: vec![Fragment::new(0)],
                     new_fragments: vec![],
                     fields_modified: vec![0],
+                    mem_wal_dir_id: None,
                     compacted_sstables: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: Some(UpdateMode::RewriteColumns),
@@ -5320,6 +5453,7 @@ mod tests {
             updated_fragments: vec![Fragment::new(0)],
             new_fragments: vec![],
             fields_modified: vec![field_modified],
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
@@ -5390,6 +5524,7 @@ mod tests {
             removed_fragment_ids: vec![],
             new_fragments: vec![moved_fragment],
             fields_modified: vec![],
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteRows),
@@ -5464,6 +5599,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let mut rebase = TransactionRebase {
             transaction: Transaction::new(
@@ -5495,6 +5632,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![],
                 fields_modified: vec![field_modified],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(UpdateMode::RewriteColumns),
@@ -5575,6 +5713,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let column_index = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
@@ -5668,6 +5808,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let index1 = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
@@ -5743,6 +5885,8 @@ mod tests {
                         created_at: None,
                         base_id: None,
                         files: None,
+                        clustering_id: None,
+                        metadata: Default::default(),
                     }],
                     removed_indices: vec![],
                 },
@@ -5791,6 +5935,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let drop_operation = Operation::CreateIndex {
             new_indices: vec![],
@@ -5856,6 +6002,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let drop_operation = Operation::CreateIndex {
             new_indices: vec![],
@@ -5900,6 +6048,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let replaced = index(Uuid::new_v4());
         let concurrently_removed = index(Uuid::new_v4());
@@ -5953,6 +6103,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let frag_reuse_index = IndexMetadata {
             uuid: Uuid::new_v4(),
@@ -5966,6 +6118,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let rewrite = Transaction::new(
             1,
@@ -6036,6 +6190,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let frag_reuse_index = IndexMetadata {
             uuid: Uuid::new_v4(),
@@ -6049,6 +6205,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         // The rewrite's own `old_fragments` are what the SRID inference reads:
@@ -6303,6 +6461,7 @@ mod tests {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
@@ -6597,6 +6756,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![],
                     fields_modified: vec![2],
+                    mem_wal_dir_id: None,
                     compacted_sstables: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: Some(RewriteColumns),
@@ -6616,6 +6776,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![Fragment::new(5)],
                     fields_modified: vec![2],
+                    mem_wal_dir_id: None,
                     compacted_sstables: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: Some(RewriteColumns),
@@ -6634,6 +6795,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![],
                     fields_modified: vec![1],
+                    mem_wal_dir_id: None,
                     compacted_sstables: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: Some(RewriteColumns),
@@ -6652,6 +6814,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![Fragment::new(5)],
                     fields_modified: vec![],
+                    mem_wal_dir_id: None,
                     compacted_sstables: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: Some(RewriteRows),
@@ -6670,6 +6833,7 @@ mod tests {
                     removed_fragment_ids: vec![0],
                     new_fragments: vec![],
                     fields_modified: vec![],
+                    mem_wal_dir_id: None,
                     compacted_sstables: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: None,
@@ -6688,6 +6852,7 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![Fragment::new(5)],
                     fields_modified: vec![],
+                    mem_wal_dir_id: None,
                     compacted_sstables: Vec::new(),
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: Some(RewriteRows),
@@ -6757,6 +6922,8 @@ mod tests {
                         created_at: None,
                         base_id: None,
                         files: None,
+                        clustering_id: None,
+                        metadata: Default::default(),
                     }],
                     removed_indices: vec![],
                 },
@@ -6832,6 +6999,7 @@ mod tests {
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
@@ -6840,6 +7008,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
             },
             None,
@@ -6878,6 +7047,7 @@ mod tests {
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
@@ -6886,6 +7056,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
@@ -6925,6 +7096,7 @@ mod tests {
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
             },
             None,
@@ -6933,6 +7105,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
@@ -6972,6 +7145,7 @@ mod tests {
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard1, 10)],
             },
             None,
@@ -6980,6 +7154,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard2, 5)],
             },
             None,
@@ -7038,6 +7213,7 @@ mod tests {
         let to_commit_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
             },
             None,
@@ -7071,6 +7247,7 @@ mod tests {
         let to_commit_txn_higher = Transaction::new(
             0,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 15)],
             },
             None,
@@ -7125,6 +7302,7 @@ mod tests {
         let committed_txn = Transaction::new(
             0,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
@@ -9313,6 +9491,8 @@ mod tests {
                 created_at: None,
                 base_id: None,
                 files: None,
+                clustering_id: None,
+                metadata: Default::default(),
             };
             let ours = Transaction::new(
                 1,

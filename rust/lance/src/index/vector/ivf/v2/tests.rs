@@ -16,7 +16,7 @@ use arrow::datatypes::{Float64Type, UInt8Type, UInt32Type, UInt64Type};
 use arrow::{array::AsArray, datatypes::Float32Type};
 use arrow_array::{
     Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Int64Array, ListArray,
-    PrimitiveArray, RecordBatch, RecordBatchIterator, UInt64Array,
+    PrimitiveArray, RecordBatch, RecordBatchIterator, UInt32Array, UInt64Array,
 };
 use arrow_buffer::OffsetBuffer;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -35,6 +35,7 @@ use lance_index::vector::v3::subindex::IvfSubIndex;
 use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
 use crate::index::DatasetIndexInternalExt;
+use crate::index::vector::details::target_partition_size_from_details;
 use crate::index::vector::ivf::v2::{
     IVFPartitionKey, IvfFlatIndex, IvfHnswSqIndex, IvfPq, IvfStateEntryBox, PartitionEntry,
 };
@@ -271,8 +272,12 @@ fn test_split_prewarm_window_compacts_partition_buffers() {
     assert_eq!(partitions[1][0].num_rows(), 90);
 }
 
+#[derive(Default)]
 struct PartitionCoverageTestFilter {
     needs_partition_rows: bool,
+    selected_rows: Arc<RowAddrMask>,
+    coverage_checks: AtomicUsize,
+    mask_reads: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -289,16 +294,18 @@ impl PreFilter for PartitionCoverageTestFilter {
         self.needs_partition_rows
     }
 
-    fn is_empty_for(&self, _rows: &RowAddrTreeMap) -> bool {
-        true
+    fn is_empty_for(&self, rows: &RowAddrTreeMap) -> bool {
+        self.coverage_checks.fetch_add(1, Ordering::Relaxed);
+        self.selected_rows.selects_all(rows)
     }
 
     fn mask(&self) -> Arc<RowAddrMask> {
-        Arc::new(RowAddrMask::all_rows())
+        self.mask_reads.fetch_add(1, Ordering::Relaxed);
+        self.selected_rows.clone()
     }
 
     fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
-        row_ids.enumerate().map(|(index, _)| index as u64).collect()
+        self.mask().selected_indices(row_ids)
     }
 }
 
@@ -326,6 +333,7 @@ async fn test_partition_coverage_is_only_built_for_capable_filters() {
 
     let ordinary_filter: Arc<dyn PreFilter> = Arc::new(PartitionCoverageTestFilter {
         needs_partition_rows: false,
+        ..Default::default()
     });
     let returned = super::IVFIndex::<FlatIndex, FlatQuantizer>::prefilter_for_partition(
         &weak_cache,
@@ -341,6 +349,7 @@ async fn test_partition_coverage_is_only_built_for_capable_filters() {
 
     let segment_filter: Arc<dyn PreFilter> = Arc::new(PartitionCoverageTestFilter {
         needs_partition_rows: true,
+        ..Default::default()
     });
     let returned = super::IVFIndex::<FlatIndex, FlatQuantizer>::prefilter_for_partition(
         &weak_cache,
@@ -361,6 +370,206 @@ async fn test_partition_coverage_is_only_built_for_capable_filters() {
     assert!(cache_weight_with_coverage > cache_weight_without_coverage);
     assert!(cache_weight_with_coverage >= entry.deep_size_of());
     assert!(entry.partition_rows_accounted.load(Ordering::Acquire));
+}
+
+#[rstest]
+#[case::flat(None)]
+#[case::pq4(Some(4))]
+#[case::pq8(Some(8))]
+#[tokio::test]
+async fn test_batch_partition_prefilter_preserves_bulk_scoring(#[case] bits: Option<usize>) {
+    const NUM_QUERIES: usize = 4;
+    const K: usize = 10;
+    let (batch, schema) = make_seeded_vector_batch(PQ_MATRIX_NUM_ROWS);
+    let vectors = batch["vector"].as_fixed_size_list();
+    let query = Query {
+        column: "vector".to_owned(),
+        key: vectors.values().slice(0, NUM_QUERIES * DIM),
+        k: PQ_MATRIX_NUM_ROWS,
+        lower_bound: None,
+        upper_bound: None,
+        minimum_nprobes: LIGHTWEIGHT_PQ_PARTITIONS,
+        maximum_nprobes: Some(LIGHTWEIGHT_PQ_PARTITIONS),
+        search_effort: 0.5,
+        ef: None,
+        refine_factor: None,
+        metric_type: Some(DistanceType::L2),
+        use_index: true,
+        query_parallelism: DEFAULT_QUERY_PARALLELISM,
+        dist_q_c: 0.0,
+        approx_mode: Default::default(),
+    };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    let mut ivf = IvfBuildParams::new(LIGHTWEIGHT_PQ_PARTITIONS);
+    ivf.max_iters = 2;
+    ivf.sample_rate = LIGHTWEIGHT_IVF_SAMPLE_RATE;
+    let params = match bits {
+        None => VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf),
+        Some(bits) => VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            ivf,
+            lightweight_pq_params_with_bits(bits),
+        ),
+    };
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".to_owned()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    let metadata = dataset.load_indices_by_name("vector_idx").await.unwrap();
+    let index = dataset
+        .open_vector_index("vector", &metadata[0].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let mut partitions = Vec::with_capacity(NUM_QUERIES);
+    let mut centroid_dists = Vec::with_capacity(NUM_QUERIES);
+    for query_index in 0..NUM_QUERIES {
+        let mut single_query = query.clone();
+        single_query.key = query.key.slice(query_index * DIM, DIM);
+        let (parts, dists) = index.find_partitions(&single_query).unwrap();
+        assert_eq!(parts.len(), LIGHTWEIGHT_PQ_PARTITIONS);
+        partitions.push(Arc::new(parts));
+        centroid_dists.push(Arc::new(dists));
+    }
+    let all_results = index
+        .clone()
+        .search_partitions_batch(
+            query.clone(),
+            partitions.clone(),
+            centroid_dists.clone(),
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|batch| {
+            let order = arrow::compute::sort_to_indices(&batch[DIST_COL], None, None).unwrap();
+            arrow::compute::take_record_batch(&batch, &order).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        all_results
+            .iter()
+            .all(|batch| batch.num_rows() == PQ_MATRIX_NUM_ROWS)
+    );
+    for (query_index, result) in all_results.iter().enumerate() {
+        let key = query.key.slice(query_index * DIM, DIM);
+        let truth = dataset
+            .scan()
+            .with_row_id()
+            .project(&[ROW_ID])
+            .unwrap()
+            .nearest("vector", key.as_ref(), K)
+            .unwrap()
+            .use_index(false)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let truth_ids = truth[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let recall = result[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .take(K)
+            .filter(|row_id| truth_ids.contains(row_id))
+            .count() as f32
+            / K as f32;
+        assert_ge!(recall, 0.5);
+    }
+    let row_ids = all_results[0][ROW_ID].as_primitive::<UInt64Type>();
+    let stale_row = row_ids.value(0);
+    let owned_rows = row_ids.values().iter().copied().collect::<RowAddrTreeMap>();
+    let mixed_rows = row_ids
+        .values()
+        .iter()
+        .copied()
+        .filter(|row_id| *row_id != stale_row)
+        .collect::<RowAddrTreeMap>();
+    let mut batch_query = query;
+    batch_query.k = K;
+    for (mask, needs_partition_rows, expect_mask_reads) in [
+        (RowAddrMask::from_allowed(owned_rows), true, false),
+        (RowAddrMask::from_allowed(mixed_rows.clone()), true, true),
+        (RowAddrMask::allow_nothing(), true, true),
+        (RowAddrMask::from_allowed(mixed_rows), false, true),
+    ] {
+        let filter = Arc::new(PartitionCoverageTestFilter {
+            needs_partition_rows,
+            selected_rows: Arc::new(mask),
+            ..Default::default()
+        });
+        let results = index
+            .clone()
+            .search_partitions_batch(
+                batch_query.clone(),
+                partitions.clone(),
+                centroid_dists.clone(),
+                filter.clone(),
+                Arc::new(NoOpMetricsCollector),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            filter.coverage_checks.load(Ordering::Relaxed),
+            if needs_partition_rows {
+                LIGHTWEIGHT_PQ_PARTITIONS
+            } else {
+                0
+            },
+            "coverage must be checked once per distinct partition, not once per query"
+        );
+        assert_eq!(
+            filter.mask_reads.load(Ordering::Relaxed) > 0,
+            expect_mask_reads,
+            "fully owned partitions must use the bulk scorer without reading the mask"
+        );
+        for (result, all_result) in results.iter().zip(&all_results) {
+            let selected = all_result[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .enumerate()
+                .filter(|(_, row_id)| filter.selected_rows.selected(**row_id))
+                .take(K)
+                .map(|(position, _)| position as u32)
+                .collect::<Vec<_>>();
+            let expected =
+                arrow::compute::take_record_batch(all_result, &UInt32Array::from(selected))
+                    .unwrap();
+            let order = arrow::compute::sort_to_indices(&result[DIST_COL], None, None).unwrap();
+            let result = arrow::compute::take_record_batch(result, &order).unwrap();
+            assert_eq!(
+                result[ROW_ID].as_primitive::<UInt64Type>().values(),
+                expected[ROW_ID].as_primitive::<UInt64Type>().values(),
+                "ownership must be applied before truncating the top-k heap"
+            );
+            for (actual, expected) in result[DIST_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .zip(expected[DIST_COL].as_primitive::<Float32Type>().values())
+            {
+                assert_lt!((actual - expected).abs(), 1e-4);
+            }
+        }
+    }
 }
 
 #[test]
@@ -2972,26 +3181,33 @@ async fn test_index(
 ) {
     match params.metric_type {
         DistanceType::Hamming => {
-            test_index_impl::<UInt8Type>(params, nlist, recall_requirement, 0..4, dataset).await;
+            Box::pin(test_index_impl::<UInt8Type>(
+                params,
+                nlist,
+                recall_requirement,
+                0..4,
+                dataset,
+            ))
+            .await;
         }
         _ => {
-            test_index_impl::<Float32Type>(
+            Box::pin(test_index_impl::<Float32Type>(
                 params.clone(),
                 nlist,
                 recall_requirement,
                 0.0..1.0,
                 dataset.clone(),
-            )
+            ))
             .await;
 
             if dataset.is_none() {
-                test_index_impl::<Float64Type>(
+                Box::pin(test_index_impl::<Float64Type>(
                     params,
                     nlist,
                     recall_requirement,
                     0.0..1.0,
                     dataset,
-                )
+                ))
                 .await;
             }
         }
@@ -3527,7 +3743,14 @@ async fn test_build_ivf_sq_dot_with_negative_values() {
     let sq_params = SQBuildParams::default();
     let params = VectorIndexParams::with_ivf_sq_params(DistanceType::Dot, ivf_params, sq_params);
 
-    test_index_impl::<Float32Type>(params, nlist, 0.75, -1.0..1.0, None).await;
+    Box::pin(test_index_impl::<Float32Type>(
+        params,
+        nlist,
+        0.75,
+        -1.0..1.0,
+        None,
+    ))
+    .await;
 }
 
 // These queries probe every partition, so recall here measures RaBitQ quantization
@@ -3720,7 +3943,14 @@ async fn test_create_ivf_hnsw_sq_dot_with_negative_values() {
         sq_params,
     );
 
-    test_index_impl::<Float32Type>(params, nlist, 0.75, -1.0..1.0, None).await;
+    Box::pin(test_index_impl::<Float32Type>(
+        params,
+        nlist,
+        0.75,
+        -1.0..1.0,
+        None,
+    ))
+    .await;
 }
 
 #[rstest]
@@ -5414,7 +5644,12 @@ async fn test_spfresh_join_split() {
     .await
     .unwrap();
 
-    let ivf_params = IvfBuildParams::try_with_centroids(NLIST, centroids).unwrap();
+    // Pin the type default target so the limits above are the ones this test
+    // reasons about; a build from a partition count would record its own.
+    let ivf_params = IvfBuildParams {
+        target_partition_size: Some(IndexType::IvfPq.target_partition_size()),
+        ..IvfBuildParams::try_with_centroids(NLIST, centroids).unwrap()
+    };
     let params = VectorIndexParams::with_ivf_pq_params(
         DistanceType::L2,
         ivf_params,
@@ -5486,6 +5721,32 @@ async fn test_spfresh_join_split() {
         true,
     )
     .await;
+}
+
+/// A multivector index built from a partition count records no target
+/// partition size: a retrain divides the table's rows by the target, so a
+/// target in vectors would train a fraction of the partitions.
+#[tokio::test]
+async fn test_multivec_build_from_partition_count_records_no_target() {
+    let test_dir = TempStrDir::default();
+    let (mut dataset, _) =
+        generate_multivec_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
+    let params = VectorIndexParams::with_ivf_pq_params(
+        DistanceType::Cosine,
+        IvfBuildParams::new(1),
+        lightweight_pq_params(),
+    );
+    dataset
+        .create_index(&["vector"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+
+    let indices = dataset.load_indices().await.unwrap();
+    let details = indices[0]
+        .index_details
+        .as_ref()
+        .expect("a vector index records its details");
+    assert_eq!(target_partition_size_from_details(details), None);
 }
 
 #[tokio::test]
@@ -5599,7 +5860,12 @@ async fn test_split_multiple_partitions_in_one_optimize() {
     .unwrap();
 
     let centroids = build_centroids_for_offsets(&offsets);
-    let ivf_params = IvfBuildParams::try_with_centroids(2, centroids).unwrap();
+    // Pin the type default target so the threshold above is the one this test
+    // reasons about; a build from a partition count would record its own.
+    let ivf_params = IvfBuildParams {
+        target_partition_size: Some(IndexType::IvfFlat.target_partition_size()),
+        ..IvfBuildParams::try_with_centroids(2, centroids).unwrap()
+    };
     let params = VectorIndexParams::with_ivf_flat_params(DistanceType::L2, ivf_params);
     dataset
         .create_index(
@@ -5912,7 +6178,16 @@ async fn optimize_after_delete(
     .await
     .unwrap();
 
-    let params = VectorIndexParams::ivf_flat(nlist, DistanceType::L2);
+    // Pin the type default target: both callers size their partitions against
+    // its split and join thresholds, and a build from a partition count would
+    // record its own.
+    let params = VectorIndexParams::with_ivf_flat_params(
+        DistanceType::L2,
+        IvfBuildParams {
+            target_partition_size: Some(IndexType::IvfFlat.target_partition_size()),
+            ..IvfBuildParams::new(nlist)
+        },
+    );
     dataset
         .create_index(
             &["vector"],
