@@ -2415,6 +2415,7 @@ mod composite {
     use arrow_schema::{DataType, Field, Schema};
     use futures::{TryStreamExt, stream};
     use lance_core::datatypes::Field as LanceField;
+    use lance_core::utils::deletion::DeletionVector;
     use lance_index::IndexType;
     use lance_index::pb::vector_index_details::{
         Compression, FlatCompression, ProductQuantization, RabitQuantization, ScalarQuantization,
@@ -4914,20 +4915,24 @@ mod composite {
     }
 
     /// A row-moving update deletes rows from the fragment and re-creates them
-    /// elsewhere from the base the overlay never modified.
+    /// elsewhere from the base the overlay never modified, so an overlay of a
+    /// moved row conflicts with it.
     #[tokio::test]
     async fn test_an_overlay_and_a_row_moving_update_conflict_in_either_order() {
-        let moving_update = |dataset: &Dataset, fragment: u64, read_version: u64| {
+        async fn moving_update(dataset: &Dataset, fragment: u64) -> Vec<Action> {
+            let deletion_file = lance_table::io::deletion::write_deletion_file(
+                &dataset.base,
+                fragment,
+                dataset.version().version,
+                &DeletionVector::from(RoaringBitmap::from_iter([0])),
+                dataset.object_store.as_ref(),
+            )
+            .await
+            .unwrap();
             vec![
                 Action::SetDeletionFile(SetDeletionFile {
                     fragment,
-                    deletion_file: Some(DeletionFile {
-                        read_version,
-                        id: 1,
-                        file_type: DeletionFileType::Array,
-                        num_deleted_rows: Some(1),
-                        base_id: None,
-                    }),
+                    deletion_file,
                     data_change: true,
                     base: None,
                 }),
@@ -4947,25 +4952,17 @@ mod composite {
                     base: None,
                 }),
             ]
-        };
+        }
 
         let original = test_dataset(false).await;
         let fragment = original.fragments()[0].id;
         let read_version = original.version().version;
+        let update = moving_update(&original, fragment).await;
         let overlaid = commit(original.clone(), vec![overlay_action(&original, fragment)]).await;
-        commit_expecting_conflict(
-            &overlaid,
-            read_version,
-            moving_update(&original, fragment, read_version),
-        )
-        .await;
+        commit_expecting_conflict(&overlaid, read_version, update).await;
 
         let original = test_dataset(false).await;
-        let updated = commit(
-            original.clone(),
-            moving_update(&original, fragment, read_version),
-        )
-        .await;
+        let updated = commit(original.clone(), moving_update(&original, fragment).await).await;
         commit_expecting_conflict(
             &updated,
             read_version,

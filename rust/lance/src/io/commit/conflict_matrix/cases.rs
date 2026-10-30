@@ -52,7 +52,7 @@ delete_whole_fragment        | L  R  R  R  R  L  R  L  L  R  R  L  R  X  X  L  L
 update_rewrite_rows          | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L  L  R  R
 update_rewrite_columns       | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L  R  R  R
 data_overlay                 | L  L  R  R  L  L  L  !  R  R  R  L  R  X  X  L  L  L  L  L  L  L  L  L  L  R  R
-data_replacement             | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L  L  R  R
+data_replacement             | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L  L  L  L  L  R  L  L  L  L  R  R
 project                      | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  L  L  R* R* R  L  R  L  L  L  L  L
 project_alter_nullability    | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  L  L  R* R  R  L  R  L  L  L  L  L
 merge                        | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R  R  R  R  L  R  R  R  R
@@ -65,13 +65,13 @@ update_config                | L  L  L  L  L  L  L  L  L  R  R  L  L  X  X  X  L
 action_append                | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  L  L  L  L  L  L  L  L  L  L  L  L
 action_update_config         | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  R  L  R  R  L  L  L  L  L  L  L  L
 action_append_and_config     | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  R  L  R  R  L  L  L  L  L  L  L  L
-action_add_column            | L  L  R  R  L  L  R  L  L  R  R  L  R  R  R  L  L  L  L  R  R  L  L  L  L  R  R
-action_replace_column        | L  L  R  R  R  L  R  R  R  R  R  L  R  R  R  L  L  L  L  R  R  L  L  L  L  R  R
+action_add_column            | L  L  R  R  L  L  R  L  L  R  R  L  R  R  R  L  L  L  L  R  L  L  L  L  L  R  R
+action_replace_column        | L  L  R  R  R  L  R  R  R  R  R  L  R  R  R  L  L  L  L  L  R  L  L  L  L  R  R
 action_rename_column         | L  L  L  L  L  L  L  R  R  R  R  L  L  R  R  L  L  L  L  L  L  R  L  L  L  L  L
 action_create_index          | L  L  L  L  L  L  L  L  L  L  L  R  L  R  R  L  L  L  L  L  L  L  R  R  L  L  L
 action_append_and_index      | L  L  L  L  L  L  L  L  L  L  L  R  L  R  R  L  L  L  L  L  L  L  R  R  L  L  L
 action_delete                | L  R  R  L  L  L  L  L  L  L  L  L  R  R  R  L  L  L  L  L  L  L  L  L  R  R  L
-action_delete_whole_fragment | L  R  R  R  R  L  R  L  L  R  R  L  R  R  R  L  L  L  L  R  R  L  L  L  R  R  R
+action_delete_whole_fragment | L  R  R  R  R  L  R  L  L  L  L  L  R  R  R  L  L  L  L  R  R  L  L  L  R  R  R
 action_update                | L  L  R  R  R  R  R  L  L  L  L  L  R  R  R  L  L  L  L  R  R  L  L  L  L  R  R
 ";
 

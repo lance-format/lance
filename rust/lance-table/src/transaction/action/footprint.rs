@@ -48,10 +48,11 @@ pub enum Coordinate {
     /// A committed fragment's per-row version sequences.
     FragmentRowVersions(u64),
     /// Which data files a committed fragment holds. Every file edit in the
-    /// fragment writes part of it; a set that restates the list whole, or that
-    /// moves the fragment's rows elsewhere, writes all of it. It is what makes a
-    /// column written for a field no concurrent writer can name collide with
-    /// those.
+    /// fragment writes part of it, and a set that restates the list whole
+    /// writes all of it. It is what makes a column written for a field no
+    /// concurrent writer can name collide with those, and with a set that
+    /// moves some of the fragment's rows elsewhere (see the footprint's
+    /// `rows_relocated_from`).
     FragmentFiles(u64),
     /// The base data backing one field within one committed fragment.
     FieldData { fragment: u64, field: i32 },
@@ -221,12 +222,6 @@ enum Mode {
     /// overlap -- which is what sets it apart from a full write. Overlays
     /// claim [`Coordinate::FieldOverlays`], not the base data a move or a
     /// column rewrite claims, so they commute with both.
-    ///
-    /// It also serves as a conflict marker on a coordinate the set does not
-    /// change at all, where it needs exactly this row and column of the table:
-    /// collide with a full write, commute with other markers. An overlay's
-    /// claim on its fragment's deletions is the case; see
-    /// [`Footprint::write_part_of_deletions`].
     WritesPart,
     /// Replaces how the coordinate is stored without changing its values: a
     /// re-encode with `data_change` false. It collides with any write, as a
@@ -465,6 +460,26 @@ pub struct Footprint {
     /// Committed fragments this set removes after moving their rows into
     /// fragments of its own, as a compaction does, rather than deleting them.
     rows_moved_from: HashSet<u64>,
+    /// Committed fragments whose deletions this set only adds to. Two such
+    /// sets write the same coordinate, but merge rather than collide when the
+    /// rows they delete differ; see [`Overlap::Deletions`]. A set that clears a
+    /// fragment's deletions, or that restates them some other way, is not in
+    /// here, and collides as any other write does.
+    deletions_added: HashSet<u64>,
+    /// Committed fragments some of whose rows this set moves into a fragment
+    /// of its own, deleting them in place, as a row-moving update does. Unlike
+    /// `rows_moved_from` the moved rows are written anew, not carried over,
+    /// and the fragment stays unless every row moved.
+    ///
+    /// The moved rows carry the values the set read, so a concurrent write to
+    /// the fragment's files misses them, in either order, while a concurrent
+    /// overlay over them is lost only where it covers a moved row (see
+    /// [`Overlap::RowsMovedUnderOverlay`]). Another set moving other rows out
+    /// of the same fragment changes no file, so two moves merge as their
+    /// deletions do.
+    rows_relocated_from: HashSet<u64>,
+    /// Committed fragments this set overlays.
+    overlaid: HashSet<u64>,
 }
 
 /// The data one index segment was built from.
@@ -621,6 +636,18 @@ pub enum Overlap {
     /// committed set rewrote the values of a field the segment was built from.
     /// The segment gives up the fragment, whose rows a reader then scans.
     UpdatedUnderIndex { segment: Uuid, fragment: u64 },
+    /// Both sets only add deletions to `fragment`. They merge where the rows
+    /// they delete differ: the pending set's deletion file is rewritten to
+    /// hold its own rows and every row deleted by the time it lands. Which
+    /// rows each side deleted is not in a footprint, so the caller checks
+    /// them while rewriting the file.
+    Deletions { fragment: u64 },
+    /// One set overlays `fragment` and the other moves some of its rows into
+    /// a fragment of its own, built from the values beneath the overlay. The
+    /// overlay survives wherever the moved rows miss its coverage; the caller
+    /// checks which rows moved, as for [`Overlap::Deletions`]. Nothing about
+    /// the pending set needs rewriting.
+    RowsMovedUnderOverlay { fragment: u64 },
 }
 
 impl Footprint {
@@ -654,6 +681,7 @@ impl Footprint {
         }
         let mut overlaps = self.index_overlaps(committed);
         overlaps.extend(self.dropped_field_overlaps(committed));
+        overlaps.extend(self.row_overlaps(committed));
         if overlaps.is_empty() {
             Verdict::Compatible
         } else {
@@ -721,6 +749,29 @@ impl Footprint {
         overlaps
     }
 
+    /// Where the two sets change the same rows of a fragment in ways that
+    /// merge row by row. See [`Overlap::Deletions`] and
+    /// [`Overlap::RowsMovedUnderOverlay`].
+    fn row_overlaps(&self, committed: &Self) -> Vec<Overlap> {
+        let sorted = |fragments: HashSet<u64>| {
+            let mut fragments: Vec<u64> = fragments.into_iter().collect();
+            fragments.sort_unstable();
+            fragments
+        };
+        let deletions = &self.deletions_added & &committed.deletions_added;
+        let moved_under_overlay = &(&self.overlaid & &committed.rows_relocated_from)
+            | &(&self.rows_relocated_from & &committed.overlaid);
+        sorted(deletions)
+            .into_iter()
+            .map(|fragment| Overlap::Deletions { fragment })
+            .chain(
+                sorted(moved_under_overlay)
+                    .into_iter()
+                    .map(|fragment| Overlap::RowsMovedUnderOverlay { fragment }),
+            )
+            .collect()
+    }
+
     /// Whether this set can still commit on top of `committed`, a set that
     /// landed after this one read.
     ///
@@ -738,6 +789,10 @@ impl Footprint {
     /// claims are compared symmetrically.
     ///
     /// A reset is the other asymmetry; see [`Self::resets_table`].
+    ///
+    /// Two sets that only add deletions to one fragment, or that overlay it and
+    /// move rows out of it, do not conflict here: whether they can both land
+    /// depends on rows, which [`Self::compare`] reports as an [`Overlap`].
     pub(crate) fn conflicts_with(&self, committed: &Self) -> bool {
         if self.opaque || committed.opaque || committed.resets_table {
             return true;
@@ -765,6 +820,9 @@ impl Footprint {
         {
             return true;
         }
+        if self.relocates_rows_under(committed) || committed.relocates_rows_under(self) {
+            return true;
+        }
         // One-way, as legacy merge insert's inserted-key filter is: a
         // uniqueness assertion is a precondition on the commit that carries
         // it, not an invariant on the table. A plain append landing after a
@@ -781,6 +839,17 @@ impl Footprint {
                 .index_claims
                 .iter()
                 .any(|theirs| ours.conflicts_with(theirs))
+        })
+    }
+
+    /// Whether `other` writes the files of a fragment this set moves rows out
+    /// of, so that the moved rows miss the write. See `rows_relocated_from`.
+    fn relocates_rows_under(&self, other: &Self) -> bool {
+        self.rows_relocated_from.iter().any(|fragment| {
+            other
+                .claims
+                .get(&Coordinate::FragmentFiles(*fragment))
+                .is_some_and(|mode| *mode >= Mode::WritesPart)
         })
     }
 
@@ -806,26 +875,48 @@ impl Footprint {
     /// against their claims and their regions, their claims against our
     /// regions, and our regions against theirs. Containment is between a
     /// region and a coordinate; two regions collide when they overlap.
+    ///
+    /// Two exceptions: deletions both sets only add to, which merge row by row
+    /// (see [`Self::compare`]), and what `committed` wrote inside a fragment
+    /// this set deletes outright that the deletion discards along with the
+    /// rows (see [`Self::deletion_discards`]).
     fn claims_conflict_with(&self, committed: &Self) -> bool {
-        let ours_against_theirs = self.claims.iter().flat_map(|(coordinate, ours)| {
-            let same_coordinate = committed.claims.get(coordinate).copied();
-            let containing_regions = committed
-                .regions
-                .iter()
-                .filter(|(region, _)| region.contains(coordinate))
-                .filter(|(region, _)| !ours.is_released_by(region))
-                .map(|(_, theirs)| *theirs);
-            same_coordinate
-                .into_iter()
-                .chain(containing_regions)
-                .map(move |theirs| (*ours, theirs))
-        });
-        let theirs_inside_our_regions = committed.claims.iter().flat_map(|(coordinate, theirs)| {
-            self.regions
-                .iter()
-                .filter(|(region, _)| region.contains(coordinate))
-                .map(move |(_, ours)| (*ours, *theirs))
-        });
+        let merges = |coordinate: &Coordinate| match coordinate {
+            Coordinate::FragmentDeletions(fragment) => {
+                self.deletions_added.contains(fragment)
+                    && committed.deletions_added.contains(fragment)
+            }
+            _ => false,
+        };
+        let ours_against_theirs = self
+            .claims
+            .iter()
+            .filter(|(coordinate, _)| !merges(coordinate))
+            .flat_map(|(coordinate, ours)| {
+                let same_coordinate = committed.claims.get(coordinate).copied();
+                let containing_regions = committed
+                    .regions
+                    .iter()
+                    .filter(|(region, _)| region.contains(coordinate))
+                    .filter(|(region, _)| !ours.is_released_by(region))
+                    .map(|(_, theirs)| *theirs);
+                same_coordinate
+                    .into_iter()
+                    .chain(containing_regions)
+                    .map(move |theirs| (*ours, theirs))
+            });
+        let theirs_inside_our_regions = committed
+            .claims
+            .iter()
+            .filter(|(coordinate, theirs)| {
+                !merges(coordinate) && !self.deletion_discards(coordinate, **theirs)
+            })
+            .flat_map(|(coordinate, theirs)| {
+                self.regions
+                    .iter()
+                    .filter(|(region, _)| region.contains(coordinate))
+                    .map(move |(_, ours)| (*ours, *theirs))
+            });
         let overlapping_regions = self.regions.iter().flat_map(|(region, ours)| {
             committed
                 .regions
@@ -837,6 +928,24 @@ impl Footprint {
             .chain(theirs_inside_our_regions)
             .chain(overlapping_regions)
             .any(|(ours, theirs)| pair_conflicts(ours, theirs))
+    }
+
+    /// Whether a write of `coordinate` in `mode` is inside a fragment this set
+    /// deletes outright, and goes with it. A partial write was to rows the
+    /// deletion takes away, so landing the deletion second loses nothing a
+    /// reader could see, as legacy lets a `Delete` that empties a fragment land
+    /// over an overlay of it; so do the rows' version sequences, which an
+    /// overlay restamps. A full write of data is not discarded so quietly: it
+    /// may be a new value a reader expected the deletion to see. Nor is a
+    /// write inside a fragment whose rows this set moves rather than deletes,
+    /// which would carry the rows over without it.
+    fn deletion_discards(&self, coordinate: &Coordinate, mode: Mode) -> bool {
+        (mode == Mode::WritesPart || matches!(coordinate, Coordinate::FragmentRowVersions(_)))
+            && coordinate.fragment().is_some_and(|fragment| {
+                self.claims.get(&Coordinate::FragmentExistence(fragment)) == Some(&Mode::Writes)
+                    && !self.rows_moved_from.contains(&fragment)
+                    && !self.rows_relocated_from.contains(&fragment)
+            })
     }
 
     fn preconditions_violated_by(&self, committed: &Self) -> bool {
@@ -940,7 +1049,7 @@ impl Footprint {
 
     /// Record that this set writes some of `coordinate`, leaving the rest as
     /// it was. See [`Mode::WritesPart`].
-    fn write_part(&mut self, coordinate: Coordinate) {
+    pub(super) fn write_part(&mut self, coordinate: Coordinate) {
         self.claim(coordinate, Mode::WritesPart);
     }
 
@@ -1017,7 +1126,8 @@ impl Footprint {
     /// An overlay is always new values, so as [`Self::write_field_data`]
     /// requires for those, plus the field's existence in any fragment: an
     /// overlay may supply a field the fragment's base files do not. Only a
-    /// committed fragment has overlays a concurrent writer can name.
+    /// committed fragment has overlays a concurrent writer can name, or rows
+    /// a concurrent writer can move out from under it.
     pub(super) fn write_partial_field_data(
         &mut self,
         fragment: Ref,
@@ -1037,18 +1147,22 @@ impl Footprint {
                 self.write_part(Coordinate::FieldOverlays { fragment, field });
             }
         }
+        if let Some(fragment) = committed_fragment {
+            self.overlaid.insert(fragment);
+        }
     }
 
-    /// Mark `fragment`'s deletions as a conflict point without changing them.
-    ///
-    /// Not a write: the set leaves the deletions as they were. The claim is a
-    /// [`Mode::WritesPart`] marker because that mode has exactly the pairing
-    /// needed -- it collides with any set that replaces the fragment's
-    /// deletions, in either order, and commutes with other markers. See
-    /// [`AddOverlays`](super::AddOverlays)'s footprint for why an overlay
-    /// needs it.
-    pub(super) fn write_part_of_deletions(&mut self, fragment: u64) {
-        self.write_part(Coordinate::FragmentDeletions(fragment));
+    /// Record that this set adds deletions to `fragment` and removes none. See
+    /// [`Overlap::Deletions`].
+    pub(super) fn add_deletions(&mut self, fragment: u64) {
+        self.write(Coordinate::FragmentDeletions(fragment));
+        self.deletions_added.insert(fragment);
+    }
+
+    /// Record that this set moves some of `fragment`'s rows into a fragment of
+    /// its own. See `rows_relocated_from`.
+    fn relocate_rows_out_of(&mut self, fragment: u64) {
+        self.rows_relocated_from.insert(fragment);
     }
 
     /// Record that this set adds a fragment, whose rows were prepared against
@@ -1382,6 +1496,35 @@ impl From<&CompositeOperation> for Footprint {
                 }
             }
         }
+
+        // A row-moving update is spelled as deletions plus the rows written
+        // anew, and nothing says which added rows came from which deleted
+        // ones. So every fragment a set that adds rows deletes from, or
+        // deletes outright, is taken to have had rows moved out. The cost is a
+        // spurious conflict between an unrelated delete and append in one set
+        // and a concurrent write to the deleted-from fragment.
+        let adds_rows = composite_operation
+            .iter_actions()
+            .any(|action| matches!(action, Action::AddFragment(fragment) if fragment.data_change));
+        if adds_rows {
+            let deleted_from: Vec<u64> = composite_operation
+                .iter_actions()
+                .filter_map(|action| match action {
+                    Action::SetDeletionFile(set)
+                        if footprint.deletions_added.contains(&set.fragment) =>
+                    {
+                        Some(set.fragment)
+                    }
+                    Action::RemoveFragment(remove) if remove.data_change => {
+                        remove.fragment.committed()
+                    }
+                    _ => None,
+                })
+                .collect();
+            for fragment in deleted_from {
+                footprint.relocate_rows_out_of(fragment);
+            }
+        }
         footprint
     }
 }
@@ -1389,11 +1532,12 @@ impl From<&CompositeOperation> for Footprint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{BasePath, DataFile};
+    use crate::format::key_existence::FilterType;
+    use crate::format::{BasePath, DataFile, DeletionFile, DeletionFileType};
     use crate::transaction::action::test_support::footprint;
     use crate::transaction::action::{
-        Action, AddBase, AddDataFile, AddField, AddFragment, AddOverlays, AlterField, DropField,
-        RemoveFragment, SetDeletionFile, TombstoneFieldData,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AddOverlays, AlterField,
+        AssertUniqueKeys, DropField, RemoveFragment, SetDeletionFile, TombstoneFieldData,
     };
     use crate::transaction::test_support::overlay_with_field;
     use arrow_schema::{DataType, Field as ArrowField};
@@ -1579,6 +1723,42 @@ mod tests {
         })
     }
 
+    /// Deletions added to a committed fragment: a delete, rather than a clear.
+    fn add_deletions(fragment: u64) -> Action {
+        Action::SetDeletionFile(SetDeletionFile {
+            fragment,
+            deletion_file: Some(DeletionFile {
+                read_version: 1,
+                id: 1,
+                file_type: DeletionFileType::Array,
+                num_deleted_rows: Some(1),
+                base_id: None,
+            }),
+            data_change: true,
+            base: None,
+        })
+    }
+
+    /// A vertical update of rows in `fragment`: deleted there, written anew.
+    fn moving_update(fragment: u64) -> Vec<Action> {
+        let mut actions = append(0);
+        actions.push(add_deletions(fragment));
+        actions
+    }
+
+    /// [`moving_update`] asserting it inserts the keys in `hashes` over field 0.
+    fn merge_insert(fragment: u64, hashes: &[u64]) -> Vec<Action> {
+        let mut actions = moving_update(fragment);
+        actions.push(Action::AssertUniqueKeys(AssertUniqueKeys {
+            key_fields: vec![FieldRef::Committed(0)],
+            filter: KeyExistenceFilter {
+                field_ids: vec![0],
+                filter: FilterType::ExactSet(hashes.iter().copied().collect()),
+            },
+        }));
+        actions
+    }
+
     fn add_base(local: u32, name: &str, path: &str) -> Action {
         Action::AddBase(AddBase {
             local,
@@ -1625,10 +1805,21 @@ mod tests {
         vec![tombstone(0, &[1])],
         false,
     )]
-    #[case::concurrent_deletes_of_one_fragment(
+    #[case::concurrent_clears_of_one_fragments_deletions(
         vec![set_deletion_file(0)],
         vec![set_deletion_file(0)],
         true,
+    )]
+    #[case::a_clear_and_an_addition_of_deletions(
+        vec![set_deletion_file(0)],
+        vec![add_deletions(0)],
+        true,
+    )]
+    // Whether the rows differ is settled when rebasing.
+    #[case::concurrent_additions_of_deletions(
+        vec![add_deletions(0)],
+        vec![add_deletions(0)],
+        false,
     )]
     #[case::removal_swallows_the_whole_fragment(
         vec![remove_fragment(0)],
@@ -1678,11 +1869,6 @@ mod tests {
         reencode(0, 1, false),
         vec![rename_field(1, "a")],
         false,
-    )]
-    #[case::an_overlay_on_a_fragment_a_concurrent_set_removes(
-        vec![add_overlays(0, 1)],
-        vec![remove_fragment(0)],
-        true,
     )]
     #[case::different_field_definitions(
         vec![Action::AlterField(AlterField { field: FieldRef::Committed(1), name: None, nullable: None })],
@@ -2026,6 +2212,48 @@ mod tests {
         ],
         false,
     )]
+    // A delete that removes a fragment takes a partial write of it along with
+    // the rows; a full write of a value is not discarded so quietly.
+    #[case::an_overlay_landing_after_its_fragment_was_removed(
+        vec![add_overlays(0, 1)],
+        vec![remove_fragment(0)],
+        true,
+    )]
+    #[case::a_removal_landing_after_an_overlay(
+        vec![remove_fragment(0)],
+        vec![add_overlays(0, 1)],
+        false,
+    )]
+    // Unless the removal moved the rows into a fragment of its own.
+    #[case::an_update_moving_every_row_landing_after_an_overlay(
+        [append(0), vec![remove_fragment(0)]].concat(),
+        vec![add_overlays(0, 1)],
+        true,
+    )]
+    #[case::a_removal_landing_after_a_column_rewrite(
+        vec![remove_fragment(0)],
+        reencode(0, 1, true),
+        true,
+    )]
+    // A row-moving update copies the values it read into a fragment of its
+    // own, so a write to the files it moved rows out of misses them, in either
+    // order.
+    #[case::a_moving_update_landing_after_a_column_rewrite(
+        moving_update(0),
+        reencode(0, 1, true),
+        true
+    )]
+    #[case::a_column_rewrite_landing_after_a_moving_update(
+        reencode(0, 1, true),
+        moving_update(0),
+        true
+    )]
+    #[case::a_moving_update_landing_after_a_column_rewrite_elsewhere(
+        moving_update(0),
+        reencode(1, 1, true),
+        false
+    )]
+    #[case::two_moving_updates_of_one_fragment(moving_update(0), moving_update(0), false)]
     fn test_directional_conflicts(
         #[case] ours: Vec<Action>,
         #[case] committed: Vec<Action>,
@@ -2067,5 +2295,44 @@ mod tests {
             Verdict::Rebase(overlaps) => assert_eq!(overlaps, expected),
             Verdict::Conflict => panic!("expected {expected:?}, got a conflict"),
         }
+    }
+
+    /// Additions to one fragment's deletions merge row by row, which the
+    /// verdict leaves to the rebase, whatever else each side does.
+    #[rstest]
+    #[case::two_deletes(vec![add_deletions(0)], vec![add_deletions(0)])]
+    #[case::a_delete_and_a_moving_update(vec![add_deletions(0)], moving_update(0))]
+    #[case::a_moving_update_and_a_delete(moving_update(0), vec![add_deletions(0)])]
+    #[case::two_moving_updates(moving_update(0), moving_update(0))]
+    fn test_additions_to_deletions_rebase(
+        #[case] ours: Vec<Action>,
+        #[case] committed: Vec<Action>,
+    ) {
+        let verdict = footprint(ours).compare(&footprint(committed));
+        assert!(
+            matches!(&verdict, Verdict::Rebase(overlaps) if overlaps == &[Overlap::Deletions { fragment: 0 }]),
+            "{verdict:?}"
+        );
+    }
+
+    /// Rebasing deletions does not relax the key assertions: two merge
+    /// inserts moving different rows of one fragment still conflict when the
+    /// keys they insert may collide, and rebase when they provably do not.
+    #[test]
+    fn test_key_assertions_hold_over_rebased_deletions() {
+        let ours = footprint(merge_insert(0, &[1, 2]));
+
+        let colliding = ours.compare(&footprint(merge_insert(0, &[2, 3])));
+        assert!(matches!(colliding, Verdict::Conflict), "{colliding:?}");
+
+        let disjoint = ours.compare(&footprint(merge_insert(0, &[3, 4])));
+        assert!(
+            matches!(&disjoint, Verdict::Rebase(overlaps) if overlaps == &[Overlap::Deletions { fragment: 0 }]),
+            "{disjoint:?}"
+        );
+
+        // An insert that says nothing about its keys cannot be checked.
+        let unqualified = ours.compare(&footprint(moving_update(0)));
+        assert!(matches!(unqualified, Verdict::Conflict), "{unqualified:?}");
     }
 }
