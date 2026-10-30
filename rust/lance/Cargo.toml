@@ -202,6 +202,10 @@ name = "scalar_index"
 harness = false
 
 [[bench]]
+name = "membership_planning"
+harness = false
+
+[[bench]]
 name = "regex_ngram"
 harness = false
 

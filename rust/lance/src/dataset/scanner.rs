@@ -16528,6 +16528,204 @@ mod test {
         assert_plan_node_equals(exec_plan, expected).await
     }
 
+    #[rstest]
+    #[case::indexed_hit("target", 2, false)]
+    #[case::indexed_miss("missing", 0, false)]
+    #[case::partially_indexed_hit("target", 4, true)]
+    #[case::partially_indexed_miss("missing", 0, true)]
+    #[tokio::test]
+    async fn test_redundant_in_conjunction_index_plan(
+        #[case] clip: &str,
+        #[case] rows: usize,
+        #[case] has_unindexed: bool,
+    ) {
+        let batch = arrow_array::record_batch!(
+            (
+                "clip",
+                Utf8,
+                [
+                    Some("target"),
+                    Some("target"),
+                    Some("other"),
+                    None,
+                    Some("target"),
+                    Some("target")
+                ]
+            ),
+            (
+                "month",
+                Utf8,
+                [
+                    Some("202608"),
+                    Some("202609"),
+                    Some("202607"),
+                    Some("202608"),
+                    None,
+                    Some("202601")
+                ]
+            )
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        for (column, index_type, builtin) in [
+            ("clip", IndexType::BTree, BuiltinIndexType::BTree),
+            ("month", IndexType::Bitmap, BuiltinIndexType::Bitmap),
+        ] {
+            dataset
+                .create_index(
+                    &[column],
+                    index_type,
+                    None,
+                    &ScalarIndexParams::for_builtin(builtin),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        if has_unindexed {
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(batch)], schema),
+                    Some(WriteParams {
+                        max_rows_per_file: 3,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(dataset.get_fragments().len(), 4);
+        }
+        let copies = if has_unindexed { 2 } else { 1 };
+        let narrow = format!("clip = '{clip}' AND month IN ('202607','202608','202609')");
+        let redundant = format!(
+            "clip IS NOT NULL AND month IN ('202601','202602','202603','202604','202605','202606','202607','202608','202609','202610') AND {narrow}"
+        );
+        let mut narrow_scan = dataset.scan();
+        narrow_scan.filter(&narrow).unwrap();
+        let narrow_plan = narrow_scan.explain_plan(false).await.unwrap();
+        assert!(narrow_plan.contains("ScalarIndexQuery"), "{narrow_plan}");
+        let mut redundant_scan = dataset.scan();
+        redundant_scan.filter(&redundant).unwrap();
+        let redundant_plan = redundant_scan.explain_plan(false).await.unwrap();
+        assert!(!redundant_plan.contains("202601"), "{redundant_plan}");
+        let scalar_query = |plan: &str| {
+            plan.lines()
+                .find(|line| line.contains("ScalarIndexQuery:"))
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        assert_eq!(scalar_query(&narrow_plan), scalar_query(&redundant_plan));
+        let expected = narrow_scan.try_into_batch().await.unwrap();
+        assert_eq!(expected.num_rows(), rows);
+        assert_eq!(redundant_scan.try_into_batch().await.unwrap(), expected);
+        let mut unindexed = dataset.scan();
+        unindexed
+            .use_scalar_index(false)
+            .filter(&redundant)
+            .unwrap();
+        assert_eq!(unindexed.try_into_batch().await.unwrap(), expected);
+
+        let wide = format!(
+            "clip = '{clip}' AND month IN ('202601','202602','202603','202604','202605','202606','202607','202608','202609','202610')"
+        );
+        let mut work = Vec::with_capacity(3);
+        for filter in [&narrow, &redundant, &wide] {
+            // Compare cold-cache scans, otherwise a preceding scan could hide
+            // extra bitmap posting loads in the redundant predicate.
+            dataset.session.index_cache.clear().await;
+            let stats = Arc::new(Mutex::new(None));
+            let captured = stats.clone();
+            let mut scan = dataset.scan();
+            scan.filter(filter)
+                .unwrap()
+                .scan_stats_callback(Arc::new(move |summary| {
+                    *captured.lock().unwrap() = Some(summary.clone());
+                }));
+            scan.try_into_batch().await.unwrap();
+            let summary = stats.lock().unwrap().take().unwrap();
+            work.push((summary.index_comparisons, summary.parts_loaded));
+        }
+        assert_eq!(
+            work[0], work[1],
+            "narrow and redundant queries must do the same index work"
+        );
+        if clip == "target" {
+            assert!(work[0].0 > 0 && work[0].1 > 0, "{work:?}");
+            assert!(
+                work[2].0 > work[0].0,
+                "wide-only query must compare more keys: {work:?}"
+            );
+            assert!(
+                work[2].1 > work[0].1,
+                "wide-only query must load more postings: {work:?}"
+            );
+        }
+
+        // Empty intersections must keep their indexable predicates. Introducing
+        // a NULL guard adds residual filtering and disables an enclosing OR's
+        // index plan, even though every original predicate has an exact index.
+        let disjoint = "month IN ('202601') AND clip = 'other' AND month IN ('202602')";
+        for (filter, expected_rows) in [
+            (disjoint.to_string(), 0),
+            (
+                format!("({disjoint}) OR clip = '{clip}'"),
+                if clip == "target" { 4 * copies } else { 0 },
+            ),
+        ] {
+            let mut scan = dataset.scan();
+            scan.filter(&filter).unwrap();
+            let plan = scan.explain_plan(false).await.unwrap();
+            assert!(plan.contains("ScalarIndexQuery:"), "{plan}");
+            assert!(plan.contains("[month = 202601]"), "{plan}");
+            assert!(plan.contains("[month = 202602]"), "{plan}");
+            assert!(plan.contains("refine_filter=--"), "{plan}");
+            let result = scan.try_into_batch().await.unwrap();
+            assert_eq!(result.num_rows(), expected_rows);
+            let mut unindexed = dataset.scan();
+            unindexed.use_scalar_index(false).filter(&filter).unwrap();
+            assert_eq!(unindexed.try_into_batch().await.unwrap(), result);
+        }
+
+        // Merging the repeated clip predicate must not expose the month
+        // contradiction to NULL-unsafe constant folding. In particular, NOT
+        // must not turn UNKNOWN into TRUE and admit the row with a NULL month.
+        let filter = "NOT (((month NOT IN ('202601') AND clip IN ('target')) \
+                      AND month IN ('202601')) AND clip IN ('target'))";
+        let mut reference_scan = dataset.scan();
+        reference_scan.filter("month IS NOT NULL").unwrap();
+        let expected = reference_scan.try_into_batch().await.unwrap();
+        assert_eq!(expected.num_rows(), 5 * copies);
+        for filter in [
+            filter,
+            "NOT (((month IN ('202601','202607','202608','202609') AND clip = 'target') \
+                AND array_has(['x','y','z','w'], month)) AND clip = 'target')",
+            "NOT (((month IN ('202601','202607','202608','202609') AND clip = 'target') \
+                AND (month LIKE 'x' OR month LIKE 'y')) AND clip = 'target')",
+            "NOT (((month IN ('202601','202607','202608','202609') AND clip = 'target') \
+                AND ((month NOT IN ('202601','202607','202608','202609')) = TRUE)) AND clip = 'target')",
+            "((((month IN ('202601','202607','202608','202609') AND clip = 'target') \
+                AND ((month IN ('202601','202607','202608','202609')) = FALSE)) AND clip = 'target')) IS FALSE",
+        ] {
+            for use_index in [true, false] {
+                let mut scan = dataset.scan();
+                scan.use_scalar_index(use_index).filter(filter).unwrap();
+                assert_eq!(scan.try_into_batch().await.unwrap(), expected, "{filter}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_inexact_scalar_index_plans() {
         let data = gen_batch()
