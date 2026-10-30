@@ -79,6 +79,11 @@ const EXEMPT: &[(Scenario, Scenario, &str)] = &[
         Scenario::ActionAppendAndConfig,
         NEW_COLUMN_MISSES_NEW_ROWS,
     ),
+    (
+        Scenario::ActionAddColumn,
+        Scenario::ActionAppendAndIndex,
+        NEW_COLUMN_MISSES_NEW_ROWS,
+    ),
 ];
 
 const NEW_COLUMN_MISSES_NEW_ROWS: &str = "a nullable column computes its values for the rows \
