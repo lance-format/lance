@@ -7,11 +7,11 @@ use std::borrow::Cow;
 
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
 use lance_core::deepsize::DeepSizeOf;
-use lance_index::frag_reuse::FragReuseIndexDetails;
+use lance_index::frag_reuse::{
+    FragDigest, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
+};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::IndexMetadata;
-use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
-use prost::Message;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -29,18 +29,49 @@ pub(super) struct V0HistoryDigests {
 
 impl V0HistoryDigests {
     pub(super) fn new(details: &FragReuseIndexDetails) -> Self {
-        let versions = details
-            .versions
-            .iter()
-            .map(|version| {
-                *blake3::hash(&pb_fri::Version::from(version).encode_to_vec()).as_bytes()
-            })
-            .collect();
+        let versions = details.versions.iter().map(version_digest).collect();
         Self {
             chain: reuse_chain_frag_bitmap(&details.versions),
             versions,
         }
     }
+}
+
+/// Hashes every field of `version` in place: converting to protobuf and
+/// encoding would copy each group's row-address bitmap twice. Lengths separate
+/// the variable-sized fields, and the destructuring fails to compile when a
+/// field is added, so a new field cannot silently drop out of the digest.
+fn version_digest(version: &FragReuseVersion) -> [u8; 32] {
+    let FragReuseVersion {
+        dataset_version,
+        groups,
+    } = version;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&dataset_version.to_le_bytes());
+    hasher.update(&(groups.len() as u64).to_le_bytes());
+    for group in groups {
+        let FragReuseGroup {
+            changed_row_addrs,
+            old_frags,
+            new_frags,
+        } = group;
+        hasher.update(&(changed_row_addrs.len() as u64).to_le_bytes());
+        hasher.update(changed_row_addrs);
+        for frags in [old_frags, new_frags] {
+            hasher.update(&(frags.len() as u64).to_le_bytes());
+            for frag in frags {
+                let FragDigest {
+                    id,
+                    physical_rows,
+                    num_deleted_rows,
+                } = frag;
+                hasher.update(&id.to_le_bytes());
+                hasher.update(&(*physical_rows as u64).to_le_bytes());
+                hasher.update(&(*num_deleted_rows as u64).to_le_bytes());
+            }
+        }
+    }
+    *hasher.finalize().as_bytes()
 }
 
 impl DeepSizeOf for V0HistoryDigests {
@@ -93,8 +124,12 @@ pub(super) fn v0_segment_cache_id(
     digests: &V0HistoryDigests,
     segment: &IndexMetadata,
 ) -> Option<Uuid> {
-    if segment.fragment_bitmap.is_none() {
+    let Some(covered) = &segment.fragment_bitmap else {
         return Some(history);
+    };
+    // Caught up on every version; skips the per-version gate below.
+    if covered.is_disjoint(&digests.chain) {
+        return None;
     }
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"lance.frag_reuse.v0_segment_cache_id");
@@ -136,7 +171,49 @@ pub(super) async fn segment_cache_id(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lance_index::frag_reuse::{FragDigest, FragReuseGroup, FragReuseVersion};
+
+    // Every field reaches the digest, and the length prefixes keep content
+    // from shifting across a field or group boundary unnoticed.
+    #[test]
+    fn version_digest_covers_every_field() {
+        let frag = |id| FragDigest {
+            id,
+            physical_rows: 100,
+            num_deleted_rows: 0,
+        };
+        let group = |addrs: &[u8], old: Vec<FragDigest>, new: Vec<FragDigest>| FragReuseGroup {
+            changed_row_addrs: addrs.to_vec(),
+            old_frags: old,
+            new_frags: new,
+        };
+        let base = FragReuseVersion {
+            dataset_version: 10,
+            groups: vec![group(&[1, 2], vec![frag(4)], vec![frag(6)])],
+        };
+        let mut variants = vec![base.clone()];
+        let mut edit = |change: &dyn Fn(&mut FragReuseVersion)| {
+            let mut version = base.clone();
+            change(&mut version);
+            variants.push(version);
+        };
+        edit(&|v| v.dataset_version = 11);
+        edit(&|v| v.groups[0].changed_row_addrs = vec![1, 3]);
+        edit(&|v| v.groups[0].old_frags[0].id = 5);
+        edit(&|v| v.groups[0].new_frags[0].physical_rows = 99);
+        edit(&|v| v.groups[0].new_frags[0].num_deleted_rows = 1);
+        edit(&|v| {
+            let moved = v.groups[0].new_frags.pop().unwrap();
+            v.groups[0].old_frags.push(moved);
+        });
+        edit(&|v| {
+            v.groups = vec![
+                group(&[1], vec![frag(4)], vec![]),
+                group(&[2], vec![], vec![frag(6)]),
+            ]
+        });
+        let digests: std::collections::HashSet<_> = variants.iter().map(version_digest).collect();
+        assert_eq!(digests.len(), variants.len());
+    }
 
     // One row per branch of the per-segment v0 key.
     #[test]
