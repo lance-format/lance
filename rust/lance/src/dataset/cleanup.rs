@@ -41,7 +41,7 @@ use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
 use dashmap::DashSet;
-use futures::future::try_join_all;
+use futures::future::{join_all, try_join_all};
 use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use humantime::parse_duration;
 use lance_core::{
@@ -1284,7 +1284,10 @@ impl<'a> CleanupTask<'a> {
             // attached to its file, which is what lets the stats below count what was
             // actually removed instead of what was merely attempted.
             let store = &self.dataset.object_store;
-            all_files_to_remove
+            // A listing error must not drop already submitted deletions. Finish
+            // the sweep before returning the first error and releasing history
+            // exclusion, including deletion of the expired manifests.
+            let first_error = all_files_to_remove
                 .map(|file| async move {
                     let file = file?;
                     // Acquire concurrency before QPS so queued deletes cannot spend
@@ -1307,7 +1310,11 @@ impl<'a> CleanupTask<'a> {
                     Ok::<_, Error>((file, outcome))
                 })
                 .buffer_unordered(execution.concurrency)
-                .try_for_each(|(file, outcome)| {
+                .fold(None, |first_error, deletion| {
+                    let (file, outcome) = match deletion {
+                        Ok(deletion) => deletion,
+                        Err(error) => return future::ready(first_error.or(Some(error))),
+                    };
                     let mut result = cleanup_result.lock().unwrap();
                     match outcome {
                         Ok(()) => result.record_file(
@@ -1338,9 +1345,12 @@ impl<'a> CleanupTask<'a> {
                             }
                         }
                     }
-                    future::ready(Ok(()))
+                    future::ready(first_error)
                 })
-                .await?;
+                .await;
+            if let Some(error) = first_error {
+                return Err(error);
+            }
 
             // Only after the objects are gone: a record that outlives its
             // manifest is retired by the next cleanup, the reverse is a lost
@@ -1855,7 +1865,11 @@ impl<'a> CleanupTask<'a> {
                 }
             })
             .collect();
-        try_join_all(tasks).await?;
+        // A failed lineage must not cancel siblings with submitted deletions:
+        // all of them must settle before the shared history lock is released.
+        for result in join_all(tasks).await {
+            result?;
+        }
         Ok(final_result.into_inner().unwrap())
     }
 
@@ -2811,6 +2825,168 @@ mod tests {
     }
 
     #[rstest]
+    #[case::execute("execute")]
+    #[case::standalone_cascade("standalone")]
+    #[case::sibling_cascade("siblings")]
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_error_drains_submitted_deletes(
+        #[case] mode: &str,
+        #[values(false, true)] is_local: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let uri = if is_local {
+            dir.as_str()
+        } else {
+            "memory://table"
+        };
+        let wrapper = Arc::new(MockObjectStore {
+            delete_latency: Duration::from_secs(1),
+            ..MockObjectStore::new()
+        });
+        let data = || {
+            lance_datagen::gen_batch()
+                .col(
+                    "id",
+                    lance_datagen::array::step::<arrow_array::types::Int32Type>(),
+                )
+                .into_reader_rows(4.into(), 1.into())
+        };
+        let mut parent = Dataset::write(
+            data(),
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(wrapper.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut deleting = parent.clone();
+        let mut failing_indices = parent.indices_dir();
+        if mode == "siblings" {
+            deleting = parent.create_branch("deleting", 1, None).await.unwrap();
+            deleting
+                .update_config([
+                    ("lance.auto_cleanup.interval", "1"),
+                    ("lance.auto_cleanup.retain_versions", "1"),
+                ])
+                .await
+                .unwrap();
+            // The old data must belong to this branch, rather than its parent.
+            deleting = Dataset::write(
+                data(),
+                Arc::new(deleting),
+                Some(WriteParams {
+                    mode: WriteMode::Overwrite,
+                    max_rows_per_file: 2,
+                    skip_auto_cleanup: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            // Distinct parent versions make these independently scheduled lineages.
+            parent.append(data(), None).await.unwrap();
+            let mut failing = parent.create_branch("failing", 2, None).await.unwrap();
+            failing
+                .update_config([
+                    ("lance.auto_cleanup.interval", "1"),
+                    // No deletions of its own may delay this branch's error.
+                    ("lance.auto_cleanup.retain_versions", "2"),
+                ])
+                .await
+                .unwrap();
+            failing_indices = failing.indices_dir();
+            parent.append(data(), None).await.unwrap();
+        }
+        let source_version = deleting.version_id();
+        let old_data = deleting
+            .data_dir()
+            .join(deleting.manifest.fragments[0].files[0].path.as_str());
+        deleting = Dataset::write(
+            data(),
+            Arc::new(deleting),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                max_rows_per_file: 2,
+                skip_auto_cleanup: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(deleting.get_fragments().len(), 2);
+        let expected = deleting.scan().try_into_batch().await.unwrap();
+        assert!(deleting.object_store.exists(&old_data).await.unwrap());
+        assert_eq!(wrapper.deletes.pending.load(Ordering::SeqCst), 0);
+        *wrapper.deletes.fail_listing.lock().unwrap() = Some(failing_indices);
+
+        let error = if mode == "standalone" {
+            let mut manifest = deleting.manifest.as_ref().clone();
+            manifest
+                .config
+                .insert("lance.auto_cleanup.interval".into(), "1".into());
+            manifest
+                .config
+                .insert("lance.auto_cleanup.retain_versions".into(), "1".into());
+            cleanup_cascade_branch(&deleting, &manifest)
+                .await
+                .unwrap_err()
+        } else {
+            let dataset = if mode == "siblings" {
+                &parent
+            } else {
+                &deleting
+            };
+            dataset
+                .cleanup(CleanupPolicy {
+                    before_version: Some(dataset.version_id()),
+                    error_if_tagged_old_versions: false,
+                    clean_referenced_branches: mode == "siblings",
+                    ..Default::default()
+                })
+                .execute()
+                .await
+                .unwrap_err()
+        };
+        assert!(matches!(error, Error::IO { .. }), "{error}");
+        assert_contains!(error.to_string(), "injected listing failure");
+        *wrapper.deletes.fail_listing.lock().unwrap() = None;
+        // Submitted requests survive cancellation of their waiting futures.
+        // Both the failed sweep and its sibling lineages must finish them
+        // before releasing the table's history lock and returning the error.
+        assert_eq!(wrapper.deletes.pending.load(Ordering::SeqCst), 0);
+        assert!(!deleting.object_store.exists(&old_data).await.unwrap());
+        let error = deleting
+            .tags()
+            .create("after_error", source_version)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::VersionNotFound { .. }), "{error}");
+        assert_contains!(error.to_string(), "does not exist");
+        deleting
+            .tags()
+            .create("latest", deleting.version_id())
+            .await
+            .unwrap();
+        assert_eq!(
+            deleting
+                .checkout_version("latest")
+                .await
+                .unwrap()
+                .scan()
+                .try_into_batch()
+                .await
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[rstest]
     #[case::default(None, false)]
     #[case::serial(Some(1), false)]
     #[case::override_default(Some(4), false)]
@@ -2949,16 +3125,25 @@ mod tests {
     #[derive(Debug)]
     struct MockObjectStore {
         delete_latency: Duration,
+        deletes: Arc<SubmittedDeletes>,
         policy: Arc<Mutex<ProxyObjectStorePolicy>>,
         last_modified_times: Arc<Mutex<HashMap<Path, DateTime<Utc>>>>,
     }
 
-    /// Delay only deletes: the upstream ThrottledStore cannot read local-file
-    /// payloads, so it cannot drive the same race test on local and memory stores.
+    #[derive(Debug, Default)]
+    struct SubmittedDeletes {
+        pending: AtomicUsize,
+        data_submitted: tokio::sync::Notify,
+        fail_listing: Mutex<Option<Path>>,
+    }
+
+    /// Model backend requests that continue after their waiting future is
+    /// dropped. Unlike ThrottledStore, this also supports local-file reads.
     #[derive(Debug)]
     struct DelayedDeletes {
         inner: Arc<dyn object_store::ObjectStore>,
         latency: Duration,
+        submitted: Arc<SubmittedDeletes>,
     }
 
     impl std::fmt::Display for DelayedDeletes {
@@ -2999,17 +3184,56 @@ mod tests {
             locations: BoxStream<'static, object_store::Result<Path>>,
         ) -> BoxStream<'static, object_store::Result<Path>> {
             let latency = self.latency;
-            let delayed = locations.then(move |location| async move {
-                tokio::time::sleep(latency).await;
-                location
-            });
-            self.inner.delete_stream(delayed.boxed())
+            let inner = self.inner.clone();
+            let submitted = self.submitted.clone();
+            locations
+                .map(move |location| {
+                    let inner = inner.clone();
+                    let submitted = submitted.clone();
+                    async move {
+                        let path = location?;
+                        if path.extension() == Some("lock") {
+                            inner.delete(&path).await?;
+                            return Ok(path);
+                        }
+                        submitted.pending.fetch_add(1, Ordering::SeqCst);
+                        let is_data = path.extension() == Some("lance");
+                        let task = tokio::spawn({
+                            let submitted = submitted.clone();
+                            async move {
+                                tokio::time::sleep(latency).await;
+                                let result = inner.delete(&path).await.map(|()| path);
+                                submitted.pending.fetch_sub(1, Ordering::SeqCst);
+                                result
+                            }
+                        });
+                        if is_data {
+                            submitted.data_submitted.notify_one();
+                        }
+                        task.await.unwrap()
+                    }
+                })
+                .buffer_unordered(16)
+                .boxed()
         }
 
         fn list(
             &self,
             prefix: Option<&Path>,
         ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            if prefix.is_some() && prefix == self.submitted.fail_listing.lock().unwrap().as_ref() {
+                let submitted = self.submitted.clone();
+                return stream::once(async move {
+                    // A sibling's deletion must be submitted before this error
+                    // can cancel its future, independent of branch scheduling.
+                    submitted.data_submitted.notified().await;
+                    Err(object_store::Error::Generic {
+                        store: "DelayedDeletes",
+                        source: "injected listing failure".into(),
+                    })
+                })
+                .boxed();
+            }
             self.inner.list(prefix)
         }
 
@@ -3051,6 +3275,7 @@ mod tests {
                 Arc::new(DelayedDeletes {
                     inner: original,
                     latency: self.delete_latency,
+                    submitted: self.deletes.clone(),
                 })
             };
             Arc::new(ProxyObjectStore::new(original, self.policy.clone()))
@@ -3070,6 +3295,7 @@ mod tests {
         pub(crate) fn new() -> Self {
             let instance = Self {
                 delete_latency: Duration::ZERO,
+                deletes: Arc::default(),
                 policy: Arc::new(Mutex::new(ProxyObjectStorePolicy::new())),
                 last_modified_times: Arc::new(Mutex::new(HashMap::new())),
             };
