@@ -1913,6 +1913,12 @@ impl Scanner {
     /// numbered independently of it is accepted as long as the names and types
     /// line up.
     ///
+    /// On a search, the projection may also name the scoring column
+    /// (`_distance` or `_score`) when the dataset has no column of that name;
+    /// the search computes it. Naming it keeps it in the output once scoring
+    /// columns are no longer appended automatically (see
+    /// [`Self::disable_scoring_autoprojection`]).
+    ///
     /// The resulting plan contains no complex expressions. See
     /// [`ProjectionPlan::from_schema`].
     ///

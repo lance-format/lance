@@ -123,6 +123,25 @@ pub fn build_scanner_projection(
     cols
 }
 
+/// `projection`, resolved against `dataset`, plus the scoring column a search
+/// computes (`_distance` or `_score`). A schema projection names it explicitly
+/// so the scanner emits it without relying on scoring-column autoprojection.
+pub fn search_projection(
+    dataset: &crate::Dataset,
+    projection: &[impl AsRef<str>],
+    scoring_column: &str,
+) -> Result<LanceSchema> {
+    let mut schema = dataset.schema().project(projection)?;
+    schema
+        .fields
+        .push(lance_core::datatypes::Field::try_from(&Field::new(
+            scoring_column,
+            DataType::Float32,
+            true,
+        ))?);
+    Ok(schema)
+}
+
 /// Validate user-facing projection names before constructing a canonical schema.
 pub fn validate_projection_names(
     user_projection: Option<&[String]>,
