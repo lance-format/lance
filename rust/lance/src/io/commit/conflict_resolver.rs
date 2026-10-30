@@ -8607,6 +8607,9 @@ mod tests {
         };
         use lance_table::system_index::frag_reuse::FragDigest;
         use lance_table::system_index::frag_reuse::ledger::{FragReuseLedger, Mapping};
+        use lance_table::transaction::action::{
+            AddDataFile, AppendFragReuseTransition, FragReuseMapping,
+        };
         use prost::Message;
         use roaring::{RoaringBitmap, RoaringTreemap};
 
@@ -9655,8 +9658,12 @@ mod tests {
         /// ledger validates. Overlap is rejected earlier and non-retryably
         /// by the double-consumption rule, so what reaches reassembly is
         /// proven disjoint.
+        #[rstest::rstest]
         #[tokio::test]
-        async fn sp_vs_sp_disjoint_merges_fresh_session() {
+        async fn sp_vs_sp_disjoint_merges_fresh_session(
+            #[values(CompactionForm::Legacy, CompactionForm::Actions)] first: CompactionForm,
+            #[values(CompactionForm::Legacy, CompactionForm::Actions)] second: CompactionForm,
+        ) {
             let dir = TempStrDir::default();
             let mut writer_a = disk_fixture(dir.as_str(), 4, 4).await;
             writer_a
@@ -9673,40 +9680,12 @@ mod tests {
             let base_version = writer_a.manifest.version;
 
             let writer_b = fresh_session(dir.as_str()).await;
-            let b_old: Vec<Fragment> = writer_b
-                .fragments()
-                .iter()
-                .filter(|f| f.id < 2)
-                .cloned()
-                .collect();
-            let (b_transition, b_destinations) = prepare_partition(&writer_b, &[0, 1], 10).await;
-            let read_version = writer_b.manifest.version;
-            assert_eq!(read_version, base_version);
+            assert_eq!(writer_b.manifest.version, base_version);
 
-            let a_old: Vec<Fragment> = writer_a
-                .fragments()
-                .iter()
-                .filter(|f| f.id >= 2)
-                .cloned()
-                .collect();
-            let (a_transition, a_destinations) = prepare_partition(&writer_a, &[2, 3], 20).await;
-            let a_version = writer_a.manifest.version;
-            commit_sp(
-                &writer_a,
-                a_version,
-                tagged_rewrite(&writer_a, a_old, a_destinations, vec![a_transition.clone()]).await,
-            )
-            .await
-            .unwrap();
+            let (_, a_transition) = commit_partition(&writer_a, &[2, 3], 20, first).await;
 
             // No caller-visible error: the in-loop rebase merges.
-            let committed = commit_sp(
-                &writer_b,
-                read_version,
-                tagged_rewrite(&writer_b, b_old, b_destinations, vec![b_transition.clone()]).await,
-            )
-            .await
-            .unwrap();
+            let (committed, b_transition) = commit_partition(&writer_b, &[0, 1], 10, second).await;
             // Exactly two commits landed on top of the shared base.
             assert_eq!(committed.manifest.version, base_version + 2);
 
@@ -10127,18 +10106,131 @@ mod tests {
 
         /// A tagged table with one stable-partition transition (fragments
         /// 10 and 11) built through the real commit path.
-        async fn make_tagged(mut dataset: Dataset) -> Dataset {
+        async fn make_tagged(dataset: Dataset) -> Dataset {
+            make_tagged_as(dataset, CompactionForm::Legacy).await
+        }
+
+        /// How a stable-partition compaction is committed.
+        #[derive(Debug, Clone, Copy)]
+        enum CompactionForm {
+            /// A `Rewrite` carrying the appended fragment reuse entry.
+            Legacy,
+            /// An action set whose `AppendFragReuseTransition` records the move.
+            Actions,
+        }
+
+        /// [`make_tagged`], committing the compaction in `form`.
+        async fn make_tagged_as(mut dataset: Dataset, form: CompactionForm) -> Dataset {
             reserve(&mut dataset, 40).await;
-            let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
-            let (transition, destinations) = prepare(&dataset).await;
+            let source_ids: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+            commit_partition(&dataset, &source_ids, 10, form).await.0
+        }
+
+        /// Partition `source_ids` into two fragments numbered from
+        /// `dest_base_id`, which an earlier reservation must cover, committing
+        /// the compaction in `form` from `dataset`'s version. Returns the
+        /// committed dataset and the transition recorded.
+        async fn commit_partition(
+            dataset: &Dataset,
+            source_ids: &[u64],
+            dest_base_id: u64,
+            form: CompactionForm,
+        ) -> (Dataset, Transition) {
+            let old_fragments: Vec<Fragment> = dataset
+                .fragments()
+                .iter()
+                .filter(|f| source_ids.contains(&f.id))
+                .cloned()
+                .collect();
+            let (transition, destinations) =
+                prepare_partition(dataset, source_ids, dest_base_id).await;
             let version = dataset.manifest.version;
-            commit_sp(
-                &dataset,
-                version,
-                tagged_rewrite(&dataset, old_fragments, destinations, vec![transition]).await,
-            )
-            .await
-            .unwrap()
+            let operation = match form {
+                CompactionForm::Legacy => {
+                    tagged_rewrite(
+                        dataset,
+                        old_fragments,
+                        destinations,
+                        vec![transition.clone()],
+                    )
+                    .await
+                }
+                CompactionForm::Actions => {
+                    action_partition(&old_fragments, &destinations, transition.clone())
+                }
+            };
+            let committed = CommitBuilder::new(Arc::new(dataset.clone()))
+                .with_experimental_composite_operations(true)
+                .execute(Transaction::new(version, operation, None))
+                .await
+                .unwrap();
+            (committed, transition)
+        }
+
+        /// The action-set form of a stable-partition compaction: the sources
+        /// removed as moved, the destinations added at their reserved ids, and
+        /// the move recorded as a transition.
+        fn action_partition(
+            sources: &[Fragment],
+            destinations: &[Fragment],
+            transition: Transition,
+        ) -> Operation {
+            let Some(transition::Mapping::StablePartition(partition)) = transition.mapping else {
+                panic!("a stable-partition transition");
+            };
+            let mut actions: Vec<TxnAction> = sources
+                .iter()
+                .map(|source| {
+                    TxnAction::RemoveFragment(RemoveFragment {
+                        fragment: ActionRef::Committed(source.id),
+                        data_change: false,
+                    })
+                })
+                .collect();
+            for destination in destinations {
+                actions.push(TxnAction::AddFragment(AddFragment {
+                    id: ActionRef::Committed(destination.id),
+                    physical_rows: destination.physical_rows.unwrap() as u64,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: false,
+                }));
+                for file in &destination.files {
+                    actions.push(TxnAction::AddDataFile(AddDataFile {
+                        fragment: ActionRef::Committed(destination.id),
+                        field_ids: file
+                            .fields
+                            .iter()
+                            .copied()
+                            .map(FieldRef::Committed)
+                            .collect(),
+                        file: DataFile {
+                            fields: Arc::from([]),
+                            ..file.clone()
+                        },
+                        data_change: false,
+                        base: None,
+                    }));
+                }
+            }
+            actions.push(TxnAction::AppendFragReuseTransition(
+                AppendFragReuseTransition {
+                    sources: sources
+                        .iter()
+                        .map(|source| ActionRef::Committed(source.id))
+                        .collect(),
+                    destinations: destinations
+                        .iter()
+                        .map(|destination| ActionRef::Committed(destination.id))
+                        .collect(),
+                    mapping: FragReuseMapping::StablePartition(partition),
+                },
+            ));
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                "partition",
+                actions,
+            )]))
         }
 
         async fn tagged_fixture() -> Dataset {

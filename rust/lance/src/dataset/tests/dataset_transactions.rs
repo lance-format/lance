@@ -5409,6 +5409,80 @@ mod composite {
             assert_each_value_once(&dataset, 0..4 * ROWS_PER_FRAGMENT).await;
         }
 
+        /// A legacy `CreateIndex` and an action compaction of the fragments it
+        /// covers. Built first, the segment is carried along by whatever the
+        /// compaction records. Built second, it rebases through a recorded
+        /// transition, as legacy does over a deferred compaction, and conflicts
+        /// over an unrecorded one, as legacy does over an eager one.
+        #[rstest::rstest]
+        #[case::build_lands_first_with_transition(true, true)]
+        #[case::build_lands_first_without_transition(true, false)]
+        #[case::compaction_lands_first_with_transition(false, true)]
+        #[case::compaction_lands_first_without_transition(false, false)]
+        #[tokio::test]
+        async fn test_a_create_index_and_an_action_compaction(
+            #[case] build_lands_first: bool,
+            #[case] record_transition: bool,
+        ) {
+            let dataset = four_fragments().await;
+            let read_version = dataset.version().version;
+            let stale = Arc::new(dataset.clone());
+            let segment = build_segment(&dataset, vec![0, 1]).await;
+            let create_index = Transaction::new(
+                read_version,
+                Operation::CreateIndex {
+                    new_indices: vec![segment],
+                    removed_indices: vec![],
+                },
+                None,
+            );
+            let compact = compaction(&dataset, &[0, 1], record_transition).await;
+
+            let dataset = if build_lands_first {
+                let dataset = CommitBuilder::new(Arc::new(dataset))
+                    .execute(create_index)
+                    .await
+                    .unwrap();
+                drop(dataset);
+                commit_from_stale(stale, compact).await.unwrap()
+            } else {
+                let dataset = commit(dataset, compact).await;
+                let landed = CommitBuilder::new(stale)
+                    .with_experimental_composite_operations(true)
+                    .execute(create_index)
+                    .await;
+                if !record_transition {
+                    assert!(
+                        matches!(landed, Err(Error::RetryableCommitConflict { .. })),
+                        "{landed:?}"
+                    );
+                    return;
+                }
+                drop(dataset);
+                landed.unwrap()
+            };
+
+            let destination = newest_fragment(&dataset);
+            let served = dataset
+                .load_indices_by_name("a_idx")
+                .await
+                .unwrap()
+                .iter()
+                .flat_map(|segment| segment.fragment_bitmap.clone().unwrap_or_default())
+                .collect::<RoaringBitmap>();
+            assert_eq!(
+                served.contains(destination),
+                record_transition,
+                "{served:?}"
+            );
+            if record_transition {
+                for value in 0..2 * ROWS_PER_FRAGMENT {
+                    assert_eq!(indexed_matches(&dataset, value).await, 1, "a = {value}");
+                }
+            }
+            assert_each_value_once(&dataset, 0..4 * ROWS_PER_FRAGMENT).await;
+        }
+
         /// Deleting a whole covered fragment is a removal too, and does not
         /// fence a concurrent build either.
         #[tokio::test]

@@ -317,9 +317,12 @@ async fn tagged_table_installs_a_new_user_index() {
 /// rebased across the rewrite by the conflict resolver: it lands with its
 /// provenance (the retired sources) and translates, so it answers for the
 /// destinations without a rebuild.
+#[rstest::rstest]
 #[tokio::test]
 #[serial_test::serial(frag_reuse_maintenance)]
-async fn user_index_built_before_a_stable_partition_lands_translating() {
+async fn user_index_built_before_a_stable_partition_lands_translating(
+    #[values(CompactionForm::Legacy, CompactionForm::Actions)] compaction: CompactionForm,
+) {
     let dir = TempStrDir::default();
     let mut dataset = lance_datagen::gen_batch()
         .col("i", lance_datagen::array::step::<Int32Type>())
@@ -347,7 +350,7 @@ async fn user_index_built_before_a_stable_partition_lands_translating() {
         built.fragment_bitmap.as_ref().unwrap(),
         &RoaringBitmap::from_iter([0u32, 1])
     );
-    let mut dataset = make_tagged(dataset).await;
+    let mut dataset = make_tagged_as(dataset, compaction).await;
     dataset
         .apply_commit(
             Transaction::new(
@@ -2236,9 +2239,12 @@ async fn tagged_table_withdraws_a_mixed_provenance_whole() {
 /// The replay carries the segment across both partitions and the rewrite in
 /// order, so the withdrawal happens where the rewrite happened; the segment
 /// claims nothing and the rows are scanned.
+#[rstest::rstest]
 #[tokio::test]
 #[serial_test::serial(frag_reuse_maintenance)]
-async fn tagged_table_commit_of_a_stale_staged_index_sees_a_rewrite_on_a_retired_destination() {
+async fn tagged_table_commit_of_a_stale_staged_index_sees_a_rewrite_on_a_retired_destination(
+    #[values(CompactionForm::Legacy, CompactionForm::Actions)] compaction: CompactionForm,
+) {
     let dir = TempStrDir::default();
     let dataset = tagged_two_column_fixture(dir.as_str()).await;
     let before = crate::index::load_all_indices(&dataset).await.unwrap();
@@ -2257,16 +2263,7 @@ async fn tagged_table_commit_of_a_stale_staged_index_sees_a_rewrite_on_a_retired
     rewrite_in_place(dataset, "v", 3, 333).await.unwrap();
     let mut dataset = fresh_session(dir.as_str()).await;
     reserve(&mut dataset, 40).await;
-    let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
-    let (transition, destinations) = prepare_partition(&dataset, &[10, 11], 20).await;
-    let version = dataset.manifest.version;
-    let mut dataset = commit_sp(
-        &dataset,
-        version,
-        tagged_rewrite(&dataset, old_fragments, destinations, vec![transition]).await,
-    )
-    .await
-    .unwrap();
+    let (mut dataset, _) = commit_partition(&dataset, &[10, 11], 20, compaction).await;
     assert_eq!(
         dataset.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
         vec![20, 21]
