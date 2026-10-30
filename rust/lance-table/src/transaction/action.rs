@@ -146,8 +146,10 @@ pub use update_compacted_sstables::UpdateCompactedSsTables;
 use apply::ApplyState;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
-    ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, Result,
+    Error, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+    Result,
 };
+use uuid::Uuid;
 
 /// A reference to a counter-allocated fragment id or base id that may not have
 /// been assigned yet. Field ids use [`FieldRef`].
@@ -355,6 +357,19 @@ impl CompositeOperation {
     pub fn rebase(&mut self, overlaps: &[Overlap]) -> Result<()> {
         for overlap in overlaps {
             match overlap {
+                // The segment keeps naming the fragments it was built over, as
+                // a legacy `CreateIndex` landing over the same compaction does:
+                // the fragment reuse index that recorded the move translates
+                // them for a reader.
+                Overlap::CompactedUnderIndex { segment, .. } => {
+                    self.added_index_segment(*segment)?;
+                }
+                Overlap::UpdatedUnderIndex { segment, fragment } => {
+                    let segment = self.added_index_segment(*segment)?;
+                    if let Some(covered) = &mut segment.covered_fragments {
+                        covered.retain(|covered| *covered != Ref::Committed(*fragment));
+                    }
+                }
                 Overlap::FieldDropped { field } => self.forget_new_fragment_field(*field),
             }
         }
@@ -372,6 +387,21 @@ impl CompositeOperation {
                 _ => true,
             });
         }
+    }
+
+    fn added_index_segment(&mut self, uuid: Uuid) -> Result<&mut AddIndexSegment> {
+        self.steps
+            .iter_mut()
+            .flat_map(|step| step.actions.iter_mut())
+            .find_map(|action| match action {
+                Action::AddIndexSegment(segment) if segment.uuid == uuid => Some(segment),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "an overlap names index segment {uuid}, which this operation does not add"
+                ))
+            })
     }
 }
 

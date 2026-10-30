@@ -393,9 +393,12 @@ impl Footprint {
             self.require_field_facet(field, FieldFacet::Existence);
             self.require_field_facet(field, FieldFacet::Type);
         }
-        for fragment in index.fragment_bitmap.iter().flatten() {
-            self.require_field_data_unless_removed(u64::from(fragment), fields.iter().copied());
-        }
+        let covered = index.fragment_bitmap.iter().flatten();
+        self.build_index_from(
+            index.uuid,
+            fields,
+            covered.map(|fragment| Ref::Committed(u64::from(fragment))),
+        );
     }
 
     pub(super) fn add_base(&mut self, base: &BasePath) {
@@ -547,9 +550,26 @@ mod tests {
         )]))
     }
 
+    /// What it takes for `ours`, read at the sample manifest, to land on top of
+    /// `theirs`, which committed on top of it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Outcome {
+        Lands,
+        Rebases,
+        Conflicts,
+    }
+
     /// Whether `ours`, read at the sample manifest, conflicts with `theirs`,
-    /// which committed on top of it.
+    /// which committed on top of it. Neither may need a rebase.
     fn conflicts(ours: &Operation, theirs: &Operation) -> bool {
+        match outcome(ours, theirs) {
+            Outcome::Lands => false,
+            Outcome::Conflicts => true,
+            Outcome::Rebases => panic!("{ours:?} over {theirs:?} unexpectedly needs a rebase"),
+        }
+    }
+
+    fn outcome(ours: &Operation, theirs: &Operation) -> Outcome {
         let mut before = sample_manifest();
         before.fragments = Arc::new(vec![fragment(0), fragment(1)]);
         let pending = Footprint::pending(&Transaction::new(1, ours.clone(), None), &before);
@@ -570,13 +590,191 @@ mod tests {
             Footprint::committed(&transaction, &before, &after)
         };
         match pending.compare(&committed) {
-            Verdict::Compatible => false,
-            Verdict::Conflict => true,
+            Verdict::Compatible => Outcome::Lands,
+            Verdict::Conflict => Outcome::Conflicts,
             Verdict::Rebase(overlaps) => {
-                assert!(overlaps.is_empty(), "no overlap can be rebased past yet");
-                false
+                assert!(!overlaps.is_empty(), "a rebase names what it rebases past");
+                Outcome::Rebases
             }
         }
+    }
+
+    /// An index segment over field 0, as a legacy `CreateIndex` of the
+    /// sample index would add it, covering `fragments`.
+    fn index_segment(fragments: Vec<Ref>) -> Action {
+        let index = sample_index_metadata("idx");
+        Action::AddIndexSegment(AddIndexSegment {
+            uuid: index.uuid,
+            name: index.name,
+            fields: vec![FieldRef::Committed(0)],
+            covering_fields: vec![],
+            index_details: None,
+            index_version: index.index_version,
+            covered_fragments: Some(fragments),
+            files: vec![],
+            base: None,
+            created_at: None,
+            dataset_version: None,
+            data_change: false,
+        })
+    }
+
+    /// An action set adding an index segment against every named operation in
+    /// both orders: over committed fragment 0 alone, and over the fragment it
+    /// appends in the same commit. Each is at least as permissive as a legacy
+    /// `CreateIndex` (and, with the append, a legacy `Append`) would be.
+    ///
+    /// Columns: the segment alone landing after the named operation, the named
+    /// operation landing after it, then the same two for the append and its
+    /// segment. A segment rebases past a column rewrite and a compaction of a
+    /// fragment it covers, where legacy prunes or keeps the coverage; whether a
+    /// compaction is translated by a fragment reuse index is settled by the
+    /// caller.
+    #[rstest]
+    #[case::append(
+        Operation::Append { fragments: vec![fragment(0)] },
+        [Outcome::Lands, Outcome::Lands, Outcome::Lands, Outcome::Lands]
+    )]
+    #[case::delete(
+        Operation::Delete {
+            updated_fragments: vec![fragment(0)],
+            deleted_fragment_ids: vec![1],
+            predicate: "true".into(),
+        },
+        [Outcome::Lands, Outcome::Lands, Outcome::Lands, Outcome::Lands]
+    )]
+    #[case::delete_the_covered_fragment(
+        Operation::Delete {
+            updated_fragments: vec![],
+            deleted_fragment_ids: vec![0],
+            predicate: "true".into(),
+        },
+        [Outcome::Lands, Outcome::Lands, Outcome::Lands, Outcome::Lands]
+    )]
+    #[case::update_rewrite_rows(
+        update(vec![fragment(0)], vec![fragment(0)], vec![], None),
+        [Outcome::Lands, Outcome::Lands, Outcome::Lands, Outcome::Lands]
+    )]
+    #[case::update_rewrite_columns(
+        update(vec![fragment(0)], vec![], vec![0], None),
+        [Outcome::Rebases, Outcome::Lands, Outcome::Lands, Outcome::Lands]
+    )]
+    #[case::data_overlay(
+        Operation::DataOverlay {
+            groups: vec![DataOverlayGroup {
+                fragment_id: 0,
+                overlays: vec![overlay_with_field(0, 1)],
+            }],
+        },
+        [Outcome::Lands, Outcome::Lands, Outcome::Lands, Outcome::Lands]
+    )]
+    // Legacy `CreateIndex` conflicts over a replacement of a field it depends
+    // on; the segment gives the fragment up instead.
+    #[case::data_replacement(
+        Operation::DataReplacement { replacements: vec![DataReplacementGroup(0, field_file("replacement", 0))] },
+        [Outcome::Rebases, Outcome::Lands, Outcome::Lands, Outcome::Lands]
+    )]
+    // Legacy replaces a same-named index rather than adding to it.
+    #[case::create_index(
+        Operation::CreateIndex {
+            new_indices: vec![sample_index_metadata("idx")],
+            removed_indices: vec![],
+        },
+        [Outcome::Conflicts, Outcome::Conflicts, Outcome::Conflicts, Outcome::Conflicts]
+    )]
+    // A compaction landing second would carry the indices it read along and
+    // miss the segment, as legacy `Rewrite` does over a `CreateIndex`.
+    #[case::rewrite(
+        Operation::Rewrite {
+            groups: vec![RewriteGroup {
+                old_fragments: vec![fragment(0)],
+                new_fragments: vec![fragment(0)],
+            }],
+            rewritten_indices: vec![],
+            frag_reuse_index: None,
+        },
+        [Outcome::Rebases, Outcome::Conflicts, Outcome::Lands, Outcome::Lands]
+    )]
+    #[case::overwrite(
+        Operation::Overwrite {
+            fragments: vec![fragment(0)],
+            schema: sample_manifest().schema,
+            config_upsert_values: None,
+            initial_bases: None,
+        },
+        [Outcome::Conflicts, Outcome::Lands, Outcome::Conflicts, Outcome::Lands]
+    )]
+    #[case::restore(
+        Operation::Restore { version: 1 },
+        [Outcome::Conflicts, Outcome::Lands, Outcome::Conflicts, Outcome::Lands]
+    )]
+    #[case::reserve_fragments(
+        Operation::ReserveFragments { num_fragments: 2 },
+        [Outcome::Lands, Outcome::Lands, Outcome::Lands, Outcome::Lands]
+    )]
+    #[case::update_config(
+        update_config(Some("k"), Some("t")),
+        [Outcome::Lands, Outcome::Lands, Outcome::Lands, Outcome::Lands]
+    )]
+    #[case::update_bases(
+        Operation::UpdateBases {
+            new_bases: vec![BasePath::new(1, "s3://bucket/base".into(), Some("base".into()), false)],
+        },
+        [Outcome::Lands, Outcome::Lands, Outcome::Lands, Outcome::Lands]
+    )]
+    #[case::clone(
+        Operation::Clone {
+            is_shallow: true,
+            ref_name: None,
+            ref_version: 1,
+            ref_path: "memory://source".into(),
+            branch_name: None,
+        },
+        [Outcome::Lands, Outcome::Lands, Outcome::Lands, Outcome::Lands]
+    )]
+    // A merge restates every fragment it read, so it cannot land over rows
+    // added since, as legacy `Merge` cannot over an `Append`.
+    #[case::merge(
+        Operation::Merge {
+            fragments: vec![fragment(0), fragment(1)],
+            schema: sample_manifest().schema,
+            preserves_nullability: true,
+        },
+        [Outcome::Lands, Outcome::Lands, Outcome::Lands, Outcome::Conflicts]
+    )]
+    #[case::project(
+        Operation::Project { schema: sample_manifest().schema, preserves_nullability: true },
+        [Outcome::Lands, Outcome::Lands, Outcome::Lands, Outcome::Lands]
+    )]
+    #[case::update_mem_wal_state(
+        Operation::UpdateMemWalState {
+            compacted_sstables: vec![],
+            dir_id: String::new(),
+        },
+        [Outcome::Conflicts, Outcome::Conflicts, Outcome::Conflicts, Outcome::Conflicts]
+    )]
+    #[case::unknown(
+        Operation::Unknown {},
+        [Outcome::Conflicts, Outcome::Conflicts, Outcome::Conflicts, Outcome::Conflicts]
+    )]
+    fn test_an_index_build_against_each_named_operation(
+        #[case] named: Operation,
+        #[case] expected: [Outcome; 4],
+    ) {
+        let alone = actions(vec![index_segment(vec![Ref::Committed(0)])]);
+        let mut appending = append_actions();
+        appending.push(index_segment(vec![Ref::Local(0)]));
+        let appending = actions(appending);
+
+        assert_eq!(
+            [
+                outcome(&alone, &named),
+                outcome(&named, &alone),
+                outcome(&appending, &named),
+                outcome(&named, &appending),
+            ],
+            expected
+        );
     }
 
     /// An action set doing what a legacy `Append` and a legacy `UpdateConfig`
