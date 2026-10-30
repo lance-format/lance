@@ -4038,7 +4038,7 @@ def test_merge_insert_source_retry(
     tmp_path, source_kind, conflict_kind, conflict_retries
 ):
     """Overlapping commits require source replay instead of an automatic rebase."""
-    from lance.types import WriteSource, coerce_source
+    from lance.types import _coerce_source, _WriteSource
 
     data = pa.table({"id": [0, 1, 2, 3], "value": [10, 11, 12, 13]})
     target_uri = tmp_path / "target"
@@ -4064,7 +4064,7 @@ def test_merge_insert_source_retry(
             scanner = source.scanner(
                 columns=["value", "id"], filter=pc.field("id") >= 0, batch_size=1
             )
-            source = WriteSource(scanner.projected_schema, scanner.to_reader)
+            source = _WriteSource(scanner.projected_schema, scanner.to_reader)
     elif source_kind == "batches":
         source = pa_ds.Scanner.from_batches(iter(data.to_batches()), schema=data.schema)
     else:
@@ -4073,7 +4073,7 @@ def test_merge_insert_source_retry(
     # Coercion must not consume one-shot scanners.
     if source_kind not in ("arrow_scanner", "batches"):
         expected_mode = "materialized" if source_kind == "table" else "replayable"
-        assert coerce_source(source).mode == expected_mode
+        assert _coerce_source(source).mode == expected_mode
 
     target = lance.dataset(target_uri)
     _commit_competing_write(target_uri, conflict_kind)
@@ -4105,12 +4105,19 @@ def test_merge_insert_source_retry(
     check_merge_stats(stats, (2, 2, 0) if conflict_kind == "upsert" else (3, 1, 0))
 
 
+def test_write_source_registry_is_internal():
+    import lance.types as source_types
+
+    assert not hasattr(source_types, "WriteSource")
+    assert not hasattr(source_types, "coerce_source")
+
+
 def test_registered_source_retry_and_lifecycle(tmp_path):
     """An external type supplies executable capabilities without native objects."""
     import threading
     import weakref
 
-    from lance.types import WriteSource, coerce_source
+    from lance.types import _coerce_source, _WriteSource
 
     class ExternalSource:
         def __init__(self, table):
@@ -4121,14 +4128,14 @@ def test_registered_source_retry_and_lifecycle(tmp_path):
             self.calls.append(threading.get_ident())
             return self.table.to_reader(max_chunksize=1)
 
-    @coerce_source.register(ExternalSource)
+    @_coerce_source.register(ExternalSource)
     def adapt(source, schema=None):
-        return WriteSource(source.table.schema, source.open, mode="replayable")
+        return _WriteSource(source.table.schema, source.open, mode="replayable")
 
     data = pa.table({"id": [0, 1], "value": [10, 11]})
     source = ExternalSource(data)
     source_ref = weakref.ref(source)
-    assert coerce_source(source).mode == "replayable"
+    assert _coerce_source(source).mode == "replayable"
     assert source.calls == []
     uri = tmp_path / "target"
     lance.write_dataset(data, uri)
@@ -4149,7 +4156,7 @@ def test_registered_source_retry_and_lifecycle(tmp_path):
 
 @pytest.mark.parametrize("operation", ["write", "uncommitted", "analyze"])
 def test_registered_source_single_read_entrypoints(tmp_path, operation):
-    from lance.types import WriteSource, coerce_source
+    from lance.types import _coerce_source, _WriteSource
 
     class ExternalSource:
         pass
@@ -4161,9 +4168,9 @@ def test_registered_source_single_read_entrypoints(tmp_path, operation):
         calls.append(True)
         return data.to_reader()
 
-    @coerce_source.register(ExternalSource)
+    @_coerce_source.register(ExternalSource)
     def adapt(source, schema=None):
-        return WriteSource(data.schema, reader, mode="replayable")
+        return _WriteSource(data.schema, reader, mode="replayable")
 
     source = ExternalSource()
     if operation == "write":
@@ -4186,7 +4193,7 @@ def test_registered_source_single_read_entrypoints(tmp_path, operation):
 
 
 def test_replayable_source_pins_lance_version_and_schema(tmp_path):
-    from lance.types import coerce_source
+    from lance.types import _coerce_source
 
     schema = pa.schema(
         [pa.field("id", pa.int64(), metadata={"field": "value"})],
@@ -4194,7 +4201,7 @@ def test_replayable_source_pins_lance_version_and_schema(tmp_path):
     )
     data = pa.table({"id": [0, 1, 2]}, schema=schema)
     source = lance.write_dataset(data, tmp_path, max_rows_per_file=1)
-    adapted = coerce_source(source)
+    adapted = _coerce_source(source)
     source.update({"id": "id + 10"})
     first = adapted.open_reader().read_all()
     second = adapted.open_reader().read_all()
@@ -4203,12 +4210,12 @@ def test_replayable_source_pins_lance_version_and_schema(tmp_path):
 
 
 def test_replayable_lance_scan_preserves_projection_and_order(tmp_path):
-    from lance.types import coerce_source
+    from lance.types import _coerce_source
 
     data = pa.table({"id": [1, 1, 2, 2, 3], "value": [10, 11, 12, 13, 14]})
     dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=2)
     scanner = dataset.scanner(columns=["value", "id"], offset=1, limit=3, batch_size=1)
-    source = coerce_source(scanner)
+    source = _coerce_source(scanner)
     assert source.mode == "replayable"
     expected = data.select(["value", "id"]).slice(1, 3)
     # Duplicate keys make encounter order observable, including across fragments.
@@ -4217,7 +4224,7 @@ def test_replayable_lance_scan_preserves_projection_and_order(tmp_path):
 
 
 def test_replayable_source_conflict_without_retries(tmp_path):
-    from lance.types import WriteSource, coerce_source
+    from lance.types import _coerce_source, _WriteSource
 
     class ExternalSource:
         pass
@@ -4229,9 +4236,9 @@ def test_replayable_source_conflict_without_retries(tmp_path):
         calls.append(True)
         return data.to_reader()
 
-    @coerce_source.register(ExternalSource)
+    @_coerce_source.register(ExternalSource)
     def adapt(source, schema=None):
-        return WriteSource(data.schema, open_reader, mode="replayable")
+        return _WriteSource(data.schema, open_reader, mode="replayable")
 
     lance.write_dataset(data, tmp_path)
     target = lance.dataset(tmp_path)
@@ -4258,7 +4265,7 @@ def test_replayable_source_conflict_without_retries(tmp_path):
     ],
 )
 def test_lance_source_preserves_unsafe_scan_options(tmp_path, options):
-    from lance.types import coerce_source
+    from lance.types import _coerce_source
 
     data = pa.table({"id": [0, 1, 2], "value": [3, 2, 1]})
     lance.write_dataset(data, tmp_path, max_rows_per_file=1)
@@ -4266,7 +4273,7 @@ def test_lance_source_preserves_unsafe_scan_options(tmp_path, options):
         source = lance.dataset(tmp_path).scanner(**options)
     else:
         source = lance.dataset(tmp_path, default_scan_options=options)
-    adapted = coerce_source(source)
+    adapted = _coerce_source(source)
     assert adapted.mode == "streaming"
     actual = adapted.open_reader().read_all()
     if "filter" in options:
@@ -4281,11 +4288,11 @@ def test_lance_source_preserves_unsafe_scan_options(tmp_path, options):
 
 
 def test_filtered_arrow_dataset_source_preserves_filter():
-    from lance.types import coerce_source
+    from lance.types import _coerce_source
 
     data = pa.table({"id": [0, 1, 2]})
     source = pa_ds.dataset(data).filter(pc.field("id") > 0)
-    adapted = coerce_source(source)
+    adapted = _coerce_source(source)
     assert adapted.mode == "streaming"
     assert adapted.open_reader().read_all() == data.slice(1)
 
@@ -4330,13 +4337,13 @@ def test_lazy_source_registration_preserves_custom_adapter(monkeypatch):
 
     datasets = pytest.importorskip("datasets")
     # Use a fresh registry to exercise lazy loading regardless of test order.
-    registry = singledispatch(source_types.coerce_source.__wrapped__)
-    monkeypatch.setattr(source_types, "coerce_source", registry)
+    registry = singledispatch(source_types._coerce_source.__wrapped__)
+    monkeypatch.setattr(source_types, "_coerce_source", registry)
     data = pa.table({"id": [1, 2]})
 
     @registry.register(datasets.IterableDataset)
     def custom_source(source, schema=None):
-        return source_types.WriteSource(data.schema, data.to_reader)
+        return source_types._WriteSource(data.schema, data.to_reader)
 
     dataset = datasets.Dataset.from_dict({"id": [1, 2]})
     ordinary = registry(dataset)
@@ -4349,7 +4356,7 @@ def test_lazy_source_registration_preserves_custom_adapter(monkeypatch):
 
 @pytest.mark.parametrize("base", [pa_ds.Scanner, lance.LanceScanner])
 def test_custom_scanner_source_only_requires_to_reader(tmp_path, base):
-    from lance.types import coerce_source
+    from lance.types import _coerce_source
 
     data = pa.table({"id": [1, 2]})
 
@@ -4368,7 +4375,7 @@ def test_custom_scanner_source_only_requires_to_reader(tmp_path, base):
             return data.to_reader()
 
     scanner = CustomScanner()
-    adapted = coerce_source(scanner)
+    adapted = _coerce_source(scanner)
     assert adapted.mode == "streaming"
     assert adapted.open_reader().read_all() == data
     assert scanner.reads == 1
@@ -4381,7 +4388,7 @@ def test_custom_scanner_source_only_requires_to_reader(tmp_path, base):
 @pytest.mark.parametrize("operation", ["execute", "analyze_plan"])
 @pytest.mark.parametrize("mode", ["replayable", "streaming"])
 def test_write_source_errors(tmp_path, failure, operation, mode):
-    from lance.types import WriteSource, coerce_source
+    from lance.types import _coerce_source, _WriteSource
 
     class ExternalSource:
         pass
@@ -4400,9 +4407,9 @@ def test_write_source_errors(tmp_path, failure, operation, mode):
 
         return pa.RecordBatchReader.from_batches(data.schema, batches())
 
-    @coerce_source.register(ExternalSource)
+    @_coerce_source.register(ExternalSource)
     def adapt(source, schema=None):
-        return WriteSource(data.schema, reader, mode=mode)
+        return _WriteSource(data.schema, reader, mode=mode)
 
     target = lance.write_dataset(data, tmp_path)
     match = "schema" if failure == "metadata" else f"external {failure} failure"

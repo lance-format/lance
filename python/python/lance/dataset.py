@@ -78,7 +78,7 @@ from .lance import (
 from .lance import __version__ as __version__
 from .lance import _Session as Session
 from .query import DocumentGranularity, FullTextQuery, MinHashQuery
-from .types import WriteSource, _coerce_reader, coerce_source
+from .types import _coerce_reader, _coerce_source, _WriteSource
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
 from .udf import batch_udf as batch_udf
@@ -396,12 +396,11 @@ class MergeInsertBuilder(_MergeInsertBuilder):
 
         Notes
         -----
-        :func:`lance.types.coerce_source` adapts built-in and registered source
-        types. Repeatable sources provide fresh readers for conflict retries.
+        Repeatable sources provide fresh readers for conflict retries.
         Keep external source files unchanged until the operation finishes.
         Sources without a repeatability contract retain the replay buffer.
         """
-        source = coerce_source(data_obj, schema)
+        source = _coerce_source(data_obj, schema)
         if source.mode == "replayable":
             return super(MergeInsertBuilder, self).execute_replayable(
                 source.schema, source.open_reader
@@ -431,7 +430,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             The schema of the data.  This only needs to be supplied whenever the data
             source is some kind of generator.
         """
-        source = coerce_source(data_obj, schema)
+        source = _coerce_source(data_obj, schema)
         reader = source.open_reader()
         if source.mode == "materialized":
             return super(MergeInsertBuilder, self).execute_uncommitted_batches(reader)
@@ -826,7 +825,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         - iops: number of I/O operations performed
         - requests: number of storage requests made
         """  # noqa: E501
-        source = coerce_source(data_obj, schema)
+        source = _coerce_source(data_obj, schema)
         if source.mode == "replayable":
             return super(MergeInsertBuilder, self).analyze_plan_replayable(
                 source.schema, source.open_reader
@@ -9196,16 +9195,16 @@ class VectorSearchQuery:
         return self._inner
 
 
-@coerce_source.register(LanceDataset)
-def _lance_dataset_source(data_obj: LanceDataset, schema=None) -> WriteSource:
+@_coerce_source.register(LanceDataset)
+def _lance_dataset_source(data_obj: LanceDataset, schema=None) -> _WriteSource:
     # Capture the native dataset version and all default scan options once.
-    return coerce_source(data_obj.scanner(), schema)
+    return _coerce_source(data_obj.scanner(), schema)
 
 
-@coerce_source.register(LanceScanner)
-def _lance_scanner_source(data_obj: LanceScanner, schema=None) -> WriteSource:
+@_coerce_source.register(LanceScanner)
+def _lance_scanner_source(data_obj: LanceScanner, schema=None) -> _WriteSource:
     if type(data_obj) is not LanceScanner:
-        return WriteSource.from_reader(data_obj.to_reader())
+        return _WriteSource.from_reader(data_obj.to_reader())
     snapshot = data_obj._snapshot
     replayable = False
     if snapshot is not None:
@@ -9239,5 +9238,5 @@ def _lance_scanner_source(data_obj: LanceScanner, schema=None) -> WriteSource:
             for key, value in snapshot.items()
         )
     if replayable:
-        return WriteSource(data_obj.projected_schema, data_obj.to_reader)
-    return WriteSource.from_reader(data_obj.to_reader())
+        return _WriteSource(data_obj.projected_schema, data_obj.to_reader)
+    return _WriteSource.from_reader(data_obj.to_reader())
