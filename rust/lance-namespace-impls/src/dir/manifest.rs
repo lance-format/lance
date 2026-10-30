@@ -2446,6 +2446,61 @@ impl ManifestNamespace {
         Self::path_has_actual_manifests(&self.object_store, &path).await
     }
 
+    // Validate the recursive delete before removing the manifest row. Registrations
+    // can share storage across namespaces, and unsafe aliases must remain available
+    // for deregister_table to remove without deleting data.
+    async fn validate_drop_location(&self, object_id: &str, location: &str) -> Result<Path> {
+        let table_path = Self::join_location(&self.base_path, location)?;
+        if table_path == self.base_path {
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "Refusing to drop table '{}': location '{}' resolves to the namespace root",
+                    object_id, location
+                ),
+            }
+            .into());
+        }
+
+        let catalog_path = self.base_path.clone().join(MANIFEST_TABLE_NAME);
+        if table_path.prefix_matches(&catalog_path) || catalog_path.prefix_matches(&table_path) {
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "Refusing to drop table '{}': location '{}' overlaps namespace catalog '{}'. Use deregister_table to remove only the registration",
+                    object_id, location, MANIFEST_TABLE_NAME
+                ),
+            }
+            .into());
+        }
+
+        let mut scanner = self.manifest_scanner().await?;
+        scanner.filter("object_type = 'table'")?;
+        scanner.project(&["object_id", "location"])?;
+        let mut stream = scanner.try_into_stream().await?;
+        while let Some(batch) = stream.try_next().await? {
+            let object_ids = Self::get_string_column(&batch, "object_id")?;
+            let locations = Self::get_string_column(&batch, "location")?;
+            for row in 0..batch.num_rows() {
+                let other_id = Self::required_string_value(object_ids, row, "object_id")?;
+                if other_id == object_id {
+                    continue;
+                }
+                let other_location = Self::required_string_value(locations, row, "location")?;
+                let other_path = Self::join_location(&self.base_path, other_location)?;
+                if table_path.prefix_matches(&other_path) || other_path.prefix_matches(&table_path)
+                {
+                    return Err(NamespaceError::InvalidInput {
+                        message: format!(
+                            "Refusing to drop table '{}': location '{}' overlaps table '{}' at '{}'. Use deregister_table to remove only the registration",
+                            object_id, location, other_id, other_location
+                        ),
+                    }
+                    .into());
+                }
+            }
+        }
+        Ok(table_path)
+    }
+
     pub(crate) fn is_not_found_load_error(err: &LanceError) -> bool {
         match err.find_root() {
             LanceError::NotFound { .. } => true,
@@ -3389,20 +3444,10 @@ impl LanceNamespace for ManifestNamespace {
 
         match table_info {
             Some(info) => {
-                // Resolve and validate the target before mutating the manifest so a
-                // root-equivalent location cannot delete the namespace root after the
-                // row is already gone.
-                let table_path = Self::join_location(&self.base_path, info.location.as_str())?;
+                let table_path = self
+                    .validate_drop_location(&object_id, &info.location)
+                    .await?;
                 let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
-                if table_path == self.base_path {
-                    return Err(NamespaceError::InvalidInput {
-                        message: format!(
-                            "Refusing to drop table '{}': location '{}' resolves to the namespace root",
-                            object_id, info.location
-                        ),
-                    }
-                    .into());
-                }
 
                 // Delete from manifest first
                 self.delete_from_manifest(&object_id).boxed().await?;
@@ -4138,15 +4183,19 @@ mod tests {
         OBJECT_ID_INDEX_NAME, OBJECT_TYPE_INDEX_NAME, ObjectType, has_auto_cleanup_config,
     };
     use crate::{DirectoryNamespace, DirectoryNamespaceBuilder};
+    use arrow::array::record_batch;
     use arrow::datatypes::DataType;
     use bytes::Bytes;
     use futures::StreamExt;
+    use lance::Dataset;
     use lance::dataset::builder::DatasetBuilder;
     use lance::dataset::cleanup::CleanupPolicyBuilder;
+    use lance::dataset::{WriteMode, WriteParams};
     use lance::index::DatasetIndexExt;
     use lance_core::utils::tempfile::TempStdDir;
     use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
     use lance_namespace::LanceNamespace;
+    use lance_namespace::error::NamespaceError;
     use lance_namespace::models::{
         CreateNamespaceRequest, CreateTableRequest, DeclareTableRequest, DescribeTableRequest,
         DropTableRequest, ListTablesRequest, RegisterTableRequest, TableExistsRequest,
@@ -7218,6 +7267,148 @@ mod tests {
         drop.id = Some(vec!["canon".to_string(), "escaped-slash".to_string()]);
         dir_namespace.drop_table(drop).await.unwrap();
         assert!(!std::path::Path::new(&format!("{temp_path}/a%2Fb")).exists());
+    }
+
+    #[rstest]
+    #[case::same("t.lance", "t.lance", true)]
+    #[case::normalized("t.lance", "./t.lance//", true)]
+    #[case::parent("held/t.lance", "held", true)]
+    #[case::child("t.lance", "t.lance/_versions", true)]
+    #[case::unicode("räk's%/t.lance", "räk's%//./t.lance/", true)]
+    #[case::sibling("t.lance", "t.lance-other", false)]
+    #[case::escaped_slash("t.lance", "t.lance%2Fnested", false)]
+    #[tokio::test]
+    async fn test_drop_preserves_other_table(
+        #[case] existing_location: &str,
+        #[case] location: &str,
+        #[case] overlaps: bool,
+        #[values(true, false)] inline_optimization: bool,
+    ) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+
+        let uri = format!("{temp_path}/{existing_location}");
+        let batch = record_batch!(("id", Int64, [1])).unwrap();
+        for mode in [WriteMode::Create, WriteMode::Append] {
+            let reader = arrow::record_batch::RecordBatchIterator::new(
+                vec![Ok(batch.clone())],
+                batch.schema(),
+            );
+            Dataset::write(
+                reader,
+                &uri,
+                Some(WriteParams {
+                    mode,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        let mut register = RegisterTableRequest::new(existing_location.to_string());
+        register.id = Some(vec!["t".to_string()]);
+        dir_namespace.register_table(register).await.unwrap();
+        let mut namespace = CreateNamespaceRequest::new();
+        namespace.id = Some(vec!["n".to_string()]);
+        dir_namespace.create_namespace(namespace).await.unwrap();
+        let alias_id = vec!["n".to_string(), "u".to_string()];
+        let mut register = RegisterTableRequest::new(location.to_string());
+        register.id = Some(alias_id.clone());
+        dir_namespace.register_table(register).await.unwrap();
+        let target = std::path::Path::new(temp_path).join(location);
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("keep.txt"), b"keep").unwrap();
+
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(alias_id.clone());
+        let result = dir_namespace.drop_table(drop).await;
+        if overlaps {
+            let error = result.unwrap_err();
+            let lance_core::Error::Namespace { source, .. } = &error else {
+                panic!("expected Namespace error, got {error}");
+            };
+            assert!(matches!(
+                source.downcast_ref::<NamespaceError>(),
+                Some(NamespaceError::InvalidInput { .. })
+            ));
+            assert!(error.to_string().contains("overlaps table 't'"), "{error}");
+            assert!(target.join("keep.txt").exists());
+            let mut drop = DropTableRequest::new();
+            drop.id = Some(vec!["t".to_string()]);
+            let error = dir_namespace.drop_table(drop).await.unwrap_err();
+            assert!(
+                error.to_string().contains("overlaps table 'n$u'"),
+                "{error}"
+            );
+        } else {
+            result.unwrap();
+            assert!(!target.exists());
+        }
+        let mut exists = TableExistsRequest::new();
+        exists.id = Some(alias_id);
+        assert_eq!(dir_namespace.table_exists(exists).await.is_ok(), overlaps);
+
+        let dataset = Dataset::open(&uri).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
+        // Reopen the namespace to verify the persisted catalog and original table.
+        let reopened = DirectoryNamespaceBuilder::new(temp_path)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        let mut exists = TableExistsRequest::new();
+        exists.id = Some(vec!["t".to_string()]);
+        reopened.table_exists(exists).await.unwrap();
+    }
+
+    #[rstest]
+    #[case::catalog("__manifest")]
+    #[case::normalized("./__manifest//")]
+    #[case::catalog_data("__manifest/data")]
+    #[case::catalog_versions("__manifest/_versions")]
+    #[tokio::test]
+    async fn test_drop_preserves_manifest_catalog(
+        #[case] location: &str,
+        #[values(true, false)] inline_optimization: bool,
+    ) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let dir_namespace = DirectoryNamespaceBuilder::new(temp_path)
+            .inline_optimization_enabled(inline_optimization)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        let mut register = RegisterTableRequest::new(location.to_string());
+        register.id = Some(vec!["danger".to_string()]);
+        dir_namespace.register_table(register).await.unwrap();
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["danger".to_string()]);
+        let error = dir_namespace.drop_table(drop).await.unwrap_err();
+        let lance_core::Error::Namespace { source, .. } = &error else {
+            panic!("expected Namespace error, got {error}");
+        };
+        assert!(matches!(
+            source.downcast_ref::<NamespaceError>(),
+            Some(NamespaceError::InvalidInput { .. })
+        ));
+        assert!(error.to_string().contains("namespace catalog"), "{error}");
+
+        let reopened = DirectoryNamespaceBuilder::new(temp_path)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        let mut exists = TableExistsRequest::new();
+        exists.id = Some(vec!["danger".to_string()]);
+        reopened.table_exists(exists).await.unwrap();
     }
 
     #[rstest]
