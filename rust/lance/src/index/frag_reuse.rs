@@ -3,6 +3,9 @@
 
 use crate::Dataset;
 use crate::index::frag_reuse_reader::SegmentPlanParts;
+use crate::index::frag_reuse_v0_cache::{
+    V0HistoryDigests, V0HistoryDigestsKey, v0_segment_cache_id,
+};
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use crate::session::index_caches::FragReuseDetailsKey;
 use lance_core::Error;
@@ -102,49 +105,6 @@ pub(crate) fn v0_cache_identity(dataset: &Dataset, entry: &IndexMetadata) -> Uui
     Uuid::from_bytes(identity)
 }
 
-/// The part of a v0 history that can change one segment's decoded rows, as a
-/// cache identity, or `None` when no part can.
-///
-/// A v0 remapper is applied while the segment is decoded, but a version the
-/// segment has caught up on moves none of its rows: that is the condition
-/// under which the trim may drop the version (`is_index_remap_caught_up`), so
-/// decoding with or without it gives the same rows. Keying on the contents of
-/// the remaining versions keeps a segment warm across compactions of
-/// fragments it never covered and across trims, while a version on its path
-/// still changes the key. A segment with no fragment bitmap cannot be
-/// classified and keeps the whole history's identity.
-fn v0_segment_cache_id(
-    history: Uuid,
-    details: &FragReuseIndexDetails,
-    segment: &IndexMetadata,
-) -> Option<Uuid> {
-    if segment.fragment_bitmap.is_none() {
-        return Some(history);
-    }
-    let chain = crate::dataset::index::frag_reuse::reuse_chain_frag_bitmap(&details.versions);
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"lance.frag_reuse.v0_segment_cache_id");
-    let mut on_path = false;
-    for version in &details.versions {
-        // A version the gate cannot classify is treated as on the path.
-        let caught_up =
-            crate::dataset::index::frag_reuse::is_index_remap_caught_up(version, segment, &chain)
-                .unwrap_or(false);
-        if caught_up {
-            continue;
-        }
-        on_path = true;
-        let encoded = pb_fri::Version::from(version).encode_to_vec();
-        hasher.update(&(encoded.len() as u64).to_le_bytes());
-        hasher.update(&encoded);
-    }
-    on_path.then(|| {
-        let mut identity = [0; 16];
-        identity.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
-        Uuid::from_bytes(identity)
-    })
-}
-
 /// The FRI identity that belongs in an index's cache namespace, if any.
 ///
 /// Only a v0 history is applied while the index is decoded (its remapper is
@@ -168,9 +128,10 @@ pub(crate) fn fri_cache_id(resolved: &Option<(Uuid, ResolvedRemapping)>) -> Opti
 /// by what they depend on rather than by snapshot:
 ///
 /// * Content decoded without translation (an identity segment under a
-///   tagged history, a v0 history, no history) depends only on the index
-///   file, so it lives in the plain per-index namespace and an append or an
-///   unrelated rewrite never cold-starts it.
+///   tagged history, no history) depends only on the index file, so it
+///   lives in the plain per-index namespace and an append or an unrelated
+///   rewrite never cold-starts it. Content decoded through a v0 remapper
+///   also lives here, under the per-index id from [`fri_cache_id`].
 /// * Content that embeds translated addresses (pages, postings, partitions
 ///   loaded through a `V1Translate` remapper) depends on the segment's
 ///   translation state, so it lives under a namespace named by the segment's
@@ -668,17 +629,24 @@ pub(super) async fn open_row_id_remapping_with_plan(
         index,
     )?;
     if fri.index_version == 0 {
+        let Some(legacy) = dataset.open_frag_reuse_index(metrics).await? else {
+            return Ok(None);
+        };
         let history = v0_cache_identity(dataset, fri);
-        return Ok(dataset.open_frag_reuse_index(metrics).await?.map(|legacy| {
-            let cache_id = v0_segment_cache_id(history, &legacy.details, index);
-            (
-                history,
-                ResolvedRemapping::V0 {
-                    remapper: Arc::new(CompactFragReuseIndexHandle(legacy)),
-                    cache_id,
-                },
-            )
-        }));
+        let digests = dataset
+            .index_cache
+            .get_or_insert_with_key(V0HistoryDigestsKey { history: &history }, || async {
+                Ok(V0HistoryDigests::new(&legacy.details))
+            })
+            .await?;
+        let cache_id = v0_segment_cache_id(history, &legacy.details, &digests, index);
+        return Ok(Some((
+            history,
+            ResolvedRemapping::V0 {
+                remapper: Arc::new(CompactFragReuseIndexHandle(legacy)),
+                cache_id,
+            },
+        )));
     }
     if fri.index_version != 1 {
         return Err(Error::not_supported(format!(

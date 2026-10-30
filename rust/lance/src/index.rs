@@ -86,6 +86,7 @@ mod create;
 pub mod frag_reuse;
 pub mod frag_reuse_reader;
 mod frag_reuse_remapping;
+mod frag_reuse_v0_cache;
 pub(crate) mod frag_reuse_with_stable_row_ids;
 pub mod mem_wal;
 pub mod optimize;
@@ -4137,27 +4138,6 @@ pub(crate) async fn frag_reuse_cache_scope(dataset: &Dataset) -> Option<Uuid> {
 }
 
 impl Dataset {
-    /// The FRI part of a segment's vector cache keys, resolved the way the
-    /// open path resolves it (see [`frag_reuse::fri_cache_id`]). `None` when
-    /// it cannot be resolved here.
-    async fn segment_cache_id(
-        &self,
-        uuid: &Uuid,
-        purpose: frag_reuse::OpenPurpose,
-    ) -> Option<Option<Uuid>> {
-        let index = self.load_index_with_purpose(uuid, purpose).await.ok()??;
-        let resolved = frag_reuse::open_row_id_remapping_with_plan(
-            self,
-            &index,
-            None,
-            purpose,
-            &NoOpMetricsCollector,
-        )
-        .await
-        .ok()?;
-        Some(frag_reuse::fri_cache_id(&resolved).copied())
-    }
-
     /// The segment's metadata for the given purpose. A query sees the derived
     /// listing only. Maintenance also reaches a registered segment the tagged
     /// reader left out of the listing (its coverage was withdrawn by an
@@ -4198,12 +4178,15 @@ impl Dataset {
         // Scalar indices cache themselves inside `open_scalar_index` (the cache
         // key is a plugin detail), so there is no cheap scalar check here.
         let frag_reuse_uuid = v0_frag_reuse_cache_id(self).await;
-        // A cached legacy entry is returned without resolving the segment
-        // again, so an unresolved one probes under the whole history.
-        let segment_cache_id = self
-            .segment_cache_id(uuid, purpose)
-            .await
-            .unwrap_or(frag_reuse_uuid);
+        // Only a v0 history keys vector entries. A cached legacy entry is
+        // returned without resolving the segment again, so a segment that
+        // cannot be resolved here probes under the whole history.
+        let segment_cache_id = match frag_reuse_uuid {
+            Some(history) => frag_reuse_v0_cache::segment_cache_id(self, uuid, purpose)
+                .await
+                .unwrap_or(Some(history)),
+            None => None,
+        };
 
         // Check sized cache for IvfIndexState (v2+ indices).
         let state_key = IvfIndexStateCacheKey::new(uuid, segment_cache_id.as_ref());
