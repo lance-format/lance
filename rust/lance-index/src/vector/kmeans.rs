@@ -2472,6 +2472,23 @@ mod tests {
         assert_eq!(expected, actual);
     }
 
+    #[rstest]
+    #[case::l2(DistanceType::L2)]
+    #[case::dot(DistanceType::Dot)]
+    fn test_find_partitions_rejects_empty_query(#[case] distance_type: DistanceType) {
+        let centroids = [1.0f32; 8];
+        let err = kmeans_find_partitions::<f32>(&centroids, &[], 1, distance_type).unwrap_err();
+        assert!(err.to_string().contains("empty query"), "{err}");
+    }
+
+    #[test]
+    fn test_find_partitions_binary_rejects_empty_query() {
+        let centroids = [0xFFu8; 8];
+        let err =
+            kmeans_find_partitions_binary(&centroids, &[], 1, DistanceType::Hamming).unwrap_err();
+        assert!(err.to_string().contains("empty query"), "{err}");
+    }
+
     /// The SoA path and the per-centroid fallback must pick the centroids the
     /// per-centroid f64 path picks, up to rounding on exact ties.
     #[rstest]
