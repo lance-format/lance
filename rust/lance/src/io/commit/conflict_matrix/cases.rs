@@ -65,8 +65,8 @@ action_append_and_config  | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  R  L  R
 action_add_column         | L  L  R  R  L  L  R  L  L  R  R  L  R  R  R  L  L  L  L  R  R  L  L  L
 action_replace_column     | L  L  R  R  R  L  R  R  R  R  R  L  R  R  R  L  L  L  L  R  R  L  L  L
 action_rename_column      | L  L  L  L  L  L  L  R  R  R  R  L  L  R  R  L  L  L  L  L  L  R  L  L
-action_create_index       | L  L  L  L  L  L  L  L  L  L  L  R  R  R  R  L  L  L  L  L  L  L  R  R
-action_append_and_index   | L  L  L  L  L  L  L  L  L  L  L  R  R  R  R  L  L  L  L  L  L  L  R  R
+action_create_index       | L  L  L  L  L  L  L  L  L  L  L  R  L  R  R  L  L  L  L  L  L  L  R  R
+action_append_and_index   | L  L  L  L  L  L  L  L  L  L  L  R  L  R  R  L  L  L  L  L  L  L  R  R
 ";
 
 /// The level [`MATRIX`] was observed under.

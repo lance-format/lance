@@ -35,10 +35,15 @@ impl RemoveFragment {
     }
 
     /// Every coordinate inside the fragment, which cannot be enumerated, so the
-    /// removal is recorded as such and matched by fragment id.
+    /// removal is recorded as such and matched by fragment id. A removal that
+    /// is not a data change moved the rows somewhere rather than deleting them.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
         if let Some(id) = self.fragment.committed() {
-            footprint.remove_fragment(id);
+            if self.data_change {
+                footprint.remove_fragment(id);
+            } else {
+                footprint.move_rows_out_of(id);
+            }
         }
     }
 }
