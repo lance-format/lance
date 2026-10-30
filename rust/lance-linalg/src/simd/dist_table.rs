@@ -2699,7 +2699,7 @@ mod tests {
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(99);
 
-        for code_len in [1, 3, 16, 191, 192, 1024] {
+        for code_len in [0, 1, 3, 16, 191, 192, 1024] {
             let n = BATCH_SIZE * 4;
             let codes: Vec<u8> = (0..n * code_len).map(|_| rng.random::<u8>()).collect();
             let dist_table: Vec<u16> = (0..BATCH_SIZE * code_len)
@@ -2726,7 +2726,7 @@ mod tests {
     /// `u16` table exactly, across [`SAFE_U16_CODE_LEN`] chunk boundaries.
     #[rstest::rstest]
     fn test_sum_4bit_hacc_dist_table_candidates_match_u16_reference(
-        #[values(1, 3, 16, 191, 192, 1024)] code_len: usize,
+        #[values(0, 1, 3, 16, 191, 192, 1024)] code_len: usize,
     ) {
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(101 + code_len as u64);
@@ -2738,7 +2738,7 @@ mod tests {
         let mut hacc_dist_table = Vec::new();
         transfer_4bit_dist_table_u16(&dist_table, &mut hacc_dist_table);
 
-        let mut expected = vec![0u32; n];
+        let mut expected = vec![u32::MAX; n];
         sum_4bit_dist_table_u16_scalar(code_len, &codes, &dist_table, &mut expected);
 
         for candidate in SUM_HACC.candidates() {
@@ -2769,19 +2769,19 @@ mod tests {
     /// does. Three batches check that rows do not bleed across batch boundaries.
     #[rstest::rstest]
     fn test_sum_4bit_dist_table_candidates_match_scalar(
-        #[values(1, 2, 3, 16, 95, 96, 128, 191, 192, 1024, 8192)] code_len: usize,
+        #[values(0, 1, 2, 3, 16, 95, 96, 128, 191, 192, 1024, 8192)] code_len: usize,
         #[values(1, 3)] num_batches: usize,
     ) {
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64((code_len * 100 + num_batches) as u64);
         let n = BATCH_SIZE * num_batches;
-        let max_entry = (u16::MAX as usize / (2 * code_len)).min(u8::MAX as usize) as u8;
+        let max_entry = (u16::MAX as usize / (2 * code_len).max(1)).min(u8::MAX as usize) as u8;
         let codes: Vec<u8> = (0..n * code_len).map(|_| rng.random::<u8>()).collect();
         let dist_table: Vec<u8> = (0..BATCH_SIZE * code_len)
             .map(|_| rng.random_range(0..=max_entry))
             .collect();
 
-        let mut expected = vec![0u16; n];
+        let mut expected = vec![u16::MAX; n];
         sum_4bit_dist_table_scalar(code_len, &codes, &dist_table, &mut expected);
 
         for candidate in SUM_U16.candidates() {
