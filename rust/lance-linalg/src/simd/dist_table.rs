@@ -662,6 +662,10 @@ unsafe fn sum_hacc_dist_table_32bytes_batch_avx2(
     _mm256_storeu_si256(dists.as_mut_ptr().add(24) as *mut __m256i, res3);
 }
 
+/// # Safety
+///
+/// The host must support `avx2`. `codes.len()` must be a multiple of 32,
+/// `dist_table.len() >= codes.len()` and `dists.len() >= 32`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -742,6 +746,11 @@ unsafe fn sum_dist_table_32bytes_batch_avx2(
 
 /// As [`sum_dist_table_32bytes_batch_avx2`], one 64-byte step per iteration,
 /// masking the loads of a final step shorter than 64 bytes.
+///
+/// # Safety
+///
+/// The host must support `avx512f` and `avx512bw`. `codes.len()` must be a
+/// multiple of 32, `dist_table.len() >= codes.len()` and `dists.len() >= 32`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
 #[inline]
@@ -764,6 +773,8 @@ unsafe fn sum_dist_table_32bytes_batch_avx512(
                 _mm512_loadu_si512(dist_table.as_ptr().add(i) as *const __m512i),
             )
         } else {
+            // Only an odd `code_len` reaches here, leaving exactly 32 bytes,
+            // so the shift cannot overflow.
             let load_mask: __mmask64 = (1 << remaining) - 1;
             (
                 _mm512_maskz_loadu_epi8(load_mask, codes.as_ptr().add(i) as *const i8),
@@ -783,7 +794,9 @@ unsafe fn sum_dist_table_32bytes_batch_avx512(
         accu3 = _mm512_add_epi16(accu3, _mm512_srli_epi16::<8>(res_hi));
     }
 
+    // merge the low 4 bits
     accu0 = _mm512_sub_epi16(accu0, _mm512_slli_epi16::<8>(accu1));
+    // merge the high 4 bits
     accu2 = _mm512_sub_epi16(accu2, _mm512_slli_epi16::<8>(accu3));
 
     // Fold the four 128-bit lanes, each summing a 16-byte column of the batch,
