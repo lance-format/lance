@@ -1020,6 +1020,13 @@ impl VariableWidthBlock {
         T::from_usize(total)?;
         Some(total as u64)
     }
+
+    fn has_large_average_value(&self) -> bool {
+        self.data.len() as u64
+            >= self
+                .num_values
+                .saturating_mul(MIN_AVERAGE_VALUE_BYTES_FOR_EXACT_SIZE)
+    }
 }
 
 /// A data block representing a struct
@@ -1122,22 +1129,38 @@ impl DictionaryDataBlock {
         let indices = indices.as_ref();
 
         // Input that cannot be decoded gets no reservation; the append below fails on it.
-        let estimated_size_bytes = match self.dictionary.as_ref() {
+        let selected_values = match self.dictionary.as_ref() {
             // Value sizes can be skewed, so the average can be off by orders of magnitude.
-            DataBlock::VariableWidth(dictionary)
-                if dictionary.data.len() as u64
-                    >= dictionary
-                        .num_values
-                        .saturating_mul(MIN_AVERAGE_VALUE_BYTES_FOR_EXACT_SIZE) =>
-            {
-                dictionary.selected_data_len(indices)
+            DataBlock::VariableWidth(dictionary) if dictionary.has_large_average_value() => {
+                Some((dictionary, false))
             }
+            // Dictionary values containing NULLs are wrapped in a nullable block.
+            DataBlock::Nullable(nullable) => match nullable.data.as_ref() {
+                DataBlock::VariableWidth(dictionary) if dictionary.has_large_average_value() => {
+                    Some((dictionary, true))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let estimated_size_bytes = match selected_values {
+            Some((dictionary, is_nullable)) => dictionary
+                .selected_data_len(indices)
+                .and_then(|data_len| {
+                    if is_nullable {
+                        // The nullable builder assigns one sixteenth of its estimate to validity.
+                        data_len.checked_add(data_len.div_ceil(15))
+                    } else {
+                        Some(data_len)
+                    }
+                })
+                .unwrap_or(0),
             // assume the indices are uniformly distributed.
-            dictionary => (dictionary.data_size()
-                * (self.indices.num_values + dictionary.num_values() - 1))
-                .checked_div(dictionary.num_values()),
-        }
-        .unwrap_or(0);
+            None => (self.dictionary.data_size()
+                * (self.indices.num_values + self.dictionary.num_values() - 1))
+                .checked_div(self.dictionary.num_values())
+                .unwrap_or(0),
+        };
         let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
 
         let selections = indices.iter().map(|idx| {
@@ -3100,6 +3123,36 @@ mod tests {
             expected_capacity
         );
         let decoded = make_array(decoded.into_arrow(value_type, true).unwrap());
+        assert_eq!(decoded.as_ref(), expected.as_ref());
+    }
+
+    #[test]
+    fn test_nullable_dictionary_decode_reserves_selected_size() {
+        let values: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("x".repeat(4096)),
+            Some("small".to_string()),
+            None,
+        ]));
+        let keys =
+            UInt8Array::from_iter_values((0..1000).map(|row| if row == 0 { 0_u8 } else { 1 }));
+        let dictionary = DictionaryArray::<UInt8Type>::try_new(keys, values).unwrap();
+        let expected = arrow_cast::cast(&dictionary, &DataType::Utf8).unwrap();
+
+        let decoded = DataBlock::from_array(dictionary)
+            .as_dictionary()
+            .unwrap()
+            .decode()
+            .unwrap();
+
+        let nullable = decoded.as_nullable_ref().unwrap();
+        let decoded_values = &nullable.data.as_variable_width_ref().unwrap().data;
+        let expected_size = 4096 + 999 * 5;
+        assert_eq!(decoded_values.len(), expected_size);
+        assert!(
+            decoded_values.clone().into_buffer().capacity() <= expected_size + 1,
+            "nullable dictionary decode should reserve the selected size"
+        );
+        let decoded = make_array(decoded.into_arrow(DataType::Utf8, true).unwrap());
         assert_eq!(decoded.as_ref(), expected.as_ref());
     }
 
