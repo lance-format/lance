@@ -1126,9 +1126,10 @@ mod tests {
     use crate::format::{BasePath, DataFile};
     use crate::transaction::action::test_support::footprint;
     use crate::transaction::action::{
-        Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, DropField, RemoveFragment,
-        SetDeletionFile, TombstoneFieldData,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AddOverlays, AlterField, DropField,
+        RemoveFragment, SetDeletionFile, TombstoneFieldData,
     };
+    use crate::transaction::test_support::overlay_with_field;
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_core::datatypes::Field;
     use lance_file::version::ConcreteFileVersion;
@@ -1288,6 +1289,14 @@ mod tests {
         })
     }
 
+    fn add_overlays(fragment: u64, field: i32) -> Action {
+        Action::AddOverlays(AddOverlays {
+            fragment: Ref::Committed(fragment),
+            overlays: vec![overlay_with_field(field, 0)],
+            data_change: true,
+        })
+    }
+
     fn remove_fragment(fragment: u64) -> Action {
         Action::RemoveFragment(RemoveFragment {
             fragment: Ref::Committed(fragment),
@@ -1385,20 +1394,42 @@ mod tests {
         vec![tombstone(7, &[2]), set_deletion_file(7)],
         false,
     )]
-    #[case::same_field_definition(
+    #[case::two_renames_of_one_field(
         vec![rename_field(1, "a")],
-        vec![Action::AlterField(AlterField { field: FieldRef::Committed(1), name: None, nullable: Some(true) })],
+        vec![rename_field(1, "b")],
+        true,
+    )]
+    // A definition is split by facet, so two writers changing different facets
+    // of one field both land.
+    #[case::a_rename_and_a_nullability_change_of_one_field(
+        vec![rename_field(1, "a")],
+        vec![set_nullability(1, true)],
+        false,
+    )]
+    // Data is written in a field's type and does not depend on its name.
+    #[case::an_append_and_a_rename(append(1), vec![rename_field(1, "a")], false)]
+    #[case::a_re_encode_and_a_rename(
+        reencode(0, 1, false),
+        vec![rename_field(1, "a")],
+        false,
+    )]
+    // Whichever lands second, the overlay stays on top: as an overlay it is
+    // newer than the rewrite, and as the rewrite it was committed after the
+    // rewrite read, so the rewrite does not tombstone it.
+    #[case::a_column_rewrite_and_an_overlay_of_the_field(
+        reencode(0, 1, true),
+        vec![add_overlays(0, 1)],
+        false,
+    )]
+    #[case::an_overlay_on_a_fragment_a_concurrent_set_removes(
+        vec![add_overlays(0, 1)],
+        vec![remove_fragment(0)],
         true,
     )]
     #[case::different_field_definitions(
         vec![Action::AlterField(AlterField { field: FieldRef::Committed(1), name: None, nullable: None })],
         vec![Action::AlterField(AlterField { field: FieldRef::Committed(2), name: None, nullable: None })],
         false,
-    )]
-    #[case::dropping_a_field_collides_with_altering_it(
-        vec![drop_field(1)],
-        vec![Action::AlterField(AlterField { field: FieldRef::Committed(1), name: None, nullable: Some(true) })],
-        true,
     )]
     #[case::dropping_a_field_leaves_other_fields_alone(
         vec![drop_field(1)],
@@ -1628,10 +1659,35 @@ mod tests {
         append(1),
         false,
     )]
+    // An append's rows are new, so the drop never tombstoned the field out of
+    // them; the field's column is left in their file unread, as legacy leaves
+    // it when an Append lands over a Project.
     #[case::an_append_landing_after_a_drop(
         vec![add_fragment(Ref::Local(0)), add_data_file(Ref::Local(0), &[1])],
         vec![drop_field(1)],
+        false,
+    )]
+    #[case::altering_a_field_landing_after_its_drop(
+        vec![set_nullability(1, true)],
+        vec![drop_field(1)],
         true,
+    )]
+    #[case::a_drop_landing_after_an_alter(
+        vec![drop_field(1)],
+        vec![rename_field(1, "a")],
+        false,
+    )]
+    // Values written since a tightening may hold nulls; a re-encode moves the
+    // values the tightening was checked against.
+    #[case::a_column_rewrite_landing_after_a_tightening(
+        reencode(7, 1, true),
+        vec![set_nullability(1, false)],
+        true,
+    )]
+    #[case::a_re_encode_landing_after_a_tightening(
+        reencode(7, 1, false),
+        vec![set_nullability(1, false)],
+        false,
     )]
     #[case::a_drop_landing_after_an_append(
         vec![drop_field(1)],

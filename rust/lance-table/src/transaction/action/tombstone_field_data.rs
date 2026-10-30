@@ -127,8 +127,11 @@ mod tests {
     use crate::transaction::action::test_support::{
         added_field, apply, apply_with_indices, backed_manifest, one_column_file,
     };
-    use crate::transaction::action::{Action, AddDataFile, AddField};
-    use crate::transaction::test_support::{overlay_with_field, sample_index_metadata};
+    use crate::transaction::action::{Action, AddDataFile, AddField, CompositeOperation, UserStep};
+    use crate::transaction::test_support::{
+        default_build_config, overlay_with_field, sample_index_metadata,
+    };
+    use crate::transaction::{Operation, Transaction};
     use lance_file::version::ConcreteFileVersion;
     use rstest::rstest;
     use std::sync::Arc;
@@ -179,6 +182,37 @@ mod tests {
             next.fragments[0].files[0].fields.as_ref(),
             &[TOMBSTONED_FIELD, 1]
         );
+    }
+
+    /// New base values supersede the overlays the writer read, but an overlay
+    /// committed after it read is the newer value and stays, as legacy
+    /// `DataReplacement` keeps it.
+    #[test]
+    fn test_tombstone_field_data_keeps_overlays_committed_after_the_read_version() {
+        let mut manifest = backed_manifest();
+        manifest.version = 3;
+        let mut fragment = manifest.fragments[0].clone();
+        fragment.overlays = vec![overlay_with_field(0, 2), overlay_with_field(0, 3)];
+        manifest.fragments = Arc::new(vec![fragment]);
+        let read_at_two = Transaction::new(
+            2,
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                "step",
+                vec![tombstone_field_zero(true)],
+            )])),
+            None,
+        );
+
+        let (next, _) = read_at_two
+            .build_manifest(Some(&manifest), vec![], "tx.txn", &default_build_config())
+            .unwrap();
+
+        let versions: Vec<u64> = next.fragments[0]
+            .overlays
+            .iter()
+            .map(|overlay| overlay.committed_version)
+            .collect();
+        assert_eq!(versions, vec![3]);
     }
 
     #[test]

@@ -30,7 +30,8 @@ use crate::{Dataset, Error};
 /// [`legacy_bar`]). A cell suffixed `*` is a known parity gap, stricter than
 /// that bar, and must have a reason in [`PARITY_GAPS`]; the suffix is checked,
 /// so closing a gap means dropping it. A mixed pair is settled by comparing
-/// footprints, the legacy side's read straight from the operation.
+/// footprints: a pending legacy operation's is read straight from the
+/// operation, a committed one's from the manifests either side of it.
 ///
 /// This grid is the expectation table, not a rendering of one: it is parsed at
 /// run time, so there is a single place to read and a single place to change.
@@ -41,26 +42,29 @@ use crate::{Dataset, Error};
 /// change; do not hand-edit a cell to make a failing test pass. When isolation
 /// levels become configurable this grows a grid per level.
 const MATRIX: &str = "\
-                          | ap dl df ur uc ov dr pj pa mg ma ci rw ow rs cf va vc v+
-append                    | L  L  L  L  L  L  L  L  R  L  R  L  L  X  X  L  L  L  L
-delete                    | L  R  R  L  R  L  R  L  L  R  R  L  R  X  X  L  L  L  L
-delete_whole_fragment     | L  R  R  R  R  L  R  L  L  R  R  L  R  X  X  L  L  L  L
-update_rewrite_rows       | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L  L  L  L
-update_rewrite_columns    | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L  L  L  L
-data_overlay              | L  L  R  R  L  L  L  !  R  R  R  L  R  X  X  L  L  L  L
-data_replacement          | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L  L  L  L
-project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  L  R* R* R*
-project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  L  R  R* R
-merge                     | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R
-merge_alter_nullability   | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R
-create_index              | L  L  L  L  L  L  L  L  L  L  L  R  R  X  X  L  L  L  L
-rewrite                   | L  R  R  R  R  R  R  L  L  R  R  R  R  X  X  L  L  L  L
-overwrite                 | L  L  L  L  L  L  L  L  L  L  L  L  L  R  L  L  L  L  L
-restore                   | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  X  L  R  R
-update_config             | L  L  L  L  L  L  L  L  L  R  R  L  L  X  X  X  L  R  R
-action_append             | L  L  L  L  L  L  L  R* R  R* R  L  L  R  R  L  L  L  L
-action_update_config      | L  L  L  L  L  L  L  R* R* R  R  L  L  R  R  R  L  R  R
-action_append_and_config  | L  L  L  L  L  L  L  R* R  R  R  L  L  R  R  R  L  R  R
+                          | ap dl df ur uc ov dr pj pa mg ma ci rw ow rs cf va vc v+ vn vr vm
+append                    | L  L  L  L  L  L  L  L  R  L  R  L  L  X  X  L  L  L  L  L  L  L
+delete                    | L  R  R  L  R  L  R  L  L  R  R  L  R  X  X  L  L  L  L  R  R  L
+delete_whole_fragment     | L  R  R  R  R  L  R  L  L  R  R  L  R  X  X  L  L  L  L  R  R  L
+update_rewrite_rows       | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L  L  L  L  R  R  L
+update_rewrite_columns    | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L  L  L  L  R  R  L
+data_overlay              | L  L  R  R  L  L  L  !  R  R  R  L  R  X  X  L  L  L  L  L  L  L
+data_replacement          | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L  L  L  L  R  R  L
+project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  L  L  R* R* R  L  R
+project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  L  L  R* R  R  L  R
+merge                     | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R  R  R  R
+merge_alter_nullability   | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R  R  R  R
+create_index              | L  L  L  L  L  L  L  L  L  L  L  R  R  X  X  L  L  L  L  L  L  L
+rewrite                   | L  R  R  R  R  R  R  L  L  R  R  R  R  X  X  L  L  L  L  R  R  L
+overwrite                 | L  L  L  L  L  L  L  L  L  L  L  L  L  R  L  L  L  L  L  L  L  L
+restore                   | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  X  L  R  R  L  L  L
+update_config             | L  L  L  L  L  L  L  L  L  R  R  L  L  X  X  X  L  R  R  L  L  L
+action_append             | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  L  L  L  L  L  L  L
+action_update_config      | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  R  L  R  R  L  L  L
+action_append_and_config  | L  L  L  L  L  L  L  L  L  L  L  L  L  R  R  R  L  R  R  L  L  L
+action_add_column         | L  L  R  R  L  L  L  L  L  L  L  L  R  R  R  L  L  L  L  R  L  L
+action_replace_column     | L  L  R  R  R  L  R  R  R  R  R  L  R  R  R  L  L  L  L  L  R  L
+action_rename_column      | L  L  L  L  L  L  L  R  R  R  R  L  L  R  R  L  L  L  L  L  L  R
 ";
 
 /// The level [`MATRIX`] was observed under.
@@ -194,14 +198,13 @@ pub(super) fn known_bug(ours: Scenario, theirs: Scenario) -> Option<&'static str
 /// resolver treats a kind of operation, not from one particular pairing. When
 /// the last `*` cell involving a scenario is closed, its entry goes too.
 const PARITY_GAPS: &[(Scenario, &str)] = &[
-    (Scenario::Project, SCHEMA_RESTATED),
-    (Scenario::ProjectAlterNullability, SCHEMA_RESTATED),
-    (Scenario::Merge, SCHEMA_RESTATED),
+    (Scenario::Project, SCHEMA_METADATA_REVERTED),
+    (Scenario::ProjectAlterNullability, SCHEMA_METADATA_REVERTED),
 ];
 
-const SCHEMA_RESTATED: &str = "a legacy Project or Merge restates the whole schema, which no \
-     footprint coordinate describes, so it fails closed against an action set; conflict \
-     parity 2/5 diffs its manifests instead";
+const SCHEMA_METADATA_REVERTED: &str = "a legacy Project installs the schema it read, metadata \
+     included, so landing it over a concurrent schema-metadata edit discards the edit. Legacy \
+     lands the pair and loses the edit; the action path conflicts instead";
 
 fn parity_gap_reason(ours: Scenario, theirs: Scenario) -> Option<&'static str> {
     [ours, theirs].into_iter().find_map(|scenario| {
@@ -328,6 +331,9 @@ pub(super) fn run(
 #[case::action_append(Scenario::ActionAppend)]
 #[case::action_update_config(Scenario::ActionUpdateConfig)]
 #[case::action_append_and_config(Scenario::ActionAppendAndConfig)]
+#[case::action_add_column(Scenario::ActionAddColumn)]
+#[case::action_replace_column(Scenario::ActionReplaceColumn)]
+#[case::action_rename_column(Scenario::ActionRenameColumn)]
 #[tokio::test]
 async fn matrix_row(#[case] ours: Scenario) {
     for theirs in Scenario::ALL {
@@ -394,6 +400,9 @@ async fn matrix_row(#[case] ours: Scenario) {
 #[case::action_append(Scenario::ActionAppend)]
 #[case::action_update_config(Scenario::ActionUpdateConfig)]
 #[case::action_append_and_config(Scenario::ActionAppendAndConfig)]
+#[case::action_add_column(Scenario::ActionAddColumn)]
+#[case::action_replace_column(Scenario::ActionReplaceColumn)]
+#[case::action_rename_column(Scenario::ActionRenameColumn)]
 #[tokio::test]
 async fn scenario_lands_uncontended(#[case] scenario: Scenario) {
     let base = fixture().await;

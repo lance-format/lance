@@ -53,16 +53,25 @@ use crate::Dataset;
 /// A pair belongs here only when the divergence is *correct* under snapshot
 /// isolation. A pair that diverges because the code is wrong belongs in
 /// `cases::KNOWN_BUGS` instead.
-const EXEMPT: &[(Scenario, Scenario, &str)] = &[(
-    Scenario::DataReplacement,
-    Scenario::DataOverlay,
-    "a data replacement tombstones the overlays its new base values supersede, but \
-     deliberately keeps an overlay committed after its own snapshot, because that \
-     overlay is the newer value (lance-table `manifest_build`, the `committed_version \
-     <= read_version` partition). Serial execution puts the replacement last, so the \
-     replacement wins the cell; the rebase lets the overlay win. Snapshot isolation \
-     permits this; serializable would not.",
-)];
+const EXEMPT: &[(Scenario, Scenario, &str)] = &[
+    (
+        Scenario::DataReplacement,
+        Scenario::DataOverlay,
+        NEWER_OVERLAY_WINS,
+    ),
+    (
+        Scenario::ActionReplaceColumn,
+        Scenario::DataOverlay,
+        NEWER_OVERLAY_WINS,
+    ),
+];
+
+const NEWER_OVERLAY_WINS: &str = "a data replacement tombstones the overlays its new base \
+     values supersede, but deliberately keeps an overlay committed after its own snapshot, \
+     because that overlay is the newer value (the `committed_version <= read_version` bound in \
+     lance-table's `manifest_build` and `TombstoneFieldData`). Serial execution puts the \
+     replacement last, so the replacement wins the cell; the rebase lets the overlay win. \
+     Snapshot isolation permits this; serializable would not.";
 
 /// Assert that `rebased` holds the content a rebase of `ours` over `theirs`
 /// should produce.
