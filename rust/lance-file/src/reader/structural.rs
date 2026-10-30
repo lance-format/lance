@@ -22,8 +22,7 @@ use crate::{
     format::pbfile,
     reader::{
         BufferDescriptor, FileMetadataIndex, FileMetadataProvider, FileReader, PreparedProjection,
-        ReadProjection, ReaderProjection, normalize_dense_page_rows, normalized_column_num_rows,
-        verify_uniform_lengths,
+        ReadProjection, ReaderProjection, normalized_column_num_rows, verify_uniform_lengths,
     },
     writer::PAGE_BUFFER_ALIGNMENT,
 };
@@ -465,6 +464,6 @@ pub fn test_projection_length(
             .ok_or_else(|| {
                 Error::invalid_input(format!("missing synthetic length for column {column}"))
             })
-            .and_then(|rows| normalize_dense_page_rows(rows, row_scale))
+            .and_then(|rows| super::normalize_dense_page_rows(rows, row_scale))
     })
 }
