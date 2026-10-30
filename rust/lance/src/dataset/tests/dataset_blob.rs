@@ -1710,6 +1710,163 @@ async fn test_mixed_blob_versions(#[case] fixture: &str, #[case] struct_input: b
 }
 
 #[tokio::test]
+async fn test_released_legacy_blob_fragment_reads_after_promotion() {
+    // 12.0.0 appended a 2.2 fragment that keeps the legacy layout, and read it back.
+    let test_dir =
+        crate::utils::test::copy_test_data_to_tmp("v12.0.0/blobs/legacy_fragment.lance").unwrap();
+    let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    let released_version = dataset.version_id();
+    assert!(!dataset.schema().field("blob").unwrap().is_blob_v2());
+    // A commit that keeps the 2.2 file promotes the column.
+    dataset.delete("id = 1").await.unwrap();
+    assert!(dataset.schema().field("blob").unwrap().is_blob_v2());
+    let expected = [
+        Some(b"legacy bytes".as_slice()),
+        Some(b"".as_slice()),
+        Some(b"fragment bytes".as_slice()),
+        None,
+        Some(b"".as_slice()),
+    ];
+
+    for compact in [false, true] {
+        if compact {
+            crate::dataset::optimize::compact_files(
+                &mut dataset,
+                crate::dataset::optimize::CompactionOptions {
+                    target_rows_per_fragment: 100,
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(dataset.manifest.fragments.len(), 1);
+        }
+        let dataset = Arc::new(dataset.clone());
+        let descriptors = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            descriptors["blob"].as_struct().fields(),
+            &*lance_core::datatypes::BLOB_V2_DESC_FIELDS
+        );
+        let mut scanner = dataset.scan();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["blob"].as_binary::<i64>().iter().collect::<Vec<_>>(),
+            expected
+        );
+        let handles = dataset.take_blobs_by_indices(&[2], "blob").await.unwrap();
+        assert_eq!(
+            handles[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"fragment bytes"
+        );
+        let ranges = dataset
+            .read_blob_ranges("blob")
+            .unwrap()
+            .with_row_indices(vec![BlobRangeRequest::new(2, 1, 3)])
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(ranges[0].data.as_deref(), Some(&b"rag"[..]));
+    }
+    // The released version keeps its legacy schema.
+    let released = Arc::new(dataset.checkout_version(released_version).await.unwrap());
+    assert!(!released.schema().field("blob").unwrap().is_blob_v2());
+    let handles = released.take_blobs_by_indices(&[3], "blob").await.unwrap();
+    assert_eq!(
+        handles[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+        b"fragment bytes"
+    );
+}
+
+#[tokio::test]
+async fn test_read_legacy_and_v2_blob_layouts_from_one_file() {
+    // A 2.2 data file can keep a legacy blob column next to a Blob v2 column. Only the
+    // legacy column is read in the legacy layout.
+    let test_dir = TempStrDir::default();
+    let blob_meta = HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]);
+    let legacy_field = Field::new("legacy", DataType::LargeBinary, true).with_metadata(blob_meta);
+    let schema = Arc::new(Schema::new(vec![
+        legacy_field.clone(),
+        blob_field("blob", true),
+    ]));
+    let mut blobs = BlobArrayBuilder::new(1);
+    blobs.push_null().unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(LargeBinaryArray::from(vec![None::<&[u8]>])),
+            blobs.finish().unwrap(),
+        ],
+    )
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &test_dir,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(dataset.schema().field("legacy").unwrap().is_blob_v2());
+
+    let mut prepared = BlobDescriptorArrayBuilder::new("blob");
+    prepared.push_inline(b"v2 bytes".as_slice()).unwrap();
+    let (prepared_field, prepared_array) = prepared.finish().unwrap().into_parts();
+    let file_schema = Arc::new(Schema::new(vec![legacy_field, prepared_field]));
+    let batch = RecordBatch::try_new(
+        file_schema.clone(),
+        vec![
+            Arc::new(LargeBinaryArray::from(vec![b"legacy bytes".as_slice()])),
+            prepared_array,
+        ],
+    )
+    .unwrap();
+    let data_file_name = format!("{}.lance", Uuid::new_v4());
+    let object_writer = dataset
+        .object_store
+        .create(&dataset.data_dir().join(data_file_name.as_str()))
+        .await
+        .unwrap();
+    let mut file_writer = lance_file::versions::v2_2::create_writer(
+        object_writer,
+        crate::datatypes::Schema::try_from(file_schema.as_ref()).unwrap(),
+        FileWriterOptions::default(),
+    )
+    .unwrap();
+    file_writer.write_batch(&batch).await.unwrap();
+    file_writer.finish().await.unwrap();
+    let data_file = dataset
+        .create_data_file(&data_file_name, None)
+        .await
+        .unwrap();
+    let replacement = Transaction::new(
+        dataset.manifest.version,
+        Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(0, data_file)],
+        },
+        None,
+    );
+    let dataset = CommitBuilder::new(Arc::new(dataset))
+        .execute(replacement)
+        .await
+        .unwrap();
+
+    let mut scanner = dataset.scan();
+    scanner.blob_handling(BlobHandling::AllBinary);
+    let batch = scanner.try_into_batch().await.unwrap();
+    for (column, bytes) in [
+        ("legacy", b"legacy bytes".as_slice()),
+        ("blob", b"v2 bytes".as_slice()),
+    ] {
+        assert_eq!(batch[column].as_binary::<i64>().value(0), bytes);
+    }
+}
+
+#[tokio::test]
 async fn test_write_and_take_blobs_with_blob_descriptor_array_builder() {
     let test_dir = TempStrDir::default();
 
