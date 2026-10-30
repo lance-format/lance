@@ -16,13 +16,15 @@ use std::sync::Arc;
 use arrow_array::{Int32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::ROW_ADDR;
+use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::address::RowAddress;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::transaction::action::{
-    Action, AddDataFile, AddFragment, CompositeOperation, ConfigUpdate, FieldRef, Ref, UserStep,
+    Action, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation, ConfigUpdate,
+    FieldRef, Ref, RefreshRowVersionMetadata, TombstoneFieldData, UserStep,
 };
 use lance_table::transaction::{UpdateMap, UpdateMapEntry};
 
@@ -114,6 +116,14 @@ pub(super) enum Scenario {
     /// Both of the above in one commit, which no single legacy operation can
     /// express.
     ActionAppendAndConfig,
+    /// A new nullable column `e`, backed in every committed fragment: what a
+    /// legacy add-column commits as a `Merge`.
+    ActionAddColumn,
+    /// [`Scenario::DataReplacement`]'s file as `TombstoneFieldData` +
+    /// `AddDataFile`.
+    ActionReplaceColumn,
+    /// A rename of `c`, which legacy commits as a `Project`.
+    ActionRenameColumn,
 }
 
 /// What a staged `theirs` touches, relative to what every `ours` in the matrix
@@ -173,7 +183,7 @@ impl Placement {
 }
 
 impl Scenario {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 22] = [
         Self::Append,
         Self::Delete,
         Self::DeleteWholeFragment,
@@ -193,6 +203,9 @@ impl Scenario {
         Self::ActionAppend,
         Self::ActionUpdateConfig,
         Self::ActionAppendAndConfig,
+        Self::ActionAddColumn,
+        Self::ActionReplaceColumn,
+        Self::ActionRenameColumn,
     ];
 
     /// Two-letter column heading for the matrix grid in `cases`.
@@ -217,6 +230,9 @@ impl Scenario {
             Self::ActionAppend => "va",
             Self::ActionUpdateConfig => "vc",
             Self::ActionAppendAndConfig => "v+",
+            Self::ActionAddColumn => "vn",
+            Self::ActionReplaceColumn => "vr",
+            Self::ActionRenameColumn => "vm",
         }
     }
 
@@ -241,6 +257,9 @@ impl Scenario {
             Self::ActionAppend => "action_append",
             Self::ActionUpdateConfig => "action_update_config",
             Self::ActionAppendAndConfig => "action_append_and_config",
+            Self::ActionAddColumn => "action_add_column",
+            Self::ActionReplaceColumn => "action_replace_column",
+            Self::ActionRenameColumn => "action_rename_column",
         }
     }
 
@@ -255,6 +274,9 @@ impl Scenario {
             Self::ActionAppend => vec![Self::Append],
             Self::ActionUpdateConfig => vec![Self::UpdateConfig],
             Self::ActionAppendAndConfig => vec![Self::Append, Self::UpdateConfig],
+            Self::ActionAddColumn => vec![Self::Merge],
+            Self::ActionReplaceColumn => vec![Self::DataReplacement],
+            Self::ActionRenameColumn => vec![Self::Project],
             legacy => vec![legacy],
         }
     }
@@ -344,6 +366,9 @@ impl Scenario {
             Self::ActionAppend => stage_action_append(dataset, false).await,
             Self::ActionUpdateConfig => stage_action_update_config(dataset).await,
             Self::ActionAppendAndConfig => stage_action_append(dataset, true).await,
+            Self::ActionAddColumn => stage_action_add_column(dataset).await,
+            Self::ActionReplaceColumn => stage_action_replace_column(dataset).await,
+            Self::ActionRenameColumn => stage_action_rename_column(dataset),
         }
     }
 }
@@ -538,6 +563,117 @@ async fn stage_action_update_config(dataset: &Arc<Dataset>) -> Result<Staged> {
     ))
 }
 
+/// A nullable column `e` added and backed in every committed fragment, the
+/// shape a legacy add-column commits as a `Merge`.
+async fn stage_action_add_column(dataset: &Arc<Dataset>) -> Result<Staged> {
+    let mut schema = LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+        "e",
+        DataType::Int32,
+        true,
+    )]))?;
+    // The id the field is minted with, so the file's own metadata agrees with
+    // the manifest it lands in.
+    schema.set_field_id(Some(dataset.manifest.max_field_id()));
+    let mut actions = vec![Action::AddField(AddField {
+        local: 0,
+        parent: None,
+        def: schema.fields[0].clone(),
+    })];
+    for fragment in dataset.fragments().iter() {
+        let rows = fragment
+            .physical_rows
+            .expect("the fixture's fragments know their row counts");
+        let values = (0..rows as i32).collect::<Vec<_>>();
+        let mut file = write_file(dataset, "add_column", schema.clone(), &values).await?;
+        file.fields = Default::default();
+        actions.push(Action::AddDataFile(AddDataFile {
+            fragment: Ref::Committed(fragment.id),
+            file,
+            field_ids: vec![FieldRef::Local(0)],
+            data_change: true,
+            base: None,
+        }));
+    }
+    refresh_row_versions(dataset, &mut actions);
+    Ok(stage_action_set(dataset, actions))
+}
+
+/// Restamp every fragment `actions` writes changed data into, as legacy
+/// `Merge` does, which a dataset with stable row ids requires.
+fn refresh_row_versions(dataset: &Dataset, actions: &mut Vec<Action>) {
+    if !dataset.manifest.uses_stable_row_ids() {
+        return;
+    }
+    let mut fragment_ids: Vec<u64> = actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(id),
+                data_change: true,
+                ..
+            }) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    fragment_ids.dedup();
+    actions.push(Action::RefreshRowVersionMetadata(
+        RefreshRowVersionMetadata { fragment_ids },
+    ));
+}
+
+/// [`stage_data_replacement`]'s new file for `c` in fragment 0, installed by
+/// tombstoning the file it replaces.
+async fn stage_action_replace_column(dataset: &Arc<Dataset>) -> Result<Staged> {
+    let Operation::DataReplacement { replacements } = stage_data_replacement(dataset, 0, "c")
+        .await?
+        .transaction
+        .operation
+    else {
+        unreachable!("a data replacement stages Operation::DataReplacement");
+    };
+    let field = FieldRef::Committed(field_id(dataset, "c")?);
+    let mut actions = Vec::new();
+    for DataReplacementGroup(fragment, mut file) in replacements {
+        file.fields = Default::default();
+        actions.push(Action::TombstoneFieldData(TombstoneFieldData {
+            fragment: Ref::Committed(fragment),
+            field_ids: vec![field],
+            data_change: true,
+        }));
+        actions.push(Action::AddDataFile(AddDataFile {
+            fragment: Ref::Committed(fragment),
+            file,
+            field_ids: vec![field],
+            data_change: true,
+            base: None,
+        }));
+    }
+    refresh_row_versions(dataset, &mut actions);
+    Ok(stage_action_set(dataset, actions))
+}
+
+fn stage_action_rename_column(dataset: &Dataset) -> Result<Staged> {
+    Ok(stage_action_set(
+        dataset,
+        vec![Action::AlterField(AlterField {
+            field: FieldRef::Committed(field_id(dataset, "c")?),
+            name: Some("c_renamed".into()),
+            nullable: None,
+        })],
+    ))
+}
+
+/// The id of the field called `name`. An error rather than a panic, so a
+/// scenario staged after a concurrent rename or drop reports that it cannot be
+/// staged, which the oracle's serial run takes as nothing to compare.
+fn field_id(dataset: &Dataset, name: &str) -> Result<i32> {
+    dataset
+        .schema()
+        .field(name)
+        .map(|field| field.id)
+        .ok_or_else(|| crate::Error::invalid_input(format!("the schema has no field {name:?}")))
+}
+
 /// A merge insert that matches the whole schema, which is the production
 /// producer of `UpdateMode::RewriteRows`: matched rows are deleted in place and
 /// rewritten into a new fragment.
@@ -571,7 +707,7 @@ async fn stage_update_rewrite_columns(
     field: &str,
 ) -> Result<Staged> {
     let mut fragment = dataset.fragments()[fragment_index].clone();
-    let field_id = dataset.schema().field(field).unwrap().id;
+    let field_id = field_id(dataset, field)?;
     let replacement = write_value_file(dataset, "update_columns", &[field], &[7, 7, 7]).await?;
     // Replace the file carrying the field rather than appending one, so the
     // fragment keeps exactly one file per field.
@@ -651,7 +787,7 @@ async fn stage_data_replacement(
     fragment: usize,
     field: &str,
 ) -> Result<Staged> {
-    let field_id = dataset.schema().field(field).unwrap().id;
+    let field_id = field_id(dataset, field)?;
     let existing = dataset.fragments()[fragment]
         .files
         .iter()
@@ -696,7 +832,7 @@ async fn stage_merge(dataset: &Arc<Dataset>, preserves_nullability: bool) -> Res
     // data the way a merge that omits a column does. See `stage_project` for
     // why `d` stays.
     let schema = dataset.schema().project(&["a", "b", "d"])?;
-    let field_c = dataset.schema().field("c").unwrap().id;
+    let field_c = field_id(dataset, "c")?;
     let fragments = dataset
         .fragments()
         .iter()
@@ -800,7 +936,17 @@ async fn write_value_file(
     fields: &[&str],
     values: &[i32],
 ) -> Result<DataFile> {
-    let schema = dataset.schema().project(fields)?;
+    write_file(dataset, name, dataset.schema().project(fields)?, values).await
+}
+
+/// Write a standalone data file holding `values` in every column of `schema`.
+async fn write_file(
+    dataset: &Arc<Dataset>,
+    name: &str,
+    schema: LanceSchema,
+    values: &[i32],
+) -> Result<DataFile> {
+    let columns = schema.fields.len();
     // A fresh uuid per call, the way real writers name data files. `name` is
     // only a human-readable hint: two stagings of the same scenario must not
     // collide, or the second silently overwrites the first's contents.
@@ -814,7 +960,7 @@ async fn write_value_file(
         schema,
         lance_file::writer::FileWriterOptions::default(),
     )?;
-    for column in 0..fields.len() {
+    for column in 0..columns {
         writer
             .write_column(column, Arc::new(Int32Array::from(values.to_vec())))
             .await?;

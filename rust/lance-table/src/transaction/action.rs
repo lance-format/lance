@@ -131,7 +131,7 @@ pub use assert_unique_keys::AssertUniqueKeys;
 pub use config_update::{ConfigUpdate, FieldMetadataUpdate};
 pub use drop_field::DropField;
 pub use drop_index::DropIndex;
-pub use footprint::{ConfigMap, Coordinate, Footprint, Overlap, Verdict};
+pub use footprint::{ConfigMap, Coordinate, FieldFacet, Footprint, Overlap, Verdict};
 pub use refresh_row_version_metadata::RefreshRowVersionMetadata;
 pub use remove_fragment::RemoveFragment;
 pub use remove_index_segment::RemoveIndexSegment;
@@ -350,12 +350,27 @@ impl CompositeOperation {
         self.steps.iter().flat_map(|step| step.actions.iter())
     }
 
-    /// Rewrite this operation past `overlaps`, the ways it overlaps a set that
-    /// committed after it read, as a [`Verdict::Rebase`] named them.
-    pub fn rebase(self, overlaps: Vec<Overlap>) -> Result<Self> {
-        match overlaps.into_iter().next() {
-            None => Ok(self),
-            Some(overlap) => match overlap {},
+    /// Rewrite this operation in place past `overlaps`, the ways it overlaps a
+    /// set that committed after it read, as a [`Verdict::Rebase`] named them.
+    pub fn rebase(&mut self, overlaps: &[Overlap]) -> Result<()> {
+        for overlap in overlaps {
+            match overlap {
+                Overlap::FieldDropped { field } => self.forget_new_fragment_field(*field),
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop binding `field` in the files of the fragments this operation
+    /// mints, dropping a file left binding nothing.
+    fn forget_new_fragment_field(&mut self, field: i32) {
+        for step in &mut self.steps {
+            step.actions.retain_mut(|action| match action {
+                Action::AddDataFile(file) if file.fragment.committed().is_none() => {
+                    file.forget_field(FieldRef::Committed(field))
+                }
+                _ => true,
+            });
         }
     }
 }

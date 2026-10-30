@@ -798,8 +798,7 @@ impl<'a> TransactionRebase<'a> {
                 // Rebased as each committed set is checked, so the next one is
                 // compared against what this set has become.
                 Operation::CompositeOperation(composite_operation) => {
-                    *composite_operation = std::mem::take(composite_operation).rebase(overlaps)?;
-                    Ok(())
+                    composite_operation.rebase(&overlaps)
                 }
                 _ => Err(self.retryable_conflict_err(other_transaction, other_version)),
             },
@@ -6527,10 +6526,25 @@ mod tests {
     /// Assert the verdict holds whichever transaction is the one rebasing, the
     /// other having committed version 2.
     async fn assert_conflict(dataset: &Dataset, a: Transaction, b: Transaction, expected: bool) {
+        assert_conflict_each_way(dataset, a, b, expected, expected).await;
+    }
+
+    /// Assert whether `a` conflicts when it rebases over `b`, and whether `b`
+    /// does over `a`, the committed one having committed version 2.
+    ///
+    /// Version 2 is the read manifest restamped, so a committed named
+    /// operation is held only to what its operation says beyond the manifests.
+    async fn assert_conflict_each_way(
+        dataset: &Dataset,
+        a: Transaction,
+        b: Transaction,
+        a_over_b: bool,
+        b_over_a: bool,
+    ) {
         let mut committed = dataset.manifest.as_ref().clone();
         committed.version = 2;
         let committed = Arc::new(committed);
-        for (ours, theirs) in [(a.clone(), b.clone()), (b, a)] {
+        for (ours, theirs, expected) in [(a.clone(), b.clone(), a_over_b), (b, a, b_over_a)] {
             let mut rebase = TransactionRebase::try_new(dataset, ours, None)
                 .await
                 .unwrap();
@@ -6572,15 +6586,6 @@ mod tests {
             predicate: "a > 5".into(),
         },
         false
-    )]
-    // The post-image of fragment 0 would put back the tombstoned data.
-    #[case::delete_restating_the_fragment(
-        Operation::Delete {
-            updated_fragments: vec![Fragment::new(0)],
-            deleted_fragment_ids: vec![],
-            predicate: "a > 5".into(),
-        },
-        true
     )]
     #[case::update_config(
         Operation::UpdateConfig {
@@ -6648,23 +6653,8 @@ mod tests {
     #[case::data_replacement(Operation::DataReplacement { replacements: vec![] }, false)]
     #[case::data_overlay(Operation::DataOverlay { groups: vec![] }, false)]
     #[case::reserve_fragments(Operation::ReserveFragments { num_fragments: 1 }, false)]
-    // Opaque: their post-image is the whole schema or the MemWAL state, which
-    // no coordinates describe yet.
-    #[case::merge(
-        Operation::Merge {
-            fragments: vec![],
-            schema: lance_core::datatypes::Schema::default(),
-            preserves_nullability: true,
-        },
-        true
-    )]
-    #[case::project(
-        Operation::Project {
-            schema: lance_core::datatypes::Schema::default(),
-            preserves_nullability: true,
-        },
-        true
-    )]
+    // Opaque: its post-image is the MemWAL state, which no coordinates
+    // describe yet.
     #[case::update_mem_wal_state(
         Operation::UpdateMemWalState {
             compacted_sstables: vec![],
@@ -6686,24 +6676,53 @@ mod tests {
         }
     }
 
-    /// A reset is asymmetric: one that landed first conflicts with the action
-    /// set, and one landing second wins over it.
+    /// Operations whose verdict depends on the order. A reset that landed
+    /// first conflicts with the action set, and one landing second wins over
+    /// it. A committed merge or projection is judged by what it changed, which
+    /// here is nothing. A pending merge restates the fragments it read; a
+    /// pending projection prunes files as they are at commit, so a column
+    /// rewrite landed first is kept.
     #[rstest::rstest]
-    #[case::overwrite(Operation::Overwrite {
-        fragments: vec![],
-        schema: lance_core::datatypes::Schema::default(),
-        config_upsert_values: None,
-        initial_bases: None,
-    })]
-    #[case::restore(Operation::Restore { version: 1 })]
+    #[case::overwrite(
+        Operation::Overwrite {
+            fragments: vec![],
+            schema: lance_core::datatypes::Schema::default(),
+            config_upsert_values: None,
+            initial_bases: None,
+        },
+        true,
+        false
+    )]
+    #[case::restore(Operation::Restore { version: 1 }, true, false)]
+    #[case::merge(
+        Operation::Merge {
+            fragments: vec![],
+            schema: lance_core::datatypes::Schema::default(),
+            preserves_nullability: true,
+        },
+        false,
+        true
+    )]
+    #[case::project(
+        Operation::Project {
+            schema: lance_core::datatypes::Schema::default(),
+            preserves_nullability: true,
+        },
+        false,
+        false
+    )]
     #[tokio::test]
-    async fn test_a_legacy_reset_against_an_action_txn(#[case] reset: Operation) {
+    async fn test_a_legacy_operation_against_an_action_txn_by_order(
+        #[case] legacy: Operation,
+        #[case] action_over_legacy: bool,
+        #[case] legacy_over_action: bool,
+    ) {
         let dataset = test_dataset(10, 2).await;
-        let reset = Transaction::new_from_version(1, reset);
+        let legacy = Transaction::new_from_version(1, legacy);
         let action = tombstone_txn(0, 0);
 
-        assert_retryable_or_ok(&dataset, action.clone(), &reset, true).await;
-        assert_retryable_or_ok(&dataset, reset, &action, false).await;
+        assert_retryable_or_ok(&dataset, action.clone(), &legacy, action_over_legacy).await;
+        assert_retryable_or_ok(&dataset, legacy, &action, legacy_over_action).await;
     }
 
     /// Check `ours` against `theirs`, committed as version 2. A conflict must be
@@ -6736,6 +6755,24 @@ mod tests {
                 theirs.operation
             );
         }
+    }
+
+    /// Pending, a delete installs its post-image of fragment 0 and would put
+    /// back the tombstoned data. Committed, it is held to what it changed,
+    /// which here is nothing the tombstone touches.
+    #[tokio::test]
+    async fn test_a_legacy_delete_restating_a_tombstoned_fragment() {
+        let dataset = test_dataset(10, 2).await;
+        let delete = Transaction::new_from_version(
+            1,
+            Operation::Delete {
+                updated_fragments: vec![Fragment::new(0)],
+                deleted_fragment_ids: vec![],
+                predicate: "a > 5".into(),
+            },
+        );
+
+        assert_conflict_each_way(&dataset, tombstone_txn(0, 0), delete, false, true).await;
     }
 
     /// Without the manifests either side of the concurrent commit there is
