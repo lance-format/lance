@@ -132,8 +132,37 @@ pub const FLAG_OBJECT_METADATA: u64 = 1 << 17;
 /// Readers can still skip an unsupported index version and scan the data.
 /// This writer-only flag is cleared when the last row-address index is removed.
 pub const FLAG_ROW_ADDR_INDICES: u64 = 1 << 18;
+/// Keeps released writers away from BTree segments whose `BTreeIndexDetails`
+/// sets `key_layout`.
+///
+/// The segment's index version 2 keeps older readers from using it, but
+/// nothing keeps v12.0.0 and v13.0.0 writers from updating a table with stable
+/// row ids. Their update adds the fragment that receives the rewritten rows to
+/// the segment's `fragment_bitmap` without indexing those rows. v12.0.0
+/// through v14.0.0 refuse this bit, so they commit nothing to the table.
+///
+/// Writer-only. v10.0.0 and v11.0.0 check writer flags only on insert. Their
+/// update, delete, index creation, column addition, and compaction drop the
+/// segment and clear the bit. Their restore, shallow clone, and branch
+/// creation keep the segment and clear the bit. Their reads stay correct.
+///
+/// [`FLAG_ROW_ADDR_INDICES`] cannot stand in for this bit: writers that
+/// support [`FLAG_ROW_ADDR_INDICES`] but not key layouts recompute bit 18 from
+/// `index_version >= 1` on restore, clone, and commits without checking the
+/// source manifest's flags or dropping a damaged `key_layout` segment.
+///
+/// A writer that supports this bit sets it on every published manifest, clones
+/// and restores included, exactly when its index section has a segment with a
+/// `key_layout`, and derives and validates it the way
+/// [`FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS`] is. A segment with a `key_layout`
+/// from a manifest without the bit is unusable, and such a writer never
+/// carries it into a new manifest.
+///
+/// Reserved ahead of its implementation. This build masks the bit out in
+/// `supported_flags_when`, so it refuses to write a table that sets it.
+pub const FLAG_BTREE_KEY_LAYOUT: u64 = 1 << 19;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 19;
+pub const FLAG_UNKNOWN: u64 = 1 << 20;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -153,6 +182,9 @@ const _: () = assert!(FLAG_MANAGED_BLOBS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_ZONE_WRITE_SEEDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_OBJECT_METADATA < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_ROW_ADDR_INDICES < FLAG_UNKNOWN);
+// Same fence for this bit: v15.0.0-beta.7 refuses bit 19 and up.
+const _: () = assert!(FLAG_BTREE_KEY_LAYOUT >= 1 << 19);
+const _: () = assert!(FLAG_BTREE_KEY_LAYOUT < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_FRAGMENT_REUSE_INDEX
@@ -408,6 +440,7 @@ fn supported_flags_when(
     mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
     mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
     mark_supported(&mut supported, FLAG_OBJECT_METADATA, true);
+    mark_supported(&mut supported, FLAG_BTREE_KEY_LAYOUT, false);
     supported
 }
 
@@ -599,11 +632,24 @@ mod tests {
     use crate::format::BasePath;
 
     #[test]
+    fn test_btree_key_layout_flag_fences_writes_without_blocking_reads() {
+        let mut manifest = empty_manifest();
+        manifest.writer_feature_flags = FLAG_BTREE_KEY_LAYOUT;
+        ensure_can_read_manifest(&manifest).unwrap();
+        let error = ensure_can_write_manifest(&manifest).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("cannot be written"));
+        assert!(!can_read_dataset(FLAG_BTREE_KEY_LAYOUT));
+        assert!(!can_write_dataset(FLAG_BTREE_KEY_LAYOUT));
+        assert_eq!(FLAG_BTREE_KEY_LAYOUT, 1 << 19);
+    }
+
+    #[test]
     fn test_object_metadata_flag_is_supported_and_derived() {
         assert_eq!(FLAG_OBJECT_METADATA, 1 << 17);
         assert!(can_read_dataset(FLAG_OBJECT_METADATA));
         assert!(can_write_dataset(FLAG_OBJECT_METADATA));
-        assert_eq!(FLAG_UNKNOWN, 1 << 19);
+        assert_eq!(FLAG_UNKNOWN, 1 << 20);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
 

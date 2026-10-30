@@ -22,7 +22,58 @@ package lance.table;
  * force us to load the index until we know we can make use of it)
  */
 
-message BTreeIndexDetails {}
+message BTreeIndexDetails {
+  /* Present when the index pages store encoded keys, and absent when they store
+   * raw values. A segment that sets it also sets IndexMetadata.index_version
+   * to 2. A version 2 segment without it has the version 1 layout.
+   */
+  BTreeKeyLayout key_layout = 1;
+}
+
+/* The keys of a BTree index whose pages store encoded keys.
+ * IndexMetadata.fields lists the key columns in key order, and the dataset
+ * schema gives their types. One key gives a single-column index with an
+ * explicit direction and null placement. Two or more keys give a composite
+ * index.
+ *
+ * EXPERIMENTAL: key layouts are an experimental format feature. This
+ * message and the index files of a segment that sets it may change
+ * incompatibly without a separate vote, in which case the index must be
+ * rebuilt (the data is never rewritten), and the feature is removed if its
+ * stabilization vote does not pass. Datasets without a key layout are not
+ * affected either way.
+ */
+message BTreeKeyLayout {
+  message ArrowRow {
+    // The arrow_row byte layout. The BTree spec defines version 1.
+    uint32 version = 1;
+  }
+  // An unset encoding is unsupported.
+  message KeyEncoding {
+    oneof encoding {
+      ArrowRow arrow_row = 1;
+    }
+  }
+  message Lexicographic {}
+  // An unset ordering is unsupported.
+  message KeyOrdering {
+    oneof ordering {
+      Lexicographic lexicographic = 1;
+    }
+  }
+  message KeyField {
+    bool descending = 1;
+    // True places nulls of this key before every other value. False places them after.
+    bool nulls_first = 2;
+  }
+  // How a tuple of key values becomes the bytes stored in the index pages.
+  KeyEncoding encoding = 1;
+  // How the stored bytes order the key tuples.
+  KeyOrdering ordering = 2;
+  // keys[i] describes the key column IndexMetadata.fields[i].
+  repeated KeyField keys = 3;
+}
+
 message BitmapIndexDetails {}
 message LabelListIndexDetails {}
 message NGramIndexDetails {}
