@@ -20,11 +20,10 @@ use lance_table::format::{Fragment, Manifest};
 use object_store::path::Path;
 use uuid::Uuid;
 
-use super::{
-    BlobV2DescriptorColumns, field_contains_blob, join_base_and_relative_path, managed_references,
-};
-use crate::dataset::Dataset;
+use super::locate::{BlobV2DescriptorColumns, join_base_and_relative_path};
+use super::managed::{field_contains_blob, managed_references};
 use crate::dataset::optimize::BlobV2BatchRewritePlan;
+use crate::dataset::{BLOBS_DIR, Dataset};
 
 type BlobCopies = HashMap<(Option<u32>, String), String>;
 
@@ -238,7 +237,7 @@ pub async fn copy_blob_columns(
         let target_uri = if id.is_none() {
             uri.clone()
         } else {
-            format!("_blobs/{}.blob", Uuid::new_v4())
+            format!("{BLOBS_DIR}/{}.blob", Uuid::new_v4())
         };
         let target_path = join_base_and_relative_path(&target.base, &target_uri)?;
         source

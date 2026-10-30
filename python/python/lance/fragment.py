@@ -31,6 +31,12 @@ from .lance import (
     DeletionFile as DeletionFile,
 )
 from .lance import (
+    FragmentAddColumnsCleanup,
+    _Fragment,
+    _write_fragments,
+    _write_fragments_transaction,
+)
+from .lance import (
     RowDatasetVersionMeta as RowDatasetVersionMeta,
 )
 from .lance import (
@@ -39,7 +45,6 @@ from .lance import (
 from .lance import (
     RowIdSequence as RowIdSequence,
 )
-from .lance import _Fragment, _write_fragments, _write_fragments_transaction
 from .lance import _Session as Session
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 from .types import _coerce_reader
@@ -101,6 +106,12 @@ class FragmentMetadata:
         Overlays are created via :class:`LanceOperation.DataOverlay`; they are
         carried here so they survive operations that round-trip fragment
         metadata (e.g. a manual ``Delete``, ``Update``, or ``Merge`` commit).
+    clustering_id : Optional[int]
+        The clustering definition this fragment was organized under, if any.
+    metadata : Dict[str, str]
+        Generic metadata attached to this fragment. Preserved verbatim through
+        operations on the fragment, including keys this library does not
+        understand; carried here so manual commits round-trip it.
     """
 
     id: int
@@ -111,6 +122,8 @@ class FragmentMetadata:
     created_at_version_meta: Optional[RowDatasetVersionMeta] = None
     last_updated_at_version_meta: Optional[RowDatasetVersionMeta] = None
     overlays: List["LanceOperation.DataOverlayFile"] = field(default_factory=list)
+    clustering_id: Optional[int] = None
+    metadata: Dict[str, str] = field(default_factory=dict)
 
     @property
     def num_deletions(self) -> int:
@@ -177,6 +190,8 @@ class FragmentMetadata:
                 if self.last_updated_at_version_meta is not None
                 else None
             ),
+            clustering_id=self.clustering_id,
+            metadata=dict(self.metadata),
         )
 
     @staticmethod
@@ -226,6 +241,9 @@ class FragmentMetadata:
             created_at_version_meta=created_at_version_meta,
             last_updated_at_version_meta=last_updated_at_version_meta,
             overlays=overlays,
+            # Absent in JSON written before these fields existed.
+            clustering_id=json_data.get("clustering_id"),
+            metadata=dict(json_data.get("metadata") or {}),
         )
 
 
@@ -249,6 +267,8 @@ class DataFile:
         The minor version of the data storage format.
     file_size_bytes : Optional[int]
         The size of the data file in bytes, if available.
+    file_metadata_size_bytes : Optional[int]
+        The size of the data file's metadata suffix in bytes, if available.
     """
 
     _path: str
@@ -258,6 +278,7 @@ class DataFile:
     file_minor_version: int = 0
     file_size_bytes: Optional[int] = None
     base_id: Optional[int] = None
+    file_metadata_size_bytes: Optional[int] = None
 
     def __init__(
         self,
@@ -268,6 +289,7 @@ class DataFile:
         file_minor_version: int = 0,
         file_size_bytes: Optional[int] = None,
         base_id: Optional[int] = None,
+        file_metadata_size_bytes: Optional[int] = None,
     ):
         # TODO: only we eliminate the path method, we can remove this
         self._path = path
@@ -277,6 +299,7 @@ class DataFile:
         self.file_minor_version = file_minor_version
         self.file_size_bytes = file_size_bytes
         self.base_id = base_id
+        self.file_metadata_size_bytes = file_metadata_size_bytes
 
     def __repr__(self):
         # pretend we have a 'path' attribute
@@ -1031,7 +1054,11 @@ class LanceFragment(pa.dataset.Fragment):
         columns: Optional[list[str]] = None,
         batch_size: Optional[int] = None,
         reader_schema: Optional[pa.Schema] = None,
-    ) -> Tuple[FragmentMetadata, LanceSchema]:
+        return_cleanup: bool = False,
+    ) -> (
+        Tuple[FragmentMetadata, LanceSchema]
+        | Tuple[FragmentMetadata, LanceSchema, FragmentAddColumnsCleanup]
+    ):
         """Add columns to this Fragment.
 
         .. warning::
@@ -1045,6 +1072,12 @@ class LanceFragment(pa.dataset.Fragment):
         fragment is created.  The new schema of the fragment is returned as well.
         These can be used in a later operation to commit the changes to the dataset.
 
+        Set ``return_cleanup=True`` to also return a cleanup token that owns only
+        the files staged by this operation. Retain the token until the outer merge
+        commits. If the commit definitively fails, call ``cleanup.cleanup()``.
+        Dropping the token does not remove files because a failed commit response
+        can have an ambiguous outcome.
+
         See Also
         --------
         lance.dataset.LanceOperation.Merge :
@@ -1053,8 +1086,10 @@ class LanceFragment(pa.dataset.Fragment):
 
         Returns
         -------
-        Tuple[FragmentMetadata, LanceSchema]
-            A new fragment with the added column(s) and the final schema.
+        Tuple[FragmentMetadata, LanceSchema] or
+        Tuple[FragmentMetadata, LanceSchema, FragmentAddColumnsCleanup]
+            A new fragment with the added column(s), the final schema, and, when
+            requested, an explicit cleanup token for the staged files.
         """
         transforms = normalize_transform(value_func, self, columns, reader_schema)
 
@@ -1067,15 +1102,17 @@ class LanceFragment(pa.dataset.Fragment):
                 )
 
         if isinstance(transforms, pa.RecordBatchReader):
-            metadata, schema = self._fragment.add_columns_from_reader(
-                transforms, batch_size
-            )
+            if return_cleanup:
+                return self._fragment.add_columns_from_reader_with_cleanup(
+                    transforms, batch_size
+                )
+            return self._fragment.add_columns_from_reader(transforms, batch_size)
         else:
-            metadata, schema = self._fragment.add_columns(
-                transforms, columns, batch_size
-            )
-
-        return metadata, schema
+            if return_cleanup:
+                return self._fragment.add_columns_with_cleanup(
+                    transforms, columns, batch_size
+                )
+            return self._fragment.add_columns(transforms, columns, batch_size)
 
     def delete(self, predicate: str) -> FragmentMetadata | None:
         """Delete rows from this Fragment.

@@ -79,6 +79,23 @@ pub trait LanceTokenizer: Send + Sync + std::fmt::Debug {
     fn box_clone(&self) -> Box<dyn LanceTokenizer>;
     /// Get document type.
     fn doc_type(&self) -> DocType;
+    /// Whether tokens sharing a position are aliases for BM25 document length.
+    ///
+    /// Split code identifiers retain the original without adding another word
+    /// at the first subword's position. Other tokenizers keep token-count norms.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_index::scalar::InvertedIndexParams;
+    ///
+    /// let tokenizer = InvertedIndexParams::code().split_identifiers(true).build()?;
+    /// assert!(tokenizer.discount_overlaps());
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    fn discount_overlaps(&self) -> bool {
+        false
+    }
 }
 
 impl Clone for Box<dyn LanceTokenizer> {
@@ -90,6 +107,7 @@ impl Clone for Box<dyn LanceTokenizer> {
 #[derive(Clone)]
 pub struct TextTokenizer {
     tokenizer: TextAnalyzer,
+    pub(super) discount_overlaps: bool,
 }
 
 impl std::fmt::Debug for TextTokenizer {
@@ -100,7 +118,10 @@ impl std::fmt::Debug for TextTokenizer {
 
 impl TextTokenizer {
     pub fn new(tokenizer: TextAnalyzer) -> Self {
-        Self { tokenizer }
+        Self {
+            tokenizer,
+            discount_overlaps: false,
+        }
     }
 }
 
@@ -119,6 +140,10 @@ impl LanceTokenizer for TextTokenizer {
 
     fn doc_type(&self) -> DocType {
         DocType::Text
+    }
+
+    fn discount_overlaps(&self) -> bool {
+        self.discount_overlaps
     }
 }
 

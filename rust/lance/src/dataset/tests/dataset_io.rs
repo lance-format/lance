@@ -19,10 +19,11 @@ use crate::dataset::schema_evolution::ColumnAlteration;
 use crate::dataset::transaction::Operation;
 use crate::dataset::{
     ManifestWriteConfig, deep_clone_copy_parallelism, parse_deep_clone_stream_concurrency,
-    validate_dataset_root_for_drop, write_manifest_file,
+    sample_row_offsets, validate_dataset_root_for_drop, write_manifest_file,
 };
 use crate::session::Session;
 use crate::session::caches::ManifestKey;
+use crate::utils::test::copy_test_data_to_tmp;
 use crate::{BlobArrayBuilder, BlobFieldOptions, Dataset, Error, Result, blob_field_with_options};
 use lance_table::format::DataStorageFormat;
 
@@ -65,6 +66,7 @@ use lance_io::utils::tracking_store::IOTracker;
 use lance_table::io::commit::write_manifest_file_to_path;
 use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
+use rand::{SeedableRng, rngs::StdRng};
 use rstest::rstest;
 
 fn file_object_store_uri(path: &std::path::Path) -> String {
@@ -1427,6 +1429,7 @@ async fn test_write_manifest(
             migration_next_row_id: None,
             activate_non_reusable_field_ids: false,
             tagged_frag_reuse_trim: false,
+            clustering_definitions: None,
         },
         dataset.manifest_location.naming_scheme,
         None,
@@ -1600,6 +1603,8 @@ async fn mixed_v2_snapshot_supports_scan_filter_and_take() {
         physical_rows: Some(second.num_rows()),
         last_updated_at_version_meta: None,
         created_at_version_meta: None,
+        clustering_id: None,
+        metadata: Default::default(),
     });
     manifest.reader_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
     manifest.writer_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
@@ -2141,6 +2146,7 @@ async fn append_dataset(
 async fn test_deep_clone(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
     data_storage_version: LanceFileVersion,
+    #[values(false, true)] local_fsync: bool,
 ) {
     // Setup source and target dirs
     let test_dir = TempStdDir::default();
@@ -2160,7 +2166,7 @@ async fn test_deep_clone(
         data_reader,
         test_uri,
         Some(WriteParams {
-            max_rows_per_file: 64,
+            max_rows_per_file: 32,
             max_rows_per_group: 16,
             data_storage_version: Some(data_storage_version),
             ..Default::default()
@@ -2196,8 +2202,17 @@ async fn test_deep_clone(
         .await
         .unwrap();
 
+    let store_params = ObjectStoreParams {
+        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+            HashMap::from([("local_fsync".to_owned(), local_fsync.to_string())]),
+        ))),
+        ..Default::default()
+    };
     // Perform deep clone
-    let cloned_dataset = branch.deep_clone(cloned_uri, "tag", None).await.unwrap();
+    let cloned_dataset = branch
+        .deep_clone(cloned_uri, "tag", Some(store_params.clone()))
+        .await
+        .unwrap();
 
     // Validate target dataset rows
     let batches = cloned_dataset
@@ -2263,7 +2278,11 @@ async fn test_deep_clone(
     let clone_dir = test_dir.join("clone_ds_old_ver");
     let cloned_ds = clone_dir.to_str().unwrap();
     let cloned_dataset = branch
-        .deep_clone(cloned_ds, ("branch", original_version - 1), None)
+        .deep_clone(
+            cloned_ds,
+            ("branch", original_version - 1),
+            Some(store_params),
+        )
         .await
         .unwrap();
     let store = branch.object_store.as_ref();
@@ -2283,6 +2302,13 @@ async fn test_deep_clone(
     assert_eq!(cloned_dataset.version().version, original_version - 1);
     assert!(cloned_dataset.manifest().base_paths.is_empty());
     assert_eq!(count_files(store, &dst_root, "_deletions").await, 0);
+
+    std::fs::remove_dir_all(base_dir).unwrap();
+    for (uri, expected_rows) in [(cloned_uri, 54), (cloned_ds, 64)] {
+        let reopened = Dataset::open(uri).await.unwrap();
+        let batch = reopened.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), expected_rows);
+    }
 }
 
 #[tokio::test]
@@ -3191,6 +3217,122 @@ async fn write_rejects_dictionary_null_index_outside_declared_key_range(
     );
 }
 
+#[rstest]
+#[case::appended_null("v10.0.0/wide_dictionary/appended_null.lance", 128, 2, 2)]
+#[case::merged_chunks("v13.0.0/wide_dictionary/merged_chunks.lance", 100, 2, 2)]
+#[case::compacted("v13.0.0/wide_dictionary/compacted.lance", 100, 1, 1)]
+#[tokio::test]
+async fn read_historical_widened_dictionary(
+    #[case] fixture: &str,
+    #[case] values_per_chunk: usize,
+    #[case] repetitions: usize,
+    #[case] fragments: usize,
+    #[values(64, 1024)] batch_size: usize,
+) {
+    let directory = copy_test_data_to_tmp(fixture).unwrap();
+    let dataset = Dataset::open(&directory.path_str()).await.unwrap();
+    assert_eq!(dataset.count_fragments(), fragments);
+    let chunks = if values_per_chunk == 128 { 1 } else { 2 };
+    let expected = (0..repetitions)
+        .flat_map(|_| {
+            (0..chunks).flat_map(|chunk| {
+                (chunk * values_per_chunk..(chunk + 1) * values_per_chunk)
+                    .map(|i| Some(format!("v{i}")))
+                    .chain([None])
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut stream = dataset
+        .scan()
+        .batch_size(batch_size)
+        .try_into_stream()
+        .await
+        .unwrap();
+    let mut actual = Vec::with_capacity(expected.len());
+    while let Some(batch) = stream.try_next().await.unwrap() {
+        assert!(batch.num_rows() <= batch_size.min(128));
+        assert_eq!(
+            batch["d"].data_type(),
+            &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8))
+        );
+        let values = arrow::compute::cast(&batch["d"], &DataType::Utf8).unwrap();
+        actual.extend(
+            as_string_array(&values)
+                .iter()
+                .map(|value| value.map(str::to_owned)),
+        );
+    }
+    assert_eq!(actual, expected);
+
+    // Sparse reads must remap the stored keys even when only high positions in
+    // the page dictionary are selected, and must preserve the in-band null.
+    let indices = [expected.len() as u64 - 2, expected.len() as u64 - 1, 0];
+    let batch = dataset
+        .take(&indices, Arc::new(dataset.schema().clone()))
+        .await
+        .unwrap();
+    let values = arrow::compute::cast(&batch["d"], &DataType::Utf8).unwrap();
+    let expected = indices.map(|i| expected[i as usize].as_deref());
+    assert_eq!(
+        as_string_array(&values),
+        &StringArray::from(Vec::from(expected))
+    );
+}
+
+/// Each batch carries the same 127-value Int8 dictionary, about 12.7 MB of values,
+/// so the writer flushes it as its own page (a column is flushed once it buffers
+/// `cache_bytes_per_column`, 8 MiB by default).  A scan batch over both pages then
+/// concatenates two decoded dictionaries.
+#[rstest]
+#[tokio::test]
+async fn scan_dictionary_batches_spanning_pages(
+    #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+) {
+    let values = Arc::new(StringArray::from(
+        (0..127)
+            .map(|i| format!("{i:03}{}", "x".repeat(100_000)))
+            .collect::<Vec<_>>(),
+    ));
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        true,
+    )]));
+    let batches = (0..2)
+        .map(|batch| {
+            let keys = Int8Array::from(
+                (0..127)
+                    .map(|i| (i % 10 != 3).then_some((i + batch) % 127))
+                    .collect::<Vec<_>>(),
+            );
+            let dictionary = Int8DictionaryArray::try_new(keys, values.clone()).unwrap();
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(batches.clone().into_iter().map(Ok), schema.clone()),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let mut scanner = dataset.scan();
+    scanner.batch_size(254);
+    let actual = scanner.try_into_batch().await.unwrap();
+
+    let expected = concat_batches(&schema, &batches).unwrap();
+    let as_utf8 = |batch: &RecordBatch| arrow_cast::cast(&batch["d"], &DataType::Utf8).unwrap();
+    assert_eq!(actual["d"].data_type(), expected["d"].data_type());
+    assert!(
+        as_utf8(&actual).as_ref() == as_utf8(&expected).as_ref(),
+        "scanned dictionary values differ from the written ones"
+    );
+}
+
 /// `dict:{value}:{index}:false` cannot express a value type whose own logical
 /// string carries ':', so `Schema::try_from` used to panic on the way in rather
 /// than rejecting the write.
@@ -3366,8 +3508,13 @@ async fn test_fast_count_rows(
 }
 
 #[rstest]
+#[case::zero(0)]
+#[case::sparse(2)]
+#[case::full(6)]
+#[case::oversized(8)]
 #[tokio::test]
 async fn test_sample_with_fragment_ids(
+    #[case] n: usize,
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
     data_storage_version: LanceFileVersion,
 ) {
@@ -3392,7 +3539,7 @@ async fn test_sample_with_fragment_ids(
 
     let projection = dataset.schema().project(&["i"]).unwrap();
     let sampled = dataset
-        .sample(8, &projection, Some(&[0, 0, 2]))
+        .sample(n, &projection, Some(&[2, 0, 0]))
         .await
         .unwrap();
     let sampled_values = sampled
@@ -3404,12 +3551,22 @@ async fn test_sample_with_fragment_ids(
         .values()
         .to_vec();
 
-    assert_eq!(sampled_values, vec![0, 2, 3, 8, 10, 11]);
+    let allowed = vec![0, 2, 3, 8, 10, 11];
+    assert_eq!(sampled.schema().as_ref(), &ArrowSchema::from(&projection));
+    assert_eq!(sampled_values.len(), n.min(allowed.len()));
+    assert!(sampled_values.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(sampled_values.iter().all(|value| allowed.contains(value)));
+    if n >= allowed.len() {
+        assert_eq!(sampled_values, allowed);
+    }
 }
 
 #[rstest]
+#[case::zero(0)]
+#[case::nonzero(1)]
 #[tokio::test]
 async fn test_sample_with_empty_fragment_ids_rejected(
+    #[case] n: usize,
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
     data_storage_version: LanceFileVersion,
 ) {
@@ -3431,7 +3588,7 @@ async fn test_sample_with_empty_fragment_ids_rejected(
     .unwrap();
 
     let projection = dataset.schema().project(&["i"]).unwrap();
-    let err = dataset.sample(1, &projection, Some(&[])).await.unwrap_err();
+    let err = dataset.sample(n, &projection, Some(&[])).await.unwrap_err();
 
     assert!(matches!(err, Error::InvalidInput { .. }));
     assert!(
@@ -3441,8 +3598,11 @@ async fn test_sample_with_empty_fragment_ids_rejected(
 }
 
 #[rstest]
+#[case::zero(0)]
+#[case::nonzero(1)]
 #[tokio::test]
 async fn test_sample_with_unknown_fragment_ids_rejected(
+    #[case] n: usize,
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
     data_storage_version: LanceFileVersion,
 ) {
@@ -3465,7 +3625,7 @@ async fn test_sample_with_unknown_fragment_ids_rejected(
 
     let projection = dataset.schema().project(&["i"]).unwrap();
     let err = dataset
-        .sample(1, &projection, Some(&[0, 999]))
+        .sample(n, &projection, Some(&[0, 999]))
         .await
         .unwrap_err();
 
@@ -3475,6 +3635,136 @@ async fn test_sample_with_unknown_fragment_ids_rejected(
             .contains("not part of the current dataset version")
     );
     assert!(err.to_string().contains("999"));
+}
+
+#[rstest]
+#[case::empty(0, 10)]
+#[case::zero(10, 0)]
+#[case::singleton(1, 1)]
+#[case::sparse(1000, 10)]
+#[case::full(10, 10)]
+#[case::oversized(10, 20)]
+#[case::maximum_request(10, usize::MAX)]
+fn test_sample_row_offsets(#[case] population: usize, #[case] requested: usize) {
+    let offsets = sample_row_offsets(&mut StdRng::seed_from_u64(42), population, requested);
+    assert_eq!(offsets.len(), requested.min(population));
+    assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(offsets.iter().all(|&offset| offset < population as u64));
+    if requested >= population {
+        assert_eq!(offsets, (0..population as u64).collect::<Vec<_>>());
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn test_sample_row_offsets_large_population() {
+    let population = 1_usize << 40;
+    let offsets = sample_row_offsets(&mut StdRng::seed_from_u64(42), population, 16);
+    assert_eq!(offsets.len(), 16);
+    assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(offsets.iter().all(|&offset| offset < population as u64));
+    assert!(offsets.iter().any(|&offset| offset > u32::MAX as u64));
+}
+
+#[rstest]
+#[case::zero(0)]
+#[case::sparse(2)]
+#[case::full(10)]
+#[case::oversized(20)]
+#[tokio::test]
+async fn test_sample_live_rows(
+    #[case] requested: usize,
+    #[values(false, true)] stable_row_ids: bool,
+    #[values(false, true)] selected: bool,
+) {
+    let batch = arrow_array::record_batch!(
+        ("i", Int32, (0..12).collect::<Vec<_>>()),
+        (
+            "nullable",
+            Int32,
+            (0..12)
+                .map(|i| (i % 2 == 0).then_some(i))
+                .collect::<Vec<_>>()
+        ),
+        ("unused", Int32, vec![0; 12])
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            enable_stable_row_ids: stable_row_ids,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+    dataset.delete("i IN (1, 9)").await.unwrap();
+    let projection = dataset.schema().project(&["nullable", "i"]).unwrap();
+    let ids = [2, 0, 0];
+    let fragments = selected.then_some(ids.as_slice());
+    let allowed = if selected {
+        vec![0, 2, 3, 8, 10, 11]
+    } else {
+        vec![0, 2, 3, 4, 5, 6, 7, 8, 10, 11]
+    };
+    let sampled = dataset
+        .sample(requested, &projection, fragments)
+        .await
+        .unwrap();
+    assert_eq!(sampled.schema().as_ref(), &ArrowSchema::from(&projection));
+    let values = sampled["i"].as_any().downcast_ref::<Int32Array>().unwrap();
+    let nullable = sampled["nullable"]
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(values.len(), requested.min(allowed.len()));
+    assert!(values.values().windows(2).all(|pair| pair[0] < pair[1]));
+    for (index, value) in values.values().iter().enumerate() {
+        assert!(allowed.contains(value));
+        assert_eq!(nullable.is_null(index), value % 2 != 0);
+        if nullable.is_valid(index) {
+            assert_eq!(nullable.value(index), *value);
+        }
+    }
+    if requested >= allowed.len() {
+        assert_eq!(values.values().as_ref(), allowed.as_slice());
+    }
+}
+
+#[rstest]
+#[case::initially_empty(false)]
+#[case::all_deleted(true)]
+#[tokio::test]
+async fn test_sample_empty_dataset(#[case] delete_all: bool) {
+    let data = gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_reader_rows(
+            RowCount::from(if delete_all { 12 } else { 0 }),
+            BatchCount::from(1),
+        );
+    let mut dataset = Dataset::write(
+        data,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    if delete_all {
+        dataset.delete("true").await.unwrap();
+    }
+    let projection = dataset.schema().project(&["i"]).unwrap();
+    let sampled = dataset.sample(10, &projection, None).await.unwrap();
+    assert_eq!(sampled.num_rows(), 0);
+    assert_eq!(sampled.schema().as_ref(), &ArrowSchema::from(&projection));
 }
 
 #[rstest]
@@ -3816,6 +4106,48 @@ async fn write_tiny_dataset(uri: &str) -> Dataset {
         .unwrap()
 }
 
+#[tokio::test]
+async fn test_open_empty_latest_manifest_reports_path() {
+    let test_dir = TempStdDir::default();
+    let uri = test_dir.to_str().unwrap();
+    let mut dataset = write_tiny_dataset(uri).await;
+    dataset.truncate_table().await.unwrap();
+    assert_eq!(dataset.version().version, 2);
+
+    let manifest_path = dataset.manifest_location.path.clone();
+    std::fs::write(lance_io::local::to_local_path(&manifest_path), b"").unwrap();
+
+    let error = Dataset::open(uri).await.unwrap_err();
+    assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
+    assert!(
+        error.to_string().contains(manifest_path.as_ref()),
+        "{error}"
+    );
+    assert!(error.to_string().contains("0 bytes"), "{error}");
+}
+
+#[tokio::test]
+async fn test_read_empty_data_file_reports_path() {
+    let test_dir = TempStdDir::default();
+    let uri = test_dir.to_str().unwrap();
+    write_tiny_dataset(uri).await;
+
+    let data_path = std::fs::read_dir(test_dir.join("data"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::write(&data_path, b"").unwrap();
+
+    let dataset = Dataset::open(uri).await.unwrap();
+    let error = dataset.scan().try_into_batch().await.unwrap_err();
+    assert!(matches!(error, Error::IO { .. }), "{error:?}");
+    let object_path = Path::from_absolute_path(&data_path).unwrap();
+    assert!(error.to_string().contains(object_path.as_ref()), "{error}");
+    assert!(error.to_string().contains("size 0 bytes"), "{error}");
+}
+
 /// `drop` deletes whatever path it is handed, so the guard must accept a real dataset
 /// even when the user keeps unmanaged files beside it.
 #[rstest]
@@ -4044,6 +4376,7 @@ async fn write_manifest_file_rejects_a_nullable_primary_key() {
             migration_next_row_id: None,
             activate_non_reusable_field_ids: false,
             tagged_frag_reuse_trim: false,
+            clustering_definitions: None,
         },
         dataset.manifest_location.naming_scheme,
         None,

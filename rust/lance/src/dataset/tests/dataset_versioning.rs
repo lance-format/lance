@@ -2,7 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
+use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 use std::vec;
 
 use crate::Dataset;
@@ -10,6 +12,7 @@ use crate::dataset::UpdateBuilder;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::datatypes::Schema;
+use crate::io::commit::load_and_sort_new_transactions;
 use lance_table::io::commit::ManifestNamingScheme;
 
 use crate::dataset::write::{CommitBuilder, WriteMode, WriteParams};
@@ -26,11 +29,11 @@ use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
 use mock_instant::thread_local::MockClock;
 use tokio::sync::Barrier;
 
-use crate::dataset::refs::branch_contents_path;
+use crate::dataset::refs::{base_branches_contents_path, branch_contents_path};
 use crate::utils::test::copy_test_data_to_tmp;
 use futures::TryStreamExt;
 use lance_core::Error;
-use object_store::path::Path;
+use object_store::{ObjectStoreExt as _, path::Path};
 use rstest::rstest;
 use std::cmp::Ordering;
 
@@ -50,6 +53,68 @@ fn assert_all_manifests_use_scheme(test_dir: &TempStdDir, scheme: ManifestNaming
         "Entries: {:?}",
         entries_names
     );
+}
+
+#[rstest]
+#[case::one_io(1)]
+#[case::two_io(2)]
+fn test_transaction_reads_with_low_io_parallelism(#[case] io_parallelism: usize) {
+    // Isolate the process-wide I/O setting from concurrently running tests.
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "dataset::tests::dataset_versioning::test_low_io_transaction_child",
+            "--nocapture",
+        ])
+        .env("LANCE_LOW_IO_TRANSACTION_TEST", "1")
+        .env("LANCE_IO_THREADS", io_parallelism.to_string())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "child process failed: {output:?}");
+}
+
+#[tokio::test]
+async fn test_low_io_transaction_child() {
+    if std::env::var_os("LANCE_LOW_IO_TRANSACTION_TEST").is_none() {
+        return;
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let data = gen_batch()
+            .col("key", array::step::<Int32Type>())
+            .into_batch_rows(RowCount::from(4))
+            .unwrap();
+        let reader = || RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(
+            reader(),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        // An empty history must finish too: no sender will publish a manifest.
+        let (current, transactions) = load_and_sort_new_transactions(&dataset).await.unwrap();
+        assert_eq!(current.version().version, 1);
+        assert!(transactions.is_empty());
+
+        let stale = dataset.clone();
+        dataset.append(reader(), None).await.unwrap();
+        let (current, transactions) = load_and_sort_new_transactions(&stale).await.unwrap();
+        assert_eq!(current.version().version, 2);
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(transactions[0].0, 2);
+
+        dataset.delete("key = 1").await.unwrap();
+        assert_eq!(dataset.version().version, 3);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 6);
+        assert_eq!(dataset.count_rows(Some("key = 1".into())).await.unwrap(), 0);
+    })
+    .await
+    .expect("transaction reads and delete must progress with one I/O slot");
 }
 
 #[tokio::test]
@@ -1173,6 +1238,42 @@ async fn test_cannot_delete_branch_referenced_by_tag() {
 }
 
 #[tokio::test]
+async fn test_list_hierarchical_branches() {
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(1), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+    dataset.create_branch("release", 1, None).await.unwrap();
+    dataset
+        .create_branch("features/nested", 1, None)
+        .await
+        .unwrap();
+
+    // OpenDAL-backed stores such as OSS may decode the '%2F' path part and
+    // expose the branch metadata as a nested object during listing.
+    let root_path = dataset.refs.root().unwrap().path;
+    let encoded_path = branch_contents_path(&root_path, "features/nested");
+    let nested_path = Path::parse(format!(
+        "{}/features/nested.json",
+        base_branches_contents_path(&root_path)
+    ))
+    .unwrap();
+    dataset
+        .object_store
+        .inner
+        .copy(&encoded_path, &nested_path)
+        .await
+        .unwrap();
+    dataset.object_store.delete(&encoded_path).await.unwrap();
+
+    let branches = dataset.list_branches().await.unwrap();
+    assert_eq!(branches.len(), 2);
+    assert!(branches.contains_key("release"));
+    assert!(branches.contains_key("features/nested"));
+}
+
+#[tokio::test]
 async fn test_branch() {
     let tempdir = TempDir::default();
     let test_uri = tempdir.path_str();
@@ -1535,7 +1636,6 @@ async fn test_branch() {
     // error loudly instead of handing back another branch's data: stage main's
     // manifest under a branch path that was never created, so resolution finds
     // a manifest belonging to main.
-    use object_store::ObjectStoreExt as _;
     let staged_manifest = main_dataset.manifest_location().path.clone();
     let staged_copy = Path::parse(format!(
         "{}/tree/ghost/_versions/{}",
@@ -1597,4 +1697,128 @@ async fn test_branch() {
         .await
         .unwrap();
     assert!(branches.is_empty());
+}
+
+fn id_rows(start: i32, rows: u64) -> impl RecordBatchReader + Send + 'static {
+    gen_batch()
+        .col("id", array::step_custom::<Int32Type>(start, 1))
+        .into_reader_rows(RowCount::from(rows), BatchCount::from(1))
+}
+
+// Simulate a branch created before the new name validation.
+async fn create_branch_before_name_check(source: &Dataset, branch: &str) {
+    let version = source.version().version;
+    let source_branch = source.manifest.branch.clone();
+    let source_location = source
+        .branch_location()
+        .find_branch(source_branch.as_deref())
+        .unwrap();
+    let location = source.branch_location().find_branch(Some(branch)).unwrap();
+    let clone = Operation::Clone {
+        is_shallow: true,
+        ref_name: source_branch.clone(),
+        ref_version: version,
+        ref_path: source_location.uri,
+        branch_name: Some(branch.to_string()),
+    };
+    CommitBuilder::new(location.uri.as_str())
+        .with_store_params(source.store_params.as_deref().cloned().unwrap_or_default())
+        .with_object_store(Arc::new(source.object_store.as_ref().clone()))
+        .with_commit_handler(source.commit_handler.clone())
+        .with_exact_storage_format(source.manifest.data_storage_format.lance_file_format())
+        .execute(Transaction::new(version, clone, None))
+        .await
+        .unwrap();
+    source
+        .branches()
+        .create(branch, version, source_branch.as_deref())
+        .await
+        .unwrap();
+}
+
+#[rstest]
+#[case::data_directory("data", true)]
+#[case::data_directory_case_alias("Data", true)]
+#[case::versions_directory("_versions", true)]
+#[case::deletions_directory("_deletions", true)]
+#[case::dir_id_mem_wal_directory("_a1b2c3d4_mem_wal", true)]
+#[case::ordinary_name("child", false)]
+#[tokio::test]
+async fn deleting_nested_branch_preserves_parent(
+    #[case] segment: &str,
+    #[case] directory_stays: bool,
+) {
+    let tempdir = TempStrDir::default();
+    let uri = tempdir.as_str();
+    let mut root = Dataset::write(id_rows(0, 4), uri, None).await.unwrap();
+    let mut outer = root
+        .create_branch("outer", root.version().version, None)
+        .await
+        .unwrap();
+    outer.delete("id = 0").await.unwrap();
+    outer.append(id_rows(4, 2), None).await.unwrap();
+    let nested = format!("outer/{segment}");
+    create_branch_before_name_check(&outer, &nested).await;
+    assert!(root.list_branches().await.unwrap().contains_key(&nested));
+    let nested_rows = root.checkout_branch(&nested).await.unwrap();
+    assert_eq!(nested_rows.count_rows(None).await.unwrap(), 5);
+
+    root.delete_branch(&nested).await.unwrap();
+
+    assert!(!root.list_branches().await.unwrap().contains_key(&nested));
+    let nested_dir = std::path::Path::new(uri).join("tree/outer").join(segment);
+    if directory_stays {
+        let preserved = root.checkout_branch(&nested).await.unwrap_or_else(|error| {
+            panic!("deleted branch {nested} should stay openable: {error}")
+        });
+        assert_eq!(preserved.count_rows(None).await.unwrap(), 5);
+    } else {
+        assert!(
+            !nested_dir.exists(),
+            "ordinary nested branch directory should be removed: {}",
+            nested_dir.display()
+        );
+    }
+    let outer = Dataset::open(uri)
+        .await
+        .unwrap()
+        .checkout_branch("outer")
+        .await
+        .unwrap_or_else(|error| panic!("branch outer is gone: {error}"));
+    let rows = outer
+        .count_rows(Some("id >= 0".to_string()))
+        .await
+        .unwrap_or_else(|error| panic!("branch outer cannot be scanned: {error}"));
+    assert_eq!(rows, 5);
+}
+
+#[rstest]
+#[case::data_directory("data")]
+#[case::versions_directory("_versions")]
+#[case::deletions_directory("_deletions")]
+#[tokio::test]
+async fn create_branch_refuses_a_nested_name_of_a_dataset_directory(#[case] segment: &str) {
+    let tempdir = TempStrDir::default();
+    let uri = tempdir.as_str();
+    let mut root = Dataset::write(id_rows(0, 4), uri, None).await.unwrap();
+    let mut outer = root
+        .create_branch("outer", root.version().version, None)
+        .await
+        .unwrap();
+    let nested = format!("outer/{segment}");
+
+    let error = outer
+        .create_branch(&nested, outer.version().version, None)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::InvalidRef { .. }), "{error}");
+    assert!(!root.list_branches().await.unwrap().contains_key(&nested));
+    let nested_versions = std::path::Path::new(uri)
+        .join("tree/outer")
+        .join(segment)
+        .join("_versions");
+    assert!(!nested_versions.exists(), "{}", nested_versions.display());
+    let outer = root.checkout_branch("outer").await.unwrap();
+    assert_eq!(outer.count_rows(None).await.unwrap(), 4);
 }

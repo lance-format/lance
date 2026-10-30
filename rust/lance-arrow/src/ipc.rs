@@ -410,6 +410,21 @@ fn write_section_padding(writer: &mut dyn Write, pos: &mut usize) -> Result<(), 
     Ok(())
 }
 
+fn skip_section_padding(data: &Bytes, offset: &mut usize) -> Result<(), ArrowError> {
+    let aligned = offset
+        .checked_add(section_padding(*offset))
+        .filter(|&aligned| aligned <= data.len())
+        .ok_or_else(|| {
+            ArrowError::ParseError(format!(
+                "IPC section at offset {} cannot be aligned within {} bytes",
+                *offset,
+                data.len()
+            ))
+        })?;
+    *offset = aligned;
+    Ok(())
+}
+
 /// Write `batch` as a 64-byte-aligned single-batch Arrow IPC section.
 ///
 /// `pos` is the absolute byte offset of `writer` within the enclosing blob.
@@ -445,7 +460,7 @@ pub fn write_ipc_section(
 /// Zero-copy: array buffers borrow from `data`'s allocation when `data`'s base
 /// address is at least 64-byte aligned (see [`write_ipc_section`]).
 pub fn read_ipc_section_at(data: &Bytes, offset: &mut usize) -> Result<RecordBatch, ArrowError> {
-    *offset += section_padding(*offset);
+    skip_section_padding(data, offset)?;
     read_ipc_stream_single_at(data, offset)
 }
 
@@ -482,15 +497,39 @@ pub fn read_ipc_section_batches_at(
     data: &Bytes,
     offset: &mut usize,
 ) -> Result<Vec<RecordBatch>, ArrowError> {
-    *offset += section_padding(*offset);
+    skip_section_padding(data, offset)?;
     read_ipc_stream_at(data, offset)
 }
 
 #[cfg(test)]
 mod tests {
     use arrow_array::{ArrayRef, record_batch};
+    use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case::truncated_padding(42, 42)]
+    #[case::partial_padding(42, 63)]
+    #[case::past_end(128, 64)]
+    #[case::alignment_overflow(usize::MAX, 64)]
+    fn test_ipc_section_rejects_invalid_alignment(
+        #[case] offset: usize,
+        #[case] len: usize,
+        #[values(false, true)] multiple_batches: bool,
+    ) {
+        let data = Bytes::from(vec![0; len]);
+        let mut next = offset;
+        let result = if multiple_batches {
+            read_ipc_section_batches_at(&data, &mut next).map(|_| ())
+        } else {
+            read_ipc_section_at(&data, &mut next).map(|_| ())
+        };
+        let error = result.unwrap_err();
+        assert!(matches!(error, ArrowError::ParseError(_)), "{error}");
+        assert!(error.to_string().contains("IPC section"), "{error}");
+        assert_eq!(next, offset, "failed reads must preserve the offset");
+    }
 
     #[test]
     fn test_ipc_roundtrip() {

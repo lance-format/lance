@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -37,6 +38,10 @@ pub struct IndexSegment {
     index_version: i32,
     /// Dataset version at which this segment's physical contents were built.
     dataset_version: u64,
+    /// The clustering definition this segment was built under, if any.
+    clustering_id: Option<u32>,
+    /// Generic metadata published with the segment; see `IndexMetadata::metadata`.
+    metadata: HashMap<String, String>,
 }
 
 impl IndexSegment {
@@ -63,7 +68,34 @@ impl IndexSegment {
             index_details,
             index_version,
             dataset_version,
+            clustering_id: None,
+            metadata: HashMap::new(),
         }
+    }
+
+    /// Publish the segment with a clustering reference and generic metadata.
+    ///
+    /// `clustering_id` must name a definition in the dataset's manifest. The
+    /// entries are stored verbatim and preserved by later changes to the
+    /// segment; a segment built from this one does not inherit them.
+    pub fn with_object_metadata(
+        mut self,
+        clustering_id: Option<u32>,
+        metadata: HashMap<String, String>,
+    ) -> Self {
+        self.clustering_id = clustering_id;
+        self.metadata = metadata;
+        self
+    }
+
+    /// Return the clustering definition this segment was built under.
+    pub fn clustering_id(&self) -> Option<u32> {
+        self.clustering_id
+    }
+
+    /// Return the generic metadata published with this segment.
+    pub fn metadata(&self) -> &HashMap<String, String> {
+        &self.metadata
     }
 
     /// Return the UUID of this segment.
@@ -169,6 +201,8 @@ impl IndexSegment {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: self.clustering_id,
+            metadata: self.metadata,
         }
     }
 }
@@ -202,7 +236,8 @@ impl IntoIndexSegment for IndexMetadata {
             self.index_version,
             self.dataset_version,
             self.covering_fields,
-        ))
+        )
+        .with_object_metadata(self.clustering_id, self.metadata))
     }
 }
 
@@ -378,6 +413,32 @@ pub trait DatasetIndexExt {
     ) -> Result<IndexMetadata>;
 
     /// Commit one or more existing physical index segments as a logical index.
+    ///
+    /// `column` names the first field in each segment. Built-in indices require
+    /// exactly one keyed field. A registered scalar plugin that returns `false`
+    /// from [`ScalarIndexPlugin::supports_optimization`](lance_index::scalar::registry::ScalarIndexPlugin::supports_optimization) may declare multiple
+    /// distinct field IDs if its fragment bitmap and covering fields are empty.
+    /// The plugin builds and refreshes its own payload; this does not enable
+    /// multi-column training through [`Self::create_index_builder`].
+    ///
+    /// For such plugins, declare every input, grouping, and predicate dependency
+    /// in `fields`, in a stable order with `column` first. This order is persisted unchanged
+    /// and must match across all segments and replacements of the same name.
+    /// Deleting any declared field removes the index; changing its type requires
+    /// dropping the index first. Renaming a field preserves its ID and the index.
+    /// Scope semantics and payload coverage remain the plugin's responsibility.
+    /// Discover these indices by name or with unfiltered [`Self::describe_indices`];
+    /// single-column query lookup does not select them.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result, index::{DatasetIndexExt, IndexSegment}};
+    /// # async fn commit(dataset: &mut Dataset, segment: IndexSegment) -> Result<()> {
+    /// // An externally built segment can declare [user_id, country] field IDs
+    /// // for a profile of user_id grouped by country, with an empty bitmap.
+    /// dataset.commit_existing_index_segments("users_by_country", "user_id", vec![segment]).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     async fn commit_existing_index_segments(
         &mut self,
         index_name: &str,
@@ -415,6 +476,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let segment = metadata.into_index_segment().unwrap();
@@ -470,10 +533,37 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let segment = metadata.into_index_segment().unwrap();
         assert_eq!(segment.fields(), &[7, 11]);
         assert_eq!(segment.covering_fields(), &[11]);
+    }
+
+    #[test]
+    fn object_metadata_round_trips_through_index_metadata() {
+        let metadata = HashMap::from([
+            ("org.example.cluster.bucket".to_string(), "3".to_string()),
+            ("org.example.unknown".to_string(), "opaque".to_string()),
+        ]);
+        let segment = IndexSegment::new(
+            Uuid::new_v4(),
+            [1u32, 2],
+            [7],
+            Arc::new(prost_types::Any::default()),
+            1,
+            5,
+            [],
+        )
+        .with_object_metadata(Some(4), metadata.clone());
+        let committed = segment.clone().into_metadata("idx");
+        assert_eq!(committed.clustering_id, Some(4));
+        assert_eq!(committed.metadata, metadata);
+        let restored = committed.into_index_segment().unwrap();
+        assert_eq!(restored.clustering_id(), Some(4));
+        assert_eq!(restored.metadata(), &metadata);
+        assert_eq!(restored.fragment_bitmap(), segment.fragment_bitmap());
     }
 }

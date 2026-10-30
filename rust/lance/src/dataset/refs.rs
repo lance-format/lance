@@ -7,13 +7,16 @@ use chrono::{DateTime, Utc};
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
-use lance_table::io::commit::CommitHandler;
+use lance_table::io::commit::{CommitHandler, VERSIONS_DIR};
+use lance_table::io::deletion::DELETIONS_DIR;
 use object_store::{Error as ObjectStoreError, path::Path};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::dataset::branch_location::BranchLocation;
+use crate::dataset::mem_wal::util::is_mem_wal_dir_name;
 use crate::dataset::refs::Ref::{Tag, Version, VersionNumber};
+use crate::dataset::{BLOBS_DIR, DATA_DIR, FRAG_REUSE_DIR, INDICES_DIR, TRANSACTIONS_DIR};
 use crate::utils::temporal::utc_now;
 use crate::{Error, Result};
 use serde::de::DeserializeOwned;
@@ -391,32 +394,36 @@ impl Branches<'_> {
     pub async fn fetch(&self) -> Result<Vec<(String, BranchContents)>> {
         let root_location = self.refs.root()?;
         let base_path = base_branches_contents_path(&root_location.path);
-        let branch_files = self.object_store().read_dir(base_path).await?;
+        // Branch names may contain '/'. Some object store adapters preserve the
+        // encoded separator in a flat key while others expose it as nested paths.
+        // Recursively list the metadata prefix so both layouts are discoverable.
+        let branch_files = self
+            .object_store()
+            .list(Some(base_path.clone()))
+            .try_collect::<Vec<_>>()
+            .await?;
 
-        let branch_names: Vec<String> = branch_files
-            .iter()
-            .filter_map(|name| name.strip_suffix(".json"))
-            .map(|str| {
-                Path::from_url_path(str)
-                    .map_err(|e| Error::InvalidRef {
-                        message: format!(
-                            "Failed to decode branch name: {} due to exception {}",
-                            str, e
-                        ),
-                    })
-                    .map(|path| path.to_string())
+        let branches: Vec<(String, Path)> = branch_files
+            .into_iter()
+            .filter_map(|meta| {
+                let relative_path = Path::from_iter(meta.location.prefix_match(&base_path)?);
+                let name = relative_path.as_ref().strip_suffix(".json")?;
+                Some(
+                    Path::from_url_path(name)
+                        .map_err(|e| Error::InvalidRef {
+                            message: format!(
+                                "Failed to decode branch name: {} due to exception {}",
+                                name, e
+                            ),
+                        })
+                        .map(|path| (path.to_string(), meta.location)),
+                )
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let branch_path = &root_location.path;
-        futures::stream::iter(branch_names)
-            .map(|name| async move {
-                let contents = BranchContents::from_path(
-                    &branch_contents_path(branch_path, &name),
-                    self.object_store(),
-                    &name,
-                )
-                .await?;
+        futures::stream::iter(branches)
+            .map(|(name, path)| async move {
+                let contents = BranchContents::from_path(&path, self.object_store(), &name).await?;
                 Ok((name, contents))
             })
             .buffer_unordered(10)
@@ -693,6 +700,23 @@ impl Branches<'_> {
             relative_dir = deleted_branch.segments[0].to_string();
         }
 
+        // Older releases allowed branches like `a/data`, which share
+        // `a`'s data directory. Don't delete the parent's files.
+        let target = BranchRelativePath::new(&relative_dir);
+        if let Some(owner) = remaining_branches.iter().find(|remaining| {
+            let remaining = BranchRelativePath::new(remaining);
+            remaining.is_parent(&target)
+                && is_dataset_dir(target.segments[remaining.segments.len()])
+        }) {
+            log::warn!(
+                "Keeping {} after deleting branch {}, since it lies in a dataset directory of branch {}",
+                relative_dir,
+                branch,
+                owner
+            );
+            return Ok(None);
+        }
+
         let absolute_dir = base_location.find_branch(Some(relative_dir.as_str()))?;
         Ok(Some(absolute_dir.path))
     }
@@ -929,7 +953,8 @@ pub fn tag_path(base_path: &Path, branch: &str) -> Path {
     base_tags_path(base_path).join(format!("{}.json", branch))
 }
 
-// Note: child will encode '/' to '%2F'
+// Path::join encodes '/' to '%2F'. Some object store adapters decode that
+// separator when translating the path into a provider key.
 pub fn branch_contents_path(base_path: &Path, branch: &str) -> Path {
     base_branches_contents_path(base_path).join(format!("{}.json", branch))
 }
@@ -1054,6 +1079,43 @@ pub fn check_valid_branch(branch_name: &str) -> Result<()> {
     Ok(())
 }
 
+// Nested branches cannot use these names because they overlap
+// directories owned by their ancestors.
+const DATASET_DIRS: &[&str] = &[
+    DATA_DIR,
+    VERSIONS_DIR,
+    TRANSACTIONS_DIR,
+    DELETIONS_DIR,
+    INDICES_DIR,
+    BLOBS_DIR,
+    FRAG_REUSE_DIR,
+];
+
+fn is_dataset_dir(segment: &str) -> bool {
+    DATASET_DIRS
+        .iter()
+        .any(|directory| segment.eq_ignore_ascii_case(directory))
+        || is_mem_wal_dir_name(segment)
+}
+
+/// Only restrict new branches so older branch names remain accessible.
+pub(crate) fn check_new_branch(branch_name: &str) -> Result<()> {
+    check_valid_branch(branch_name)?;
+    if let Some(segment) = branch_name
+        .split('/')
+        .skip(1)
+        .find(|segment| is_dataset_dir(segment))
+    {
+        return Err(Error::InvalidRef {
+            message: format!(
+                "Branch '{}' cannot use reserved directory '{}' after the first segment",
+                branch_name, segment
+            ),
+        });
+    }
+    Ok(())
+}
+
 pub fn check_valid_tag(s: &str) -> Result<()> {
     if s.is_empty() {
         return Err(Error::InvalidRef {
@@ -1159,7 +1221,9 @@ mod tests {
             "normal",
             "with-dash",
             "with_underscore",
-            "with.dot"
+            "with.dot",
+            "data",
+            "_versions/child"
         )]
         branch_name: &str,
     ) {
@@ -1168,6 +1232,31 @@ mod tests {
             "Branch name '{}' should be valid",
             branch_name
         );
+        assert!(
+            check_new_branch(branch_name).is_ok(),
+            "Branch name '{}' should be creatable",
+            branch_name
+        );
+    }
+
+    #[rstest]
+    #[case::data("outer/data")]
+    #[case::data_case_alias("outer/Data")]
+    #[case::versions("outer/_versions")]
+    #[case::transactions("outer/_transactions")]
+    #[case::deletions("outer/_deletions")]
+    #[case::indices("outer/_indices")]
+    #[case::blobs("outer/_blobs")]
+    #[case::frag_reuse("outer/_fri")]
+    #[case::mem_wal("outer/_mem_wal")]
+    #[case::dir_id_mem_wal("outer/_a1b2c3d4_mem_wal")]
+    #[case::below_a_nested_branch("a/b/_indices")]
+    #[case::above_another_segment("a/data/b")]
+    fn new_branch_cannot_nest_in_a_dataset_directory(#[case] branch_name: &str) {
+        check_valid_branch(branch_name).unwrap();
+        let error = check_new_branch(branch_name).unwrap_err();
+        assert!(matches!(error, Error::InvalidRef { .. }), "{error}");
+        assert_contains!(error.to_string(), "after the first segment");
     }
 
     #[rstest]
@@ -1394,6 +1483,12 @@ mod tests {
     #[case("feature/auth/module", &["feature/other"], Some("feature/auth"))]
     #[case("feature/dev", &["bugfix", "hotfix"], Some("feature"))]
     #[case("branch1", &["dev/branch2", "feature/nathan/branch3", "branch4"], Some("branch1"))]
+    #[case::data_directory_of_a_remaining_parent("outer/data", &["outer"], None)]
+    #[case::dir_id_mem_wal_directory_of_a_remaining_parent("outer/_a1b2c3d4_mem_wal", &["outer"], None)]
+    #[case::versions_directory_of_a_nested_parent("a/b/_versions", &["a", "a/b", "c"], None)]
+    #[case::inside_the_data_directory_of_a_remaining_ancestor("a/data/x", &["a", "a/data/y"], None)]
+    #[case::directory_name_without_a_remaining_parent("outer/data", &["other"], Some("outer"))]
+    #[case::ordinary_name_below_a_directory_name("outer/data/x", &["outer/data"], Some("outer/data/x"))]
     fn test_get_cleanup_path(
         #[case] branch_to_delete: &str,
         #[case] remaining_branches: &[&str],

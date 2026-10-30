@@ -1452,18 +1452,16 @@ async fn assert_scalar_queries_match(dataset: &Dataset) {
 /// (T3) After the upgrade, `optimize_indices` merges the v0-deferred
 /// segment with a newer one. The merge translates the addresses: the
 /// merged FILE holds live addresses (the old file's source addresses are
-/// gone) and indexed queries equal the scan after a fresh reopen. It keeps
-/// the old stamp and provenance, though: the merged segment carries the
-/// OLD segment's dataset version (the minimum of its sources) and the union
-/// of the stored bitmaps, so the trim that follows KEEPS the legacy version
-/// and rebuilds the entry bitmap to the legacy sources and destination. The
-/// legacy version stays pinned until a remap advances the stamp; that is
-/// the conservative side.
+/// gone) and indexed queries equal the scan after a fresh reopen. The
+/// merged segment is stamped with the manifest it was built from and keeps
+/// the union of the stored bitmaps, so the trim that follows releases the
+/// legacy version: the merged stamp is past it and its retired sources are
+/// in no segment's bitmap.
 #[tokio::test]
 #[serial_test::serial(frag_reuse_maintenance)]
 async fn v0_deferred_segment_merges_into_live_addresses_after_upgrade() {
     let dir = TempStrDir::default();
-    let (dataset, destination) = v0_deferred_scalar_fixture(dir.as_str()).await;
+    let (dataset, destination) = Box::pin(v0_deferred_scalar_fixture(dir.as_str())).await;
     let old = stored_segment(&dataset, "i_idx").await;
     // The file still addresses the retired sources.
     let stale = raw_segment_row_addrs(&dataset, &old, 101).await;
@@ -1493,6 +1491,7 @@ async fn v0_deferred_segment_merges_into_live_addresses_after_upgrade() {
             .collect::<RoaringBitmap>()
     );
 
+    let built_from = dataset.manifest.version;
     dataset
         .optimize_indices(&OptimizeOptions::merge(2))
         .await
@@ -1517,10 +1516,10 @@ async fn v0_deferred_segment_merges_into_live_addresses_after_upgrade() {
         assert_eq!(RowAddress::from(live[&value]).fragment_id(), destination);
     }
     assert_eq!(
-        merged.dataset_version, old.dataset_version,
-        "the merge keeps the oldest source stamp (below the legacy version)"
+        merged.dataset_version, built_from,
+        "the merge is stamped with the manifest it was built from"
     );
-    assert!(merged.dataset_version < legacy_versions(&dataset).await[0].dataset_version);
+    assert!(merged.dataset_version > legacy_versions(&dataset).await[0].dataset_version);
     // Provenance union: the old segment's listed bitmap {0, 1, destination}
     // and the newer segment's fragments (the two partition destinations and
     // the appended fragment).
@@ -1535,20 +1534,16 @@ async fn v0_deferred_segment_merges_into_live_addresses_after_upgrade() {
     );
     assert_scalar_queries_match(&dataset).await;
 
-    // The merged segment is still stamped before the legacy version: the
-    // trim keeps it and rebuilds the entry bitmap to the legacy sources and
-    // destination.
+    // The merged segment is past the legacy version and covers none of its
+    // retired sources: the trim releases it, and with nothing left to
+    // retain, drops the entry.
     let mut dataset = dataset;
     cleanup_frag_reuse_index(&mut dataset).await.unwrap();
-    assert_eq!(
-        legacy_versions(&dataset).await.len(),
-        1,
-        "the legacy version stays pinned until a remap advances the stamp"
+    assert!(
+        legacy_versions(&dataset).await.is_empty(),
+        "the legacy version is released once the merged stamp is past it"
     );
-    assert_eq!(
-        fri_entry(&dataset).await.unwrap().fragment_bitmap.unwrap(),
-        RoaringBitmap::from_iter([2u32, 3, destination])
-    );
+    assert!(fri_entry(&dataset).await.is_none());
     let dataset = fresh_session(dir.as_str()).await;
     assert_eq!(
         stored_segments(&dataset, "i_idx").await[0].uuid,
@@ -1560,14 +1555,14 @@ async fn v0_deferred_segment_merges_into_live_addresses_after_upgrade() {
 /// (Multi-round) Two v0 deferred compactions before the upgrade, the second
 /// consuming the first's destination together with the other indexed
 /// fragments, then the same merge and trim checks: the merged file holds
-/// live addresses two hops away from what the old file stored, while the
-/// merge keeps the old stamp and provenance, so both legacy versions stay
-/// pinned (the conservative side) until a remap advances the stamp.
+/// live addresses two hops away from what the old file stored, the merge
+/// is stamped with the manifest it was built from, and the trim releases
+/// both legacy versions.
 #[tokio::test]
 #[serial_test::serial(frag_reuse_maintenance)]
 async fn two_v0_deferred_rounds_merge_and_trim_after_upgrade() {
     let dir = TempStrDir::default();
-    let (mut dataset, first_destination) = v0_deferred_scalar_fixture(dir.as_str()).await;
+    let (mut dataset, first_destination) = Box::pin(v0_deferred_scalar_fixture(dir.as_str())).await;
     let old = stored_segment(&dataset, "i_idx").await;
     // Round two: every remaining fragment (F0, F1 and the first destination)
     // is indexed, so the planner bins them together.
@@ -1625,6 +1620,7 @@ async fn two_v0_deferred_rounds_merge_and_trim_after_upgrade() {
         &RoaringBitmap::from_iter([second_destination])
     );
     let newer = segments[1].clone();
+    let built_from = dataset.manifest.version;
     dataset
         .optimize_indices(&OptimizeOptions::merge(2))
         .await
@@ -1649,8 +1645,8 @@ async fn two_v0_deferred_rounds_merge_and_trim_after_upgrade() {
         );
     }
     assert_eq!(
-        merged.dataset_version, old.dataset_version,
-        "the merge keeps the oldest source stamp"
+        merged.dataset_version, built_from,
+        "the merge is stamped with the manifest it was built from"
     );
     assert_eq!(
         merged.fragment_bitmap.as_ref().unwrap(),
@@ -1659,15 +1655,12 @@ async fn two_v0_deferred_rounds_merge_and_trim_after_upgrade() {
     );
     assert_scalar_queries_match(&dataset).await;
 
-    // Both legacy versions stay pinned; the entry bitmap is rebuilt to the
-    // sources and destinations of both rounds.
+    // The merged segment is past both legacy versions and covers none of
+    // their retired sources: the trim releases both and drops the entry.
     let mut dataset = dataset;
     cleanup_frag_reuse_index(&mut dataset).await.unwrap();
-    assert_eq!(legacy_versions(&dataset).await.len(), 2);
-    assert_eq!(
-        fri_entry(&dataset).await.unwrap().fragment_bitmap.unwrap(),
-        RoaringBitmap::from_iter([0u32, 1, 2, 3, first_destination, second_destination])
-    );
+    assert!(legacy_versions(&dataset).await.is_empty());
+    assert!(fri_entry(&dataset).await.is_none());
     let dataset = fresh_session(dir.as_str()).await;
     assert_scalar_queries_match(&dataset).await;
 }
@@ -1683,7 +1676,7 @@ async fn two_v0_deferred_rounds_merge_and_trim_after_upgrade() {
 #[serial_test::serial(frag_reuse_maintenance)]
 async fn upgrade_merge_leaves_the_caught_up_segment_alone() {
     let dir = TempStrDir::default();
-    let (dataset, destination) = v0_deferred_scalar_fixture(dir.as_str()).await;
+    let (dataset, destination) = Box::pin(v0_deferred_scalar_fixture(dir.as_str())).await;
     let old = stored_segment(&dataset, "i_idx").await;
     let (dataset, sp_destinations) = upgrade_by_stable_partition(dataset, 300).await;
     let mut dataset = append_scalar_rows(dataset, 400, 4).await;

@@ -21,7 +21,10 @@ import org.lance.fragment.VersionMeta;
 import com.google.common.base.MoreObjects;
 
 import java.io.Serializable;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /** Metadata of a Fragment in the dataset. Matching to lance Fragment. */
@@ -35,6 +38,8 @@ public class FragmentMetadata implements Serializable {
   private final RowIdMeta rowIdMeta;
   private final VersionMeta createdAtVersionMeta;
   private final VersionMeta lastUpdatedAtVersionMeta;
+  private final Long clusteringId;
+  private final Map<String, String> metadata;
 
   public FragmentMetadata(
       int id,
@@ -73,6 +78,39 @@ public class FragmentMetadata implements Serializable {
       VersionMeta createdAtVersionMeta,
       VersionMeta lastUpdatedAtVersionMeta,
       List<DataFile> referencedLanceFiles) {
+    this(
+        id,
+        files,
+        physicalRows,
+        deletionFile,
+        rowIdMeta,
+        createdAtVersionMeta,
+        lastUpdatedAtVersionMeta,
+        referencedLanceFiles,
+        null,
+        Collections.emptyMap());
+  }
+
+  /**
+   * Full constructor, including the clustering reference and generic metadata.
+   *
+   * @param clusteringId the clustering definition this fragment was organized under, or null; a
+   *     non-negative value within the unsigned 32-bit range
+   * @param metadata generic metadata attached to this fragment, preserved verbatim through
+   *     operations on the fragment (including keys this library does not understand); null is
+   *     treated as empty
+   */
+  public FragmentMetadata(
+      int id,
+      List<DataFile> files,
+      Long physicalRows,
+      DeletionFile deletionFile,
+      RowIdMeta rowIdMeta,
+      VersionMeta createdAtVersionMeta,
+      VersionMeta lastUpdatedAtVersionMeta,
+      List<DataFile> referencedLanceFiles,
+      Long clusteringId,
+      Map<String, String> metadata) {
     this.id = id;
     this.files = files;
     this.referencedLanceFiles = referencedLanceFiles;
@@ -81,6 +119,11 @@ public class FragmentMetadata implements Serializable {
     this.rowIdMeta = rowIdMeta;
     this.createdAtVersionMeta = createdAtVersionMeta;
     this.lastUpdatedAtVersionMeta = lastUpdatedAtVersionMeta;
+    this.clusteringId = clusteringId;
+    this.metadata =
+        metadata == null
+            ? Collections.emptyMap()
+            : Collections.unmodifiableMap(new HashMap<>(metadata));
   }
 
   public int getId() {
@@ -136,6 +179,24 @@ public class FragmentMetadata implements Serializable {
     return lastUpdatedAtVersionMeta;
   }
 
+  /**
+   * The clustering definition this fragment was organized under when it was created, by its id in
+   * the manifest, or null when the fragment has no clustering reference. Operations on the same
+   * fragment keep it; a fragment written from this one does not inherit it.
+   */
+  public Long getClusteringId() {
+    return clusteringId;
+  }
+
+  /**
+   * Generic metadata attached to this fragment, like the dataset's table metadata. Operations on
+   * the same fragment preserve every entry, including keys this library does not understand; new
+   * fragments carry only what their writer sets. Never null; empty when there is none.
+   */
+  public Map<String, String> getMetadata() {
+    return metadata;
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) {
@@ -152,7 +213,9 @@ public class FragmentMetadata implements Serializable {
         && Objects.equals(deletionFile, that.deletionFile)
         && Objects.equals(rowIdMeta, that.rowIdMeta)
         && Objects.equals(createdAtVersionMeta, that.createdAtVersionMeta)
-        && Objects.equals(lastUpdatedAtVersionMeta, that.lastUpdatedAtVersionMeta);
+        && Objects.equals(lastUpdatedAtVersionMeta, that.lastUpdatedAtVersionMeta)
+        && Objects.equals(clusteringId, that.clusteringId)
+        && Objects.equals(metadata, that.metadata);
   }
 
   @Override
@@ -165,7 +228,9 @@ public class FragmentMetadata implements Serializable {
         deletionFile,
         rowIdMeta,
         createdAtVersionMeta,
-        lastUpdatedAtVersionMeta);
+        lastUpdatedAtVersionMeta,
+        clusteringId,
+        metadata);
   }
 
   @Override
@@ -179,6 +244,8 @@ public class FragmentMetadata implements Serializable {
         .add("rowIdMeta", rowIdMeta)
         .add("createdAtVersionMeta", createdAtVersionMeta)
         .add("lastUpdatedAtVersionMeta", lastUpdatedAtVersionMeta)
+        .add("clusteringId", clusteringId)
+        .add("metadata", metadata)
         .toString();
   }
 }

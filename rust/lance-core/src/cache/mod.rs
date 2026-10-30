@@ -348,6 +348,18 @@ impl LanceCache {
         self.state.backend.capacity_bytes()
     }
 
+    /// Largest admissible RAM entry, if reported by the backend. An admitted
+    /// entry remains subject to ordinary cache eviction.
+    ///
+    /// ```
+    /// use lance_core::cache::LanceCache;
+    /// let cache = LanceCache::with_capacity(1024);
+    /// assert_eq!(cache.max_entry_bytes(), Some(1024));
+    /// ```
+    pub fn max_entry_bytes(&self) -> Option<u64> {
+        self.state.backend.max_entry_bytes()
+    }
+
     // -- Stats / clear --------------------------------------------------------
 
     pub async fn stats(&self) -> CacheStats {
@@ -1619,12 +1631,16 @@ mod tests {
         assert!(contenders.iter().all(|handle| !handle.is_finished()));
 
         release.notify_one();
-        assert!(matches!(owner.await.unwrap(), Err(Error::Timeout { .. })));
+        // The loader error is shared across every waiter, so it comes back
+        // wrapped in `Error::Shared`; `find_root` recovers the timeout.
+        let owner_err = owner.await.unwrap().expect_err("owner must see the error");
+        assert!(matches!(owner_err.find_root(), Error::Timeout { .. }));
         for contender in contenders {
-            assert!(matches!(
-                contender.await.unwrap(),
-                Err(Error::Timeout { .. })
-            ));
+            let err = contender
+                .await
+                .unwrap()
+                .expect_err("contender must see the error");
+            assert!(matches!(err.find_root(), Error::Timeout { .. }));
         }
         assert_eq!(loader_calls.load(Ordering::SeqCst), 1);
     }

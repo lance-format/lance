@@ -294,7 +294,7 @@ pub struct BatchStore {
     generation: u64,
 
     /// Generation-scoped Blob v2 writer. Durable puts reuse its current pack;
-    /// the WAL path seals it before persisting any descriptors that reference it.
+    /// the WAL path finishes it before persisting any descriptors that reference it.
     blob_preprocessor: AsyncMutex<BlobPreprocessorState>,
 }
 
@@ -677,7 +677,7 @@ impl BatchStore {
         self.blob_preprocessor.lock().await.fail(error);
     }
 
-    /// Seal the generation's current packed sidecar before its descriptors are
+    /// Finish the generation's current packed sidecar before its descriptors are
     /// made durable in the WAL. The preprocessor remains reusable so later puts
     /// can start a new pack under the same generation target.
     pub(crate) async fn finish_blob_pack(&self) -> crate::Result<()> {
