@@ -821,7 +821,7 @@ impl Branches<'_> {
     ) -> Result<Option<Vec<PathBuf>>> {
         let mut canonical_retained_dirs = Vec::with_capacity(DATASET_DIRS.len() + 1);
         for name in self.object_store().read_dir(path.clone()).await? {
-            if name != REFS_DIR && !is_dataset_dir(&name) {
+            if !name.eq_ignore_ascii_case(REFS_DIR) && !is_dataset_dir(&name) {
                 continue;
             }
             let owned_path = path.clone().join(name);

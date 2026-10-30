@@ -1877,6 +1877,75 @@ async fn test_delete_branch_preserves_aliased_main_dataset(
     }
 }
 
+#[derive(Debug)]
+struct GateUppercaseRefsStore {
+    inner: Arc<dyn OSObjectStore>,
+    root: Path,
+    uppercase: bool,
+}
+
+impl std::fmt::Display for GateUppercaseRefsStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GateUppercaseRefsStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl OSObjectStore for GateUppercaseRefsStore {
+    async fn put_opts(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(path, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        path: &Path,
+        options: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(path, options).await
+    }
+
+    async fn get_opts(&self, path: &Path, options: GetOptions) -> object_store::Result<GetResult> {
+        self.inner.get_opts(path, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        paths: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(paths)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        let mut entries = self.inner.list_with_delimiter(prefix).await?;
+        if self.uppercase && prefix == Some(&self.root) {
+            for directory in &mut entries.common_prefixes {
+                if directory.filename() == Some("_refs") {
+                    *directory = self.root.clone().join("_REFS");
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
 #[cfg(unix)]
 #[rstest]
 #[tokio::test]
@@ -1947,6 +2016,77 @@ async fn test_delete_branch_preserves_shared_refs(
     assert_eq!(
         batch["id"].as_primitive::<Int32Type>().values().as_ref(),
         &[0, 10, 20]
+    );
+}
+
+#[cfg(unix)]
+#[rstest]
+#[tokio::test]
+async fn test_gatekeeper_case_spelled_shared_refs(
+    #[values(false, true)] use_object_store: bool,
+    #[values(false, true)] uppercase: bool,
+) {
+    let tempdir = TempDir::default();
+    let uri = if use_object_store {
+        format!("file-object-store://{}", tempdir.path_str())
+    } else {
+        tempdir.path_str()
+    };
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    root.tags().create("checkpoint", 1).await.unwrap();
+    let mut survivor = root.create_branch("retained", 1, None).await.unwrap();
+    survivor.append(id_rows(10, 1), None).await.unwrap();
+    std::os::unix::fs::symlink(
+        tempdir.std_path().join("_refs"),
+        tempdir.std_path().join("tree/a"),
+    )
+    .unwrap();
+    root.create_branch("a", 1, None).await.unwrap();
+    root.create_branch("a/b", 1, None).await.unwrap();
+    let mut expected_branches = root.list_branches().await.unwrap();
+    expected_branches.remove("a").unwrap();
+    let expected_tags = root.tags().list().await.unwrap();
+    assert_eq!(
+        Dataset::open(&uri)
+            .await
+            .unwrap()
+            .checkout_branch("retained")
+            .await
+            .unwrap()
+            .scan()
+            .try_into_batch()
+            .await
+            .unwrap()["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .as_ref(),
+        &[0, 10],
+    );
+
+    let mut store = root.object_store.as_ref().clone();
+    store.inner = Arc::new(GateUppercaseRefsStore {
+        inner: store.inner.clone(),
+        root: root.refs.root().unwrap().path,
+        uppercase,
+    });
+    let store = Arc::new(store);
+    root.object_store = store.clone();
+    root.refs.object_store = store;
+    assert!(root.list_branches().await.unwrap().contains_key("retained"));
+    root.delete_branch("a").await.unwrap();
+
+    let fresh = Dataset::open(&uri).await.unwrap();
+    let branches = fresh.list_branches().await.unwrap();
+    let tags = fresh.tags().list().await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&branches).unwrap(),
+        serde_json::to_value(expected_branches).unwrap(),
+        "shared branch records lost: {:?}",
+        branches.keys().collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        serde_json::to_value(tags).unwrap(),
+        serde_json::to_value(expected_tags).unwrap(),
     );
 }
 
