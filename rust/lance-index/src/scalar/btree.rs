@@ -52,8 +52,10 @@ use arrow_ord::ord::make_comparator;
 use arrow_schema::{DataType, Field, IntervalUnit, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion_common::hash_utils::{RandomState, with_hashes};
+use datafusion_common::utils::normalize_float_zero;
 use datafusion_common::{DFSchema, DataFusionError, ScalarValue};
 use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_physical_expr::{
     PhysicalExpr, PhysicalSortExpr, create_physical_expr, expressions::Column,
 };
@@ -125,6 +127,29 @@ pub const BTREE_ROW_ADDR_DOMAIN_VERSION: u32 = 1;
 pub const BTREE_INDEX_VERSION: u32 = BTREE_ROW_ADDR_DOMAIN_VERSION;
 pub(crate) const BTREE_VALUES_COLUMN: &str = "values";
 pub(crate) const BTREE_IDS_COLUMN: &str = "ids";
+
+fn checked_batch_size(batch_size: u64) -> std::result::Result<usize, String> {
+    if batch_size == 0 {
+        return Err("BTree batch_size must be greater than zero, got 0".to_string());
+    }
+    usize::try_from(batch_size)
+        .map_err(|_| format!("BTree batch_size {batch_size} does not fit in usize"))
+}
+
+fn parse_batch_size(metadata: &HashMap<String, String>, source: &str) -> Result<u64> {
+    let Some(raw_batch_size) = metadata.get(BATCH_SIZE_META_KEY) else {
+        return Ok(DEFAULT_BTREE_BATCH_SIZE);
+    };
+    let batch_size = raw_batch_size.parse::<u64>().map_err(|error| {
+        Error::corrupt_file_named(
+            source,
+            format!("invalid BTree batch_size metadata {raw_batch_size:?}: {error}"),
+        )
+    })?;
+    checked_batch_size(batch_size)
+        .map(|_| batch_size)
+        .map_err(|error| Error::corrupt_file_named(source, error))
+}
 
 /// Wraps a ScalarValue and implements Ord (ScalarValue only implements PartialOrd)
 #[derive(Clone, Debug)]
@@ -723,6 +748,30 @@ where
     }
 }
 
+/// Comparator for floating-point page bounds. DataFusion normalizes `-0.0` to
+/// `+0.0` before comparison, so the page search must use the same equality.
+fn primitive_float_cmp<'a, T>(
+    left: &'a PrimitiveArray<T>,
+    right: &'a PrimitiveArray<T>,
+) -> impl Fn(usize, usize) -> Ordering + 'a
+where
+    T: ArrowPrimitiveType,
+{
+    let canonical = |value: T::Native| {
+        if value.is_zero() {
+            T::Native::ZERO
+        } else {
+            value
+        }
+    };
+    move |i, j| match (left.is_null(i), right.is_null(j)) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => canonical(left.value(i)).compare(canonical(right.value(j))),
+    }
+}
+
 /// Satisfies scalar queries by searching the `page_lookup.lance` batch directly.
 ///
 /// The batch holds one row per page with columns `min | max | null_count | page_idx`,
@@ -908,9 +957,9 @@ impl BTreeLookup {
             UInt16 => self.scan_native::<UInt16Type>(mins, maxs, query, page_ids),
             UInt32 => self.scan_native::<UInt32Type>(mins, maxs, query, page_ids),
             UInt64 => self.scan_native::<UInt64Type>(mins, maxs, query, page_ids),
-            Float16 => self.scan_native::<Float16Type>(mins, maxs, query, page_ids),
-            Float32 => self.scan_native::<Float32Type>(mins, maxs, query, page_ids),
-            Float64 => self.scan_native::<Float64Type>(mins, maxs, query, page_ids),
+            Float16 => self.scan_float::<Float16Type>(mins, maxs, query, page_ids),
+            Float32 => self.scan_float::<Float32Type>(mins, maxs, query, page_ids),
+            Float64 => self.scan_float::<Float64Type>(mins, maxs, query, page_ids),
             Decimal128(_, _) => self.scan_native::<Decimal128Type>(mins, maxs, query, page_ids),
             Decimal256(_, _) => self.scan_native::<Decimal256Type>(mins, maxs, query, page_ids),
             Utf8 => Ok(self.scan_accessor(
@@ -967,6 +1016,28 @@ impl BTreeLookup {
             primitive_cmp(&mins, &query),
             primitive_cmp(&maxs, &query),
             primitive_cmp(&mins, &mins),
+        ))
+    }
+
+    /// Floating-point variant of [`Self::scan_native`] that treats both signed
+    /// zero encodings as equal, matching DataFusion's comparison semantics.
+    fn scan_float<K: ArrowPrimitiveType>(
+        &self,
+        mins: &dyn Array,
+        maxs: &dyn Array,
+        query: &dyn Array,
+        page_ids: &[u32],
+    ) -> Result<Vec<u32>> {
+        let mins = reinterpret_primitive::<K>(mins)?;
+        let maxs = reinterpret_primitive::<K>(maxs)?;
+        let query = reinterpret_primitive::<K>(query)?;
+        Ok(self.scan_equality_pages(
+            query.len(),
+            page_ids,
+            |idx| maxs.is_null(idx),
+            primitive_float_cmp(&mins, &query),
+            primitive_float_cmp(&maxs, &query),
+            primitive_float_cmp(&mins, &mins),
         ))
     }
 
@@ -1596,6 +1667,9 @@ impl CacheCodecImpl for BTreeIndexState {
 
     fn deserialize(r: &mut CacheEntryReader<'_>) -> Result<Self> {
         let header: BTreeIndexHeader = r.read_header()?;
+        let batch_size = header.batch_size;
+        checked_batch_size(header.batch_size)
+            .map_err(|error| Error::corrupt_file_named("BTree index cache metadata", error))?;
         let ranges_to_files = if header.has_ranges_to_files {
             let map: RangeInclusiveMap<u32, (String, u32)> = header
                 .ranges_to_files
@@ -1609,7 +1683,7 @@ impl CacheCodecImpl for BTreeIndexState {
         let lookup_batch = r.read_ipc()?;
         Ok(Self {
             lookup_batch,
-            batch_size: header.batch_size,
+            batch_size,
             ranges_to_files,
             results_are_row_addresses: header.results_are_row_addresses,
         })
@@ -1673,6 +1747,10 @@ struct PageKeyMatches {
 impl KeysByValue {
     /// Group the non-null entries of `keys` by value; null keys match nothing.
     fn try_new(keys: ArrayRef) -> Result<Self> {
+        // DataFusion normalizes signed zeros before equality comparisons. Doing
+        // the same here keeps both the hash and comparator consistent with
+        // `search(Equals)`.
+        let keys = normalize_float_zero(&keys);
         let random_state = RandomState::default();
         let mut table: HashTable<(u64, u32)> = HashTable::new();
         let mut groups: Vec<Vec<u32>> = Vec::new();
@@ -1704,12 +1782,13 @@ impl KeysByValue {
 
     /// The page rows whose value equals some key.
     fn match_page(&self, values: &ArrayRef, rows: &UInt64Array) -> Result<PageKeyMatches> {
-        let value_eq = make_comparator(values, &self.keys, SortOptions::default())?;
+        let values = normalize_float_zero(values);
+        let value_eq = make_comparator(&values, &self.keys, SortOptions::default())?;
         let mut matches = PageKeyMatches {
             rows: Vec::new(),
             groups: Vec::new(),
         };
-        with_hashes([values], &self.random_state, |hashes| {
+        with_hashes([&values], &self.random_state, |hashes| {
             for idx in (0..values.len()).filter(|idx| values.is_valid(*idx)) {
                 if let Some(&(_, group)) = self.table.find(hashes[idx], |&(_, group)| {
                     value_eq(idx, self.groups[group as usize][0] as usize).is_eq()
@@ -2144,6 +2223,7 @@ impl BTreeIndex {
             &query.to_expr(BTREE_VALUES_COLUMN.to_string()),
             &df_schema,
             &ExecutionProps::default(),
+            &PhysicalPlanningContext::default(),
         )?)
     }
 
@@ -2268,6 +2348,8 @@ impl BTreeIndex {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         results_are_row_addresses: bool,
     ) -> Result<Self> {
+        checked_batch_size(batch_size)
+            .map_err(|error| Error::corrupt_file_named("BTree index metadata", error))?;
         let data_type = data.column(0).data_type().clone();
         let page_lookup = Arc::new(BTreeLookup::try_new(data)?);
 
@@ -2328,11 +2410,7 @@ impl BTreeIndex {
             .read_range(0..num_rows_in_lookup, None)
             .await?;
         let file_schema = page_lookup_file.schema();
-        let batch_size = file_schema
-            .metadata
-            .get(BATCH_SIZE_META_KEY)
-            .map(|bs| bs.parse().unwrap_or(DEFAULT_BTREE_BATCH_SIZE))
-            .unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
+        let batch_size = parse_batch_size(&file_schema.metadata, "BTree lookup metadata")?;
 
         let range_partitioned = file_schema
             .metadata
@@ -3244,6 +3322,7 @@ pub async fn train_btree_index(
     fragment_ids: Option<Vec<u32>>,
     range_id: Option<u32>,
 ) -> Result<Vec<IndexFile>> {
+    let batch_size_usize = checked_batch_size(batch_size).map_err(Error::invalid_input)?;
     // Create `partition_id` for distributed index building.
     // This ID serves as a high-level mask (first 32 bits of a u64) to ensure
     // that index partitions generated by different workers do not conflict.
@@ -3294,7 +3373,7 @@ pub async fn train_btree_index(
         .data_type()
         .clone();
 
-    let mut batches_source = chunk_concat_stream(batches_source, batch_size as usize);
+    let mut batches_source = chunk_concat_stream(batches_source, batch_size_usize);
 
     while let Some(batch) = batches_source.try_next().await? {
         encoded_batches.push(
@@ -3425,12 +3504,10 @@ async fn merge_metadata_files(
 
     // Step 3: Extract shared metadata and generate lookup_schema
     let first_lookup_reader = store.open_index_file(&part_lookup_files[0]).await?;
-    let batch_size = first_lookup_reader
-        .schema()
-        .metadata
-        .get(BATCH_SIZE_META_KEY)
-        .map(|bs| bs.parse().unwrap_or(DEFAULT_BTREE_BATCH_SIZE))
-        .unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
+    let batch_size = parse_batch_size(
+        &first_lookup_reader.schema().metadata,
+        "BTree partition lookup metadata",
+    )?;
     let range_partitioned = first_lookup_reader
         .schema()
         .metadata
@@ -3958,6 +4035,13 @@ impl BasicTrainer for BTreeIndexPlugin {
         }
 
         let params = serde_json::from_str::<BTreeParameters>(params)?;
+        if let Some(zone_size) = params.zone_size
+            && zone_size == 0
+        {
+            return Err(Error::invalid_input_source(
+                format!("BTree zone_size must be greater than zero, got {zone_size}").into(),
+            ));
+        }
         Ok(Box::new(BTreeTrainingRequest::new(params)))
     }
 
@@ -4176,11 +4260,12 @@ mod tests {
     };
 
     use super::{
-        BTreeIndexPlugin, BTreeIndexState, BTreeLookup, BTreePageKey, DEFAULT_BTREE_BATCH_SIZE,
-        Matches, OrderableScalarValue, PAGE_PREFETCH_CHUNK_SIZE, part_lookup_file_path,
-        part_page_data_file_path, train_btree_index,
+        BATCH_SIZE_META_KEY, BTREE_LOOKUP_NAME, BTreeIndexPlugin, BTreeIndexState, BTreeLookup,
+        BTreePageKey, DEFAULT_BTREE_BATCH_SIZE, Matches, OrderableScalarValue,
+        PAGE_PREFETCH_CHUNK_SIZE, part_lookup_file_path, part_page_data_file_path,
+        train_btree_index,
     };
-    use crate::scalar::registry::ScalarIndexPlugin;
+    use crate::scalar::registry::{BasicTrainer, ScalarIndexPlugin};
     use arrow_array::RecordBatch;
     use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey};
 
@@ -4206,6 +4291,72 @@ mod tests {
         IndexBuildProgress,
         lance_core::Result<()>
     );
+
+    #[test]
+    fn test_btree_rejects_zero_zone_size() {
+        let params = r#"{"zone_size":0}"#;
+        let field = Field::new("value", DataType::Int64, true);
+
+        let Err(error) = BTreeIndexPlugin.new_training_request(params, &field) else {
+            panic!("zero zone size must be rejected");
+        };
+
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("zone_size"));
+    }
+
+    #[tokio::test]
+    async fn test_btree_load_rejects_zero_batch_size_metadata() {
+        let tmpdir = TempObjDir::default();
+        let store = LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.as_ref().clone(),
+            Arc::new(LanceCache::no_cache()),
+        );
+        let lookup_batch = sample_lookup_batch();
+        let mut writer = store
+            .new_index_file(BTREE_LOOKUP_NAME, lookup_batch.schema())
+            .await
+            .unwrap();
+        writer.write_record_batch(lookup_batch).await.unwrap();
+        writer
+            .finish_with_metadata(HashMap::from([(
+                BATCH_SIZE_META_KEY.to_string(),
+                "0".to_string(),
+            )]))
+            .await
+            .unwrap();
+
+        let result = BTreeIndex::load(Arc::new(store), None, &LanceCache::no_cache(), true).await;
+        let Err(error) = result else {
+            panic!("zero batch size metadata must be rejected");
+        };
+
+        assert!(matches!(error, lance_core::Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("batch_size"));
+    }
+
+    #[tokio::test]
+    async fn test_direct_writer_rejects_zero_batch_size() {
+        let stream = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col("_rowaddr", array::step::<UInt64Type>())
+            .into_df_stream(RowCount::from(3), BatchCount::from(1));
+        let tmpdir = TempObjDir::default();
+        let store = LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.as_ref().clone(),
+            Arc::new(LanceCache::no_cache()),
+        );
+
+        let error = train_btree_index(stream, &store, 0, None, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("batch_size"));
+    }
+
     #[test]
     fn test_scalar_value_size() {
         let size_of_i32 = OrderableScalarValue(ScalarValue::Int32(Some(0))).deep_size_of();
@@ -4684,6 +4835,24 @@ mod tests {
                 .collect();
             assert_eq!(looked_up, searched, "key {key:?}");
         }
+    }
+
+    /// Each signed zero occupies its own page, so lookup also has to select both
+    /// pages before matching values.
+    #[tokio::test]
+    async fn test_lookup_signed_zero_across_pages() {
+        let values: ArrayRef = Arc::new(Float64Array::from_iter_values(
+            (0..128).map(|idx| if idx < 64 { -0.0 } else { 0.0 }),
+        ));
+        let row_ids = (0..128).map(|idx| 1000 + idx).collect::<Vec<u64>>();
+        let (_tmpdir, index) =
+            train_lookup_index(&values, &row_ids, &LanceCache::no_cache(), true).await;
+
+        let keys: ArrayRef = Arc::new(Float64Array::from(vec![0.0, -0.0]));
+        let expected = (0..2_u32)
+            .flat_map(|key_idx| row_ids.iter().map(move |row_id| (key_idx, *row_id)))
+            .collect::<Vec<_>>();
+        assert_eq!(lookup_pairs(index.as_ref(), keys).await, expected);
     }
 
     #[tokio::test]

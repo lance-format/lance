@@ -37,7 +37,7 @@ fn gather_materialized_values(
                 continue;
             }
             let take_end = end.min(array_end);
-            selected.extend(array_index, start - array_start, take_end - array_start);
+            selected.try_extend(array_index, start - array_start, take_end - array_start)?;
             start = take_end;
         }
     }
@@ -115,8 +115,8 @@ fn restore_leaf_slots(
                 "Materialized range exceeds decoded values",
             ));
         }
-        restored.extend_nulls(start - output_offset);
-        restored.extend(0, value_offset, value_offset + count);
+        restored.try_extend_nulls(start - output_offset)?;
+        restored.try_extend(0, value_offset, value_offset + count)?;
         output_offset = end;
         value_offset += count;
     }
@@ -125,7 +125,7 @@ fn restore_leaf_slots(
             "Decoded values exceed materialized ranges",
         ));
     }
-    restored.extend_nulls(slots - output_offset);
+    restored.try_extend_nulls(slots - output_offset)?;
     Ok(make_array(restored.freeze()))
 }
 

@@ -3,6 +3,123 @@
 
 use super::*;
 
+#[rstest::rstest]
+#[case::identifiers(
+    InvertedIndexParams::code().split_identifiers(true),
+    &["getUserName", "get_user_name", "get user name", "user name get", "getUserName getUserName"],
+    &[3, 3, 3, 3, 6]
+)]
+#[case::without_originals(
+    InvertedIndexParams::code().split_identifiers(true).preserve_original(false),
+    &["getUserName", "get_user_name", "get user name"],
+    &[3, 3, 3]
+)]
+#[case::filtered_subwords(
+    InvertedIndexParams::code().split_identifiers(true).remove_stop_words(true)
+        .custom_stop_words(Some(vec!["get".into(), "user".into(), "name".into()])),
+    &["get_user_name", "get_user_name keep"],
+    &[1, 2]
+)]
+#[case::filtered_original(
+    InvertedIndexParams::code().split_identifiers(true).max_token_length(Some(5)),
+    &["getUserName", "get_user_name"],
+    &[3, 3]
+)]
+#[case::filtered_leading_position(
+    InvertedIndexParams::code().split_identifiers(true).remove_stop_words(true)
+        .custom_stop_words(Some(vec!["get".into(), "get_user_name".into()])),
+    &["get_user_name", "get user name"],
+    &[2, 2]
+)]
+#[case::ngram(
+    InvertedIndexParams::default().base_tokenizer("ngram".into())
+        .ngram_min_length(2).ngram_max_length(2),
+    &["abcd", "abcdef"],
+    &[3, 5]
+)]
+#[tokio::test]
+async fn test_document_lengths_indexed_and_flat(
+    #[case] params: InvertedIndexParams,
+    #[case] docs: &[&str],
+    #[case] expected: &[u64],
+) {
+    let mut docs = docs.iter().copied().map(Some).collect::<Vec<_>>();
+    docs.extend([None, Some("")]);
+    let batch = arrow_array::record_batch!(
+        ("doc", Utf8, docs.clone()),
+        ("_rowid", UInt64, (0..docs.len() as u64).collect::<Vec<_>>())
+    )
+    .unwrap();
+    let query_tokens = Arc::new(Tokens::new(vec!["get".to_string()], DocType::Text));
+    let counted = tokenize_and_count(
+        stream::iter(vec![Ok(batch.clone())]),
+        params.build().unwrap(),
+        query_tokens.clone(),
+        0,
+        None,
+        0,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        counted[FLAT_ALL_TOKENS_COL]
+            .as_primitive::<UInt64Type>()
+            .values(),
+        expected
+    );
+    let total: u64 = expected.iter().sum();
+    let scorer = initialize_scorer(None, &query_tokens, &counted);
+    assert_eq!(scorer.total_tokens, total);
+    assert_eq!(scorer.num_docs(), expected.len());
+    assert_eq!(
+        scorer.avg_doc_length(),
+        total as f32 / expected.len() as f32
+    );
+
+    let (_, stats) = tokenize_and_blend_multi(
+        stream::iter(vec![Ok(batch.clone())]),
+        params.build().unwrap(),
+        query_tokens,
+        Arc::new(vec![0]),
+        Arc::new(vec![1.0]),
+        Arc::new(vec![Arc::new(lance_select::RowAddrMask::all_rows())]),
+        None,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats.total_tokens, vec![total]);
+
+    for with_position in [false, true] {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let mut builder =
+            InvertedIndexBuilder::new(params.clone().with_position(with_position).num_workers(1));
+        builder
+            .update(
+                Box::pin(RecordBatchStreamAdapter::new(
+                    batch.schema(),
+                    stream::iter(vec![Ok(batch.clone())]),
+                )),
+                store.as_ref(),
+                None,
+            )
+            .await
+            .unwrap();
+        let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let (tokens, num_docs, _) = index.bm25_stats_for_terms(&[], None).await.unwrap();
+        assert_eq!((tokens, num_docs), (total, expected.len()));
+    }
+}
+
 #[tokio::test]
 async fn flat_bm25_search_stream_with_metrics_records_elapsed_compute() {
     use crate::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;

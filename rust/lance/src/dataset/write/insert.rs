@@ -257,6 +257,7 @@ impl<'a> InsertBuilder<'a> {
             None,
             self.preassigned_data_file_name.clone(),
             self.inherited_field_ids,
+            None,
         ))
         .await?;
 

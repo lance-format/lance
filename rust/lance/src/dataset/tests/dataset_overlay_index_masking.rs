@@ -3103,13 +3103,14 @@ async fn test_fts_combined_fields_overlay_routes_only_stale_rows(
         .full_text_search(combined_fields_query("mango", &["text"]))
         .unwrap();
     let plan = scan.analyze_plan().await.unwrap();
-    let flat_read = plan
+    // The corpus owner rebuilds its children for each execution and reports
+    // their runtime I/O metrics; the displayed children are plan templates.
+    let corpus = plan
         .lines()
-        .skip_while(|line| !line.contains("FlatCombinedFields"))
-        .find(|line| line.contains("LanceRead"))
-        .unwrap_or_else(|| panic!("no flat read in the plan:\n{plan}"));
+        .find(|line| line.trim_start().starts_with("CombinedFieldsCorpus,"))
+        .unwrap_or_else(|| panic!("no combined-fields corpus in the plan:\n{plan}"));
     assert!(
-        flat_read.contains("rows_scanned=1,"),
+        corpus.contains("rows_scanned=1,"),
         "the flat side must read only the stale row:\n{plan}"
     );
 }

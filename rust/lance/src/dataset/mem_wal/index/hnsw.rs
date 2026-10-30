@@ -874,6 +874,27 @@ mod tests {
             .install(insert)
     }
 
+    #[test]
+    fn test_index_rejects_unallocatable_m_at_insert_boundary() {
+        let m = usize::MAX / 2;
+        let index = HnswMemIndex::with_capacity(
+            1,
+            "vector".to_string(),
+            DistanceType::L2,
+            HnswBuildParams::default().num_edges(m).ef_construction(m),
+            1,
+            1,
+        );
+
+        let error = index.insert(&make_batch(0, 1, 8), 0).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains("neighbor_capacity"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(index.len(), 0);
+    }
+
     fn make_batch(start_id: i32, n: usize, dim: usize) -> RecordBatch {
         let ids: Vec<i32> = (start_id..start_id + n as i32).collect();
         let mut flat: Vec<f32> = Vec::with_capacity(n * dim);

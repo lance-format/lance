@@ -30,7 +30,10 @@ use geoarrow_array::builder::RectBuilder;
 use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor, IntoArrow};
 use geoarrow_schema::{Dimension, RectType};
 use lance_arrow::RecordBatchExt;
-use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache, WeakLanceCache};
+use lance_core::cache::{
+    CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
+    KeyBuilder, LanceCache, WeakLanceCache,
+};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
@@ -276,6 +279,21 @@ impl DeepSizeOf for RTreeCacheValue {
     }
 }
 
+impl CacheCodecImpl for RTreeCacheValue {
+    const TYPE_ID: &'static str = "lance.scalar.RTreeCacheValue";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, writer: &mut CacheEntryWriter<'_>) -> Result<()> {
+        // Preserve the GeoArrow field metadata on pages and the binary bitmap
+        // column on the null entry using the same Arrow IPC representation.
+        writer.write_ipc(&self.0)
+    }
+
+    fn deserialize(reader: &mut CacheEntryReader<'_>) -> Result<Self> {
+        Ok(Self(Arc::new(reader.read_ipc()?)))
+    }
+}
+
 impl CacheKey for RTreeCacheKey {
     type ValueType = RTreeCacheValue;
 
@@ -288,6 +306,10 @@ impl CacheKey for RTreeCacheKey {
 
     fn type_name() -> &'static str {
         "RTree"
+    }
+
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<RTreeCacheValue>())
     }
 
     fn schema() -> CacheKeySchema {
@@ -334,20 +356,7 @@ impl RTreeIndex {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
-        let pages_reader = store.open_index_file(RTREE_PAGES_NAME).await?;
-        let metadata = RTreeMetadata::from(&pages_reader.schema().metadata);
-        validate_stored_page_size(metadata.page_size, metadata.num_items)?;
-        let nulls_reader = store.open_index_file(RTREE_NULLS_NAME).await?;
-
-        Ok(Arc::new(Self {
-            metadata: Arc::new(metadata),
-            store,
-            frag_reuse_index,
-            batch_remapper: None,
-            index_cache: WeakLanceCache::from(index_cache),
-            pages_reader,
-            nulls_reader,
-        }))
+        Self::load_inner(store, frag_reuse_index, None, index_cache).await
     }
 
     /// Additive sibling of [`Self::load`] for mappings that require
@@ -358,6 +367,19 @@ impl RTreeIndex {
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         lance_index_core::remapping::check_batch_remapping_entry()?;
+        Self::load_inner(store, None, remapping, index_cache).await
+    }
+
+    async fn load_inner(
+        store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        debug_assert!(
+            frag_reuse_index.is_none() || batch_remapper.is_none(),
+            "RTree legacy and batch remappers are mutually exclusive"
+        );
         let pages_reader = store.open_index_file(RTREE_PAGES_NAME).await?;
         let metadata = RTreeMetadata::from(&pages_reader.schema().metadata);
         validate_stored_page_size(metadata.page_size, metadata.num_items)?;
@@ -366,8 +388,8 @@ impl RTreeIndex {
         Ok(Arc::new(Self {
             metadata: Arc::new(metadata),
             store,
-            frag_reuse_index: None,
-            batch_remapper: remapping,
+            frag_reuse_index,
+            batch_remapper,
             index_cache: WeakLanceCache::from(index_cache),
             pages_reader,
             nulls_reader,
@@ -474,18 +496,24 @@ impl RTreeIndex {
         Ok(null_map)
     }
 
+    async fn remap_row_addrs(&self, row_addrs: RowAddrTreeMap) -> Result<RowAddrTreeMap> {
+        if let Some(remapper) = &self.frag_reuse_index {
+            Ok(remapper.remap_row_addrs_tree_map(&row_addrs))
+        } else if let Some(remapper) = &self.batch_remapper {
+            remap_row_addrs_tree_map_async(remapper.as_ref(), &row_addrs).await
+        } else {
+            Ok(row_addrs)
+        }
+    }
+
     /// Prepare old entries in the current row-ID domain before filtering either
     /// representation. New input must bypass this helper, even when it reuses old IDs.
     async fn retained_data(
         &self,
         old_data_filter: Option<&OldIndexDataFilter>,
     ) -> Result<(SendableRecordBatchStream, RowAddrTreeMap)> {
-        let mut null_map = self.search_null(&NoOpMetricsCollector).await?;
-        if let Some(remapper) = &self.frag_reuse_index {
-            null_map = remapper.remap_row_addrs_tree_map(&null_map);
-        } else if let Some(remapper) = &self.batch_remapper {
-            null_map = remap_row_addrs_tree_map_async(remapper.as_ref(), &null_map).await?;
-        }
+        let null_map = self.search_null(&NoOpMetricsCollector).await?;
+        let mut null_map = self.remap_row_addrs(null_map).await?;
         if let Some(filter) = old_data_filter {
             filter.retain_old_rows(&mut null_map);
         }
@@ -760,32 +788,17 @@ impl ScalarIndex for RTreeIndex {
                 let geo_array =
                     extract_bounding_boxes(query.value.to_array()?.as_ref(), &query.field)?;
                 let bbox = total_bounds(&geo_array)?;
-                let mut rowids = self.search_bbox(bbox, metrics).await?;
-                let mut null_map = self.search_null(metrics).await?;
-
-                if let Some(fri) = &self.frag_reuse_index {
-                    // Legacy synchronous remapping path.
-                    rowids = fri.remap_row_addrs_tree_map(&rowids);
-                    null_map = fri.remap_row_addrs_tree_map(&null_map);
-                } else if let Some(remapper) = &self.batch_remapper {
-                    // Tagged asynchronous path.
-                    rowids = remap_row_addrs_tree_map_async(remapper.as_ref(), &rowids).await?;
-                    null_map = remap_row_addrs_tree_map_async(remapper.as_ref(), &null_map).await?;
-                }
+                let rowids = self.search_bbox(bbox, metrics).await?;
+                let null_map = self.search_null(metrics).await?;
+                let rowids = self.remap_row_addrs(rowids).await?;
+                let null_map = self.remap_row_addrs(null_map).await?;
                 Ok(SearchResult::AtMost(NullableRowAddrSet::new(
                     rowids, null_map,
                 )))
             }
             GeoQuery::IsNull => {
-                let mut null_map = self.search_null(metrics).await?;
-
-                if let Some(fri) = &self.frag_reuse_index {
-                    // Legacy synchronous remapping path.
-                    null_map = fri.remap_row_addrs_tree_map(&null_map);
-                } else if let Some(remapper) = &self.batch_remapper {
-                    // Tagged asynchronous path.
-                    null_map = remap_row_addrs_tree_map_async(remapper.as_ref(), &null_map).await?;
-                }
+                let null_map = self.search_null(metrics).await?;
+                let null_map = self.remap_row_addrs(null_map).await?;
                 Ok(SearchResult::Exact(NullableRowAddrSet::new(
                     null_map,
                     RowAddrTreeMap::default(),
@@ -1306,9 +1319,85 @@ mod tests {
     use geo_types::{LineString, Rect, coord, line_string};
     use geoarrow_array::builder::{LineStringBuilder, PointBuilder, RectBuilder};
     use geoarrow_schema::{Dimension, LineStringType, PointType, RectType};
+    use lance_core::cache::{CacheDecode, CacheEntry, CacheMissReason};
     use lance_core::utils::tempfile::TempObjDir;
     use lance_geo::bbox::is_empty_rect;
     use rand::Rng;
+
+    #[rstest::rstest]
+    #[case::leaf("leaf")]
+    #[case::internal("internal")]
+    #[case::nulls("nulls")]
+    #[case::empty_leaf("empty_leaf")]
+    #[case::empty_nulls("empty_nulls")]
+    fn test_rtree_cache_codec(#[case] kind: &str) {
+        let codec = RTreeCacheKey::codec().expect("RTree entries must support disk caching");
+        let batch = if kind.ends_with("nulls") {
+            let mut bitmap = Vec::new();
+            RowAddrTreeMap::from_iter([7, (2_u64 << 32) | 9])
+                .serialize_into(&mut bitmap)
+                .unwrap();
+            RecordBatch::try_new(
+                RTREE_NULLS_SCHEMA.clone(),
+                vec![Arc::new(BinaryArray::from_vec(vec![bitmap.as_slice()]))],
+            )
+            .unwrap()
+        } else {
+            let mut rects = RectBuilder::new(RectType::new(Dimension::XY, Default::default()));
+            for i in 0..3 {
+                rects.push_rect(Some(&Rect::new(
+                    coord! { x: i as f64, y: -1.0 },
+                    coord! { x: i as f64 + 0.5, y: 1.0 },
+                )));
+            }
+            RecordBatch::try_new(
+                if kind == "internal" {
+                    RTREE_PAGE_SCHEMA.clone()
+                } else {
+                    BBOX_ROWID_SCHEMA.clone()
+                },
+                vec![
+                    rects.finish().to_array_ref(),
+                    Arc::new(UInt64Array::from(vec![0, 7, u64::MAX])),
+                ],
+            )
+            .unwrap()
+            .slice(1, 2)
+        };
+        let batch = if kind.starts_with("empty") {
+            batch.slice(0, 0)
+        } else {
+            batch
+        };
+        let expected = Arc::new(batch);
+        let entry: CacheEntry = Arc::new(RTreeCacheValue(expected.clone()));
+        let dir = TempDir::default();
+        let path = dir.std_path().join("rtree.cache");
+        codec
+            .serialize(&entry, &mut std::fs::File::create(&path).unwrap())
+            .unwrap();
+        drop(entry);
+        let bytes = bytes::Bytes::from(std::fs::read(path).unwrap());
+        let restored = codec.deserialize(&bytes).hit().unwrap();
+        let restored = restored.downcast_ref::<RTreeCacheValue>().unwrap();
+        assert_eq!(restored.0, expected);
+        if !kind.ends_with("nulls") {
+            let boxes =
+                extract_bounding_boxes(restored.0.column(0).as_ref(), restored.0.schema().field(0))
+                    .unwrap();
+            assert_eq!(boxes.len(), expected.num_rows());
+        }
+        // The complete envelope ends at byte 39; the IPC section starts at byte 64.
+        for len in (39..=64).chain(std::iter::once(bytes.len() / 2)) {
+            assert!(
+                matches!(
+                    codec.deserialize(&bytes.slice(..len)),
+                    CacheDecode::Miss(CacheMissReason::BodyError)
+                ),
+                "truncated {kind} entry with {len} bytes must be a cache miss"
+            );
+        }
+    }
 
     fn expected_num_pages(num_items: usize, page_size: u32) -> u64 {
         RTreeMetadata::calculate_page_offsets(num_items, page_size).len() as u64

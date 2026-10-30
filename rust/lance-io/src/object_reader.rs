@@ -476,9 +476,10 @@ impl Reader for SmallReader {
                 return Err(object_store::Error::Generic {
                     store: "memory",
                     source: format!(
-                        "Invalid range {}..{} for object of size {} bytes",
+                        "Invalid range {}..{} for object '{}' of size {} bytes",
                         start,
                         end,
+                        inner.path,
                         bytes.len()
                     )
                     .into(),
