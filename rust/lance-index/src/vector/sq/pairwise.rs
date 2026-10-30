@@ -20,6 +20,7 @@ use arrow_array::{
     types::{Float64Type, UInt8Type, UInt64Type},
 };
 use arrow_schema::{DataType, Field};
+use lance_core::utils::cpu::Kernel;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, dot_u8::dot_u8_u64, l2_u8::l2_u8_u64};
 
@@ -164,7 +165,6 @@ impl PairScorer for SQPairScorer {
                 } else {
                     &[]
                 },
-                #[cfg(target_arch = "x86_64")]
                 squares: if !is_dot && self.batched {
                     column_values::<UInt64Type>(batch, CODE_SQUARES_COLUMN)?
                 } else {
@@ -190,20 +190,95 @@ impl PairScorer for SQPairScorer {
             scorer: self,
             anchor: rows(anchor)?,
             candidates: rows(candidates)?,
-            batched: self.batched,
+            l2: if self.batched {
+                SQ_L2.get()
+            } else {
+                SQ_L2.fallback()
+            },
+            dot: if self.batched {
+                SQ_DOT.get()
+            } else {
+                SQ_DOT.fallback()
+            },
         })
     }
 }
 
+/// Squared L2 times `scale` of the anchor against every candidate row,
+/// given the anchor's `Σ code²` and the candidates' staged `Σ code` and
+/// `Σ code²`, which only the batched kernels read.
+type L2Fn = unsafe fn(
+    anchor: &[u8],
+    anchor_squares: u64,
+    codes: &[u8],
+    sums: &[u64],
+    squares: &[u64],
+    scale: f32,
+    out: &mut [f32],
+);
+/// Dot distances of the anchor against every candidate row.
+type DotFn =
+    unsafe fn(anchor: &[u8], codes: &[u8], sums: &[u64], terms: &DotTerms, out: &mut [f32]);
+
+// Every candidate but the portable last one is batched: it needs the staged
+// code statistics and `dim <= MAX_BATCHED_DIM`.
+lance_core::dispatch! {
+    static SQ_L2: Dispatch<L2Fn> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[x86::L2_AVX512_VNNI, L2_PORTABLE]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[L2_PORTABLE]
+        }
+    };
+}
+
+lance_core::dispatch! {
+    static SQ_DOT: Dispatch<DotFn> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[x86::DOT_AVX512_VNNI, DOT_PORTABLE]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[DOT_PORTABLE]
+        }
+    };
+}
+
 /// Whether this host runs the batched SIMD kernels at dimension `dim`.
 fn batched_kernels_available(dim: usize) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    let has_vnni = std::arch::is_x86_feature_detected!("avx512f")
-        && std::arch::is_x86_feature_detected!("avx512bw")
-        && std::arch::is_x86_feature_detected!("avx512vnni");
-    #[cfg(not(target_arch = "x86_64"))]
-    let has_vnni = false;
-    dim <= MAX_BATCHED_DIM && has_vnni
+    dim <= MAX_BATCHED_DIM && !SQ_L2.selected().features().is_empty()
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(L2_PORTABLE: L2Fn)]
+    fn l2_portable(
+        anchor: &[u8],
+        _anchor_squares: u64,
+        codes: &[u8],
+        _sums: &[u64],
+        _squares: &[u64],
+        scale: f32,
+        out: &mut [f32],
+    ) {
+        for (out, b) in out.iter_mut().zip(codes.chunks_exact(anchor.len())) {
+            *out = l2_u8_u64(b, anchor) as f32 * scale;
+        }
+    }
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(DOT_PORTABLE: DotFn)]
+    fn dot_portable(anchor: &[u8], codes: &[u8], sums: &[u64], terms: &DotTerms, out: &mut [f32]) {
+        for ((out, b), &b_sum) in out.iter_mut().zip(codes.chunks_exact(anchor.len())).zip(sums) {
+            *out = terms.distance(dot_u8_u64(b, anchor), b_sum);
+        }
+    }
 }
 
 /// One staged batch's rows as raw slices.
@@ -213,7 +288,6 @@ struct StagedRows<'a> {
     /// For dot or the batched kernels; empty otherwise.
     sums: &'a [u64],
     /// For the batched l2 and cosine kernels; empty otherwise.
-    #[cfg(target_arch = "x86_64")]
     squares: &'a [u64],
     /// Cosine only.
     norms: &'a [f64],
@@ -244,9 +318,10 @@ pub struct SQKernel<'a> {
     scorer: &'a SQPairScorer,
     anchor: StagedRows<'a>,
     candidates: StagedRows<'a>,
-    /// Whether the batched SIMD kernels apply, from the scorer; tests clear
-    /// it to compare against the portable kernels.
-    batched: bool,
+    /// The batched kernels when the scorer staged their statistics, else
+    /// the portable ones.
+    l2: Kernel<L2Fn>,
+    dot: Kernel<DotFn>,
 }
 
 impl PairKernel for SQKernel<'_> {
@@ -265,38 +340,27 @@ impl PairKernel for SQKernel<'_> {
                 distance_scale: scorer.distance_scale,
                 anchor_sum: self.anchor.sums[anchor_row] as f32,
             };
-            #[cfg(target_arch = "x86_64")]
-            if self.batched {
-                // SAFETY: `batched` is set only when AVX-512 VNNI was detected
-                // and `dim <= MAX_BATCHED_DIM`.
-                unsafe { x86::dot_distances(a, codes, sums, &terms, out) };
-                return;
-            }
-            for ((out, b), &b_sum) in out.iter_mut().zip(codes.chunks_exact(dim)).zip(sums) {
-                *out = terms.distance(dot_u8_u64(b, a), b_sum);
-            }
+            self.dot.call(a, codes, sums, &terms, out);
             return;
         }
-        #[cfg(target_arch = "x86_64")]
-        if self.batched {
-            // SAFETY: as for dot.
-            unsafe {
-                x86::l2_distances(
-                    a,
-                    self.anchor.squares[anchor_row],
-                    codes,
-                    &self.candidates.sums[candidates.clone()],
-                    &self.candidates.squares[candidates.clone()],
-                    scorer.distance_scale,
-                    out,
-                )
-            };
-        }
-        if !self.batched {
-            for (out, b) in out.iter_mut().zip(codes.chunks_exact(dim)) {
-                *out = l2_u8_u64(b, a) as f32 * scorer.distance_scale;
-            }
-        }
+        // Without the batched kernels these statistics are not staged, and
+        // the portable kernel ignores them.
+        let anchor_squares = self.anchor.squares.get(anchor_row).copied();
+        self.l2.call(
+            a,
+            anchor_squares.unwrap_or_default(),
+            codes,
+            self.candidates
+                .sums
+                .get(candidates.clone())
+                .unwrap_or_default(),
+            self.candidates
+                .squares
+                .get(candidates.clone())
+                .unwrap_or_default(),
+            scorer.distance_scale,
+            out,
+        );
         if scorer.metric == DistanceType::Cosine {
             l2_to_cosine(
                 out,
@@ -322,7 +386,7 @@ mod x86 {
 
     use std::arch::x86_64::*;
 
-    use super::{DotTerms, MAX_BATCHED_DIM};
+    use super::{DotFn, DotTerms, L2Fn, MAX_BATCHED_DIM};
 
     const ROWS: usize = 8;
 
@@ -444,96 +508,96 @@ mod x86 {
         dim
     }
 
-    /// Squared L2 times `scale` of the anchor against every candidate row.
-    ///
-    /// # Safety
-    /// The CPU supports AVX-512F, AVX-512BW and AVX-512 VNNI.
-    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
-    pub(super) unsafe fn l2_distances(
-        anchor: &[u8],
-        anchor_squares: u64,
-        codes: &[u8],
-        sums: &[u64],
-        squares: &[u64],
-        scale: f32,
-        out: &mut [f32],
-    ) {
-        let dim = check_shapes(anchor, codes, sums, out);
-        assert_eq!(squares.len(), sums.len());
-        let num_rows = sums.len();
-        if num_rows < ROWS {
-            for (i, out) in out.iter_mut().enumerate() {
-                // SAFETY: row `i` is in bounds.
-                let row = unsafe { codes.as_ptr().add(i * dim) };
-                let dot = unsafe { dot(anchor.as_ptr(), row, dim, sums[i]) };
-                *out = (anchor_squares + squares[i] - 2 * dot) as f32 * scale;
+    lance_core::target_kernel! {
+        #[target_features("avx512f", "avx512bw", "avx512vnni")]
+        #[candidate(pub(super) L2_AVX512_VNNI: L2Fn)]
+        /// Squared L2 times `scale` of the anchor against every candidate row.
+        fn l2_distances(
+            anchor: &[u8],
+            anchor_squares: u64,
+            codes: &[u8],
+            sums: &[u64],
+            squares: &[u64],
+            scale: f32,
+            out: &mut [f32],
+        ) {
+            let dim = check_shapes(anchor, codes, sums, out);
+            assert_eq!(squares.len(), sums.len());
+            let num_rows = sums.len();
+            if num_rows < ROWS {
+                for (i, out) in out.iter_mut().enumerate() {
+                    // SAFETY: row `i` is in bounds.
+                    let row = unsafe { codes.as_ptr().add(i * dim) };
+                    let dot = unsafe { dot(anchor.as_ptr(), row, dim, sums[i]) };
+                    *out = (anchor_squares + squares[i] - 2 * dot) as f32 * scale;
+                }
+                return;
             }
-            return;
-        }
-        let anchor_squares = _mm256_set1_epi32(anchor_squares as i32);
-        let scale = _mm256_set1_ps(scale);
-        for i in groups(num_rows) {
-            // SAFETY: rows `i..i + ROWS` are in bounds of every slice.
-            unsafe {
-                let dots = biased_dots(anchor.as_ptr(), codes.as_ptr().add(i * dim), dim);
-                let sums = load_low32(sums.as_ptr().add(i));
-                let squares = load_low32(squares.as_ptr().add(i));
-                // Σa² + Σb² − 2(D + 128·Sb), wrapping.
-                let l2 = _mm256_sub_epi32(
-                    _mm256_sub_epi32(
-                        _mm256_add_epi32(anchor_squares, squares),
-                        _mm256_slli_epi32::<1>(dots),
-                    ),
-                    _mm256_slli_epi32::<8>(sums),
-                );
-                let distances = _mm256_mul_ps(_mm256_cvtepi32_ps(l2), scale);
-                _mm256_storeu_ps(out.as_mut_ptr().add(i), distances);
+            let anchor_squares = _mm256_set1_epi32(anchor_squares as i32);
+            let scale = _mm256_set1_ps(scale);
+            for i in groups(num_rows) {
+                // SAFETY: rows `i..i + ROWS` are in bounds of every slice.
+                unsafe {
+                    let dots = biased_dots(anchor.as_ptr(), codes.as_ptr().add(i * dim), dim);
+                    let sums = load_low32(sums.as_ptr().add(i));
+                    let squares = load_low32(squares.as_ptr().add(i));
+                    // Σa² + Σb² − 2(D + 128·Sb), wrapping.
+                    let l2 = _mm256_sub_epi32(
+                        _mm256_sub_epi32(
+                            _mm256_add_epi32(anchor_squares, squares),
+                            _mm256_slli_epi32::<1>(dots),
+                        ),
+                        _mm256_slli_epi32::<8>(sums),
+                    );
+                    let distances = _mm256_mul_ps(_mm256_cvtepi32_ps(l2), scale);
+                    _mm256_storeu_ps(out.as_mut_ptr().add(i), distances);
+                }
             }
         }
     }
 
-    /// Dot distances of the anchor against every candidate row.
-    ///
-    /// # Safety
-    /// The CPU supports AVX-512F, AVX-512BW and AVX-512 VNNI.
-    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
-    pub(super) unsafe fn dot_distances(
-        anchor: &[u8],
-        codes: &[u8],
-        sums: &[u64],
-        terms: &DotTerms,
-        out: &mut [f32],
-    ) {
-        let dim = check_shapes(anchor, codes, sums, out);
-        let num_rows = sums.len();
-        if num_rows < ROWS {
-            for (i, out) in out.iter_mut().enumerate() {
-                // SAFETY: row `i` is in bounds.
-                let row = unsafe { codes.as_ptr().add(i * dim) };
-                let dot = unsafe { dot(anchor.as_ptr(), row, dim, sums[i]) };
-                *out = terms.distance(dot, sums[i]);
+    lance_core::target_kernel! {
+        #[target_features("avx512f", "avx512bw", "avx512vnni")]
+        #[candidate(pub(super) DOT_AVX512_VNNI: DotFn)]
+        /// Dot distances of the anchor against every candidate row.
+        fn dot_distances(
+            anchor: &[u8],
+            codes: &[u8],
+            sums: &[u64],
+            terms: &DotTerms,
+            out: &mut [f32],
+        ) {
+            let dim = check_shapes(anchor, codes, sums, out);
+            let num_rows = sums.len();
+            if num_rows < ROWS {
+                for (i, out) in out.iter_mut().enumerate() {
+                    // SAFETY: row `i` is in bounds.
+                    let row = unsafe { codes.as_ptr().add(i * dim) };
+                    let dot = unsafe { dot(anchor.as_ptr(), row, dim, sums[i]) };
+                    *out = terms.distance(dot, sums[i]);
+                }
+                return;
             }
-            return;
-        }
-        let one = _mm256_set1_ps(1.0);
-        let constant = _mm256_set1_ps(terms.constant);
-        let lower_scale = _mm256_set1_ps(terms.lower_scale);
-        let distance_scale = _mm256_set1_ps(terms.distance_scale);
-        let anchor_sum = _mm256_set1_ps(terms.anchor_sum);
-        for i in groups(num_rows) {
-            // SAFETY: rows `i..i + ROWS` are in bounds of every slice.
-            unsafe {
-                let dots = biased_dots(anchor.as_ptr(), codes.as_ptr().add(i * dim), dim);
-                let sums = load_low32(sums.as_ptr().add(i));
-                let dot = _mm256_add_epi32(dots, _mm256_slli_epi32::<7>(sums));
-                // Separate multiplies and adds in `DotTerms::distance` order.
-                let sum_term = _mm256_mul_ps(
-                    lower_scale,
-                    _mm256_add_ps(_mm256_cvtepi32_ps(sums), anchor_sum),
-                );
-                let code_term = _mm256_mul_ps(distance_scale, _mm256_cvtepi32_ps(dot));
-                let dot = _mm256_add_ps(_mm256_add_ps(constant, sum_term), code_term);
-                _mm256_storeu_ps(out.as_mut_ptr().add(i), _mm256_sub_ps(one, dot));
+            let one = _mm256_set1_ps(1.0);
+            let constant = _mm256_set1_ps(terms.constant);
+            let lower_scale = _mm256_set1_ps(terms.lower_scale);
+            let distance_scale = _mm256_set1_ps(terms.distance_scale);
+            let anchor_sum = _mm256_set1_ps(terms.anchor_sum);
+            for i in groups(num_rows) {
+                // SAFETY: rows `i..i + ROWS` are in bounds of every slice.
+                unsafe {
+                    let dots = biased_dots(anchor.as_ptr(), codes.as_ptr().add(i * dim), dim);
+                    let sums = load_low32(sums.as_ptr().add(i));
+                    let dot = _mm256_add_epi32(dots, _mm256_slli_epi32::<7>(sums));
+                    // Separate multiplies and adds in `DotTerms::distance` order.
+                    let sum_term = _mm256_mul_ps(
+                        lower_scale,
+                        _mm256_add_ps(_mm256_cvtepi32_ps(sums), anchor_sum),
+                    );
+                    let code_term = _mm256_mul_ps(distance_scale, _mm256_cvtepi32_ps(dot));
+                    let dot = _mm256_add_ps(_mm256_add_ps(constant, sum_term), code_term);
+                    _mm256_storeu_ps(out.as_mut_ptr().add(i), _mm256_sub_ps(one, dot));
+                }
             }
         }
     }
@@ -585,23 +649,33 @@ mod tests {
         .unwrap()
     }
 
-    /// Distances from the batched kernel (where the CPU supports it) and from
-    /// the portable per-pair kernel, which must agree bit for bit.
+    /// Distances from the dispatched kernels. Every host-supported candidate
+    /// must agree bit for bit with the portable one.
     fn distances(kernel: &SQKernel, anchor: usize, candidates: Range<usize>) -> Vec<f32> {
-        let mut out = vec![f32::NAN; candidates.len()];
-        kernel.distances(anchor, candidates.clone(), &mut out);
-        let portable = SQKernel {
-            batched: false,
-            ..*kernel
+        let run = |kernel: &SQKernel| {
+            let mut out = vec![f32::NAN; candidates.len()];
+            kernel.distances(anchor, candidates.clone(), &mut out);
+            out.iter().map(|d| d.to_bits()).collect::<Vec<_>>()
         };
-        let mut expected = vec![f32::NAN; candidates.len()];
-        portable.distances(anchor, candidates, &mut expected);
-        assert_eq!(
-            out.iter().map(|d| d.to_bits()).collect::<Vec<_>>(),
-            expected.iter().map(|d| d.to_bits()).collect::<Vec<_>>(),
-            "batched and portable kernels disagree"
-        );
-        out
+        let expected = run(&SQKernel {
+            l2: SQ_L2.fallback(),
+            dot: SQ_DOT.fallback(),
+            ..*kernel
+        });
+        for (l2, dot) in SQ_L2.candidates().iter().zip(SQ_DOT.candidates()) {
+            let (Some(l2_kernel), Some(dot_kernel)) = (l2.kernel(), dot.kernel()) else {
+                continue;
+            };
+            let actual = run(&SQKernel {
+                l2: l2_kernel,
+                dot: dot_kernel,
+                ..*kernel
+            });
+            assert_eq!(actual, expected, "{} / {}", l2.name(), dot.name());
+        }
+        let out = run(kernel);
+        assert_eq!(out, expected, "dispatched");
+        out.into_iter().map(f32::from_bits).collect()
     }
 
     // Dimensions cover a tail-only row, whole 64-byte blocks, and blocks plus

@@ -425,12 +425,10 @@ fn centered_fits_i32(dim: usize, bits: u8) -> bool {
 /// The best kernel of `dispatch`, or with `simd = false` its portable one.
 fn select<F: Copy>(dispatch: &Dispatch<F>, simd: bool) -> Kernel<F> {
     if simd {
-        return dispatch.get();
+        dispatch.get()
+    } else {
+        dispatch.fallback()
     }
-    let portable = dispatch.candidates().last();
-    portable
-        .and_then(|candidate| candidate.kernel())
-        .expect("the last candidate needs no CPU features")
 }
 
 lance_core::target_kernel! {
