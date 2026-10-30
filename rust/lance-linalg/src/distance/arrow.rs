@@ -11,8 +11,8 @@ use lance_arrow::FixedSizeListArrayExt;
 use num_traits::AsPrimitive;
 
 use super::{
-    Cosine, DistanceFunc, DistanceType, Dot, L2, Normalize, dot_distance_batch_into, hamming,
-    l2_distance_batch_into, norm_l2,
+    Cosine, DistanceFunc, DistanceType, Dot, L2, Normalize, cosine_distance_batch_into,
+    dot_distance_batch_into, hamming, l2_distance_batch_into, norm_l2,
 };
 use crate::Result;
 
@@ -79,12 +79,12 @@ impl Operation<'_> {
     {
         match self {
             Self::Batch(metric) => {
-                if metric == DistanceType::Cosine {
-                    return Ok(T::cosine_batch(query, values, dim).collect());
-                }
                 let mut distances = vec![0.0; values.len() / dim];
                 match metric {
                     DistanceType::L2 => l2_distance_batch_into(query, values, dim, &mut distances),
+                    DistanceType::Cosine => {
+                        cosine_distance_batch_into(query, values, dim, &mut distances)
+                    }
                     DistanceType::Dot => {
                         dot_distance_batch_into(query, values, dim, &mut distances)
                     }

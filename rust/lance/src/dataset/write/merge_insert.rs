@@ -690,6 +690,8 @@ struct MergeInsertParams {
     retry_timeout: Duration,
     // MemWAL SSTables to mark as compacted when this commit succeeds.
     compacted_sstables: Vec<CompactedSsTable>,
+    // The `dir_id` of the MemWAL `compacted_sstables` belongs to.
+    mem_wal_dir_id: Option<String>,
     // If true, skip auto cleanup during commits. This should be set to true
     // for high frequency writes to improve performance. This is also useful
     // if the writer does not have delete permissions and the clean up would
@@ -957,6 +959,7 @@ impl MergeInsertBuilder {
                 spill_for_retry: true,
                 retry_timeout: Duration::from_secs(30),
                 compacted_sstables: Vec::new(),
+                mem_wal_dir_id: None,
                 skip_auto_cleanup: false,
                 use_index: true,
                 write_mode: MergeInsertWriteMode::default(),
@@ -1106,7 +1109,16 @@ impl MergeInsertBuilder {
     /// so it cannot enforce this: if a delete pass carried the marker and the
     /// process then died before the matching upsert, the recorded generation
     /// would claim rows were copied in that never were.
-    pub fn mark_sstables_as_compacted(&mut self, sstables: Vec<CompactedSsTable>) -> &mut Self {
+    ///
+    /// `dir_id` names the MemWAL the SSTables belong to; the commit fails with
+    /// [`Error::StaleMemWal`] if it was since disabled or replaced. Pass an
+    /// empty `sstables` on passes that record no progress so they are checked too.
+    pub fn mark_sstables_as_compacted(
+        &mut self,
+        dir_id: impl Into<String>,
+        sstables: Vec<CompactedSsTable>,
+    ) -> &mut Self {
+        self.params.mem_wal_dir_id = Some(dir_id.into());
         self.params.compacted_sstables.extend(sstables);
         self
     }
@@ -3565,6 +3577,8 @@ impl MergeInsertJob {
             ))
     }
 
+    /// Build the uncommitted merge-insert transaction, using the v2 plan when
+    /// it supports the source and the legacy path otherwise.
     async fn execute_uncommitted_impl(
         self,
         provider: Arc<dyn TableProvider>,
@@ -3699,6 +3713,7 @@ impl MergeInsertJob {
                 new_fragments: vec![],
                 fields_modified: vec![],
                 compacted_sstables: self.params.compacted_sstables.clone(),
+                mem_wal_dir_id: self.params.mem_wal_dir_id.clone(),
                 fields_for_preserving_frag_bitmap: full_schema
                     .fields_pre_order()
                     .map(|f| f.id as u32)
@@ -3749,6 +3764,7 @@ impl MergeInsertJob {
                 new_fragments,
                 fields_modified,
                 compacted_sstables: self.params.compacted_sstables.clone(),
+                mem_wal_dir_id: self.params.mem_wal_dir_id.clone(),
                 fields_for_preserving_frag_bitmap: vec![], // in-place update do not affect preserving frag bitmap
                 update_mode: Some(RewriteColumns),
                 inserted_rows_filter: None, // not implemented for v1
@@ -3860,6 +3876,7 @@ impl MergeInsertJob {
                 // modify any field values.
                 fields_modified: vec![],
                 compacted_sstables: self.params.compacted_sstables.clone(),
+                mem_wal_dir_id: self.params.mem_wal_dir_id.clone(),
                 fields_for_preserving_frag_bitmap: full_schema
                     .fields_pre_order()
                     .map(|f| f.id as u32)
@@ -5708,13 +5725,15 @@ mod tests {
             .unwrap()
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
             new_batch.clone(),
             job,
             &[1, 2, 3, 4, 5, 6],
             &[7, 8, 9],
             &[3, 0, 0],
-        )
+        ))
         .await;
 
         // upsert, no delete
@@ -5723,13 +5742,15 @@ mod tests {
             .when_matched(WhenMatched::UpdateAll)
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
             new_batch.clone(),
             job,
             &[1, 2, 3],
             &[4, 5, 6, 7, 8, 9],
             &[3, 3, 0],
-        )
+        ))
         .await;
 
         // conditional upsert, no delete
@@ -5740,13 +5761,15 @@ mod tests {
             )
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
             new_batch.clone(),
             job,
             &[1, 2, 3, 4, 5],
             &[6, 7, 8, 9],
             &[3, 1, 0],
-        )
+        ))
         .await;
 
         // conditional update, no matches
@@ -5756,8 +5779,16 @@ mod tests {
             .when_matched(WhenMatched::update_if(&ds, "target.filterme = 'z'").unwrap())
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(new_batch.clone(), job, &[1, 2, 3, 4, 5, 6], &[], &[0, 0, 0])
-            .await;
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[1, 2, 3, 4, 5, 6],
+            &[],
+            &[0, 0, 0],
+        ))
+        .await;
 
         // update only, no delete (useful for bulk update)
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -5766,8 +5797,16 @@ mod tests {
             .when_not_matched(WhenNotMatched::DoNothing)
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(new_batch.clone(), job, &[1, 2, 3], &[4, 5, 6], &[0, 3, 0])
-            .await;
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[1, 2, 3],
+            &[4, 5, 6],
+            &[0, 3, 0],
+        ))
+        .await;
 
         // Conditional update
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -5778,8 +5817,16 @@ mod tests {
             .when_not_matched(WhenNotMatched::DoNothing)
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(new_batch.clone(), job, &[1, 2, 3, 6], &[4, 5], &[0, 2, 0])
-            .await;
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[1, 2, 3, 6],
+            &[4, 5],
+            &[0, 2, 0],
+        ))
+        .await;
 
         // No-op (will raise an error)
         assert!(
@@ -5796,8 +5843,16 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(new_batch.clone(), job, &[4, 5, 6], &[7, 8, 9], &[3, 0, 3])
-            .await;
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[4, 5, 6],
+            &[7, 8, 9],
+            &[3, 0, 3],
+        ))
+        .await;
 
         // upsert, with delete all
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -5806,8 +5861,16 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(new_batch.clone(), job, &[], &[4, 5, 6, 7, 8, 9], &[3, 3, 3])
-            .await;
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[],
+            &[4, 5, 6, 7, 8, 9],
+            &[3, 3, 3],
+        ))
+        .await;
 
         // conditional upsert, with delete all
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -5818,8 +5881,16 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(new_batch.clone(), job, &[4, 5], &[6, 7, 8, 9], &[3, 1, 3])
-            .await;
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[4, 5],
+            &[6, 7, 8, 9],
+            &[3, 1, 3],
+        ))
+        .await;
 
         // update only, with delete all (unusual)
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -5829,7 +5900,16 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(new_batch.clone(), job, &[], &[4, 5, 6], &[0, 3, 3]).await;
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[],
+            &[4, 5, 6],
+            &[0, 3, 3],
+        ))
+        .await;
 
         // just delete all (not real case, just use delete)
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -5838,7 +5918,16 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(new_batch.clone(), job, &[4, 5, 6], &[], &[0, 0, 3]).await;
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[4, 5, 6],
+            &[],
+            &[0, 0, 3],
+        ))
+        .await;
 
         // For the "delete some" tests we use key > 1
         let condition = create_delete_condition();
@@ -5848,13 +5937,15 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
             new_batch.clone(),
             job,
             &[1, 4, 5, 6],
             &[7, 8, 9],
             &[3, 0, 2],
-        )
+        ))
         .await;
 
         // upsert, with delete some
@@ -5864,13 +5955,15 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
             new_batch.clone(),
             job,
             &[1],
             &[4, 5, 6, 7, 8, 9],
             &[3, 3, 2],
-        )
+        ))
         .await;
 
         // conditional upsert, with delete some
@@ -5882,13 +5975,15 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
             new_batch.clone(),
             job,
             &[1, 4, 5],
             &[6, 7, 8, 9],
             &[3, 1, 2],
-        )
+        ))
         .await;
 
         // update only, witxh delete some (unusual)
@@ -5899,7 +5994,16 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(new_batch.clone(), job, &[1], &[4, 5, 6], &[0, 3, 2]).await;
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[1],
+            &[4, 5, 6],
+            &[0, 3, 2],
+        ))
+        .await;
 
         // just delete some (not real case, just use delete)
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -5908,7 +6012,16 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(new_batch.clone(), job, &[1, 4, 5, 6], &[], &[0, 0, 2]).await;
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[1, 4, 5, 6],
+            &[],
+            &[0, 0, 2],
+        ))
+        .await;
     }
 
     #[rstest::rstest]
@@ -5917,23 +6030,27 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
     ) {
-        MergeInsertTestBuilder::new()
-            .with_version(version)
-            .with_stable_row_ids(enable_stable_row_ids)
-            .with_test_keys(&[4, 5, 6])
-            .with_expected_left_keys(&[])
-            .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
-            .with_expected_stats(&[3, 3, 3])
-            .with_job_builder(|ds| {
-                MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
-                    .unwrap()
-                    .when_matched(WhenMatched::UpdateAll)
-                    .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
-                    .try_build()
-                    .unwrap()
-            })
-            .run_test()
-            .await;
+        // Boxed: the builder holds several `Fragment`s, which puts the
+        // future over the `large_futures` threshold.
+        Box::pin(
+            MergeInsertTestBuilder::new()
+                .with_version(version)
+                .with_stable_row_ids(enable_stable_row_ids)
+                .with_test_keys(&[4, 5, 6])
+                .with_expected_left_keys(&[])
+                .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
+                .with_expected_stats(&[3, 3, 3])
+                .with_job_builder(|ds| {
+                    MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
+                        .unwrap()
+                        .when_matched(WhenMatched::UpdateAll)
+                        .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+                        .try_build()
+                        .unwrap()
+                })
+                .run_test(),
+        )
+        .await;
     }
 
     #[rstest::rstest]
@@ -5942,22 +6059,26 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
     ) {
-        MergeInsertTestBuilder::new()
-            .with_version(version)
-            .with_stable_row_ids(enable_stable_row_ids)
-            .with_test_keys(&[4, 5, 6])
-            .with_expected_left_keys(&[1, 2, 3])
-            .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
-            .with_expected_stats(&[3, 3, 0])
-            .with_job_builder(|ds| {
-                MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
-                    .unwrap()
-                    .when_matched(WhenMatched::UpdateAll)
-                    .try_build()
-                    .unwrap()
-            })
-            .run_test()
-            .await;
+        // Boxed: the builder holds several `Fragment`s, which puts the
+        // future over the `large_futures` threshold.
+        Box::pin(
+            MergeInsertTestBuilder::new()
+                .with_version(version)
+                .with_stable_row_ids(enable_stable_row_ids)
+                .with_test_keys(&[4, 5, 6])
+                .with_expected_left_keys(&[1, 2, 3])
+                .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
+                .with_expected_stats(&[3, 3, 0])
+                .with_job_builder(|ds| {
+                    MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
+                        .unwrap()
+                        .when_matched(WhenMatched::UpdateAll)
+                        .try_build()
+                        .unwrap()
+                })
+                .run_test(),
+        )
+        .await;
     }
 
     #[rstest::rstest]
@@ -5966,25 +6087,30 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
     ) {
-        MergeInsertTestBuilder::new()
-            .with_version(version)
-            .with_stable_row_ids(enable_stable_row_ids)
-            .with_test_keys(&[6])
-            .with_expected_left_keys(&[1, 2, 3, 4, 5])
-            .with_expected_right_keys(&[6, 7, 8, 9])
-            .with_expected_stats(&[3, 1, 0])
-            .with_job_builder(|ds| {
-                let keys = vec!["key".to_string()];
-                MergeInsertBuilder::try_new(ds.clone(), keys)
-                    .unwrap()
-                    .when_matched(
-                        WhenMatched::update_if(&ds, "source.filterme != target.filterme").unwrap(),
-                    )
-                    .try_build()
-                    .unwrap()
-            })
-            .run_test()
-            .await;
+        // Boxed: the builder holds several `Fragment`s, which puts the
+        // future over the `large_futures` threshold.
+        Box::pin(
+            MergeInsertTestBuilder::new()
+                .with_version(version)
+                .with_stable_row_ids(enable_stable_row_ids)
+                .with_test_keys(&[6])
+                .with_expected_left_keys(&[1, 2, 3, 4, 5])
+                .with_expected_right_keys(&[6, 7, 8, 9])
+                .with_expected_stats(&[3, 1, 0])
+                .with_job_builder(|ds| {
+                    let keys = vec!["key".to_string()];
+                    MergeInsertBuilder::try_new(ds.clone(), keys)
+                        .unwrap()
+                        .when_matched(
+                            WhenMatched::update_if(&ds, "source.filterme != target.filterme")
+                                .unwrap(),
+                        )
+                        .try_build()
+                        .unwrap()
+                })
+                .run_test(),
+        )
+        .await;
     }
 
     #[rstest::rstest]
@@ -5993,24 +6119,28 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
     ) {
-        MergeInsertTestBuilder::new()
-            .with_version(version)
-            .with_stable_row_ids(enable_stable_row_ids)
-            .with_test_keys(&[4, 5, 6])
-            .with_expected_left_keys(&[1, 2, 3])
-            .with_expected_right_keys(&[4, 5, 6])
-            .with_expected_stats(&[0, 3, 0])
-            .with_job_builder(|ds| {
-                let keys = vec!["key".to_string()];
-                MergeInsertBuilder::try_new(ds, keys)
-                    .unwrap()
-                    .when_matched(WhenMatched::UpdateAll)
-                    .when_not_matched(WhenNotMatched::DoNothing)
-                    .try_build()
-                    .unwrap()
-            })
-            .run_test()
-            .await;
+        // Boxed: the builder holds several `Fragment`s, which puts the
+        // future over the `large_futures` threshold.
+        Box::pin(
+            MergeInsertTestBuilder::new()
+                .with_version(version)
+                .with_stable_row_ids(enable_stable_row_ids)
+                .with_test_keys(&[4, 5, 6])
+                .with_expected_left_keys(&[1, 2, 3])
+                .with_expected_right_keys(&[4, 5, 6])
+                .with_expected_stats(&[0, 3, 0])
+                .with_job_builder(|ds| {
+                    let keys = vec!["key".to_string()];
+                    MergeInsertBuilder::try_new(ds, keys)
+                        .unwrap()
+                        .when_matched(WhenMatched::UpdateAll)
+                        .when_not_matched(WhenNotMatched::DoNothing)
+                        .try_build()
+                        .unwrap()
+                })
+                .run_test(),
+        )
+        .await;
     }
 
     #[rstest::rstest]
@@ -6019,25 +6149,29 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
     ) {
-        MergeInsertTestBuilder::new()
-            .with_version(version)
-            .with_stable_row_ids(enable_stable_row_ids)
-            .with_test_keys(&[1, 4, 5, 6])
-            .with_expected_left_keys(&[1])
-            .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
-            .with_expected_stats(&[3, 3, 2])
-            .with_job_builder(|ds| {
-                let keys = vec!["key".to_string()];
-                let condition = create_delete_condition();
-                MergeInsertBuilder::try_new(ds, keys)
-                    .unwrap()
-                    .when_matched(WhenMatched::UpdateAll)
-                    .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition))
-                    .try_build()
-                    .unwrap()
-            })
-            .run_test()
-            .await;
+        // Boxed: the builder holds several `Fragment`s, which puts the
+        // future over the `large_futures` threshold.
+        Box::pin(
+            MergeInsertTestBuilder::new()
+                .with_version(version)
+                .with_stable_row_ids(enable_stable_row_ids)
+                .with_test_keys(&[1, 4, 5, 6])
+                .with_expected_left_keys(&[1])
+                .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
+                .with_expected_stats(&[3, 3, 2])
+                .with_job_builder(|ds| {
+                    let keys = vec!["key".to_string()];
+                    let condition = create_delete_condition();
+                    MergeInsertBuilder::try_new(ds, keys)
+                        .unwrap()
+                        .when_matched(WhenMatched::UpdateAll)
+                        .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition))
+                        .try_build()
+                        .unwrap()
+                })
+                .run_test(),
+        )
+        .await;
     }
 
     #[rstest::rstest]

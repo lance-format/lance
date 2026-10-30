@@ -20,7 +20,7 @@ use futures::future::BoxFuture;
 use futures::stream;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::spawn_cpu;
-use lance_select::{RowAddrMask, RowAddrTreeMap};
+use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 use lance_table::format::Fragment;
 use lance_table::format::IndexMetadata;
 use lance_table::rowids::RowIdSequence;
@@ -401,6 +401,37 @@ impl DatasetPreFilter {
     }
 }
 
+/// Whether `mask` is known to pass no row: an empty allow list. Block lists
+/// never prove this, whatever they hold.
+pub(crate) fn mask_selects_nothing(mask: &RowAddrMask) -> bool {
+    matches!(mask, RowAddrMask::AllowList(rows) if rows.is_empty())
+}
+
+/// Whether a prefilter `mask` can select any row of one index segment.
+///
+/// `segment_rows`, when it is an allow list of the rows the segment may
+/// answer for (the live rows of its covered fragments, in the mask's own
+/// domain), decides alone. Otherwise, for address-domain masks, the
+/// segment's fragment `coverage` decides by fragment key. With neither (a
+/// row-id mask of a segment whose rows are unknown, or unknown coverage)
+/// only a globally empty allow list proves emptiness. Emptiness is never
+/// claimed where it cannot be proven, so a segment that is kept may still
+/// turn out to hold no selectable row; one that is dropped never does.
+pub fn prefilter_may_match_segment(
+    mask: &RowAddrMask,
+    segment_rows: Option<&RowAddrMask>,
+    coverage: Option<&RoaringBitmap>,
+    address_domain: bool,
+) -> bool {
+    if let Some(RowAddrMask::AllowList(rows)) = segment_rows {
+        return mask.may_select_any(rows);
+    }
+    if address_domain && let Some(coverage) = coverage {
+        return mask.may_select_fragments(coverage);
+    }
+    !matches!(mask, RowAddrMask::AllowList(rows) if rows.is_empty())
+}
+
 #[async_trait]
 impl PreFilter for DatasetPreFilter {
     /// Waits for the prefilter to be fully loaded
@@ -459,6 +490,14 @@ impl PreFilter for DatasetPreFilter {
             .clone()
     }
 
+    fn selects_nothing(&self) -> bool {
+        self.final_mask
+            .lock()
+            .unwrap()
+            .get()
+            .is_some_and(|mask| mask_selects_nothing(mask))
+    }
+
     /// Check whether a slice of row ids should be included in a query.
     ///
     /// Returns a vector of indices into the input slice that should be included,
@@ -474,6 +513,82 @@ impl PreFilter for DatasetPreFilter {
 #[cfg(test)]
 mod test {
     use lance_select::RowSetOps;
+
+    /// Only an empty allow list selects nothing; a block list, even of
+    /// every row the caller knows about, never proves it.
+    #[test]
+    fn selects_nothing_needs_an_empty_allow_list() {
+        use super::mask_selects_nothing;
+        use lance_select::{RowAddrMask, RowAddrTreeMap};
+        let mut rows = RowAddrTreeMap::new();
+        rows.insert_fragment(0);
+        assert!(mask_selects_nothing(&RowAddrMask::allow_nothing()));
+        assert!(!mask_selects_nothing(&RowAddrMask::from_allowed(
+            rows.clone()
+        )));
+        assert!(!mask_selects_nothing(&RowAddrMask::from_block(rows)));
+        assert!(!mask_selects_nothing(&RowAddrMask::all_rows()));
+    }
+
+    /// Emptiness is proven only from the mask and a known row set or, in
+    /// the address domain, known coverage; unknown coverage, a row-id mask
+    /// without a row set, or a block list keep the segment.
+    #[test]
+    fn segment_match_proof_is_conservative() {
+        use super::prefilter_may_match_segment;
+        use lance_select::{RowAddrMask, RowAddrTreeMap};
+        use roaring::RoaringBitmap;
+        let mut allow = RowAddrTreeMap::new();
+        allow.insert((3u64 << 32) | 4);
+        let allow = RowAddrMask::from_allowed(allow);
+        let others = RoaringBitmap::from_iter([0u32, 1]);
+        let here = RoaringBitmap::from_iter([1u32, 3]);
+        assert!(!prefilter_may_match_segment(
+            &allow,
+            None,
+            Some(&others),
+            true
+        ));
+        assert!(prefilter_may_match_segment(&allow, None, Some(&here), true));
+        assert!(prefilter_may_match_segment(&allow, None, None, true));
+        assert!(prefilter_may_match_segment(
+            &allow,
+            None,
+            Some(&others),
+            false
+        ));
+        let mut rows = RowAddrTreeMap::new();
+        rows.insert((3u64 << 32) | 9);
+        let rows = RowAddrMask::from_allowed(rows);
+        assert!(!prefilter_may_match_segment(
+            &allow,
+            Some(&rows),
+            Some(&here),
+            false
+        ));
+        let mut rows = RowAddrTreeMap::new();
+        rows.insert((3u64 << 32) | 4);
+        let rows = RowAddrMask::from_allowed(rows);
+        assert!(prefilter_may_match_segment(
+            &allow,
+            Some(&rows),
+            Some(&others),
+            false
+        ));
+        let block = RowAddrMask::all_rows();
+        assert!(prefilter_may_match_segment(
+            &block,
+            None,
+            Some(&others),
+            true
+        ));
+        assert!(!prefilter_may_match_segment(
+            &RowAddrMask::allow_nothing(),
+            None,
+            None,
+            false
+        ));
+    }
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use rstest::rstest;
 
@@ -607,6 +722,8 @@ mod test {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let prefilter = DatasetPreFilter::new(Arc::new(dataset), &[index], None);
 

@@ -19,14 +19,14 @@ pub(super) use external::{
 pub use file::BlobFile;
 pub(super) use locate::{collect_blob_v2_descriptor_files, data_file_key_from_path};
 pub use managed::preserve_managed_descriptors;
-pub(super) use managed::{field_contains_blob, managed_paths};
+pub(super) use managed::{field_contains_blob, managed_paths, may_be_same_store};
 pub use materialize::{
     BlobMaterializationAdmission, BlobMaterializationContext, MaterializedBlobBatch,
     blob_v2_descriptor_schema, materialize_blob_v2_binary_batch,
     materialize_blob_v2_binary_batch_with_admission, public_blob_v2_binary_output_schema,
     schema_has_blob_v2_binary_view, split_batch_by_bytes,
 };
-pub use prepared::{prepared_blob_batch_to_descriptors, prepared_blob_ids};
+pub use prepared::{prepared_blob_batch_to_descriptors, prepared_blob_ids, prepared_sidecar_bytes};
 pub use read::{
     BlobRangeRequest, BlobReadRange, ReadBlob, ReadBlobRange, ReadBlobRangesBuilder,
     ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream, take_blobs_by_addresses,

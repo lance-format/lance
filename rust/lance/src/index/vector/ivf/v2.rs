@@ -1384,6 +1384,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         scratch: &mut QueryScratch,
     ) -> Result<RecordBatch> {
         let _stage_timer = IndexTimer::new(metrics, IndexTiming::Search);
+        if prepared.pre_filter.selects_nothing() {
+            return Ok(RecordBatch::new_empty(VECTOR_RESULT_SCHEMA.clone()));
+        }
         let PreparedPartitionSearch {
             query,
             pre_filter,
@@ -1468,6 +1471,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         metrics: &dyn MetricsCollector,
     ) -> Result<()> {
         let _stage_timer = IndexTimer::new(metrics, IndexTiming::Search);
+        if prepared.pre_filter.selects_nothing() {
+            return Ok(());
+        }
         let PreparedPartitionSearch {
             query,
             pre_filter,
@@ -2779,6 +2785,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             .await?;
             (part_entry, pre_filter)
         };
+        if pre_filter.selects_nothing() {
+            return Ok(RecordBatch::new_empty(VECTOR_RESULT_SCHEMA.clone()));
+        }
 
         let partition_centroid = self.ivf.centroid(partition_id);
         let rq_search_cache = self.rq_search_cache.clone();
@@ -3323,15 +3332,25 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let load_parallelism = get_num_compute_intensive_cpus().max(1);
         let load_index = self.clone();
         let load_metrics = metrics.clone();
+        let load_pre_filter = pre_filter;
         let mut loaded_chunks = stream::iter(assignment_list)
             .map(move |(part_id, probing_queries)| {
                 let index = load_index.clone();
                 let metrics = load_metrics.clone();
+                let pre_filter = load_pre_filter.clone();
                 async move {
+                    let part_id = part_id as usize;
                     let part_entry = index
-                        .load_query_partition(part_id as usize, metrics.as_ref())
+                        .load_query_partition(part_id, metrics.as_ref())
                         .await?;
-                    Result::Ok((part_id as usize, part_entry, probing_queries))
+                    let pre_filter = Self::prefilter_for_partition(
+                        &index.index_cache,
+                        part_id,
+                        &part_entry,
+                        pre_filter,
+                    )
+                    .await?;
+                    Result::Ok((part_id, part_entry, probing_queries, pre_filter))
                 }
             })
             .buffered(load_parallelism)
@@ -3357,7 +3376,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         while let Some(chunk) = pending {
             let chunk = chunk.into_iter().collect::<Result<Vec<_>>>()?;
             let index = self.clone();
-            let pre_filter = pre_filter.clone();
             let base_queries = base_queries.clone();
             let raw_query_contexts = raw_query_contexts.clone();
             let scratch_pool = self.scratch_pool.clone();
@@ -3366,7 +3384,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             let score = spawn_cpu(move || -> Result<Vec<BinaryHeap<OrderedNode<u64>>>> {
                 search_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
                 scratch_pool.with_scratch(|scratch| -> Result<()> {
-                    for (part_id, part_entry, probing_queries) in &chunk {
+                    for (part_id, part_entry, probing_queries, pre_filter) in &chunk {
                         let partition_centroid = index.ivf.centroid(*part_id);
                         for (query_index, dist_q_c) in probing_queries {
                             let mut single_query = base_queries[*query_index].clone();

@@ -36,7 +36,7 @@
 //! (which should only be done if the caller can guarantee there are no updates
 //! happening at the same time)
 
-use super::refs::TagContents;
+use super::refs::{TagContents, normalize_branch};
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -52,10 +52,10 @@ use lance_core::{
         TRACE_FILE_AUDIT,
     },
 };
-use lance_io::object_store::ObjectStore;
+use lance_io::object_store::{ObjectStore, ObjectStoreRegistry, uri_to_url};
 use lance_table::{
     feature_flags::{ensure_can_read_manifest, ensure_can_write_manifest},
-    format::{IndexMetadata, Manifest},
+    format::{BasePath, IndexMetadata, Manifest, is_detached_version},
     io::{
         commit::{ManifestLocation, ManifestNamingScheme},
         deletion::deletion_file_path,
@@ -66,8 +66,10 @@ use object_store::ObjectMeta;
 use object_store::path::Path;
 use prost::Message;
 use std::fmt::Debug;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     future,
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
@@ -294,12 +296,84 @@ impl CleanupAction {
     }
 }
 
+fn is_managed_blob_directory(directory: &str) -> bool {
+    matches!(directory, "_blobs" | "data")
+}
+
+/// `data/` and `_blobs/` are the directories cleanup deletes `.blob` files from.
+pub(in crate::dataset) fn in_blob_deletion_scope(owner_base: &Path, path: &Path) -> bool {
+    let Some(mut relative) = path.prefix_match(owner_base) else {
+        return false;
+    };
+    let Some(directory) = relative.next() else {
+        return false;
+    };
+    is_managed_blob_directory(directory.as_ref())
+}
+
 fn remove_prefix(path: &Path, prefix: &Path) -> Path {
     let relative_parts = path.prefix_match(prefix);
     if relative_parts.is_none() {
         return path.clone();
     }
     Path::from_iter(relative_parts.unwrap())
+}
+
+/// Whether `uri` may refer to `base`.
+/// Unknown locations match so cleanup does not delete live files.
+fn may_be_same_location(
+    registry: &ObjectStoreRegistry,
+    store: &ObjectStore,
+    storage_options: Option<&HashMap<String, String>>,
+    uri: &str,
+    base: &Path,
+) -> bool {
+    let Ok(url) = uri_to_url(uri) else {
+        return true;
+    };
+    let Some(provider) = registry.get_provider(url.scheme()) else {
+        return true;
+    };
+    let Ok(path) = provider.extract_path(&url) else {
+        return true;
+    };
+    // The prefix includes the base's storage options, including the Azure account.
+    let same_store = match registry.calculate_object_store_prefix(uri, storage_options) {
+        Ok(prefix) => super::blob::may_be_same_store(registry, store, url.scheme(), &prefix),
+        Err(_) => true,
+    };
+    if !same_store {
+        return false;
+    }
+    let is_local = |scheme: &str| matches!(scheme, "file" | "file-object-store" | "file+uring");
+    if !is_local(store.scheme()) || !is_local(url.scheme()) {
+        return path == *base;
+    }
+    if path == *base {
+        return true;
+    }
+    let local = object_store::local::LocalFileSystem::new();
+    let identify = |path: &Path| {
+        local
+            .path_to_filesystem(path)
+            .ok()
+            .and_then(|path| directory_identity(&path))
+    };
+    identify(&path)
+        .zip(identify(base))
+        .is_none_or(|(path, base)| path == base)
+}
+
+#[cfg(unix)]
+fn directory_identity(path: &std::path::Path) -> Option<(u64, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+// Stable std exposes a file identity only on unix, so the canonical path stands in.
+#[cfg(not(unix))]
+fn directory_identity(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    std::fs::canonicalize(path).ok()
 }
 
 fn staging_manifest_version(relative_path: &Path) -> Option<u64> {
@@ -352,12 +426,14 @@ struct CleanupTask<'a> {
     include_referenced_branches: bool,
 }
 
-/// The visible descriptor rows and base namespace used by one fragment scan.
+/// Cache identity includes the cleanup owner's base IDs.
+/// The same fragment can have different referenced paths for different owners.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ManagedScanKey {
     store_prefix: String,
     data_dir: Path,
     bases: Vec<(u32, String, bool)>,
+    owner_base_ids: BTreeSet<Option<u32>>,
     fragment: Vec<u8>,
     fields: Vec<arrow_schema::Field>,
     field_ids: Vec<i32>,
@@ -578,6 +654,16 @@ impl<'a> CleanupTask<'a> {
         mut delete_execution: Option<Arc<DeleteExecution>>,
         managed_scan_permits: Option<Arc<Semaphore>>,
     ) -> Result<Self> {
+        // Cleanup keeps every version numbered at or above the one it reads from.
+        // Detached versions have the high bit set, so from a detached checkout every
+        // attached version, the latest included, could expire.
+        let read_version = operation.dataset.version().version;
+        if is_detached_version(read_version) {
+            return Err(Error::invalid_input(format!(
+                "cannot clean up from detached version {read_version}; \
+                 check out an attached version of the dataset first"
+            )));
+        }
         if action.deletes_files() && delete_execution.is_none() {
             let concurrency = operation
                 .delete_concurrency
@@ -604,7 +690,7 @@ impl<'a> CleanupTask<'a> {
             dataset: operation.dataset,
             policy: operation.policy.clone(),
             action,
-            read_version: operation.dataset.version().version,
+            read_version,
             ignored_manifests,
             track_removed_manifests,
             include_referenced_branches,
@@ -738,12 +824,14 @@ impl<'a> CleanupTask<'a> {
             .map(|(id, base)| (*id, base.path.clone(), base.is_dataset_root))
             .collect::<Vec<_>>();
         bases.sort_unstable();
+        let owner_base_ids = self.parent_base_ids(&dataset.manifest);
         stream::iter(dataset.get_fragments())
             .map(|fragment| {
                 let key = ManagedScanKey {
                     store_prefix: dataset.object_store.store_prefix.clone(),
                     data_dir: dataset.data_dir(),
                     bases: bases.clone(),
+                    owner_base_ids: owner_base_ids.clone(),
                     fragment: lance_table::format::pb::DataFragment::from(&fragment.metadata)
                         .encode_to_vec(),
                     fields: fields.clone(),
@@ -757,6 +845,7 @@ impl<'a> CleanupTask<'a> {
                     .entry(key)
                     .or_default()
                     .clone();
+                let scan_owner_base_ids = owner_base_ids.clone();
                 async move {
                     let scanned = cell
                         .get_or_try_init(|| async {
@@ -767,9 +856,17 @@ impl<'a> CleanupTask<'a> {
                                         "cleanup managed scan semaphore closed: {e}"
                                     ))
                                 })?;
-                            let paths =
-                                super::blob::managed_paths(dataset, self.dataset, fragment.scan())
-                                    .await?;
+                            let paths = super::blob::managed_paths(
+                                dataset,
+                                self.dataset,
+                                &scan_owner_base_ids,
+                                fragment.scan(),
+                            )
+                            .await?;
+                            let paths: Vec<_> = paths
+                                .into_iter()
+                                .filter(|path| in_blob_deletion_scope(&self.dataset.base, path))
+                                .collect();
                             let found = !paths.is_empty();
                             let mut inspection = inspection.lock().unwrap();
                             for path in paths {
@@ -1550,6 +1647,17 @@ impl<'a> CleanupTask<'a> {
                 {
                     return Ok(None);
                 }
+                if !relative_path
+                    .parts()
+                    .next()
+                    .is_some_and(|part| is_managed_blob_directory(part.as_ref()))
+                {
+                    debug!(
+                        path = relative_path.as_ref(),
+                        "Will not garbage collect blob file because it does not follow convention"
+                    );
+                    return Ok(None);
+                }
                 if relative_path
                     .parts()
                     .next()
@@ -1575,14 +1683,6 @@ impl<'a> CleanupTask<'a> {
                 //
                 // These files are not referenced directly by the manifest.  Instead, treat them
                 // as referenced if their parent data file is referenced.
-                if !relative_path.as_ref().starts_with("data") {
-                    debug!(
-                        path = relative_path.as_ref(),
-                        "Will not garbage collect blob file because it does not follow convention"
-                    );
-                    return Ok(None);
-                }
-
                 let mut parts = relative_path.parts();
                 let data_dir = parts.next();
                 let data_file_key = parts.next();
@@ -1876,6 +1976,42 @@ impl<'a> CleanupTask<'a> {
         Ok(inspection.into_inner().unwrap())
     }
 
+    /// Bases that may reference files owned by this dataset.
+    ///
+    /// Use branch lineage for inherited roots, excluding bases copied
+    /// unchanged. Fall back to location checks for other bases.
+    fn parent_base_ids(&self, manifest: &Manifest) -> BTreeSet<Option<u32>> {
+        let own = &self.dataset.manifest;
+        // A source on main may be recorded as `main`, as the Java binding does.
+        let branch = normalize_branch(own.branch.as_deref());
+        let registry = self.dataset.session.store_registry();
+        let names_this_dataset = |base: &BasePath| {
+            // A registration can take the id and path of a branch's root, so
+            // only a base listed here unchanged was copied from this dataset.
+            let by_lineage = base.is_dataset_root
+                && normalize_branch(base.name.as_deref()) == branch
+                && own.base_paths.get(&base.id) != Some(base);
+            // `base_<id>.account_name` overrides the dataset account.
+            let base_params = self.dataset.store_params_for_base(Some(base));
+            by_lineage
+                || may_be_same_location(
+                    &registry,
+                    &self.dataset.object_store,
+                    base_params.storage_options(),
+                    &base.path,
+                    &self.dataset.base,
+                )
+        };
+        let own_root = (manifest.branch == own.branch).then_some(None);
+        manifest
+            .base_paths
+            .values()
+            .filter(|base| names_this_dataset(base))
+            .map(|base| Some(base.id))
+            .chain(own_root)
+            .collect()
+    }
+
     /// The `_fri/<map_id>/` row maps a branch manifest's tagged FRI entry
     /// resolves into THIS dataset's base: stable-partition mappings whose
     /// `base_id` names the parent (a branch clone's relocated entry keeps
@@ -1885,6 +2021,7 @@ impl<'a> CleanupTask<'a> {
         &self,
         branch_root: &Path,
         manifest: &Manifest,
+        parent_base_ids: &BTreeSet<Option<u32>>,
         entry: &IndexMetadata,
     ) -> Result<Vec<String>> {
         use lance_table::system_index::frag_reuse::ledger::Mapping;
@@ -1918,7 +2055,7 @@ impl<'a> CleanupTask<'a> {
                         } else {
                             path
                         };
-                        let store = if base_path.path == self.dataset.uri {
+                        let store = if parent_base_ids.contains(&Some(id)) {
                             None
                         } else {
                             // Foreign bases are opened with default store
@@ -1966,8 +2103,7 @@ impl<'a> CleanupTask<'a> {
             .filter_map(|transition| match transition.mapping() {
                 Mapping::StablePartition(partition) => partition
                     .base_id
-                    .and_then(|id| manifest.base_paths.get(&id))
-                    .filter(|base_path| base_path.path == self.dataset.uri)
+                    .filter(|id| parent_base_ids.contains(&Some(*id)))
                     .map(|_| partition.map_id.clone()),
                 _ => None,
             })
@@ -1997,6 +2133,7 @@ impl<'a> CleanupTask<'a> {
         };
         let indexes =
             read_manifest_indexes(&self.dataset.object_store, &location, &manifest).await?;
+        let parent_base_ids = self.parent_base_ids(&manifest);
 
         // Resolve tagged FRI references into the parent before taking the
         // lock (content reads are async). A history this client cannot
@@ -2009,7 +2146,12 @@ impl<'a> CleanupTask<'a> {
                 && index.index_version != 0
             {
                 match self
-                    .branch_frag_reuse_parent_map_ids(branch_root, &manifest, index)
+                    .branch_frag_reuse_parent_map_ids(
+                        branch_root,
+                        &manifest,
+                        &parent_base_ids,
+                        index,
+                    )
                     .await
                 {
                     Ok(map_ids) => branch_parent_map_ids.extend(map_ids),
@@ -2031,63 +2173,42 @@ impl<'a> CleanupTask<'a> {
 
         for fragment in manifest.fragments.iter() {
             for file in fragment.referenced_lance_files() {
-                if let Some(base_id) = file.base_id {
-                    let base_path = manifest.base_paths.get(&base_id);
-                    if let Some(base_path) = base_path
-                        && base_path.path == self.dataset.uri
-                    {
-                        let full_data_path =
-                            self.dataset.data_dir().clone().join(file.path.as_str());
-                        let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
-                        inspection
-                            .verified_files
-                            .data_paths
-                            .remove(&relative_data_path);
-                        inspection
-                            .referenced_files
-                            .data_paths
-                            .insert(relative_data_path);
-                        is_referenced = true;
-                    }
+                if parent_base_ids.contains(&file.base_id) {
+                    let full_data_path = self.dataset.data_dir().clone().join(file.path.as_str());
+                    let relative_data_path = remove_prefix(&full_data_path, &self.dataset.base);
+                    inspection
+                        .verified_files
+                        .data_paths
+                        .remove(&relative_data_path);
+                    inspection
+                        .referenced_files
+                        .data_paths
+                        .insert(relative_data_path);
+                    is_referenced = true;
                 }
             }
             if let Some(del_file) = fragment.deletion_file.as_ref()
-                && let Some(base_id) = del_file.base_id
+                && parent_base_ids.contains(&del_file.base_id)
             {
-                let base_path = manifest.base_paths.get(&base_id);
-                if let Some(base_path) = base_path {
-                    let deletion_path = fragment.deletion_file.as_ref().map(|deletion_file| {
-                        deletion_file_path(&self.dataset.base, fragment.id, deletion_file)
-                    });
-                    if base_path.path == self.dataset.uri {
-                        if let Some(deletion_path) = deletion_path {
-                            let relative_del_path =
-                                remove_prefix(&deletion_path, &self.dataset.base);
-                            inspection
-                                .verified_files
-                                .delete_paths
-                                .remove(&relative_del_path);
-                            inspection
-                                .referenced_files
-                                .delete_paths
-                                .insert(relative_del_path);
-                        }
-                        is_referenced = true;
-                    }
-                }
+                let deletion_path = deletion_file_path(&self.dataset.base, fragment.id, del_file);
+                let relative_del_path = remove_prefix(&deletion_path, &self.dataset.base);
+                inspection
+                    .verified_files
+                    .delete_paths
+                    .remove(&relative_del_path);
+                inspection
+                    .referenced_files
+                    .delete_paths
+                    .insert(relative_del_path);
+                is_referenced = true;
             }
         }
         for index in indexes {
-            if let Some(base_id) = index.base_id {
-                let base_path = manifest.base_paths.get(&base_id);
-                if let Some(base_path) = base_path
-                    && base_path.path == self.dataset.uri
-                {
-                    let uuid_str = index.uuid.to_string();
-                    inspection.verified_files.index_uuids.remove(&uuid_str);
-                    inspection.referenced_files.index_uuids.insert(uuid_str);
-                    is_referenced = true;
-                }
+            if parent_base_ids.contains(&index.base_id) {
+                let uuid_str = index.uuid.to_string();
+                inspection.verified_files.index_uuids.remove(&uuid_str);
+                inspection.referenced_files.index_uuids.insert(uuid_str);
+                is_referenced = true;
             }
         }
         if fri_unresolvable {
@@ -2602,12 +2723,16 @@ mod tests {
     };
 
     use super::*;
-    use crate::blob::{BlobArrayBuilder, blob_field};
+    use crate::blob::{BlobArrayBuilder, BlobDescriptor, BlobDescriptorArrayBuilder, blob_field};
+    use crate::dataset::blob::test_util::managed_blob_schema;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::index::DatasetIndexExt;
     use crate::{
         dataset::transaction::{Operation, Transaction},
-        dataset::{AutoCleanupParams, ReadParams, WriteMode, WriteParams, builder::DatasetBuilder},
+        dataset::{
+            AutoCleanupParams, CommitBuilder, DeleteBuilder, ReadParams, WriteMode, WriteParams,
+            builder::DatasetBuilder,
+        },
         index::vector::VectorIndexParams,
     };
     use all_asserts::{assert_gt, assert_lt};
@@ -2620,6 +2745,8 @@ mod tests {
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+    use lance_io::object_store::storage_options::StorageOptionsAccessor;
     use lance_io::object_store::{
         ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
     };
@@ -3197,6 +3324,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -4809,6 +4938,800 @@ mod tests {
         assert_eq!(child.scan().try_into_batch().await.unwrap(), expected);
     }
 
+    /// Writes a parent at `uri` and forks a branch from a version that, once
+    /// this returns, alone names the parent's data file, deletion file, index
+    /// and managed blob.
+    async fn fork_branch_holding_parent_objects(uri: &str) -> Dataset {
+        let batch = managed_blob_batch();
+        let mut parent = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            uri,
+            Some(WriteParams {
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        parent.delete("id = 0").await.unwrap();
+        parent
+            .create_index(
+                &["id"],
+                IndexType::Scalar,
+                Some("id_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let fork_version = parent.version_id();
+        parent
+            .create_branch("branch", fork_version, None)
+            .await
+            .unwrap();
+        parent.delete("id >= 0").await.unwrap();
+        parent.drop_index("id_idx").await.unwrap();
+        parent
+    }
+
+    async fn clean_every_old_version(uri: &str) {
+        let dataset = Dataset::open(uri).await.unwrap();
+        cleanup_old_versions(
+            &dataset,
+            CleanupPolicy {
+                before_version: Some(dataset.version_id()),
+                // The mocked clock puts every commit before the real file
+                // times, so only an unfiltered listing reaches the parent's files.
+                delete_unverified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn assert_cleanup_keeps_branch_parent_objects(recorded: &str, cleaned: &str) {
+        fork_branch_holding_parent_objects(recorded).await;
+        clean_every_old_version(cleaned).await;
+
+        let branch = Arc::new(
+            Dataset::open(recorded)
+                .await
+                .unwrap()
+                .checkout_branch("branch")
+                .await
+                .unwrap(),
+        );
+        let mut lookup = branch.scan();
+        lookup.filter("id = 1").unwrap();
+        assert_eq!(lookup.try_into_batch().await.unwrap().num_rows(), 1);
+        let values = branch.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(
+            values[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"second"
+        );
+    }
+
+    fn local_file_uri(scheme: &str, path: &str) -> String {
+        let path = path.replace('\\', "/");
+        let path_prefix = if path.starts_with('/') { "" } else { "/" };
+        format!("{scheme}://{path_prefix}{path}")
+    }
+
+    #[test]
+    fn local_file_uri_keeps_windows_drive_letters_out_of_authority() {
+        assert_eq!(
+            local_file_uri("file-object-store", r"C:\Users\runner\dataset"),
+            "file-object-store:///C:/Users/runner/dataset"
+        );
+    }
+
+    #[rstest]
+    #[case::recorded_spelling(str::to_string)]
+    #[case::file_url(|path: &str| local_file_uri("file", path))]
+    #[case::trailing_slash(|path: &str| format!("{path}/"))]
+    #[case::dot_segments(|path: &str| format!("{path}/./sub/.."))]
+    #[case::percent_encoded(|path: &str| local_file_uri("file", &path.replace('.', "%2E")))]
+    #[case::scheme_alias(|path: &str| local_file_uri("file-object-store", path))]
+    #[tokio::test]
+    async fn cleanup_keeps_parent_objects_of_branch_recorded_under_another_uri_spelling(
+        #[case] respell: fn(&str) -> String,
+    ) {
+        let uri = TempStrDir::default();
+        let respelled = respell(uri.as_str());
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        assert_eq!(
+            ObjectStore::extract_path_from_uri(registry.clone(), &respelled).unwrap(),
+            ObjectStore::extract_path_from_uri(registry, uri.as_str()).unwrap()
+        );
+        assert_cleanup_keeps_branch_parent_objects(uri.as_str(), &respelled).await;
+    }
+
+    // Lance keeps a local path as spelled, but the filesystem follows the
+    // link, so both spellings commit to and list the branches of one dataset.
+    #[cfg(unix)]
+    #[rstest]
+    #[case::branch_recorded_through_symlink("link", "dataset")]
+    #[case::cleaned_through_symlink("dataset", "link")]
+    #[cfg_attr(
+        target_os = "macos",
+        case::branch_recorded_through_firmlink("firmlink", "dataset")
+    )]
+    #[cfg_attr(
+        target_os = "macos",
+        case::cleaned_through_firmlink("dataset", "firmlink")
+    )]
+    #[tokio::test]
+    async fn cleanup_keeps_parent_objects_of_branch_across_a_link(
+        #[case] recorded: &str,
+        #[case] cleaned: &str,
+    ) {
+        let temp = TempStrDir::default();
+        let root = std::fs::canonicalize(temp.as_str()).unwrap();
+        let root = root.to_str().unwrap();
+        let spelling = |name: &str| match name {
+            // The same directory on the data volume, which realpath does not merge.
+            "firmlink" => format!("/System/Volumes/Data{root}/dataset"),
+            name => format!("{root}/{name}"),
+        };
+        std::fs::create_dir(spelling("dataset")).unwrap();
+        std::os::unix::fs::symlink(spelling("dataset"), spelling("link")).unwrap();
+        assert_cleanup_keeps_branch_parent_objects(&spelling(recorded), &spelling(cleaned)).await;
+    }
+
+    async fn data_objects(dataset: &Dataset) -> Vec<Path> {
+        let dirs =
+            ["data", "_deletions", "_indices", "_blobs"].map(|dir| dataset.base.clone().join(dir));
+        dataset
+            .object_store
+            .read_dir_all(&dataset.base, None)
+            .map_ok(|meta| meta.location)
+            .try_filter(|path| future::ready(dirs.iter().any(|dir| path.prefix_matches(dir))))
+            .try_collect()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn parent_cleanup_reclaims_objects_only_a_deleted_branch_held() {
+        let uri = TempStrDir::default();
+        let mut parent = fork_branch_holding_parent_objects(uri.as_str()).await;
+        clean_every_old_version(uri.as_str()).await;
+        assert!(!data_objects(&parent).await.is_empty());
+
+        parent.delete_branch("branch").await.unwrap();
+        clean_every_old_version(uri.as_str()).await;
+        let left = data_objects(&parent).await;
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[rstest]
+    #[case::recorded_path(str::to_string)]
+    #[case::file_object_store_scheme(|dir: &str| local_file_uri("file-object-store", dir))]
+    #[tokio::test]
+    async fn cleanup_keeps_then_reclaims_a_branch_blob_on_a_nested_base(
+        #[case] base_uri: fn(&str) -> String,
+    ) {
+        let uri = TempStrDir::default();
+        let payload = b"receipt";
+        let blob_dir = format!("{}/_blobs", uri.as_str());
+        std::fs::create_dir_all(&blob_dir).unwrap();
+        std::fs::write(format!("{blob_dir}/receipt.blob"), payload).unwrap();
+        let blob_base = base_uri(&blob_dir);
+
+        let mut values = BlobDescriptorArrayBuilder::new("blob");
+        values
+            .push(BlobDescriptor::Managed {
+                base_id: Some(7),
+                uri: "receipt.blob".to_string(),
+                offset: 0,
+                size: payload.len() as u64,
+            })
+            .unwrap();
+        let (field, column) = values.finish().unwrap().into_parts();
+        let schema = Arc::new(managed_blob_schema(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+        let mut parent = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            uri.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                initial_bases: Some(vec![BasePath::new(7, blob_base, None, false)]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        parent
+            .create_branch("branch", parent.version_id(), None)
+            .await
+            .unwrap();
+
+        let rows = arrow_array::record_batch!(("id", Int32, [0])).unwrap();
+        Dataset::write(
+            RecordBatchIterator::new([Ok(rows.clone())], rows.schema()),
+            uri.as_str(),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        clean_every_old_version(uri.as_str()).await;
+
+        let branch = Dataset::open(uri.as_str())
+            .await
+            .unwrap()
+            .checkout_branch("branch")
+            .await
+            .unwrap();
+        let values = Arc::new(branch)
+            .take_blobs_by_indices(&[0], "blob")
+            .await
+            .unwrap();
+        assert_eq!(
+            values[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            payload
+        );
+
+        let mut parent = Dataset::open(uri.as_str()).await.unwrap();
+        let receipt = parent.base.clone().join("_blobs").join("receipt.blob");
+        parent.delete_branch("branch").await.unwrap();
+        clean_every_old_version(uri.as_str()).await;
+        assert!(
+            !parent.object_store.exists(&receipt).await.unwrap(),
+            "cleanup retained {receipt}"
+        );
+    }
+
+    #[rstest]
+    #[case::data_base(false)]
+    #[case::dataset_root(true)]
+    #[tokio::test]
+    async fn cleanup_keeps_nested_root_added_on_child(#[case] is_dataset_root: bool) {
+        let uri = TempStrDir::default();
+        let rows = arrow_array::record_batch!(("id", Int32, [0])).unwrap();
+        let mut parent = Dataset::write(
+            RecordBatchIterator::new([Ok(rows.clone())], rows.schema()),
+            uri.as_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        let child = Arc::new(
+            parent
+                .create_branch("child", parent.version_id(), None)
+                .await
+                .unwrap(),
+        );
+        let blob_dir = format!("{}/_blobs", uri.as_str());
+        std::fs::create_dir_all(&blob_dir).unwrap();
+        std::fs::write(format!("{blob_dir}/receipt.blob"), b"receipt").unwrap();
+        let child = child
+            .add_bases(
+                vec![BasePath::new(
+                    7,
+                    blob_dir,
+                    Some("main".to_string()),
+                    is_dataset_root,
+                )],
+                None,
+            )
+            .await
+            .unwrap();
+        let mut values = BlobDescriptorArrayBuilder::new("blob");
+        values
+            .push(BlobDescriptor::Managed {
+                base_id: Some(7),
+                uri: "receipt.blob".to_string(),
+                offset: 0,
+                size: 7,
+            })
+            .unwrap();
+        let (field, column) = values.finish().unwrap().into_parts();
+        let schema = Arc::new(managed_blob_schema(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+        let child = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch)], schema),
+                child.uri(),
+                Some(WriteParams {
+                    mode: WriteMode::Overwrite,
+                    data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let blob = child.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(
+            blob[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"receipt"
+        );
+        parent.update_config([("revision", "2")]).await.unwrap();
+        parent.update_config([("revision", "3")]).await.unwrap();
+        clean_every_old_version(uri.as_str()).await;
+        let receipt = parent.base.clone().join("_blobs").join("receipt.blob");
+        assert!(
+            parent.object_store.exists(&receipt).await.unwrap(),
+            "parent cleanup deleted a live blob registered only on its child"
+        );
+        let child = Arc::new(
+            Dataset::open(uri.as_str())
+                .await
+                .unwrap()
+                .checkout_branch("child")
+                .await
+                .unwrap(),
+        );
+        let blob = child.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        assert_eq!(
+            blob[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"receipt"
+        );
+
+        let mut parent = Dataset::open(uri.as_str()).await.unwrap();
+        parent.delete_branch("child").await.unwrap();
+        clean_every_old_version(uri.as_str()).await;
+        assert!(
+            !parent.object_store.exists(&receipt).await.unwrap(),
+            "cleanup retained {receipt}"
+        );
+    }
+
+    #[cfg(feature = "aws")]
+    #[tokio::test]
+    async fn cleanup_reclaims_a_parent_blob_named_only_by_a_foreign_root() {
+        let uri = TempStrDir::default();
+        let rows = arrow_array::record_batch!(("id", Int32, [0])).unwrap();
+        let mut parent = Dataset::write(
+            RecordBatchIterator::new([Ok(rows.clone())], rows.schema()),
+            uri.as_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        let child = Arc::new(
+            parent
+                .create_branch("child", parent.version_id(), None)
+                .await
+                .unwrap(),
+        );
+        let blob_dir = format!("{}/_blobs", uri.as_str());
+        std::fs::create_dir_all(&blob_dir).unwrap();
+        std::fs::write(format!("{blob_dir}/receipt.blob"), b"receipt").unwrap();
+        let child = child
+            .add_bases(
+                vec![BasePath::new(
+                    7,
+                    "s3://bucket-b/orders".to_string(),
+                    Some("main".to_string()),
+                    true,
+                )],
+                None,
+            )
+            .await
+            .unwrap();
+        let mut values = BlobDescriptorArrayBuilder::new("blob");
+        values
+            .push(BlobDescriptor::Managed {
+                base_id: Some(7),
+                uri: "_blobs/receipt.blob".to_string(),
+                offset: 0,
+                size: 7,
+            })
+            .unwrap();
+        let (field, column) = values.finish().unwrap().into_parts();
+        let schema = Arc::new(managed_blob_schema(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+        Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            child.uri(),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        parent.update_config([("revision", "2")]).await.unwrap();
+        parent.update_config([("revision", "3")]).await.unwrap();
+
+        let parent = DatasetBuilder::from_uri(uri.as_str())
+            .with_storage_options(HashMap::from([
+                ("region".to_string(), "us-east-1".to_string()),
+                ("aws_access_key_id".to_string(), "test".to_string()),
+                ("aws_secret_access_key".to_string(), "test".to_string()),
+            ]))
+            .load()
+            .await
+            .unwrap();
+        let child = parent.checkout_branch("child").await.unwrap();
+        let foreign = child.object_store(Some(7)).await.unwrap();
+        assert_eq!(foreign.store_prefix, "s3$bucket-b");
+        assert!(!crate::dataset::blob::may_be_same_store(
+            child.session.store_registry().as_ref(),
+            &parent.object_store,
+            foreign.scheme(),
+            &foreign.store_prefix,
+        ));
+
+        let receipt = parent.base.clone().join("_blobs").join("receipt.blob");
+        assert!(parent.object_store.exists(&receipt).await.unwrap());
+        cleanup_old_versions(
+            &parent,
+            CleanupPolicy {
+                before_version: Some(parent.version_id()),
+                delete_unverified: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !parent.object_store.exists(&receipt).await.unwrap(),
+            "parent cleanup kept {receipt} for a root on {prefix}",
+            prefix = foreign.store_prefix
+        );
+    }
+
+    #[tokio::test]
+    async fn root_cleanup_drops_its_fork_once_a_grandchild_reads_only_its_parent() {
+        let uri = TempStrDir::default();
+        let batch = managed_blob_batch();
+        let rows = || RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+        let mut root = Dataset::write(
+            rows(),
+            uri.as_str(),
+            Some(WriteParams {
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let fork_version = root.version_id();
+        let mut child = root
+            .create_branch("child", fork_version, None)
+            .await
+            .unwrap();
+        // The child replaces the rows it inherited and drops the history that
+        // named them, so the grandchild reads only the child's objects.
+        child.delete("true").await.unwrap();
+        child.append(rows(), None).await.unwrap();
+        child
+            .cleanup(CleanupPolicy {
+                before_version: Some(child.version_id()),
+                ..Default::default()
+            })
+            .execute()
+            .await
+            .unwrap();
+        let grandchild = Arc::new(
+            child
+                .create_branch("grandchild", child.version_id(), None)
+                .await
+                .unwrap(),
+        );
+        root.delete("id = 0").await.unwrap();
+        clean_every_old_version(uri.as_str()).await;
+
+        let versions = Dataset::open(uri.as_str())
+            .await
+            .unwrap()
+            .versions()
+            .await
+            .unwrap();
+        assert!(
+            versions
+                .iter()
+                .all(|version| version.version != fork_version),
+            "{versions:?}"
+        );
+        let values = grandchild
+            .take_blobs_by_indices(&[1], "blob")
+            .await
+            .unwrap();
+        assert_eq!(
+            values[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"second"
+        );
+    }
+
+    #[cfg(unix)]
+    fn relative_to_working_directory(path: &str) -> String {
+        let depth = std::env::current_dir().unwrap().components().count() - 1;
+        format!("{}{path}", "/..".repeat(depth).trim_start_matches('/'))
+    }
+
+    #[rstest]
+    #[case::unnamed_root(
+        |root: &str| BasePath::new(7, format!("{root}/other"), None, true),
+        true
+    )]
+    #[cfg_attr(
+        unix,
+        case::unnamed_root_with_relative_uri(
+            |root: &str| BasePath::new(
+                7,
+                relative_to_working_directory(&format!("{root}/other")),
+                None,
+                true,
+            ),
+            true
+        )
+    )]
+    #[cfg_attr(
+        unix,
+        case::relative_uri_of_this_dataset(
+            |root: &str| BasePath::new(
+                7,
+                relative_to_working_directory(&format!("{root}/dataset")),
+                Some("other".into()),
+                true,
+            ),
+            true
+        )
+    )]
+    #[case::main_alias(
+        |root: &str| BasePath::new(7, format!("{root}/other"), Some("main".into()), true),
+        true
+    )]
+    #[case::other_branch_root(
+        |root: &str| BasePath::new(7, format!("{root}/other"), Some("other".into()), true),
+        false
+    )]
+    #[case::copied_from_this_dataset(
+        |root: &str| BasePath::new(5, format!("{root}/other"), None, true),
+        false
+    )]
+    #[case::root_at_the_id_and_path_of_a_registration(
+        |root: &str| BasePath::new(6, format!("{root}/other"), None, true),
+        true
+    )]
+    #[case::registered_at_this_uri(
+        |root: &str| BasePath::new(7, format!("{root}/dataset"), Some("primary".into()), true),
+        true
+    )]
+    #[cfg_attr(
+        unix,
+        case::registered_through_a_symlink(
+            |root: &str| BasePath::new(7, format!("{root}/link"), Some("primary".into()), true),
+            true
+        )
+    )]
+    #[case::unknown_scheme(
+        |_: &str| BasePath::new(7, "no-such-scheme://table".into(), Some("other".into()), true),
+        true
+    )]
+    #[case::missing_directory(
+        |root: &str| BasePath::new(7, format!("{root}/missing"), Some("other".into()), true),
+        true
+    )]
+    #[cfg_attr(
+        feature = "aws",
+        case::s3_base_on_a_local_dataset(
+            |_: &str| BasePath::new(7, "s3://bucket/table".into(), Some("other".into()), true),
+            false
+        )
+    )]
+    #[tokio::test]
+    async fn parent_base_ids_follow_branch_lineage_then_location(
+        #[case] base: fn(&str) -> BasePath,
+        #[case] is_parent: bool,
+    ) {
+        let temp = TempStrDir::default();
+        let root = temp.as_str();
+        std::fs::create_dir(format!("{root}/other")).unwrap();
+        let rows = arrow_array::record_batch!(("id", Int32, [0])).unwrap();
+        let schema = rows.schema();
+        let mut parent = Dataset::write(
+            RecordBatchIterator::new([Ok(rows)], schema),
+            &format!("{root}/dataset"),
+            None,
+        )
+        .await
+        .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(format!("{root}/dataset"), format!("{root}/link")).unwrap();
+        // As a shallow clone of `other` this dataset lists it as a root that
+        // every branch copies under the same id and path.
+        let bases = &mut Arc::make_mut(&mut parent.manifest).base_paths;
+        bases.insert(5, BasePath::new(5, format!("{root}/other"), None, true));
+        // Id 6 is a registration at the same path a branch root can reuse.
+        // A different name means the branch did not copy it unchanged.
+        bases.insert(
+            6,
+            BasePath::new(6, format!("{root}/other"), Some("primary".into()), true),
+        );
+        let task = CleanupTask::new(
+            &parent.cleanup(CleanupPolicy::default()),
+            CleanupAction::Execute,
+        )
+        .unwrap();
+        let mut manifest = parent.manifest.as_ref().clone();
+        manifest.branch = Some("branch".to_string());
+        let base = base(root);
+        let id = base.id;
+        manifest.base_paths.insert(id, base);
+        assert_eq!(
+            task.parent_base_ids(&manifest).contains(&Some(id)),
+            is_parent
+        );
+    }
+
+    #[cfg(feature = "aws")]
+    #[tokio::test]
+    async fn different_buckets_are_not_the_same_location() {
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("region".to_string(), "us-east-1".to_string()),
+                    ("aws_access_key_id".to_string(), "test".to_string()),
+                    ("aws_secret_access_key".to_string(), "test".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+        let (owner, base) =
+            ObjectStore::from_uri_and_params(registry.clone(), "s3://bucket-a/orders", &params)
+                .await
+                .unwrap();
+        assert!(may_be_same_location(
+            registry.as_ref(),
+            &owner,
+            None,
+            "s3://bucket-a/orders",
+            &base,
+        ));
+        assert!(may_be_same_location(
+            registry.as_ref(),
+            &owner,
+            None,
+            "s3+ddb://bucket-a/orders",
+            &base,
+        ));
+        assert!(!may_be_same_location(
+            registry.as_ref(),
+            &owner,
+            None,
+            "s3://bucket-b/orders",
+            &base,
+        ));
+    }
+
+    #[cfg(feature = "azure")]
+    #[tokio::test]
+    async fn same_path_on_another_azure_account_is_not_a_parent_base() {
+        let dir = TempStrDir::default();
+        let rows = arrow_array::record_batch!(("id", Int32, [0])).unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(rows.clone())], rows.schema()),
+            dir.as_str(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        async fn parent_base(dataset: &Dataset, base_account: &str) -> (String, bool) {
+            let params = ObjectStoreParams {
+                storage_options_accessor: Some(Arc::new(
+                    StorageOptionsAccessor::with_static_options(HashMap::from([
+                        ("account_name".to_string(), "account-a".to_string()),
+                        ("account_key".to_string(), "dGVzdA==".to_string()),
+                        ("base_7.account_name".to_string(), base_account.to_string()),
+                    ])),
+                )),
+                ..Default::default()
+            };
+            let registry = dataset.session.store_registry();
+            let (owner, owner_base) = ObjectStore::from_uri_and_params(
+                registry,
+                "az://container/orders",
+                &params.scoped_to_base(None),
+            )
+            .await
+            .unwrap();
+            let mut dataset = dataset.with_object_store(owner, Some(params));
+            dataset.base = owner_base;
+            let base = BasePath::new(
+                7,
+                "az://container/orders".to_string(),
+                Some("other".to_string()),
+                false,
+            );
+            Arc::make_mut(&mut dataset.manifest)
+                .base_paths
+                .insert(7, base);
+            let opened = dataset.object_store(Some(7)).await.unwrap();
+            let mut manifest = dataset.manifest.as_ref().clone();
+            manifest.branch = Some("branch".to_string());
+            let task = CleanupTask::new(
+                &dataset.cleanup(CleanupPolicy::default()),
+                CleanupAction::Execute,
+            )
+            .unwrap();
+            (
+                opened.store_prefix.clone(),
+                task.parent_base_ids(&manifest).contains(&Some(7)),
+            )
+        }
+
+        let (opened, is_parent) = parent_base(&dataset, "account-b").await;
+        assert_eq!(opened, "az$container@account-b");
+        assert!(!is_parent);
+
+        let (opened, is_parent) = parent_base(&dataset, "account-a").await;
+        assert_eq!(opened, "az$container@account-a");
+        assert!(is_parent);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unnamed_root_keeps_a_relative_uri_recorded_elsewhere() {
+        if let Ok(root) = std::env::var("LANCE_RELATIVE_URI_CHILD") {
+            let wrong = std::fs::canonicalize("../dataset").unwrap();
+            let dataset_path = std::fs::canonicalize(format!("{root}/dataset")).unwrap();
+            assert_ne!(wrong, dataset_path);
+            let parent = Dataset::open(&format!("{root}/dataset")).await.unwrap();
+            let registry = parent.session.store_registry();
+            assert!(!may_be_same_location(
+                registry.as_ref(),
+                &parent.object_store,
+                parent.initial_storage_options(),
+                "../dataset",
+                &parent.base,
+            ));
+            let task = CleanupTask::new(
+                &parent.cleanup(CleanupPolicy::default()),
+                CleanupAction::Execute,
+            )
+            .unwrap();
+            let mut manifest = parent.manifest.as_ref().clone();
+            manifest.branch = Some("branch".to_string());
+            manifest
+                .base_paths
+                .insert(7, BasePath::new(7, "../dataset".to_string(), None, true));
+            assert!(task.parent_base_ids(&manifest).contains(&Some(7)));
+            return;
+        }
+
+        let root = TempStrDir::default();
+        let root_path = root.as_str().to_string();
+        std::fs::create_dir_all(format!("{root_path}/writer")).unwrap();
+        std::fs::create_dir_all(format!("{root_path}/reader/nested")).unwrap();
+        std::fs::create_dir_all(format!("{root_path}/reader/dataset")).unwrap();
+        let rows = arrow_array::record_batch!(("id", Int32, [0])).unwrap();
+        Dataset::write(
+            RecordBatchIterator::new([Ok(rows.clone())], rows.schema()),
+            &format!("{root_path}/dataset"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::canonicalize(format!("{root_path}/writer/../dataset")).unwrap(),
+            std::fs::canonicalize(format!("{root_path}/dataset")).unwrap()
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("dataset::cleanup::tests::unnamed_root_keeps_a_relative_uri_recorded_elsewhere")
+            .arg("--exact")
+            .current_dir(format!("{root_path}/reader/nested"))
+            .env("LANCE_RELATIVE_URI_CHILD", &root_path)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "stdout:\n{stdout}\nstderr:\n{stderr}",
+        );
+    }
+
     #[tokio::test]
     async fn cleanup_collects_detached_staging_manifest() {
         MockClock::set_system_time(std::time::Duration::from_secs(0));
@@ -5538,6 +6461,54 @@ mod tests {
                 )
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_rejects_a_detached_checkout() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        fixture.append_some_data().await.unwrap();
+        let dataset = Arc::new(*fixture.open().await.unwrap());
+        let delete = DeleteBuilder::new(dataset.clone(), "true")
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let detached = CommitBuilder::new(dataset.clone())
+            .with_detached(true)
+            .execute(delete.transaction)
+            .await
+            .unwrap();
+        assert!(is_detached_version(detached.version_id()));
+        let before = fixture.count_files().await.unwrap();
+
+        // Every attached version is older than the policy's cutoff.
+        let policy = CleanupPolicyBuilder::default()
+            .before_timestamp(utc_now() + TimeDelta::days(1))
+            .build();
+        let operation = detached.cleanup(policy.clone());
+        for error in [
+            operation.explain().await.unwrap_err(),
+            operation.execute().await.unwrap_err(),
+            detached
+                .cleanup_with_policy(policy.clone())
+                .await
+                .unwrap_err(),
+            detached
+                .cleanup_old_versions(TimeDelta::zero(), None, None)
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert_contains!(error.to_string(), "detached version");
+        }
+
+        let after = fixture.count_files().await.unwrap();
+        assert_eq!(after.num_manifest_files, before.num_manifest_files);
+        assert_eq!(after.num_bytes, before.num_bytes);
+        assert_eq!(
+            fixture.open().await.unwrap().version_id(),
+            dataset.version_id()
         );
     }
 
@@ -8195,6 +9166,78 @@ mod tests {
             assert_eq!(branch.count_rows(None).await.unwrap(), 8);
         }
 
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn parent_cleanup_keeps_a_row_map_named_only_by_a_branch_history() {
+            let fixture = MockDatasetFixture::try_new().unwrap();
+            let (mut dataset, map_id) = make_tagged(&fixture).await;
+            let mut branch = fixture
+                .create_branch_and_load(&mut dataset, "child", (None, None))
+                .await
+                .unwrap();
+            // With its own data and index the branch rescues no parent
+            // version, so only its tagged history names the parent's row map.
+            branch.delete("true").await.unwrap();
+            branch
+                .append(
+                    lance_datagen::gen_batch()
+                        .col("i", lance_datagen::array::step::<Int32Type>())
+                        .into_reader_rows(
+                            lance_datagen::RowCount::from(4),
+                            lance_datagen::BatchCount::from(1),
+                        ),
+                    None,
+                )
+                .await
+                .unwrap();
+            branch
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+            let branch_entry = branch
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .unwrap();
+            // Writers leave base_id unset on tagged index entries.
+            assert_ne!(branch_entry.index_version, 0);
+            assert_eq!(branch_entry.base_id, None);
+            branch
+                .cleanup(expire_below(branch.version().version, true))
+                .execute()
+                .await
+                .unwrap();
+
+            dataset
+                .create_index(
+                    &["i"],
+                    IndexType::Scalar,
+                    Some("i_idx".into()),
+                    &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            let latest = dataset.version().version;
+            // The branch recorded the parent uri without the trailing slash.
+            let respelled = fixture
+                .load_dataset(&format!("{}/", fixture.dataset_path))
+                .await
+                .unwrap();
+            cleanup_old_versions(&respelled, expire_below(latest, true))
+                .await
+                .unwrap();
+
+            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id]);
+        }
+
         /// D2: a map referenced only by expiring manifests goes away in the
         /// same pass that removes them (the trim released it from the entry
         /// first).
@@ -8339,6 +9382,8 @@ mod tests {
                 created_at: None,
                 base_id: None,
                 files: None,
+                clustering_id: None,
+                metadata: Default::default(),
             };
 
             let task = CleanupTask::new(

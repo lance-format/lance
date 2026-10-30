@@ -53,6 +53,12 @@ reqsign-google = { version = "3.0.3", optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { workspace = true }
 
+[target.'cfg(target_family = "unix")'.dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["fs"] }
+
+[target.'cfg(target_family = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation"] }
+
 [dev-dependencies]
 serde_json.workspace = true
 criterion.workspace = true

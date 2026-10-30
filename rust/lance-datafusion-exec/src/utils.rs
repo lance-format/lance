@@ -250,6 +250,13 @@ pub const ROWS_SCANNED_METRIC: &str = "rows_scanned";
 pub const TASK_WAIT_TIME_METRIC: &str = "task_wait_time";
 pub const DELTAS_SEARCHED_METRIC: &str = "deltas_searched";
 pub const PARTITIONS_SEARCHED_METRIC: &str = "partitions_searched";
+/// Index segments whose candidate search was omitted because the completed
+/// prefilter proved they hold no selectable row. Index loading and
+/// preparation are not skipped: a vector delta is counted once at the
+/// early-search barrier, after its partitions were loaded and its scoring
+/// skipped; a full-text segment is counted after every segment's statistics
+/// were prepared.
+pub const INDEX_SEGMENTS_SKIPPED_METRIC: &str = "index_segments_skipped";
 pub const FIND_PARTITIONS_ELAPSED_METRIC: &str = "find_partitions_elapsed";
 pub const SCALAR_INDEX_SEARCH_TIME_METRIC: &str = "search_time";
 pub const SCALAR_INDEX_SER_TIME_METRIC: &str = "serialization_time";

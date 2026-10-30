@@ -77,6 +77,18 @@ impl<F: Copy> Candidate<F> {
 #[derive(Clone, Copy)]
 pub struct Kernel<F>(F);
 
+impl<F: Copy> Kernel<F> {
+    /// The kernel as its `unsafe fn` pointer, for signatures `call` cannot
+    /// cover, such as a parameter type with its own lifetime. Prefer `call`.
+    ///
+    /// The pointer came from a `Kernel`, so its host-feature precondition is
+    /// already met. The caller still owns any other precondition of the
+    /// kernel, such as slice lengths, alignment or aliasing.
+    pub fn as_fn(self) -> F {
+        self.0
+    }
+}
+
 /// Implements `call` for one kernel signature, generic over the listed types.
 ///
 /// Each signature needs its own impl: a reference parameter makes the pointer
@@ -100,7 +112,13 @@ macro_rules! impl_call {
 }
 
 impl_call!(<A: ?Sized, B: ?Sized> fn(a: &A, b: &B));
+impl_call!(<A: ?Sized, C: ?Sized> fn(a: &A, b: f32, c: &C));
 impl_call!(<A: ?Sized, B: ?Sized, D: ?Sized> fn(a: &A, b: &B, c: usize, d: &mut D));
+impl_call!(<A: ?Sized, D: ?Sized> fn(a: &A, b: f32, c: f32, d: &D));
+impl_call!(
+    <A: ?Sized, B: ?Sized, D: ?Sized, E: ?Sized>
+    fn(a: &A, b: &B, c: usize, d: &D, e: &mut E)
+);
 
 /// One operation's kernels, best first, with the host's choice made once.
 ///
@@ -258,6 +276,7 @@ mod tests {
 
     type SumFn = unsafe fn(&[f32], &[f32]) -> f32;
     type FillFn = unsafe fn(&[f32], &[f32], usize, &mut [f32]);
+    type ScaledFillFn = unsafe fn(&[f32], &[f32], usize, &[f32], &mut [f32]);
 
     fn portable_sum(x: &[f32], y: &[f32]) -> f32 {
         x.iter().chain(y).sum()
@@ -281,6 +300,23 @@ mod tests {
         fn macro_fill(x: &[f32], batch: &[f32], dimension: usize, out: &mut [f32]) {
             for (o, y) in out.iter_mut().zip(batch.chunks_exact(dimension)) {
                 *o = portable_sum(x, y);
+            }
+        }
+    }
+
+    crate::target_kernel! {
+        #[target_features()]
+        #[candidate(PORTABLE_SCALED_FILL: ScaledFillFn)]
+        fn macro_scaled_fill(
+            x: &[f32],
+            batch: &[f32],
+            dimension: usize,
+            scales: &[f32],
+            out: &mut [f32],
+        ) {
+            macro_fill(x, batch, dimension, out);
+            for (o, scale) in out.iter_mut().zip(scales) {
+                *o *= scale;
             }
         }
     }
@@ -345,6 +381,10 @@ mod tests {
         static FILL: Dispatch<FillFn> = &[PORTABLE_FILL];
     }
 
+    crate::dispatch! {
+        static SCALED_FILL: Dispatch<ScaledFillFn> = &[PORTABLE_SCALED_FILL];
+    }
+
     #[test]
     fn portable_only_dispatch_is_static_and_callable() {
         assert!(PORTABLE_ONLY.is_static());
@@ -393,6 +433,53 @@ mod tests {
         let mut out = [0.0; 2];
         FILL.get().call(&[1.0], &[2.0, 3.0], 1, &mut out);
         assert_eq!(out, [3.0, 4.0]);
+    }
+
+    type ScaledSumFn = unsafe fn(&[f32], f32, &[f32]) -> f32;
+    type DoublyScaledSumFn = unsafe fn(&[f32], f32, f32, &[f32]) -> f32;
+
+    crate::target_kernel! {
+        #[target_features()]
+        #[candidate(SCALED_SUM: ScaledSumFn)]
+        fn scaled_sum(x: &[f32], scale: f32, y: &[f32]) -> f32 {
+            scale * portable_sum(x, y)
+        }
+    }
+
+    crate::target_kernel! {
+        #[target_features()]
+        #[candidate(DOUBLY_SCALED_SUM: DoublyScaledSumFn)]
+        fn doubly_scaled_sum(x: &[f32], a: f32, b: f32, y: &[f32]) -> f32 {
+            a * b * portable_sum(x, y)
+        }
+    }
+
+    crate::dispatch! {
+        static SCALED: Dispatch<ScaledSumFn> = &[SCALED_SUM];
+    }
+
+    crate::dispatch! {
+        static DOUBLY_SCALED: Dispatch<DoublyScaledSumFn> = &[DOUBLY_SCALED_SUM];
+    }
+
+    #[test]
+    fn scalar_argument_kernels_are_callable() {
+        assert_eq!(SCALED.get().call(&[1.0], 2.0, &[3.0]), 8.0);
+        assert_eq!(DOUBLY_SCALED.get().call(&[1.0], 2.0, 3.0, &[3.0]), 24.0);
+    }
+
+    #[test]
+    fn five_argument_kernel_is_callable_directly_and_as_fn() {
+        let kernel = SCALED_FILL.get();
+        let mut out = [0.0; 2];
+        kernel.call(&[1.0], &[2.0, 3.0], 1, &[2.0, 10.0], &mut out);
+        assert_eq!(out, [6.0, 40.0]);
+
+        let mut out = [0.0; 2];
+        // SAFETY: `get` returns only a kernel the host supports, and the
+        // kernel has no other precondition.
+        unsafe { kernel.as_fn()(&[1.0], &[2.0, 3.0], 1, &[2.0, 10.0], &mut out) };
+        assert_eq!(out, [6.0, 40.0]);
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
