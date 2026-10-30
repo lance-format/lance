@@ -36,7 +36,7 @@
 //! (which should only be done if the caller can guarantee there are no updates
 //! happening at the same time)
 
-use super::refs::TagContents;
+use super::refs::{HistoryLock, TagContents};
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -550,7 +550,13 @@ impl<'a> CleanupOperation<'a> {
     pub async fn execute(&self) -> Result<RemovalStats> {
         info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.dataset.uri);
         let cleanup = CleanupTask::new(self, CleanupAction::Execute)?;
-        Ok(cleanup.run().await?.stats)
+        let guard = HistoryLock::acquire(
+            self.dataset.object_store.clone(),
+            &self.dataset.branch_location(),
+            "clean up old versions",
+        )
+        .await?;
+        guard.finish(cleanup.run().await.map(|run| run.stats)).await
     }
 }
 
@@ -2424,6 +2430,12 @@ pub async fn cleanup_cascade_branch(
     let Some(operation) = build_cleanup_operation(dataset, manifest, false).await? else {
         return Ok(None);
     };
+    let guard = HistoryLock::acquire(
+        dataset.object_store.clone(),
+        &dataset.branch_location(),
+        "clean up a referenced branch",
+    )
+    .await?;
     let result = cleanup_cascade_branch_run(
         operation,
         CleanupAction::Execute,
@@ -2431,8 +2443,8 @@ pub async fn cleanup_cascade_branch(
         None,
         None,
     )
-    .await?;
-    Ok(Some(result.stats))
+    .await;
+    guard.finish(result.map(|run| Some(run.stats))).await
 }
 
 async fn cleanup_cascade_branch_run(
@@ -2630,6 +2642,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use datafusion::common::assert_contains;
+    use futures::stream::BoxStream;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_index::IndexType;
@@ -2642,8 +2655,160 @@ mod tests {
     use mock_instant::thread_local::MockClock;
     use object_store::ObjectStoreExt;
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, RenameOptions,
+    };
     use rstest::rstest;
     use uuid::Uuid;
+
+    #[rstest]
+    #[case::create_tag("create_tag")]
+    #[case::update_tag("update_tag")]
+    #[case::create_branch("create_branch")]
+    #[case::restore("restore")]
+    #[case::detached_restore("detached_restore")]
+    #[tokio::test]
+    async fn cleanup_excludes_concurrent_history_references(
+        #[case] operation: &str,
+        #[values(false, true)] is_local: bool,
+        #[values(false, true)] on_branch: bool,
+    ) {
+        tokio::time::pause();
+        let dir = TempStrDir::default();
+        let uri = if is_local {
+            dir.as_str()
+        } else {
+            "memory://table"
+        };
+        let wrapper = Arc::new(MockObjectStore {
+            delete_latency: Duration::from_secs(1),
+            ..MockObjectStore::new()
+        });
+        let data = || {
+            lance_datagen::gen_batch()
+                .col(
+                    "id",
+                    lance_datagen::array::step::<arrow_array::types::Int32Type>(),
+                )
+                .into_reader_rows(4.into(), 4.into())
+        };
+        let mut dataset = Dataset::write(
+            data(),
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(wrapper.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        if on_branch {
+            dataset = dataset.create_branch("source", 1, None).await.unwrap();
+        }
+        dataset.append(data(), None).await.unwrap();
+        let source_version = dataset.version().version;
+        let mut source = dataset.clone();
+        dataset = Dataset::write(
+            data(),
+            Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .tags()
+            .create("existing", dataset.version().version)
+            .await
+            .unwrap();
+        let expected = dataset.scan().try_into_batch().await.unwrap();
+        let mut author = dataset.clone();
+        let deleting = Arc::new(tokio::sync::Notify::new());
+        wrapper.policy.lock().unwrap().set_before_policy(
+            "observe_cleanup_delete",
+            Arc::new({
+                let deleting = deleting.clone();
+                move |method, path| {
+                    if method == "delete" && path.extension() != Some("lock") {
+                        deleting.notify_one();
+                    }
+                    Ok(())
+                }
+            }),
+        );
+        let cleanup = tokio::spawn({
+            let dataset = dataset.clone();
+            async move {
+                dataset
+                    .cleanup(CleanupPolicy {
+                        before_version: Some(dataset.version().version),
+                        error_if_tagged_old_versions: false,
+                        ..Default::default()
+                    })
+                    .execute()
+                    .await
+            }
+        });
+        // The store pauses the first delete after cleanup has inspected refs.
+        // No manifest or data has disappeared yet, so every operation below
+        // would succeed without coordination with cleanup.
+        deleting.notified().await;
+        let result = match operation {
+            "create_tag" => author.tags().create("during", source_version).await,
+            "update_tag" => author.tags().update("existing", source_version).await,
+            "create_branch" => author
+                .create_branch("during", source_version, None)
+                .await
+                .map(|_| ()),
+            "restore" => source.restore().await,
+            "detached_restore" => CommitBuilder::new(Arc::new(author.clone()))
+                .with_detached(true)
+                .execute(Transaction::new(
+                    author.version().version,
+                    Operation::Restore {
+                        version: source_version,
+                    },
+                    None,
+                ))
+                .await
+                .map(|_| ()),
+            _ => unreachable!(),
+        };
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+        assert_contains!(error.to_string(), "history.lock");
+        let stats = cleanup.await.unwrap().unwrap();
+        assert_eq!(stats.old_versions, 2);
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
+        assert_eq!(
+            dataset.tags().get_version("existing").await.unwrap(),
+            dataset.version().version
+        );
+        assert!(!dataset.tags().list().await.unwrap().contains_key("during"));
+        assert!(
+            !dataset
+                .branches()
+                .list()
+                .await
+                .unwrap()
+                .contains_key("during")
+        );
+        // Completion releases the guard before returning to the caller.
+        author
+            .tags()
+            .create("after", author.version().version)
+            .await
+            .unwrap();
+    }
 
     #[rstest]
     #[case::default(None, false)]
@@ -2788,6 +2953,92 @@ mod tests {
         last_modified_times: Arc<Mutex<HashMap<Path, DateTime<Utc>>>>,
     }
 
+    /// Delay only deletes: the upstream ThrottledStore cannot read local-file
+    /// payloads, so it cannot drive the same race test on local and memory stores.
+    #[derive(Debug)]
+    struct DelayedDeletes {
+        inner: Arc<dyn object_store::ObjectStore>,
+        latency: Duration,
+    }
+
+    impl std::fmt::Display for DelayedDeletes {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "DelayedDeletes({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for DelayedDeletes {
+        async fn put_opts(
+            &self,
+            path: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(path, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            path: &Path,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(path, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            path: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(path, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            let latency = self.latency;
+            let delayed = locations.then(move |location| async move {
+                tokio::time::sleep(latency).await;
+                location
+            });
+            self.inner.delete_stream(delayed.boxed())
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: RenameOptions,
+        ) -> object_store::Result<()> {
+            self.inner.rename_opts(from, to, options).await
+        }
+    }
+
     impl WrappingObjectStore for MockObjectStore {
         fn wrap(
             &self,
@@ -2797,13 +3048,10 @@ mod tests {
             let original: Arc<dyn object_store::ObjectStore> = if self.delete_latency.is_zero() {
                 original
             } else {
-                Arc::new(ThrottledStore::new(
-                    original,
-                    ThrottleConfig {
-                        wait_delete_per_call: self.delete_latency,
-                        ..Default::default()
-                    },
-                ))
+                Arc::new(DelayedDeletes {
+                    inner: original,
+                    latency: self.delete_latency,
+                })
             };
             Arc::new(ProxyObjectStore::new(original, self.policy.clone()))
         }

@@ -23,6 +23,10 @@ use std::fmt;
 use std::fmt::Formatter;
 use uuid::Uuid;
 
+mod history_lock;
+
+pub(crate) use history_lock::HistoryLock;
+
 pub const MAIN_BRANCH: &str = "main";
 
 /// Lance Ref
@@ -233,21 +237,31 @@ impl Tags<'_> {
 
     pub async fn create(&self, tag: &str, reference: impl Into<Ref>) -> Result<()> {
         check_valid_tag(tag)?;
-        let root_location = self.refs.root()?;
-        let tag_file = tag_path(&root_location.path, tag);
-
-        let now = utc_now();
-        let tag_contents = self
-            .build_tag_content_by_ref(reference, Some(now), Some(now))
-            .await?;
-
-        put_ref_if_absent(
-            self.object_store(),
-            &tag_file,
-            serde_json::to_vec_pretty(&tag_contents)?,
-            format!("tag {} already exists", tag),
+        let guard = HistoryLock::acquire(
+            self.refs.object_store.clone(),
+            &self.refs.base_location,
+            "create tag",
         )
-        .await
+        .await?;
+        let result = async {
+            let root_location = self.refs.root()?;
+            let tag_file = tag_path(&root_location.path, tag);
+
+            let now = utc_now();
+            let tag_contents = self
+                .build_tag_content_by_ref(reference, Some(now), Some(now))
+                .await?;
+
+            put_ref_if_absent(
+                self.object_store(),
+                &tag_file,
+                serde_json::to_vec_pretty(&tag_contents)?,
+                format!("tag {} already exists", tag),
+            )
+            .await
+        }
+        .await;
+        guard.finish(result).await
     }
 
     pub async fn delete(&self, tag: &str) -> Result<()> {
@@ -267,31 +281,40 @@ impl Tags<'_> {
 
     pub async fn update(&self, tag: &str, reference: impl Into<Ref>) -> Result<()> {
         check_valid_tag(tag)?;
+        let guard = HistoryLock::acquire(
+            self.refs.object_store.clone(),
+            &self.refs.base_location,
+            "update tag",
+        )
+        .await?;
+        let result = async {
+            let root_location = self.refs.root()?;
+            let tag_file = tag_path(&root_location.path, tag);
+            if !self.object_store().exists(&tag_file).await? {
+                return Err(Error::RefNotFound {
+                    message: format!("tag {} does not exist", tag),
+                });
+            }
+            let mut tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
+            let updated_reference = self
+                .build_tag_content_by_ref(reference, tag_contents.created_at, Some(utc_now()))
+                .await?;
+            tag_contents.branch = updated_reference.branch;
+            tag_contents.version = updated_reference.version;
+            tag_contents.created_at = updated_reference.created_at;
+            tag_contents.updated_at = updated_reference.updated_at;
+            tag_contents.manifest_size = updated_reference.manifest_size;
 
-        let root_location = self.refs.root()?;
-        let tag_file = tag_path(&root_location.path, tag);
-        if !self.object_store().exists(&tag_file).await? {
-            return Err(Error::RefNotFound {
-                message: format!("tag {} does not exist", tag),
-            });
+            self.object_store()
+                .put(
+                    &tag_file,
+                    serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
+                )
+                .await
+                .map(|_| ())
         }
-        let mut tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
-        let updated_reference = self
-            .build_tag_content_by_ref(reference, tag_contents.created_at, Some(utc_now()))
-            .await?;
-        tag_contents.branch = updated_reference.branch;
-        tag_contents.version = updated_reference.version;
-        tag_contents.created_at = updated_reference.created_at;
-        tag_contents.updated_at = updated_reference.updated_at;
-        tag_contents.manifest_size = updated_reference.manifest_size;
-
-        self.object_store()
-            .put(
-                &tag_file,
-                serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
-            )
-            .await
-            .map(|_| ())
+        .await;
+        guard.finish(result).await
     }
 
     pub async fn replace_metadata(
@@ -300,25 +323,34 @@ impl Tags<'_> {
         metadata: HashMap<String, String>,
     ) -> Result<()> {
         check_valid_tag(tag)?;
+        let guard = HistoryLock::acquire(
+            self.refs.object_store.clone(),
+            &self.refs.base_location,
+            "replace tag metadata",
+        )
+        .await?;
+        let result = async {
+            let root_location = self.refs.root()?;
+            let tag_file = tag_path(&root_location.path, tag);
+            if !self.object_store().exists(&tag_file).await? {
+                return Err(Error::RefNotFound {
+                    message: format!("tag {} does not exist", tag),
+                });
+            }
 
-        let root_location = self.refs.root()?;
-        let tag_file = tag_path(&root_location.path, tag);
-        if !self.object_store().exists(&tag_file).await? {
-            return Err(Error::RefNotFound {
-                message: format!("tag {} does not exist", tag),
-            });
+            let mut tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
+            tag_contents.metadata = metadata;
+
+            self.object_store()
+                .put(
+                    &tag_file,
+                    serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
+                )
+                .await
+                .map(|_| ())
         }
-
-        let mut tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
-        tag_contents.metadata = metadata;
-
-        self.object_store()
-            .put(
-                &tag_file,
-                serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
-            )
-            .await
-            .map(|_| ())
+        .await;
+        guard.finish(result).await
     }
 
     async fn build_tag_content_by_ref(
@@ -538,26 +570,35 @@ impl Branches<'_> {
         metadata: HashMap<String, String>,
     ) -> Result<()> {
         check_valid_branch(branch)?;
+        let guard = HistoryLock::acquire(
+            self.refs.object_store.clone(),
+            &self.refs.base_location,
+            "replace branch metadata",
+        )
+        .await?;
+        let result = async {
+            let root_location = self.refs.root()?;
+            let branch_file = branch_contents_path(&root_location.path, branch);
+            if !self.object_store().exists(&branch_file).await? {
+                return Err(Error::RefNotFound {
+                    message: format!("branch {} does not exist", branch),
+                });
+            }
 
-        let root_location = self.refs.root()?;
-        let branch_file = branch_contents_path(&root_location.path, branch);
-        if !self.object_store().exists(&branch_file).await? {
-            return Err(Error::RefNotFound {
-                message: format!("branch {} does not exist", branch),
-            });
+            let mut branch_contents =
+                BranchContents::from_path(&branch_file, self.object_store(), branch).await?;
+            branch_contents.metadata = metadata;
+
+            self.object_store()
+                .put(
+                    &branch_file,
+                    serde_json::to_string_pretty(&branch_contents)?.as_bytes(),
+                )
+                .await
+                .map(|_| ())
         }
-
-        let mut branch_contents =
-            BranchContents::from_path(&branch_file, self.object_store(), branch).await?;
-        branch_contents.metadata = metadata;
-
-        self.object_store()
-            .put(
-                &branch_file,
-                serde_json::to_string_pretty(&branch_contents)?.as_bytes(),
-            )
-            .await
-            .map(|_| ())
+        .await;
+        guard.finish(result).await
     }
 
     /// Delete a branch
