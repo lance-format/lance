@@ -61,11 +61,9 @@ pub fn overlay_affects_index(
     schema: &Schema,
 ) -> bool {
     overlay.committed_version > index_version
-        && overlay
-            .data_file
-            .fields
-            .iter()
-            .any(|field_id| field_affects_index(*field_id, indexed_field_ids, schema))
+        && overlay.data_file.fields.iter().any(|field_id| {
+            *field_id >= 0 && field_affects_index(*field_id, indexed_field_ids, schema)
+        })
 }
 
 /// Whether `field_id` is, contains, or is nested in an indexed field.
@@ -179,6 +177,10 @@ pub fn collect_overlay_stale_rows_for_segment(
 
 /// Remove from `coverage` every fragment with an overlay that makes `index`
 /// stale ([`overlay_affects_index`]).
+///
+/// Address translation does not incorporate newer overlay values. Call this
+/// before advancing a segment's maintenance watermark, using its source
+/// `dataset_version`. Unknown coverage must keep its original watermark.
 pub fn remove_overlay_stale_frags(
     coverage: &mut RoaringBitmap,
     fragments: &[Fragment],
@@ -509,5 +511,30 @@ mod tests {
                 .is_empty(),
             expected
         );
+    }
+
+    #[rstest::rstest]
+    #[case::parent(0, 2, 5, true)]
+    #[case::child(2, 0, 5, true)]
+    #[case::sibling(2, 3, 5, false)]
+    #[case::incorporated(0, 2, 9, false)]
+    #[case::obsolete(-1, 2, 5, false)]
+    fn test_remap_withdraws_stale_values_before_advancing_watermark(
+        #[case] changed: i32,
+        #[case] indexed: i32,
+        #[case] source_version: u64,
+        #[case] is_stale: bool,
+    ) {
+        let schema = nested_struct_schema();
+        let fragments = [fragment_with_overlay(
+            0,
+            dense_overlay(vec![changed], [1], 9),
+        )];
+        let source = segment(vec![indexed], source_version, Some(bitmap([0, 1])));
+        let mut coverage = source.fragment_bitmap.clone().unwrap();
+        remove_overlay_stale_frags(&mut coverage, &fragments, &source, &schema);
+        assert_eq!(coverage.contains(0), !is_stale);
+        assert!(coverage.contains(1));
+        assert_eq!(source.dataset_version, source_version);
     }
 }
