@@ -64,6 +64,13 @@ impl EncodingsIo for LanceEncodingsIo {
         ranges: Vec<std::ops::Range<u64>>,
         priority: u64,
     ) -> BoxFuture<'static, lance_core::Result<Vec<bytes::Bytes>>> {
+        if let Some(invalid) = ranges.iter().find(|range| range.start > range.end) {
+            return futures::future::ready(Err(lance_core::Error::invalid_input(format!(
+                "Invalid read range {}..{}: start is after end",
+                invalid.start, invalid.end
+            ))))
+            .boxed();
+        }
         let mut split_ranges = Vec::new();
         let mut split_indices = Vec::new(); // Track which original range each split came from
         // Large ranges (above read_chunk_size) will be split into

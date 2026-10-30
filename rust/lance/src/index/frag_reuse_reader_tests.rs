@@ -136,14 +136,25 @@ async fn tagged_remapping_translates_pairwise_staged_ids(#[case] options: Duplic
 }
 
 #[rstest::rstest]
-#[case::default_search("default")]
-#[case::all_segments("all")]
-#[case::partial_selection("partial")]
-#[case::reconverged("reconverged")]
+#[case::default_search("default", false, true, false, false)]
+#[case::default_prefilter("default", true, true, false, false)]
+#[case::all_segments("all", false, true, false, false)]
+#[case::all_prefilter("all", true, true, false, false)]
+#[case::partial_selection("partial", false, true, false, false)]
+#[case::partial_prefilter("partial", true, true, false, false)]
+#[case::reconverged("reconverged", false, true, false, false)]
+#[case::reconverged_prefilter("reconverged", true, true, false, false)]
+#[case::all_postfilter("all", true, false, false, false)]
+#[case::partial_postfilter("partial", true, false, false, false)]
+#[case::partial_fast("partial", false, false, true, false)]
+#[case::segment_only("partial", false, false, false, true)]
 #[tokio::test]
 async fn vector_fragment_search_requires_every_contributor(
     #[case] selection: &str,
-    #[values(false, true)] filtered_destination: bool,
+    #[case] filtered_destination: bool,
+    #[case] prefilter: bool,
+    #[case] is_fast: bool,
+    #[case] segment_only: bool,
 ) {
     let mut dataset = lance_datagen::gen_batch()
         .col("i", lance_datagen::array::step::<Int32Type>())
@@ -276,17 +287,29 @@ async fn vector_fragment_search_requires_every_contributor(
     }
 
     let mut scan = dataset.scan();
-    let expected_rows = if selection == "reconverged" && !filtered_destination {
+    let is_postfilter = filtered_destination && !prefilter;
+    let expected_rows = if segment_only {
+        4
+    } else if is_fast {
+        0
+    } else if is_postfilter {
+        2
+    } else if selection == "reconverged" && !filtered_destination {
         8
     } else {
         1
     };
-    scan.nearest("vector", query, expected_rows).unwrap();
+    let k = if is_postfilter {
+        3
+    } else {
+        expected_rows.max(1)
+    };
     if filtered_destination {
         scan.with_fragments(vec![dataset.fragments()[0].clone()]);
-        scan.filter("i = 6").unwrap();
-        scan.prefilter(true);
-    } else {
+        scan.filter(if prefilter { "i = 6" } else { "i != 6" })
+            .unwrap();
+        scan.prefilter(prefilter);
+    } else if !segment_only {
         scan.with_fragments(dataset.fragments().iter().cloned().collect());
     }
     match selection {
@@ -299,14 +322,89 @@ async fn vector_fragment_search_requires_every_contributor(
         "default" | "reconverged" => {}
         _ => unreachable!(),
     }
+    scan.nearest("vector", query, k).unwrap().nprobes(1);
+    if is_fast {
+        scan.fast_search();
+    }
     let plan = scan.explain_plan(false).await.unwrap();
-    assert_eq!(plan.contains("ANN"), selection != "partial", "{plan}");
-    if selection == "partial" {
+    assert_eq!(
+        plan.contains("ANN"),
+        selection != "partial" || segment_only,
+        "{plan}"
+    );
+    if selection == "partial" && !is_fast && !segment_only {
         // The query names no metric, so the flat fallback ranks by the index's.
         assert!(plan.contains("KNNVectorDistance: metric=cosine"), "{plan}");
     }
     let result = scan.try_into_batch().await.unwrap();
     assert_eq!(result.num_rows(), expected_rows);
+    if is_fast {
+        return;
+    }
+    // Ordinary reads define current values and scope; no FRI coverage helper or KNN kernel
+    // participates in the distance oracle.
+    let mut oracle = dataset.scan();
+    if filtered_destination {
+        oracle.with_fragments(vec![dataset.fragments()[0].clone()]);
+    }
+    let source = oracle.try_into_batch().await.unwrap();
+    let norm = |vector: &[f32]| {
+        vector
+            .iter()
+            .map(|value| f64::from(*value).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    };
+    let query_norm = norm(query.values());
+    let mut expected = Vec::new();
+    for row in 0..source.num_rows() {
+        let id = source["i"].as_primitive::<Int32Type>().value(row);
+        if segment_only && id >= 4 {
+            continue;
+        }
+        if filtered_destination && prefilter && id != 6 {
+            continue;
+        }
+        let vector = source["vector"].as_fixed_size_list().value(row);
+        let vector = vector.as_primitive::<arrow_array::types::Float32Type>();
+        let dot = vector
+            .values()
+            .iter()
+            .zip(query.values())
+            .map(|(value, q)| f64::from(*value) * f64::from(*q))
+            .sum::<f64>();
+        let distance = 1.0 - dot / (norm(vector.values()) * query_norm);
+        expected.push((id, distance));
+    }
+    expected.sort_by(|left, right| left.1.total_cmp(&right.1));
+    expected.truncate(k);
+    if is_postfilter {
+        expected.retain(|(id, _)| *id != 6);
+    }
+    let actual = result["i"].as_primitive::<Int32Type>().values();
+    assert_eq!(
+        actual.as_ref(),
+        expected.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        "{plan}"
+    );
+    let unique: RoaringBitmap = actual.iter().map(|id| *id as u32).collect();
+    assert_eq!(unique.len() as usize, result.num_rows());
+    assert_eq!(
+        expected
+            .iter()
+            .filter(|(id, _)| unique.contains(*id as u32))
+            .count() as f64
+            / expected.len() as f64,
+        1.0
+    );
+    for (row, (_, distance)) in expected.iter().enumerate() {
+        let actual = f64::from(
+            result["_distance"]
+                .as_primitive::<arrow_array::types::Float32Type>()
+                .value(row),
+        );
+        assert!(actual.is_finite() && (actual - distance).abs() <= 1e-5 + 1e-6 * distance.abs());
+    }
     if expected_rows == 8 {
         let mut values = result["i"].as_primitive::<Int32Type>().values().to_vec();
         values.sort_unstable();
@@ -314,11 +412,13 @@ async fn vector_fragment_search_requires_every_contributor(
     }
     // IVF_FLAT with one partition is exact: the nearest row must come from Y,
     // including when explicit selection of X requires a flat fallback.
-    assert_eq!(
-        result["i"].as_primitive::<Int32Type>().value(0),
-        6,
-        "{plan}"
-    );
+    if !is_postfilter && !segment_only {
+        assert_eq!(
+            result["i"].as_primitive::<Int32Type>().value(0),
+            6,
+            "{plan}"
+        );
+    }
 }
 
 #[rstest::rstest]
@@ -1846,6 +1946,8 @@ async fn tagged_coverage_filtering_bypasses_system_indexes() {
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     });
     persist_fixture(&mut dataset, indices).await;
 
@@ -1877,7 +1979,7 @@ async fn tagged_coverage_filtering_bypasses_system_indexes() {
 async fn tagged_remapping_plans_coverage_once_per_snapshot() {
     use crate::index::frag_reuse::{
         FriQueryPlanKey, OpenPurpose, ResolvedRemapping, open_row_id_remapping,
-        open_row_id_remapping_with_plan,
+        open_row_id_remapping_with_plan, resolve_query_segment_coverages,
     };
 
     let mut dataset = fixture().await;
@@ -1947,6 +2049,12 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
         .await
         .expect("the first tagged open must publish the snapshot plan");
     assert!(plan.segments.contains_key(&siblings[1].uuid));
+    let resolved = resolve_query_segment_coverages(&dataset, &siblings.iter().collect::<Vec<_>>())
+        .await
+        .unwrap();
+    for (metadata, coverage) in siblings.iter().zip(resolved) {
+        assert_eq!(Some(coverage), metadata.fragment_bitmap);
+    }
 
     // Later opens must resolve from the published plan instead of re-running
     // the whole-dataset sibling scan: with the sibling dropped from the cached
@@ -1957,6 +2065,15 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
     let mut pruned = plan.as_ref().clone();
     pruned.segments.remove(&siblings[1].uuid);
     plan_cache.insert_with_key(&key, Arc::new(pruned)).await;
+    let no_sibling_coverage = resolve_query_segment_coverages(&dataset, &[&siblings[1]])
+        .await
+        .unwrap_err();
+    assert!(
+        no_sibling_coverage
+            .to_string()
+            .contains("FRI query coverage is unavailable"),
+        "{no_sibling_coverage}"
+    );
     let mapping = FragmentReuseIndex::open(&dataset, fri).await.unwrap();
     let empty = RoaringBitmap::new();
     let no_coverage = mapping.translation_fingerprint(&empty, &empty, &[]);
@@ -3296,6 +3413,8 @@ async fn install_history(
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     indices.push(fri.clone());
     Arc::make_mut(&mut dataset.manifest).fragments = live.into();

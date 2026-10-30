@@ -38,6 +38,7 @@ use lance_table::format::{DataFile, DataStorageFormat, Fragment, Manifest};
 use object_store::path::Path;
 
 use super::Dataset;
+use super::blob::BlobPayloadInventory;
 use super::fragment::{
     FileFragment, FragReadConfig, GenericFileReader, MetadataMode, V1FragmentReader,
     write::FragmentCreateBuilder,
@@ -131,7 +132,8 @@ pub async fn write_fragments(
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
-    keep_field_ids: bool,
+    inherited_field_ids: bool,
+    created_blob_payloads: Option<BlobPayloadInventory>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     // A writer that spills row lineage into the fragment's own data file
     // carries the hidden columns in its stream. They are not dataset fields:
@@ -140,12 +142,7 @@ pub async fn write_fragments(
     // the blob promotion, which gives every negative field id a new one.
     let (mut normalized_schema, lineage_fields) = split_row_lineage_fields(normalized_schema)?;
     if dataset.is_none() {
-        if keep_field_ids {
-            normalized_schema.try_set_field_id(None)?;
-        } else {
-            // Input Arrow IDs must not seed allocation for a new dataset's blob children.
-            normalized_schema.try_reassign_field_ids(None)?;
-        }
+        write::assign_new_table_field_ids(&mut normalized_schema, inherited_field_ids)?;
     }
     let normalized_schema = match version {
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
@@ -159,7 +156,7 @@ pub async fn write_fragments(
         normalized_schema,
         &params,
         schema_compare_options(version),
-        keep_field_ids,
+        inherited_field_ids,
     )?;
     schema.fields.extend(lineage_fields);
     match version {
@@ -185,6 +182,7 @@ pub async fn write_fragments(
         seeds,
         file_row_counts,
         preassigned_data_file_name,
+        created_blob_payloads,
     )
     .await?;
     Ok((fragments, schema))
@@ -234,6 +232,13 @@ pub fn validate_row_limits(version: ConcreteFileVersion, params: &WriteParams) -
             "max_rows_per_file must be greater than zero",
         ));
     }
+    if params.max_rows_per_file > u32::MAX as usize {
+        return Err(Error::invalid_input(format!(
+            "max_rows_per_file cannot exceed the fragment row capacity of {} rows, got {}",
+            u32::MAX,
+            params.max_rows_per_file
+        )));
+    }
     if matches!(version, ConcreteFileVersion::V1) && params.max_rows_per_group == 0 {
         return Err(Error::invalid_input(
             "max_rows_per_group must be greater than zero",
@@ -255,13 +260,23 @@ pub async fn write_fragments_direct(
     seeds: SeedCollector,
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
+    created_blob_payloads: Option<BlobPayloadInventory>,
 ) -> Result<Vec<Fragment>> {
     validate_row_limits(version, &params)?;
     let buffered_reader = if let Some(file_row_counts) = file_row_counts.as_ref() {
-        if file_row_counts.contains(&0) {
-            return Err(Error::invalid_input(
-                "File row counts must be greater than zero",
-            ));
+        if let Some(rows) = file_row_counts.iter().find(|rows| **rows == 0) {
+            return Err(Error::invalid_input(format!(
+                "File row counts must be greater than zero, got {rows}"
+            )));
+        }
+        if let Some(rows) = file_row_counts
+            .iter()
+            .find(|rows| **rows > u32::MAX as usize)
+        {
+            return Err(Error::invalid_input(format!(
+                "File row counts cannot exceed the fragment row capacity of {} rows, got {rows}",
+                u32::MAX
+            )));
         }
         match version {
             ConcreteFileVersion::V1 => {
@@ -314,6 +329,7 @@ pub async fn write_fragments_direct(
         seeds,
         file_row_counts,
         preassigned_data_file_name,
+        created_blob_payloads,
     )
     .await
 }
@@ -1188,5 +1204,22 @@ mod tests {
         assert_eq!(user.fields, vec![key, named_like_lineage]);
         // Split out with its reserved id intact.
         assert_eq!(lineage, vec![hidden]);
+    }
+
+    #[test]
+    fn rejects_file_limit_above_fragment_row_capacity() {
+        let params = WriteParams {
+            max_rows_per_file: u32::MAX as usize + 1,
+            ..Default::default()
+        };
+
+        let error = validate_row_limits(ConcreteFileVersion::V2_0, &params).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot exceed the fragment row capacity"),
+            "{error}"
+        );
     }
 }

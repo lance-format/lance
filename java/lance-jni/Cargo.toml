@@ -1,6 +1,6 @@
 [package]
 name = "lance-jni"
-version = "15.0.0-beta.1"
+version = "15.0.0-beta.7"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 rust-version = "1.94"
@@ -34,11 +34,11 @@ lance-namespace-impls = { path = "../../rust/lance-namespace-impls", features = 
 lance-core = { path = "../../rust/lance-core" }
 lance-file = { path = "../../rust/lance-file" }
 lance-table = { path = "../../rust/lance-table" }
-arrow = { version = "58.0.0", features = ["ffi"] }
-arrow-array = "58.0.0"
-arrow-schema = "58.0.0"
-datafusion = { version = "54.0.0", default-features = false }
-datafusion-common = "54.0.0"
+arrow = { version = "59.2.0", features = ["ffi"] }
+arrow-array = "59.2.0"
+arrow-schema = "59.2.0"
+datafusion = { version = "55.0.0", default-features = false }
+datafusion-common = "55.0.0"
 object_store = { version = "0.14.2" }
 tokio = { version = "1.23", features = [
     "rt-multi-thread",
@@ -79,6 +79,3 @@ strip = true
 
 [lints.clippy]
 disallowed_macros = "deny"
-
-[patch.crates-io]
-object_store = { git = "https://github.com/apache/arrow-rs-object-store.git", rev = "c10758c207c0103355f940f0c736fb8ecb157b04" }

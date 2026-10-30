@@ -9,10 +9,13 @@ use arrow::array::{AsArray, BooleanBuilder, ListBuilder, UInt32Builder};
 use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_array::{Array, BooleanArray, Float32Array, OffsetSizeTrait, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, SchemaRef};
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{NullEquality, Statistics};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::ChildStats;
+use datafusion::physical_plan::StatisticsArgs;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, reset_plan_states};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, Gauge, MetricValue, MetricsSet};
@@ -54,6 +57,7 @@ use crate::index::scalar::inverted::{
     ResolvedFtsField, flatten_fts_document_column, fts_document_schema, load_segment_details,
     load_segments, transform_fts_document_stream,
 };
+use crate::index::segment_coverage::{SegmentCoverage, SegmentRowDomain};
 use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::inverted::builder::ScoredDoc;
@@ -237,6 +241,13 @@ impl ExecutionPlan for FtsDocumentExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -271,13 +282,13 @@ impl ExecutionPlan for FtsDocumentExec {
 
 /// Open one FTS segment as an [`InvertedIndex`].
 ///
-/// With `restrict_rows` the segment may only report live rows currently stored in the
-/// fragments it covers (see [`open_fts_segments`]).
+/// With `coverage` the segment may only report live rows currently stored in the fragments
+/// it covers (see [`open_fts_segments`]).
 async fn open_fts_segment(
     dataset: &Dataset,
     column: &str,
     segment: &IndexMetadata,
-    restrict_rows: bool,
+    coverage: Option<(&SegmentCoverage, usize)>,
     metrics: &IndexMetrics,
 ) -> Result<Arc<InvertedIndex>> {
     let open = async {
@@ -296,15 +307,8 @@ async fn open_fts_segment(
             })
     };
     let allowed_rows = async {
-        let coverage = if restrict_rows {
-            segment.effective_fragment_bitmap(&dataset.fragment_bitmap)
-        } else {
-            None
-        };
-        match coverage.and_then(|coverage| {
-            DatasetPreFilter::create_restricted_deletion_mask(Arc::new(dataset.clone()), coverage)
-        }) {
-            Some(mask) => Ok(Some(mask.await?)),
+        match coverage {
+            Some((coverage, index)) => Ok(Some(coverage.live_rows(index).await?)),
             None => Ok(None),
         }
     };
@@ -330,12 +334,13 @@ async fn open_fts_segments(
     segments: &[IndexMetadata],
     metrics: &IndexMetrics,
 ) -> Result<Vec<Arc<InvertedIndex>>> {
-    let restrict_rows = dataset.manifest.uses_stable_row_ids() && segments.len() > 1;
-    try_join_all(
-        segments
-            .iter()
-            .map(|segment| open_fts_segment(dataset, column, segment, restrict_rows, metrics)),
-    )
+    let segment_refs = segments.iter().collect::<Vec<_>>();
+    let coverage =
+        SegmentCoverage::resolve(dataset, &segment_refs, SegmentRowDomain::RowId).await?;
+    try_join_all(segments.iter().enumerate().map(|(index, segment)| {
+        let coverage = coverage.as_ref().map(|coverage| (coverage, index));
+        open_fts_segment(dataset, column, segment, coverage, metrics)
+    }))
     .await
 }
 
@@ -1193,6 +1198,13 @@ impl ExecutionPlan for HybridCompoundQueryExec {
         vec![Distribution::SinglePartition; self.children().len()]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -1544,6 +1556,13 @@ impl ExecutionPlan for CompoundQueryExec {
             .iter()
             .map(|_| Distribution::SinglePartition)
             .collect()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -2097,6 +2116,13 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
             .iter()
             .map(|_| Distribution::SinglePartition)
             .collect()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -2811,6 +2837,13 @@ impl ExecutionPlan for SharedFtsScorerExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![Distribution::SinglePartition]
     }
@@ -3410,6 +3443,13 @@ impl ExecutionPlan for MatchQueryExec {
             .collect()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -3950,6 +3990,13 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
             .collect()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -4210,11 +4257,9 @@ impl FlatMatchFilterExec {
                     column
                 ))
             })?;
-            return Ok(
-                open_fts_segment(dataset, column, index_meta, false, metrics)
-                    .await?
-                    .tokenizer(),
-            );
+            return Ok(open_fts_segment(dataset, column, index_meta, None, metrics)
+                .await?
+                .tokenizer());
         }
         Ok(default_text_tokenizer())
     }
@@ -4228,11 +4273,9 @@ impl FlatMatchFilterExec {
         let index_meta = segments.first().ok_or_else(|| {
             DataFusionError::Execution(format!("FTS index for column {} has no segments", column))
         })?;
-        Ok(
-            open_fts_segment(dataset, column, index_meta, false, metrics)
-                .await?
-                .tokenizer(),
-        )
+        Ok(open_fts_segment(dataset, column, index_meta, None, metrics)
+            .await?
+            .tokenizer())
     }
 
     pub fn new(
@@ -4488,6 +4531,13 @@ impl ExecutionPlan for FlatMatchFilterExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -4543,8 +4593,16 @@ impl ExecutionPlan for FlatMatchFilterExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DataFusionResult<Arc<Statistics>> {
+        Ok(Arc::clone(&input_stats[0]))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -4780,6 +4838,13 @@ impl ExecutionPlan for FlatMatchQueryExec {
         // this, EnforceDistribution may round-robin the scan across `target_partitions`
         // and only partition 0 is consumed, silently dropping the other fragments.
         vec![Distribution::SinglePartition; self.children().len()]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -5158,6 +5223,13 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
             .iter()
             .map(|_| Distribution::SinglePartition)
             .collect()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -5654,6 +5726,13 @@ impl ExecutionPlan for PhraseQueryExec {
             .collect()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -5932,6 +6011,13 @@ impl ExecutionPlan for BoostQueryExec {
             .collect()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -6207,6 +6293,13 @@ impl ExecutionPlan for BooleanQueryExec {
             .collect()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -6355,11 +6448,17 @@ impl ExecutionPlan for BooleanQueryExec {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::physical_plan::ChildrenPropertiesMode;
+    use datafusion::physical_plan::ReplaceChildrenOptions;
+    use datafusion_physical_expr::PhysicalExpr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use crate::index::DatasetIndexExt;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int32Type;
     use arrow_array::{
         ArrayRef, Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
         UInt64Array, record_batch,
@@ -6395,8 +6494,8 @@ mod tests {
     };
     use lance_index::scalar::inverted::{
         CombinedCorpusStats, CombinedFieldColumn, DocumentGranularity, FTS_SCHEMA, InvertedIndex,
-        Language, MemBM25Scorer, SCORE_COL, build_combined_bm25_scorer, build_global_bm25_scorer,
-        prepare_bm25_query,
+        InvertedListFormatVersion, Language, MemBM25Scorer, SCORE_COL, build_combined_bm25_scorer,
+        build_global_bm25_scorer, prepare_bm25_query,
     };
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{IndexCriteria, IndexType};
@@ -6405,12 +6504,16 @@ mod tests {
         result::{IndexExprResult, IndexExprResultWireFormat},
     };
     use lance_table::format::IndexMetadata;
+    use lance_table::io::manifest::read_manifest_indexes;
+    use lance_table::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
     use rstest::rstest;
     use uuid::Uuid;
 
     use crate::{
         Dataset,
         dataset::WriteParams,
+        dataset::index::{DatasetIndexRemapperOptions, frag_reuse::cleanup_frag_reuse_index},
+        dataset::optimize::{CompactionOptions, CompactionTask, TaskData, commit_compaction},
         dataset::transaction::{Operation, TransactionBuilder},
         dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched},
         index::DatasetIndexInternalExt,
@@ -6673,7 +6776,13 @@ mod tests {
         let replaced: Arc<dyn ExecutionPlan> =
             Arc::new(hybrid.with_indexed_input(indexed, scorer).unwrap());
         assert_eq!(replaced.children().len(), 2);
-        assert_eq!(replaced.required_input_distribution().len(), 2);
+        assert_eq!(
+            replaced
+                .input_distribution_requirements()
+                .per_child_distributions()
+                .len(),
+            2
+        );
         // Scanner plans retain execution state, so the comparison needs an
         // independent residual scan over the same immutable dataset snapshot.
         let mut scanner = hybrid.dataset().scan();
@@ -6683,7 +6792,12 @@ mod tests {
             .with_fragments(vec![hybrid.dataset().fragments().last().unwrap().clone()]);
         let mut children = replaced.children().into_iter().cloned().collect::<Vec<_>>();
         children[0] = scanner.create_plan().await.unwrap();
-        let rewritten = replaced.with_new_children(children).unwrap();
+        let rewritten = replaced
+            .replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap();
         let actual = rewritten
             .execute(0, Arc::new(TaskContext::default()))
             .unwrap()
@@ -6727,7 +6841,12 @@ mod tests {
         assert!(matches!(error, DataFusionError::Plan(_)));
         assert!(error.to_string().contains("bounded limit"));
 
-        let error = Arc::new(hybrid).with_new_children(vec![]).unwrap_err();
+        let error = Arc::new(hybrid)
+            .replace_children(
+                vec![],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap_err();
         assert!(matches!(error, DataFusionError::Internal(_)));
         assert!(error.to_string().contains("expected 1 children"));
     }
@@ -6763,7 +6882,12 @@ mod tests {
         let replaced: Arc<dyn ExecutionPlan> =
             Arc::new(hybrid.with_indexed_input(input, scorer).unwrap());
         let children = replaced.children().into_iter().cloned().collect();
-        let rewritten = replaced.with_new_children(children).unwrap();
+        let rewritten = replaced
+            .replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap();
         let error = rewritten
             .execute(0, Arc::new(TaskContext::default()))
             .unwrap()
@@ -7039,8 +7163,8 @@ mod tests {
         assert_eq!(filtered.children().len(), 2);
         assert!(
             filtered
-                .required_input_distribution()
-                .iter()
+                .input_distribution_requirements()
+                .per_child_distributions()
                 .all(|distribution| {
                     matches!(
                         distribution,
@@ -7070,15 +7194,20 @@ mod tests {
         );
         let rebuilt = filtered
             .clone()
-            .with_new_children(vec![
-                expanded_corpus,
-                empty.execution_plan().unwrap().clone(),
-            ])
+            .replace_children(
+                vec![expanded_corpus, empty.execution_plan().unwrap().clone()],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
             .unwrap();
         assert!(execute_results(rebuilt.as_ref()).await.unwrap().is_empty());
         assert_eq!(rebuilt.metrics().unwrap().output_rows(), Some(0));
         assert_eq!(shared.wait().await.unwrap().num_docs(), 6);
-        let error = filtered.with_new_children(vec![]).unwrap_err();
+        let error = filtered
+            .replace_children(
+                vec![],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap_err();
         assert!(matches!(error, DataFusionError::Internal(_)));
         assert!(error.to_string().contains("expected 2 children"));
     }
@@ -7095,7 +7224,12 @@ mod tests {
         };
         assert!(matches!(error, DataFusionError::Internal(_)));
         assert!(error.to_string().contains("got 0 and 0"));
-        let error = owner.with_new_children(vec![]).unwrap_err();
+        let error = owner
+            .replace_children(
+                vec![],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap_err();
         assert!(matches!(error, DataFusionError::Internal(_)));
         assert!(error.to_string().contains("requires one input"));
     }
@@ -7147,6 +7281,12 @@ mod tests {
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![&self.input]
+        }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+        ) -> DataFusionResult<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
         }
         fn with_new_children(
             self: Arc<Self>,
@@ -7275,10 +7415,17 @@ mod tests {
         let union = UnionExec::try_new(vec![indexed, flat]).unwrap();
         let input: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(union));
         let owner = Arc::new(SharedFtsScorerExec::new(input.clone(), shared));
-        let owner = owner.with_new_children(vec![input]).unwrap();
-        assert_eq!(owner.required_input_distribution().len(), 1);
+        let owner = owner
+            .replace_children(
+                vec![input],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap();
+        let distributions = owner.input_distribution_requirements();
+        let distributions = distributions.per_child_distributions().collect::<Vec<_>>();
+        assert_eq!(distributions.len(), 1);
         assert!(matches!(
-            owner.required_input_distribution()[0],
+            distributions[0],
             datafusion_physical_expr::Distribution::SinglePartition
         ));
         assert_eq!(owner.schema(), FTS_SCHEMA.clone());
@@ -8031,6 +8178,295 @@ mod tests {
         );
     }
 
+    // Check the indexed leaf separately: the full scanner's fallback can hide stale
+    // postings even when the addresses passed from the leaf to Take are invalid.
+    async fn assert_partial_fts_results(
+        dataset: &Dataset,
+        index_uuid: Uuid,
+        expected_indexed: &[i32],
+        expected_all: &[i32],
+    ) {
+        let leaf = MatchQueryExec::new_with_segment_uuids(
+            Arc::new(dataset.clone()),
+            MatchQuery::new("searchable".into())
+                .with_column(Some("text".into()))
+                .with_document_granularity(DocumentGranularity::Row),
+            FtsSearchParams::default().with_limit(Some(1000)),
+            PreFilterSource::None,
+            vec![index_uuid],
+        )
+        .unwrap();
+        let mut addresses = execute_row_ids(&leaf).await.unwrap();
+        assert_eq!(
+            addresses.len(),
+            expected_indexed.len(),
+            "FTS must exclude postings outside its healed coverage"
+        );
+        assert!(
+            addresses.iter().all(|&address| dataset
+                .fragment_bitmap
+                .contains(RowAddress::from(address).fragment_id())),
+            "FTS must not return retired row addresses"
+        );
+
+        // Score order need not match physical row order. Verify Take preserves the
+        // requested order and one output row per address, including with deletions.
+        addresses.swap(0, 2);
+        let mut expected_taken = expected_indexed.to_vec();
+        expected_taken.swap(0, 2);
+        let taken = Arc::new(dataset.clone())
+            .take_builder(&addresses, Arc::new(dataset.schema().clone()))
+            .unwrap()
+            .with_row_address(false)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(taken.num_rows(), addresses.len());
+        assert_eq!(
+            taken["id"].as_primitive::<Int32Type>().values().as_ref(),
+            expected_taken
+        );
+
+        // The compacted destination must be scanned by the fallback. Exact IDs
+        // detect both missing rows and duplicates across indexed and flat results.
+        let mut scan = dataset.scan();
+        scan.full_text_search(FullTextSearchQuery::new("searchable".into()))
+            .unwrap();
+        scan.limit(Some(1000), None).unwrap();
+        let results = scan.try_into_batch().await.unwrap();
+        let mut actual = results["id"].as_primitive::<Int32Type>().values().to_vec();
+        actual.sort_unstable();
+        assert_eq!(actual, expected_all);
+    }
+
+    #[rstest]
+    #[case::no_deletion(false)]
+    #[case::surviving_deletion(true)]
+    #[tokio::test]
+    async fn test_fts_v1_partial_coverage_after_fri_cleanup(#[case] has_surviving_deletion: bool) {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "text",
+                lance_datagen::array::cycle_utf8_literals(&["searchable document"]),
+            )
+            .into_dataset_with_params(
+                "memory://",
+                FragmentCount::from(259),
+                FragmentRowCount::from(2),
+                Some(WriteParams {
+                    max_rows_per_file: 2,
+                    enable_stable_row_ids: false,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 259);
+        if has_surviving_deletion {
+            // Keep a deletion vector on a surviving indexed fragment, to cover the block-list path.
+            dataset.delete("id = 202").await.unwrap();
+        }
+        let params = InvertedIndexParams::default()
+            .format_version(InvertedListFormatVersion::V1)
+            .with_position(false);
+        // An existing index overlaps the rewrite, causing deferred compaction to
+        // record reuse history while its replacement builds on a pinned snapshot.
+        let old_index = dataset
+            .create_index_builder(&["text"], IndexType::Inverted, &params)
+            .name("text_idx".into())
+            .fragments((0..3).chain(101..259).collect())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments("text_idx", "text", vec![old_index])
+            .await
+            .unwrap();
+        let mut build_snapshot = dataset.clone();
+        let mut parts = Vec::with_capacity(2);
+        for fragments in [(0..130).collect(), (130..259).collect()] {
+            parts.push(
+                build_snapshot
+                    .create_index_builder(&["text"], IndexType::Inverted, &params)
+                    .name("text_idx".into())
+                    .replace(true)
+                    .fragments(fragments)
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(parts.iter().all(|s| s.index_version == 1));
+
+        let appended = lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step_custom::<Int32Type>(518, 1))
+            .col(
+                "text",
+                lance_datagen::array::cycle_utf8_literals(&["searchable document"]),
+            )
+            .into_reader_rows(RowCount::from(40), BatchCount::from(1));
+        dataset
+            .append(
+                appended,
+                Some(WriteParams {
+                    max_rows_per_file: 2,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 279);
+
+        // Rewrite 101 indexed fragments together with 20 appended fragments.
+        // The staged build covers only 101/121 inputs, so it cannot cover the destination.
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        let task = CompactionTask {
+            task: TaskData {
+                fragments: dataset
+                    .fragments()
+                    .iter()
+                    .filter(|f| f.id < 101 || f.id >= 259)
+                    .cloned()
+                    .collect(),
+                output_clustering_id: None,
+                output_metadata: Default::default(),
+            },
+            read_version: dataset.version().version,
+            options: options.clone(),
+        };
+        assert_eq!(task.task.fragments.len(), 121);
+        let rewritten = task.execute(&dataset).await.unwrap();
+        assert_eq!(rewritten.new_fragments.len(), 1);
+        commit_compaction(
+            &mut dataset,
+            vec![rewritten],
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        let stored = read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
+        let fri_meta = stored
+            .iter()
+            .find(|i| i.name == FRAG_REUSE_INDEX_NAME)
+            .unwrap();
+        assert_eq!(fri_meta.index_version, 0);
+        let fri = crate::index::frag_reuse::load_frag_reuse_index_details(&dataset, fri_meta)
+            .await
+            .unwrap();
+        let group = &fri.versions.last().unwrap().groups[0];
+        assert_eq!(group.old_frags.len(), 121);
+        assert_eq!(group.new_frags.len(), 1);
+        let new_fragment = group.new_frags[0].id;
+
+        // Publish the staged build after compaction, from its original snapshot.
+        let merged = build_snapshot
+            .merge_existing_index_segments(parts)
+            .await
+            .unwrap();
+        assert_eq!(merged.index_version, 1);
+        let build_coverage = merged.fragment_bitmap.as_ref().unwrap();
+        assert_eq!(build_coverage.len(), 259);
+        assert_eq!(
+            group
+                .old_frags
+                .iter()
+                .filter(|f| build_coverage.contains(f.id as u32))
+                .count(),
+            101
+        );
+        build_snapshot
+            .commit_existing_index_segments("text_idx", "text", vec![merged])
+            .await
+            .unwrap();
+        dataset = build_snapshot;
+        let raw = read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
+        let raw_fts = raw.iter().find(|i| i.name == "text_idx").unwrap();
+        let raw_overlap = group
+            .old_frags
+            .iter()
+            .filter(|f| {
+                raw_fts
+                    .fragment_bitmap
+                    .as_ref()
+                    .unwrap()
+                    .contains(f.id as u32)
+            })
+            .count();
+        assert_eq!(raw_overlap, 101);
+        let segments = crate::index::scalar::inverted::load_segments(
+            &dataset,
+            "text",
+            DocumentGranularity::Row,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(segments.len(), 1);
+        let coverage = segments[0].fragment_bitmap.as_ref().unwrap();
+        assert_eq!(coverage.len(), 158);
+        assert!(!coverage.contains(new_fragment as u32));
+        assert!(coverage.iter().all(|id| (101..259).contains(&id)));
+        let index_uuid = segments[0].uuid;
+        let expected_indexed = (202..518)
+            .filter(|id| !has_surviving_deletion || *id != 202)
+            .collect::<Vec<_>>();
+        let expected_all = (0..558)
+            .filter(|id| !has_surviving_deletion || *id != 202)
+            .collect::<Vec<_>>();
+
+        // A normal metadata commit persists the healed bitmap without rewriting
+        // postings. Warm the index while the original FRI mapping still exists.
+        dataset.delete("false").await.unwrap();
+        let stored = read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
+        let stored_fts = stored.iter().find(|i| i.name == "text_idx").unwrap();
+        assert_eq!(stored_fts.uuid, index_uuid);
+        assert_eq!(stored_fts.fragment_bitmap.as_ref(), Some(coverage));
+        let before_cleanup = dataset.clone();
+        let original_fri = dataset.frag_reuse_index().await.unwrap().unwrap();
+        assert_eq!(original_fri.details.versions.len(), 1);
+        assert_partial_fts_results(&dataset, index_uuid, &expected_indexed, &expected_all).await;
+
+        // Once coverage no longer intersects the retired fragments or destination,
+        // cleanup can discard this mapping. The unchanged postings must still be
+        // restricted to live covered fragments, even when a deletion vector exists.
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+        let trimmed_fri = dataset.frag_reuse_index().await.unwrap().unwrap();
+        assert!(trimmed_fri.details.versions.is_empty());
+        assert_ne!(trimmed_fri.uuid, original_fri.uuid);
+        assert_partial_fts_results(&dataset, index_uuid, &expected_indexed, &expected_all).await;
+        assert_partial_fts_results(
+            &before_cleanup,
+            index_uuid,
+            &expected_indexed,
+            &expected_all,
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn test_match_query_exec_segment_selection() {
         let (dataset, segments, fragment_ids) = create_segment_selection_fixture().await;
@@ -8156,7 +8592,10 @@ mod tests {
             )
             .unwrap(),
         )
-        .with_new_children(vec![])
+        .replace_children(
+            vec![],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
         .unwrap();
         let rewritten = ordered_plan.downcast_ref::<MatchQueryExec>().unwrap();
         assert_eq!(
@@ -8393,7 +8832,10 @@ mod tests {
             )
             .unwrap(),
         )
-        .with_new_children(vec![])
+        .replace_children(
+            vec![],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
         .unwrap();
         let rewritten = ordered_plan.downcast_ref::<PhraseQueryExec>().unwrap();
         assert_eq!(
@@ -9251,6 +9693,15 @@ mod tests {
                 .await
                 .unwrap();
         }
+        let engines = MatchQuery::new("engines".into()).with_column(Some("text".into()));
+        assert_eq!(
+            fts_hits(&dataset, engines.into())
+                .await
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            ["a1", "a4"]
+        );
 
         let update = record_batch!(
             ("id", Utf8, ["a1"]),

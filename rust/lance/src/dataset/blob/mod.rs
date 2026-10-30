@@ -26,12 +26,13 @@ pub use materialize::{
     materialize_blob_v2_binary_batch_with_admission, public_blob_v2_binary_output_schema,
     schema_has_blob_v2_binary_view, split_batch_by_bytes,
 };
-pub use prepared::{prepared_blob_batch_to_descriptors, prepared_blob_ids};
+pub use prepared::{prepared_blob_batch_to_descriptors, prepared_blob_ids, prepared_sidecar_bytes};
 pub use read::{
     BlobRangeRequest, BlobReadRange, ReadBlob, ReadBlobRange, ReadBlobRangesBuilder,
     ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream, take_blobs_by_addresses,
 };
 pub(super) use read::{take_blobs, validate_blob_column};
+pub use write::BlobPayloadInventory;
 pub use write::BlobPreprocessor;
 pub(super) use write::{
     blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,

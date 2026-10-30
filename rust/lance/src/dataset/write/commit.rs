@@ -8,6 +8,7 @@ use std::time::Duration;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_select::RowAddrTreeMap;
+use lance_table::format::ClusteringDefinition;
 use lance_table::{
     format::{DataStorageFormat, is_detached_version},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
@@ -57,7 +58,10 @@ pub struct CommitBuilder<'a> {
     activate_non_reusable_field_ids: bool,
     /// Set only by `Dataset::deep_clone`, after it has copied the source files.
     deep_clone_files_copied: bool,
-    keep_field_ids: bool,
+    inherited_field_ids: bool,
+    /// The complete desired clustering definitions list for an `UpdateConfig`
+    /// commit; see [`ManifestBuildConfig::clustering_definitions`].
+    clustering_definitions: Option<Vec<ClusteringDefinition>>,
 }
 
 /// Default timeout applied to [`CommitBuilder::execute`] when none is set.
@@ -84,7 +88,8 @@ impl<'a> CommitBuilder<'a> {
             migration_next_row_id: None,
             activate_non_reusable_field_ids: false,
             deep_clone_files_copied: false,
-            keep_field_ids: false,
+            inherited_field_ids: false,
+            clustering_definitions: None,
         }
     }
 
@@ -154,6 +159,42 @@ impl<'a> CommitBuilder<'a> {
     /// `Uri` destination resolves one from the uri.
     pub fn with_commit_handler(mut self, commit_handler: Arc<dyn CommitHandler>) -> Self {
         self.commit_handler = Some(commit_handler);
+        self
+    }
+
+    /// Commit the complete list of clustering definitions this writer wants
+    /// the table to hold, planned against the manifest it read. Only an
+    /// `UpdateConfig` may carry it: the list rides alongside the metadata it
+    /// publishes and the commit stays a plain `UpdateConfig`; the manifest is
+    /// the durable record of the definitions. Any other operation refuses this
+    /// input, and so does a detached commit.
+    ///
+    /// The list is applied against the landing manifest on every attempt: a
+    /// definition allocated or removed underneath it, or one whose identity
+    /// changed, refuses the commit so the writer plans again. Every definition
+    /// the list allocates (each id above the read manifest's allocation mark,
+    /// not only the highest) is checked against the landing schema from the
+    /// schema the writer read: every key field must still be the same typed
+    /// field by id (same logical type along its path and in its subtree, a
+    /// timestamp's unit and timezone included). A same-id rename keeps a key;
+    /// a retype, a drop or a cast under a new id refuses the commit, and with
+    /// it every other allocation in the list. Retained definitions are not
+    /// checked.
+    ///
+    /// Definitions key on schema field ids, so allocating the first one on a
+    /// table with reusable field ids activates non-reusable field ids in the
+    /// same commit (see [`Dataset::migrate_to_non_reusable_field_ids`]): a
+    /// dropped key field's id is never handed to a later column, and an
+    /// overwrite assigns ids above the mark. Until that activation lands, a
+    /// stricter fence in the conflict resolver refuses concurrent schema
+    /// replacements that could reassign a key's id; it compares names too and
+    /// is deliberately separate from the typed check above. Activation is
+    /// permanent: clearing the definitions does not undo it, and under that
+    /// contract the versions from before the activating commit can no longer
+    /// be restored (they stay readable). A table already under the contract is
+    /// unaffected.
+    pub fn with_clustering_definitions(mut self, definitions: Vec<ClusteringDefinition>) -> Self {
+        self.clustering_definitions = Some(definitions);
         self
     }
 
@@ -300,10 +341,10 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
-    /// Create the dataset with the field ids its schema already carries; see
-    /// [`InsertBuilder::with_table_field_ids`](super::InsertBuilder::with_table_field_ids).
-    pub(crate) fn with_table_field_ids(mut self) -> Self {
-        self.keep_field_ids = true;
+    /// Create the dataset keeping an existing table's field IDs; see
+    /// [`InsertBuilder::with_inherited_field_ids`](super::InsertBuilder::with_inherited_field_ids).
+    pub(crate) fn with_inherited_field_ids(mut self) -> Self {
+        self.inherited_field_ids = true;
         self
     }
 
@@ -334,6 +375,16 @@ impl<'a> CommitBuilder<'a> {
     }
 
     async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
+        // A definitions list is a commit-time input for UpdateConfig alone. Every
+        // other operation is refused here, before any path is chosen: the
+        // new-dataset paths never reach the manifest builder's own check.
+        if self.clustering_definitions.is_some()
+            && !matches!(transaction.operation, Operation::UpdateConfig { .. })
+        {
+            return Err(Error::invalid_input(
+                "a complete clustering definitions list can only be committed with UpdateConfig",
+            ));
+        }
         if matches!(
             transaction.operation,
             Operation::Clone {
@@ -463,6 +514,7 @@ impl<'a> CommitBuilder<'a> {
             storage_format: self.storage_format.map(DataStorageFormat::new),
             migration_next_row_id: self.migration_next_row_id,
             activate_non_reusable_field_ids: self.activate_non_reusable_field_ids,
+            clustering_definitions: self.clustering_definitions.clone(),
             ..Default::default()
         };
 
@@ -514,7 +566,7 @@ impl<'a> CommitBuilder<'a> {
                 manifest_naming_scheme,
                 metadata_cache.as_ref(),
                 session.clone(),
-                self.keep_field_ids,
+                self.inherited_field_ids,
             )
             .await?
         };
@@ -680,13 +732,13 @@ mod tests {
             .execute(transaction)
             .await
             .unwrap();
-        assert_eq!(dataset.schema().field("a").unwrap().id, 0);
+        assert_eq!(dataset.schema().field("a").unwrap().id, 42);
         assert_eq!(dataset.schema().metadata, metadata);
         let committed = dataset.read_transaction().await.unwrap().unwrap();
         let Operation::Overwrite { schema, .. } = committed.operation else {
             panic!("expected Overwrite");
         };
-        assert_eq!(schema.field("a").unwrap().id, 0);
+        assert_eq!(schema.field("a").unwrap().id, 42);
         assert_eq!(schema.metadata, metadata);
     }
 
@@ -757,6 +809,8 @@ mod tests {
             physical_rows: Some(10),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -1403,6 +1457,7 @@ mod tests {
                 new_fragments: vec![],
                 removed_fragment_ids: vec![],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,

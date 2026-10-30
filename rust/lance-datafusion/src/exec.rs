@@ -13,6 +13,8 @@ use std::{
 use chrono::{DateTime, Utc};
 
 use arrow_schema::Schema as ArrowSchema;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::{
     catalog::{TableProvider, streaming::StreamingTable},
     dataframe::DataFrame,
@@ -23,6 +25,7 @@ use datafusion::{
         metrics::MetricValue, stream::RecordBatchStreamAdapter, streaming::PartitionStream,
     },
 };
+use datafusion_common::config::ConfigNonZeroUsize;
 use futures::StreamExt;
 use lance_core::{Error, Result, utils::tracing::StreamTracingExt};
 use tracing::Span;
@@ -83,6 +86,13 @@ impl ExecutionPlan for TracedExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> datafusion_common::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -211,6 +221,11 @@ fn get_task_context(
     let Some(batch_size) = options.validated_batch_size()? else {
         return Ok(Arc::new(task_ctx));
     };
+    let batch_size = ConfigNonZeroUsize::try_new(batch_size).map_err(|_| {
+        Error::invalid_input(format!(
+            "LanceExecutionOptions.batch_size must be greater than 0, got {batch_size}"
+        ))
+    })?;
     let mut session_config = task_ctx.session_config().clone();
     session_config.options_mut().execution.batch_size = batch_size;
     Ok(Arc::new(task_ctx.with_session_config(session_config)))
@@ -225,6 +240,20 @@ pub fn execute_plan(
     options: LanceExecutionOptions,
 ) -> Result<SendableRecordBatchStream> {
     let task_context = get_task_context(&get_session_context(&options), &options)?;
+    execute_plan_with_context(plan, options, task_context)
+}
+
+/// Executes a plan with an existing session context.
+///
+/// This is useful when resources created outside the physical plan, such as
+/// replay spill files, must share the context's memory or disk managers with
+/// operators in the plan. `options` must describe the supplied context.
+pub fn execute_plan_with_session_context(
+    plan: Arc<dyn ExecutionPlan>,
+    options: LanceExecutionOptions,
+    session_ctx: &SessionContext,
+) -> Result<SendableRecordBatchStream> {
+    let task_context = get_task_context(session_ctx, &options)?;
     execute_plan_with_context(plan, options, task_context)
 }
 
@@ -254,14 +283,11 @@ pub async fn analyze_plan_with_context(
 
     let schema = plan.schema();
     // TODO(tsaucer) I chose SUMMARY here but do we also want DEV?
-    let analyze = Arc::new(AnalyzeExec::new(
-        true,
-        true,
-        vec![MetricType::Summary],
-        None,
-        plan,
-        schema,
-    ));
+    let analyze = Arc::new(
+        AnalyzeExec::builder(true, true, plan, schema)
+            .with_metric_types(vec![MetricType::Summary])
+            .build(),
+    );
 
     let session_ctx = get_session_context(&options);
     let task_context = match task_context {
@@ -796,6 +822,14 @@ mod tests {
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![]
+        }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn PhysicalExpr>,
+            ) -> datafusion_common::Result<TreeNodeRecursion>,
+        ) -> datafusion_common::Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
         }
         fn with_new_children(
             self: Arc<Self>,

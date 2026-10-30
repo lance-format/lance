@@ -325,12 +325,12 @@ pub(crate) enum TaggedTrimOutcome {
     NothingToTrim,
     /// Replace the current entry with the filtered history.
     Replace {
-        new_entry: IndexMetadata,
-        current_entry: IndexMetadata,
+        new_entry: Box<IndexMetadata>,
+        current_entry: Box<IndexMetadata>,
     },
     /// Everything trimmed away: delete the entry outright. The manifest
     /// feature flags stay set (they are sticky).
-    Delete { current_entry: IndexMetadata },
+    Delete { current_entry: Box<IndexMetadata> },
 }
 
 /// Segments of a logical index whose whole contribution is already served
@@ -513,12 +513,12 @@ async fn cleanup_tagged_frag_reuse_index(dataset: &mut Dataset) -> lance_core::R
             new_entry,
             current_entry,
         } => Operation::CreateIndex {
-            new_indices: vec![new_entry],
-            removed_indices: vec![current_entry],
+            new_indices: vec![*new_entry],
+            removed_indices: vec![*current_entry],
         },
         TaggedTrimOutcome::Delete { current_entry } => Operation::CreateIndex {
             new_indices: vec![],
-            removed_indices: vec![current_entry],
+            removed_indices: vec![*current_entry],
         },
     };
 
@@ -854,7 +854,7 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
     }
     if retained.iter().all(|kept| !*kept) {
         return Ok(TaggedTrimOutcome::Delete {
-            current_entry: entry,
+            current_entry: Box::new(entry),
         });
     }
 
@@ -885,8 +885,8 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
     decode_frag_reuse_ledger_from_content(entry.index_version, &new_content).await?;
     let new_entry = build_tagged_frag_reuse_entry(dataset, new_content, fragment_bitmap).await?;
     Ok(TaggedTrimOutcome::Replace {
-        new_entry,
-        current_entry: entry,
+        new_entry: Box::new(new_entry),
+        current_entry: Box::new(entry),
     })
 }
 
@@ -938,6 +938,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -2290,6 +2292,8 @@ mod tests {
                 created_at: None,
                 base_id: None,
                 files: None,
+                clustering_id: None,
+                metadata: Default::default(),
             };
             dataset
                 .apply_commit(

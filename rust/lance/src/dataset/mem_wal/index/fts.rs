@@ -3210,8 +3210,10 @@ fn index_text_with_predicate(
     term_builders: &mut FxHashMap<Arc<str>, BatchTermBuilder>,
     mut retain_term: impl FnMut(&str) -> bool,
 ) -> Result<(u32, bool)> {
+    let discount_overlaps = tokenizer.discount_overlaps();
     let mut stream = tokenizer.token_stream_for_doc(text);
     let mut num_tokens = 0u32;
+    let mut last_position = None;
     let mut retained_term = false;
     while let Some(token) = stream.next() {
         let position = u32::try_from(token.position).map_err(|_| {
@@ -3232,11 +3234,14 @@ fn index_text_with_predicate(
                 );
             }
         }
-        num_tokens = num_tokens.checked_add(1).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "token count overflow for document_position={document_position}"
-            ))
-        })?;
+        if !discount_overlaps || last_position != Some(token.position) {
+            num_tokens = num_tokens.checked_add(1).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "document length overflow for document_position={document_position}"
+                ))
+            })?;
+        }
+        last_position = Some(token.position);
     }
     Ok((num_tokens, retained_term))
 }
@@ -5920,6 +5925,41 @@ mod tests {
             .collect::<Vec<_>>();
         rows.sort_unstable();
         assert_eq!(rows, vec![0, 1]);
+    }
+
+    #[rstest]
+    #[case::full(false)]
+    #[case::query_filtered(true)]
+    fn test_code_document_lengths_and_frequencies(#[case] is_filtered: bool) {
+        let mut tokenizer = InvertedIndexParams::code()
+            .split_identifiers(true)
+            .build()
+            .unwrap();
+        let mut terms = FxHashMap::default();
+        let allowed = FxHashSet::from_iter(["get".to_string()]);
+        for (row, text, expected) in [
+            (0, "getUserName", 3),
+            (1, "get_user_name", 3),
+            (2, "get user name", 3),
+            (3, "user name get", 3),
+            (4, "getUserName getUserName", 6),
+            (5, "otherIdentifier", 2),
+        ] {
+            let length = if is_filtered {
+                index_text_filtered(text, row, tokenizer.as_mut(), &mut terms, &allowed)
+                    .unwrap()
+                    .0
+            } else {
+                index_text(text, row, tokenizer.as_mut(), &mut terms).unwrap()
+            };
+            assert_eq!(length, expected, "{text}");
+        }
+        assert_eq!(terms["get"].frequencies, vec![1, 1, 1, 1, 2]);
+        if !is_filtered {
+            assert_eq!(terms["getusername"].frequencies, vec![1, 2]);
+            assert_eq!(terms["getusername"].pos_data, vec![0, 0, 3]);
+            assert_eq!(terms["get_user_name"].frequencies, vec![1]);
+        }
     }
 
     #[test]

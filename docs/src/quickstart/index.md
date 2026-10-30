@@ -1,108 +1,144 @@
 ---
-title: Quickstart
-description: Get started with Lance - create datasets, convert from Parquet, and learn the basics
+title: LanceDB Quickstart
+description: Get started with Lance using LanceDB - create a table, query it, and run vector and full-text search
 ---
 
-# Getting Started with Lance Tables
+# Getting Started with LanceDB
 
-This quickstart guide will walk you through the core features of Lance including creating datasets, versioning, and vector search.
+Lance is an open table format. You can work with Lance tables from many engines, and this quickstart covers three of them:
 
-By the end of this tutorial, you'll be able to create Lance datasets from pandas DataFrames and convert existing Parquet files to Lance format. You'll also understand the basic workflow for working with Lance datasets and be prepared to explore advanced features like versioning and vector search.
+- **LanceDB** (this page) is a retrieval database built on Lance. It runs embedded in your application or as a distributed service.
+- **[Apache Spark](spark.md)** runs SQL and distributed data processing on Lance tables.
+- **[PyLance](pylance.md)** is the Python SDK for the Lance format itself, for low-level control over datasets.
 
-## Install the Python SDK
+All three engines read and write the same format, so a table you create with one of them can be opened with the others.
 
-The easiest way to get started with Lance is via our Python SDK `pylance`:
+In this guide, you'll create a small product catalog with LanceDB, filter it, search it by vector similarity and by keyword, modify it, and look back at earlier versions.
+
+## Install LanceDB
+
+This guide displays results as pandas DataFrames, so install pandas as well:
 
 ```bash
-pip install pylance
+--8<-- "snippets/quickstart/lancedb-install.sh"
 ```
 
-For the latest features and bug fixes, you can install the preview version:
+## Connect to a Database
 
-=== "pip"
-
-    ```bash
-    pip install --pre --extra-index-url https://pypi.fury.io/lance-format pylance
-    ```
-
-=== "uv"
-
-    ```bash
-    uv venv
-    uv pip install --prerelease allow --index https://pypi.fury.io/lance-format pylance
-
-    # To add to pyproject.toml, just do:
-    uv add --prerelease allow --index https://pypi.fury.io/lance-format pylance
-    ```
-
-!!! note
-    Preview releases receive the same level of testing as regular releases.
-
-## Set Up Your Environment
-
-First, let's import the necessary libraries:
+This guide uses LanceDB in embedded mode, where a database is a directory of Lance tables, on local disk or in object storage such as `s3://`. Connect to a local path; LanceDB creates it if it doesn't exist:
 
 ```python
-import shutil
-import lance
-import numpy as np
-import pandas as pd
-import pyarrow as pa
+--8<-- "snippets/quickstart/lancedb_quickstart.py:connect"
 ```
 
-## Create Your First Dataset
+The same client connects to a distributed LanceDB deployment when you pass a `db://` URI instead of a path.
 
-Lance is built on top of Apache Arrow, making it incredibly easy to work with pandas DataFrames and Arrow tables. You can create Lance datasets from various data sources including pandas DataFrames, Arrow tables, and existing Parquet files. Lance automatically handles the conversion and optimization for you.
+## Create a Table
 
-### Create a Simple Dataset
-
-You'll create a simple dataframe and then write it to Lance format. This demonstrates the basic workflow for creating Lance datasets.
-
-Create a simple dataframe:
+Create a table from a list of dictionaries. LanceDB infers the schema and stores the `vector` column as a fixed-size vector:
 
 ```python
-df = pd.DataFrame({"a": [5]})
-df
+--8<-- "snippets/quickstart/lancedb_quickstart.py:create"
 ```
 
-Now you'll write this dataframe to Lance format and verify the data was saved correctly:
-
-```python
-shutil.rmtree("/tmp/test.lance", ignore_errors=True)
-
-dataset = lance.write_dataset(df, "/tmp/test.lance")
-dataset.to_table().to_pandas()
+```output
+--8<-- "snippets/quickstart/outputs/lancedb_quickstart.py.create.txt"
 ```
 
-### Convert Your Existing Parquet Files
+LanceDB also accepts pandas DataFrames, Polars DataFrames, and Arrow tables as input.
 
-You'll convert an existing Parquet file to Lance format. This shows how to migrate your existing data to Lance.
+## Filter Rows
 
-First, you'll create a Parquet file and then convert it to Lance:
+Use SQL expressions to filter rows and choose columns:
 
 ```python
-shutil.rmtree("/tmp/test.parquet", ignore_errors=True)
-shutil.rmtree("/tmp/test.lance", ignore_errors=True)
-
-tbl = pa.Table.from_pandas(df)
-pa.dataset.write_dataset(tbl, "/tmp/test.parquet", format='parquet')
-
-parquet = pa.dataset.dataset("/tmp/test.parquet")
-parquet.to_table().to_pandas()
+--8<-- "snippets/quickstart/lancedb_quickstart.py:filter"
 ```
 
-Now you'll convert the Parquet dataset to Lance format in a single line:
+```output
+--8<-- "snippets/quickstart/outputs/lancedb_quickstart.py.filter.txt"
+```
+
+## Search by Vector Similarity
+
+Pass a query vector to `search` to find the nearest rows. The `_distance` column holds each row's distance from the query:
 
 ```python
-dataset = lance.write_dataset(parquet, "/tmp/test.lance")
+--8<-- "snippets/quickstart/lancedb_quickstart.py:vector-search"
+```
 
-# Make sure it's the same
-dataset.to_table().to_pandas()
+```output
+--8<-- "snippets/quickstart/outputs/lancedb_quickstart.py.vector-search.txt"
+```
+
+You can combine vector search with a filter:
+
+```python
+--8<-- "snippets/quickstart/lancedb_quickstart.py:filtered-vector-search"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/lancedb_quickstart.py.filtered-vector-search.txt"
+```
+
+On a small table like this one, LanceDB compares the query against every vector. For larger tables, create a [vector index](https://docs.lancedb.com/indexing) to keep searches fast.
+
+## Search by Keyword
+
+Create a full-text search index on a text column, then search it with keywords. The `_score` column holds each row's relevance score:
+
+```python
+--8<-- "snippets/quickstart/lancedb_quickstart.py:fts"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/lancedb_quickstart.py.fts.txt"
+```
+
+## Add, Update, and Delete Rows
+
+```python
+--8<-- "snippets/quickstart/lancedb_quickstart.py:modify"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/lancedb_quickstart.py.modify.txt"
+```
+
+## Time Travel
+
+Every change creates a new version of the table:
+
+```python
+--8<-- "snippets/quickstart/lancedb_quickstart.py:version"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/lancedb_quickstart.py.version.txt"
+```
+
+Earlier versions stay readable. Check out version 1 to see the table as it was when you created it:
+
+```python
+--8<-- "snippets/quickstart/lancedb_quickstart.py:checkout"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/lancedb_quickstart.py.checkout.txt"
+```
+
+Return to the latest version to continue making changes:
+
+```python
+--8<-- "snippets/quickstart/lancedb_quickstart.py:checkout-latest"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/lancedb_quickstart.py.checkout-latest.txt"
 ```
 
 ## Next Steps
 
-Now that you've mastered the basics of creating Lance datasets, here's what you can explore next:
-
-- **[Versioning Your Datasets with Lance](versioning.md)** - Learn how to track changes over time with native versioning
-- **[Vector Indexing and Vector Search With Lance](vector-search.md)** - Build high-performance vector search capabilities with ANN indices
+- Read the [LanceDB documentation](https://docs.lancedb.com/) for embeddings, hybrid search, reranking, distributed deployments, and the TypeScript and Rust SDKs.
+- See the [Spark quickstart](spark.md) to process Lance tables at scale with SQL.
+- See the [PyLance quickstart](pylance.md) to work directly with the Lance format.

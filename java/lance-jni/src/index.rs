@@ -3,6 +3,7 @@
 
 use crate::error::{Error, Result};
 use crate::traits::{IntoJava, export_vec};
+use crate::utils::to_java_map;
 use jni::JNIEnv;
 use jni::objects::{JObject, JValue};
 use jni::sys::jbyte;
@@ -161,10 +162,18 @@ impl IntoJava for &IndexMetadata {
         // Determine index type from index_details type_url
         let index_type = determine_index_type(env, &self.index_details)?;
 
+        // A u32 id fits a Java long losslessly; `Integer` would fold the upper
+        // half of the range into negative values.
+        let clustering_id = match self.clustering_id {
+            Some(id) => env.new_object("java/lang/Long", "(J)V", &[JValue::Long(i64::from(id))])?,
+            None => JObject::null(),
+        };
+        let metadata = to_java_map(env, &self.metadata)?;
+
         // Create Index object
         Ok(env.new_object(
             "org/lance/index/Index",
-            "(Ljava/util/UUID;Ljava/util/List;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Ljava/lang/Long;Ljava/util/List;Lorg/lance/index/IndexType;)V",
+            "(Ljava/util/UUID;Ljava/util/List;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Ljava/lang/Long;Ljava/util/List;Lorg/lance/index/IndexType;Ljava/lang/Long;Ljava/util/Map;)V",
             &[
                 JValue::Object(&uuid),
                 JValue::Object(&fields),
@@ -179,6 +188,8 @@ impl IntoJava for &IndexMetadata {
                 JValue::Object(&size_bytes),
                 JValue::Object(&files),
                 JValue::Object(&index_type),
+                JValue::Object(&clustering_id),
+                JValue::Object(&metadata),
             ],
         )?)
     }
