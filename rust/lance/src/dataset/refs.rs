@@ -674,9 +674,10 @@ impl Branches<'_> {
                     if remaining_paths.contains(&path) {
                         continue;
                     }
-                    if remaining_paths.iter().any(|remaining| {
-                        remaining.prefix_matches(&path) || path.prefix_matches(remaining)
-                    }) {
+                    if remaining_paths
+                        .iter()
+                        .any(|remaining| remaining.prefix_matches(&path))
+                    {
                         // A shared directory must remain, but the deleted branch's own
                         // files (especially its manifests) must not remain accessible.
                         let entries = self.object_store().list_with_delimiter(Some(&path)).await?;
