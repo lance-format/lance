@@ -729,12 +729,32 @@ impl Branches<'_> {
                                 )
                                 .await?;
                             // Hierarchical stores may include the listed directory's marker.
-                            pending.extend(
-                                entries
-                                    .common_prefixes
-                                    .into_iter()
-                                    .filter(|child| child != &path && child.prefix_matches(&path)),
-                            );
+                            let canonical_path = if has_local_paths {
+                                self.object_store().canonicalize_local_path(&path).await?
+                            } else {
+                                None
+                            };
+                            for child in entries
+                                .common_prefixes
+                                .into_iter()
+                                .filter(|child| child != &path && child.prefix_matches(&path))
+                            {
+                                if has_local_paths {
+                                    let canonical_child =
+                                        self.object_store().canonicalize_local_path(&child).await?;
+                                    match (&canonical_path, canonical_child) {
+                                        (Some(parent), Some(child))
+                                            if child.starts_with(parent) => {}
+                                        _ => {
+                                            log::warn!(
+                                                "Keeping aliased branch subtree {child}: canonical path leaves parent {path}"
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                }
+                                pending.push(child);
+                            }
                         }
                         SharedBranchPath::Unrelated => {
                             if let Err(e) = self.object_store().remove_dir_all(path).await {
@@ -859,16 +879,20 @@ impl Branches<'_> {
         }
         let mut is_ancestor = false;
         for remaining in remaining_paths {
-            match (&canonical_path, &remaining.canonical_path) {
-                (Some(path), Some(remaining)) if path == remaining => {
-                    return Ok(SharedBranchPath::Remaining);
-                }
-                (Some(path), Some(remaining)) => {
-                    is_ancestor |= remaining.starts_with(path);
-                }
-                _ if &remaining.path == path => return Ok(SharedBranchPath::Remaining),
-                _ => is_ancestor |= remaining.path.prefix_matches(path),
+            if &remaining.path == path
+                || canonical_path
+                    .as_ref()
+                    .zip(remaining.canonical_path.as_ref())
+                    .is_some_and(|(path, remaining)| path == remaining)
+            {
+                return Ok(SharedBranchPath::Remaining);
             }
+            let is_logical_descendant = remaining.path.prefix_matches(path);
+            let is_physical_descendant = canonical_path
+                .as_ref()
+                .zip(remaining.canonical_path.as_ref())
+                .is_some_and(|(path, remaining)| remaining.starts_with(path));
+            is_ancestor |= is_logical_descendant || is_physical_descendant;
         }
         if is_ancestor {
             Ok(SharedBranchPath::Ancestor)

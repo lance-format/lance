@@ -1695,6 +1695,75 @@ async fn test_delete_branch_preserves_relocated_parent_data(#[case] use_object_s
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn test_delete_branch_preserves_symlink_routed_child_namespace() {
+    let tempdir = TempDir::default();
+    let uri = tempdir.path_str();
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    let mut parent = root.create_branch("p", 1, None).await.unwrap();
+    parent.append(id_rows(10, 2), None).await.unwrap();
+    let mut removed = root.create_branch("a", 1, None).await.unwrap();
+    removed.append(id_rows(20, 1), None).await.unwrap();
+
+    let data_path = tempdir.std_path().join("tree/p/data");
+    let relocated_data = tempdir.std_path().join("relocated-data");
+    std::fs::rename(&data_path, &relocated_data).unwrap();
+    std::os::unix::fs::symlink(&relocated_data, &data_path).unwrap();
+    let route = tempdir.std_path().join("tree/a/b");
+    std::os::unix::fs::symlink(&relocated_data, &route).unwrap();
+
+    let mut child = root.create_branch("a/b/x", 1, None).await.unwrap();
+    child.append(id_rows(30, 1), None).await.unwrap();
+
+    root.delete_branch("a").await.unwrap();
+
+    assert!(route.is_symlink(), "the surviving branch route was removed");
+    assert!(root.list_branches().await.unwrap().contains_key("a/b/x"));
+    let parent = Dataset::open(&uri)
+        .await
+        .unwrap()
+        .checkout_branch("p")
+        .await
+        .unwrap();
+    assert_eq!(
+        parent.scan().try_into_batch().await.unwrap()["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .as_ref(),
+        &[0, 10, 11]
+    );
+    let child = Dataset::open(&uri)
+        .await
+        .unwrap()
+        .checkout_branch("a/b/x")
+        .await
+        .unwrap();
+    assert_eq!(
+        child.scan().try_into_batch().await.unwrap()["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .as_ref(),
+        &[0, 30]
+    );
+    match Dataset::open(&uri)
+        .await
+        .unwrap()
+        .checkout_version(("a", None))
+        .await
+    {
+        Err(Error::NotFound { .. } | Error::DatasetNotFound { .. }) => {}
+        Err(error) => panic!("unexpected checkout error: {error}"),
+        Ok(still_readable) => panic!(
+            "deleted branch is still readable: {:?}",
+            still_readable.scan().try_into_batch().await.unwrap()["id"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .as_ref()
+        ),
+    }
+}
+
 #[tokio::test]
 async fn test_branch() {
     let tempdir = TempDir::default();
