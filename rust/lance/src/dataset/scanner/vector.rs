@@ -380,7 +380,7 @@ impl Scanner {
             // fragment, so sparse overlays incur near-zero overhead.
             let stale_rows = self.overlay_stale_vector_rows(&index_segments)?;
             // Build a prefilter block mask for stale rows (empty = no-op fast path).
-            let overlay_block = self.stale_rows_block_mask(&stale_rows).await?;
+            let overlay_block = stale_rows.block_mask().await?;
 
             let ann_query = if self.quantized_refine_factor.is_some() {
                 let exact_factor = q.refine_factor.unwrap_or(1) as usize;
@@ -799,7 +799,7 @@ impl Scanner {
         q: &Query,
         index_name: &str,
         indexed_segments: &[IndexMetadata],
-        stale_rows: &HashMap<u32, RoaringBitmap>,
+        stale_rows: &IndexVisibility,
         mut knn_node: Arc<dyn ExecutionPlan>,
         filter_plan: &ExprFilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -902,7 +902,8 @@ impl Scanner {
                 let filter_columns = Planner::column_names_in_expr(expr);
                 take_proj = take_proj.union_columns(filter_columns, OnMissing::Error)?;
             }
-            let mut stale_node = self.stale_rows_take(stale_rows, take_proj).await?;
+            let mut stale_node =
+                self.row_ids_take(stale_rows.result_rows().await?.clone(), take_proj)?;
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 stale_node = Arc::new(LanceFilterExec::try_new(expr.clone(), stale_node)?);
             }

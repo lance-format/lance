@@ -54,6 +54,7 @@ use uuid::Uuid;
 use crate::dataset::Dataset;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::index::DatasetIndexExt;
+use crate::index::visibility::IndexVisibility;
 use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::scalar::fetch_index_details;
 use crate::index::scalar::inverted::{
@@ -76,7 +77,7 @@ use super::{FilterPlan, PlannedFilteredScan, Scanner, fts_indexed_columns};
 enum FtsOverlayPlan {
     Unchanged(Option<Vec<IndexMetadata>>),
     RowLevel {
-        stale_rows: HashMap<u32, RoaringBitmap>,
+        stale_rows: IndexVisibility,
         segments: Vec<IndexMetadata>,
     },
     FullScan,
@@ -1679,7 +1680,10 @@ impl Scanner {
                     let flat_phrase_plan = self
                         .plan_flat_match_query(
                             unindexed_fragments,
-                            HashMap::new(),
+                            IndexVisibility::from_physical_rows(
+                                self.dataset.clone(),
+                                HashMap::new(),
+                            ),
                             &flat_query,
                             &flat_params,
                             FlatMatchFilter::BeforeScoring(filter_plan),
@@ -1693,7 +1697,10 @@ impl Scanner {
                     .fts_overlay_plan(&column, document_granularity, target_fragments)
                     .await?
                 {
-                    FtsOverlayPlan::Unchanged(segments) => (HashMap::new(), segments),
+                    FtsOverlayPlan::Unchanged(segments) => (
+                        IndexVisibility::from_physical_rows(self.dataset.clone(), HashMap::new()),
+                        segments,
+                    ),
                     FtsOverlayPlan::RowLevel {
                         stale_rows,
                         segments,
@@ -1705,7 +1712,10 @@ impl Scanner {
                         let flat_phrase_plan = self
                             .plan_flat_match_query(
                                 target_fragments.to_vec(),
-                                HashMap::new(),
+                                IndexVisibility::from_physical_rows(
+                                    self.dataset.clone(),
+                                    HashMap::new(),
+                                ),
                                 &flat_query,
                                 &flat_params,
                                 FlatMatchFilter::BeforeScoring(filter_plan),
@@ -1715,7 +1725,7 @@ impl Scanner {
                         return Self::combine_fts_leaf_plans(None, Some(flat_phrase_plan), params);
                     }
                 };
-                let overlay_block = self.stale_rows_block_mask(&stale_rows).await?;
+                let overlay_block = stale_rows.block_mask().await?;
                 let segments = match preset_segments {
                     Some(segments) => segments,
                     None => load_segments(&self.dataset, &column, document_granularity)
@@ -1779,7 +1789,7 @@ impl Scanner {
                 let flat_phrase_plan = self
                     .plan_flat_match_query(
                         target_fragments.to_vec(),
-                        HashMap::new(),
+                        IndexVisibility::from_physical_rows(self.dataset.clone(), HashMap::new()),
                         &flat_query,
                         &flat_params,
                         FlatMatchFilter::BeforeScoring(filter_plan),
@@ -1926,7 +1936,7 @@ impl Scanner {
         let flat_plan = self
             .plan_flat_match_query(
                 corpus_fragments,
-                HashMap::new(),
+                IndexVisibility::from_physical_rows(self.dataset.clone(), HashMap::new()),
                 query,
                 params,
                 FlatMatchFilter::AtEmission(candidate_filter),
@@ -1992,7 +2002,10 @@ impl Scanner {
                     let flat_match_plan = self
                         .plan_flat_match_query(
                             unindexed_fragments,
-                            HashMap::new(),
+                            IndexVisibility::from_physical_rows(
+                                self.dataset.clone(),
+                                HashMap::new(),
+                            ),
                             query,
                             params,
                             FlatMatchFilter::BeforeScoring(filter_plan),
@@ -2006,7 +2019,10 @@ impl Scanner {
                     .fts_overlay_plan(&column, document_granularity, target_fragments)
                     .await?
                 {
-                    FtsOverlayPlan::Unchanged(segments) => (HashMap::new(), segments),
+                    FtsOverlayPlan::Unchanged(segments) => (
+                        IndexVisibility::from_physical_rows(self.dataset.clone(), HashMap::new()),
+                        segments,
+                    ),
                     FtsOverlayPlan::RowLevel {
                         stale_rows,
                         segments,
@@ -2018,7 +2034,10 @@ impl Scanner {
                         let flat_match_plan = self
                             .plan_flat_match_query(
                                 target_fragments.to_vec(),
-                                HashMap::new(),
+                                IndexVisibility::from_physical_rows(
+                                    self.dataset.clone(),
+                                    HashMap::new(),
+                                ),
                                 query,
                                 params,
                                 FlatMatchFilter::BeforeScoring(filter_plan),
@@ -2028,7 +2047,7 @@ impl Scanner {
                         return Self::combine_fts_leaf_plans(None, Some(flat_match_plan), params);
                     }
                 };
-                let overlay_block = self.stale_rows_block_mask(&stale_rows).await?;
+                let overlay_block = stale_rows.block_mask().await?;
                 let has_flat_path = !self.fast_search
                     && (!unindexed_fragments.is_empty() || !stale_rows.is_empty());
                 let shared_scorer = (has_flat_path && document_granularity.is_list_element())
@@ -2086,7 +2105,7 @@ impl Scanner {
                 let flat_match_plan = self
                     .plan_flat_match_query(
                         target_fragments.to_vec(),
-                        HashMap::new(),
+                        IndexVisibility::from_physical_rows(self.dataset.clone(), HashMap::new()),
                         query,
                         params,
                         FlatMatchFilter::BeforeScoring(filter_plan),
@@ -2138,7 +2157,7 @@ impl Scanner {
     async fn plan_flat_match_query(
         &self,
         fragments: Vec<Fragment>,
-        stale_rows: HashMap<u32, RoaringBitmap>,
+        stale_rows: IndexVisibility,
         query: &MatchQuery,
         params: &FtsSearchParams,
         filter: FlatMatchFilter<'_>,
@@ -2328,8 +2347,8 @@ impl Scanner {
             {
                 FtsOverlayPlan::Unchanged(_) => {}
                 FtsOverlayPlan::RowLevel { stale_rows, .. } => {
-                    column_stale_rows = self.stale_rows_in_id_domain(&stale_rows).await?;
-                    for (fragment_id, offsets) in stale_rows {
+                    column_stale_rows = stale_rows.result_rows().await?.clone();
+                    for (&fragment_id, offsets) in stale_rows.physical_rows() {
                         *stale_addresses.entry(fragment_id).or_default() |= offsets;
                     }
                 }
@@ -2361,7 +2380,8 @@ impl Scanner {
 
         // A stale row in a fragment the flat side reads whole is already read there.
         stale_addresses.retain(|fragment_id, _| !uncovered.contains(*fragment_id));
-        let overlay_block = self.stale_rows_block_mask(&stale_addresses).await?;
+        let stale_rows = IndexVisibility::from_physical_rows(self.dataset.clone(), stale_addresses);
+        let overlay_block = stale_rows.block_mask().await?;
 
         let uncovered_fragments: Vec<Fragment> = corpus_fragments
             .iter()
@@ -2414,7 +2434,7 @@ impl Scanner {
         // entries anywhere: one unified scan that already emits merged hits sorted
         // by score with the top-k limit applied, so no union/sort is needed, and
         // there are no fragments to restrict the prefilter to.
-        if uncovered_fragments.is_empty() && stale_addresses.is_empty() {
+        if uncovered_fragments.is_empty() && stale_rows.is_empty() {
             return Ok(index_exec(None, None));
         }
         // `fast_search` is index-only by contract, but must still drop the
@@ -2446,7 +2466,7 @@ impl Scanner {
             .iter()
             .map(|fragment| fragment.id as u32)
             .collect();
-        scanned_fragments.extend(stale_addresses.keys().copied());
+        scanned_fragments.extend(stale_rows.physical_rows().keys().copied());
         // The flat side reads unfiltered and applies the filter only to the rows it
         // emits, as the indexed side does, so every row it reads counts toward the
         // corpus. Pushing the filter into the scan would make the corpus depend on
@@ -2468,7 +2488,7 @@ impl Scanner {
         let flat_plan = self
             .plan_flat_combined_fields_query(
                 flat_fragments,
-                stale_addresses,
+                stale_rows,
                 scanned_fragments,
                 stats_scope,
                 emit_prefilter,
@@ -2517,7 +2537,7 @@ impl Scanner {
     async fn plan_flat_combined_fields_query(
         &self,
         fragments: Vec<Fragment>,
-        stale_rows: HashMap<u32, RoaringBitmap>,
+        stale_rows: IndexVisibility,
         scanned_fragments: RoaringBitmap,
         stats_scope: FlatStatsScope,
         emit_prefilter: PreFilterSource,
@@ -2602,28 +2622,10 @@ impl Scanner {
             return Ok(FtsOverlayPlan::Unchanged(None));
         };
 
-        let overlaid_frags = overlaid_fragments(target_fragments);
-        let mut stale_rows = HashMap::new();
-        for segment in &segments {
-            if segment.fragment_bitmap.is_none() {
-                let mut legacy_stale_rows = HashMap::new();
-                collect_overlay_stale_rows_for_segment(
-                    segment,
-                    &overlaid_frags,
-                    &mut legacy_stale_rows,
-                    self.dataset.schema(),
-                )?;
-                if !legacy_stale_rows.is_empty() {
-                    return Ok(FtsOverlayPlan::FullScan);
-                }
-            } else {
-                collect_overlay_stale_rows_for_segment(
-                    segment,
-                    &overlaid_frags,
-                    &mut stale_rows,
-                    self.dataset.schema(),
-                )?;
-            }
+        let stale_rows =
+            IndexVisibility::from_segments(self.dataset.clone(), &segments, target_fragments)?;
+        if stale_rows.has_stale_unknown_coverage() {
+            return Ok(FtsOverlayPlan::FullScan);
         }
 
         if stale_rows.is_empty() {

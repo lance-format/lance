@@ -71,16 +71,15 @@ use uuid::Uuid;
 
 use crate::dataset::Dataset;
 use crate::index::loading::DatasetIndexInternalExt;
-use crate::index::prefilter::{DatasetPreFilter, FilterLoader, mask_selects_nothing};
+use crate::index::prefilter::{DatasetPreFilter, mask_selects_nothing};
 use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
 use crate::session::index_caches::SegmentOwnershipMaskKey;
 use crate::{Error, Result};
 use lance_arrow::*;
 
-use super::row_addr_mask::MaskAndLoader;
 use super::utils::{
-    FilteredRowIdsToPrefilter, IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterMasks,
-    PreFilterSource, SelectionVectorToPrefilter,
+    IndexMetrics, InstrumentedRecordBatchStreamAdapter, PreFilterMasks, PreFilterSource,
+    build_prefilter,
 };
 
 mod adaptive_probe;
@@ -1248,50 +1247,6 @@ pub static KNN_PARTITION_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         Field::new(INDEX_UUID_COLUMN, DataType::Utf8, false),
     ]))
 });
-
-/// Build the shared [`DatasetPreFilter`] for an ANN search node, executing the
-/// prefilter source (if any) for this partition. Used by both the single-query
-/// [`ANNIvfSubIndexExec`] and the batch [`ANNIvfBatchExec`] so the prefilter is
-/// wired identically (and, for a batch, built once and shared across queries).
-///
-/// `masks.overlay_block`, when `Some`, excludes rows whose index entries may be stale
-/// due to a newer data overlay (see [`DatasetPreFilter::with_overlay_block`]).
-fn build_dataset_prefilter(
-    dataset: Arc<Dataset>,
-    indices: &[IndexMetadata],
-    prefilter_source: &PreFilterSource,
-    partition: usize,
-    context: Arc<datafusion::execution::context::TaskContext>,
-    masks: PreFilterMasks,
-    metrics: &ExecutionPlanMetricsSet,
-) -> DataFusionResult<Arc<DatasetPreFilter>> {
-    let prefilter_loader = match prefilter_source {
-        PreFilterSource::FilteredRowIds(src_node) => {
-            let stream = src_node.execute(partition, context)?;
-            Some(
-                Box::new(FilteredRowIdsToPrefilter::new(stream).with_metrics(metrics, partition))
-                    as Box<dyn FilterLoader>,
-            )
-        }
-        PreFilterSource::ScalarIndexQuery(src_node) => {
-            let stream = src_node.execute(partition, context)?;
-            Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
-        }
-        PreFilterSource::None => None,
-    };
-    // AND the external row-address mask into whatever the filter produced.
-    let prefilter_loader = match masks.external_mask {
-        Some(mask) => {
-            Some(Box::new(MaskAndLoader::new(mask, prefilter_loader)) as Box<dyn FilterLoader>)
-        }
-        None => prefilter_loader,
-    };
-    let mut pre_filter = DatasetPreFilter::new(dataset, indices, prefilter_loader);
-    if let Some(overlay_block) = masks.overlay_block {
-        pre_filter = pre_filter.with_overlay_block(overlay_block);
-    }
-    Ok(Arc::new(pre_filter))
-}
 
 /// Create a new ANN execution node. `overlay_block`, when `Some`, excludes rows whose index
 /// entries may be stale due to a newer data overlay (see [`ANNIvfSubIndexExec::with_overlay_block`]).
@@ -2622,12 +2577,12 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 async move { DataFusionResult::Ok(stream::iter(plan)) }
             })
             .try_flatten();
-        let pre_filter = build_dataset_prefilter(
+        let pre_filter = build_prefilter(
+            context,
+            partition,
+            &prefilter_source,
             ds.clone(),
             &indices,
-            &prefilter_source,
-            partition,
-            context,
             PreFilterMasks {
                 overlay_block: self.overlay_block.clone(),
                 external_mask: self.external_mask.clone(),
@@ -2804,7 +2759,7 @@ pub fn new_knn_batch_exec(
 /// because the two-node pipeline streams one partition-list per delta through a
 /// per-query top-k, whereas the shared scan must invert queries onto partitions
 /// and keep one heap per query in a single pass. It still reuses the underlying
-/// primitives (partition load, prefilter wiring via `build_dataset_prefilter`,
+/// primitives (partition load, prefilter wiring via `build_prefilter`,
 /// and the per-partition accumulate the index performs).
 ///
 /// Output schema: `{query_index: Int32, _distance: Float32, _rowid: UInt64}`,
@@ -2996,12 +2951,12 @@ impl ExecutionPlan for ANNIvfBatchExec {
         let metrics_clone = metrics.clone();
         let timer = Instant::now();
 
-        let pre_filter = build_dataset_prefilter(
+        let pre_filter = build_prefilter(
+            context,
+            partition,
+            &self.prefilter_source,
             ds.clone(),
             &indices,
-            &self.prefilter_source,
-            partition,
-            context,
             // Batch queries have no overlay or external row-address mask.
             PreFilterMasks {
                 overlay_block: None,
@@ -3423,6 +3378,7 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
 
     use crate::dataset::{WriteMode, WriteParams};
+    use crate::index::prefilter::FilterLoader;
     use crate::index::vector::VectorIndexParams;
     use crate::index::vector::ivf::v2::STREAMING_SEARCH_BATCH_SIZE;
     use crate::io::exec::testing::TestingExec;

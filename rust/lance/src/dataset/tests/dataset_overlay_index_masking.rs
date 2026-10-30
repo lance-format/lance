@@ -868,9 +868,23 @@ async fn vector_query_ids(dataset: &Dataset, k: usize, fast_search: bool) -> Vec
 /// Parametrized over `stable_row_ids` to cover the row-id domain for both block and re-score.
 #[rstest]
 #[tokio::test]
-async fn test_vector_index_rescore_on_overlay(#[values(false, true)] stable_row_ids: bool) {
-    let dataset = create_vector_overlay_dataset(stable_row_ids).await;
+async fn test_vector_index_rescore_on_overlay(
+    #[values(false, true)] stable_row_ids: bool,
+    #[values(false, true)] has_deletion_hole: bool,
+) {
+    let mut dataset = create_vector_overlay_dataset(stable_row_ids).await;
+    if has_deletion_hole {
+        dataset.delete("id = 34").await.unwrap();
+    }
     let ids = vector_query_ids(&dataset, 3, false).await;
+
+    // IVF_FLAT visits the sole partition. Its current top three are deterministic.
+    let expected = [40, 0, 1];
+    let recall =
+        expected.iter().filter(|id| ids.contains(id)).count() as f64 / expected.len() as f64;
+    assert!(recall >= 0.5, "recall={recall}, ids={ids:?}");
+    let unique: RoaringBitmap = ids.iter().map(|id| *id as u32).collect();
+    assert_eq!(unique.len() as usize, ids.len());
 
     // id=40 was moved onto the query and is found by re-scoring (new-match recall).
     assert!(

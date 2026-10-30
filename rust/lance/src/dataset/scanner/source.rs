@@ -38,8 +38,7 @@ use lance_select::{IndexExprResult, RowAddrMask, RowAddrTreeMap};
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 
-use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
-use crate::dataset::rowids::{live_row_addrs_to_row_ids, translate_addr_treemap_to_row_ids};
+use crate::dataset::rowids::live_row_addrs_to_row_ids;
 use crate::dataset::{row_offsets_to_row_addresses, versions};
 use crate::datatypes::Schema;
 use crate::index::visibility::IndexVisibility;
@@ -784,88 +783,17 @@ impl Scanner {
         .await
     }
 
-    /// Compute per-row stale data for a vector index's segments.
-    ///
-    /// Returns a map from fragment_id to the set of row offsets within that fragment that are stale
-    /// (their vector values have been updated by a newer overlay since the index was built). An
-    /// empty map means no stale rows — the fast path where no masking is needed.
-    pub(super) fn overlay_stale_vector_rows(
-        &self,
-        segments: &[IndexMetadata],
-    ) -> Result<HashMap<u32, RoaringBitmap>> {
-        // Scope to the query's target fragments (all dataset fragments if unscoped).
-        let dataset_frags = self.dataset.fragments();
-        let fragments: &[Fragment] = match self.fragments.as_ref() {
-            Some(f) => f.as_slice(),
-            None => dataset_frags.as_slice(),
-        };
-        let overlaid_frags = overlaid_fragments(fragments);
-        if overlaid_frags.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let mut stale: HashMap<u32, RoaringBitmap> = HashMap::new();
-        for segment in segments {
-            collect_overlay_stale_rows_for_segment(
-                segment,
-                &overlaid_frags,
-                &mut stale,
-                self.dataset.schema(),
-            )?;
-        }
-        Ok(stale)
+    /// Resolve stale vector entries within the requested fragment scope.
+    pub(super) fn overlay_stale_vector_rows(&self, segments: &[IndexMetadata]) -> Result<IndexVisibility> {
+        let fragments = self
+            .fragments
+            .as_deref()
+            .unwrap_or_else(|| self.dataset.fragments());
+        IndexVisibility::from_segments(self.dataset.clone(), segments, fragments)
     }
 
-    /// Collect the stale rows into a [`RowAddrTreeMap`] in the domain the index results use.
-    ///
-    /// Index results are in the row-id domain (see `ScalarQuery::evaluate_nullable`), and a
-    /// physical row address equals its row id only when the dataset does not use stable row ids.
-    /// Under stable row ids the addresses are translated to their row ids so the result lines up
-    /// with the index output it is combined with (block mask) or taken against.
-    pub(super) async fn stale_rows_in_id_domain(
-        &self,
-        stale_rows: &HashMap<u32, RoaringBitmap>,
-    ) -> Result<RowAddrTreeMap> {
-        let mut tree_map = RowAddrTreeMap::new();
-        for (&frag_id, offsets) in stale_rows {
-            tree_map.insert_bitmap(frag_id, offsets.clone());
-        }
-        if self.dataset.manifest.uses_stable_row_ids() {
-            tree_map = translate_addr_treemap_to_row_ids(&self.dataset, &tree_map).await?;
-        }
-        Ok(tree_map)
-    }
-
-    /// Build a block-list mask over stale rows, or `None` when there are none.
-    ///
-    /// The mask removes these rows from an index result so the index never emits them; they
-    /// are re-evaluated against their current (overlay-merged) values on a targeted take path
-    /// (see [`Self::stale_rows_take`]).
-    pub(super) async fn stale_rows_block_mask(
-        &self,
-        stale_rows: &HashMap<u32, RoaringBitmap>,
-    ) -> Result<Option<RowAddrMask>> {
-        if stale_rows.is_empty() {
-            return Ok(None);
-        }
-        let tree_map = self.stale_rows_in_id_domain(stale_rows).await?;
-        Ok(Some(RowAddrMask::from_block(tree_map)))
-    }
-
-    /// Take the stale rows by physical address, projecting `projection`, to re-evaluate only
-    /// those rows (rather than their whole fragments) against their current overlay-merged values.
-    ///
-    /// The rows are identified by an address allow list routed through `FilteredReadExec`, not a
-    /// `_rowid` column (`_rowid` and row address diverge under stable row ids — see
-    /// [`Self::stale_rows_in_id_domain`]).
-    pub(super) async fn stale_rows_take(
-        &self,
-        stale_rows: &HashMap<u32, RoaringBitmap>,
-        projection: Projection,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let take_id_map = self.stale_rows_in_id_domain(stale_rows).await?;
-        self.row_ids_take(take_id_map, projection)
-    }
-
+    /// Read a result-domain ID selection against current values and the same
+    /// fragment and physical-row restrictions as the indexed branch.
     pub(super) fn row_ids_take(
         &self,
         rows: RowAddrTreeMap,

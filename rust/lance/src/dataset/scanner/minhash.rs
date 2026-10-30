@@ -29,6 +29,7 @@ use roaring::RoaringBitmap;
 
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::index::DatasetIndexExt;
+use crate::index::visibility::IndexVisibility;
 use crate::index::loading::DatasetIndexInternalExt;
 use crate::io::exec::knn::knn_empty_result_schema;
 use crate::io::exec::{
@@ -135,26 +136,13 @@ impl Scanner {
         // Rows whose value was replaced by a data overlay newer than the index
         // have stale signatures: the index branch blocks them and the flat
         // branch re-scores them from their current value.
-        let mut stale_rows: HashMap<u32, RoaringBitmap> = HashMap::new();
-        if target_fragments
-            .iter()
-            .any(|fragment| !fragment.overlays.is_empty())
-        {
-            let overlaid_frags = overlaid_fragments(target_fragments);
-            for segment in &segments {
-                collect_overlay_stale_rows_for_segment(
-                    segment,
-                    &overlaid_frags,
-                    &mut stale_rows,
-                    self.dataset.schema(),
-                )?;
-            }
-        }
+        let stale_rows =
+            IndexVisibility::from_segments(self.dataset.clone(), &segments, target_fragments)?;
 
         let indexed_plan = if all_unindexed {
             None
         } else {
-            let overlay_block = self.stale_rows_block_mask(&stale_rows).await?;
+            let overlay_block = stale_rows.block_mask().await?;
             let prefilter_source = self
                 .prefilter_source(filter_plan, self.get_indexed_frags(&segments))
                 .await?;
@@ -230,7 +218,7 @@ impl Scanner {
     pub(super) async fn plan_uncovered_rows_scan(
         &self,
         fragments: Vec<Fragment>,
-        stale_rows: HashMap<u32, RoaringBitmap>,
+        stale_rows: IndexVisibility,
         mut columns: Vec<String>,
         filter_plan: &ExprFilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -266,7 +254,8 @@ impl Scanner {
         }
         if !stale_rows.is_empty() {
             // A take by address applies no filter, so the whole plan runs here
-            let mut plan = self.stale_rows_take(&stale_rows, scan_projection).await?;
+            let mut plan =
+                self.row_ids_take(stale_rows.result_rows().await?.clone(), scan_projection)?;
             if let Some(filter) = filter_plan.full_expr.as_ref() {
                 let planner = Planner::new(plan.schema());
                 let filter = planner.optimize_expr(filter.clone())?;
@@ -295,7 +284,7 @@ impl Scanner {
     async fn plan_flat_minhash(
         &self,
         fragments: Vec<Fragment>,
-        stale_rows: HashMap<u32, RoaringBitmap>,
+        stale_rows: IndexVisibility,
         query: &MinHashQuery,
         params: &MinHashLshIndexParams,
         limit: usize,

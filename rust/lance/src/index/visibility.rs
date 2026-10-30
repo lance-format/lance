@@ -35,6 +35,7 @@ pub struct IndexVisibility {
     dataset: Arc<Dataset>,
     physical_rows: HashMap<u32, RoaringBitmap>,
     result_rows: OnceCell<RowAddrTreeMap>,
+    has_stale_unknown_coverage: bool,
 }
 
 impl IndexVisibility {
@@ -45,8 +46,23 @@ impl IndexVisibility {
     ) -> Result<Self> {
         let overlaid = overlaid_fragments(fragments);
         let mut physical_rows = HashMap::new();
+        let mut has_stale_unknown_coverage = false;
         if !overlaid.is_empty() {
             for segment in segments {
+                if segment.fragment_bitmap.is_none() {
+                    let mut stale = HashMap::new();
+                    collect_overlay_stale_rows_for_segment(
+                        segment,
+                        &overlaid,
+                        &mut stale,
+                        dataset.schema(),
+                    )?;
+                    has_stale_unknown_coverage |= !stale.is_empty();
+                    for (fragment, offsets) in stale {
+                        *physical_rows.entry(fragment).or_default() |= offsets;
+                    }
+                    continue;
+                }
                 collect_overlay_stale_rows_for_segment(
                     segment,
                     &overlaid,
@@ -55,7 +71,9 @@ impl IndexVisibility {
                 )?;
             }
         }
-        Ok(Self::from_physical_rows(dataset, physical_rows))
+        let mut plan = Self::from_physical_rows(dataset, physical_rows);
+        plan.has_stale_unknown_coverage = has_stale_unknown_coverage;
+        Ok(plan)
     }
 
     pub(crate) fn from_physical_rows(
@@ -66,6 +84,7 @@ impl IndexVisibility {
             dataset,
             physical_rows,
             result_rows: OnceCell::new(),
+            has_stale_unknown_coverage: false,
         }
     }
 
@@ -95,6 +114,16 @@ impl IndexVisibility {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.physical_rows.is_empty()
+    }
+
+    /// FTS preserves its historical whole-scan fallback when a stale segment
+    /// cannot identify its indexed fragment set. Unknown is not empty coverage.
+    pub(crate) fn has_stale_unknown_coverage(&self) -> bool {
+        self.has_stale_unknown_coverage
+    }
+
+    pub(crate) fn physical_rows(&self) -> &HashMap<u32, RoaringBitmap> {
+        &self.physical_rows
     }
 
     /// Physical addresses for scans and coverage accounting, never stable IDs.
