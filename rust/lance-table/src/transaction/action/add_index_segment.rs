@@ -7,7 +7,7 @@ use super::apply::{ApplyState, reject_frag_reuse_history};
 use super::footprint::IndexIdentity;
 use super::proto::{data_change_from_wire, data_change_to_wire, non_empty, required};
 use super::query_contract::QueryContract;
-use super::{FieldRef, Footprint, Ref};
+use super::{FieldFacet, FieldRef, Footprint, Ref};
 use crate::format::{IndexFile, IndexMetadata, pb, pb_actions};
 use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
 use lance_core::deepsize::{Context, DeepSizeOf};
@@ -293,7 +293,8 @@ impl AddIndexSegment {
         // manifest no longer has. Landing second, it discards the segment as it
         // applies, so the definition is only required, not written.
         for field in dependencies.iter().copied() {
-            footprint.require_field_definition(field);
+            footprint.require_field_facet(field, FieldFacet::Existence);
+            footprint.require_field_facet(field, FieldFacet::Type);
         }
         let Some(covered) = &self.covered_fragments else {
             // Unstated reach. The claim already collides with every other claim

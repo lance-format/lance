@@ -6,7 +6,7 @@
 use super::apply::ApplyState;
 use super::footprint::UnenforcedKey;
 use super::proto::required;
-use super::{ConfigMap, Coordinate, FieldRef, Footprint};
+use super::{ConfigMap, Coordinate, FieldFacet, FieldRef, Footprint};
 use crate::format::pb_actions;
 use crate::transaction::UpdateMap;
 use crate::transaction::update_map::apply_update_map;
@@ -127,7 +127,7 @@ impl ConfigUpdate {
             // there, and is lost with it if the field is dropped afterwards.
             if let Some(id) = update.field.committed() {
                 footprint.write_map_update(ConfigMap::Field(id), &update.updates);
-                footprint.require_field_definition(update.field);
+                footprint.require_field_facet(update.field, FieldFacet::Existence);
             }
         }
         // The reserved keys are declared per field but held once per table, so

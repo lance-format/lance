@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::proto::required;
-use super::{Coordinate, FieldRef, Footprint};
+use super::{Coordinate, FieldFacet, FieldRef, Footprint};
 use crate::format::pb_actions;
 use lance_core::datatypes::Field;
 use lance_core::deepsize::DeepSizeOf;
@@ -89,7 +89,7 @@ impl AddField {
             footprint.add_required_column();
         }
         if let Some(parent) = self.parent {
-            footprint.require_field_definition(parent);
+            footprint.require_field_facet(parent, FieldFacet::Existence);
             footprint.add_child(parent);
             if parent.committed().is_some() {
                 footprint.write(Coordinate::NewRowSchema);

@@ -5,7 +5,7 @@
 
 use super::apply::ApplyState;
 use super::proto::{data_change_from_wire, data_change_to_wire, required};
-use super::{FieldRef, Footprint, Ref};
+use super::{FieldFacet, FieldRef, Footprint, Ref};
 use crate::format::{DataFile, pb, pb_actions};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -148,12 +148,19 @@ impl AddDataFile {
 
     /// The data of every committed field the file backs, in the fragment it is
     /// attached to. A file backing only minted fields writes nothing.
+    ///
+    /// Each committed field's existence is required in a minted fragment too:
+    /// apply rejects a file naming a field the schema no longer has, so a
+    /// concurrent drop landing first has to be a conflict, not a failed apply.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        if self.data_change {
-            footprint.write_field_data(self.fragment, self.field_ids.iter().copied());
-        } else {
-            footprint.move_field_data(self.fragment, self.field_ids.iter().copied());
+        for field in self.field_ids.iter().copied() {
+            footprint.require_field_facet(field, FieldFacet::Existence);
         }
+        footprint.write_field_data(
+            self.fragment,
+            self.field_ids.iter().copied(),
+            self.data_change,
+        );
     }
 }
 

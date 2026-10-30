@@ -40,6 +40,7 @@ impl TombstoneFieldData {
             .iter()
             .map(|field| state.resolve_schema_field(*field, "TombstoneFieldData"))
             .collect::<Result<Vec<_>>>()?;
+        let (read_version, new_version) = (state.read_version(), state.new_version());
         let fragment = state.fragment_mut(fragment_id, "TombstoneFieldData")?;
 
         for &field_id in &field_ids {
@@ -62,13 +63,27 @@ impl TombstoneFieldData {
         }
 
         if self.data_change {
-            // New values for these fields supersede any overlay still shadowing
-            // them, so the drop is not silently masked by stale overlay cells.
+            // New values for these fields supersede the overlays this operation
+            // read, and any it added itself, so the drop is not silently masked
+            // by stale overlay cells. An overlay committed concurrently is newer
+            // than what this operation read and stays on top, as it does over a
+            // legacy DataReplacement; footprints let the two commute on that
+            // basis.
             let overlaid: Vec<u32> = field_ids
                 .iter()
                 .filter_map(|id| u32::try_from(*id).ok())
                 .collect();
-            crate::format::overlay::tombstone_overlay_fields(&mut fragment.overlays, &overlaid);
+            let mut overlays = Vec::with_capacity(fragment.overlays.len());
+            for overlay in fragment.overlays.drain(..) {
+                let mut one = vec![overlay];
+                if one[0].committed_version <= read_version
+                    || one[0].committed_version == new_version
+                {
+                    crate::format::overlay::tombstone_overlay_fields(&mut one, &overlaid);
+                }
+                overlays.extend(one);
+            }
+            fragment.overlays = overlays;
             state.rebind_fields(fragment_id, field_ids.iter().copied())?;
         }
         // A re-encode leaves both alone: the overlays are newer than the base
@@ -84,13 +99,14 @@ impl TombstoneFieldData {
     }
 
     /// The data of each named field in this fragment, and nothing else: another
-    /// field's data in the same fragment is untouched.
+    /// field's data in the same fragment is untouched, and so are the
+    /// overlays committed after this operation read.
     pub(super) fn footprint(&self, footprint: &mut Footprint) {
-        if self.data_change {
-            footprint.write_field_data(self.fragment, self.field_ids.iter().copied());
-        } else {
-            footprint.move_field_data(self.fragment, self.field_ids.iter().copied());
-        }
+        footprint.write_field_data(
+            self.fragment,
+            self.field_ids.iter().copied(),
+            self.data_change,
+        );
     }
 }
 
@@ -131,7 +147,7 @@ mod tests {
     use crate::transaction::test_support::{
         default_build_config, overlay_with_field, sample_index_metadata,
     };
-    use crate::transaction::{Operation, Transaction};
+    use crate::transaction::{Operation, ReadVersionState, Transaction};
     use lance_file::version::ConcreteFileVersion;
     use rstest::rstest;
     use std::sync::Arc;
@@ -189,10 +205,14 @@ mod tests {
     /// `DataReplacement` keeps it.
     #[test]
     fn test_tombstone_field_data_keeps_overlays_committed_after_the_read_version() {
-        let mut manifest = backed_manifest();
+        let mut read = backed_manifest();
+        read.version = 2;
+        let mut fragment = read.fragments[0].clone();
+        fragment.overlays = vec![overlay_with_field(0, 2)];
+        read.fragments = Arc::new(vec![fragment.clone()]);
+        let mut manifest = read.clone();
         manifest.version = 3;
-        let mut fragment = manifest.fragments[0].clone();
-        fragment.overlays = vec![overlay_with_field(0, 2), overlay_with_field(0, 3)];
+        fragment.overlays.push(overlay_with_field(0, 3));
         manifest.fragments = Arc::new(vec![fragment]);
         let read_at_two = Transaction::new(
             2,
@@ -204,7 +224,16 @@ mod tests {
         );
 
         let (next, _) = read_at_two
-            .build_manifest(Some(&manifest), vec![], "tx.txn", &default_build_config())
+            .build_manifest_with_read_version(
+                Some(&manifest),
+                vec![],
+                "tx.txn",
+                &default_build_config(),
+                Some(ReadVersionState {
+                    manifest: &read,
+                    indices: &[],
+                }),
+            )
             .unwrap();
 
         let versions: Vec<u64> = next.fragments[0]

@@ -112,18 +112,17 @@ impl AddOverlays {
         self.data_change
     }
 
-    /// A partial write of each overlaid field's data in the fragment, a
+    /// A partial write of each overlaid field's overlays in the fragment, a
     /// requirement on each of those fields' definitions, and a partial write of
     /// the fragment's deletions.
     ///
     /// Partial, because two concurrent overlays over the same cells both land
     /// and the newer `committed_version` decides which value wins. A full
-    /// rewrite of the same column is another matter: it replaces every cell
-    /// from a snapshot that never saw this overlay, and
-    /// [`TombstoneFieldData`](super::TombstoneFieldData) tombstones the overlay
-    /// as it applies, so the overlay's values would be lost without a trace.
-    /// That pair conflicts in either order, as the legacy Update-vs-DataOverlay
-    /// check already does.
+    /// rewrite of the same column commutes with it too: landing second, the
+    /// overlay is newer than the rewrite's values, and landing first, it was
+    /// committed after the rewrite read, so
+    /// [`TombstoneFieldData`](super::TombstoneFieldData) leaves it in place.
+    /// That is legacy's `DataReplacement`-beside-`DataOverlay` behaviour.
     ///
     /// The definition is required for the same reason a data file requires it:
     /// the overlay's values are encoded in the type the schema names, and a
@@ -379,42 +378,41 @@ mod tests {
     }
 
     /// A full rewrite of the overlaid column replaces every cell from a
-    /// snapshot that never saw the overlay, and tombstones the overlay as it
-    /// applies; the overlay's values would be gone without a trace. Either
-    /// order loses, so the pair is symmetric. A re-encode (`data_change`
-    /// false) keeps the overlay and every row's offset, so the overlay still
-    /// wins its cells whichever lands first.
+    /// snapshot that never saw the overlay, but it only tombstones the
+    /// overlays committed by then, and a re-encode (`data_change` false)
+    /// leaves them alone. Whichever lands second, the overlay is the newer
+    /// value and stays on top, as legacy lets `DataReplacement` land beside
+    /// `DataOverlay`.
     #[rstest::rstest]
     #[case::rewrite(true)]
     #[case::reencode(false)]
-    fn test_an_overlay_conflicts_with_a_rewrite_of_its_column_but_not_a_reencode(
-        #[case] data_change: bool,
-    ) {
+    fn test_an_overlay_and_a_rewrite_of_the_same_column_commute(#[case] data_change: bool) {
         let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
-        let rewrite = |field: i32| {
-            footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![FieldRef::Committed(field)],
-                data_change,
-            })])
-        };
+        let rewrite = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
+            fragment: Ref::Committed(0),
+            field_ids: vec![FieldRef::Committed(0)],
+            data_change,
+        })]);
 
-        assert_eq!(overlaid.conflicts_with(&rewrite(0)), data_change);
-        assert_eq!(rewrite(0).conflicts_with(&overlaid), data_change);
-        // Another column of the same fragment is not touched by the overlay.
-        assert!(!overlaid.conflicts_with(&rewrite(1)));
-        assert!(!rewrite(1).conflicts_with(&overlaid));
+        assert!(!overlaid.conflicts_with(&rewrite));
+        assert!(!rewrite.conflicts_with(&overlaid));
     }
 
-    /// An overlay landing after its field was altered or dropped would carry
-    /// values checked against a definition the schema no longer holds, or for
-    /// a field that is gone. Landing first, the alter covers the overlay's
-    /// values like any others and the drop tombstones the overlay, so those
-    /// orders are fine.
+    /// An overlay landing after its field's nullability changed or the field
+    /// was dropped would carry values checked against a definition the schema
+    /// no longer holds, or for a field that is gone. Landing first, the alter
+    /// covers the overlay's values like any others and the drop tombstones the
+    /// overlay, so those orders are fine. A rename changes no value, so the
+    /// overlay does not depend on the name.
     #[test]
     fn test_an_overlay_needs_its_field_defined_as_it_was() {
         let overlaid = footprint(vec![add(Ref::Committed(0), vec![overlay("a.lance", &[0])])]);
         let altered = footprint(vec![Action::AlterField(AlterField {
+            field: FieldRef::Committed(0),
+            name: None,
+            nullable: Some(true),
+        })]);
+        let renamed = footprint(vec![Action::AlterField(AlterField {
             field: FieldRef::Committed(0),
             name: Some("renamed".into()),
             nullable: None,
@@ -425,6 +423,7 @@ mod tests {
 
         assert!(overlaid.conflicts_with(&altered));
         assert!(!altered.conflicts_with(&overlaid));
+        assert!(!overlaid.conflicts_with(&renamed));
         assert!(overlaid.conflicts_with(&dropped));
         assert!(!dropped.conflicts_with(&overlaid));
     }
@@ -458,11 +457,12 @@ mod tests {
     }
 
     /// One set may overlay a cell and then rewrite the whole column in the
-    /// same operation (an overlay being materialized). The full write is what
-    /// a concurrent set sees: another overlay of the column no longer
-    /// commutes with it, while a rewrite of a different column still does.
+    /// same operation (an overlay being materialized). The rewrite tombstones
+    /// that set's own overlay, but a concurrent overlay of the column is newer
+    /// than what it read and stays on top, so the two commute; so does a
+    /// rewrite of a different column. A rewrite of the same column does not.
     #[test]
-    fn test_a_full_write_in_the_same_set_dominates_a_partial_one() {
+    fn test_materializing_an_overlay_commutes_with_a_concurrent_one() {
         let materialize = footprint(vec![
             add(Ref::Committed(0), vec![overlay("a.lance", &[0])]),
             Action::TombstoneFieldData(TombstoneFieldData {
@@ -478,10 +478,18 @@ mod tests {
             data_change: true,
         })]);
 
-        assert!(materialize.conflicts_with(&other_overlay));
-        assert!(other_overlay.conflicts_with(&materialize));
+        let same_column = footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
+            fragment: Ref::Committed(0),
+            field_ids: vec![FieldRef::Committed(0)],
+            data_change: true,
+        })]);
+
+        assert!(!materialize.conflicts_with(&other_overlay));
+        assert!(!other_overlay.conflicts_with(&materialize));
         assert!(!materialize.conflicts_with(&other_column));
         assert!(!other_column.conflicts_with(&materialize));
+        assert!(materialize.conflicts_with(&same_column));
+        assert!(same_column.conflicts_with(&materialize));
     }
 
     /// Overlaid cells have changed since the version a consumer last read, so
@@ -626,30 +634,22 @@ mod tests {
 
     /// A negative id marks a tombstoned column in the overlay's file. It holds
     /// nothing a reader sees, so it claims nothing: only the live column
-    /// collides with a rewrite.
+    /// collides with a drop of its field landing first.
     #[test]
     fn test_a_tombstoned_column_in_an_overlay_claims_nothing() {
         let mut partly_tombstoned = overlay("a.lance", &[0]);
         partly_tombstoned.data_file.fields = vec![-1, 1].into();
         partly_tombstoned.data_file.column_indices = vec![0, 1].into();
         let overlaid = footprint(vec![add(Ref::Committed(0), vec![partly_tombstoned])]);
-        let rewrite = |field: i32| {
-            footprint(vec![Action::TombstoneFieldData(TombstoneFieldData {
-                fragment: Ref::Committed(0),
-                field_ids: vec![FieldRef::Committed(field)],
-                data_change: true,
+        let drop_field = |field: i32| {
+            footprint(vec![Action::DropField(DropField {
+                field: FieldRef::Committed(field),
             })])
         };
-        let drop_field_zero = footprint(vec![Action::DropField(DropField {
-            field: FieldRef::Committed(0),
-        })]);
 
-        assert!(overlaid.conflicts_with(&rewrite(1)));
-        assert!(rewrite(1).conflicts_with(&overlaid));
-        for other in [rewrite(0), drop_field_zero] {
-            assert!(!overlaid.conflicts_with(&other));
-            assert!(!other.conflicts_with(&overlaid));
-        }
+        assert!(overlaid.conflicts_with(&drop_field(1)));
+        assert!(!overlaid.conflicts_with(&drop_field(0)));
+        assert!(!drop_field(0).conflicts_with(&overlaid));
     }
 
     /// An overlay covering a row past the end of its fragment supplies values

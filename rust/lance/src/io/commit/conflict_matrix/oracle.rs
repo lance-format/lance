@@ -64,7 +64,27 @@ const EXEMPT: &[(Scenario, Scenario, &str)] = &[
         Scenario::DataOverlay,
         NEWER_OVERLAY_WINS,
     ),
+    (
+        Scenario::ActionAddColumn,
+        Scenario::Append,
+        NEW_COLUMN_MISSES_NEW_ROWS,
+    ),
+    (
+        Scenario::ActionAddColumn,
+        Scenario::ActionAppend,
+        NEW_COLUMN_MISSES_NEW_ROWS,
+    ),
+    (
+        Scenario::ActionAddColumn,
+        Scenario::ActionAppendAndConfig,
+        NEW_COLUMN_MISSES_NEW_ROWS,
+    ),
 ];
+
+const NEW_COLUMN_MISSES_NEW_ROWS: &str = "a nullable column computes its values for the rows \
+     it read, so rows appended concurrently read null in it. Serial execution adds the column \
+     last and computes it for the appended rows too. Snapshot isolation permits this, as a \
+     nullable add commuting with an append; serializable would not.";
 
 const NEWER_OVERLAY_WINS: &str = "a data replacement tombstones the overlays its new base \
      values supersede, but deliberately keeps an overlay committed after its own snapshot, \
