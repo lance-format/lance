@@ -177,6 +177,60 @@ async fn test_merge(
 }
 
 #[rstest]
+#[case::within_batch(Some(1), 2)]
+#[case::across_batches(Some(1), 1)]
+#[case::unmatched_within_batch(Some(9), 2)]
+#[case::unmatched_across_batches(Some(9), 1)]
+#[case::null_within_batch(None, 2)]
+#[case::null_across_batches(None, 1)]
+#[tokio::test]
+async fn test_merge_rejects_duplicate_right_keys(
+    #[case] key: Option<i32>,
+    #[case] batch_size: usize,
+) {
+    let original =
+        arrow_array::record_batch!(("id", Int32, [Some(1), Some(2), None, Some(1)])).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(original.clone())], original.schema());
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            max_rows_per_group: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+    let version = dataset.version().version;
+
+    let right =
+        arrow_array::record_batch!(("right_id", Int32, [key, key]), ("value", Int32, [10, 20]))
+            .unwrap();
+    let batches = (0..right.num_rows())
+        .step_by(batch_size)
+        .map(|offset| Ok(right.slice(offset, batch_size)))
+        .collect::<Vec<_>>();
+    let reader = RecordBatchIterator::new(batches, right.schema());
+    let error = dataset.merge(reader, "id", "right_id").await.unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    let expected_key = key.map_or_else(|| "NULL".to_string(), |key| key.to_string());
+    assert!(
+        error.to_string().contains(&format!(
+            "Duplicate right-side join key in column 'right_id': {expected_key} "
+        )),
+        "{error}"
+    );
+
+    assert_eq!(dataset.version().version, version);
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), original);
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(dataset.version().version, version);
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), original);
+}
+
+#[rstest]
 #[tokio::test]
 async fn test_large_merge(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
