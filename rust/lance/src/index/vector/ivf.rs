@@ -5657,6 +5657,13 @@ async fn train_streaming_coreset_ivf_model_with_algorithm<A: StreamingCoresetAlg
                 total_steps,
                 has_decoupled_budget,
             );
+            // Preserve enough of the partition budget across the remaining steps.
+            // Empty or undersized steps cannot reserve summaries they never build.
+            let remaining_steps = total_steps.saturating_sub(step - 1).max(1);
+            let partition_floor = num_partitions
+                .saturating_sub(algorithm.coreset_len(&coreset))
+                .div_ceil(remaining_steps);
+            let local_k = local_k.max(partition_floor).min(training_data.len());
             let mut chunk_coreset = algorithm.new_coreset(dimension, local_k);
             algorithm.append_local_coreset(
                 &mut chunk_coreset,
@@ -8332,6 +8339,7 @@ mod tests {
     #[rstest]
     #[case::fixed_dot_small_remainder(MetricType::Dot, false, 0, 1_050, None, 4)]
     #[case::fixed_steps_below_partition_count(MetricType::Dot, false, 0, 600, None, 2)]
+    #[case::fixed_dot_empty_first_step(MetricType::Dot, false, 262, 1_050, None, 2)]
     #[case::fixed_l2_empty_first_step(MetricType::L2, false, 262, 1_050, None, 2)]
     #[case::nullable_l2_steps_below_partition_count(MetricType::L2, true, 0, 600, None, 4)]
     #[case::nullable_dot_small_remainder(MetricType::Dot, true, 0, 1_050, None, 4)]
