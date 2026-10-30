@@ -1250,9 +1250,8 @@ impl<'a> TransactionRebase<'a> {
                     }
                     Ok(())
                 }
-                // Merge, reserve, and project don't change row ids. The MemWAL
-                // index is the exception: its install validates schema-dependent
-                // state, which a concurrent schema change invalidates.
+                // Merge preserves row ids. The MemWAL index's install validates
+                // schema-dependent state, which a concurrent schema change invalidates.
                 Operation::Merge {
                     fragments, schema, ..
                 } => {
@@ -1262,11 +1261,9 @@ impl<'a> TransactionRebase<'a> {
                     // A merge that removed or retyped a field our index keys
                     // on or carries (an `alter_columns` cast rewrites the
                     // column under a new field id) leaves the index describing
-                    // a column that no longer exists on a tagged table's
-                    // destinations; the build is redone against the new field.
-                    if self.current_lineage.is_some()
-                        && let Some(read_schema) = self.read_schema.as_ref()
-                    {
+                    // a column that no longer exists; the build is redone
+                    // against the new field, regardless of fragment reuse history.
+                    if let Some(read_schema) = self.read_schema.as_ref() {
                         let gone: HashSet<i32> = read_schema
                             .fields_pre_order()
                             .filter(|field| {
@@ -1336,7 +1333,21 @@ impl<'a> TransactionRebase<'a> {
                     Ok(())
                 }
                 Operation::ReserveFragments { .. } => Ok(()),
-                Operation::Project { .. } => Ok(()),
+                // A projection removes existing indices on dropped fields.
+                // An index built before it must not reintroduce those dependencies.
+                Operation::Project { schema, .. } => {
+                    if new_indices.iter().any(|index| {
+                        !is_system_index(index)
+                            && index
+                                .dependency_fields()
+                                .iter()
+                                .any(|field| schema.field_by_id(*field).is_none())
+                    }) {
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
                 // Should be compatible with rewrite if it didn't move the rows
                 // we indexed. If it did, we could retry.
                 // TODO: this will change with stable row ids.
@@ -5694,6 +5705,8 @@ mod tests {
     enum CoveringConflictSite {
         /// The index, on a tagged table, over an `alter_columns` cast.
         IndexOverCast,
+        IndexOverUntaggedCast,
+        IndexOverProjection,
         IndexOverDataReplacement,
         DataReplacementOverIndex,
         IndexOverFoldedOverlay,
@@ -5736,7 +5749,7 @@ mod tests {
                 )],
             };
             let (mut rebase, theirs) = match self {
-                Self::IndexOverCast => {
+                Self::IndexOverCast | Self::IndexOverUntaggedCast | Self::IndexOverProjection => {
                     let mut rebase = rebase_of(create_index);
                     let history = IndexMetadata {
                         uuid: Uuid::new_v4(),
@@ -5753,19 +5766,29 @@ mod tests {
                         clustering_id: None,
                         metadata: Default::default(),
                     };
-                    rebase.current_lineage = Some(TaggedLineage::new(&history, None));
+                    if matches!(self, Self::IndexOverCast) {
+                        rebase.current_lineage = Some(TaggedLineage::new(&history, None));
+                    }
                     rebase.read_schema = Some(schema.clone());
                     let kept: Vec<i32> = [KEYED, CARRIED, UNRELATED]
                         .into_iter()
                         .filter(|field| *field != changed)
                         .collect();
-                    // A cast moves the column to a new field id.
-                    let cast = Operation::Merge {
-                        fragments: vec![],
-                        schema: schema.project_by_ids(&kept, true),
-                        preserves_nullability: true,
+                    // A cast moves the column to a new field id; a projection drops it.
+                    let schema = schema.project_by_ids(&kept, true);
+                    let change = if matches!(self, Self::IndexOverProjection) {
+                        Operation::Project {
+                            schema,
+                            preserves_nullability: true,
+                        }
+                    } else {
+                        Operation::Merge {
+                            fragments: vec![],
+                            schema,
+                            preserves_nullability: true,
+                        }
                     };
-                    (rebase, cast)
+                    (rebase, change)
                 }
                 Self::IndexOverDataReplacement => (rebase_of(create_index), replacement),
                 Self::DataReplacementOverIndex => (rebase_of(replacement), create_index),
@@ -5820,6 +5843,8 @@ mod tests {
     /// repeats the carried column; a change to another column does not.
     #[rstest::rstest]
     #[case::index_over_cast(CoveringConflictSite::IndexOverCast)]
+    #[case::index_over_untagged_cast(CoveringConflictSite::IndexOverUntaggedCast)]
+    #[case::index_over_projection(CoveringConflictSite::IndexOverProjection)]
     #[case::index_over_data_replacement(CoveringConflictSite::IndexOverDataReplacement)]
     #[case::data_replacement_over_index(CoveringConflictSite::DataReplacementOverIndex)]
     #[case::index_over_folded_overlay(CoveringConflictSite::IndexOverFoldedOverlay)]
