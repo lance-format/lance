@@ -319,10 +319,11 @@ mod half_c {
                 lance_core::target_kernel! {
                     #[target_features($($feature),*)]
                     #[candidate(pub(super) $candidate: BatchKernel<f16>)]
-                    /// Out of line so the loop gets registers of its own:
-                    /// inlined into `l2_batch_into`, LLVM spilled the batch
-                    /// pointer to the stack on aarch64, which put a
-                    /// store-to-load round trip on every dimension-8 distance.
+                    /// Out of line even where the dispatch resolves at compile
+                    /// time, so the loop gets registers of its own: inlined into
+                    /// `l2_batch_into` on aarch64, LLVM spilled the batch pointer
+                    /// to the stack, a store-to-load round trip on every
+                    /// dimension-8 distance. Other tiers share it for uniformity.
                     #[inline(never)]
                     fn $name(x: &[f16], batch: &[f16], dimension: usize, output: &mut [f32]) {
                         for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
