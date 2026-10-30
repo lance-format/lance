@@ -487,24 +487,15 @@ mod tests {
     use arrow_array::{
         Array, ArrayRef, builder::StringDictionaryBuilder, record_batch, types::Int8Type,
     };
-    use arrow_ipc::writer::IpcWriteOptions;
     use arrow_schema::{DataType, Field, Schema};
     use rstest::rstest;
 
     use super::*;
 
-    fn write_ipc_stream_for_test(batches: &[RecordBatch], legacy: bool) -> Vec<u8> {
+    fn write_ipc_stream_for_test(batches: &[RecordBatch]) -> Vec<u8> {
         let first = batches.first().unwrap();
-        let metadata_version = if legacy {
-            MetadataVersion::V4
-        } else {
-            MetadataVersion::V5
-        };
-        let options = IpcWriteOptions::try_new(8, legacy, metadata_version).unwrap();
-
         let mut buf = Vec::new();
-        let mut writer =
-            StreamWriter::try_new_with_options(&mut buf, first.schema_ref(), options).unwrap();
+        let mut writer = StreamWriter::try_new(&mut buf, first.schema_ref()).unwrap();
         for batch in batches {
             writer.write(batch).unwrap();
         }
@@ -602,13 +593,11 @@ mod tests {
         }
     }
 
-    #[rstest]
-    #[case::modern(false)]
-    #[case::legacy(true)]
-    fn test_ipc_stream_at_single_pass_offsets_and_zero_copy(#[case] legacy: bool) {
+    #[test]
+    fn test_ipc_stream_at_single_pass_offsets_and_zero_copy() {
         let batch1 = record_batch!(("v", Int64, [1i64, 2, 3])).unwrap();
         let batch2 = record_batch!(("v", Int64, [4i64, 5])).unwrap();
-        let stream = write_ipc_stream_for_test(&[batch1.clone(), batch2.clone()], legacy);
+        let stream = write_ipc_stream_for_test(&[batch1.clone(), batch2.clone()]);
 
         let mut blob = vec![0xAB; IPC_SECTION_ALIGNMENT];
         blob.extend_from_slice(&stream);
@@ -628,10 +617,8 @@ mod tests {
         assert_buffers_share_input(&data, &read);
     }
 
-    #[rstest]
-    #[case::modern(false)]
-    #[case::legacy(true)]
-    fn test_ipc_stream_at_dictionary_batch(#[case] legacy: bool) {
+    #[test]
+    fn test_ipc_stream_at_dictionary_batch() {
         let mut builder = StringDictionaryBuilder::<Int8Type>::new();
         builder.append("alpha").unwrap();
         builder.append("beta").unwrap();
@@ -644,10 +631,7 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(dictionary) as ArrayRef]).unwrap();
 
-        let data = Bytes::from(write_ipc_stream_for_test(
-            std::slice::from_ref(&batch),
-            legacy,
-        ));
+        let data = Bytes::from(write_ipc_stream_for_test(std::slice::from_ref(&batch)));
         let mut offset = 0;
         let read = read_ipc_stream_at(&data, &mut offset).unwrap();
 
@@ -656,16 +640,13 @@ mod tests {
         assert_buffers_share_input(&data, &read);
     }
 
-    #[rstest]
-    #[case::modern(false)]
-    #[case::legacy(true)]
-    fn test_ipc_stream_at_stops_after_unsupported_message(#[case] legacy: bool) {
+    #[test]
+    fn test_ipc_stream_at_stops_after_unsupported_message() {
         let batch_a = record_batch!(("v", Int64, [1i64, 2, 3])).unwrap();
         let batch_b = record_batch!(("v", Int64, [4i64, 5])).unwrap();
-        let mut stream_a = write_ipc_stream_for_test(std::slice::from_ref(&batch_a), legacy);
-        let stream_b = write_ipc_stream_for_test(std::slice::from_ref(&batch_b), legacy);
-        let eos_len = if legacy { 4 } else { 8 };
-        stream_a.truncate(stream_a.len() - eos_len);
+        let mut stream_a = write_ipc_stream_for_test(std::slice::from_ref(&batch_a));
+        let stream_b = write_ipc_stream_for_test(std::slice::from_ref(&batch_b));
+        stream_a.truncate(stream_a.len() - 8);
         let stream_a_len = stream_a.len();
         let schema_b_len = match read_one_ipc_message(&Bytes::from(stream_b.clone())).unwrap() {
             IpcMessageRead::Message(message) => message.buffer.len(),
@@ -692,16 +673,11 @@ mod tests {
         );
     }
 
-    #[rstest]
-    #[case::modern(false)]
-    #[case::legacy(true)]
-    fn test_ipc_stream_at_zero_length_body(#[case] legacy: bool) {
+    #[test]
+    fn test_ipc_stream_at_zero_length_body() {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let batch = RecordBatch::new_empty(schema);
-        let data = Bytes::from(write_ipc_stream_for_test(
-            std::slice::from_ref(&batch),
-            legacy,
-        ));
+        let data = Bytes::from(write_ipc_stream_for_test(std::slice::from_ref(&batch)));
 
         let schema_message = match read_one_ipc_message(&data).unwrap() {
             IpcMessageRead::Message(message) => message,
@@ -720,14 +696,11 @@ mod tests {
         assert_eq!(offset, data.len());
     }
 
-    #[rstest]
-    #[case::modern(false)]
-    #[case::legacy(true)]
-    fn test_ipc_stream_at_error_preserves_offset(#[case] legacy: bool) {
+    #[test]
+    fn test_ipc_stream_at_error_preserves_offset() {
         let batch = record_batch!(("v", Int64, [1i64, 2, 3])).unwrap();
-        let mut stream = write_ipc_stream_for_test(&[batch], legacy);
-        let eos_len = if legacy { 4 } else { 8 };
-        stream.truncate(stream.len() - eos_len);
+        let mut stream = write_ipc_stream_for_test(&[batch]);
+        stream.truncate(stream.len() - 8);
 
         let mut blob = vec![0xAA; 3];
         blob.extend_from_slice(&stream);
