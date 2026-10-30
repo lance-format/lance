@@ -40,6 +40,7 @@ use datafusion::physical_plan::{
 use datafusion::scalar::ScalarValue;
 use datafusion_expr::ExprSchemable;
 use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_physical_expr::aggregate::LoweredAggregateBuilder;
 use datafusion_physical_expr::expressions::{Column, Literal};
@@ -2858,7 +2859,13 @@ impl Scanner {
             // Convert logical to physical expression
             let df_schema = Arc::new(DFSchema::try_from(arrow_schema.clone())?);
             let execution_props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
-            create_physical_expr(&expr, &df_schema, &execution_props).map_err(|e| {
+            create_physical_expr(
+                &expr,
+                &df_schema,
+                &execution_props,
+                &PhysicalPlanningContext::default(),
+            )
+            .map_err(|e| {
                 Error::internal(format!(
                     "Failed to create physical expression for nested field '{}': {}",
                     column_name, e
@@ -3224,8 +3231,12 @@ impl Scanner {
             .iter()
             .map(|expr| {
                 let name = expr.schema_name().to_string();
-                let physical_expr =
-                    create_physical_expr(expr, &df_schema, &ExecutionProps::default())?;
+                let physical_expr = create_physical_expr(
+                    expr,
+                    &df_schema,
+                    &ExecutionProps::default(),
+                    &PhysicalPlanningContext::default(),
+                )?;
                 Ok((physical_expr, name))
             })
             .collect::<Result<_>>()?;
@@ -3276,11 +3287,13 @@ impl Scanner {
             _ => (None, String::new()),
         };
         let execution_props = ExecutionProps::default();
+        let planning_ctx = PhysicalPlanningContext::default();
         let mut builder = LoweredAggregateBuilder::new(
             &coerced_expr,
             df_schema,
             input_schema.as_ref(),
             &execution_props,
+            &planning_ctx,
         )
         .with_human_display(human_display);
         if let Some(name) = name {
@@ -5449,7 +5462,7 @@ impl Scanner {
         // retain their existing scoring and approximation contracts.
         if let FtsQuery::Match(match_query) = query
             && let Some(plan) = self
-                .plan_restricted_match_query(match_query, &params, filter_plan, &prefilter_source)
+                .plan_corpus_match_query(match_query, &params, filter_plan, &prefilter_source)
                 .await?
         {
             return Ok(plan);
@@ -6106,9 +6119,9 @@ impl Scanner {
     }
 
     /// Use global append-only corpus statistics independently of the selected candidates.
-    /// This entry is called only for a root scalar-text Match with a user prefilter or
-    /// explicit fragment selection. Other query shapes retain their existing planner.
-    async fn plan_restricted_match_query(
+    /// Exact root scalar-text matches share this corpus with and without candidate
+    /// restrictions. Other query shapes retain their existing planner.
+    async fn plan_corpus_match_query(
         &self,
         query: &MatchQuery,
         params: &FtsSearchParams,
@@ -6118,13 +6131,8 @@ impl Scanner {
         let is_primary_fts = self.full_text_query.is_some()
             && self.nearest.is_none()
             && self.filter.query_filter.is_none();
-        let has_postfilter = !self.prefilter && self.filter.expr_filter.is_some();
-        let has_restriction =
-            self.fragments.is_some() || (self.prefilter && !filter_plan.is_empty());
         if !is_primary_fts
             || self.fast_search
-            || has_postfilter
-            || !has_restriction
             || params.wand_factor != 1.0
             || params.phrase_slop.is_some()
             || query.fuzziness != Some(0)
@@ -6590,6 +6598,14 @@ impl Scanner {
             ))));
         }
 
+        // Candidate fragments do not define the corpus: even an index-only
+        // selection needs statistics from unindexed rows outside that selection.
+        let corpus_fragments = if self.fast_search {
+            target_fragments
+        } else {
+            self.dataset.fragments()
+        };
+
         // Kept per column; see `FlatStatsCoverage`.
         let mut per_column_coverage = Vec::with_capacity(query.column_names().len());
         let mut uncovered = RoaringBitmap::new();
@@ -6618,7 +6634,7 @@ impl Scanner {
                         .collect()
                 }
                 // No index on this column at all, so no fragment is covered for it.
-                None => target_fragments
+                None => corpus_fragments
                     .iter()
                     .map(|fragment| fragment.id as u32)
                     .collect(),
@@ -6632,7 +6648,7 @@ impl Scanner {
             // reaches `docFreq_f`.
             let mut column_stale_rows = RowAddrTreeMap::new();
             match self
-                .fts_overlay_plan(column, DocumentGranularity::Row, target_fragments)
+                .fts_overlay_plan(column, DocumentGranularity::Row, corpus_fragments)
                 .await?
             {
                 FtsOverlayPlan::Unchanged(_) => {}
@@ -6645,7 +6661,7 @@ impl Scanner {
                 // A legacy segment reports no fragment coverage, so no target fragment
                 // can be proven free of stale entries and no row can be named as one.
                 FtsOverlayPlan::FullScan => {
-                    uncovered.extend(target_fragments.iter().map(|fragment| fragment.id as u32));
+                    uncovered.extend(corpus_fragments.iter().map(|fragment| fragment.id as u32));
                     needs_whole_corpus = true;
                 }
             }
@@ -6672,7 +6688,7 @@ impl Scanner {
         stale_addresses.retain(|fragment_id, _| !uncovered.contains(*fragment_id));
         let overlay_block = self.stale_rows_block_mask(&stale_addresses).await?;
 
-        let uncovered_fragments: Vec<Fragment> = target_fragments
+        let uncovered_fragments: Vec<Fragment> = corpus_fragments
             .iter()
             .filter(|fragment| uncovered.contains(fragment.id as u32))
             .cloned()
@@ -6744,7 +6760,7 @@ impl Scanner {
         // index and the corpus has to be re-measured from every target fragment. That
         // is a full scan, so it stays confined to that case.
         let (flat_fragments, stats_scope) = if needs_whole_corpus {
-            (target_fragments.to_vec(), FlatStatsScope::WholeCorpus)
+            (corpus_fragments.to_vec(), FlatStatsScope::WholeCorpus)
         } else {
             (
                 uncovered_fragments,
@@ -6772,7 +6788,7 @@ impl Scanner {
             .await?;
         // Only a plan with both children needs the two to agree on a corpus, and a
         // whole-corpus scan leaves no fragment for an indexed child.
-        let is_mixed = !needs_whole_corpus && flat_fragments.len() != target_fragments.len();
+        let is_mixed = !needs_whole_corpus && !covered.is_empty();
         let shared_scorer = is_mixed.then(|| Arc::new(SharedFtsScorer::new()));
         let flat_plan = self
             .plan_flat_combined_fields_query(
@@ -6791,20 +6807,26 @@ impl Scanner {
         let scored_plan = if !is_mixed {
             flat_plan
         } else {
-            let union =
-                UnionExec::try_new(vec![index_exec(Some(covered), shared_scorer), flat_plan])?;
+            let union = UnionExec::try_new(vec![
+                index_exec(Some(covered), shared_scorer.clone()),
+                flat_plan,
+            ])?;
             Arc::new(RepartitionExec::try_new(
                 union,
                 Partitioning::RoundRobinBatch(1),
             )?)
         };
-        Ok(Arc::new(
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
             SortExec::new(
                 Self::fts_score_sort_exprs(scored_plan.schema().as_ref())?.into(),
                 scored_plan,
             )
             .with_fetch(params.limit),
-        ))
+        );
+        Ok(match shared_scorer {
+            Some(shared_scorer) => Arc::new(SharedFtsScorerExec::new_combined(plan, shared_scorer)),
+            None => plan,
+        })
     }
 
     /// Plan the flat (unindexed) side of a `combined_fields` query: one scan over
@@ -8384,7 +8406,12 @@ impl Scanner {
                 let logical = col(DIST_COL).gt_eq(lit(v));
                 let schema = flat_dist.schema();
                 let df_schema = DFSchema::try_from(schema)?;
-                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())?;
+                let physical = create_physical_expr(
+                    &logical,
+                    &df_schema,
+                    &ExecutionProps::new(),
+                    &PhysicalPlanningContext::default(),
+                )?;
                 Ok::<(Expr, Arc<dyn PhysicalExpr>), _>((logical, physical))
             })
             .transpose()?;
@@ -8395,7 +8422,12 @@ impl Scanner {
                 let logical = col(DIST_COL).lt(lit(v));
                 let schema = flat_dist.schema();
                 let df_schema = DFSchema::try_from(schema)?;
-                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())?;
+                let physical = create_physical_expr(
+                    &logical,
+                    &df_schema,
+                    &ExecutionProps::new(),
+                    &PhysicalPlanningContext::default(),
+                )?;
                 Ok::<(Expr, Arc<dyn PhysicalExpr>), _>((logical, physical))
             })
             .transpose()?;
@@ -8405,7 +8437,12 @@ impl Scanner {
                 let logical = llog.and(ulog);
                 let schema = flat_dist.schema();
                 let df_schema = DFSchema::try_from(schema)?;
-                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())?;
+                let physical = create_physical_expr(
+                    &logical,
+                    &df_schema,
+                    &ExecutionProps::new(),
+                    &PhysicalPlanningContext::default(),
+                )?;
                 Some((logical, physical))
             }
             (Some((llog, lphys)), None) => Some((llog, lphys)),
@@ -13088,6 +13125,209 @@ mod test {
         // with adaptive nprobes.
         assert_batch_matches_single_queries(dataset, &batch, &query_values, k, true, None, None)
             .await;
+    }
+
+    /// An in-place vector update (`update_columns` + `Operation::Update`) prunes the
+    /// fragment from the old segment's bitmap while that segment still physically
+    /// holds the pre-update vector, and `optimize_indices(append)` indexes the fresh
+    /// vector in a new delta. Like the single-query path, the batch node must apply
+    /// each segment's ownership so the stale copy is neither returned nor counted.
+    #[rstest]
+    #[case::fixed_nprobes(Some(2))]
+    #[tokio::test]
+    async fn test_batch_knn_skips_rows_owned_by_newer_delta(
+        #[case] nprobes: Option<usize>,
+        #[values(false, true)] enable_stable_row_ids: bool,
+    ) {
+        use crate::dataset::transaction::{Operation, UpdateMode, UpdatedFragmentOffsets};
+        use arrow_array::{RecordBatchReader, UInt64Array};
+
+        const DIM: usize = 8;
+        const BULK_ROWS: usize = 1000;
+        const UPDATED_ID: u32 = 10_000;
+        const STALE_VALUE: f32 = 10.0;
+        const FRESH_VALUE: f32 = -10.0;
+        let k = 5;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let vector_type = DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+            DIM as i32,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::UInt32, false),
+            ArrowField::new("vec", vector_type.clone(), true),
+        ]));
+        let constant_vector = |value: f32| {
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from_iter_values(std::iter::repeat_n(value, DIM)),
+                DIM as i32,
+            )
+            .unwrap()
+        };
+
+        let bulk = lance_testing::datagen::generate_random_array_with_seed::<Float32Type>(
+            BULK_ROWS * DIM,
+            [7; 32],
+        );
+        let bulk_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values(0..BULK_ROWS as u32)),
+                Arc::new(FixedSizeListArray::try_new_from_values(bulk, DIM as i32).unwrap()),
+            ],
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(bulk_batch)], schema.clone()),
+            test_uri,
+            Some(WriteParams {
+                enable_stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let stale_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from_iter_values([UPDATED_ID])),
+                Arc::new(constant_vector(STALE_VALUE)),
+            ],
+        )
+        .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(stale_batch)], schema.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("idx".into()),
+                &VectorIndexParams::ivf_flat(4, MetricType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let mut fragment = dataset.get_fragment(1).unwrap();
+        let mut fragment_scan = fragment.scan();
+        fragment_scan.with_row_id();
+        let updated_row_id = fragment_scan.try_into_batch().await.unwrap()[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .value(0);
+        let update_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(ROW_ID, DataType::UInt64, false),
+            ArrowField::new("vec", vector_type, true),
+        ]));
+        let update_batch = RecordBatch::try_new(
+            update_schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from_iter_values([updated_row_id])),
+                Arc::new(constant_vector(FRESH_VALUE)),
+            ],
+        )
+        .unwrap();
+        let right_stream: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            vec![Ok(update_batch)],
+            update_schema,
+        ));
+        let updated = fragment
+            .update_columns_with_offsets(right_stream, ROW_ID, ROW_ID)
+            .await
+            .unwrap();
+        let updated_fragment_id = updated.fragment.id;
+        let mut dataset = Dataset::commit(
+            test_uri,
+            Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![updated.fragment],
+                new_fragments: vec![],
+                fields_modified: updated.fields_modified,
+                mem_wal_dir_id: None,
+                compacted_sstables: Vec::new(),
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: Some(UpdatedFragmentOffsets(HashMap::from([(
+                    updated_fragment_id,
+                    updated.matched_offsets,
+                )]))),
+            },
+            Some(dataset.version().version),
+            None,
+            None,
+            Default::default(),
+            true,
+        )
+        .await
+        .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        assert_eq!(dataset.load_indices_by_name("idx").await.unwrap().len(), 2);
+
+        // Query 0 sits on the stale value, query 1 on the fresh one.
+        let query_values: Vec<f32> = [STALE_VALUE, FRESH_VALUE]
+            .iter()
+            .flat_map(|&value| std::iter::repeat_n(value, DIM))
+            .collect();
+        let queries = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(query_values.clone()),
+            DIM as i32,
+        )
+        .unwrap();
+        let configure = |scan: &mut Scanner, query: &dyn Array| {
+            scan.nearest("vec", query, k).unwrap();
+            match nprobes {
+                Some(nprobes) => {
+                    scan.nprobes(nprobes);
+                }
+                None => {
+                    scan.minimum_nprobes(1);
+                }
+            }
+            scan.project(&["id"]).unwrap();
+        };
+
+        let mut scan = dataset.scan();
+        configure(&mut scan, &queries);
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ANNIvfBatch"), "got:\n{plan}");
+        let batch = scan.try_into_batch().await.unwrap();
+        for query_index in 0..2 {
+            let query = Float32Array::from(
+                query_values[query_index * DIM..(query_index + 1) * DIM].to_vec(),
+            );
+            let mut single_scan = dataset.scan();
+            configure(&mut single_scan, &query);
+            let single = single_scan.try_into_batch().await.unwrap();
+            let mask = BooleanArray::from_iter(
+                batch[QUERY_INDEX_COL]
+                    .as_primitive::<Int32Type>()
+                    .iter()
+                    .map(|value| value.map(|value| value == query_index as i32)),
+            );
+            let batch_rows = arrow::compute::filter_record_batch(&batch, &mask).unwrap();
+            let ids = batch_rows["id"].as_primitive::<UInt32Type>().values();
+            assert_eq!(
+                ids.iter().filter(|&&id| id == UPDATED_ID).count(),
+                usize::from(query_index == 1),
+                "query {query_index}: the updated row must appear once, with its fresh vector only; ids {ids:?}"
+            );
+            assert_eq!(batch_rows.num_rows(), k);
+            assert_eq!(
+                batch_rows[DIST_COL].as_primitive::<Float32Type>().values(),
+                single[DIST_COL].as_primitive::<Float32Type>().values(),
+                "query {query_index}: batch distances must match single-query"
+            );
+        }
     }
 
     /// `nprobes(0)` is not rejected by the query builder, so both probe bounds
@@ -19998,29 +20238,30 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         .await?;
 
         log::info!("Test case: Full text search with unindexed rows");
-        // The flat-FTS path now reads through `FilteredReadExec`, matching the
-        // brute-force KNN path. With no prefilter the scan still produces no
-        // pushdown, but the operator differs by storage version: legacy emits
-        // a `LanceScan`, v2 emits a `LanceRead` with empty filters.
+        // MatchCorpus initializes shared BM25 statistics before either child scores
+        // candidates. The flat input reads through FilteredReadExec: legacy emits
+        // a LanceScan, v2 emits a LanceRead with empty filters.
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
+      MatchCorpus
+        SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+          CoalescePartitionsExec
+            UnionExec
+              MatchQuery: column=s, query=[hello]
+              FlatMatchQuery: column=s, query=hello
+                LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None"#
+        } else {
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
+    MatchCorpus
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         CoalescePartitionsExec
           UnionExec
             MatchQuery: column=s, query=[hello]
             FlatMatchQuery: column=s, query=hello
-              LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None"#
-        } else {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], source=stream(_rowid)
-    SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-      CoalescePartitionsExec
-        UnionExec
-          MatchQuery: column=s, query=[hello]
-          FlatMatchQuery: column=s, query=hello
-            LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--"#
+              LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--"#
         };
         dataset.append_new_data().await?;
         assert_plan_equals(

@@ -1,6 +1,6 @@
 [package]
 name = "lance-arrow-scalar"
-version = "58.0.0"
+version = "59.0.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

@@ -830,7 +830,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         return super(MergeInsertBuilder, self).analyze_plan(reader)
 
     def mark_sstables_as_compacted(
-        self, sstables: "List[mem_wal.CompactedSsTable]"
+        self, sstables: "List[mem_wal.CompactedSsTable]", dir_id: str = ""
     ) -> "MergeInsertBuilder":
         """Mark MemWAL SSTables as compacted into the base table.
 
@@ -848,11 +848,15 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         ----------
         sstables : list of CompactedSsTable
             SSTables to mark as compacted.
+        dir_id : str, optional
+            The ``dir_id`` of the MemWAL the SSTables belong to; empty for a
+            MemWAL without one. The commit fails if the table's MemWAL has
+            since been disabled or replaced.
         """
         from .mem_wal import _to_raw_compacted_sstables
 
         raw_sstables = _to_raw_compacted_sstables(sstables)
-        super(MergeInsertBuilder, self).mark_sstables_as_compacted(raw_sstables)
+        super(MergeInsertBuilder, self).mark_sstables_as_compacted(raw_sstables, dir_id)
         return self
 
 
@@ -5883,8 +5887,10 @@ class LanceDataset(pa.dataset.Dataset):
         -------
         dict or None
             A dict with ``num_shards``, ``maintained_indexes``,
-            ``writer_config_defaults``, and ``sharding_specs``, or ``None`` when
-            MemWAL has not been initialized on this dataset.
+            ``writer_config_defaults``, ``sharding_specs``, and ``dir_id``, or
+            ``None`` when MemWAL has not been initialized on this dataset.
+            ``dir_id`` names the MemWAL that commits recording compaction
+            progress must carry.
         """
         return self._ds.mem_wal_index_details()
 
@@ -6356,6 +6362,11 @@ class Index:
     files: Optional[List["IndexFile"]] = None
     index_details: Optional[Tuple[str, bytes]] = None
     covering_fields: List[int] = dataclasses.field(default_factory=list)
+    clustering_id: Optional[int] = None
+    """The clustering definition this segment was built under, if any."""
+    metadata: Dict[str, str] = dataclasses.field(default_factory=dict)
+    """Generic metadata attached to this segment. Preserved verbatim, including
+    keys this library does not understand."""
 
 
 class IndexInformation(TypedDict):
@@ -6607,6 +6618,10 @@ class LanceOperation:
         compacted_sstables: list[lance.mem_wal.CompactedSsTable]
             MemWAL SSTables to record as compacted. An empty list changes
             nothing. A non-empty list requires a MemWAL index on the table.
+        mem_wal_dir_id: str, optional
+            The ``dir_id`` of the MemWAL the SSTables belong to. Required when
+            ``compacted_sstables`` is non-empty; the commit fails if the
+            table's MemWAL has since been disabled or replaced.
         """
 
         removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
@@ -6623,6 +6638,7 @@ class LanceOperation:
         compacted_sstables: List["mem_wal.CompactedSsTable"] = dataclasses.field(
             default_factory=list
         )
+        mem_wal_dir_id: Optional[str] = None
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
@@ -6997,11 +7013,16 @@ class LanceOperation:
         ----------
         compacted_sstables: list[lance.mem_wal.CompactedSsTable]
             SSTables to mark compacted, one entry per shard.
+        dir_id: str
+            The ``dir_id`` of the MemWAL this update was built for; empty for a
+            MemWAL without one. The commit fails unless the table still carries
+            that MemWAL.
         """
 
         compacted_sstables: List["mem_wal.CompactedSsTable"] = dataclasses.field(
             default_factory=list
         )
+        dir_id: str = ""
 
 
 @dataclass
@@ -8042,11 +8063,11 @@ class DatasetOptimizer:
             Controls how much data is read at once when performing binary copy.
             Defaults to 16MB.
         max_source_fragments: int, optional
-            Maximum number of fragments whose identities may change in a
-            single run. This includes compacted source fragments and following
-            fragments relabeled to preserve row order. The planner selects
-            candidates from a suffix within this limit. If not specified, uses
-            the manifest config value, or applies no limit.
+            Maximum number of source fragments to compact in a single run.
+            Compaction tasks are included until adding the next task would
+            exceed this limit, allowing compaction to proceed incrementally.
+            Fragments are processed oldest first. If not specified, uses the
+            manifest config value, or applies no limit.
         max_source_rows: int, optional
             Maximum number of source rows to compact in a single run. Rows are
             counted as live rows (physical rows minus soft-deleted rows).
@@ -8063,9 +8084,7 @@ class DatasetOptimizer:
             Fragment IDs to exclude from compaction planning. Excluded
             fragments remain unchanged and act as boundaries, so fragments
             on opposite sides are not combined into the same compaction task.
-            To preserve row order, only candidates after the last present
-            excluded fragment are eligible. Duplicate and unknown IDs are
-            ignored.
+            Duplicate and unknown IDs are ignored.
         data_storage_version: str, optional
             Output data file version, such as "2.2", "stable", or "next".
             Uses the compaction config target when set, otherwise the dataset's

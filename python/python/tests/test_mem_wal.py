@@ -57,11 +57,19 @@ def _append_only_table(ids, prefix: str) -> pa.Table:
     )
 
 
-def _write_sstable(base_path: str, shard_id: str, gen_folder: str, data: pa.Table):
+def _mem_wal_dir(ds: lance.LanceDataset) -> str:
+    """The storage directory of ``ds``'s MemWAL: ``_{dir_id}_mem_wal``."""
+    dir_id = ds.mem_wal_index_details()["dir_id"]
+    return os.path.join(ds.uri, f"_{dir_id}_mem_wal")
+
+
+def _write_sstable(
+    ds: lance.LanceDataset, shard_id: str, gen_folder: str, data: pa.Table
+):
     """Write an SSTable Lance dataset at the expected sub-path.
 
     The collector resolves SSTable paths as:
-        {base_dataset_path}/_mem_wal/{shard_id}/{gen_folder}
+        {base_dataset_path}/_{dir_id}_mem_wal/{shard_id}/{gen_folder}
 
     Production flush also writes a primary-key dedup sidecar (`_pk_index/`) that
     the LSM scanner opens to dedup across generations; stage it here too so the
@@ -69,7 +77,7 @@ def _write_sstable(base_path: str, shard_id: str, gen_folder: str, data: pa.Tabl
     """
     from lance.lance import _write_pk_sidecar
 
-    gen_path = os.path.join(base_path, "_mem_wal", shard_id, gen_folder)
+    gen_path = os.path.join(_mem_wal_dir(ds), shard_id, gen_folder)
     lance.write_dataset(data, gen_path, schema=_LOOKUP_SCHEMA)
     _write_pk_sidecar(gen_path, data, ["id"])
 
@@ -81,12 +89,23 @@ def test_mark_sstables_as_compacted(tmp_path):
         _lookup_table([1, 2, 3], "base"), ds_path, schema=_LOOKUP_SCHEMA
     )
     dataset.initialize_mem_wal()
+    dir_id = dataset.mem_wal_index_details()["dir_id"]
+    assert dir_id
+
+    # Progress for any MemWAL but the table's own is refused.
+    with pytest.raises(OSError, match="Stale MemWAL"):
+        (
+            dataset.merge_insert("id")
+            .when_matched_update_all()
+            .mark_sstables_as_compacted([CompactedSsTable(shard_id, 1)], "stale")
+            .execute(_lookup_table([2], "stale"))
+        )
 
     (
         dataset.merge_insert("id")
         .when_matched_update_all()
         .when_not_matched_insert_all()
-        .mark_sstables_as_compacted([CompactedSsTable(shard_id, 1)])
+        .mark_sstables_as_compacted([CompactedSsTable(shard_id, 1)], dir_id)
         .execute(_lookup_table([2, 4], "compacted"))
     )
 
@@ -115,7 +134,7 @@ def test_point_lookup_with_memtables(tmp_path):
     base_ds.initialize_mem_wal()
 
     # --- SSTable: overwrites id=2 ---
-    _write_sstable(ds_path, shard_id, "gen_1", _lookup_table([2], "gen1"))
+    _write_sstable(base_ds, shard_id, "gen_1", _lookup_table([2], "gen1"))
 
     # --- ShardSnapshot describing the SSTable state ---
     snap = ShardSnapshot(shard_id).with_sstable(1, "gen_1").with_current_generation(2)
@@ -185,7 +204,7 @@ def test_lsm_scanner_with_memtables(tmp_path):
     )
     base_ds.initialize_mem_wal()
 
-    _write_sstable(ds_path, shard_id, "gen_1", _lookup_table([2], "gen1"))
+    _write_sstable(base_ds, shard_id, "gen_1", _lookup_table([2], "gen1"))
 
     snap = ShardSnapshot(shard_id).with_sstable(1, "gen_1").with_current_generation(2)
 
@@ -422,7 +441,8 @@ def test_shard_writer_e2e_correctness(tmp_path):
     """
     End-to-end correctness test for ShardWriter covering:
     - Multi-round writes that trigger WAL and MemTable flushes
-    - File-system layout verification (_mem_wal/<shard_id>/wal/ and manifest/)
+    - File-system layout verification (_{dir_id}_mem_wal/<shard_id>/wal/ and
+      manifest/)
     - SSTable data readable via LsmScanner
     - New writer created after close can write and scan correctly
 
@@ -475,7 +495,7 @@ def test_shard_writer_e2e_correctness(tmp_path):
     assert closed_memtable_stats["frozen_bytes"] == 0
 
     # === File-system layout ===
-    mem_wal_dir = os.path.join(ds_path, "_mem_wal", shard_id)
+    mem_wal_dir = os.path.join(_mem_wal_dir(ds), shard_id)
     assert os.path.isdir(mem_wal_dir), f"MemWAL directory missing: {mem_wal_dir}"
 
     wal_dir = os.path.join(mem_wal_dir, "wal")

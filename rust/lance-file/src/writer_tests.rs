@@ -4,7 +4,9 @@
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::ptr::NonNull;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::reader::{FileReader, FileReaderOptions, ReaderProjection, describe_encoding};
     use crate::testing::FsFixture;
@@ -19,7 +21,7 @@ mod tests {
         Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatch,
         RecordBatchReader, StringArray, StructArray, UInt64Array,
     };
-    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+    use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{
         DataType, Field, Field as ArrowField, Fields as ArrowFields, Schema, Schema as ArrowSchema,
     };
@@ -192,6 +194,160 @@ mod tests {
         file_writer.add_schema_metadata("foo", "bar");
         file_writer.finish().await.unwrap();
         // Tests asserting the contents of the written file are in reader.rs
+    }
+
+    #[tokio::test]
+    async fn test_sliced_batches_preserve_page_accumulation() {
+        let expected =
+            arrow_array::record_batch!(("id", UInt64, (0..1024).collect::<Vec<u64>>())).unwrap();
+        let mut page_counts = Vec::with_capacity(2);
+        for sliced in [false, true] {
+            let batches = (0..1024).step_by(32).map(|offset| {
+                if sliced {
+                    Ok(expected.slice(offset, 32))
+                } else {
+                    arrow_array::record_batch!((
+                        "id",
+                        UInt64,
+                        (offset as u64..offset as u64 + 32).collect::<Vec<_>>()
+                    ))
+                }
+            });
+            let input = arrow_array::RecordBatchIterator::new(batches, expected.schema());
+            let fs = FsFixture::default();
+            crate::testing::write_lance_file(
+                input,
+                &fs,
+                ConcreteFileVersion::V2_1,
+                FileWriterOptions {
+                    data_cache_bytes: Some(4096),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let scheduler = fs
+                .scheduler
+                .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+                .await
+                .unwrap();
+            let reader = FileReader::try_open(
+                scheduler,
+                None,
+                Arc::<DecoderPlugins>::default(),
+                &LanceCache::no_cache(),
+                FileReaderOptions::default(),
+            )
+            .await
+            .unwrap();
+            page_counts.push(reader.metadata().column_metadatas[0].pages.len());
+            let output = crate::testing::read_lance_file(
+                &fs,
+                Arc::<DecoderPlugins>::default(),
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .await;
+            let actual = arrow_select::concat::concat_batches(&expected.schema(), &output).unwrap();
+            assert_eq!(actual, expected);
+        }
+        assert!(page_counts[0] < 32);
+        assert_eq!(page_counts[0], page_counts[1]);
+    }
+
+    #[tokio::test]
+    async fn test_write_batch_snapshots_foreign_values() {
+        let owner = Arc::new((0..4096).map(AtomicU64::new).collect::<Vec<_>>());
+        // SAFETY: AtomicU64 has u64's layout and owner keeps the allocation alive.
+        let buffer = unsafe {
+            Buffer::from_custom_allocation(
+                NonNull::new(owner.as_ptr() as *mut u8).unwrap(),
+                4096 * 8,
+                owner.clone(),
+            )
+        };
+        let input = UInt64Array::new(ScalarBuffer::new(buffer, 0, 4096), None).slice(17, 32);
+        let batch = RecordBatch::try_from_iter([("id", Arc::new(input) as ArrayRef)]).unwrap();
+        let fs = FsFixture::default();
+        let sink = fs.object_store.create(&fs.tmp_path).await.unwrap();
+        let schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
+        let mut writer = versions::create_writer(
+            ConcreteFileVersion::V2_1,
+            sink,
+            schema,
+            FileWriterOptions {
+                data_cache_bytes: Some(4096),
+                keep_original_array: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        writer.write_batch(&batch).await.unwrap();
+        drop(batch);
+        owner[17].store(999, Ordering::Relaxed);
+        writer.add_schema_metadata("foo", "bar");
+        writer.finish().await.unwrap();
+
+        let output = crate::testing::read_lance_file(
+            &fs,
+            Arc::<DecoderPlugins>::default(),
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await;
+        let values = output[0]
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 17);
+    }
+
+    #[tokio::test]
+    async fn test_spare_batch_capacity_preserves_page_accumulation() {
+        async fn page_count(capacity: usize) -> usize {
+            let batches = (0..32)
+                .map(|batch_index| {
+                    let mut values = Vec::with_capacity(capacity);
+                    values.extend(batch_index * 32..batch_index * 32 + 32);
+                    RecordBatch::try_from_iter([(
+                        "id",
+                        Arc::new(UInt64Array::from(values)) as ArrayRef,
+                    )])
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let schema = batches[0].schema();
+            let fs = FsFixture::default();
+            crate::testing::write_lance_file(
+                arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema),
+                &fs,
+                ConcreteFileVersion::V2_1,
+                FileWriterOptions {
+                    data_cache_bytes: Some(4096),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let scheduler = fs
+                .scheduler
+                .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+                .await
+                .unwrap();
+            let reader = FileReader::try_open(
+                scheduler,
+                None,
+                Arc::<DecoderPlugins>::default(),
+                &LanceCache::no_cache(),
+                FileReaderOptions::default(),
+            )
+            .await
+            .unwrap();
+            reader.metadata().column_metadatas[0].pages.len()
+        }
+
+        let compact_capacity = page_count(32).await;
+        assert_eq!(compact_capacity, page_count(64).await);
+        assert!(compact_capacity < 32);
     }
 
     #[rstest]

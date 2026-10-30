@@ -1946,6 +1946,8 @@ async fn tagged_coverage_filtering_bypasses_system_indexes() {
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     });
     persist_fixture(&mut dataset, indices).await;
 
@@ -1977,7 +1979,7 @@ async fn tagged_coverage_filtering_bypasses_system_indexes() {
 async fn tagged_remapping_plans_coverage_once_per_snapshot() {
     use crate::index::frag_reuse::{
         FriQueryPlanKey, OpenPurpose, ResolvedRemapping, open_row_id_remapping,
-        open_row_id_remapping_with_plan,
+        open_row_id_remapping_with_plan, resolve_query_segment_coverages,
     };
 
     let mut dataset = fixture().await;
@@ -2047,6 +2049,12 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
         .await
         .expect("the first tagged open must publish the snapshot plan");
     assert!(plan.segments.contains_key(&siblings[1].uuid));
+    let resolved = resolve_query_segment_coverages(&dataset, &siblings.iter().collect::<Vec<_>>())
+        .await
+        .unwrap();
+    for (metadata, coverage) in siblings.iter().zip(resolved) {
+        assert_eq!(Some(coverage), metadata.fragment_bitmap);
+    }
 
     // Later opens must resolve from the published plan instead of re-running
     // the whole-dataset sibling scan: with the sibling dropped from the cached
@@ -2057,6 +2065,15 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
     let mut pruned = plan.as_ref().clone();
     pruned.segments.remove(&siblings[1].uuid);
     plan_cache.insert_with_key(&key, Arc::new(pruned)).await;
+    let no_sibling_coverage = resolve_query_segment_coverages(&dataset, &[&siblings[1]])
+        .await
+        .unwrap_err();
+    assert!(
+        no_sibling_coverage
+            .to_string()
+            .contains("FRI query coverage is unavailable"),
+        "{no_sibling_coverage}"
+    );
     let mapping = FragmentReuseIndex::open(&dataset, fri).await.unwrap();
     let empty = RoaringBitmap::new();
     let no_coverage = mapping.translation_fingerprint(&empty, &empty, &[]);
@@ -3396,6 +3413,8 @@ async fn install_history(
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     indices.push(fri.clone());
     Arc::make_mut(&mut dataset.manifest).fragments = live.into();

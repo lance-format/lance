@@ -34,7 +34,7 @@ async fn write_two_column_schema_evolution_dataset(uri: &str) -> Dataset {
 #[tokio::test]
 async fn test_binary_copy_merge_small_files() {
     for version in NON_LEGACY_VERSIONS {
-        do_test_binary_copy_merge_small_files(version).await;
+        Box::pin(do_test_binary_copy_merge_small_files(version)).await;
     }
 }
 
@@ -307,7 +307,10 @@ async fn do_test_binary_copy_packed_struct_column_mapping(version: LanceFileVers
 #[tokio::test]
 async fn test_binary_copy_skipped_after_metadata_only_add_column() {
     for version in NON_LEGACY_VERSIONS {
-        do_test_binary_copy_skipped_after_metadata_only_add_column(version).await;
+        Box::pin(do_test_binary_copy_skipped_after_metadata_only_add_column(
+            version,
+        ))
+        .await;
     }
 }
 
@@ -401,7 +404,7 @@ async fn do_test_binary_copy_skipped_after_metadata_only_add_column(version: Lan
 #[tokio::test]
 async fn test_binary_copy_empty_string_scalar_index() {
     for version in NON_LEGACY_VERSIONS {
-        do_test_binary_copy_empty_string_scalar_index(version).await;
+        Box::pin(do_test_binary_copy_empty_string_scalar_index(version)).await;
     }
 }
 
@@ -545,7 +548,7 @@ async fn do_test_binary_copy_with_defer_remap(version: LanceFileVersion) {
 #[case(LanceFileVersion::V2_3)]
 #[tokio::test]
 async fn test_binary_copy_preserves_stable_row_ids(#[case] version: LanceFileVersion) {
-    do_binary_copy_preserves_stable_row_ids(version).await;
+    Box::pin(do_binary_copy_preserves_stable_row_ids(version)).await;
 }
 
 async fn do_binary_copy_preserves_stable_row_ids(version: LanceFileVersion) {
@@ -705,7 +708,7 @@ async fn do_binary_copy_preserves_stable_row_ids(version: LanceFileVersion) {
 #[case(LanceFileVersion::V2_3)]
 #[tokio::test]
 async fn test_binary_copy_remaps_unstable_row_ids(#[case] version: LanceFileVersion) {
-    do_binary_copy_remaps_unstable_row_ids(version).await;
+    Box::pin(do_binary_copy_remaps_unstable_row_ids(version)).await;
 }
 
 async fn do_binary_copy_remaps_unstable_row_ids(version: LanceFileVersion) {
