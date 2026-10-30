@@ -2108,6 +2108,80 @@ def test_strict_overwrite(tmp_path: Path):
     assert exc_info.value.retryable is True
 
 
+def test_fragment_object_metadata_round_trips_through_append(tmp_path: Path):
+    """A fragment's generic metadata map crosses Python -> Rust -> Python intact."""
+    import dataclasses
+
+    table = pa.Table.from_pydict({"a": range(10)})
+    base_dir = tmp_path / "fragment_metadata"
+    dataset = lance.write_dataset(table, base_dir)
+
+    metadata = {
+        "org.example.cluster.bucket": "3",
+        "org.example.unknown": "  opaque value: 東京  ",
+        "org.example.empty": "",
+    }
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    assert fragment.clustering_id is None
+    assert fragment.metadata == {}
+    stamped = dataclasses.replace(fragment, metadata=metadata)
+
+    dataset = lance.LanceDataset.commit(
+        dataset, lance.LanceOperation.Append([stamped]), read_version=dataset.version
+    )
+    committed = [f.metadata for f in dataset.get_fragments()]
+    assert committed[0].metadata == {}
+    assert committed[1].metadata == metadata
+    assert committed[1].clustering_id is None
+
+    # Operations on the same fragment keep the map.
+    dataset.delete("a = 3")
+    kept = dataset.get_fragments()[1].metadata
+    assert kept.metadata == metadata
+    assert kept.deletion_file is not None
+
+
+def test_nonzero_clustering_reference_reaches_rust_validation(tmp_path: Path):
+    """A nonzero clustering_id crosses Python -> Rust on fragments and indices.
+
+    No definition can exist in a table created from Python yet, so the manifest
+    validation error is the evidence that the reference arrived in Rust.
+    """
+    import dataclasses
+
+    from lance.dataset import Index
+
+    table = pa.Table.from_pydict({"a": range(10)})
+    base_dir = tmp_path / "clustering_reference"
+    dataset = lance.write_dataset(table, base_dir)
+
+    fragment = dataclasses.replace(
+        lance.fragment.LanceFragment.create(base_dir, table), clustering_id=7
+    )
+    with pytest.raises(OSError, match="references clustering definition 7"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.Append([fragment]),
+            read_version=dataset.version,
+        )
+
+    index = Index(
+        uuid="00000000-0000-0000-0000-000000000001",
+        name="a_idx",
+        fields=[0],
+        dataset_version=dataset.version,
+        fragment_ids=set(f.fragment_id for f in dataset.get_fragments()),
+        index_version=0,
+        clustering_id=9,
+    )
+    with pytest.raises(OSError, match="references clustering definition 9"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.CreateIndex(new_indices=[index], removed_indices=[]),
+            read_version=dataset.version,
+        )
+
+
 def test_commit_timeout(tmp_path: Path):
     from datetime import timedelta
 
@@ -7123,21 +7197,11 @@ def test_transaction_audit_fields(tmp_path):
         pa.table({"id": [3, 4]}), tmp_path / "base", mode="append"
     )
 
-    empty = lance.LanceOperation.UpdateMemWalState()
-    tagged = lance.Transaction(
-        read_version=dataset.version, operation=empty, tag="audit-window"
-    )
-    dataset = lance.LanceDataset.commit(dataset, tagged)
-    read_back = dataset.read_transaction(dataset.version)
-    assert read_back.tag == "audit-window"
-    assert isinstance(read_back.operation, lance.LanceOperation.UpdateMemWalState)
-    assert list(read_back.operation.compacted_sstables) == []
-
     shard_id = str(uuid.uuid4())
     recorded = lance.LanceOperation.UpdateMemWalState(
         compacted_sstables=[CompactedSsTable(shard_id, 3)]
     )
-    with pytest.raises(OSError, match="__lance_mem_wal"):
+    with pytest.raises(OSError, match="Stale MemWAL"):
         lance.LanceDataset.commit(
             dataset,
             lance.Transaction(read_version=dataset.version, operation=recorded),
@@ -7146,11 +7210,24 @@ def test_transaction_audit_fields(tmp_path):
     update = lance.LanceOperation.Update(
         compacted_sstables=[CompactedSsTable(shard_id, 1)]
     )
-    with pytest.raises(OSError, match="__lance_mem_wal"):
+    with pytest.raises(OSError, match="mem_wal_dir_id"):
         lance.LanceDataset.commit(
             dataset,
             lance.Transaction(read_version=dataset.version, operation=update),
         )
+
+    dataset.initialize_mem_wal(unsharded=True)
+    dir_id = dataset.mem_wal_index_details()["dir_id"]
+    empty = lance.LanceOperation.UpdateMemWalState(dir_id=dir_id)
+    tagged = lance.Transaction(
+        read_version=dataset.version, operation=empty, tag="audit-window"
+    )
+    dataset = lance.LanceDataset.commit(dataset, tagged)
+    read_back = dataset.read_transaction(dataset.version)
+    assert read_back.tag == "audit-window"
+    assert isinstance(read_back.operation, lance.LanceOperation.UpdateMemWalState)
+    assert list(read_back.operation.compacted_sstables) == []
+    assert read_back.operation.dir_id == dir_id
 
     dataset.optimize.compact_files()
     rewrite = dataset.read_transaction(dataset.version)

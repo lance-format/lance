@@ -625,6 +625,7 @@ impl MergeInsertBuilder {
     pub fn mark_sstables_as_compacted<'a>(
         mut slf: PyRefMut<'a, Self>,
         sstables: Vec<Bound<'a, crate::mem_wal::PyCompactedSsTable>>,
+        dir_id: String,
     ) -> PyResult<PyRefMut<'a, Self>> {
         use lance_index::mem_wal::CompactedSsTable;
 
@@ -632,7 +633,8 @@ impl MergeInsertBuilder {
             .iter()
             .map(|sstable| sstable.borrow().to_lance())
             .collect::<PyResult<_>>()?;
-        slf.builder.mark_sstables_as_compacted(compacted_sstables);
+        slf.builder
+            .mark_sstables_as_compacted(dir_id, compacted_sstables);
         Ok(slf)
     }
 }
@@ -3975,7 +3977,8 @@ impl Dataset {
     /// has not been initialized.
     ///
     /// The returned dict has `num_shards`, `maintained_indexes`,
-    /// `maintain_all_indexes`, `writer_config_defaults`, and `sharding_specs`.
+    /// `maintain_all_indexes`, `writer_config_defaults`, `sharding_specs`, and
+    /// `dir_id`.
     ///
     /// `maintain_all_indexes` is what distinguishes maintaining every index
     /// the table has from maintaining none: both leave `maintained_indexes`
@@ -3996,6 +3999,7 @@ impl Dataset {
         dict.set_item("maintained_indexes", details.maintained_indexes)?;
         dict.set_item("maintain_all_indexes", details.maintain_all_indexes)?;
         dict.set_item("writer_config_defaults", details.writer_config_defaults)?;
+        dict.set_item("dir_id", details.dir_id)?;
 
         let specs = PyList::empty(py);
         for spec in &details.sharding_specs {
@@ -5956,7 +5960,9 @@ impl PySearchFilter {
             search_effort,
         ) = vector_query_params_from_dict(query, default_k)?;
 
-        let metric_type = Some(metric_type_opt.unwrap_or(MetricType::L2));
+        // Leave an unset metric to the core, which takes it from the index the
+        // search picks, as the `nearest` path does.
+        let metric_type = metric_type_opt;
 
         let vector_query = VectorQuery {
             column,

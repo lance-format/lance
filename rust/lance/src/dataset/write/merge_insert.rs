@@ -62,6 +62,7 @@ use super::{
     CommitBuilder, ExternalBlobMode, TargetBaseInfo, WriteMode, WriteParams,
     validate_and_resolve_target_bases_with_primary, write_fragments_internal,
 };
+use crate::dataset::blob::BlobPayloadInventory;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::dataset::rowids::{
     get_row_id_index, inline_row_lineage_max_bytes, load_spilled_row_lineage,
@@ -96,6 +97,7 @@ use arrow_select::take::take_record_batch;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column as DFColumn, NullEquality, TableReference};
 use datafusion::error::DataFusionError;
+use datafusion::physical_plan::replace_children_if_necessary;
 use datafusion::{
     catalog::{TableProvider, streaming::StreamingTable},
     datasource::MemTable,
@@ -144,6 +146,7 @@ use lance_index::IndexCriteria;
 use lance_index::mem_wal::CompactedSsTable;
 use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
+use lance_table::io::deletion::deletion_file_path;
 use log::info;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use snafu::ResultExt;
@@ -687,6 +690,8 @@ struct MergeInsertParams {
     retry_timeout: Duration,
     // MemWAL SSTables to mark as compacted when this commit succeeds.
     compacted_sstables: Vec<CompactedSsTable>,
+    // The `dir_id` of the MemWAL `compacted_sstables` belongs to.
+    mem_wal_dir_id: Option<String>,
     // If true, skip auto cleanup during commits. This should be set to true
     // for high frequency writes to improve performance. This is also useful
     // if the writer does not have delete permissions and the clean up would
@@ -954,6 +959,7 @@ impl MergeInsertBuilder {
                 spill_for_retry: true,
                 retry_timeout: Duration::from_secs(30),
                 compacted_sstables: Vec::new(),
+                mem_wal_dir_id: None,
                 skip_auto_cleanup: false,
                 use_index: true,
                 write_mode: MergeInsertWriteMode::default(),
@@ -1103,7 +1109,16 @@ impl MergeInsertBuilder {
     /// so it cannot enforce this: if a delete pass carried the marker and the
     /// process then died before the matching upsert, the recorded generation
     /// would claim rows were copied in that never were.
-    pub fn mark_sstables_as_compacted(&mut self, sstables: Vec<CompactedSsTable>) -> &mut Self {
+    ///
+    /// `dir_id` names the MemWAL the SSTables belong to; the commit fails with
+    /// [`Error::StaleMemWal`] if it was since disabled or replaced. Pass an
+    /// empty `sstables` on passes that record no progress so they are checked too.
+    pub fn mark_sstables_as_compacted(
+        &mut self,
+        dir_id: impl Into<String>,
+        sstables: Vec<CompactedSsTable>,
+    ) -> &mut Self {
+        self.params.mem_wal_dir_id = Some(dir_id.into());
         self.params.compacted_sstables.extend(sstables);
         self
     }
@@ -2351,7 +2366,7 @@ impl MergeInsertJob {
                             )) as Arc<dyn ExecutionPlan>
                         })
                         .collect();
-                    let new_node = node.with_new_children(new_children)?;
+                    let new_node = replace_children_if_necessary(node, new_children)?;
                     Ok(Transformed::yes(new_node))
                 } else {
                     Ok(Transformed::no(node))
@@ -3562,6 +3577,8 @@ impl MergeInsertJob {
             ))
     }
 
+    /// Build the uncommitted merge-insert transaction, using the v2 plan when
+    /// it supports the source and the legacy path otherwise.
     async fn execute_uncommitted_impl(
         self,
         provider: Arc<dyn TableProvider>,
@@ -3696,6 +3713,7 @@ impl MergeInsertJob {
                 new_fragments: vec![],
                 fields_modified: vec![],
                 compacted_sstables: self.params.compacted_sstables.clone(),
+                mem_wal_dir_id: self.params.mem_wal_dir_id.clone(),
                 fields_for_preserving_frag_bitmap: full_schema
                     .fields_pre_order()
                     .map(|f| f.id as u32)
@@ -3746,6 +3764,7 @@ impl MergeInsertJob {
                 new_fragments,
                 fields_modified,
                 compacted_sstables: self.params.compacted_sstables.clone(),
+                mem_wal_dir_id: self.params.mem_wal_dir_id.clone(),
                 fields_for_preserving_frag_bitmap: vec![], // in-place update do not affect preserving frag bitmap
                 update_mode: Some(RewriteColumns),
                 inserted_rows_filter: None, // not implemented for v1
@@ -3857,6 +3876,7 @@ impl MergeInsertJob {
                 // modify any field values.
                 fields_modified: vec![],
                 compacted_sstables: self.params.compacted_sstables.clone(),
+                mem_wal_dir_id: self.params.mem_wal_dir_id.clone(),
                 fields_for_preserving_frag_bitmap: full_schema
                     .fields_pre_order()
                     .map(|f| f.id as u32)
@@ -3947,7 +3967,8 @@ impl MergeInsertJob {
     /// reports the streaming shape: the source is stood in for by an empty one-shot
     /// stream. The wrapping affects the plan, so use [`Self::analyze_plan_batches`]
     /// or [`Self::analyze_plan_provider`] when that matters. Those execute the merge
-    /// to collect metrics and may write data files; this method writes nothing.
+    /// to collect metrics, writing data files they delete afterwards; this method
+    /// writes nothing.
     ///
     /// # Errors
     ///
@@ -3989,9 +4010,9 @@ impl MergeInsertJob {
     /// and executes it to collect performance metrics and analysis.
     ///
     /// **Note:** This method executes the merge insert operation to collect metrics
-    /// but **does not commit the changes**. While data files may be written to storage
-    /// during execution, they will not be referenced by any dataset version and the
-    /// dataset remains unchanged. This is intended for performance analysis only.
+    /// but **does not commit the changes**. Data and deletion files written during
+    /// execution are deleted once the metrics are collected, and the dataset
+    /// remains unchanged. This is intended for performance analysis only.
     ///
     /// # Arguments
     ///
@@ -4063,7 +4084,22 @@ impl MergeInsertJob {
 
         // Use the analyze_plan function from lance_datafusion, but strip out the wrapper lines
         let options = LanceExecutionOptions::default();
-        let full_analysis = analyze_plan(plan, options).await?;
+        let analysis_result = analyze_plan(plan.clone(), options).await;
+
+        // Executing the plan wrote files for a transaction that is never
+        // committed, so nothing will ever reference them. Remove them now
+        // rather than leaving them to orphan cleanup, whether or not the
+        // analysis itself succeeded.
+        if let Some(transaction) = uncommitted_transaction(plan.as_ref()) {
+            self.cleanup_uncommitted_files(&transaction).await;
+        }
+        // Managed blob payloads are separate objects no fragment lists. The
+        // write node records each one as it creates it, including in a run
+        // that failed before building a transaction.
+        if let Some(created_blob_payloads) = created_blob_payloads(plan.as_ref()) {
+            created_blob_payloads.delete_all().await;
+        }
+        let full_analysis = analysis_result?;
 
         // Remove the AnalyzeExec and TracedExec lines from the output
         let lines: Vec<&str> = full_analysis.lines().collect();
@@ -4077,6 +4113,109 @@ impl MergeInsertJob {
 
         Ok(filtered_lines.join("\n"))
     }
+
+    /// Delete the files an executed-but-uncommitted merge wrote.
+    ///
+    /// New fragments are entirely new. An updated fragment keeps the files it
+    /// had in the read version, so only the data files and deletion file that
+    /// differ from that version are removed. Failures are logged, not
+    /// returned: the files are unreferenced either way, and orphan cleanup
+    /// still reclaims anything left behind.
+    async fn cleanup_uncommitted_files(&self, transaction: &Transaction) {
+        let Operation::Update {
+            new_fragments,
+            updated_fragments,
+            ..
+        } = &transaction.operation
+        else {
+            return;
+        };
+
+        let original_fragments: HashMap<u64, &Fragment> = self
+            .dataset
+            .manifest
+            .fragments
+            .iter()
+            .map(|fragment| (fragment.id, fragment))
+            .collect();
+
+        let mut written_fragments = new_fragments.clone();
+        let mut written_deletion_files = Vec::new();
+        for updated in updated_fragments {
+            let original = original_fragments.get(&updated.id);
+            let mut written = updated.clone();
+            written.files.retain(|file| {
+                original.is_none_or(|original| {
+                    !original
+                        .files
+                        .iter()
+                        .any(|existing| existing.path == file.path)
+                })
+            });
+            if !written.files.is_empty() {
+                written_fragments.push(written);
+            }
+            if let Some(deletion_file) = &updated.deletion_file
+                && original
+                    .is_none_or(|original| original.deletion_file.as_ref() != Some(deletion_file))
+            {
+                written_deletion_files.push(deletion_file_path(
+                    &self.dataset.base,
+                    updated.id,
+                    deletion_file,
+                ));
+            }
+        }
+
+        if !written_fragments.is_empty() {
+            let target_bases_info = resolve_target_bases(&self.dataset, &self.params)
+                .await
+                .ok()
+                .flatten();
+            cleanup_data_fragments(
+                &self.dataset.object_store,
+                &self.dataset.base,
+                target_bases_info.as_deref(),
+                &written_fragments,
+            )
+            .await;
+        }
+        // Merge insert writes deletion files with `write_deletion_file`, which
+        // always places them under the dataset root.
+        for path in written_deletion_files {
+            if let Err(e) = self.dataset.object_store.delete(&path).await {
+                log::warn!(
+                    "Failed to clean up orphaned deletion file '{}': {}",
+                    path,
+                    e
+                );
+            }
+        }
+    }
+}
+
+/// The transaction a merge insert write node built during execution, if the
+/// node ran to completion.
+fn uncommitted_transaction(plan: &dyn ExecutionPlan) -> Option<Transaction> {
+    if let Some(full_exec) = plan.downcast_ref::<exec::FullSchemaMergeInsertExec>() {
+        full_exec.transaction()
+    } else if let Some(in_place_exec) = plan.downcast_ref::<exec::InPlaceMergeInsertExec>() {
+        in_place_exec.transaction()
+    } else if let Some(delete_exec) = plan.downcast_ref::<exec::DeleteOnlyMergeInsertExec>() {
+        delete_exec.transaction()
+    } else {
+        None
+    }
+}
+
+/// The managed blob payloads a merge insert write node created.
+///
+/// Only the full-schema node can create any. The in-place node refuses a source
+/// that carries a blob column and never inserts rows, and the delete-only node
+/// writes no data.
+fn created_blob_payloads(plan: &dyn ExecutionPlan) -> Option<&BlobPayloadInventory> {
+    plan.downcast_ref::<exec::FullSchemaMergeInsertExec>()
+        .map(|full_exec| full_exec.created_blob_payloads())
 }
 
 /// Merger will store these statistics as it runs (for each batch)
@@ -4675,6 +4814,10 @@ mod tests {
     use arrow_select::concat::concat_batches;
     use async_trait::async_trait;
     use datafusion::common::Column;
+    use datafusion::physical_plan::ChildrenPropertiesMode;
+    use datafusion::physical_plan::ReplaceChildrenOptions;
+    use datafusion::physical_plan::StatisticsArgs;
+    use datafusion::physical_plan::StatisticsContext;
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{FutureExt, StreamExt, TryStreamExt, future::try_join_all};
@@ -4691,6 +4834,7 @@ mod tests {
     use object_store::throttle::ThrottleConfig;
     use roaring::RoaringBitmap;
     use std::collections::HashMap;
+    use std::io::Write;
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::{Barrier, Notify};
     use url::Url;
@@ -4811,21 +4955,26 @@ mod tests {
             "retry attempts within one execution must share a disk manager"
         );
 
-        let mut rejected = first_manager
+        let rejected = first_manager
             .create_tmp_file("testing rejected merge job spill")
             .unwrap();
-        rejected.inner().as_file().set_len(2).unwrap();
-        assert!(matches!(
-            rejected.update_disk_usage(),
-            Err(DataFusionError::ResourcesExhausted(_))
-        ));
+        let mut writer = rejected.open_writer().unwrap();
+        let error = writer.write_all(&[0, 0]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("used disk space during the spilling process has exceeded")
+        );
+        drop(writer);
         drop(rejected);
 
-        let mut next_spill = second_manager
+        let next_spill = second_manager
             .create_tmp_file("testing independent merge job spill")
             .unwrap();
-        next_spill.inner().as_file().set_len(1).unwrap();
-        next_spill.update_disk_usage().unwrap();
+        let mut writer = next_spill.open_writer().unwrap();
+        writer.write_all(&[0]).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
         assert_eq!(second_manager.used_disk_space(), 1);
     }
 
@@ -5576,13 +5725,15 @@ mod tests {
             .unwrap()
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
             new_batch.clone(),
             job,
             &[1, 2, 3, 4, 5, 6],
             &[7, 8, 9],
             &[3, 0, 0],
-        )
+        ))
         .await;
 
         // upsert, no delete
@@ -5591,13 +5742,15 @@ mod tests {
             .when_matched(WhenMatched::UpdateAll)
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
             new_batch.clone(),
             job,
             &[1, 2, 3],
             &[4, 5, 6, 7, 8, 9],
             &[3, 3, 0],
-        )
+        ))
         .await;
 
         // conditional upsert, no delete
@@ -5608,13 +5761,15 @@ mod tests {
             )
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
             new_batch.clone(),
             job,
             &[1, 2, 3, 4, 5],
             &[6, 7, 8, 9],
             &[3, 1, 0],
-        )
+        ))
         .await;
 
         // conditional update, no matches
@@ -5624,8 +5779,16 @@ mod tests {
             .when_matched(WhenMatched::update_if(&ds, "target.filterme = 'z'").unwrap())
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(new_batch.clone(), job, &[1, 2, 3, 4, 5, 6], &[], &[0, 0, 0])
-            .await;
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[1, 2, 3, 4, 5, 6],
+            &[],
+            &[0, 0, 0],
+        ))
+        .await;
 
         // update only, no delete (useful for bulk update)
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -5634,8 +5797,16 @@ mod tests {
             .when_not_matched(WhenNotMatched::DoNothing)
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(new_batch.clone(), job, &[1, 2, 3], &[4, 5, 6], &[0, 3, 0])
-            .await;
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[1, 2, 3],
+            &[4, 5, 6],
+            &[0, 3, 0],
+        ))
+        .await;
 
         // Conditional update
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -5646,8 +5817,16 @@ mod tests {
             .when_not_matched(WhenNotMatched::DoNothing)
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(new_batch.clone(), job, &[1, 2, 3, 6], &[4, 5], &[0, 2, 0])
-            .await;
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[1, 2, 3, 6],
+            &[4, 5],
+            &[0, 2, 0],
+        ))
+        .await;
 
         // No-op (will raise an error)
         assert!(
@@ -5664,8 +5843,16 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(new_batch.clone(), job, &[4, 5, 6], &[7, 8, 9], &[3, 0, 3])
-            .await;
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[4, 5, 6],
+            &[7, 8, 9],
+            &[3, 0, 3],
+        ))
+        .await;
 
         // upsert, with delete all
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -5674,8 +5861,16 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(new_batch.clone(), job, &[], &[4, 5, 6, 7, 8, 9], &[3, 3, 3])
-            .await;
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[],
+            &[4, 5, 6, 7, 8, 9],
+            &[3, 3, 3],
+        ))
+        .await;
 
         // conditional upsert, with delete all
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -5686,8 +5881,16 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(new_batch.clone(), job, &[4, 5], &[6, 7, 8, 9], &[3, 1, 3])
-            .await;
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[4, 5],
+            &[6, 7, 8, 9],
+            &[3, 1, 3],
+        ))
+        .await;
 
         // update only, with delete all (unusual)
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -5697,7 +5900,16 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(new_batch.clone(), job, &[], &[4, 5, 6], &[0, 3, 3]).await;
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[],
+            &[4, 5, 6],
+            &[0, 3, 3],
+        ))
+        .await;
 
         // just delete all (not real case, just use delete)
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -5706,7 +5918,16 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(new_batch.clone(), job, &[4, 5, 6], &[], &[0, 0, 3]).await;
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[4, 5, 6],
+            &[],
+            &[0, 0, 3],
+        ))
+        .await;
 
         // For the "delete some" tests we use key > 1
         let condition = create_delete_condition();
@@ -5716,13 +5937,15 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
             new_batch.clone(),
             job,
             &[1, 4, 5, 6],
             &[7, 8, 9],
             &[3, 0, 2],
-        )
+        ))
         .await;
 
         // upsert, with delete some
@@ -5732,13 +5955,15 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
             new_batch.clone(),
             job,
             &[1],
             &[4, 5, 6, 7, 8, 9],
             &[3, 3, 2],
-        )
+        ))
         .await;
 
         // conditional upsert, with delete some
@@ -5750,13 +5975,15 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
             new_batch.clone(),
             job,
             &[1, 4, 5],
             &[6, 7, 8, 9],
             &[3, 1, 2],
-        )
+        ))
         .await;
 
         // update only, witxh delete some (unusual)
@@ -5767,7 +5994,16 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(new_batch.clone(), job, &[1], &[4, 5, 6], &[0, 3, 2]).await;
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[1],
+            &[4, 5, 6],
+            &[0, 3, 2],
+        ))
+        .await;
 
         // just delete some (not real case, just use delete)
         let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -5776,7 +6012,16 @@ mod tests {
             .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
             .try_build()
             .unwrap();
-        check_then_refresh_dataset(new_batch.clone(), job, &[1, 4, 5, 6], &[], &[0, 0, 2]).await;
+        // Boxed: the dataset and job held across the await put this
+        // future over the `large_futures` threshold.
+        Box::pin(check_then_refresh_dataset(
+            new_batch.clone(),
+            job,
+            &[1, 4, 5, 6],
+            &[],
+            &[0, 0, 2],
+        ))
+        .await;
     }
 
     #[rstest::rstest]
@@ -5785,23 +6030,27 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
     ) {
-        MergeInsertTestBuilder::new()
-            .with_version(version)
-            .with_stable_row_ids(enable_stable_row_ids)
-            .with_test_keys(&[4, 5, 6])
-            .with_expected_left_keys(&[])
-            .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
-            .with_expected_stats(&[3, 3, 3])
-            .with_job_builder(|ds| {
-                MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
-                    .unwrap()
-                    .when_matched(WhenMatched::UpdateAll)
-                    .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
-                    .try_build()
-                    .unwrap()
-            })
-            .run_test()
-            .await;
+        // Boxed: the builder holds several `Fragment`s, which puts the
+        // future over the `large_futures` threshold.
+        Box::pin(
+            MergeInsertTestBuilder::new()
+                .with_version(version)
+                .with_stable_row_ids(enable_stable_row_ids)
+                .with_test_keys(&[4, 5, 6])
+                .with_expected_left_keys(&[])
+                .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
+                .with_expected_stats(&[3, 3, 3])
+                .with_job_builder(|ds| {
+                    MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
+                        .unwrap()
+                        .when_matched(WhenMatched::UpdateAll)
+                        .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+                        .try_build()
+                        .unwrap()
+                })
+                .run_test(),
+        )
+        .await;
     }
 
     #[rstest::rstest]
@@ -5810,22 +6059,26 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
     ) {
-        MergeInsertTestBuilder::new()
-            .with_version(version)
-            .with_stable_row_ids(enable_stable_row_ids)
-            .with_test_keys(&[4, 5, 6])
-            .with_expected_left_keys(&[1, 2, 3])
-            .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
-            .with_expected_stats(&[3, 3, 0])
-            .with_job_builder(|ds| {
-                MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
-                    .unwrap()
-                    .when_matched(WhenMatched::UpdateAll)
-                    .try_build()
-                    .unwrap()
-            })
-            .run_test()
-            .await;
+        // Boxed: the builder holds several `Fragment`s, which puts the
+        // future over the `large_futures` threshold.
+        Box::pin(
+            MergeInsertTestBuilder::new()
+                .with_version(version)
+                .with_stable_row_ids(enable_stable_row_ids)
+                .with_test_keys(&[4, 5, 6])
+                .with_expected_left_keys(&[1, 2, 3])
+                .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
+                .with_expected_stats(&[3, 3, 0])
+                .with_job_builder(|ds| {
+                    MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
+                        .unwrap()
+                        .when_matched(WhenMatched::UpdateAll)
+                        .try_build()
+                        .unwrap()
+                })
+                .run_test(),
+        )
+        .await;
     }
 
     #[rstest::rstest]
@@ -5834,25 +6087,30 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
     ) {
-        MergeInsertTestBuilder::new()
-            .with_version(version)
-            .with_stable_row_ids(enable_stable_row_ids)
-            .with_test_keys(&[6])
-            .with_expected_left_keys(&[1, 2, 3, 4, 5])
-            .with_expected_right_keys(&[6, 7, 8, 9])
-            .with_expected_stats(&[3, 1, 0])
-            .with_job_builder(|ds| {
-                let keys = vec!["key".to_string()];
-                MergeInsertBuilder::try_new(ds.clone(), keys)
-                    .unwrap()
-                    .when_matched(
-                        WhenMatched::update_if(&ds, "source.filterme != target.filterme").unwrap(),
-                    )
-                    .try_build()
-                    .unwrap()
-            })
-            .run_test()
-            .await;
+        // Boxed: the builder holds several `Fragment`s, which puts the
+        // future over the `large_futures` threshold.
+        Box::pin(
+            MergeInsertTestBuilder::new()
+                .with_version(version)
+                .with_stable_row_ids(enable_stable_row_ids)
+                .with_test_keys(&[6])
+                .with_expected_left_keys(&[1, 2, 3, 4, 5])
+                .with_expected_right_keys(&[6, 7, 8, 9])
+                .with_expected_stats(&[3, 1, 0])
+                .with_job_builder(|ds| {
+                    let keys = vec!["key".to_string()];
+                    MergeInsertBuilder::try_new(ds.clone(), keys)
+                        .unwrap()
+                        .when_matched(
+                            WhenMatched::update_if(&ds, "source.filterme != target.filterme")
+                                .unwrap(),
+                        )
+                        .try_build()
+                        .unwrap()
+                })
+                .run_test(),
+        )
+        .await;
     }
 
     #[rstest::rstest]
@@ -5861,24 +6119,28 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
     ) {
-        MergeInsertTestBuilder::new()
-            .with_version(version)
-            .with_stable_row_ids(enable_stable_row_ids)
-            .with_test_keys(&[4, 5, 6])
-            .with_expected_left_keys(&[1, 2, 3])
-            .with_expected_right_keys(&[4, 5, 6])
-            .with_expected_stats(&[0, 3, 0])
-            .with_job_builder(|ds| {
-                let keys = vec!["key".to_string()];
-                MergeInsertBuilder::try_new(ds, keys)
-                    .unwrap()
-                    .when_matched(WhenMatched::UpdateAll)
-                    .when_not_matched(WhenNotMatched::DoNothing)
-                    .try_build()
-                    .unwrap()
-            })
-            .run_test()
-            .await;
+        // Boxed: the builder holds several `Fragment`s, which puts the
+        // future over the `large_futures` threshold.
+        Box::pin(
+            MergeInsertTestBuilder::new()
+                .with_version(version)
+                .with_stable_row_ids(enable_stable_row_ids)
+                .with_test_keys(&[4, 5, 6])
+                .with_expected_left_keys(&[1, 2, 3])
+                .with_expected_right_keys(&[4, 5, 6])
+                .with_expected_stats(&[0, 3, 0])
+                .with_job_builder(|ds| {
+                    let keys = vec!["key".to_string()];
+                    MergeInsertBuilder::try_new(ds, keys)
+                        .unwrap()
+                        .when_matched(WhenMatched::UpdateAll)
+                        .when_not_matched(WhenNotMatched::DoNothing)
+                        .try_build()
+                        .unwrap()
+                })
+                .run_test(),
+        )
+        .await;
     }
 
     #[rstest::rstest]
@@ -5887,25 +6149,29 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
         #[values(true, false)] enable_stable_row_ids: bool,
     ) {
-        MergeInsertTestBuilder::new()
-            .with_version(version)
-            .with_stable_row_ids(enable_stable_row_ids)
-            .with_test_keys(&[1, 4, 5, 6])
-            .with_expected_left_keys(&[1])
-            .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
-            .with_expected_stats(&[3, 3, 2])
-            .with_job_builder(|ds| {
-                let keys = vec!["key".to_string()];
-                let condition = create_delete_condition();
-                MergeInsertBuilder::try_new(ds, keys)
-                    .unwrap()
-                    .when_matched(WhenMatched::UpdateAll)
-                    .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition))
-                    .try_build()
-                    .unwrap()
-            })
-            .run_test()
-            .await;
+        // Boxed: the builder holds several `Fragment`s, which puts the
+        // future over the `large_futures` threshold.
+        Box::pin(
+            MergeInsertTestBuilder::new()
+                .with_version(version)
+                .with_stable_row_ids(enable_stable_row_ids)
+                .with_test_keys(&[1, 4, 5, 6])
+                .with_expected_left_keys(&[1])
+                .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
+                .with_expected_stats(&[3, 3, 2])
+                .with_job_builder(|ds| {
+                    let keys = vec!["key".to_string()];
+                    let condition = create_delete_condition();
+                    MergeInsertBuilder::try_new(ds, keys)
+                        .unwrap()
+                        .when_matched(WhenMatched::UpdateAll)
+                        .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition))
+                        .try_build()
+                        .unwrap()
+                })
+                .run_test(),
+        )
+        .await;
     }
 
     #[rstest::rstest]
@@ -6548,13 +6814,10 @@ mod tests {
         assert_eq!(actual_payload, expected_payload);
     }
 
-    /// merge_insert matches keys by bit pattern, in the indexed probe and in the
-    /// hash join behind it alike, so a source key of `+0.0` updates only the
-    /// `+0.0` row. Filters answer zero comparisons per IEEE 754 now, and this
-    /// pins that the two are still allowed to disagree: making key matching agree
-    /// needs the unindexed join fixed too, and DataFusion 54 hashes join keys by
-    /// raw bits. Both settings of `use_index` are exercised; which one the planner
-    /// picks for a one-row source is not asserted.
+    /// merge_insert matches float keys per IEEE 754, like filters do, so a source
+    /// key of `+0.0` matches both the `-0.0` and the `+0.0` row. Both settings of
+    /// `use_index` are exercised; which one the planner picks for a one-row source
+    /// is not asserted.
     #[rstest::rstest]
     #[tokio::test]
     async fn test_merge_insert_on_float_zero_key(#[values(true, false)] use_index: bool) {
@@ -6597,10 +6860,86 @@ mod tests {
             .await
             .unwrap();
 
-        // Only the +0.0 row is updated. Checking both sides pins which row was
-        // replaced, not just how many; `value = 20` is the -0.0 row.
+        // Both zero rows are updated; `value = 20` was the -0.0 row and
+        // `value = 30` the +0.0 row.
         assert_eq!(ds.count_rows(None).await.unwrap(), 4);
-        for (filter, expected) in [("value = 99", 1), ("value = 30", 0), ("value = 20", 1)] {
+        for (filter, expected) in [("value = 99", 2), ("value = 30", 0), ("value = 20", 0)] {
+            assert_eq!(
+                ds.count_rows(Some(filter.to_string())).await.unwrap(),
+                expected,
+                "{filter}"
+            );
+        }
+    }
+
+    /// `-0.0` and `+0.0` are one key, so a source holding both has a duplicate
+    /// key: each zero target row is matched twice. The default `Fail` rejects
+    /// that as ambiguous; `FirstSeen` updates each zero row once, with either
+    /// source row's value depending on join order.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_merge_insert_source_with_both_float_zeros(
+        #[values(true, false)] use_index: bool,
+        #[values(SourceDedupeBehavior::Fail, SourceDedupeBehavior::FirstSeen)]
+        behavior: SourceDedupeBehavior,
+    ) {
+        let target = record_batch!(
+            (
+                "key",
+                Float64,
+                [Some(-1.0), Some(-0.0), Some(0.0), Some(1.0)]
+            ),
+            ("value", Int32, [10, 20, 30, 40])
+        )
+        .unwrap();
+        let schema = target.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(target)], schema.clone());
+        let mut ds = Dataset::write(reader, "memory://", None).await.unwrap();
+        ds.create_index(
+            &["key"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let source = record_batch!(
+            ("key", Float64, [Some(-0.0), Some(0.0)]),
+            ("value", Int32, [98, 99])
+        )
+        .unwrap();
+        let result = MergeInsertBuilder::try_new(Arc::new(ds), vec!["key".to_string()])
+            .unwrap()
+            .when_not_matched(WhenNotMatched::DoNothing)
+            .when_matched(WhenMatched::UpdateAll)
+            .use_index(use_index)
+            .source_dedupe_behavior(behavior)
+            .try_build()
+            .unwrap()
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(source)],
+                schema.clone(),
+            )))
+            .await;
+
+        if behavior == SourceDedupeBehavior::Fail {
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("Ambiguous merge inserts"),
+                "Fail must reject a source holding both zeros, got: {err}"
+            );
+            return;
+        }
+
+        let (ds, _) = result.unwrap();
+        assert_eq!(ds.count_rows(None).await.unwrap(), 4);
+        for (filter, expected) in [
+            ("value = 98 OR value = 99", 2),
+            ("value = 20", 0),
+            ("value = 30", 0),
+        ] {
             assert_eq!(
                 ds.count_rows(Some(filter.to_string())).await.unwrap(),
                 expected,
@@ -8095,8 +8434,11 @@ mod tests {
         );
 
         let rebuilt = plan
-            .with_new_children(vec![dummy_input.clone()])
-            .expect("with_new_children must accept exactly one child");
+            .replace_children(
+                vec![dummy_input.clone()],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .expect("replace_children must accept exactly one child");
         let rebuilt_rendered = format!("{}", displayable(rebuilt.as_ref()).indent(false));
         assert!(
             rebuilt_rendered.contains("IndexedLookup [a, b]"),
@@ -14075,6 +14417,191 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         assert!(analysis.contains("elapsed_compute"));
     }
 
+    fn list_dataset_files(base_dir: &str) -> Vec<std::path::PathBuf> {
+        fn walk(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, files);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(std::path::Path::new(base_dir), &mut files);
+        files.sort();
+        files
+    }
+
+    /// `analyze_plan` executes the merge without committing it, so every file
+    /// the execution wrote is unreferenced and must be removed afterwards.
+    /// Each case drives a different write node: the full-schema upsert writes a
+    /// new fragment plus deletion files, the in-place update writes a patch
+    /// file onto existing fragments, and the delete-only path writes only
+    /// deletion files.
+    #[derive(Debug, Clone, Copy)]
+    enum AnalyzedWriteNode {
+        FullSchema,
+        InPlace,
+        DeleteOnly,
+    }
+
+    #[rstest::rstest]
+    #[case::full_schema_upsert(AnalyzedWriteNode::FullSchema)]
+    #[case::in_place_update(AnalyzedWriteNode::InPlace)]
+    #[case::delete_only(AnalyzedWriteNode::DeleteOnly)]
+    #[tokio::test]
+    async fn test_analyze_plan_removes_written_files(#[case] write_node: AnalyzedWriteNode) {
+        let tempdir = TempStrDir::default();
+        let data = lance_datagen::gen_batch()
+            .col("key", array::step::<UInt32Type>())
+            .col("value", array::step::<UInt32Type>())
+            .col("other", array::cycle_utf8_literals(&["a", "b"]))
+            .into_reader_rows(RowCount::from(4), BatchCount::from(2));
+        let write_params = WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        };
+        let dataset = Arc::new(
+            Dataset::write(data, &tempdir, Some(write_params))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let files_before = list_dataset_files(&tempdir);
+
+        // Keys 1 and 5 hit both fragments; key 100 is new.
+        let builder =
+            || MergeInsertBuilder::try_new(dataset.clone(), vec!["key".to_string()]).unwrap();
+        let (job, source, expected_node) = match write_node {
+            AnalyzedWriteNode::FullSchema => (
+                builder()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::InsertAll)
+                    .try_build()
+                    .unwrap(),
+                record_batch!(
+                    ("key", UInt32, [1, 5, 100]),
+                    ("value", UInt32, [10, 50, 1000]),
+                    ("other", Utf8, ["x", "y", "z"])
+                )
+                .unwrap(),
+                "MergeInsert:",
+            ),
+            AnalyzedWriteNode::InPlace => (
+                builder()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::DoNothing)
+                    .write_mode(MergeInsertWriteMode::RewriteColumns)
+                    .try_build()
+                    .unwrap(),
+                record_batch!(("key", UInt32, [1, 5]), ("value", UInt32, [10, 50])).unwrap(),
+                "InPlaceMergeInsert:",
+            ),
+            AnalyzedWriteNode::DeleteOnly => (
+                builder()
+                    .when_matched(WhenMatched::Delete)
+                    .when_not_matched(WhenNotMatched::DoNothing)
+                    .try_build()
+                    .unwrap(),
+                record_batch!(("key", UInt32, [1, 5])).unwrap(),
+                "DeleteOnlyMergeInsert:",
+            ),
+        };
+
+        let analysis = job.analyze_plan_batches(vec![source]).await.unwrap();
+        assert!(
+            analysis.trim_start().starts_with(expected_node),
+            "expected the {expected_node} write node:\n{analysis}"
+        );
+
+        assert_eq!(list_dataset_files(&tempdir), files_before);
+        let mut dataset = (*dataset).clone();
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.version().version, 1);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 8);
+    }
+
+    /// With managed blobs enabled, Blob v2 payloads above the inline threshold
+    /// live in their own `_blobs/<uuid>.blob` objects rather than beside the
+    /// data file, so removing the analyzed data files alone leaves them behind. Repeated
+    /// analyses must not accumulate those objects, and the committed blobs the
+    /// target rows still reference must stay readable.
+    #[rstest::rstest]
+    #[case::packed(65 * 1024)]
+    #[case::dedicated(4 * 1024 * 1024 + 1)]
+    #[tokio::test]
+    async fn test_analyze_plan_removes_written_blob_payloads(#[case] payload_size: usize) {
+        let tempdir = TempStrDir::default();
+        let schema = Arc::new(crate::dataset::blob::test_util::managed_blob_schema(vec![
+            Field::new("id", DataType::Int64, true),
+            crate::blob_field("payload", true),
+        ]));
+        let make_batch = |ids: Vec<i64>, value: u8| {
+            let payload = vec![value; payload_size];
+            let mut blobs = crate::BlobArrayBuilder::new(ids.len());
+            for _ in &ids {
+                blobs.push_bytes(&payload).unwrap();
+            }
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(ids)), blobs.finish().unwrap()],
+            )
+            .unwrap()
+        };
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(make_batch(vec![0, 1], 1))], schema.clone()),
+                &tempdir,
+                Some(WriteParams {
+                    max_rows_per_file: 1,
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let files_before = list_dataset_files(&tempdir);
+        let blobs_dir = std::path::Path::new(tempdir.as_ref() as &str).join("_blobs");
+        assert!(
+            files_before.iter().any(|path| path.starts_with(&blobs_dir)),
+            "the fixture must store its payloads as managed objects: {files_before:?}"
+        );
+
+        let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap();
+        for _ in 0..2 {
+            let analysis = job
+                .analyze_plan_batches(vec![make_batch(vec![0, 2], 2)])
+                .await
+                .unwrap();
+            assert!(
+                analysis.trim_start().starts_with("MergeInsert:"),
+                "expected the full-schema write node:\n{analysis}"
+            );
+        }
+
+        assert_eq!(list_dataset_files(&tempdir), files_before);
+        assert_eq!(dataset.version().version, 1);
+        for blob in dataset
+            .take_blobs_by_indices(&[0, 1], "payload")
+            .await
+            .unwrap()
+        {
+            assert_eq!(
+                blob.unwrap().read().await.unwrap().as_ref(),
+                vec![1; payload_size]
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_merge_insert_with_action_column() {
         // Test that merge_insert works when the user has a column named "action"
@@ -17810,7 +18337,7 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
     }
 
     fn collect_exact_row_counts(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<usize>) {
-        if let Ok(stats) = plan.partition_statistics(None)
+        if let Ok(stats) = StatisticsContext::new().compute(plan.as_ref(), &StatisticsArgs::new())
             && let datafusion::common::stats::Precision::Exact(n) = stats.num_rows
         {
             out.push(n);

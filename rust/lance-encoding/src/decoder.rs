@@ -329,8 +329,12 @@ pub trait LogicalPageDecoder: std::fmt::Debug + Send {
 
     fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask>;
 
-    /// Returns how many of the requested rows can be decoded into one Arrow array
-    /// while keeping every i32 offset buffer within `byte_budget` bytes.
+    /// Plans how many of the requested rows can be decoded into one Arrow array.
+    ///
+    /// `DrainLimit::rows` and `DrainLimit::bytes` describe the largest prefix
+    /// that fits the i32 offset budget. Independent batch-level constraints,
+    /// such as dictionary key capacity, are reported separately in
+    /// `DrainLimit::dictionary_rows`.
     ///
     /// Most page decoders can always drain the full request and consume no budget.
     /// Decoders that build arrays with i32 offsets (Utf8 / Binary / List) may return
@@ -340,20 +344,26 @@ pub trait LogicalPageDecoder: std::fmt::Debug + Send {
         Ok(DrainLimit {
             rows: num_rows,
             bytes: 0,
+            dictionary_rows: None,
         })
     }
 
     fn data_type(&self) -> &DataType;
 }
 
-/// Result of limiting a drain request to a variable-width byte budget.
+/// Result of limiting a drain request to one output array.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DrainLimit {
-    /// How many of the requested rows can be decoded into one Arrow array
+    /// How many requested rows fit the byte-based i32 offset budget.
     pub rows: u64,
     /// The variable-width bytes (at the most constrained i32-offset nesting level)
-    /// those rows consume from the caller's budget
+    /// those rows consume from the caller's budget.
     pub bytes: u64,
+    /// An independent batch-level row limit imposed by dictionary key capacity.
+    /// Unlike `rows`, this limit does not accumulate across pages.
+    /// Composites that change row coordinates must translate this limit rather
+    /// than forwarding it.
+    pub dictionary_rows: Option<u64>,
 }
 
 /// The byte budget applied to each output batch of an i32-offset column.
@@ -362,17 +372,25 @@ pub struct DrainLimit {
 /// buffer's offsets exceed `i32::MAX`, so batches are split before that point.
 pub(crate) const I32_OFFSET_BYTE_BUDGET: u64 = i32::MAX as u64;
 
-/// Clamp a batch's row count to the byte-budgeted limit.
+/// Apply a plan to the requested batch size and reserve the selected rows.
 ///
 /// A batch always advances by at least one row: a first row whose (possibly
-/// over-estimated) size exceeds the whole budget is emitted alone.  A genuinely
-/// oversized row then surfaces the same arrow-level offset error it always did,
-/// while an over-estimated one decodes fine.
-fn clamp_rows_to_i32_budget(limit: DrainLimit, to_take: u64) -> u64 {
-    if to_take == 0 {
+/// over-estimated) size exceeds the whole budget, or whose nested child cannot fit
+/// a declared dictionary key type, is emitted alone. A genuinely oversized value
+/// or dictionary then surfaces the same decoding error it always did, while an
+/// over-estimated value decodes fine.
+fn apply_drain_limit(limit: DrainLimit, requested_rows: u64, rows_remaining: &mut u64) -> u64 {
+    if requested_rows == 0 {
         return 0;
     }
-    limit.rows.clamp(1, to_take)
+    let planned_rows = limit
+        .dictionary_rows
+        .map(|dictionary_rows| limit.rows.min(dictionary_rows))
+        .unwrap_or(limit.rows);
+    let rows = planned_rows.clamp(1, requested_rows);
+    debug_assert!(rows <= *rows_remaining);
+    *rows_remaining -= rows;
+    rows
 }
 
 /// Returns whether concatenating arrays of this type can overflow an i32 offset buffer.
@@ -1685,7 +1703,6 @@ impl BatchDecodeStream {
         }
 
         let mut to_take = self.rows_remaining.min(self.rows_per_batch as u64);
-        self.rows_remaining -= to_take;
 
         let scheduled_need = (self.rows_drained + to_take).saturating_sub(self.rows_scheduled);
         trace!(
@@ -1717,16 +1734,15 @@ impl BatchDecodeStream {
         );
         self.root_decoder.wait_for_loaded(loaded_need).await?;
 
-        if self.limit_i32_offset_batch_size && has_i32_offsets(self.root_decoder.data_type()) {
-            let limit = LogicalPageDecoder::max_rows_to_drain(
-                &self.root_decoder,
-                to_take,
-                I32_OFFSET_BYTE_BUDGET,
-            )?;
-            let clamped = clamp_rows_to_i32_budget(limit, to_take);
-            self.rows_remaining += to_take - clamped;
-            to_take = clamped;
-        }
+        let byte_budget =
+            if self.limit_i32_offset_batch_size && has_i32_offsets(self.root_decoder.data_type()) {
+                I32_OFFSET_BYTE_BUDGET
+            } else {
+                u64::MAX
+            };
+        let limit =
+            LogicalPageDecoder::max_rows_to_drain(&self.root_decoder, to_take, byte_budget)?;
+        to_take = apply_drain_limit(limit, to_take, &mut self.rows_remaining);
 
         let next_task = self.root_decoder.drain(to_take)?;
         self.rows_drained += to_take;
@@ -1785,14 +1801,8 @@ trait RootDecoderType {
     fn accept_message(&mut self, message: RootDecoderMessage) -> Result<()>;
     fn drain_batch(&mut self, num_rows: u64) -> Result<NextDecodeTask>;
     fn wait(&mut self, loaded_need: u64, runtime: &tokio::runtime::Runtime) -> Result<()>;
-    /// See [`LogicalPageDecoder::max_rows_to_drain`].  Decoders without i32-offset
-    /// accounting place no limit.
-    fn max_rows_to_drain(&self, num_rows: u64, _byte_budget: u64) -> Result<DrainLimit> {
-        Ok(DrainLimit {
-            rows: num_rows,
-            bytes: 0,
-        })
-    }
+    /// See [`LogicalPageDecoder::max_rows_to_drain`].
+    fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit>;
 }
 impl RootDecoderType for StructuralStructDecoder {
     fn accept_message(&mut self, message: RootDecoderMessage) -> Result<()> {
@@ -1807,6 +1817,9 @@ impl RootDecoderType for StructuralStructDecoder {
     fn wait(&mut self, _: u64, _: &tokio::runtime::Runtime) -> Result<()> {
         // Waiting happens elsewhere (not as part of the decoder)
         Ok(())
+    }
+    fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
+        StructuralFieldDecoder::max_rows_to_drain(self, num_rows, byte_budget)
     }
 }
 impl RootDecoderType for SimpleStructDecoder {
@@ -1823,12 +1836,6 @@ impl RootDecoderType for SimpleStructDecoder {
         runtime.block_on(self.wait_for_loaded(loaded_need))
     }
     fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
-        if !has_i32_offsets(LogicalPageDecoder::data_type(self)) {
-            return Ok(DrainLimit {
-                rows: num_rows,
-                bytes: 0,
-            });
-        }
         LogicalPageDecoder::max_rows_to_drain(self, num_rows, byte_budget)
     }
 }
@@ -1932,7 +1939,6 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
         }
 
         let mut to_take = self.rows_remaining.min(self.rows_per_batch as u64);
-        self.rows_remaining -= to_take;
 
         let scheduled_need = (self.rows_drained + to_take).saturating_sub(self.rows_scheduled);
         trace!(
@@ -1959,9 +1965,7 @@ impl<T: RootDecoderType> BatchDecodeIterator<T> {
         let limit = self
             .root_decoder
             .max_rows_to_drain(to_take, I32_OFFSET_BYTE_BUDGET)?;
-        let clamped = clamp_rows_to_i32_budget(limit, to_take);
-        self.rows_remaining += to_take - clamped;
-        to_take = clamped;
+        to_take = apply_drain_limit(limit, to_take, &mut self.rows_remaining);
 
         let next_task = self.root_decoder.drain_batch(to_take)?;
 
@@ -2150,8 +2154,6 @@ impl StructuralBatchDecodeStream {
         } else {
             row_limit
         };
-        self.rows_remaining -= to_take;
-
         let scheduled_need = (self.rows_drained + to_take).saturating_sub(self.rows_scheduled);
         trace!(
             "scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}",
@@ -2174,6 +2176,12 @@ impl StructuralBatchDecodeStream {
             return Ok(None);
         }
 
+        let limit = StructuralFieldDecoder::max_rows_to_drain(
+            &self.root_decoder,
+            to_take,
+            I32_OFFSET_BYTE_BUDGET,
+        )?;
+        to_take = apply_drain_limit(limit, to_take, &mut self.rows_remaining);
         let next_task = self.root_decoder.drain_batch_task(to_take)?;
         self.rows_drained += to_take;
         Ok(Some(next_task))
@@ -2724,6 +2732,11 @@ pub fn schedule_and_decode_blocking(
 ///
 /// See [`crate::decoder`] for more information
 pub trait PrimitivePageDecoder: Send + Sync {
+    /// Number of stored dictionary values, if this decoder preserves dictionary encoding.
+    fn dictionary_len(&self) -> Option<u64> {
+        None
+    }
+
     /// Decode data into buffers
     ///
     /// This may be a simple zero-copy from a disk buffer or could involve complex decoding
@@ -3026,8 +3039,9 @@ impl RequestBatch {
         pending
             .iter()
             .flat_map(|read| &read.ranges)
-            .map(|range| range.end - range.start)
-            .sum()
+            .fold(0u64, |total, range| {
+                total.saturating_add(range.end.saturating_sub(range.start))
+            })
     }
 
     /// Bytes requested by the reads collected so far.
@@ -3124,16 +3138,24 @@ impl RequestBatch {
         priority: u64,
         is_nested_step: bool,
     ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
+        if let Some(invalid) = ranges.iter().find(|range| range.start > range.end) {
+            return futures::future::ready(Err(Error::invalid_input(format!(
+                "Invalid read range {}..{}: start is after end",
+                invalid.start, invalid.end
+            ))))
+            .boxed();
+        }
         let mut state = self.shared.state.lock().unwrap();
         let is_scheduling_finished = state.is_scheduling_finished;
         let pending = &mut state.reads;
         // Keep every batch within the budget: a page that shards its reads
         // must not have all its shards collapse into one unbounded read.
-        let bytes = ranges
-            .iter()
-            .map(|range| range.end - range.start)
-            .sum::<u64>();
-        if !pending.is_empty() && Self::queued_bytes(pending) + bytes > IO_REQUEST_BATCH_BYTES {
+        let bytes = ranges.iter().fold(0u64, |total, range| {
+            total.saturating_add(range.end.saturating_sub(range.start))
+        });
+        if !pending.is_empty()
+            && Self::queued_bytes(pending).saturating_add(bytes) > IO_REQUEST_BATCH_BYTES
+        {
             // Until the run finishes, the queued reads belong to its current
             // step, so they go where the step's flush sends them.
             let io = if is_scheduling_finished {
@@ -3473,6 +3495,11 @@ pub trait DecodePageTask: Send + std::fmt::Debug {
 }
 
 pub trait StructuralPageDecoder: std::fmt::Debug + Send {
+    /// Number of stored dictionary values, if this decoder preserves dictionary encoding.
+    fn dictionary_len(&self) -> Option<u64> {
+        None
+    }
+
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>>;
     fn num_rows(&self) -> u64;
     /// Returns the exact decoded byte count for the next `num_rows` rows
@@ -3521,6 +3548,15 @@ pub trait StructuralDecodeArrayTask: std::fmt::Debug + Send {
 }
 
 pub trait StructuralFieldDecoder: std::fmt::Debug + Send {
+    /// See [`LogicalPageDecoder::max_rows_to_drain`].
+    fn max_rows_to_drain(&self, num_rows: u64, _byte_budget: u64) -> Result<DrainLimit> {
+        Ok(DrainLimit {
+            rows: num_rows,
+            bytes: 0,
+            dictionary_rows: None,
+        })
+    }
+
     /// Add a newly scheduled child decoder
     ///
     /// The default implementation does not expect children and returns
@@ -3629,12 +3665,45 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct StaticStructuralPageDecoder {
+        num_rows: u64,
+        dictionary_len: Option<u64>,
+    }
+
+    #[derive(Debug)]
+    struct StaticStructuralDecodeTask;
+
+    impl DecodePageTask for StaticStructuralDecodeTask {
+        fn decode(self: Box<Self>) -> Result<DecodedPage> {
+            Err(Error::internal(
+                "static structural decoder plans rows but does not decode".to_string(),
+            ))
+        }
+    }
+
+    impl StructuralPageDecoder for StaticStructuralPageDecoder {
+        fn dictionary_len(&self) -> Option<u64> {
+            self.dictionary_len
+        }
+
+        fn drain(&mut self, _num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
+            Ok(Box::new(StaticStructuralDecodeTask))
+        }
+
+        fn num_rows(&self) -> u64 {
+            self.num_rows
+        }
+    }
+
+    #[derive(Debug)]
     struct StaticArrayPageDecoder {
         array: ArrayRef,
         rows_drained: u64,
         /// Pretend each row decodes to this many bytes instead of its real size,
         /// so budget exhaustion can be tested without gigabyte allocations.
         fake_bytes_per_row: Option<u64>,
+        /// Independent row constraint used to emulate dictionary key capacity.
+        row_limit: Option<u64>,
     }
 
     impl StaticArrayPageDecoder {
@@ -3643,12 +3712,20 @@ mod tests {
                 array: Arc::new(StringArray::from(values.to_vec())),
                 rows_drained: 0,
                 fake_bytes_per_row: None,
+                row_limit: None,
             }
         }
 
         fn with_fake_bytes_per_row(values: &[&str], fake_bytes_per_row: u64) -> Self {
             Self {
                 fake_bytes_per_row: Some(fake_bytes_per_row),
+                ..Self::new(values)
+            }
+        }
+
+        fn with_row_limit(values: &[&str], row_limit: u64) -> Self {
+            Self {
+                row_limit: Some(row_limit),
                 ..Self::new(values)
             }
         }
@@ -3697,7 +3774,8 @@ mod tests {
             let start = self.rows_drained as usize;
             let mut rows = 0u64;
             let mut bytes = 0u64;
-            for row in start..start + num_rows as usize {
+            let row_limit = self.row_limit.unwrap_or(num_rows);
+            for row in start..start + num_rows.min(row_limit) as usize {
                 let row_bytes = self.row_bytes(row);
                 if bytes + row_bytes > byte_budget {
                     break;
@@ -3705,7 +3783,11 @@ mod tests {
                 bytes += row_bytes;
                 rows += 1;
             }
-            Ok(DrainLimit { rows, bytes })
+            Ok(DrainLimit {
+                rows,
+                bytes,
+                dictionary_rows: self.row_limit,
+            })
         }
 
         fn data_type(&self) -> &DataType {
@@ -3744,6 +3826,32 @@ mod tests {
             batch_sizes.push(task.task.await.unwrap().num_rows());
         }
         batch_sizes
+    }
+
+    fn array_iterator_batch_sizes(
+        pages: Vec<StaticArrayPageDecoder>,
+        batch_size: u32,
+    ) -> Vec<usize> {
+        let num_rows = pages.iter().map(|page| page.num_rows()).sum::<u64>();
+        let fields = Fields::from(vec![ArrowField::new("value", DataType::Utf8, false)]);
+        let schema = Arc::new(ArrowSchema::new(fields.clone()));
+        let root_decoder = SimpleStructDecoder::new(fields, num_rows);
+        let decoders = pages
+            .into_iter()
+            .map(|page| {
+                MessageType::DecoderReady(DecoderReady {
+                    decoder: Box::new(page),
+                    path: VecDeque::from([0]),
+                })
+            })
+            .collect();
+        let messages = VecDeque::from([Ok(DecoderMessage {
+            scheduled_so_far: num_rows,
+            decoders,
+        })]);
+        BatchDecodeIterator::new(messages, batch_size, num_rows, root_decoder, schema)
+            .map(|batch| batch.unwrap().num_rows())
+            .collect()
     }
 
     #[tokio::test]
@@ -3791,6 +3899,33 @@ mod tests {
         )
         .await;
         assert_eq!(batch_sizes, vec![1, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_array_stream_applies_independent_row_limits() {
+        let batch_sizes = array_stream_batch_sizes(
+            vec![
+                StaticArrayPageDecoder::with_row_limit(&["a"], 2),
+                StaticArrayPageDecoder::with_row_limit(&["b"], 2),
+                StaticArrayPageDecoder::with_row_limit(&["c"], 2),
+            ],
+            3,
+        )
+        .await;
+        assert_eq!(batch_sizes, vec![2, 1]);
+    }
+
+    #[test]
+    fn test_blocking_iterator_applies_independent_row_limits() {
+        let batch_sizes = array_iterator_batch_sizes(
+            vec![
+                StaticArrayPageDecoder::with_row_limit(&["a"], 2),
+                StaticArrayPageDecoder::with_row_limit(&["b"], 2),
+                StaticArrayPageDecoder::with_row_limit(&["c"], 2),
+            ],
+            3,
+        );
+        assert_eq!(batch_sizes, vec![2, 1]);
     }
 
     #[test]
@@ -4071,6 +4206,52 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_structural_stream_translates_nested_dictionary_limit_through_fsl() {
+        let dictionary_type =
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let item_fields = Fields::from(vec![ArrowField::new("value", dictionary_type, true)]);
+        let fsl_type = DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Struct(item_fields), true)),
+            8,
+        );
+        let fields = Fields::from(vec![ArrowField::new("vectors", fsl_type, true)]);
+        let root_decoder = StructuralStructDecoder::new(
+            fields, false, /*is_root=*/ true, /*nullable=*/ false,
+        )
+        .unwrap();
+        let (tx, rx) = unbounded_channel();
+        let loaded_page = async move {
+            Ok(LoadedPageShard {
+                decoder: Box::new(StaticStructuralPageDecoder {
+                    num_rows: 300 * 8,
+                    dictionary_len: Some(129),
+                }),
+                path: VecDeque::from([0, 0]),
+            })
+        }
+        .boxed();
+        tx.send(Ok(DecoderMessage {
+            scheduled_so_far: 300,
+            decoders: vec![MessageType::UnloadedPage(UnloadedPageShard(loaded_page))],
+        }))
+        .unwrap();
+        drop(tx);
+
+        let mut stream = StructuralBatchDecodeStream::new(
+            rx,
+            300,
+            300,
+            root_decoder,
+            /*spawn_batch_decode_tasks=*/ false,
+            None,
+        );
+        let task = stream.next_batch_task().await.unwrap().unwrap();
+
+        assert_eq!(task.num_rows, 16);
+        assert_eq!(stream.rows_remaining, 284);
+    }
+
     #[test]
     fn test_coalesce_indices_to_ranges_with_single_index() {
         let indices = vec![1];
@@ -4349,5 +4530,30 @@ mod tests {
                 "third batch should be near 50 rows, got {third_batch_rows}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn submit_request_rejects_inverted_range() {
+        use crate::testing::SimulatedScheduler;
+
+        let batch = super::RequestBatch::new(std::sync::Arc::new(SimulatedScheduler::new(
+            bytes::Bytes::new(),
+        )));
+        // Build the range at runtime: clippy rejects an inverted literal, but the
+        // point of the test is that malformed metadata can produce one.
+        let start = 10u64;
+        let end = 5u64;
+        let error = batch
+            .submit_request(vec![start..end], 0)
+            .await
+            .expect_err("an inverted read range must fail");
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("start is after end"),
+            "unexpected error: {error}"
+        );
     }
 }

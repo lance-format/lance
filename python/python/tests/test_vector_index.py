@@ -2556,20 +2556,49 @@ def test_index_cast_centroids(tmp_path):
     )
 
 
-def test_fragment_scan_disallowed_on_ann(dataset):
-    q = np.random.randn(128)
-    with pytest.raises(
-        ValueError, match="This operation is not supported for fragment scan"
-    ):
-        scanner = dataset.scanner(
-            columns=["id"],
-            nearest={
-                "column": "vector",
-                "q": q,
-            },
-            fragments=[LanceFragment(dataset, 0)],
-        )
-        scanner.explain_plan(True)
+@pytest.fixture
+def fragment_vector_dataset(tmp_path):
+    table = pa.table(
+        {
+            "id": range(12),
+            "vector": pa.array(
+                [[float(i), 0.0, 0.0, 0.0] for i in range(12)],
+                type=pa.list_(pa.float32(), 4),
+            ),
+        }
+    )
+    dataset = lance.write_dataset(table.slice(0, 8), tmp_path, max_rows_per_file=4)
+    dataset = dataset.create_index(
+        "vector",
+        "IVF_FLAT",
+        num_partitions=1,
+        ivf_centroids=np.zeros((1, 4), dtype=np.float32),
+    )
+    segment = str(dataset.describe_indices()[0].segments[0].uuid)
+    dataset = lance.write_dataset(table.slice(8), dataset.uri, mode="append")
+    return dataset, segment
+
+
+@pytest.mark.parametrize("as_string", [False, True], ids=["uuid", "string"])
+def test_fragment_scan_default_postfilter(fragment_vector_dataset, as_string):
+    dataset, segment = fragment_vector_dataset
+    # The binding sets fragments before nearest; both filtering flags use defaults.
+    scanner = dataset.scanner(
+        columns=["id", "_distance"],
+        fragments=dataset.get_fragments()[1:],
+        index_segments=[segment if as_string else uuid.UUID(segment)],
+        nearest={"column": "vector", "q": np.zeros(4, dtype=np.float32), "k": 6},
+        filter="id % 2 = 1",
+    )
+    plan = scanner.explain_plan()
+    assert "ANNSubIndex" in plan and "KNNVectorDistance" in plan, plan
+    assert "UnionExec" in plan, plan
+    result = scanner.to_table()
+    ids = result["id"].to_pylist()
+    expected_ids = [5, 7, 9]
+    assert len(set(ids) & set(expected_ids)) / len(expected_ids) == 1.0, plan
+    assert ids == expected_ids, plan
+    assert result["_distance"].to_pylist() == [25.0, 49.0, 81.0]
 
 
 def test_fragment_scan_allowed_on_ann_with_file_scan_prefilter(dataset):
@@ -2866,6 +2895,9 @@ def test_retrain_indices(tmp_path, retrain):
         index_type="IVF_FLAT",
         num_partitions=1,
         ivf_centroids=old_centroid,
+        # A retrain sizes partitions from the target the index records. Pin it
+        # at the 128 rows the table ends with so the retrain keeps one partition.
+        target_partition_size=128,
         index_file_version=IndexFileVersion.V3,
     )
     indexed_dataset = lance.write_dataset(
@@ -3489,6 +3521,42 @@ def test_prewarm_index(tmp_path):
     run(dataset, q=np.array(q), assert_func=func)
 
 
+def test_vector_search_filter_uses_the_index_metric(tmp_path):
+    # With no metric given, a VectorSearchQuery filter used to search with L2
+    # and skip a cosine index. Rows 0-3 point the query's way but are far away;
+    # rows 4-7 are near it in L2 and point elsewhere, so the two metrics pick
+    # disjoint top 4s.
+    vectors = [[10.0, 1.0]] * 4 + [[0.0, 1.0]] * 4
+    ds = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array(range(8), pa.int64()),
+                "vector": pa.array(vectors, pa.list_(pa.float32(), 2)),
+                "text": ["match"] * 8,
+            }
+        ),
+        tmp_path / "ds",
+    )
+    ds = ds.create_index(
+        "vector",
+        "IVF_FLAT",
+        metric="cosine",
+        num_partitions=1,
+        ivf_centroids=np.array([[1.0, 0.0]], dtype=np.float32),
+    )
+    ds.create_scalar_index("text", "INVERTED")
+    q = np.array([1.0, 0.0], dtype=np.float32)
+
+    scanner = ds.scanner(
+        columns=["id"],
+        filter=VectorSearchQuery("vector", q, k=4),
+        full_text_query=MatchQuery("match", column="text"),
+        prefilter=True,
+    )
+    assert "ANNSubIndex" in scanner.explain_plan()
+    assert sorted(scanner.to_table()["id"].to_pylist()) == [0, 1, 2, 3]
+
+
 def test_scanner_rejects_unknown_index_segments(tmp_path):
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
@@ -3504,6 +3572,37 @@ def test_scanner_rejects_unknown_index_segments(tmp_path):
                 "k": 10,
             },
             index_segments=[uuid.uuid4()],
+        ).to_table()
+
+
+def test_scanner_rejects_invalid_index_segment_uuid(fragment_vector_dataset):
+    dataset, _ = fragment_vector_dataset
+    with pytest.raises(ValueError, match="invalid index segment uuid 'not-a-uuid'"):
+        dataset.scanner(
+            nearest={"column": "vector", "q": np.zeros(4), "k": 5},
+            fragments=dataset.get_fragments()[1:],
+            index_segments=["not-a-uuid"],
+        ).to_table()
+
+
+@pytest.mark.parametrize(
+    "segments",
+    [
+        pytest.param(str(uuid.UUID(int=0)), id="single-string"),
+        pytest.param(uuid.UUID(int=0), id="single-uuid"),
+        pytest.param([123], id="integer-element"),
+        pytest.param([None], id="none-element"),
+    ],
+)
+def test_scanner_rejects_index_segment_types(fragment_vector_dataset, segments):
+    dataset, _ = fragment_vector_dataset
+    with pytest.raises(
+        TypeError, match="index_segments must be an iterable of str or uuid.UUID"
+    ):
+        dataset.scanner(
+            nearest={"column": "vector", "q": np.zeros(4), "k": 5},
+            fragments=dataset.get_fragments()[1:],
+            index_segments=segments,
         ).to_table()
 
 
@@ -4205,6 +4304,83 @@ def test_distributed_ivf_pq_order_invariance(tmp_path: Path):
     assert ids_12 == ids_21
     for a, b in zip(dists_12, dists_21):
         assert np.allclose(a, b, atol=1e-6)
+
+
+@pytest.mark.parametrize("prefilter", [True, False])
+@pytest.mark.parametrize(
+    "index_metric,metric,use_index,expected_ids",
+    [
+        (None, None, True, [0, 1]),
+        ("cosine", None, True, [2, 3]),
+        ("dot", None, True, [4, 5]),
+        ("cosine", "cosine", True, [2, 3]),
+        ("cosine", "l2", True, [0, 1]),
+        ("cosine", None, False, [0, 1]),
+        ("cosine", "cosine", False, [2, 3]),
+    ],
+)
+def test_vector_search_filter_metric(
+    tmp_path, prefilter, index_metric, metric, use_index, expected_ids
+):
+    # Each metric has a disjoint top two, so an L2 fallback cannot pass by chance.
+    vectors = [[1, 0.1], [1, 0.2], [3, 0], [4, 0.01], [10, 4], [9, 5], None]
+    table = pa.table(
+        {
+            "id": range(len(vectors)),
+            "vector": pa.array(vectors, type=pa.list_(pa.float32(), 2)),
+            "text": ["match"] * len(vectors),
+        }
+    )
+    ds = lance.write_dataset(table, tmp_path, max_rows_per_file=2)
+    if index_metric is not None:
+        ds.create_index(
+            "vector",
+            "IVF_FLAT",
+            metric=index_metric,
+            num_partitions=1,
+            ivf_centroids=np.array([[1, 0]], dtype=np.float32),
+        )
+    ds.create_scalar_index("text", "INVERTED")
+
+    scanner = ds.scanner(
+        columns=["id"],
+        filter=VectorSearchQuery(
+            "vector", [1, 0], k=2, metric=metric, use_index=use_index
+        ),
+        full_text_query=MatchQuery("match", column="text"),
+        prefilter=prefilter,
+    )
+    uses_ann = (
+        prefilter
+        and use_index
+        and index_metric is not None
+        and metric in (None, index_metric)
+    )
+    assert ("ANNIvf" in scanner.explain_plan()) == uses_ann
+    assert sorted(scanner.to_table()["id"].to_pylist()) == expected_ids
+
+
+@pytest.mark.parametrize("prefilter", [True, False])
+def test_fts_filter_binary_default_metric(tmp_path, prefilter):
+    ds = lance.write_dataset(
+        pa.table(
+            {
+                "id": [0, 1, 2],
+                "vector": pa.array([[128, 0], [3, 0], None], pa.list_(pa.uint8(), 2)),
+                "text": ["match"] * 3,
+            }
+        ),
+        tmp_path,
+        max_rows_per_file=1,
+    )
+    ds.create_scalar_index("text", "INVERTED")
+    result = ds.to_table(
+        columns=["id"],
+        nearest={"column": "vector", "q": np.array([0, 0], dtype=np.uint8), "k": 1},
+        filter=MatchQuery("match", column="text"),
+        prefilter=prefilter,
+    )
+    assert result["id"].to_pylist() == [0]
 
 
 def test_fts_filter_vector_search(tmp_path):

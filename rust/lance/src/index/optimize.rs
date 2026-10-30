@@ -747,7 +747,7 @@ async fn plan_split_rebuild(
     }
     let uuid = Uuid::new_v4();
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
-    let files = build_vector_model_segment(
+    let built = build_vector_model_segment(
         dataset,
         field_path,
         name,
@@ -764,11 +764,16 @@ async fn plan_split_rebuild(
         covering_fields: Vec::new(),
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(RoaringBitmap::new()),
-        index_details: Some(Arc::new(vector_index_details(&params))),
+        index_details: Some(Arc::new(vector_index_details(
+            &params,
+            built.target_partition_size,
+        ))),
         index_version: params.index_type().version(),
         created_at: Some(Utc::now()),
         base_id: None,
-        files: Some(files),
+        files: Some(built.files),
+        clustering_id: None,
+        metadata: Default::default(),
     };
     Ok(Some(SplitInputs {
         reference,
@@ -861,7 +866,7 @@ async fn pack_split_index(
     let fragment_groups = pack_next_fit(build_inputs, task_limit);
 
     enum MergeInput {
-        Absorbed(IndexMetadata),
+        Absorbed(Box<IndexMetadata>),
         Build(Vec<u32>),
     }
     let mut merge_inputs = Vec::with_capacity(absorbed.len() + fragment_groups.len());
@@ -872,7 +877,7 @@ async fn pack_split_index(
             .iter()
             .map(|id| rows_by_fragment.get(&id).copied().unwrap_or(0))
             .sum();
-        merge_inputs.push((MergeInput::Absorbed(segment), rows));
+        merge_inputs.push((MergeInput::Absorbed(Box::new(segment)), rows));
     }
     for group in fragment_groups {
         let rows = group
@@ -894,7 +899,7 @@ async fn pack_split_index(
         let mut builds = Vec::new();
         for input in bin {
             match input {
-                MergeInput::Absorbed(segment) => absorbed.push(segment),
+                MergeInput::Absorbed(segment) => absorbed.push(*segment),
                 MergeInput::Build(fragments) => builds.push(fragments),
             }
         }
@@ -1159,6 +1164,8 @@ async fn merge_vector_segments(
         created_at: Some(Utc::now()),
         base_id: None,
         files: Some(files),
+        clustering_id: None,
+        metadata: Default::default(),
     })
 }
 

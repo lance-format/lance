@@ -1461,7 +1461,7 @@ async fn assert_scalar_queries_match(dataset: &Dataset) {
 #[serial_test::serial(frag_reuse_maintenance)]
 async fn v0_deferred_segment_merges_into_live_addresses_after_upgrade() {
     let dir = TempStrDir::default();
-    let (dataset, destination) = v0_deferred_scalar_fixture(dir.as_str()).await;
+    let (dataset, destination) = Box::pin(v0_deferred_scalar_fixture(dir.as_str())).await;
     let old = stored_segment(&dataset, "i_idx").await;
     // The file still addresses the retired sources.
     let stale = raw_segment_row_addrs(&dataset, &old, 101).await;
@@ -1562,7 +1562,7 @@ async fn v0_deferred_segment_merges_into_live_addresses_after_upgrade() {
 #[serial_test::serial(frag_reuse_maintenance)]
 async fn two_v0_deferred_rounds_merge_and_trim_after_upgrade() {
     let dir = TempStrDir::default();
-    let (mut dataset, first_destination) = v0_deferred_scalar_fixture(dir.as_str()).await;
+    let (mut dataset, first_destination) = Box::pin(v0_deferred_scalar_fixture(dir.as_str())).await;
     let old = stored_segment(&dataset, "i_idx").await;
     // Round two: every remaining fragment (F0, F1 and the first destination)
     // is indexed, so the planner bins them together.
@@ -1676,7 +1676,7 @@ async fn two_v0_deferred_rounds_merge_and_trim_after_upgrade() {
 #[serial_test::serial(frag_reuse_maintenance)]
 async fn upgrade_merge_leaves_the_caught_up_segment_alone() {
     let dir = TempStrDir::default();
-    let (dataset, destination) = v0_deferred_scalar_fixture(dir.as_str()).await;
+    let (dataset, destination) = Box::pin(v0_deferred_scalar_fixture(dir.as_str())).await;
     let old = stored_segment(&dataset, "i_idx").await;
     let (dataset, sp_destinations) = upgrade_by_stable_partition(dataset, 300).await;
     let mut dataset = append_scalar_rows(dataset, 400, 4).await;

@@ -883,6 +883,12 @@ struct MiniBlockDecoder {
 /// See [`MiniBlockScheduler`] for more details on the scheduling and decoding
 /// process for miniblock encoded data.
 impl StructuralPageDecoder for MiniBlockDecoder {
+    fn dictionary_len(&self) -> Option<u64> {
+        self.dictionary
+            .as_ref()
+            .map(|dictionary| dictionary.num_values())
+    }
+
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
         let mut items_desired = num_rows;
         let mut need_preamble = false;
@@ -1037,8 +1043,8 @@ impl MiniBlockScheduler {
         let def_meaning = layout
             .layers
             .iter()
-            .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
-            .collect::<Vec<_>>();
+            .map(|l| EncodingUtils::try_repdef_layer_to_def_interp(*l))
+            .collect::<Result<Vec<_>>>()?;
         let value_decompressor = decompressors.create_miniblock_decompressor(
             layout.value_compression.as_ref().unwrap(),
             decompressors,
@@ -1417,6 +1423,26 @@ impl ChunkInstructions {
     }
 }
 
+/// Checks that the chunk index maps exactly the requested rows.
+///
+/// The chunk index comes from the file.  A mismatch means the page's row mapping does not
+/// cover the requested rows, so decoding it would produce the wrong number of rows.
+fn ensure_scheduled_rows(num_rows: u64, instructions: &[ChunkInstructions]) -> Result<()> {
+    let scheduled_rows = instructions
+        .iter()
+        .map(|instructions| instructions.rows_to_take)
+        .sum::<u64>();
+    if num_rows != scheduled_rows {
+        return Err(Error::corrupt_file_named(
+            "miniblock_metadata",
+            format!(
+                "Mini-block chunk index maps {num_rows} requested rows to {scheduled_rows} rows"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 enum Words {
     U16(ScalarBuffer<u16>),
     U32(ScalarBuffer<u32>),
@@ -1563,6 +1589,12 @@ fn build_chunk_index(
     repetition_index_depth: u16,
 ) -> Result<MiniBlockChunkIndex> {
     let num_chunks = words.len();
+    if num_chunks == 0 {
+        return Err(Error::corrupt_file_named(
+            "miniblock_metadata",
+            "mini-block page has no chunk metadata",
+        ));
+    }
     // Validate item counts before byte sizes because both share a metadata word,
     // and an invalid count must not reach the final-chunk subtraction.
     let value_counts = analyze_value_counts(words, items_in_page)?;
@@ -1605,9 +1637,26 @@ fn build_chunk_index(
     // Nested pages track rows via the repetition index and keep leaf item counts
     // separately; flat pages have row == value index, so value counts are rows.
     let rows = if let Some(rep_index_data) = rep_index_bytes {
-        assert!(rep_index_data.len() % 8 == 0);
+        if rep_index_data.len() % 8 != 0 {
+            return Err(Error::corrupt_file_named(
+                "miniblock_metadata",
+                format!(
+                    "repetition index has {} bytes, which is not a whole number of u64 words",
+                    rep_index_data.len()
+                ),
+            ));
+        }
         let stride = repetition_index_depth as usize + 1;
         let (row_starts, has_trailer) = parse_nested_rep(rep_index_data, stride);
+        if row_starts.num_chunks() != num_chunks || has_trailer.len() != num_chunks {
+            return Err(Error::corrupt_file_named(
+                "miniblock_metadata",
+                format!(
+                    "repetition index covers {} chunks but the page has {num_chunks} chunks",
+                    row_starts.num_chunks()
+                ),
+            ));
+        }
         let item_counts = if value_counts.uniform {
             ItemCounts::Uniform {
                 values_per_chunk: value_counts.values_per_chunk,
@@ -1738,20 +1787,24 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         ranges: &[Range<u64>],
         io: &Arc<dyn EncodingsIo>,
     ) -> Result<Vec<PageLoadTask>> {
-        let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
+        let num_rows = ranges.iter().try_fold(0u64, |total, range| {
+            range
+                .end
+                .checked_sub(range.start)
+                .and_then(|len| total.checked_add(len))
+                .ok_or_else(|| {
+                    Error::invalid_input(format!("Invalid requested row range {range:?}"))
+                })
+        })?;
 
-        let page_meta = self.page_meta.as_ref().unwrap();
+        let page_meta = self.page_meta.as_ref().ok_or_else(|| {
+            Error::internal("Mini-block page was scheduled before its metadata was loaded")
+        })?;
 
         let chunk_instructions =
             ChunkInstructions::schedule_instructions(&page_meta.chunk_index, ranges);
 
-        debug_assert_eq!(
-            num_rows,
-            chunk_instructions
-                .iter()
-                .map(|ci| ci.rows_to_take)
-                .sum::<u64>()
-        );
+        ensure_scheduled_rows(num_rows, &chunk_instructions)?;
 
         let chunks_needed = chunk_instructions
             .iter()
@@ -3226,5 +3279,47 @@ mod tests {
             assert!(matches!(error, Error::CorruptFile { .. }));
             assert!(error.to_string().contains("mini-block"));
         }
+    }
+
+    #[test]
+    fn test_ensure_scheduled_rows_rejects_mismatch() {
+        let instructions = vec![ChunkInstructions {
+            chunk_idx: 0,
+            preamble: PreambleAction::Absent,
+            rows_to_skip: 0,
+            rows_to_take: 1,
+            take_trailer: false,
+        }];
+
+        super::ensure_scheduled_rows(1, &instructions).expect("matching row counts must pass");
+
+        let error = super::ensure_scheduled_rows(2, &instructions)
+            .expect_err("a chunk index that maps too few rows must fail");
+        assert!(
+            matches!(error, lance_core::Error::CorruptFile { .. }),
+            "expected CorruptFile, got: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("maps 2 requested rows to 1 rows"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_build_chunk_index_rejects_mismatched_rep_index() {
+        // Two chunks in the metadata, but a repetition index that only covers one.
+        let words = Words::from_bytes(bytes::Bytes::from(vec![1u8, 0, 0, 0]), false).unwrap();
+        let error = build_chunk_index(&words, 2, 0, 16, Some(&[0u8; 16]), 1)
+            .expect_err("a repetition index that misses a chunk must fail");
+        assert!(
+            matches!(error, lance_core::Error::CorruptFile { .. }),
+            "expected CorruptFile, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("chunks"),
+            "unexpected error: {error}"
+        );
     }
 }

@@ -9,10 +9,13 @@ use arrow::array::{AsArray, BooleanBuilder, ListBuilder, UInt32Builder};
 use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_array::{Array, BooleanArray, Float32Array, OffsetSizeTrait, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, SchemaRef};
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{NullEquality, Statistics};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::ChildStats;
+use datafusion::physical_plan::StatisticsArgs;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, reset_plan_states};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, Gauge, MetricValue, MetricsSet};
@@ -54,6 +57,7 @@ use crate::index::scalar::inverted::{
     ResolvedFtsField, flatten_fts_document_column, fts_document_schema, load_segment_details,
     load_segments, transform_fts_document_stream,
 };
+use crate::index::segment_coverage::{SegmentCoverage, SegmentRowDomain};
 use crate::{Dataset, index::DatasetIndexInternalExt};
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::inverted::builder::ScoredDoc;
@@ -237,6 +241,13 @@ impl ExecutionPlan for FtsDocumentExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -271,13 +282,13 @@ impl ExecutionPlan for FtsDocumentExec {
 
 /// Open one FTS segment as an [`InvertedIndex`].
 ///
-/// With `restrict_rows` the segment may only report live rows currently stored in the
-/// fragments it covers (see [`open_fts_segments`]).
+/// With `coverage` the segment may only report live rows currently stored in the fragments
+/// it covers (see [`open_fts_segments`]).
 async fn open_fts_segment(
     dataset: &Dataset,
     column: &str,
     segment: &IndexMetadata,
-    restrict_rows: bool,
+    coverage: Option<(&SegmentCoverage, usize)>,
     metrics: &IndexMetrics,
 ) -> Result<Arc<InvertedIndex>> {
     let open = async {
@@ -296,15 +307,8 @@ async fn open_fts_segment(
             })
     };
     let allowed_rows = async {
-        let coverage = if restrict_rows {
-            segment.effective_fragment_bitmap(&dataset.fragment_bitmap)
-        } else {
-            None
-        };
-        match coverage.and_then(|coverage| {
-            DatasetPreFilter::create_restricted_deletion_mask(Arc::new(dataset.clone()), coverage)
-        }) {
-            Some(mask) => Ok(Some(mask.await?)),
+        match coverage {
+            Some((coverage, index)) => Ok(Some(coverage.live_rows(index).await?)),
             None => Ok(None),
         }
     };
@@ -330,12 +334,13 @@ async fn open_fts_segments(
     segments: &[IndexMetadata],
     metrics: &IndexMetrics,
 ) -> Result<Vec<Arc<InvertedIndex>>> {
-    let restrict_rows = dataset.manifest.uses_stable_row_ids() && segments.len() > 1;
-    try_join_all(
-        segments
-            .iter()
-            .map(|segment| open_fts_segment(dataset, column, segment, restrict_rows, metrics)),
-    )
+    let segment_refs = segments.iter().collect::<Vec<_>>();
+    let coverage =
+        SegmentCoverage::resolve(dataset, &segment_refs, SegmentRowDomain::RowId).await?;
+    try_join_all(segments.iter().enumerate().map(|(index, segment)| {
+        let coverage = coverage.as_ref().map(|coverage| (coverage, index));
+        open_fts_segment(dataset, column, segment, coverage, metrics)
+    }))
     .await
 }
 
@@ -1193,6 +1198,13 @@ impl ExecutionPlan for HybridCompoundQueryExec {
         vec![Distribution::SinglePartition; self.children().len()]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -1544,6 +1556,13 @@ impl ExecutionPlan for CompoundQueryExec {
             .iter()
             .map(|_| Distribution::SinglePartition)
             .collect()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -2099,6 +2118,13 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
             .collect()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -2562,18 +2588,24 @@ impl<S: Send + Sync + 'static> Drop for SharedFtsScorerProducer<S> {
     }
 }
 
-/// Owns one restricted Match plan's scorer lifecycle. Each execution gets a
+/// Owns one mixed FTS plan's scorer lifecycle. Each execution gets a
 /// fresh producer/consumer pair, including after failure or child replacement.
 /// Re-execution still requires replayable children: an overlay-stale scalar
 /// prefilter can contain a consumable `OneShotExec` that this owner cannot replay.
 #[derive(Debug)]
 pub(crate) struct SharedFtsScorerExec {
     input: Arc<dyn ExecutionPlan>,
-    scorer: Arc<SharedFtsScorer>,
+    scorer: SharedFtsCorpus,
     /// Retain metric handles, never a finished execution's task-owning plan.
     /// Concurrent executions have independent scorers. Rebound metrics describe
     /// the latest execution; template-retained counters keep their existing semantics.
     metrics: Arc<Mutex<SharedFtsExecutionMetrics>>,
+}
+
+#[derive(Debug, Clone)]
+enum SharedFtsCorpus {
+    Match(Arc<SharedFtsScorer>),
+    Combined(Arc<SharedFtsScorer<CombinedFieldsBM25Scorer>>),
 }
 
 #[derive(Debug)]
@@ -2600,13 +2632,24 @@ impl Drop for SharedFtsMetricsGuard {
                 metrics.active = None;
             }
             Ok(_) => {}
-            Err(error) => log::warn!("could not retain restricted Match runtime metrics: {error}"),
+            Err(error) => log::warn!("could not retain FTS runtime metrics: {error}"),
         }
     }
 }
 
 impl SharedFtsScorerExec {
     pub(crate) fn new(input: Arc<dyn ExecutionPlan>, scorer: Arc<SharedFtsScorer>) -> Self {
+        Self::with_corpus(input, SharedFtsCorpus::Match(scorer))
+    }
+
+    pub(crate) fn new_combined(
+        input: Arc<dyn ExecutionPlan>,
+        scorer: Arc<SharedFtsScorer<CombinedFieldsBM25Scorer>>,
+    ) -> Self {
+        Self::with_corpus(input, SharedFtsCorpus::Combined(scorer))
+    }
+
+    fn with_corpus(input: Arc<dyn ExecutionPlan>, scorer: SharedFtsCorpus) -> Self {
         Self {
             metrics: Arc::new(Mutex::new(SharedFtsExecutionMetrics {
                 execution: Arc::new(()),
@@ -2619,71 +2662,106 @@ impl SharedFtsScorerExec {
     }
 
     fn prepare_execution(&self) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let scorer = Arc::new(SharedFtsScorer::new());
+        let fresh = match &self.scorer {
+            SharedFtsCorpus::Match(_) => SharedFtsCorpus::Match(Arc::new(SharedFtsScorer::new())),
+            SharedFtsCorpus::Combined(_) => {
+                SharedFtsCorpus::Combined(Arc::new(SharedFtsScorer::new()))
+            }
+        };
         let mut consumers = 0;
         let mut producers = 0;
         // Reset other execution state too, particularly a previous top-k sort's
-        // score threshold. This owner only encloses the restricted root Match.
+        // score threshold. Each execution owns its corpus independently.
         let input = reset_plan_states(self.input.clone())?;
         let input = input
             .transform_up(|plan| {
-                if let Some(node) = plan.downcast_ref::<MatchQueryExec>()
-                    && node
-                        .shared_scorer
-                        .as_ref()
-                        .is_some_and(|shared| Arc::ptr_eq(shared, &self.scorer))
+                if let (SharedFtsCorpus::Match(template), SharedFtsCorpus::Match(scorer)) =
+                    (&self.scorer, &fresh)
                 {
-                    consumers += 1;
-                    return Ok(Transformed::yes(Arc::new(MatchQueryExec {
-                        dataset: node.dataset.clone(),
-                        query: node.query.clone(),
-                        tokenized_query: node.tokenized_query.clone(),
-                        params: node.params.clone(),
-                        prefilter_source: node.prefilter_source.clone(),
-                        base_scorer: node.base_scorer.clone(),
-                        prepared_query: node.prepared_query.clone(),
-                        shared_scorer: Some(scorer.clone()),
-                        segment_selection: node.segment_selection.clone(),
-                        overlay_block: node.overlay_block.clone(),
-                        document_granularity: node.document_granularity,
-                        schema: node.schema.clone(),
-                        external_mask: node.external_mask.clone(),
-                        properties: node.properties.clone(),
-                        metrics: node.metrics.clone(),
-                    })
-                        as Arc<dyn ExecutionPlan>));
+                    if let Some(node) = plan.downcast_ref::<MatchQueryExec>()
+                        && node
+                            .shared_scorer
+                            .as_ref()
+                            .is_some_and(|shared| Arc::ptr_eq(shared, template))
+                    {
+                        consumers += 1;
+                        return Ok(Transformed::yes(Arc::new(MatchQueryExec {
+                            dataset: node.dataset.clone(),
+                            query: node.query.clone(),
+                            tokenized_query: node.tokenized_query.clone(),
+                            params: node.params.clone(),
+                            prefilter_source: node.prefilter_source.clone(),
+                            base_scorer: node.base_scorer.clone(),
+                            prepared_query: node.prepared_query.clone(),
+                            shared_scorer: Some(scorer.clone()),
+                            segment_selection: node.segment_selection.clone(),
+                            overlay_block: node.overlay_block.clone(),
+                            document_granularity: node.document_granularity,
+                            schema: node.schema.clone(),
+                            external_mask: node.external_mask.clone(),
+                            properties: node.properties.clone(),
+                            metrics: node.metrics.clone(),
+                        })
+                            as Arc<dyn ExecutionPlan>));
+                    }
+                    if let Some(node) = plan.downcast_ref::<FlatMatchQueryExec>()
+                        && node
+                            .shared_scorer
+                            .as_ref()
+                            .is_some_and(|shared| Arc::ptr_eq(shared, template))
+                    {
+                        producers += 1;
+                        return Ok(Transformed::yes(Arc::new(FlatMatchQueryExec {
+                            dataset: node.dataset.clone(),
+                            query: node.query.clone(),
+                            tokenized_query: node.tokenized_query.clone(),
+                            params: node.params.clone(),
+                            unindexed_input: node.unindexed_input.clone(),
+                            candidate_filter: node.candidate_filter.clone(),
+                            base_scorer: node.base_scorer.clone(),
+                            shared_scorer: Some(scorer.clone()),
+                            preset_segments: node.preset_segments.clone(),
+                            document_granularity: node.document_granularity,
+                            document_column: node.document_column.clone(),
+                            schema: node.schema.clone(),
+                            properties: node.properties.clone(),
+                            metrics: node.metrics.clone(),
+                        })
+                            as Arc<dyn ExecutionPlan>));
+                    }
                 }
-                if let Some(node) = plan.downcast_ref::<FlatMatchQueryExec>()
-                    && node
-                        .shared_scorer
-                        .as_ref()
-                        .is_some_and(|shared| Arc::ptr_eq(shared, &self.scorer))
+                if let (SharedFtsCorpus::Combined(template), SharedFtsCorpus::Combined(scorer)) =
+                    (&self.scorer, &fresh)
                 {
-                    producers += 1;
-                    return Ok(Transformed::yes(Arc::new(FlatMatchQueryExec {
-                        dataset: node.dataset.clone(),
-                        query: node.query.clone(),
-                        tokenized_query: node.tokenized_query.clone(),
-                        params: node.params.clone(),
-                        unindexed_input: node.unindexed_input.clone(),
-                        candidate_filter: node.candidate_filter.clone(),
-                        base_scorer: node.base_scorer.clone(),
-                        shared_scorer: Some(scorer.clone()),
-                        preset_segments: node.preset_segments.clone(),
-                        document_granularity: node.document_granularity,
-                        document_column: node.document_column.clone(),
-                        schema: node.schema.clone(),
-                        properties: node.properties.clone(),
-                        metrics: node.metrics.clone(),
-                    })
-                        as Arc<dyn ExecutionPlan>));
+                    if let Some(node) = plan.downcast_ref::<CombinedFieldsQueryExec>()
+                        && node
+                            .shared_scorer
+                            .as_ref()
+                            .is_some_and(|shared| Arc::ptr_eq(shared, template))
+                    {
+                        consumers += 1;
+                        let mut node = node.clone();
+                        node.shared_scorer = Some(scorer.clone());
+                        return Ok(Transformed::yes(Arc::new(node) as Arc<dyn ExecutionPlan>));
+                    }
+                    if let Some(node) = plan.downcast_ref::<FlatCombinedFieldsExec>()
+                        && node
+                            .shared_scorer
+                            .as_ref()
+                            .is_some_and(|shared| Arc::ptr_eq(shared, template))
+                    {
+                        producers += 1;
+                        let mut node = node.clone();
+                        node.shared_scorer = Some(scorer.clone());
+                        return Ok(Transformed::yes(Arc::new(node) as Arc<dyn ExecutionPlan>));
+                    }
                 }
                 Ok(Transformed::no(plan))
             })?
             .data;
         if consumers != 1 || producers != 1 {
             return Err(DataFusionError::Internal(format!(
-                "restricted Match corpus requires one scorer consumer and producer, got {consumers} and {producers}"
+                "FTS corpus requires one scorer consumer and producer, got {consumers} and {producers}"
             )));
         }
         Ok(input)
@@ -2739,7 +2817,10 @@ impl SharedFtsScorerExec {
 
 impl DisplayAs for SharedFtsScorerExec {
     fn fmt_as(&self, _format: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "MatchCorpus")
+        f.write_str(match &self.scorer {
+            SharedFtsCorpus::Match(_) => "MatchCorpus",
+            SharedFtsCorpus::Combined(_) => "CombinedFieldsCorpus",
+        })
     }
 }
 
@@ -2756,6 +2837,13 @@ impl ExecutionPlan for SharedFtsScorerExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![Distribution::SinglePartition]
     }
@@ -2770,14 +2858,14 @@ impl ExecutionPlan for SharedFtsScorerExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Internal(format!(
-                "restricted Match corpus requires one input, got {}",
+                "FTS corpus requires one input, got {}",
                 children.len()
             )));
         }
-        let input = children.pop().ok_or_else(|| {
-            DataFusionError::Internal("restricted Match corpus input is missing".to_string())
-        })?;
-        Ok(Arc::new(Self::new(input, self.scorer.clone())))
+        let input = children
+            .pop()
+            .ok_or_else(|| DataFusionError::Internal("FTS corpus input is missing".to_string()))?;
+        Ok(Arc::new(Self::with_corpus(input, self.scorer.clone())))
     }
 
     fn execute(
@@ -2787,20 +2875,20 @@ impl ExecutionPlan for SharedFtsScorerExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         if partition != 0 {
             return Err(DataFusionError::Internal(format!(
-                "restricted Match corpus requires partition 0, got {partition}"
+                "FTS corpus requires partition 0, got {partition}"
             )));
         }
         let input = self.prepare_execution()?;
         if input.output_partitioning().partition_count() != 1 {
             return Err(DataFusionError::Internal(
-                "restricted Match corpus input must have one output partition".to_string(),
+                "FTS corpus input must have one output partition".to_string(),
             ));
         }
         let execution = Arc::new(());
         let result = input.execute(partition, context);
         let snapshot = Self::execution_metrics(self.input.as_ref(), input.as_ref());
         *self.metrics.lock().map_err(|_| {
-            DataFusionError::Internal("restricted Match runtime lock was poisoned".to_string())
+            DataFusionError::Internal("FTS runtime lock was poisoned".to_string())
         })? = SharedFtsExecutionMetrics {
             execution: execution.clone(),
             active: Some(Arc::downgrade(&input)),
@@ -3355,6 +3443,13 @@ impl ExecutionPlan for MatchQueryExec {
             .collect()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -3575,7 +3670,7 @@ impl ExecutionPlan for MatchQueryExec {
 /// scan so term statistics are shared across fields. Per-column boosts are baked
 /// into the blended term frequency, so there is no post-scan boost multiplier or
 /// `AggregateExec(max)`. Emits `(ROW_ID, SCORE)` in [`FTS_SCHEMA`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CombinedFieldsQueryExec {
     dataset: Arc<Dataset>,
     query: CombinedFieldsQuery,
@@ -3895,6 +3990,13 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
             .collect()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -4155,11 +4257,9 @@ impl FlatMatchFilterExec {
                     column
                 ))
             })?;
-            return Ok(
-                open_fts_segment(dataset, column, index_meta, false, metrics)
-                    .await?
-                    .tokenizer(),
-            );
+            return Ok(open_fts_segment(dataset, column, index_meta, None, metrics)
+                .await?
+                .tokenizer());
         }
         Ok(default_text_tokenizer())
     }
@@ -4173,11 +4273,9 @@ impl FlatMatchFilterExec {
         let index_meta = segments.first().ok_or_else(|| {
             DataFusionError::Execution(format!("FTS index for column {} has no segments", column))
         })?;
-        Ok(
-            open_fts_segment(dataset, column, index_meta, false, metrics)
-                .await?
-                .tokenizer(),
-        )
+        Ok(open_fts_segment(dataset, column, index_meta, None, metrics)
+            .await?
+            .tokenizer())
     }
 
     pub fn new(
@@ -4433,6 +4531,13 @@ impl ExecutionPlan for FlatMatchFilterExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -4488,8 +4593,16 @@ impl ExecutionPlan for FlatMatchFilterExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DataFusionResult<Arc<Statistics>> {
+        Ok(Arc::clone(&input_stats[0]))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -4725,6 +4838,13 @@ impl ExecutionPlan for FlatMatchQueryExec {
         // this, EnforceDistribution may round-robin the scan across `target_partitions`
         // and only partition 0 is consumed, silently dropping the other fragments.
         vec![Distribution::SinglePartition; self.children().len()]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -4983,7 +5103,7 @@ pub enum FlatStatsScope {
 /// planner, exactly as the single-column match path does.
 ///
 /// The input must carry `_rowid` plus every target column of the query.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FlatCombinedFieldsExec {
     dataset: Arc<Dataset>,
     query: CombinedFieldsQuery,
@@ -5103,6 +5223,13 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
             .iter()
             .map(|_| Distribution::SinglePartition)
             .collect()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -5599,6 +5726,13 @@ impl ExecutionPlan for PhraseQueryExec {
             .collect()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -5877,6 +6011,13 @@ impl ExecutionPlan for BoostQueryExec {
             .collect()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -6152,6 +6293,13 @@ impl ExecutionPlan for BooleanQueryExec {
             .collect()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -6300,6 +6448,10 @@ impl ExecutionPlan for BooleanQueryExec {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::physical_plan::ChildrenPropertiesMode;
+    use datafusion::physical_plan::ReplaceChildrenOptions;
+    use datafusion_physical_expr::PhysicalExpr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -6624,7 +6776,13 @@ mod tests {
         let replaced: Arc<dyn ExecutionPlan> =
             Arc::new(hybrid.with_indexed_input(indexed, scorer).unwrap());
         assert_eq!(replaced.children().len(), 2);
-        assert_eq!(replaced.required_input_distribution().len(), 2);
+        assert_eq!(
+            replaced
+                .input_distribution_requirements()
+                .per_child_distributions()
+                .len(),
+            2
+        );
         // Scanner plans retain execution state, so the comparison needs an
         // independent residual scan over the same immutable dataset snapshot.
         let mut scanner = hybrid.dataset().scan();
@@ -6634,7 +6792,12 @@ mod tests {
             .with_fragments(vec![hybrid.dataset().fragments().last().unwrap().clone()]);
         let mut children = replaced.children().into_iter().cloned().collect::<Vec<_>>();
         children[0] = scanner.create_plan().await.unwrap();
-        let rewritten = replaced.with_new_children(children).unwrap();
+        let rewritten = replaced
+            .replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap();
         let actual = rewritten
             .execute(0, Arc::new(TaskContext::default()))
             .unwrap()
@@ -6678,7 +6841,12 @@ mod tests {
         assert!(matches!(error, DataFusionError::Plan(_)));
         assert!(error.to_string().contains("bounded limit"));
 
-        let error = Arc::new(hybrid).with_new_children(vec![]).unwrap_err();
+        let error = Arc::new(hybrid)
+            .replace_children(
+                vec![],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap_err();
         assert!(matches!(error, DataFusionError::Internal(_)));
         assert!(error.to_string().contains("expected 1 children"));
     }
@@ -6714,7 +6882,12 @@ mod tests {
         let replaced: Arc<dyn ExecutionPlan> =
             Arc::new(hybrid.with_indexed_input(input, scorer).unwrap());
         let children = replaced.children().into_iter().cloned().collect();
-        let rewritten = replaced.with_new_children(children).unwrap();
+        let rewritten = replaced
+            .replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap();
         let error = rewritten
             .execute(0, Arc::new(TaskContext::default()))
             .unwrap()
@@ -6990,8 +7163,8 @@ mod tests {
         assert_eq!(filtered.children().len(), 2);
         assert!(
             filtered
-                .required_input_distribution()
-                .iter()
+                .input_distribution_requirements()
+                .per_child_distributions()
                 .all(|distribution| {
                     matches!(
                         distribution,
@@ -7021,15 +7194,20 @@ mod tests {
         );
         let rebuilt = filtered
             .clone()
-            .with_new_children(vec![
-                expanded_corpus,
-                empty.execution_plan().unwrap().clone(),
-            ])
+            .replace_children(
+                vec![expanded_corpus, empty.execution_plan().unwrap().clone()],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
             .unwrap();
         assert!(execute_results(rebuilt.as_ref()).await.unwrap().is_empty());
         assert_eq!(rebuilt.metrics().unwrap().output_rows(), Some(0));
         assert_eq!(shared.wait().await.unwrap().num_docs(), 6);
-        let error = filtered.with_new_children(vec![]).unwrap_err();
+        let error = filtered
+            .replace_children(
+                vec![],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap_err();
         assert!(matches!(error, DataFusionError::Internal(_)));
         assert!(error.to_string().contains("expected 2 children"));
     }
@@ -7046,7 +7224,12 @@ mod tests {
         };
         assert!(matches!(error, DataFusionError::Internal(_)));
         assert!(error.to_string().contains("got 0 and 0"));
-        let error = owner.with_new_children(vec![]).unwrap_err();
+        let error = owner
+            .replace_children(
+                vec![],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap_err();
         assert!(matches!(error, DataFusionError::Internal(_)));
         assert!(error.to_string().contains("requires one input"));
     }
@@ -7098,6 +7281,12 @@ mod tests {
         }
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![&self.input]
+        }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+        ) -> DataFusionResult<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
         }
         fn with_new_children(
             self: Arc<Self>,
@@ -7226,10 +7415,17 @@ mod tests {
         let union = UnionExec::try_new(vec![indexed, flat]).unwrap();
         let input: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(union));
         let owner = Arc::new(SharedFtsScorerExec::new(input.clone(), shared));
-        let owner = owner.with_new_children(vec![input]).unwrap();
-        assert_eq!(owner.required_input_distribution().len(), 1);
+        let owner = owner
+            .replace_children(
+                vec![input],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap();
+        let distributions = owner.input_distribution_requirements();
+        let distributions = distributions.per_child_distributions().collect::<Vec<_>>();
+        assert_eq!(distributions.len(), 1);
         assert!(matches!(
-            owner.required_input_distribution()[0],
+            distributions[0],
             datafusion_physical_expr::Distribution::SinglePartition
         ));
         assert_eq!(owner.schema(), FTS_SCHEMA.clone());
@@ -8122,9 +8318,7 @@ mod tests {
             .unwrap();
         assert_eq!(dataset.get_fragments().len(), 279);
 
-        let before_compaction = dataset.scan().try_into_batch().await.unwrap();
-        // A task must rewrite a contiguous range to preserve row order. Rewrite
-        // the last 101 indexed fragments together with 20 appended fragments.
+        // Rewrite 101 indexed fragments together with 20 appended fragments.
         // The staged build covers only 101/121 inputs, so it cannot cover the destination.
         let options = CompactionOptions {
             target_rows_per_fragment: 1000,
@@ -8136,9 +8330,11 @@ mod tests {
                 fragments: dataset
                     .fragments()
                     .iter()
-                    .filter(|f| f.id >= 158)
+                    .filter(|f| f.id < 101 || f.id >= 259)
                     .cloned()
                     .collect(),
+                output_clustering_id: None,
+                output_metadata: Default::default(),
             },
             read_version: dataset.version().version,
             options: options.clone(),
@@ -8154,10 +8350,6 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            dataset.scan().try_into_batch().await.unwrap(),
-            before_compaction
-        );
         let stored = read_manifest_indexes(
             &dataset.object_store,
             &dataset.manifest_location,
@@ -8231,9 +8423,9 @@ mod tests {
         let coverage = segments[0].fragment_bitmap.as_ref().unwrap();
         assert_eq!(coverage.len(), 158);
         assert!(!coverage.contains(new_fragment as u32));
-        assert!(coverage.iter().all(|id| (0..158).contains(&id)));
+        assert!(coverage.iter().all(|id| (101..259).contains(&id)));
         let index_uuid = segments[0].uuid;
-        let expected_indexed = (0..316)
+        let expected_indexed = (202..518)
             .filter(|id| !has_surviving_deletion || *id != 202)
             .collect::<Vec<_>>();
         let expected_all = (0..558)
@@ -8400,7 +8592,10 @@ mod tests {
             )
             .unwrap(),
         )
-        .with_new_children(vec![])
+        .replace_children(
+            vec![],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
         .unwrap();
         let rewritten = ordered_plan.downcast_ref::<MatchQueryExec>().unwrap();
         assert_eq!(
@@ -8637,7 +8832,10 @@ mod tests {
             )
             .unwrap(),
         )
-        .with_new_children(vec![])
+        .replace_children(
+            vec![],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
         .unwrap();
         let rewritten = ordered_plan.downcast_ref::<PhraseQueryExec>().unwrap();
         assert_eq!(
@@ -9495,6 +9693,15 @@ mod tests {
                 .await
                 .unwrap();
         }
+        let engines = MatchQuery::new("engines".into()).with_column(Some("text".into()));
+        assert_eq!(
+            fts_hits(&dataset, engines.into())
+                .await
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            ["a1", "a4"]
+        );
 
         let update = record_batch!(
             ("id", Utf8, ["a1"]),

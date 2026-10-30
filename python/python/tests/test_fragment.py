@@ -355,7 +355,8 @@ def test_fragment_meta():
         "file_size_bytes=100), DataFile(path='1.lance', fields=[1], column_indices=[], "
         "file_major_version=0, file_minor_version=0, file_size_bytes=None)], "
         "physical_rows=100, deletion_file=None, row_id_meta=None, "
-        "created_at_version_meta=None, last_updated_at_version_meta=None, overlays=[])"
+        "created_at_version_meta=None, last_updated_at_version_meta=None, overlays=[], "
+        "clustering_id=None, metadata={})"
     )
 
 
@@ -613,6 +614,46 @@ def test_deletion_file_with_base_id_serialization():
     deserialized = FragmentMetadata.from_json(json.dumps(json_data))
     assert deserialized.deletion_file is not None
     assert deserialized.deletion_file.base_id == 456
+
+
+def test_fragment_metadata_json_round_trips_clustering_metadata():
+    """clustering_id and the generic map survive to_json/from_json and pickle,
+    and JSON written before the fields existed reads back with defaults."""
+    from lance.fragment import FragmentMetadata
+
+    metadata = {
+        "org.example.cluster.bucket": "3",
+        "org.example.unknown": "  opaque value: 東京  ",
+        "org.example.empty": "",
+    }
+    stamped = FragmentMetadata(
+        id=0, files=[], physical_rows=1, clustering_id=7, metadata=metadata
+    )
+
+    json_data = stamped.to_json()
+    assert json_data["clustering_id"] == 7
+    assert json_data["metadata"] == metadata
+    restored = FragmentMetadata.from_json(json.dumps(json_data))
+    assert restored == stamped
+    assert restored.clustering_id == 7
+    assert restored.metadata == metadata
+    assert pickle.loads(pickle.dumps(stamped)) == stamped
+
+    # A fragment without either field writes explicit defaults and reads back.
+    plain = FragmentMetadata(id=1, files=[], physical_rows=1)
+    plain_json = plain.to_json()
+    assert plain_json["clustering_id"] is None
+    assert plain_json["metadata"] == {}
+    assert FragmentMetadata.from_json(json.dumps(plain_json)) == plain
+
+    # JSON produced before these fields existed carries neither key.
+    legacy = {
+        k: v for k, v in plain_json.items() if k not in ("clustering_id", "metadata")
+    }
+    legacy_restored = FragmentMetadata.from_json(json.dumps(legacy))
+    assert legacy_restored.clustering_id is None
+    assert legacy_restored.metadata == {}
+    assert legacy_restored == plain
 
 
 def test_fragment_update_columns_basic(tmp_path):

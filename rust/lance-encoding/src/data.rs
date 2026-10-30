@@ -983,6 +983,50 @@ impl VariableWidthBlock {
     pub fn data_size(&self) -> u64 {
         (self.data.len() + self.offsets.len()) as u64
     }
+
+    /// Returns how many `data` bytes the values at `indices` span, or `None` if
+    /// decoding them cannot succeed.  Runs before the offsets are validated, so it
+    /// checks every offset it reads.
+    fn selected_data_len<I: ArrowNativeType>(&self, indices: &[I]) -> Option<u64> {
+        match self.bits_per_offset {
+            32 => self.selected_data_len_typed::<i32, I>(indices),
+            64 => self.selected_data_len_typed::<i64, I>(indices),
+            _ => None,
+        }
+    }
+
+    fn selected_data_len_typed<T, I>(&self, indices: &[I]) -> Option<u64>
+    where
+        T: OffsetSizeTrait + bytemuck::Pod,
+        I: ArrowNativeType,
+    {
+        if !self.offsets.len().is_multiple_of(std::mem::size_of::<T>()) {
+            return None;
+        }
+        let offsets = self.offsets.borrow_to_typed_view::<T>();
+        let total = indices.iter().try_fold(0_usize, |total, index| {
+            let index = index.to_usize()?;
+            if index as u64 >= self.num_values {
+                return None;
+            }
+            let start = offsets.get(index)?.to_usize()?;
+            let end = offsets.get(index + 1)?.to_usize()?;
+            if start > end || end > self.data.len() {
+                return None;
+            }
+            total.checked_add(end - start)
+        })?;
+        // Appending fails once the output outgrows what `T` offsets can address
+        T::from_usize(total)?;
+        Some(total as u64)
+    }
+
+    fn has_large_average_value(&self) -> bool {
+        self.data.len() as u64
+            >= self
+                .num_values
+                .saturating_mul(MIN_AVERAGE_VALUE_BYTES_FOR_EXACT_SIZE)
+    }
 }
 
 /// A data block representing a struct
@@ -1059,6 +1103,11 @@ impl StructDataBlock {
     }
 }
 
+/// Below this average value size, decoding a variable-width dictionary keeps the average-based
+/// reservation: it over-reserves at most this many bytes per row, while sizing the output
+/// exactly costs a pass over the indices.
+const MIN_AVERAGE_VALUE_BYTES_FOR_EXACT_SIZE: u64 = 1024;
+
 /// A data block for dictionary encoded data
 #[derive(Debug, Clone)]
 pub struct DictionaryDataBlock {
@@ -1076,14 +1125,43 @@ impl DictionaryDataBlock {
             return Ok(DataBlock::AllNull(AllNullDataBlock { num_values: 0 }));
         }
 
-        // assume the indices are uniformly distributed.
-        let estimated_size_bytes = self.dictionary.data_size()
-            * (self.indices.num_values + self.dictionary.num_values() - 1)
-            / self.dictionary.num_values();
-        let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
-
         let indices = self.indices.data.borrow_to_typed_slice::<K::Native>();
         let indices = indices.as_ref();
+
+        // Input that cannot be decoded gets no reservation; the append below fails on it.
+        let selected_values = match self.dictionary.as_ref() {
+            // Value sizes can be skewed, so the average can be off by orders of magnitude.
+            DataBlock::VariableWidth(dictionary) if dictionary.has_large_average_value() => {
+                Some((dictionary, false))
+            }
+            // Dictionary values containing NULLs are wrapped in a nullable block.
+            DataBlock::Nullable(nullable) => match nullable.data.as_ref() {
+                DataBlock::VariableWidth(dictionary) if dictionary.has_large_average_value() => {
+                    Some((dictionary, true))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let estimated_size_bytes = match selected_values {
+            Some((dictionary, is_nullable)) => dictionary
+                .selected_data_len(indices)
+                .and_then(|data_len| {
+                    if is_nullable {
+                        // The nullable builder assigns one sixteenth of its estimate to validity.
+                        data_len.checked_add(data_len.div_ceil(15))
+                    } else {
+                        Some(data_len)
+                    }
+                })
+                .unwrap_or(0),
+            // assume the indices are uniformly distributed.
+            None => (self.dictionary.data_size()
+                * (self.indices.num_values + self.dictionary.num_values() - 1))
+                .checked_div(self.dictionary.num_values())
+                .unwrap_or(0),
+        };
+        let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
 
         let selections = indices.iter().map(|idx| {
             let idx = idx.to_usize().unwrap() as u64;
@@ -1230,6 +1308,21 @@ impl DictionaryDataBlock {
             dictionary: Box::new(dictionary),
         }
     }
+}
+
+/// Limits recovery batches only when a stored dictionary exceeds its declared key capacity.
+pub(crate) fn dictionary_batch_limit(data_type: &DataType, dictionary_len: u64) -> Option<u64> {
+    let DataType::Dictionary(key_type, _) = data_type else {
+        return None;
+    };
+    let capacity = match key_type.as_ref() {
+        DataType::Int8 => i8::MAX as u64 + 1,
+        DataType::UInt8 => u8::MAX as u64 + 1,
+        DataType::Int16 => i16::MAX as u64 + 1,
+        DataType::UInt16 => u16::MAX as u64 + 1,
+        _ => return None,
+    };
+    (dictionary_len > capacity).then_some(capacity)
 }
 
 /// A DataBlock is a collection of buffers that represents an "array" of data in very generic terms
@@ -2240,7 +2333,7 @@ impl DataBlock {
             | DataType::UInt32
             | DataType::UInt64
             | DataType::UInt8 => {
-                let data = if !encoding && arrays.len() == 1 {
+                let data = if arrays.len() == 1 {
                     let data = arrays[0].to_data();
                     let width = data_type.byte_width();
                     LanceBuffer::from(
@@ -2419,7 +2512,7 @@ mod tests {
         LargeStringArray, StringArray, StringViewArray, UInt8Array, UInt16Array,
         cast::AsArray,
         make_array, new_null_array,
-        types::{Int8Type, Int32Type, UInt16Type},
+        types::{Int8Type, Int32Type, UInt8Type, UInt16Type},
     };
     use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
     use arrow_data::ArrayData;
@@ -2986,6 +3079,83 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::utf8_mostly_small(DataType::Utf8, 4096, 1, 4096 + 999 * 5, 4096 + 999 * 5)]
+    #[case::utf8_mostly_large(DataType::Utf8, 4096, 0, 999 * 4096 + 5, 999 * 4096 + 5)]
+    #[case::large_binary_mostly_small(
+        DataType::LargeBinary,
+        4096,
+        1,
+        4096 + 999 * 5,
+        4096 + 999 * 5
+    )]
+    // Values averaging under 1 KiB keep the estimate from the average (117 bytes x 1001 / 2)
+    #[case::utf8_small_values(DataType::Utf8, 100, 1, 100 + 999 * 5, 117 * 1001 / 2)]
+    fn test_dictionary_decode_reserves_selected_size(
+        #[case] value_type: DataType,
+        #[case] large_value_len: usize,
+        #[case] common_key: u8,
+        #[case] expected_size: usize,
+        #[case] expected_capacity: usize,
+    ) {
+        // The average value size is far from the size of the value most rows select
+        let values = arrow_cast::cast(
+            &StringArray::from(vec!["x".repeat(large_value_len), "small".to_string()]),
+            &value_type,
+        )
+        .unwrap();
+        let keys = UInt8Array::from_iter_values(
+            (0..1000).map(|row| if row == 0 { 1 - common_key } else { common_key }),
+        );
+        let dictionary = DictionaryArray::<UInt8Type>::try_new(keys, values).unwrap();
+        let expected = arrow_cast::cast(&dictionary, &value_type).unwrap();
+
+        let decoded = DataBlock::from_array(dictionary)
+            .as_dictionary()
+            .unwrap()
+            .decode()
+            .unwrap();
+
+        let decoded_values = &decoded.as_variable_width_ref().unwrap().data;
+        assert_eq!(decoded_values.len(), expected_size);
+        assert_eq!(
+            decoded_values.clone().into_buffer().capacity(),
+            expected_capacity
+        );
+        let decoded = make_array(decoded.into_arrow(value_type, true).unwrap());
+        assert_eq!(decoded.as_ref(), expected.as_ref());
+    }
+
+    #[test]
+    fn test_nullable_dictionary_decode_reserves_selected_size() {
+        let values: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("x".repeat(4096)),
+            Some("small".to_string()),
+            None,
+        ]));
+        let keys =
+            UInt8Array::from_iter_values((0..1000).map(|row| if row == 0 { 0_u8 } else { 1 }));
+        let dictionary = DictionaryArray::<UInt8Type>::try_new(keys, values).unwrap();
+        let expected = arrow_cast::cast(&dictionary, &DataType::Utf8).unwrap();
+
+        let decoded = DataBlock::from_array(dictionary)
+            .as_dictionary()
+            .unwrap()
+            .decode()
+            .unwrap();
+
+        let nullable = decoded.as_nullable_ref().unwrap();
+        let decoded_values = &nullable.data.as_variable_width_ref().unwrap().data;
+        let expected_size = 4096 + 999 * 5;
+        assert_eq!(decoded_values.len(), expected_size);
+        assert!(
+            decoded_values.clone().into_buffer().capacity() <= expected_size + 1,
+            "nullable dictionary decode should reserve the selected size"
+        );
+        let decoded = make_array(decoded.into_arrow(DataType::Utf8, true).unwrap());
+        assert_eq!(decoded.as_ref(), expected.as_ref());
+    }
+
     #[test]
     fn test_all_null() {
         for data_type in [
@@ -3211,6 +3381,67 @@ mod tests {
         );
     }
 
+    fn variable_width_block(offsets: &[i32], data: &[u8]) -> VariableWidthBlock {
+        VariableWidthBlock {
+            data: LanceBuffer::copy_slice(data),
+            offsets: LanceBuffer::reinterpret_vec(offsets.to_vec()),
+            bits_per_offset: 32,
+            num_values: offsets.len() as u64 - 1,
+            block_info: BlockInfo::new(),
+        }
+    }
+
+    #[rstest]
+    #[case::selected_values(variable_width_block(&[0, 1, 3, 6], b"abcdef"), vec![2, 0, 2, 1], Some(9))]
+    #[case::offsets_not_starting_at_zero(
+        variable_width_block(&[2, 3, 5], b"xxabc"),
+        vec![0, 1, 1],
+        Some(5)
+    )]
+    #[case::large_offsets(
+        VariableWidthBlock {
+            offsets: LanceBuffer::reinterpret_vec(vec![0_i64, 4, 6]),
+            bits_per_offset: 64,
+            ..variable_width_block(&[0, 4, 6], b"abcdef")
+        },
+        vec![1, 1, 0],
+        Some(8)
+    )]
+    #[case::index_out_of_range(variable_width_block(&[0, 1, 2], b"ab"), vec![2], None)]
+    #[case::index_past_num_values(
+        VariableWidthBlock { num_values: 2, ..variable_width_block(&[0, 1, 2, 3], b"abc") },
+        vec![2],
+        None
+    )]
+    #[case::short_offsets(
+        VariableWidthBlock { num_values: 2, ..variable_width_block(&[0, 1], b"ab") },
+        vec![1],
+        None
+    )]
+    #[case::offset_past_data(variable_width_block(&[0, 1, i32::MAX], b"ab"), vec![1], None)]
+    #[case::decreasing_offsets(variable_width_block(&[0, 2, 1], b"ab"), vec![1], None)]
+    #[case::negative_offset(variable_width_block(&[-1, 1, 2], b"ab"), vec![0], None)]
+    #[case::offsets_not_multiple_of_width(
+        VariableWidthBlock {
+            offsets: LanceBuffer::copy_slice(&[0, 0, 0, 0, 2]),
+            ..variable_width_block(&[0, 2], b"ab")
+        },
+        vec![0],
+        None
+    )]
+    #[case::beyond_offset_capacity(
+        variable_width_block(&[0, 1 << 20], &vec![0; 1 << 20]),
+        vec![0; 2048],
+        None
+    )]
+    fn variable_width_selected_data_len(
+        #[case] block: VariableWidthBlock,
+        #[case] indices: Vec<u64>,
+        #[case] expected: Option<u64>,
+    ) {
+        assert_eq!(block.selected_data_len(&indices), expected);
+    }
+
     #[rstest]
     #[case::binary_i32_tail_out_of_bounds(
         DataType::Binary,
@@ -3377,6 +3608,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dictionary_rejects_unsupported_index_width_mismatch() {
+        let block = DataBlock::Dictionary(DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(vec![0_u16]),
+                bits_per_value: 16,
+                num_values: 1,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(DataBlock::from_array(StringArray::from(vec!["value"]))),
+        });
+        let data_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let error = block.into_arrow(data_type, false).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }));
+        assert!(error.to_string().contains("dictionary indices use 16 bits"));
+    }
+
+    #[rstest]
+    #[case::index_out_of_range(
+        DataBlock::VariableWidth(variable_width_block(&[0, 1, 2], b"ab")),
+        vec![0, 2],
+        "cannot append selection 2..3 from a block with 2 values"
+    )]
+    #[case::empty_dictionary(
+        DataBlock::VariableWidth(variable_width_block(&[0], b"")),
+        vec![0],
+        "cannot append selection 0..1 from a block with 0 values"
+    )]
+    #[case::empty_fixed_width_dictionary(
+        DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::empty(),
+            bits_per_value: 64,
+            num_values: 0,
+            block_info: BlockInfo::new(),
+        }),
+        vec![0],
+        "cannot append selection 0..1 from a block with 0 values"
+    )]
+    fn dictionary_decode_rejects_malformed_input(
+        #[case] dictionary: DataBlock,
+        #[case] indices: Vec<u8>,
+        #[case] expected_message: &str,
+    ) {
+        let num_indices = indices.len() as u64;
+        let block = DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(indices),
+                bits_per_value: 8,
+                num_values: num_indices,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(dictionary),
+        };
+
+        let error = block
+            .decode()
+            .expect_err("a malformed dictionary must fail to decode");
+
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+        assert!(
+            error.to_string().contains(expected_message),
+            "unexpected error: {error}"
+        );
+    }
+
     fn widened_int8_dictionary(indices: Vec<u32>, values: Vec<Option<String>>) -> ArrayRef {
         let num_values = indices.len() as u64;
         let dictionary = DataBlock::Dictionary(DictionaryDataBlock {
@@ -3509,6 +3805,113 @@ mod tests {
             ),
             "unexpected error: {error}"
         );
+    }
+
+    #[rstest]
+    #[case::fits_int8(DataType::Int8, 128, None)]
+    #[case::overflow_int8(DataType::Int8, 129, Some(128))]
+    #[case::fits_uint8(DataType::UInt8, 256, None)]
+    #[case::overflow_uint8(DataType::UInt8, 257, Some(256))]
+    #[case::fits_int16(DataType::Int16, 32768, None)]
+    #[case::overflow_int16(DataType::Int16, 32769, Some(32768))]
+    #[case::fits_uint16(DataType::UInt16, 65536, None)]
+    #[case::overflow_uint16(DataType::UInt16, 65537, Some(65536))]
+    fn dictionary_recovery_batch_limit(
+        #[case] key_type: DataType,
+        #[case] dictionary_len: u64,
+        #[case] expected: Option<u64>,
+    ) {
+        let data_type = DataType::Dictionary(Box::new(key_type), Box::new(DataType::Utf8));
+        assert_eq!(
+            super::dictionary_batch_limit(&data_type, dictionary_len),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[case::int8(DataType::Int8)]
+    #[case::uint8(DataType::UInt8)]
+    #[case::int16(DataType::Int16)]
+    #[case::uint16(DataType::UInt16)]
+    fn dictionary_recovers_widened_indices(#[case] key_type: DataType) {
+        // Duplicate values and a null beyond the declared key's range are both
+        // emitted by historical writers. Only the selected values need to fit.
+        let high_index = super::max_index_val(&key_type) as usize + 1;
+        let mut values = vec![Some("duplicate"); high_index + 2];
+        values[high_index] = Some("high");
+        values[high_index + 1] = None;
+        let block = DataBlock::Dictionary(DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(vec![
+                    high_index as u32,
+                    0,
+                    high_index as u32 + 1,
+                    1,
+                ]),
+                bits_per_value: 32,
+                num_values: 4,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(DataBlock::from_array(StringArray::from(values))),
+        });
+        let data_type = DataType::Dictionary(Box::new(key_type), Box::new(DataType::Utf8));
+        for validate in [false, true] {
+            let array = make_array(
+                block
+                    .clone()
+                    .into_arrow(data_type.clone(), validate)
+                    .unwrap(),
+            );
+            assert_eq!(array.data_type(), &data_type);
+            let decoded = arrow_cast::cast(array.as_ref(), &DataType::Utf8).unwrap();
+            assert_eq!(
+                decoded.as_ref(),
+                &StringArray::from(vec![
+                    Some("high"),
+                    Some("duplicate"),
+                    None,
+                    Some("duplicate")
+                ])
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::empty(vec![])]
+    #[case::all_null(vec![None, None])]
+    fn dictionary_recovers_widened_nulls(#[case] values: Vec<Option<&str>>) {
+        let block = DataBlock::Dictionary(DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(vec![0_u32; values.len()]),
+                bits_per_value: 32,
+                num_values: values.len() as u64,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(DataBlock::from_array(StringArray::from(vec![None::<&str>]))),
+        });
+        let data_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let array = make_array(block.into_arrow(data_type, false).unwrap());
+        let decoded = arrow_cast::cast(array.as_ref(), &DataType::Utf8).unwrap();
+        assert_eq!(decoded.as_ref(), &StringArray::from(values));
+    }
+
+    #[test]
+    fn dictionary_recovers_widened_duplicate_entries() {
+        let values =
+            StringArray::from((0..180).map(|i| format!("v{}", i % 90)).collect::<Vec<_>>());
+        let block = DataBlock::Dictionary(DictionaryDataBlock {
+            indices: FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec((0_u32..180).collect()),
+                bits_per_value: 32,
+                num_values: 180,
+                block_info: BlockInfo::new(),
+            },
+            dictionary: Box::new(DataBlock::from_array(values.clone())),
+        });
+        let data_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let array = make_array(block.into_arrow(data_type, false).unwrap());
+        let decoded = arrow_cast::cast(array.as_ref(), &DataType::Utf8).unwrap();
+        assert_eq!(decoded.as_ref(), &values);
     }
 
     #[rstest]
