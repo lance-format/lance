@@ -6,6 +6,7 @@ use std::ops::Range;
 use chrono::{DateTime, Utc};
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
+use lance_io::local::to_local_path;
 use lance_io::object_store::ObjectStore;
 use lance_table::io::commit::{CommitHandler, VERSIONS_DIR};
 use lance_table::io::deletion::DELETIONS_DIR;
@@ -24,6 +25,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::Formatter;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 pub const MAIN_BRANCH: &str = "main";
@@ -659,7 +661,7 @@ impl Branches<'_> {
                 Ok(())
             }
             BranchCleanup::Selective(delete_path) => {
-                let remaining_paths = remaining_branches
+                let branch_paths = remaining_branches
                     .iter()
                     .map(|branch| {
                         self.refs
@@ -668,40 +670,63 @@ impl Branches<'_> {
                             .map(|location| location.path)
                     })
                     .collect::<Result<Vec<_>>>()?;
+                // Case-insensitive local filesystems can expose a surviving branch under a
+                // different spelling. Remote object stores remain case-sensitive.
+                let canonicalize_local_paths = self.object_store().has_direct_local_paths()
+                    || self.object_store().scheme() == "file-object-store";
+                let mut remaining_paths = Vec::with_capacity(branch_paths.len());
+                for path in branch_paths {
+                    let canonical_path = if canonicalize_local_paths {
+                        tokio::fs::canonicalize(to_local_path(&path)).await.ok()
+                    } else {
+                        None
+                    };
+                    remaining_paths.push(RemainingBranchPath {
+                        path,
+                        canonical_path,
+                    });
+                }
 
                 let mut pending = vec![delete_path];
                 while let Some(path) = pending.pop() {
-                    if remaining_paths.contains(&path) {
-                        continue;
-                    }
-                    if remaining_paths
-                        .iter()
-                        .any(|remaining| remaining.prefix_matches(&path))
+                    match Self::classify_shared_branch_path(
+                        &path,
+                        &remaining_paths,
+                        canonicalize_local_paths,
+                    )
+                    .await
                     {
-                        // A shared directory must remain, but the deleted branch's own
-                        // files (especially its manifests) must not remain accessible.
-                        let entries = self.object_store().list_with_delimiter(Some(&path)).await?;
-                        futures::stream::iter(entries.objects.into_iter().map(Ok))
-                            .try_for_each_concurrent(
-                                self.object_store().io_parallelism(),
-                                |file| async move {
-                                    self.object_store().delete(&file.location).await
-                                },
-                            )
-                            .await?;
-                        // Hierarchical stores may include the listed directory's marker.
-                        pending.extend(
-                            entries
-                                .common_prefixes
-                                .into_iter()
-                                .filter(|child| child != &path && child.prefix_matches(&path)),
-                        );
-                    } else if let Err(e) = self.object_store().remove_dir_all(path).await {
-                        match &e {
-                            Error::NotFound { .. } => {
-                                log::debug!("Branch directory already deleted");
+                        SharedBranchPath::Remaining => continue,
+                        SharedBranchPath::Ancestor => {
+                            // A shared directory must remain, but the deleted branch's own
+                            // files (especially its manifests) must not remain accessible.
+                            let entries =
+                                self.object_store().list_with_delimiter(Some(&path)).await?;
+                            futures::stream::iter(entries.objects.into_iter().map(Ok))
+                                .try_for_each_concurrent(
+                                    self.object_store().io_parallelism(),
+                                    |file| async move {
+                                        self.object_store().delete(&file.location).await
+                                    },
+                                )
+                                .await?;
+                            // Hierarchical stores may include the listed directory's marker.
+                            pending.extend(
+                                entries
+                                    .common_prefixes
+                                    .into_iter()
+                                    .filter(|child| child != &path && child.prefix_matches(&path)),
+                            );
+                        }
+                        SharedBranchPath::Unrelated => {
+                            if let Err(e) = self.object_store().remove_dir_all(path).await {
+                                match &e {
+                                    Error::NotFound { .. } => {
+                                        log::debug!("Branch directory already deleted");
+                                    }
+                                    _ => return Err(e),
+                                }
                             }
-                            _ => return Err(e),
                         }
                     }
                 }
@@ -769,6 +794,36 @@ impl Branches<'_> {
         Ok(BranchCleanup::Recursive(absolute_dir.path))
     }
 
+    async fn classify_shared_branch_path(
+        path: &Path,
+        remaining_paths: &[RemainingBranchPath],
+        canonicalize_local_paths: bool,
+    ) -> SharedBranchPath {
+        let canonical_path = if canonicalize_local_paths {
+            tokio::fs::canonicalize(to_local_path(path)).await.ok()
+        } else {
+            None
+        };
+        let mut is_ancestor = false;
+        for remaining in remaining_paths {
+            match (&canonical_path, &remaining.canonical_path) {
+                (Some(path), Some(remaining)) if path == remaining => {
+                    return SharedBranchPath::Remaining;
+                }
+                (Some(path), Some(remaining)) => {
+                    is_ancestor |= remaining.starts_with(path);
+                }
+                _ if &remaining.path == path => return SharedBranchPath::Remaining,
+                _ => is_ancestor |= remaining.path.prefix_matches(path),
+            }
+        }
+        if is_ancestor {
+            SharedBranchPath::Ancestor
+        } else {
+            SharedBranchPath::Unrelated
+        }
+    }
+
     fn dataset_dir_owner<'a>(
         deleted_branch: &BranchRelativePath<'_>,
         remaining_branches: &[&'a str],
@@ -779,6 +834,17 @@ impl Branches<'_> {
                 && is_dataset_dir(deleted_branch.segments[remaining.segments.len()])
         })
     }
+}
+
+struct RemainingBranchPath {
+    path: Path,
+    canonical_path: Option<PathBuf>,
+}
+
+enum SharedBranchPath {
+    Remaining,
+    Ancestor,
+    Unrelated,
 }
 
 #[derive(Debug)]

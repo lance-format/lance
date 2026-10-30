@@ -1464,6 +1464,54 @@ async fn test_delete_branch_with_shared_directory(
 }
 
 #[tokio::test]
+async fn test_delete_branch_preserves_case_aliased_shared_directories() {
+    let tempdir = TempDir::default();
+    let uri = tempdir.path_str();
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    let mut deleted = root.create_branch("a", 1, None).await.unwrap();
+    deleted.append(id_rows(10, 1), None).await.unwrap();
+    let mut lower_child = root.create_branch("a/b", 1, None).await.unwrap();
+    lower_child.append(id_rows(20, 1), None).await.unwrap();
+    let mut case_child = root.create_branch("A/c", 1, None).await.unwrap();
+    case_child.append(id_rows(30, 1), None).await.unwrap();
+
+    root.delete_branch("a").await.unwrap();
+
+    let branches = root.list_branches().await.unwrap();
+    assert_eq!(branches.len(), 2);
+    assert!(branches.contains_key("a/b"));
+    assert!(branches.contains_key("A/c"));
+
+    for (branch, expected_before, appended, expected_after) in [
+        ("a/b", [0, 20], 40, [0, 20, 40]),
+        ("A/c", [0, 30], 50, [0, 30, 50]),
+    ] {
+        let mut dataset = root.checkout_branch(branch).await.unwrap();
+        assert_eq!(
+            dataset.scan().try_into_batch().await.unwrap()["id"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .as_ref(),
+            &expected_before
+        );
+        dataset.append(id_rows(appended, 1), None).await.unwrap();
+        assert_eq!(
+            root.checkout_branch(branch)
+                .await
+                .unwrap()
+                .scan()
+                .try_into_batch()
+                .await
+                .unwrap()["id"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .as_ref(),
+            &expected_after
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_branch() {
     let tempdir = TempDir::default();
     let test_uri = tempdir.path_str();
