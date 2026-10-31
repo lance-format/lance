@@ -243,13 +243,13 @@ fn collect_fts_columns_in_order(query: &FtsQuery) -> Vec<String> {
 }
 
 /// The multiple of the exact distance a vector index ranks by. Lance indexes
-/// cosine on SQ and PQ as L2 over normalized vectors, twice `1 - cos`; FLAT
-/// and RQ rank it, and every other metric, on its own scale.
+/// cosine on SQ, PQ, and RQ as L2 over normalized vectors, twice `1 - cos`;
+/// FLAT ranks it, and every other metric, on its own scale.
 fn index_distance_scale(metric: MetricType, segments: &[IndexMetadata]) -> f32 {
     let quantized_as_l2 = segments.iter().any(|segment| {
         segment.index_details.as_ref().is_some_and(|details| {
             let index_type = crate::index::vector::details::derive_vector_index_type(details);
-            index_type.ends_with("PQ") || index_type.ends_with("SQ")
+            index_type.ends_with("PQ") || index_type.ends_with("SQ") || index_type.ends_with("RQ")
         })
     });
     if metric == MetricType::Cosine && quantized_as_l2 {
@@ -1213,6 +1213,8 @@ pub struct Scanner {
 
     nearest: Option<Query>,
     probe_params: ProbeParams,
+    /// Candidate overfetch factor for RQ Fast-to-Accurate refinement.
+    quantized_refine_factor: Option<u32>,
     nearest_query_count: usize,
     /// True when the query shape represents a batch of single-vector queries
     /// (list-like query on a fixed-size vector column, or multiple concatenated vectors).
@@ -1708,6 +1710,7 @@ impl Scanner {
             ordering: None,
             nearest: None,
             probe_params: ProbeParams::default(),
+            quantized_refine_factor: None,
             nearest_query_count: 1,
             is_batch_nearest: false,
             use_stats: true,
@@ -2509,6 +2512,7 @@ impl Scanner {
             dist_q_c: 0.0,
             approx_mode: Default::default(),
         });
+        self.quantized_refine_factor = None;
         self.nearest_query_count = query_count;
         self.is_batch_nearest = is_batch_nearest;
         Ok(self)
@@ -2677,6 +2681,32 @@ impl Scanner {
         if let Some(q) = self.nearest.as_mut() {
             q.refine_factor = Some(factor)
         };
+        self
+    }
+
+    /// Re-rank an over-fetched IVF_RQ candidate set with its multi-bit index data.
+    ///
+    /// Unlike [`Self::refine`], this does not read original vectors from the dataset.
+    /// It first discovers `factor * k` candidates with one-bit RQ scores and then
+    /// re-ranks them with the index's most accurate stored RQ representation. If
+    /// exact refinement is also configured, the quantized stage emits enough
+    /// candidates for that exact stage.
+    ///
+    /// ```
+    /// # use arrow_array::Float32Array;
+    /// # use lance::{Dataset, Result};
+    /// # async fn search(dataset: &Dataset) -> Result<()> {
+    /// let query = Float32Array::from(vec![0.0_f32; 128]);
+    /// let mut scanner = dataset.scan();
+    /// scanner.nearest("vector", &query, 10)?;
+    /// scanner.quantized_refine(4);
+    /// let results = scanner.try_into_batch().await?;
+    /// # let _ = results;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn quantized_refine(&mut self, factor: u32) -> &mut Self {
+        self.quantized_refine_factor = Some(factor);
         self
     }
 
@@ -6915,6 +6945,12 @@ impl Scanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut q = q.clone();
 
+        if matches!(self.quantized_refine_factor, Some(0)) {
+            return Err(Error::invalid_input(
+                "Quantized refine factor cannot be zero".to_string(),
+            ));
+        }
+
         // Sanity check
         let (vector_type, element_type) = get_vector_type(self.dataset.schema(), &q.column)?;
 
@@ -7153,6 +7189,21 @@ impl Scanner {
             // Build a prefilter block mask for stale rows (empty = no-op fast path).
             let overlay_block = self.stale_rows_block_mask(&stale_rows).await?;
 
+            let ann_query = if self.quantized_refine_factor.is_some() {
+                let exact_factor = q.refine_factor.unwrap_or(1) as usize;
+                let mut ann_query = q.clone();
+                ann_query.k = q.k.checked_mul(exact_factor).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "quantized refinement result count overflows: k={} exact_refine_factor={exact_factor}",
+                        q.k
+                    ))
+                })?;
+                ann_query.refine_factor = None;
+                ann_query
+            } else {
+                q.clone()
+            };
+
             let ann_node = match vector_type {
                 DataType::FixedSizeList(_, _) => {
                     // Refine applies the distance range to exact distances, but
@@ -7165,10 +7216,10 @@ impl Scanner {
                             Query {
                                 lower_bound: q.lower_bound.map(|lower| lower * scale),
                                 upper_bound: q.upper_bound.map(|upper| upper * scale),
-                                ..q.clone()
+                                ..ann_query
                             }
                         }
-                        None => q.clone(),
+                        None => ann_query,
                     };
                     self.ann(
                         &ann_query,
@@ -7179,6 +7230,11 @@ impl Scanner {
                     .await?
                 }
                 DataType::List(_) => {
+                    if self.quantized_refine_factor.is_some() {
+                        return Err(Error::not_supported(
+                            "quantized refinement is not supported for multivector columns",
+                        ));
+                    }
                     self.multivec_ann(&q, &index_segments, filter_plan, overlay_block.clone())
                         .await?
                 }
@@ -7212,6 +7268,11 @@ impl Scanner {
 
             Ok(knn_node)
         } else {
+            if self.quantized_refine_factor.is_some() {
+                return Err(Error::not_supported(
+                    "quantized refinement requires an IVF_RQ vector index",
+                ));
+            }
             if self.fast_search {
                 return Ok(Arc::new(EmptyExec::new(knn_empty_result_schema(
                     self.is_batch_nearest,
@@ -7270,7 +7331,7 @@ impl Scanner {
     /// search per query vector.
     ///
     /// Requires all of:
-    /// - no refine step (the batch path does not yet rerank);
+    /// - no exact or quantized refine step (the batch path does not yet rerank);
     /// - fixed nprobes (`minimum_nprobes == maximum_nprobes`) — see below;
     /// - every segment an IVF index with a flat-style sub-index (i.e. not HNSW);
     /// - every target fragment covered by the *selected* `index_segments` (or
@@ -7295,12 +7356,13 @@ impl Scanner {
         index_segments: &[IndexMetadata],
         q: &Query,
     ) -> Result<bool> {
-        // Any refine factor sends the query onto a reranking path that the
-        // shared batch scan does not implement: the single-query path reranks
-        // with the original vectors even when the factor is 1, and rejects a
-        // factor of 0 outright (`Refine factor cannot be zero`). The batch path
-        // does neither, so fall back to the per-query loop for every `Some(_)`.
-        if q.refine_factor.is_some() {
+        // Any exact or quantized refine factor sends the query onto a reranking
+        // path that the shared batch scan does not implement. Exact refinement
+        // reranks with the original vectors even when the factor is 1, while
+        // quantized refinement overfetches and reranks with Accurate RQ scores.
+        // The batch path does neither, so fall back to the per-query loop for
+        // every configured refinement.
+        if q.refine_factor.is_some() || self.quantized_refine_factor.is_some() {
             return Ok(false);
         }
         // Only fixed nprobes is provably equivalent to single-query search; see
@@ -7533,9 +7595,26 @@ impl Scanner {
 
         let q = q.clone();
         debug_assert!(q.metric_type.is_some());
+        let keep_quantized_distances =
+            self.quantized_refine_factor.is_some() && q.refine_factor.is_none();
+
+        // Retained RQ scores use the index's native distance scale. Convert the
+        // flat arms' bounds before filtering, then their scores before merging;
+        // fetching indexed vectors just to recompute distances defeats quantized refinement.
+        let flat_distance_scale = if keep_quantized_distances {
+            q.metric_type
+                .map_or(1.0, |metric| index_distance_scale(metric, indexed_segments))
+        } else {
+            1.0
+        };
+        let flat_query = Query {
+            lower_bound: q.lower_bound.map(|bound| bound / flat_distance_scale),
+            upper_bound: q.upper_bound.map(|bound| bound / flat_distance_scale),
+            ..q.clone()
+        };
 
         // Ensure the vector column is present for distance computation.
-        if knn_node.schema().column_with_name(&q.column).is_none() {
+        if !keep_quantized_distances && knn_node.schema().column_with_name(&q.column).is_none() {
             let vector_projection = self
                 .dataset
                 .empty_projection()
@@ -7581,7 +7660,7 @@ impl Scanner {
                 Some(mask) => Arc::new(RowAddrMaskFilterExec::new(scan_node, mask)) as _,
                 None => scan_node,
             };
-            let topk_fallback = self.flat_knn(scan_node, &q).await?;
+            let topk_fallback = self.flat_knn(scan_node, &flat_query).await?;
             let topk_fallback: Arc<dyn ExecutionPlan> =
                 Arc::new(project(topk_fallback, knn_node.schema().as_ref())?);
             flat_inputs.push(topk_fallback);
@@ -7606,20 +7685,73 @@ impl Scanner {
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 stale_node = Arc::new(LanceFilterExec::try_new(expr.clone(), stale_node)?);
             }
-            let topk_stale = self.flat_knn(stale_node, &q).await?;
+            let topk_stale = self.flat_knn(stale_node, &flat_query).await?;
             let topk_stale: Arc<dyn ExecutionPlan> =
                 Arc::new(project(topk_stale, knn_node.schema().as_ref())?);
             flat_inputs.push(topk_stale);
         }
 
+        if flat_distance_scale != 1.0 {
+            for input in &mut flat_inputs {
+                let exprs: Vec<_> = input
+                    .schema()
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, field)| {
+                        let column =
+                            Arc::new(Column::new(field.name(), index)) as Arc<dyn PhysicalExpr>;
+                        let expr = if field.name() == DIST_COL {
+                            Arc::new(expressions::BinaryExpr::new(
+                                column,
+                                datafusion::logical_expr::Operator::Multiply,
+                                Arc::new(Literal::new(ScalarValue::Float32(Some(
+                                    flat_distance_scale,
+                                )))),
+                            )) as Arc<dyn PhysicalExpr>
+                        } else {
+                            column
+                        };
+                        (expr, field.name().clone())
+                    })
+                    .collect();
+                *input = Arc::new(ProjectionExec::try_new(exprs, input.clone())?);
+            }
+        }
+
         // Union: flat paths first (matching original order), then ANN results.
         flat_inputs.push(knn_node);
         let unioned = UnionExec::try_new(flat_inputs)?;
-        let unioned = RepartitionExec::try_new(
+        let unioned: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
             unioned,
             datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
-        )?;
-        self.flat_knn(Arc::new(unioned), &q).await
+        )?);
+        if keep_quantized_distances {
+            let sort = SortExec::new(
+                [
+                    PhysicalSortExpr {
+                        expr: expressions::col(DIST_COL, unioned.schema().as_ref())?,
+                        options: SortOptions {
+                            descending: false,
+                            nulls_first: false,
+                        },
+                    },
+                    PhysicalSortExpr {
+                        expr: expressions::col(ROW_ID, unioned.schema().as_ref())?,
+                        options: SortOptions {
+                            descending: false,
+                            nulls_first: false,
+                        },
+                    },
+                ]
+                .into(),
+                unioned,
+            )
+            .with_fetch(Some(q.k));
+            Self::flat_knn_not_null_filter(Arc::new(sort))
+        } else {
+            self.flat_knn(unioned, &q).await
+        }
     }
 
     #[async_recursion]
@@ -8621,6 +8753,7 @@ impl Scanner {
             prefilter_source,
             overlay_block,
             self.external_row_mask.clone(),
+            self.quantized_refine_factor,
         )?;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
@@ -8681,6 +8814,7 @@ impl Scanner {
                 prefilter_source.clone(),
                 overlay_block.clone(),
                 self.external_row_mask.clone(),
+                None,
             )?;
             let sort_expr = PhysicalSortExpr {
                 expr: expressions::col(DIST_COL, ann_node.schema().as_ref())?,
@@ -9089,6 +9223,7 @@ pub mod test_dataset {
         IndexType,
         scalar::{ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
         vector::{
+            bq::{RQBuildParams, RQRotationType},
             hnsw::builder::HnswBuildParams,
             ivf::IvfBuildParams,
             kmeans::{KMeansParams, train_kmeans},
@@ -9234,6 +9369,24 @@ pub mod test_dataset {
                 IvfBuildParams::new(2),
                 HnswBuildParams::default(),
                 SQBuildParams::default(),
+            );
+            self.dataset
+                .create_index(
+                    &["vec"],
+                    IndexType::Vector,
+                    Some("idx".to_string()),
+                    &params,
+                    true,
+                )
+                .await?;
+            Ok(())
+        }
+
+        pub async fn make_rq_vector_index(&mut self, num_bits: u8) -> Result<()> {
+            let params = VectorIndexParams::with_ivf_rq_params(
+                MetricType::L2,
+                IvfBuildParams::new(2),
+                RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast),
             );
             self.dataset
                 .create_index(
@@ -9441,6 +9594,8 @@ mod test {
         BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, PhraseQuery,
     };
     use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+    use lance_index::vector::bq::builder::RabitQuantizer;
+    use lance_index::vector::bq::{RQBuildParams, RQRotationType};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
@@ -13109,6 +13264,27 @@ mod test {
         assert_eq!(query.minimum_nprobes, 2);
         assert_eq!(query.maximum_nprobes, Some(2));
         assert_eq!(query.search_effort, effort);
+    }
+
+    #[tokio::test]
+    async fn test_batch_knn_quantized_refinement_uses_rerank_path() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds.make_rq_vector_index(4).await.unwrap();
+        let (queries, _) = batch_knn_two_queries();
+
+        let mut scan = test_ds.dataset.scan();
+        scan.nearest("vec", &queries, 10).unwrap();
+        scan.nprobes(2);
+        scan.quantized_refine(40);
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            !plan.contains("ANNIvfBatch"),
+            "quantized refinement must not use the shared-scan batch node, got:\n{plan}"
+        );
+        assert!(plan.contains("quantized_refine_factor=40"), "{plan}");
     }
 
     /// Without pinned nprobes the shared-scan fast path is not equivalent to
@@ -21195,6 +21371,315 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             scanner.nearest_mut().unwrap().approx_mode,
             ApproxMode::Accurate
         );
+
+        assert_eq!(scanner.quantized_refine_factor, None);
+        scanner.quantized_refine(4);
+        assert_eq!(scanner.quantized_refine_factor, Some(4));
+
+        scanner.nearest("vec", &query_vector, 5).unwrap();
+        assert_eq!(scanner.quantized_refine_factor, None);
+
+        scanner.quantized_refine(0);
+        let error = scanner.explain_plan(false).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("cannot be zero"));
+    }
+
+    #[rstest]
+    #[case::rq4(4)]
+    #[case::rq8(8)]
+    #[tokio::test]
+    async fn test_ivf_rq_quantized_refinement(#[case] num_bits: u8) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_rq_vector_index(num_bits).await.unwrap();
+        let query_vector = Float32Array::from_iter_values((0..32).map(|value| value as f32));
+
+        let mut accurate = test_ds.dataset.scan();
+        accurate
+            .nearest("vec", &query_vector, 10)
+            .unwrap()
+            .nprobes(2)
+            .approx_mode(ApproxMode::Accurate)
+            .with_row_id()
+            .project(&["i"])
+            .unwrap();
+        let accurate_results = accurate.try_into_batch().await.unwrap();
+
+        // The fixture has 400 rows across multiple fragments. This factor makes
+        // the Fast candidate pass exhaustive, so selected-candidate scoring
+        // must produce the same top-k set as native Accurate RQ search. Ties in
+        // approximate scores may appear in a different order.
+        let mut quantized = test_ds.dataset.scan();
+        quantized
+            .nearest("vec", &query_vector, 10)
+            .unwrap()
+            .nprobes(2)
+            .quantized_refine(40)
+            .with_row_id()
+            .project(&["i"])
+            .unwrap();
+        let plan = quantized.explain_plan(false).await.unwrap();
+        assert!(plan.contains("quantized_refine_factor=40"), "{plan}");
+        assert!(!plan.contains("KNNVectorDistance"), "{plan}");
+        let quantized_results = quantized.try_into_batch().await.unwrap();
+        let quantized_ids = BTreeSet::from_iter(batch_row_ids(&quantized_results));
+        let accurate_ids = BTreeSet::from_iter(batch_row_ids(&accurate_results));
+        assert_eq!(quantized_ids, accurate_ids);
+        assert!(
+            quantized_results[DIST_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .all(|distance| distance.is_finite())
+        );
+
+        // Exact refinement remains a separate final stage and still reads the
+        // original vectors only when the caller explicitly asks for it.
+        let mut exact = test_ds.dataset.scan();
+        exact
+            .nearest("vec", &query_vector, 10)
+            .unwrap()
+            .use_index(false)
+            .with_row_id()
+            .project(&["i"])
+            .unwrap();
+        let exact_results = exact.try_into_batch().await.unwrap();
+
+        let mut quantized_then_exact = test_ds.dataset.scan();
+        quantized_then_exact
+            .nearest("vec", &query_vector, 10)
+            .unwrap()
+            .nprobes(2)
+            .quantized_refine(40)
+            .refine(2)
+            .with_row_id()
+            .project(&["i"])
+            .unwrap();
+        let plan = quantized_then_exact.explain_plan(false).await.unwrap();
+        assert!(plan.contains("quantized_refine_factor=40"), "{plan}");
+        assert!(plan.contains("KNNVectorDistance"), "{plan}");
+        let quantized_then_exact_results = quantized_then_exact.try_into_batch().await.unwrap();
+        assert_eq!(quantized_then_exact_results, exact_results);
+    }
+
+    #[rstest]
+    #[case::rq4(4)]
+    #[case::rq8(8)]
+    #[tokio::test]
+    async fn test_quantized_refinement_merges_unindexed_distance_scales(
+        #[case] num_bits: u8,
+        #[values(DistanceType::Cosine, DistanceType::L2, DistanceType::Dot)] metric: DistanceType,
+        #[values(false, true)] exact_refine: bool,
+        #[values(None, Some((0.15, 0.25)), Some((0.28, 0.32)))] range: Option<(f32, f32)>,
+    ) {
+        const DIM: usize = 32;
+        let make_batch = |rows: usize, first: f32, nearest_boost: f32| {
+            let mut values = Vec::with_capacity(rows * DIM);
+            for row in 0..rows {
+                // Separate the nearest ten so recall measures the merge rather
+                // than approximation noise among nearly tied RQ4 scores.
+                let boost = if row < 10 { nearest_boost } else { 0.0 };
+                let x = first + boost + row as f32 * 0.0001;
+                let tail: Vec<f32> = (1..DIM)
+                    .map(|dim| ((row * 37 + dim * 19) as f32).sin())
+                    .collect();
+                let norm = tail.iter().map(|value| value * value).sum::<f32>().sqrt();
+                values.push(x);
+                values.extend(tail.iter().map(|value| value / norm * (1.0 - x * x).sqrt()));
+            }
+            RecordBatch::try_from_iter([(
+                "vec",
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM as i32)
+                        .unwrap(),
+                ) as ArrayRef,
+            )])
+            .unwrap()
+        };
+        let indexed = make_batch(128, 0.8, 0.04);
+        let centroids = indexed["vec"].as_fixed_size_list().slice(0, 4);
+        let tmp = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(indexed.clone())], indexed.schema()),
+            &tmp,
+            Some(WriteParams {
+                max_rows_per_file: 32,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut rq_params = RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast);
+        let mut rotation = RabitQuantizer::new::<Float32Type>(num_bits, DIM as i32)
+            .metadata_ref()
+            .clone();
+        // Reuse a fixed rotation so recall assertions are deterministic.
+        for (index, signs) in rotation
+            .fast_rotation_signs
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            *signs = (index * 37 + 19) as u8;
+        }
+        rq_params.rotation = Some(rotation);
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::with_ivf_rq_params(
+                    metric,
+                    IvfBuildParams::try_with_centroids(4, Arc::new(centroids)).unwrap(),
+                    rq_params,
+                ),
+                true,
+            )
+            .await
+            .unwrap();
+        let appended = make_batch(16, 0.7, 0.0);
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 5);
+
+        let mut query = vec![0.0; DIM];
+        query[0] = 1.0;
+        let query = Float32Array::from(query);
+        let scale = if metric == DistanceType::Cosine && !exact_refine {
+            2.0
+        } else {
+            1.0
+        };
+        // Fixture ranges are expressed as 1 - cos. L2 on unit vectors is twice
+        // that, as are native RQ cosine scores without exact refinement.
+        let metric_scale = if metric == DistanceType::L2 { 2.0 } else { 1.0 };
+        let mut exact = dataset.scan();
+        exact
+            .nearest("vec", &query, 10)
+            .unwrap()
+            .distance_metric(metric)
+            .use_index(false)
+            .with_row_id()
+            .project::<&str>(&[])
+            .unwrap();
+        if let Some((lower, upper)) = range {
+            exact.distance_range(Some(lower * metric_scale), Some(upper * metric_scale));
+        }
+        let expected = exact.try_into_batch().await.unwrap();
+        let expected_ids = BTreeSet::from_iter(batch_row_ids(&expected));
+
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("vec", &query, 10)
+            .unwrap()
+            .distance_metric(metric)
+            .nprobes(4)
+            .quantized_refine(64)
+            .with_row_id()
+            .project::<&str>(&[])
+            .unwrap();
+        if exact_refine {
+            scanner.refine(2);
+        }
+        if let Some((lower, upper)) = range {
+            scanner.distance_range(
+                Some(lower * metric_scale * scale),
+                Some(upper * metric_scale * scale),
+            );
+        }
+        let plan = scanner.explain_plan(false).await.unwrap();
+        if !exact_refine {
+            // Only the unindexed scan computes vector distances. Indexed rows
+            // retain their RQ scores without taking their original vectors.
+            assert_eq!(plan.matches("KNNVectorDistance").count(), 1, "{plan}");
+            assert!(!plan.contains("Take:"), "{plan}");
+        }
+        let results = scanner.try_into_batch().await.unwrap();
+        assert_eq!(results.num_rows(), 10);
+        let ids = batch_row_ids(&results);
+        let recall = ids.iter().filter(|id| expected_ids.contains(id)).count();
+        assert!(
+            recall >= 5,
+            "recall={recall}/10, metric={metric:?}, ids={ids:?}"
+        );
+        for (row, distance) in results[DIST_COL]
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .enumerate()
+        {
+            if let Some((lower, upper)) = range {
+                assert!(
+                    (lower * metric_scale * scale..upper * metric_scale * scale).contains(distance)
+                );
+            }
+            if RowAddress::from(ids[row]).fragment_id() == 4 {
+                let offset = RowAddress::from(ids[row]).row_offset();
+                let expected_distance =
+                    (1.0 - (0.7 + offset as f32 * 0.0001)) * metric_scale * scale;
+                assert!((distance - expected_distance).abs() < 1e-5);
+            } else {
+                assert!(
+                    range != Some((0.28, 0.32)),
+                    "indexed row passed appended-only bounds"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_quantized_refinement_scores_selective_prefilter_shortcut_rows() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_rq_vector_index(4).await.unwrap();
+        let query_vector = Float32Array::from_iter_values((0..32).map(|value| value as f32));
+
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .nearest("vec", &query_vector, 10)
+            .unwrap()
+            .minimum_nprobes(1)
+            .maximum_nprobes(2)
+            .prefilter(true)
+            .filter("i = 0 OR i = 399")
+            .unwrap()
+            .quantized_refine(2)
+            .distance_range(None, Some(f32::MAX));
+        let results = scanner.try_into_batch().await.unwrap();
+
+        assert_eq!(results.num_rows(), 2);
+        assert!(
+            results[DIST_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .all(|distance| distance.is_finite())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_quantized_refinement_rejects_non_rq_index() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        let query_vector = Float32Array::from(vec![0.0; 32]);
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .nearest("vec", &query_vector, 5)
+            .unwrap()
+            .quantized_refine(2);
+        let error = scanner.try_into_batch().await.unwrap_err();
+        assert!(error.to_string().contains("requires an IVF_RQ flat index"));
     }
 
     #[tokio::test]
