@@ -2473,9 +2473,12 @@ mod tests {
         #[case] total: usize,
     ) {
         const DIM: usize = 32;
-        let fsl =
-            FixedSizeListArray::try_new_from_values(generate_random_array(total * DIM), DIM as i32)
-                .unwrap();
+        // Seeded so the data and query are fixed across runs.
+        let fsl = FixedSizeListArray::try_new_from_values(
+            generate_random_array_with_seed::<Float32Type>(total * DIM, [42; 32]),
+            DIM as i32,
+        )
+        .unwrap();
         let store = Arc::new(FlatFloatStorage::new(fsl.clone(), distance_type));
         let builder = HNSW::index_vectors(
             store.as_ref(),
@@ -2677,9 +2680,12 @@ mod tests {
     async fn test_acorn_filtered_search() {
         const DIM: usize = 32;
         const TOTAL: usize = 2048;
-        let fsl =
-            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
-                .unwrap();
+        // Seeded so the data and query are fixed across runs.
+        let fsl = FixedSizeListArray::try_new_from_values(
+            generate_random_array_with_seed::<Float32Type>(TOTAL * DIM, [42; 32]),
+            DIM as i32,
+        )
+        .unwrap();
         let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
         let builder = HNSW::index_vectors(
             store.as_ref(),
