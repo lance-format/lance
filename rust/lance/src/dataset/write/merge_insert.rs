@@ -2055,16 +2055,6 @@ impl MergeInsertJob {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // Use standard SQL NULL semantics for composite keys so this path
-        // produces the same result as the full-scan path.  The
-        // single-column case keeps its historical `NullEqualsNull` behavior
-        // to avoid changing semantics for existing callers.
-        let null_equality = if self.params.on.len() == 1 {
-            NullEquality::NullEqualsNull
-        } else {
-            NullEquality::NullEqualsNothing
-        };
-
         // HashJoinExec cannot spill its build side. Sort both inputs instead,
         // capping oversized batches so the sorts and the join can spill within
         // the configured fair memory pool.
@@ -2115,7 +2105,7 @@ impl MergeInsertJob {
             None,
             JoinType::Full,
             sort_options,
-            null_equality,
+            NullEquality::NullEqualsNothing,
         )?);
         let joined = if let Some(source_ordinal_column) = source_ordinal_column {
             let output_schema = joined
@@ -4467,39 +4457,14 @@ impl Merger {
         Ok(at_least_one_valid)
     }
 
-    // Since we are performing an
-    // outer join below we expect the results to look like:
-    //
-    // | LEFT KEYS | LEFT PAYLOAD | RIGHT KEYS | RIGHT PAYLOAD |
-    // | NULL      | NULL         | NOT NULL   | ************* | <- when not matched
-    // | ********* | ************ | ********** | ************* | <- when matched
-    // | ********* | ************ | NULL       | NULL          | <- when not matched by source
-    //
-    // To test which case we are in we check to see if all of LEFT KEYS or RIGHT KEYS are null
-    //
-    // This returns three selection bitmaps
-    //
-    //  - The first is true for rows that are in the left side only
-    //  - The second is true for rows in both the left and the right
-    //  - The third is true for rows in the right side only
+    // Returns selection bitmaps for source-only, matched, and target-only rows.
     fn extract_selections(
         &self,
         combined_batch: &RecordBatch,
-        right_offset: usize,
+        row_id_col: usize,
     ) -> Result<(BooleanArray, BooleanArray, BooleanArray)> {
-        // The outer join distinguishes its three cases by which side's join
-        // keys were NULL-padded: a present row always has non-null keys, while
-        // the absent side is filled with NULLs. We therefore test the *key*
-        // columns, located by name. They are NOT necessarily the first
-        // `num_keys` columns — a partial-schema source can place a payload
-        // column (e.g. an all-null vector) at position 0, and checking
-        // positions [0, num_keys) there misreads an all-null leading payload
-        // column as an absent join side, silently dropping every matched row
-        // (https://github.com/lancedb/lancedb/issues/3515). The target half is
-        // resolved independently because the indexed path keeps dataset-schema
-        // order even when the source fields are reordered. Restrict that lookup
-        // to the target half because a valid source field can have the same
-        // `target_`-prefixed name.
+        // Locate source keys by name: a reordered partial-schema source can put
+        // an all-null payload before its keys (lancedb/lancedb#3515).
         let combined_schema = combined_batch.schema();
         let source_key_cols = self
             .params
@@ -4514,32 +4479,16 @@ impl Merger {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let target_key_cols = self
-            .params
-            .on
-            .iter()
-            .map(|key| {
-                let target_key = format!("target_{key}");
-                combined_schema
-                    .fields()
-                    .iter()
-                    .enumerate()
-                    .skip(right_offset)
-                    .find_map(|(index, field)| (field.name() == &target_key).then_some(index))
-                    .ok_or_else(|| {
-                        Error::internal(format!(
-                            "merge insert target key column '{}' not found in joined batch",
-                            target_key
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
 
-        let in_left = Self::not_all_null(combined_batch, &source_key_cols)?;
-        let in_right = Self::not_all_null(combined_batch, &target_key_cols)?;
-        let in_both = arrow::compute::and(&in_left, &in_right)?;
-        let left_only = arrow::compute::and(&in_left, &arrow::compute::not(&in_right)?)?;
-        let right_only = arrow::compute::and(&arrow::compute::not(&in_left)?, &in_right)?;
+        // Every target row has a row id, even when its keys are NULL. A NULL
+        // target row id therefore identifies a source-only row regardless of
+        // its key values. With SQL equality, matched rows have non-null source
+        // keys; target-only rows have NULL-padded source keys.
+        let has_source_key = Self::not_all_null(combined_batch, &source_key_cols)?;
+        let in_right = arrow::compute::is_not_null(combined_batch.column(row_id_col))?;
+        let left_only = arrow::compute::not(&in_right)?;
+        let in_both = arrow::compute::and(&has_source_key, &in_right)?;
+        let right_only = arrow::compute::and(&arrow::compute::not(&has_source_key)?, &in_right)?;
         Ok((left_only, in_both, right_only))
     }
 
@@ -4574,7 +4523,7 @@ impl Merger {
         let right_cols_with_id = Vec::from_iter(right_offset..num_fields);
 
         let mut batches = Vec::with_capacity(2);
-        let (left_only, in_both, right_only) = self.extract_selections(&batch, right_offset)?;
+        let (left_only, in_both, right_only) = self.extract_selections(&batch, row_id_col)?;
 
         // There is no contention on this mutex.  We're only using it to bypass the rust
         // borrow checker (the stream needs to be `sync` since it crosses an await point)
@@ -7630,12 +7579,15 @@ mod tests {
     /// (NULL != NULL) on the post-filter hash join so its behavior is
     /// identical to the full-scan path; otherwise enabling the indexed
     /// path for multi-column joins would silently change semantics.
+    #[rstest::rstest]
+    #[case::btree(IndexType::BTree)]
+    #[case::bitmap(IndexType::Bitmap)]
     #[tokio::test]
-    async fn test_indexed_merge_insert_composite_key_null_semantics() {
+    async fn test_indexed_merge_insert_composite_key_null_semantics(#[case] index_type: IndexType) {
         let initial = record_batch!(
-            ("a", Int32, [Some(1)]),
-            ("b", Utf8, [Option::<&str>::None]),
-            ("value", Int32, [Some(10)])
+            ("a", Int32, [Some(1), None]),
+            ("b", Utf8, [Option::<&str>::None, None]),
+            ("value", Int32, [10, 11])
         )
         .unwrap();
         let schema = initial.schema();
@@ -7648,20 +7600,22 @@ mod tests {
         .await
         .unwrap();
 
-        ds.create_index(
-            &["a"],
-            IndexType::Scalar,
-            None,
-            &ScalarIndexParams::default(),
-            false,
-        )
-        .await
-        .unwrap();
+        for key in ["a", "b"] {
+            ds.create_index(
+                &[key],
+                index_type,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        }
 
         let source = record_batch!(
-            ("a", Int32, [Some(1)]),
-            ("b", Utf8, [Option::<&str>::None]),
-            ("value", Int32, [Some(99)])
+            ("a", Int32, [Some(1), None]),
+            ("b", Utf8, [Option::<&str>::None, None]),
+            ("value", Int32, [99, 100])
         )
         .unwrap();
 
@@ -7679,9 +7633,22 @@ mod tests {
                 .await
                 .unwrap();
 
-        assert_eq!(stats.num_inserted_rows, 1);
+        assert_eq!(stats.num_inserted_rows, 2);
         assert_eq!(stats.num_updated_rows, 0);
-        assert_eq!(updated_ds.count_rows(None).await.unwrap(), 2);
+        let actual = updated_ds
+            .scan()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first("value".into())]))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let expected = record_batch!(
+            ("a", Int32, [Some(1), None, Some(1), None]),
+            ("b", Utf8, [Option::<&str>::None, None, None, None]),
+            ("value", Int32, [10, 11, 99, 100])
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
     }
 
     /// Composite-key merge_insert where new (unindexed) fragments are
@@ -15864,41 +15831,71 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         );
     }
 
-    /// Variant of test_merge_insert_null_on_column_inserts with a single ON column
-    /// that is entirely NULL, and a target row that also has a NULL in that column.
-    /// Since standard SQL equality treats NULL != NULL, the source row must not match
-    /// the existing target row and must be inserted separately.
+    /// NULL source keys must be inserted separately from NULL target keys in both
+    /// indexed and full-scan merges, including when every source key is NULL.
+    #[rstest::rstest]
+    #[case::no_index(None, true)]
+    #[case::btree(Some(IndexType::BTree), true)]
+    #[case::btree_full_scan(Some(IndexType::BTree), false)]
+    #[case::bitmap(Some(IndexType::Bitmap), true)]
+    #[case::bitmap_full_scan(Some(IndexType::Bitmap), false)]
     #[tokio::test]
-    async fn test_merge_insert_null_single_on_column() {
-        // Dataset with a single row where id is NULL.
+    async fn test_merge_insert_null_single_on_column(
+        #[case] index_type: Option<IndexType>,
+        #[case] use_index: bool,
+        #[values(WhenMatched::UpdateAll, WhenMatched::DoNothing)] when_matched: WhenMatched,
+        #[values(false, true)] all_null_source: bool,
+    ) {
         let initial_data = record_batch!(
-            ("id", Int32, [Option::<i32>::None]),
-            ("value", Int32, [Some(1)])
+            ("id", Int32, [None, Some(1), Some(2)]),
+            ("value", Int32, [1, 2, 3])
         )
         .unwrap();
 
-        let dataset = Dataset::write(
+        let mut dataset = Dataset::write(
             RecordBatchIterator::new(vec![Ok(initial_data.clone())], initial_data.schema()),
-            "memory://test_null_single_on_column",
-            None,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
+        if let Some(index_type) = index_type {
+            dataset
+                .create_index(
+                    &["id"],
+                    index_type,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
 
-        // Source has two rows: one with id=NULL and one with id=5.
-        // id=NULL should not match the existing id=NULL row (standard equality), so it
-        // gets inserted.  id=5 is a brand-new key and also gets inserted.
-        let new_data = record_batch!(
-            ("id", Int32, [Option::<i32>::None, Some(5)]),
-            ("value", Int32, [Some(99), Some(50)])
-        )
-        .unwrap();
+        let new_data = if all_null_source {
+            record_batch!(
+                ("id", Int32, [Option::<i32>::None, None]),
+                ("value", Int32, [99, 50])
+            )
+            .unwrap()
+        } else {
+            record_batch!(
+                ("id", Int32, [None, Some(1), Some(5)]),
+                ("value", Int32, [99, 20, 50])
+            )
+            .unwrap()
+        };
 
+        let has_update = !all_null_source && when_matched == WhenMatched::UpdateAll;
         let (merged_dataset, stats) =
             MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
                 .unwrap()
-                .when_matched(WhenMatched::UpdateAll)
+                .when_matched(when_matched)
                 .when_not_matched(WhenNotMatched::InsertAll)
+                .use_index(use_index)
                 .try_build()
                 .unwrap()
                 .execute_reader(Box::new(RecordBatchIterator::new(
@@ -15908,16 +15905,32 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
                 .await
                 .unwrap();
 
-        // Both source rows must be inserted (not silently dropped).
-        assert_eq!(
-            stats.num_inserted_rows, 2,
-            "both rows with NULL ON column should be inserted"
-        );
-        assert_eq!(stats.num_updated_rows, 0);
+        assert_eq!(stats.num_inserted_rows, 2);
+        assert_eq!(stats.num_updated_rows, u64::from(has_update));
+        assert_eq!(stats.num_deleted_rows, 0);
 
-        // Dataset now has: original NULL-id row + 2 newly inserted rows = 3 total.
-        let count = merged_dataset.count_rows(None).await.unwrap();
-        assert_eq!(count, 3);
+        let actual = merged_dataset
+            .scan()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first("value".into())]))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let inserted_key = (!all_null_source).then_some(5);
+        let expected = if has_update {
+            record_batch!(
+                ("id", Int32, [None, Some(2), Some(1), inserted_key, None]),
+                ("value", Int32, [1, 3, 20, 50, 99])
+            )
+            .unwrap()
+        } else {
+            record_batch!(
+                ("id", Int32, [None, Some(1), Some(2), inserted_key, None]),
+                ("value", Int32, [1, 2, 3, 50, 99])
+            )
+            .unwrap()
+        };
+        assert_eq!(actual, expected);
     }
 
     /// Test case for Issue #3634: merge_insert should provide a helpful error

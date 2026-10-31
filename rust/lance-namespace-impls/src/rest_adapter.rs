@@ -3855,8 +3855,8 @@ mod tests {
                 "branch must be forwarded in the request body and honored by the backend"
             );
 
-            // The directory backend ignores branch on these, or lacks the
-            // operation, so we check the request it received.
+            // The directory backend lacks update_field_metadata, so we check the
+            // branch each operation received.
             let branch = Some("dev".to_string());
             fixture
                 .namespace
@@ -3892,6 +3892,7 @@ mod tests {
             let mut create_index = CreateTableIndexRequest::new("id".into(), "BTREE".into());
             create_index.id = Some(id.clone());
             create_index.name = Some("id_idx".to_string());
+            create_index.branch = branch.clone();
             fixture
                 .namespace
                 .create_table_index(create_index)

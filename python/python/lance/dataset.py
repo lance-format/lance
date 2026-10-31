@@ -818,6 +818,8 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         - rows_scanned: total rows examined during the scan
         - iops: number of I/O operations performed
         - requests: number of storage requests made
+        - task_wait_time: time spent waiting for scheduled I/O
+        - decode_time: time spent decoding, summed over concurrent decode tasks
         """  # noqa: E501
         reader = _coerce_reader(data_obj, schema)
 
@@ -2816,6 +2818,9 @@ class LanceDataset(pa.dataset.Dataset):
         is the right side. Rows existing in the dataset but not on the left will
         be filled with null values, unless Lance doesn't support null values for
         some types, in which case an error will be raised.
+        The right-side join column must contain unique keys; null counts as a
+        key, so at most one null value is allowed. Duplicate right-side keys
+        raise an error.
 
         Parameters
         ----------
@@ -8187,6 +8192,40 @@ class Tags:
 
     def __init__(self, dataset: _Dataset):
         self._ds = dataset
+
+    def get(self, tag: str) -> Tag:
+        """
+        Get metadata for a dataset tag by name without listing all tags.
+
+        Parameters
+        ----------
+        tag: str
+            The name of the tag to retrieve.
+
+        Returns
+        -------
+        Tag
+            Tag metadata with the same fields as the values returned by
+            :meth:`list`, including the referenced branch, version, timestamps,
+            manifest size, and attached metadata.
+
+        Raises
+        ------
+        ValueError
+            If the tag does not exist or its name is invalid.
+
+        Examples
+        --------
+        >>> import tempfile
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> with tempfile.TemporaryDirectory() as uri:
+        ...     ds = lance.write_dataset(pa.table({"id": [1, 2]}), uri)
+        ...     ds.tags.create("v1", 1)
+        ...     ds.tags.get("v1")["version"]
+        1
+        """
+        return self._ds.get_tag(tag)
 
     def list(self) -> dict[str, Tag]:
         """
