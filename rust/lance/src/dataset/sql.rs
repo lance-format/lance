@@ -909,9 +909,12 @@ mod tests {
   "Plan with Metrics",
 ], StringArray
 [
-  "ProjectionExec: expr=[x@0 as x, y@1 as y], metrics=[output_rows=50, elapsed_compute=...]\n  CooperativeExec, metrics=[]\n    LanceRead: uri=test_sql_dataset/data, projection=[x, y], num_fragments=..., range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=y >= Int32(100), refine_filter=y >= Int32(100), metrics=[output_rows=..., elapsed_compute=..., fragments_scanned=..., ranges_scanned=..., rows_scanned=..., bytes_read=..., iops=..., requests=..., task_wait_time=...]\n",
+  "ProjectionExec: expr=[x@0 as x, y@1 as y], metrics=[output_rows=50, elapsed_compute=...]\n  CooperativeExec, metrics=[]\n    LanceRead: uri=test_sql_dataset/data, projection=[x, y], num_fragments=..., range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=y >= Int32(100), refine_filter=y >= Int32(100), metrics=[output_rows=..., elapsed_compute=..., fragments_scanned=..., ranges_scanned=..., rows_scanned=..., bytes_read=..., iops=..., requests=..., decode_time=..., task_wait_time=...]\n",
 ]], row_count: 1 }"#;
         assert_string_matches(&plan, expected_pattern).unwrap();
+        // The timers must run on the executed path, not just be registered.
+        assert!(!plan.contains("task_wait_time=0ns"), "{plan}");
+        assert!(!plan.contains("decode_time=0ns"), "{plan}");
     }
 
     #[tokio::test]
