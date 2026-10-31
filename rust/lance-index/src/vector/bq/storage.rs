@@ -576,6 +576,20 @@ impl DeepSizeOf for RabitQuantizationStorage {
 }
 
 impl RabitQuantizationStorage {
+    /// Kernel over this partition's staged rows for scoring stored rows against
+    /// each other.
+    fn code_kernel(&self) -> RQKernel<'_> {
+        // The trait methods that call this cannot return an error. Staging
+        // fails only for non-l2 storage or an old index, which IVF_HNSW_RQ
+        // creation rejects up front.
+        let (scorer, staged) = self
+            .staged_rows()
+            .expect("RQ code-to-code distance requires an l2, current-format index");
+        scorer
+            .kernel(staged, staged)
+            .expect("staged RQ rows always bind to their own scorer")
+    }
+
     /// Stage every row for code-to-code scoring on first use.
     ///
     /// Only l2 is supported: the scorer needs the partition centroid for dot,
@@ -1006,11 +1020,16 @@ struct CodeAnchor<'a> {
     num_rows: usize,
 }
 
+/// Distance between two stored rows, `anchor` first.
+fn pair_distance(kernel: &RQKernel<'_>, anchor: usize, row: usize) -> f32 {
+    let mut dist = [0.0];
+    kernel.distances(anchor, row..row + 1, &mut dist);
+    dist[0]
+}
+
 impl CodeAnchor<'_> {
     fn distance(&self, id: usize) -> f32 {
-        let mut dist = [0.0];
-        self.kernel.distances(self.row, id..id + 1, &mut dist);
-        dist[0]
+        pair_distance(&self.kernel, self.row, id)
     }
 
     fn distance_all(&self, dists: &mut Vec<f32>) {
@@ -2444,23 +2463,33 @@ impl VectorStore for RabitQuantizationStorage {
     }
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
-        // The trait cannot return an error. Staging fails only for non-l2
-        // storage or an old index, which IVF_HNSW_RQ creation rejects up front.
-        let (scorer, staged) = self
-            .staged_rows()
-            .expect("RQ code-to-code distance requires an l2, current-format index");
-        let kernel = scorer
-            .kernel(staged, staged)
-            .expect("staged RQ rows always bind to their own scorer");
         RabitDistCalculator::anchored(
             self.code_dim(),
             self.metadata.num_bits,
             CodeAnchor {
-                kernel,
+                kernel: self.code_kernel(),
                 row: id as usize,
                 num_rows: self.len(),
             },
         )
+    }
+
+    // HNSW calls these on every neighbor selection, so bind the kernel once per
+    // call instead of building a calculator for every candidate.
+    fn dist_between(&self, u: u32, v: u32) -> f32 {
+        pair_distance(&self.code_kernel(), u as usize, v as usize)
+    }
+
+    fn prefers_candidate(&self, candidate: &OrderedNode, selected: &[OrderedNode]) -> bool {
+        let kernel = self.code_kernel();
+        selected.iter().all(|other| {
+            candidate.dist
+                < OrderedFloat(pair_distance(
+                    &kernel,
+                    candidate.id as usize,
+                    other.id as usize,
+                ))
+        })
     }
 }
 
@@ -5369,7 +5398,26 @@ mod tests {
             }
             assert_eq!(calc.distance(u as u32), 0.0);
         }
-        // `dist_between` is symmetric.
+        // `dist_between` is symmetric and agrees with the anchored calculator.
         assert_eq!(storage.dist_between(3, 35), storage.dist_between(35, 3));
+        assert_eq!(
+            storage.dist_between(3, 35),
+            storage.dist_calculator_from_id(3).distance(35)
+        );
+
+        // A candidate is kept only while it is closer to the anchor than to every
+        // selected neighbor.
+        let candidate = 5u32;
+        let selected: Vec<OrderedNode> = [2u32, 20, 33]
+            .into_iter()
+            .map(|id| OrderedNode::new(id, OrderedFloat(storage.dist_between(0, id))))
+            .collect();
+        for threshold in [0.0, f32::MAX] {
+            let node = OrderedNode::new(candidate, OrderedFloat(threshold));
+            let expected = selected
+                .iter()
+                .all(|other| threshold < storage.dist_between(candidate, other.id));
+            assert_eq!(storage.prefers_candidate(&node, &selected), expected);
+        }
     }
 }

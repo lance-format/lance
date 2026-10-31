@@ -341,8 +341,7 @@ pub(crate) fn column_values<'a, T: ArrowPrimitiveType>(
     batch: &'a RecordBatch,
     name: &str,
 ) -> Result<&'a [T::Native]> {
-    Ok(batch
-        .column_by_name(name)
+    Ok(column(batch, name)
         .and_then(|column| column.as_primitive_opt::<T>())
         .ok_or_else(|| {
             Error::internal(format!(
@@ -353,13 +352,20 @@ pub(crate) fn column_values<'a, T: ArrowPrimitiveType>(
         .values())
 }
 
+/// [`RecordBatch::column_by_name`] without cloning the schema `Arc`. Kernel
+/// binding looks up a dozen columns per call, and the atomic refcount traffic
+/// on one shared schema serialized multi-threaded HNSW builds.
+fn column<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a ArrayRef> {
+    let index = batch.schema_ref().index_of(name).ok()?;
+    Some(batch.column(index))
+}
+
 /// Flattened values of a fixed-size-list staged column.
 pub(crate) fn list_values<'a, T: ArrowPrimitiveType>(
     batch: &'a RecordBatch,
     name: &str,
 ) -> Result<&'a [T::Native]> {
-    Ok(batch
-        .column_by_name(name)
+    Ok(column(batch, name)
         .and_then(|column| column.as_fixed_size_list_opt())
         .and_then(|list| list.values().as_primitive_opt::<T>())
         .ok_or_else(|| {
