@@ -89,6 +89,9 @@ pub enum IndexType {
     IvfHnswPq = 105,
     IvfHnswFlat = 106,
     IvfRq = 107,
+    IvfVamanaFlat = 108,
+    IvfVamanaSq = 109,
+    IvfVamanaPq = 110,
 }
 
 impl std::fmt::Display for IndexType {
@@ -113,6 +116,9 @@ impl std::fmt::Display for IndexType {
             Self::IvfHnswPq => write!(f, "IVF_HNSW_PQ"),
             Self::IvfHnswFlat => write!(f, "IVF_HNSW_FLAT"),
             Self::IvfRq => write!(f, "IVF_RQ"),
+            Self::IvfVamanaFlat => write!(f, "IVF_VAMANA_FLAT"),
+            Self::IvfVamanaSq => write!(f, "IVF_VAMANA_SQ"),
+            Self::IvfVamanaPq => write!(f, "IVF_VAMANA_PQ"),
         }
     }
 }
@@ -143,6 +149,9 @@ impl TryFrom<i32> for IndexType {
             v if v == Self::IvfHnswPq as i32 => Ok(Self::IvfHnswPq),
             v if v == Self::IvfHnswFlat as i32 => Ok(Self::IvfHnswFlat),
             v if v == Self::IvfRq as i32 => Ok(Self::IvfRq),
+            v if v == Self::IvfVamanaFlat as i32 => Ok(Self::IvfVamanaFlat),
+            v if v == Self::IvfVamanaSq as i32 => Ok(Self::IvfVamanaSq),
+            v if v == Self::IvfVamanaPq as i32 => Ok(Self::IvfVamanaPq),
             _ => Err(Error::invalid_input_source(
                 format!("the input value {} is not a valid IndexType", value).into(),
             )),
@@ -173,6 +182,9 @@ impl TryFrom<&str> for IndexType {
             "IVF_HNSW_FLAT" => Ok(Self::IvfHnswFlat),
             "IVF_HNSW_SQ" => Ok(Self::IvfHnswSq),
             "IVF_HNSW_PQ" => Ok(Self::IvfHnswPq),
+            "IVF_VAMANA_FLAT" => Ok(Self::IvfVamanaFlat),
+            "IVF_VAMANA_SQ" => Ok(Self::IvfVamanaSq),
+            "IVF_VAMANA_PQ" => Ok(Self::IvfVamanaPq),
             "FragmentReuse" => Ok(Self::FragmentReuse),
             "MemWal" => Ok(Self::MemWal),
             _ => Err(Error::invalid_input(format!(
@@ -212,6 +224,9 @@ impl IndexType {
                 | Self::IvfFlat
                 | Self::IvfSq
                 | Self::IvfRq
+                | Self::IvfVamanaFlat
+                | Self::IvfVamanaSq
+                | Self::IvfVamanaPq
         )
     }
 
@@ -254,6 +269,7 @@ impl IndexType {
             | Self::IvfHnswPq
             | Self::IvfHnswFlat => 1,
             Self::IvfRq => 2,
+            Self::IvfVamanaFlat | Self::IvfVamanaSq | Self::IvfVamanaPq => 4,
         }
     }
 
@@ -273,6 +289,7 @@ impl IndexType {
             Self::IvfHnswFlat => 1 << 20,
             Self::IvfHnswSq => 1 << 20,
             Self::IvfHnswPq => 1 << 20,
+            Self::IvfVamanaFlat | Self::IvfVamanaSq | Self::IvfVamanaPq => 1 << 20,
             _ => 8192,
         }
     }
@@ -288,6 +305,9 @@ impl IndexType {
             Self::IvfHnswPq,
             Self::IvfHnswFlat,
             Self::IvfRq,
+            Self::IvfVamanaFlat,
+            Self::IvfVamanaSq,
+            Self::IvfVamanaPq,
         ]
         .into_iter()
         .map(|index_type| index_type.version() as u32)
@@ -317,7 +337,10 @@ impl IndexType {
             | Self::IvfHnswSq
             | Self::IvfHnswPq
             | Self::IvfHnswFlat
-            | Self::IvfRq => url.ends_with("VectorIndexDetails"),
+            | Self::IvfRq
+            | Self::IvfVamanaFlat
+            | Self::IvfVamanaSq
+            | Self::IvfVamanaPq => url.ends_with("VectorIndexDetails"),
         }
     }
 }

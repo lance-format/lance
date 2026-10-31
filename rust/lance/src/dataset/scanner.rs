@@ -86,6 +86,7 @@ use lance_index::scalar::inverted::{
 };
 use lance_index::scalar::minhash_lsh::{MinHashLshIndexParams, MinHashQuery};
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
+use lance_index::vector::vamana::AdaptiveStop;
 use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, ProbeParams, Query};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
@@ -2508,6 +2509,7 @@ impl Scanner {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            adaptive_stop: None,
         });
         self.nearest_query_count = query_count;
         self.is_batch_nearest = is_batch_nearest;
@@ -2643,6 +2645,43 @@ impl Scanner {
             log::warn!("ef is not set because nearest has not been called yet");
         }
         self
+    }
+
+    /// Stop each IVF_VAMANA_* walk once none of its unexpanded candidates is
+    /// among the `k` nearest or nearer than `1 + margin` times the length to
+    /// the `k`-th: adaptive beam search, where a query whose neighbors stand
+    /// clear stops soon after finding them and a crowded one walks further.
+    ///
+    /// The margin is a finite fraction of at least zero; at zero a walk
+    /// expands its `k` nearest and stops. [`Self::ef`] stays the most
+    /// candidates a walk keeps and becomes a cap: unset, it gives a list a
+    /// margin can only cut short, so set it to a length no walk reaches, such
+    /// as 2048, for the margin to decide where each walk stops. Under a filter
+    /// or a distance range, a walk the margin leaves without enough rows is
+    /// walked again without it, up to that cap. Other index types ignore the
+    /// margin. Call [`Self::nearest`] first; calling it again clears the
+    /// margin.
+    ///
+    /// ```
+    /// # use arrow_array::Float32Array;
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset, vector: &Float32Array) -> Result<()> {
+    /// let mut scanner = dataset.scan();
+    /// scanner.nearest("vector", vector, 10)?.ef(2048).stop_margin(0.05)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn stop_margin(&mut self, margin: f32) -> Result<&mut Self> {
+        let query = self.nearest.as_mut().ok_or_else(|| {
+            Error::invalid_input("stop_margin requires nearest to be called first")
+        })?;
+        let stop = AdaptiveStop {
+            margin,
+            rank: query.k,
+        };
+        stop.validate(query.k)?;
+        query.adaptive_stop = Some(stop);
+        Ok(self)
     }
 
     /// Only search indexed data, skipping flat fallback (default: false).
@@ -3486,6 +3525,11 @@ impl Scanner {
         }
         if let Some(QueryFilter::Vector(query)) = &self.filter.query_filter {
             query.validate_search_effort()?;
+            // A filter's query is the caller's own, while a margin reaches
+            // `self.nearest` only through `stop_margin`.
+            if let Some(stop) = &query.adaptive_stop {
+                stop.validate(query.k)?;
+            }
         }
         if self.batch_readahead == 0 {
             return Err(Error::invalid_input_source(
@@ -7340,7 +7384,9 @@ impl Scanner {
                 .map(|details| {
                     let index_type =
                         crate::index::vector::details::derive_vector_index_type(details);
-                    index_type.starts_with("IVF_") && !index_type.contains("HNSW")
+                    index_type.starts_with("IVF_")
+                        && !index_type.contains("HNSW")
+                        && !index_type.contains("VAMANA")
                 })
                 .unwrap_or(false)
         });

@@ -343,6 +343,9 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             dist_q_c: 0.0,
             query_parallelism,
             approx_mode,
+            // Only the scanner reads a stop margin; this parse serves
+            // JniTestHelper.
+            adaptive_stop: None,
         };
         query.validate_search_effort()?;
         Ok(query)
@@ -466,6 +469,8 @@ pub fn get_vector_index_params(
             if let Some(hnsw_params) = hnsw_params {
                 stages.push(StageParams::Hnsw(hnsw_params));
             }
+
+            stages.extend(crate::vamana::stage(env, &vector_index_params_obj)?);
 
             // Parse PQBuildParams
             let pq_params = env.get_optional_from_method(

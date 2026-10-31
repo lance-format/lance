@@ -859,6 +859,17 @@ impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
                     )
                     .await
                 }
+                SubIndexType::Vamana => {
+                    reconstruct_typed::<lance_index::vector::vamana::Vamana, Q>(
+                        self,
+                        object_store,
+                        file_metadata_cache,
+                        index_cache,
+                        frag_reuse_index,
+                        context,
+                    )
+                    .await
+                }
             }
         })
     }
@@ -2649,6 +2660,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
             (SubIndexType::Hnsw, QuantizationType::Flat)
             | (SubIndexType::Hnsw, QuantizationType::FlatBin) => IndexType::IvfHnswFlat,
+            (SubIndexType::Vamana, quantization_type) => {
+                crate::index::vector::vamana::index_type(quantization_type)
+            }
             (sub_index_type, quantization_type) => {
                 unimplemented!(
                     "unsupported index type: {}, {}",

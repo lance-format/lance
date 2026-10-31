@@ -4345,7 +4345,10 @@ impl Dataset {
                     remapping,
                     open_context,
                 )
-                .await;
+                .await
+                .and_then(|index| {
+                    vector::vamana::wrap_for_search(self, index_meta, column, index)
+                });
         }
 
         // Fallback: in-memory cache for legacy indices.
@@ -4626,6 +4629,24 @@ impl Dataset {
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
+                    }
+
+                    "IVF_VAMANA_FLAT" | "IVF_VAMANA_SQ" | "IVF_VAMANA_PQ" => {
+                        vector::vamana::open_ivf(
+                            self,
+                            index_meta,
+                            column,
+                            index_metadata.index_type.as_str(),
+                            object_store.clone(),
+                            index_dir,
+                            uuid.to_owned(),
+                            remapping,
+                            self.metadata_cache.as_ref(),
+                            index_cache,
+                            file_sizes,
+                            open_context,
+                        )
+                        .await
                     }
 
                     _ => Err(Error::index(format!(

@@ -66,6 +66,7 @@ pub mod traits;
 mod transaction;
 mod update;
 pub mod utils;
+mod vamana;
 mod vector_trainer;
 
 pub use error::Error;
