@@ -1306,6 +1306,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     batches.extend(extra);
                     loss += extra_loss;
                 }
+                // The old graph of the partition, for Vamana to extend over the
+                // storage of these rows.
+                let sources: &[ExistingIndex] = if is_affected { &[] } else { &indices };
+                let storage_rows = batches.iter().map(RecordBatch::num_rows).sum();
+                let base =
+                    super::vamana::merge::merge_base::<S, Q>(sources, partition, storage_rows)
+                        .await?;
 
                 spawn_cpu(move || {
                     let num_rows = batches.iter().map(|b| b.num_rows()).sum::<usize>();
@@ -1323,6 +1330,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         batches,
                         column,
                         frag_reuse_index,
+                        base,
                     )?;
                     Ok(Budgeted::untracked(PartitionBuildResult {
                         partition_id: output_partition_id,
@@ -1493,6 +1501,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                                             input.batches,
                                             column,
                                             frag_reuse_index,
+                                            None,
                                         )?;
                                         Ok(Some((storage, sub_index, loss)))
                                     })
@@ -1552,13 +1561,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         batches: Vec<RecordBatch>,
         column: String,
         frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
+        base: Option<super::vamana::merge::MergeBase>,
     ) -> Result<(Q::Storage, S)> {
         let frag_reuse_index = frag_reuse_index
             .map(|index| Arc::new(CompactFragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
         let storage =
             StorageBuilder::new_with_remapper(column, distance_type, quantizer, frag_reuse_index)?
                 .build(batches)?;
-        let sub_index = S::index_vectors(&storage, sub_index_params)?;
+        let sub_index = match base {
+            Some(base) => super::vamana::merge::extend(base, &storage, sub_index_params)?,
+            None => S::index_vectors(&storage, sub_index_params)?,
+        };
 
         Ok((storage, sub_index))
     }

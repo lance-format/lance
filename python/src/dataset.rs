@@ -1615,6 +1615,10 @@ impl Dataset {
                 } else {
                     None
                 };
+            let stop_margin: Option<f32> = match nearest.get_item("stop_margin")? {
+                Some(margin) if !margin.is_none() => Some(margin.extract()?),
+                _ => None,
+            };
 
             scanner
                 .and_then(|s| {
@@ -1630,6 +1634,9 @@ impl Dataset {
                     }
                     if let Some(ef) = ef {
                         s = s.ef(ef);
+                    }
+                    if let Some(margin) = stop_margin {
+                        s = s.stop_margin(margin)?;
                     }
                     s = s.query_parallelism(query_parallelism);
                     s = s.approx_mode(approx_mode);
@@ -2665,6 +2672,7 @@ impl Dataset {
             "FM" => IndexType::Fm,
             "IVF_FLAT" | "IVF_PQ" | "IVF_SQ" | "IVF_RQ" | "IVF_HNSW_FLAT" | "IVF_HNSW_PQ"
             | "IVF_HNSW_SQ" => IndexType::Vector,
+            "IVF_VAMANA_FLAT" | "IVF_VAMANA_PQ" | "IVF_VAMANA_SQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
@@ -5444,6 +5452,13 @@ fn prepare_vector_index_params(
             sq_params,
         ))),
 
+        "IVF_VAMANA_FLAT" | "IVF_VAMANA_PQ" | "IVF_VAMANA_SQ" => {
+            crate::vamana::vector_index_params(
+                index_type, m_type, ivf_params, pq_params, sq_params, kwargs,
+            )
+            .map(Box::new)
+        }
+
         _ => Err(PyValueError::new_err(format!(
             "Index type '{index_type}' is not supported."
         ))),
@@ -5988,6 +6003,7 @@ impl PySearchFilter {
             dist_q_c: 0.0,
             approx_mode,
             search_effort,
+            adaptive_stop: None, // Vector query filters take no stop margin
         };
         vector_query
             .validate_search_effort()

@@ -4228,6 +4228,9 @@ class LanceDataset(pa.dataset.Dataset):
             "IVF_HNSW_PQ",
             "IVF_HNSW_SQ",
             "IVF_RQ",
+            "IVF_VAMANA_FLAT",
+            "IVF_VAMANA_PQ",
+            "IVF_VAMANA_SQ",
         ]
         if index_type not in valid_index_types:
             raise NotImplementedError(
@@ -4706,6 +4709,18 @@ class LanceDataset(pa.dataset.Dataset):
                 Int, the number of edges per node in the graph.
             ef_construction
                 Int, the number of nodes to examine during the construction.
+
+        Optional parameters for `IVF_VAMANA_*`, which support the l2 and cosine
+        metrics only:
+            max_degree
+                Int, the most out-edges a vertex of a partition's graph keeps.
+                Default is 64.
+            search_list_size
+                Int, the candidates each search keeps while the graph is built.
+                Default is 100.
+            alpha
+                Float of at least 1.0, the pruning slack of the second build pass.
+                Default is 1.2.
 
         Examples
         --------
@@ -7449,6 +7464,7 @@ class ScannerBuilder:
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
         search_effort: Optional[float] = None,
+        stop_margin: Optional[float] = None,
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
 
@@ -7496,6 +7512,18 @@ class ScannerBuilder:
             setting. ``fast`` favors lower latency and may reduce recall,
             ``normal`` uses the default balance, and ``accurate`` favors higher
             recall and may increase latency.
+        stop_margin: float, optional
+            Stop each walk of an IVF_VAMANA_* index once none of its unexpanded
+            candidates is among the ``k`` nearest or nearer than
+            ``1 + stop_margin`` times the length to the ``k``-th: a query whose
+            neighbors stand clear stops soon after finding them, and a crowded
+            one walks further. A finite fraction of at least zero; at zero a
+            walk expands its ``k`` nearest and stops. ``ef`` stays the most
+            candidates a walk keeps and becomes a cap, so set it to a length no
+            walk reaches, such as 2048, for the margin to decide where each walk
+            stops. Under a filter or a distance range, a walk the margin leaves
+            without enough rows is walked again without it, up to that cap.
+            Other index types ignore it. None walks each list to its end.
         """
         self._nearest = _build_vector_search_query(
             column,
@@ -7513,6 +7541,7 @@ class ScannerBuilder:
             approx_mode=approx_mode,
             search_effort=search_effort,
             distance_range=distance_range,
+            stop_margin=stop_margin,
         )
         return self
 
@@ -8853,6 +8882,7 @@ def _build_vector_search_query(
     approx_mode: Literal["fast", "normal", "accurate"] = "normal",
     distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
     search_effort: Optional[float] = None,
+    stop_margin: Optional[float] = None,
 ) -> dict:
     """Configure nearest neighbor search.
 
@@ -8886,8 +8916,9 @@ def _build_vector_search_query(
     use_index: bool, default True
         Whether to use the index for the search.
     ef: int, optional
-        Beam width for HNSW search. Defaults to ``1.5 * k * refine_factor``,
-        floored at 256.
+        Beam width for HNSW search, and the search list of an
+        ``IVF_VAMANA_*`` index's walk. For HNSW it defaults to
+        ``1.5 * k * refine_factor``, floored at 256.
     query_parallelism: int, optional
         Maximum partition-search concurrency for a single vector query.
         The default is 0. Value 0 uses the automatic policy, which currently
@@ -8915,6 +8946,10 @@ def _build_vector_search_query(
         Both bounds are optional. The lower bound is inclusive and the upper
         bound is exclusive, so (0.0, 1.0) keeps distances d where
         0.0 <= d < 1.0, (None, 0.5) keeps d < 0.5, and (0.5, None) keeps d >= 0.5.
+    stop_margin: float, optional
+        How far past its ``k``-th candidate a walk of an IVF_VAMANA_* index
+        goes on expanding, as a fraction of that candidate's length; see
+        :meth:`ScannerBuilder.nearest`. Validated by the scanner.
 
     Returns
     -------
@@ -9002,6 +9037,7 @@ def _build_vector_search_query(
         "approx_mode": approx_mode,
         "search_effort": search_effort,
         "distance_range": distance_range,
+        "stop_margin": stop_margin,
     }
 
 

@@ -45,6 +45,8 @@ pub const INDEX_METADATA_SCHEMA_KEY: &str = "lance:index";
 pub const VECTOR_INDEX_VERSION: u32 = 1;
 /// Version for IVF_RQ indices.
 pub const IVF_RQ_INDEX_VERSION: u32 = 2;
+/// Version for IVF_VAMANA_* indices.
+pub const IVF_VAMANA_INDEX_VERSION: u32 = 4;
 
 /// The factor of threshold to trigger split / join for vector index.
 ///
@@ -104,8 +106,20 @@ mod tests {
     }
 
     #[test]
+    fn test_ivf_vamana_has_dedicated_index_version() {
+        for index_type in [
+            IndexType::IvfVamanaFlat,
+            IndexType::IvfVamanaSq,
+            IndexType::IvfVamanaPq,
+        ] {
+            assert!(index_type.version() > IndexType::IvfRq.version());
+            assert_eq!(index_type.version() as u32, IVF_VAMANA_INDEX_VERSION);
+        }
+    }
+
+    #[test]
     fn test_max_vector_version_tracks_highest_supported() {
-        assert_eq!(IndexType::max_vector_version(), IVF_RQ_INDEX_VERSION);
+        assert_eq!(IndexType::max_vector_version(), IVF_VAMANA_INDEX_VERSION);
     }
 
     #[test]
@@ -137,6 +151,9 @@ mod tests {
             IndexType::IvfHnswPq,
             IndexType::IvfHnswFlat,
             IndexType::IvfRq,
+            IndexType::IvfVamanaFlat,
+            IndexType::IvfVamanaSq,
+            IndexType::IvfVamanaPq,
         ];
 
         for index_type in all {
@@ -184,6 +201,9 @@ mod tests {
             ("IVF_HNSW_FLAT", IndexType::IvfHnswFlat),
             ("IVF_HNSW_SQ", IndexType::IvfHnswSq),
             ("IVF_HNSW_PQ", IndexType::IvfHnswPq),
+            ("IVF_VAMANA_FLAT", IndexType::IvfVamanaFlat),
+            ("IVF_VAMANA_SQ", IndexType::IvfVamanaSq),
+            ("IVF_VAMANA_PQ", IndexType::IvfVamanaPq),
             ("FragmentReuse", IndexType::FragmentReuse),
             ("MemWal", IndexType::MemWal),
         ];
