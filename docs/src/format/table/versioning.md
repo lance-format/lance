@@ -41,9 +41,41 @@ they should return an "unsupported" error on any read or write operation.
 | `2^15`   | `FLAG_NON_REUSABLE_FIELD_IDS`    | No              | Yes             | The manifest sets `max_allocated_field_id`, and a writer must assign new field IDs above it. Before activation, all clients that can write to the dataset must enforce writer feature flags. See [Field IDs](schema.md#field-ids). |
 | `2^16`   | `FLAG_ZONE_WRITE_SEEDS`         | Yes             | Yes             | Referenced data files contain version 1 [zone write seeds](../index/scalar/zone_write_seeds.md). Both bits remain set in derived snapshots, including clone and restore. Reserved and unsupported until implemented. |
 | `2^17`   | `FLAG_OBJECT_METADATA`         | No              | Yes             | The snapshot contains [clustering definitions, references, or a nonzero allocation high-water mark](clustering.md), nonempty [fragment metadata](index.md#fragment-metadata), or nonempty [index segment metadata](../index/index.md#index-segment-metadata). Reserved, unsupported until writers implement the maintenance rules. Readers may ignore this metadata. |
+| `2^20`   | `FLAG_VERSIONED_INVERTED_INDEX` | No              | Yes             | The index section contains an inverted index with declared index version 3 or later. Writers must preserve unsupported index segments or refuse the operation. See [Versioned inverted indices](#versioned-inverted-indices). Reserved and unsupported until implemented. |
 
 </div>
 
-Bits 16 and 17 are reserved but remain unsupported. Bits at positions 18 and above are unknown. Unknown or unsupported flags cause implementations to reject the corresponding read or write operation with an "unsupported" error. The paired mixed-version, Managed Blob, and zone write-seed reader and writer bits must each either both be set or both be clear; a half-set manifest is invalid.
+Bits 16 and 17 are reserved but remain unsupported. Bit 20 is reserved and remains unsupported until its writer contract is implemented. Bits 18, 19, and positions 21 and above are unknown. Unknown or unsupported flags cause implementations to reject the corresponding read or write operation with an "unsupported" error. The paired mixed-version, Managed Blob, and zone write-seed reader and writer bits must each either both be set or both be clear; a half-set manifest is invalid.
 
 Committing schema metadata `lance.blob.managed = "true"` activates the Managed Blob capability, even without new blob files. Ordinary Blob v2 writes without this opt-in do not activate it. Once activated, removing the opt-in, removing Blob fields, or restoring an older snapshot does not clear it. Before activation, all maintenance clients must support Managed Blobs: the flag cannot revoke old handles or prevent older clients from running cleanup through an unflagged historical snapshot. See [client compatibility](../../guide/blob.md#managed-objects-and-client-compatibility).
+
+## Versioned Inverted Indices
+
+A writer implementing this capability must set `FLAG_VERSIONED_INVERTED_INDEX` in `writer_feature_flags`
+whenever the index section contains a segment whose `index_details` identifies
+`lance.table.InvertedIndexDetails` and whose `IndexMetadata.index_version` is at
+least 3. The index type is identified using the existing case-insensitive type
+URL convention. This condition uses the declared index version, not
+`InvertedIndexDetails.posting_format_version`, and does not apply to other index
+types with the same version number.
+
+The bit must be published atomically with the affected index metadata. Every
+operation that publishes a manifest, including append, index maintenance,
+clone, and restore, must derive the requirement from the complete index
+section being committed, including segments it cannot use for queries.
+Unsupported segments must not be omitted merely because the writer cannot
+decode them. A writer that cannot preserve them correctly must refuse the
+operation. An explicit index drop, replacement, or restore may remove segments;
+the bit may be cleared only when the complete resulting index section contains
+no affected segment.
+
+This is a writer-only capability. It must not be set in `reader_feature_flags`;
+it does not change index encodings or grant a reader support for an otherwise
+unsupported index version. Ordinary reads remain subject to the existing
+reader flags and index-version checks. Even a client that can read index
+version 3 must refuse writes if it does not recognize this writer flag.
+
+The flag does not retroactively protect existing unflagged snapshots or revoke
+old client handles. Before publishing protected snapshots, deployments must
+upgrade or stop all writers that do not enforce this capability, including
+long-lived writers opened before activation. Readers may be upgraded separately.
