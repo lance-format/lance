@@ -5585,7 +5585,14 @@ class LanceDataset(pa.dataset.Dataset):
     def get_transactions(self, recent_transactions=10) -> List[Optional[Transaction]]:
         return self._ds.get_transactions(recent_transactions)
 
-    def sql(self, sql: str) -> "SqlQueryBuilder":
+    def sql(
+        self,
+        sql: str,
+        *,
+        parameters: Optional[
+            Union[Sequence[Any], Dict[str, Any], pa.RecordBatch]
+        ] = None,
+    ) -> "SqlQueryBuilder":
         """Execute SQL query on the dataset.
 
         Parameters
@@ -5593,6 +5600,9 @@ class LanceDataset(pa.dataset.Dataset):
         sql : str
             SQL SELECT statement to execute. The query must reference the dataset
             as the FROM clause or omit the FROM clause to query the current dataset.
+        parameters : sequence, dict, or pyarrow.RecordBatch, optional
+            Values to bind to SQL placeholders. See
+            :meth:`SqlQueryBuilder.parameters` for supported forms.
 
         Returns
         -------
@@ -5609,7 +5619,10 @@ class LanceDataset(pa.dataset.Dataset):
             query.to_batch_records()
 
         """
-        return SqlQueryBuilder(self._ds.sql(sql))
+        builder = SqlQueryBuilder(self._ds.sql(sql))
+        if parameters is not None:
+            builder.parameters(parameters)
+        return builder
 
     def delta(
         self,
@@ -6110,6 +6123,40 @@ class SqlQueryBuilder:
 
     def __init__(self, builder):
         self._builder = builder
+
+    def parameters(
+        self, parameters: Union[Sequence[Any], Dict[str, Any], pa.RecordBatch]
+    ) -> "SqlQueryBuilder":
+        """
+        Bind values to SQL placeholders without interpolating SQL text.
+
+        Parameters
+        ----------
+        parameters: sequence, dict, or pyarrow.RecordBatch
+            A sequence binds ``$1``, ``$2``, etc. A dict binds ``$name`` using
+            keys without the ``$`` prefix. Values may be Python scalars,
+            including ``None``, or PyArrow scalars for explicit Arrow types.
+            A RecordBatch must have exactly one row; its column names bind
+            named placeholders, also without the ``$`` prefix.
+
+            Calling this method again replaces the previous bindings. Missing
+            bindings and incompatible types raise an error during execution.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            query = dataset.sql(
+                "SELECT * FROM dataset WHERE id = $1", parameters=[42]
+            ).build()
+            query.to_batch_records()
+
+            query = dataset.sql(
+                "SELECT * FROM dataset WHERE name = $name"
+            ).parameters({"name": "O'Reilly"}).build()
+        """
+        self._builder = self._builder.parameters(parameters)
+        return self
 
     def table_name(self, table_name: str) -> "SqlQueryBuilder":
         """

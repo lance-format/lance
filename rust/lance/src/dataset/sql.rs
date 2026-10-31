@@ -6,7 +6,7 @@ use crate::datafusion::LanceTableProvider;
 use crate::dataset::scanner::validate_batch_size;
 use crate::dataset::utils::SchemaAdapter;
 use arrow_array::RecordBatch;
-use datafusion::common::DataFusionError;
+use datafusion::common::{DataFusionError, ParamValues};
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{Expr as LogicalExpr, LogicalPlan};
@@ -47,6 +47,9 @@ pub struct SqlQueryBuilder {
 
     /// Override the approximate maximum bytes in each scan batch.
     pub(crate) batch_size_bytes: Option<u64>,
+
+    /// Values to bind to SQL placeholders, or None to leave them unbound.
+    pub(crate) parameters: Option<Arc<ParamValues>>,
 }
 
 impl SqlQueryBuilder {
@@ -60,6 +63,7 @@ impl SqlQueryBuilder {
             blob_handling: None,
             batch_size: None,
             batch_size_bytes: None,
+            parameters: None,
         }
     }
 
@@ -123,6 +127,27 @@ impl SqlQueryBuilder {
         self
     }
 
+    /// Bind values to SQL placeholders before query optimization and execution.
+    ///
+    /// A vector binds positional placeholders (`$1`, `$2`, ...). A map binds
+    /// named placeholders (`$name`), with keys that omit the `$` prefix.
+    /// Calling this again replaces the previous bindings.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use datafusion::common::ScalarValue;
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let query = dataset.sql("SELECT * FROM dataset WHERE id = $1")
+    ///     .with_parameters(vec![ScalarValue::from(42i64)])
+    ///     .build().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_parameters(mut self, parameters: impl Into<ParamValues>) -> Self {
+        self.parameters = Some(Arc::new(parameters.into()));
+        self
+    }
+
     pub async fn build(self) -> lance_core::Result<SqlQuery> {
         if let Some(batch_size) = self.batch_size {
             validate_batch_size(batch_size)?;
@@ -165,6 +190,12 @@ impl SqlQueryBuilder {
             // fails to plan (e.g. another expression aliased to a system
             // column name), so the query still runs without the extra columns.
             state.statement_to_plan(projected).await.unwrap_or(plan)
+        } else {
+            plan
+        };
+        let plan = if let Some(parameters) = self.parameters {
+            plan.with_param_values(Arc::unwrap_or_clone(parameters))
+                .map_err(planning_error)?
         } else {
             plan
         };
@@ -373,7 +404,7 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field};
-    use datafusion::common::DataFusionError;
+    use datafusion::common::{DataFusionError, ParamValues, ScalarValue};
     use lance_arrow::json::ARROW_JSON_EXT_NAME;
     use lance_arrow::{ARROW_EXT_NAME_KEY, SchemaExt};
     use lance_core::datatypes::BlobHandling;
@@ -432,6 +463,102 @@ mod tests {
         pretty_assertions::assert_eq!(results.num_columns(), 4);
         assert_true!(results.column(2).as_primitive::<UInt64Type>().value(0) > 100);
         assert_true!(results.column(3).as_primitive::<UInt64Type>().value(0) > 100);
+    }
+
+    #[rstest]
+    #[case::positional(
+        "SELECT x FROM dataset WHERE x >= $1 AND x < $2 ORDER BY x",
+        vec![ScalarValue::from(1i32), ScalarValue::from(3i32)].into(),
+        vec![1, 2]
+    )]
+    #[case::named_repeated(
+        "SELECT x FROM dataset WHERE x = $value OR x = $value ORDER BY x",
+        vec![("value", ScalarValue::from(2i32))].into(),
+        vec![2]
+    )]
+    #[case::aggregate(
+        "SELECT CAST(COUNT(*) AS INT) AS x FROM dataset WHERE x = $1",
+        vec![ScalarValue::from(2i32)].into(),
+        vec![1]
+    )]
+    #[case::limit(
+        "SELECT x FROM dataset ORDER BY x LIMIT $1",
+        vec![ScalarValue::from(2i64)].into(),
+        vec![0, 1]
+    )]
+    #[case::subquery(
+        "SELECT x FROM dataset WHERE x IN (SELECT x FROM dataset WHERE x = $value)",
+        vec![("value", ScalarValue::from(2i32))].into(),
+        vec![2]
+    )]
+    #[case::null(
+        "SELECT x FROM dataset WHERE $1 IS NULL ORDER BY x",
+        vec![ScalarValue::Null].into(),
+        vec![0, 1, 2, 3]
+    )]
+    #[tokio::test]
+    async fn test_sql_parameters(
+        #[case] sql: &str,
+        #[case] parameters: ParamValues,
+        #[case] expected: Vec<i32>,
+    ) {
+        let ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_dataset(
+                "memory://",
+                FragmentCount::from(2),
+                FragmentRowCount::from(2),
+            )
+            .await
+            .unwrap();
+        let batches = ds
+            .sql(sql)
+            .with_parameters(parameters)
+            .with_row_id(true)
+            .with_row_addr(true)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let actual: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch["x"]
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn test_sql_missing_parameter() {
+        let ds = gen_batch()
+            .col("x", array::step::<Int32Type>())
+            .into_dataset(
+                "memory://",
+                FragmentCount::from(1),
+                FragmentRowCount::from(1),
+            )
+            .await
+            .unwrap();
+        let error = ds
+            .sql("SELECT x FROM dataset WHERE x = $1")
+            .with_parameters(Vec::<ScalarValue>::new())
+            .build()
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("No value found for placeholder with id $1")
+        );
     }
 
     /// Requested system columns are appended after the user's columns when
