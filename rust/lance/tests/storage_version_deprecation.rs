@@ -70,7 +70,6 @@ async fn legacy_create_warns_append_does_not() {
         1,
         "expected exactly one legacy warning on create, got {after_create:?}"
     );
-    println!("WARNING TEXT: {}", after_create[0]);
 
     LOGS.get().unwrap().lock().unwrap().clear();
     Dataset::write(
