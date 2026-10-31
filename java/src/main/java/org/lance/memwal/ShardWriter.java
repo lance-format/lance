@@ -65,9 +65,11 @@ public class ShardWriter implements Closeable {
   public static ShardWriter create(Dataset dataset, String shardId, ShardWriterConfig config) {
     Preconditions.checkNotNull(dataset, "dataset must not be null");
     Preconditions.checkNotNull(shardId, "shardId must not be null");
-    ShardWriter writer = createNative(dataset, shardId, config);
-    writer.allocator = dataset.allocator();
-    return writer;
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      ShardWriter writer = createNative(dataset, shardId, config);
+      writer.allocator = dataset.allocator();
+      return writer;
+    }
   }
 
   static native ShardWriter createNative(Dataset dataset, String shardId, ShardWriterConfig config);

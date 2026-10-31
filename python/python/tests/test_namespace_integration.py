@@ -56,9 +56,11 @@ from lance_namespace import (
     ListTableVersionsRequest,
     ListTableVersionsResponse,
     NamespaceExistsRequest,
+    NamespaceExistsResponse,
     RegisterTableRequest,
     RegisterTableResponse,
     TableExistsRequest,
+    TableExistsResponse,
 )
 
 
@@ -86,7 +88,9 @@ class CustomNamespace(LanceNamespace):
     ) -> DescribeNamespaceResponse:
         return self._inner.describe_namespace(request)
 
-    def namespace_exists(self, request: NamespaceExistsRequest) -> None:
+    def namespace_exists(
+        self, request: NamespaceExistsRequest
+    ) -> NamespaceExistsResponse:
         return self._inner.namespace_exists(request)
 
     def drop_namespace(self, request: DropNamespaceRequest) -> DropNamespaceResponse:
@@ -106,7 +110,7 @@ class CustomNamespace(LanceNamespace):
     def describe_table(self, request: DescribeTableRequest) -> DescribeTableResponse:
         return self._inner.describe_table(request)
 
-    def table_exists(self, request: TableExistsRequest) -> None:
+    def table_exists(self, request: TableExistsRequest) -> TableExistsResponse:
         return self._inner.table_exists(request)
 
     def drop_table(self, request: DropTableRequest) -> DropTableResponse:
@@ -256,6 +260,8 @@ def create_tracking_namespace(
 
     inner_ns_client = DirectoryNamespace(**dir_props)
     ns_client = _wrap_if_custom(inner_ns_client, use_custom)
+    # Table operations require their parent namespace to exist.
+    ns_client.create_namespace(CreateNamespaceRequest(id=["test_ns"], mode="ExistOk"))
     return ns_client, inner_ns_client
 
 
@@ -1113,6 +1119,9 @@ def test_basic_create_and_drop_on_s3(s3_bucket: str, use_custom: bool):
     dir_props["root"] = f"s3://{s3_bucket}/{test_prefix}"
     inner_ns_client = DirectoryNamespace(**dir_props)
     ns_client = _wrap_if_custom(inner_ns_client, use_custom)
+
+    # createTable requires the parent namespace to exist.
+    ns_client.create_namespace(CreateNamespaceRequest(id=["test_ns"]))
 
     table_name = "basic_test_table"
     table_data = create_test_table_data()

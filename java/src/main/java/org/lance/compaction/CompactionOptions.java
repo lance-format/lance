@@ -13,6 +13,8 @@
  */
 package org.lance.compaction;
 
+import org.lance.DataStorageVersion;
+
 import com.google.common.base.MoreObjects;
 
 import java.io.IOException;
@@ -20,6 +22,9 @@ import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.OptionalDataException;
 import java.io.Serializable;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 
 /**
@@ -47,6 +52,8 @@ public class CompactionOptions implements Serializable {
   private Optional<Long> maxSourceFragments;
   private Optional<Long> maxSourceRows;
   private Optional<Long> maxSourceBytes;
+  private List<Long> excludedFragmentIds;
+  private Optional<DataStorageVersion> dataStorageVersion;
 
   private CompactionOptions(
       Optional<Long> targetRowsPerFragment,
@@ -61,7 +68,9 @@ public class CompactionOptions implements Serializable {
       Optional<Long> binaryCopyReadBatchBytes,
       Optional<Long> maxSourceFragments,
       Optional<Long> maxSourceRows,
-      Optional<Long> maxSourceBytes) {
+      Optional<Long> maxSourceBytes,
+      List<Long> excludedFragmentIds,
+      Optional<String> dataStorageVersion) {
     this.targetRowsPerFragment = targetRowsPerFragment;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
@@ -75,6 +84,8 @@ public class CompactionOptions implements Serializable {
     this.maxSourceFragments = maxSourceFragments;
     this.maxSourceRows = maxSourceRows;
     this.maxSourceBytes = maxSourceBytes;
+    this.excludedFragmentIds = List.copyOf(excludedFragmentIds);
+    this.dataStorageVersion = dataStorageVersion.map(DataStorageVersion::fromRustString);
   }
 
   public Optional<Boolean> getDeferIndexRemap() {
@@ -100,6 +111,15 @@ public class CompactionOptions implements Serializable {
 
   public Optional<Long> getMaxSourceBytes() {
     return maxSourceBytes;
+  }
+
+  public List<Long> getExcludedFragmentIds() {
+    return excludedFragmentIds;
+  }
+
+  /** Returns the version selector as its string value for the native layer. */
+  public Optional<String> getDataStorageVersion() {
+    return dataStorageVersion.map(DataStorageVersion::toRustString);
   }
 
   public Optional<Boolean> getMaterializeDeletions() {
@@ -150,6 +170,8 @@ public class CompactionOptions implements Serializable {
         .add("maxSourceFragments", maxSourceFragments.orElse(null))
         .add("maxSourceRows", maxSourceRows.orElse(null))
         .add("maxSourceBytes", maxSourceBytes.orElse(null))
+        .add("excludedFragmentIds", excludedFragmentIds)
+        .add("dataStorageVersion", dataStorageVersion.orElse(null))
         .toString();
   }
 
@@ -167,6 +189,8 @@ public class CompactionOptions implements Serializable {
     output.writeObject(maxSourceFragments.orElse(null));
     output.writeObject(maxSourceRows.orElse(null));
     output.writeObject(maxSourceBytes.orElse(null));
+    output.writeObject(excludedFragmentIds);
+    output.writeObject(getDataStorageVersion().orElse(null));
   }
 
   private void readObject(ObjectInputStream input) throws IOException, ClassNotFoundException {
@@ -192,6 +216,8 @@ public class CompactionOptions implements Serializable {
     this.maxSourceFragments = Optional.ofNullable((Long) input.readObject());
     this.maxSourceRows = readTrailingLong(input);
     this.maxSourceBytes = readTrailingLong(input);
+    this.excludedFragmentIds = readTrailingLongList(input);
+    this.dataStorageVersion = readTrailingString(input).map(DataStorageVersion::fromRustString);
   }
 
   /**
@@ -203,6 +229,32 @@ public class CompactionOptions implements Serializable {
       throws IOException, ClassNotFoundException {
     try {
       return Optional.ofNullable((Long) input.readObject());
+    } catch (OptionalDataException e) {
+      if (!e.eof) {
+        throw e;
+      }
+      return Optional.empty();
+    }
+  }
+
+  @SuppressWarnings("unchecked")
+  private static List<Long> readTrailingLongList(ObjectInputStream input)
+      throws IOException, ClassNotFoundException {
+    try {
+      List<Long> fragmentIds = (List<Long>) input.readObject();
+      return fragmentIds == null ? Collections.emptyList() : List.copyOf(fragmentIds);
+    } catch (OptionalDataException e) {
+      if (!e.eof) {
+        throw e;
+      }
+      return Collections.emptyList();
+    }
+  }
+
+  private static Optional<String> readTrailingString(ObjectInputStream input)
+      throws IOException, ClassNotFoundException {
+    try {
+      return Optional.ofNullable((String) input.readObject());
     } catch (OptionalDataException e) {
       if (!e.eof) {
         throw e;
@@ -226,6 +278,8 @@ public class CompactionOptions implements Serializable {
     private Optional<Long> maxSourceFragments = Optional.empty();
     private Optional<Long> maxSourceRows = Optional.empty();
     private Optional<Long> maxSourceBytes = Optional.empty();
+    private List<Long> excludedFragmentIds = Collections.emptyList();
+    private Optional<DataStorageVersion> dataStorageVersion = Optional.empty();
 
     private Builder() {}
 
@@ -318,6 +372,37 @@ public class CompactionOptions implements Serializable {
     }
 
     /**
+     * Select the output data file version without changing the dataset's default write version.
+     * Omission uses the compaction config target when set, otherwise the dataset default. The
+     * planner resolves release selectors before distributing tasks. V1/V2 cross-family targets are
+     * rejected by the engine.
+     */
+    public Builder withDataStorageVersion(DataStorageVersion version) {
+      this.dataStorageVersion = Optional.of(Objects.requireNonNull(version, "version"));
+      return this;
+    }
+
+    /**
+     * Fragment IDs to exclude from compaction planning. Excluded fragments remain unchanged and act
+     * as boundaries, so fragments on opposite sides are not combined into the same task. Duplicate
+     * and unknown IDs are ignored.
+     *
+     * @throws IllegalArgumentException if an ID is negative or exceeds the unsigned 32-bit range
+     */
+    public Builder withExcludedFragmentIds(List<Long> excludedFragmentIds) {
+      Objects.requireNonNull(excludedFragmentIds, "excludedFragmentIds");
+      for (Long fragmentId : excludedFragmentIds) {
+        if (fragmentId == null || fragmentId < 0 || fragmentId > 0xFFFF_FFFFL) {
+          throw new IllegalArgumentException(
+              "excludedFragmentIds must contain values between 0 and 4294967295, got "
+                  + fragmentId);
+        }
+      }
+      this.excludedFragmentIds = List.copyOf(excludedFragmentIds);
+      return this;
+    }
+
+    /**
      * A max source budget of zero admits no work and a negative value would wrap around to an
      * effectively unlimited budget on the Rust side, so both are rejected here. Leave the option
      * unset for no limit.
@@ -344,7 +429,9 @@ public class CompactionOptions implements Serializable {
           binaryCopyReadBatchBytes,
           maxSourceFragments,
           maxSourceRows,
-          maxSourceBytes);
+          maxSourceBytes,
+          excludedFragmentIds,
+          dataStorageVersion.map(DataStorageVersion::toRustString));
     }
   }
 }

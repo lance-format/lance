@@ -378,6 +378,39 @@ public class SessionTest {
   }
 
   @Test
+  void testCheckedOutDatasetsShareInternalSession(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("dataset_checkout_session").toString();
+
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      try (Dataset source = Dataset.open().allocator(allocator).uri(datasetPath).build()) {
+        source.tags().create("version-one", Ref.ofMain(1));
+        Session sourceSession = source.session();
+
+        try (Dataset byVersion = source.checkoutVersion(1);
+            Dataset byTag = source.checkoutTag("version-one");
+            Dataset byRef = source.checkout(Ref.ofMain(1))) {
+          assertNotNull(byVersion.session());
+          assertNotNull(byTag.session());
+          assertNotNull(byRef.session());
+          assertTrue(byVersion.session().isSameAs(sourceSession));
+          assertTrue(byTag.session().isSameAs(sourceSession));
+          assertTrue(byRef.session().isSameAs(sourceSession));
+
+          source.close();
+          assertTrue(sourceSession.isClosed());
+          assertFalse(byVersion.session().isClosed());
+          assertFalse(byTag.session().isClosed());
+          assertFalse(byRef.session().isClosed());
+        }
+      }
+    }
+  }
+
+  @Test
   void testSessionToString() {
     try (Session session = Session.builder().build()) {
       String str = session.toString();

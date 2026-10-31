@@ -14,10 +14,12 @@
 package org.lance.compaction;
 
 import org.lance.Dataset;
+import org.lance.LockManager;
 
 import com.google.common.base.MoreObjects;
 
 import java.io.Serializable;
+import java.util.List;
 import java.util.Optional;
 
 /** The compaction task which can be sent across network and executed individually. */
@@ -42,23 +44,27 @@ public class CompactionTask implements Serializable {
   }
 
   public RewriteResult execute(Dataset dataset) {
-    return nativeExecute(
-        dataset,
-        taskData,
-        readVersion,
-        compactionOptions.getTargetRowsPerFragment(),
-        compactionOptions.getMaxRowsPerGroup(),
-        compactionOptions.getMaxBytesPerFile(),
-        compactionOptions.getMaterializeDeletions(),
-        compactionOptions.getMaterializeDeletionsThreshold(),
-        compactionOptions.getNumThreads(),
-        compactionOptions.getBatchSize(),
-        compactionOptions.getDeferIndexRemap(),
-        compactionOptions.getCompactionMode(),
-        compactionOptions.getBinaryCopyReadBatchBytes(),
-        compactionOptions.getMaxSourceFragments(),
-        compactionOptions.getMaxSourceRows(),
-        compactionOptions.getMaxSourceBytes());
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return nativeExecute(
+          dataset,
+          taskData,
+          readVersion,
+          compactionOptions.getTargetRowsPerFragment(),
+          compactionOptions.getMaxRowsPerGroup(),
+          compactionOptions.getMaxBytesPerFile(),
+          compactionOptions.getMaterializeDeletions(),
+          compactionOptions.getMaterializeDeletionsThreshold(),
+          compactionOptions.getNumThreads(),
+          compactionOptions.getBatchSize(),
+          compactionOptions.getDeferIndexRemap(),
+          compactionOptions.getCompactionMode(),
+          compactionOptions.getBinaryCopyReadBatchBytes(),
+          compactionOptions.getMaxSourceFragments(),
+          compactionOptions.getMaxSourceRows(),
+          compactionOptions.getMaxSourceBytes(),
+          compactionOptions.getExcludedFragmentIds(),
+          compactionOptions.getDataStorageVersion());
+    }
   }
 
   private native RewriteResult nativeExecute(
@@ -77,7 +83,9 @@ public class CompactionTask implements Serializable {
       Optional<Long> binaryCopyReadBatchBytes,
       Optional<Long> maxSourceFragments,
       Optional<Long> maxSourceRows,
-      Optional<Long> maxSourceBytes);
+      Optional<Long> maxSourceBytes,
+      List<Long> excludedFragmentIds,
+      Optional<String> dataStorageVersion);
 
   public CompactionOptions getCompactionOptions() {
     return compactionOptions;

@@ -33,16 +33,21 @@ import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Add test for distributed compaction. */
 public class CompactionTest {
-  @Test
-  public void testBasicCompaction(@TempDir Path tempDir) throws Exception {
+  @ParameterizedTest
+  @EnumSource(DataStorageVersion.class)
+  public void testBasicCompaction(DataStorageVersion version, @TempDir Path tempDir)
+      throws Exception {
     String datasetPath = tempDir.resolve("test_dataset_for_compaction").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -59,7 +64,24 @@ public class CompactionTest {
                 .withNumThreads(1)
                 .withMaxSourceRows(1000)
                 .withMaxSourceBytes(10L * 1024 * 1024)
+                .withDataStorageVersion(version)
                 .build();
+        compactionOptions = serializeAndDeserialize(compactionOptions);
+        assertEquals(
+            Optional.of(version.toRustString()), compactionOptions.getDataStorageVersion());
+        if (version == DataStorageVersion.LEGACY) {
+          CompactionOptions legacyOptions = compactionOptions;
+          IllegalArgumentException error =
+              assertThrows(
+                  IllegalArgumentException.class,
+                  () -> Compaction.planCompaction(dataset, legacyOptions));
+          assertTrue(error.getMessage().contains("V1 and V2"));
+          return;
+        }
+        String exactVersion =
+            version == DataStorageVersion.STABLE
+                ? "2.2"
+                : version == DataStorageVersion.NEXT ? "2.3" : version.toRustString();
         CompactionPlan compactionPlan = Compaction.planCompaction(dataset, compactionOptions);
 
         // The source budgets are loose, so the plan is unaffected and the
@@ -68,6 +90,9 @@ public class CompactionTest {
         assertEquals(
             Optional.of(10L * 1024 * 1024),
             compactionPlan.getCompactionOptions().getMaxSourceBytes());
+        assertEquals(
+            Optional.of(exactVersion),
+            compactionPlan.getCompactionOptions().getDataStorageVersion());
 
         // will plan to compact two fragments into one.
         assertEquals(1, compactionPlan.getCompactionTasks().size());
@@ -88,6 +113,19 @@ public class CompactionTest {
 
         // mock network transferring
         result = serializeAndDeserialize(result);
+        result
+            .getNewFragments()
+            .forEach(
+                fragment ->
+                    fragment
+                        .getFiles()
+                        .forEach(
+                            file ->
+                                assertEquals(
+                                    exactVersion,
+                                    file.getFileMajorVersion()
+                                        + "."
+                                        + file.getFileMinorVersion())));
         CompactionMetrics ignored =
             Compaction.commitCompaction(
                 dataset, Collections.singletonList(result), compactionPlan.getCompactionOptions());
@@ -96,6 +134,20 @@ public class CompactionTest {
         dataset.checkoutLatest();
         assertEquals(1, dataset.getFragments().size());
         assertEquals(20, dataset.getFragments().get(0).countRows());
+        dataset
+            .getFragments()
+            .forEach(
+                fragment ->
+                    fragment
+                        .metadata()
+                        .getFiles()
+                        .forEach(
+                            file ->
+                                assertEquals(
+                                    exactVersion,
+                                    file.getFileMajorVersion()
+                                        + "."
+                                        + file.getFileMinorVersion())));
       }
     }
   }
@@ -143,6 +195,41 @@ public class CompactionTest {
         dataset.checkoutLatest();
         assertEquals(1, dataset.getFragments().size());
         assertEquals(11, dataset.getFragments().get(0).countRows());
+      }
+    }
+  }
+
+  @Test
+  public void testExcludedFragmentIds(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("test_excluded_fragment_ids").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      testDataset.write(2, 10).close();
+      testDataset.write(3, 10).close();
+      try (Dataset dataset = testDataset.write(4, 10)) {
+        CompactionOptions options =
+            CompactionOptions.builder()
+                .withTargetRowsPerFragment(100)
+                .withExcludedFragmentIds(Arrays.asList(1L, 1L, 999L))
+                .build();
+
+        CompactionPlan plan = Compaction.planCompaction(dataset, options);
+
+        assertEquals(
+            Arrays.asList(1L, 1L, 999L), plan.getCompactionOptions().getExcludedFragmentIds());
+        assertEquals(1, plan.getCompactionTasks().size());
+        assertEquals(2, plan.getCompactionTasks().get(0).getTaskData().getFragments().size());
+        assertEquals(
+            2, plan.getCompactionTasks().get(0).getTaskData().getFragments().get(0).getId());
+        assertEquals(
+            3, plan.getCompactionTasks().get(0).getTaskData().getFragments().get(1).getId());
+
+        CompactionTask task = serializeAndDeserialize(plan.getCompactionTasks().get(0));
+        assertEquals(
+            Arrays.asList(1L, 1L, 999L), task.getCompactionOptions().getExcludedFragmentIds());
       }
     }
   }
@@ -212,6 +299,16 @@ public class CompactionTest {
     // Fields absent from the old stream deserialize as unset.
     assertEquals(Optional.empty(), options.getMaxSourceRows());
     assertEquals(Optional.empty(), options.getMaxSourceBytes());
+    assertEquals(Collections.emptyList(), options.getExcludedFragmentIds());
+    assertEquals(Optional.empty(), options.getDataStorageVersion());
+  }
+
+  @Test
+  public void testUnknownDataStorageVersion() {
+    IllegalArgumentException error =
+        assertThrows(
+            IllegalArgumentException.class, () -> DataStorageVersion.fromRustString("unknown"));
+    assertEquals("Unknown data storage version: unknown", error.getMessage());
   }
 
   private static <T> T serializeAndDeserialize(T object)

@@ -12,7 +12,7 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-dashmap = "6"
+dashmap.workspace = true
 datafusion.workspace = true
 lance.workspace = true
 lance-namespace.workspace = true

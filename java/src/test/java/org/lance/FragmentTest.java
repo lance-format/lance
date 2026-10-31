@@ -13,6 +13,9 @@
  */
 package org.lance;
 
+import org.lance.file.FileWriteOptions;
+import org.lance.fragment.DeletionFile;
+import org.lance.fragment.DeletionFileType;
 import org.lance.fragment.FragmentMergeResult;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
@@ -21,16 +24,25 @@ import org.lance.operation.Project;
 import org.lance.operation.Update;
 import org.lance.schema.LanceField;
 
+import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -38,7 +50,13 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -49,6 +67,66 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class FragmentTest {
+  @Test
+  void testDeletionFileRelativePath() {
+    DeletionFile bitmap = new DeletionFile(7, 11, 2L, DeletionFileType.BITMAP, null);
+    DeletionFile array = new DeletionFile(7, 11, 2L, DeletionFileType.ARRAY, null);
+    DeletionFile highBitId = new DeletionFile(-1L, 11, 2L, DeletionFileType.BITMAP, null);
+    byte[] inlineBytes = new byte[] {1, 2, 3};
+    DeletionFile inline = new DeletionFile(7, 11, 2L, DeletionFileType.BITMAP, null, inlineBytes);
+
+    assertEquals("_deletions/5-11-7.bin", bitmap.getRelativePath(5));
+    assertEquals("_deletions/5-11-7.arrow", array.getRelativePath(5));
+    assertEquals("_deletions/5-11-18446744073709551615.bin", highBitId.getRelativePath(5));
+    assertArrayEquals(inlineBytes, inline.getInline());
+    assertNull(inline.getRelativePath(5));
+    assertThrows(IllegalArgumentException.class, () -> bitmap.getRelativePath(-1));
+  }
+
+  @Test
+  void testInlineDeletionFileRoundTrip(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("inline_deletion_round_trip").toString();
+    byte[] expectedInline;
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 5)) {
+        dataset.updateConfig(Map.of("lance.deletions.inline_max_bytes", "4096"));
+        dataset.delete("id = 1");
+        assertEquals(4, dataset.countRows());
+
+        FragmentMetadata original = dataset.getFragments().get(0).metadata();
+        DeletionFile deletionFile = original.getDeletionFile();
+        assertNotNull(deletionFile);
+        assertNull(deletionFile.getRelativePath(original.getId()));
+        expectedInline = deletionFile.getInline();
+        assertNotNull(expectedInline);
+        assertTrue(expectedInline.length > 0);
+
+        Update update =
+            Update.builder()
+                .updatedFragments(Collections.singletonList(original))
+                .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
+                .build();
+        try (Transaction transaction =
+                new Transaction.Builder().readVersion(dataset.version()).operation(update).build();
+            Dataset committed = new CommitBuilder(dataset).execute(transaction)) {
+          assertArrayEquals(
+              expectedInline,
+              committed.getFragments().get(0).metadata().getDeletionFile().getInline());
+        }
+      }
+    }
+
+    try (Dataset reopened = Dataset.open(datasetPath)) {
+      assertEquals(4, reopened.countRows());
+      assertEquals(0, reopened.countRows("id = 1"));
+      assertArrayEquals(
+          expectedInline, reopened.getFragments().get(0).metadata().getDeletionFile().getInline());
+    }
+  }
+
   @Test
   void testFragmentCreateFfiArray(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("new_fragment_array").toString();
@@ -61,6 +139,24 @@ public class FragmentTest {
   }
 
   @Test
+  void testFragmentWriteRejectsZeroMaxPageBytes(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("zero_max_page_bytes").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      WriteParams params =
+          new WriteParams.Builder()
+              .withFileWriteOptions(FileWriteOptions.builder().maxPageBytes(0).build())
+              .build();
+
+      IllegalArgumentException error =
+          assertThrows(
+              IllegalArgumentException.class, () -> testDataset.createNewFragment(3, params));
+      assertTrue(error.getMessage().contains("max_page_bytes must be greater than 0, got 0"));
+    }
+  }
+
+  @Test
   void testFragmentCreate(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("new_fragment").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -69,6 +165,7 @@ public class FragmentTest {
       testDataset.createEmptyDataset().close();
       int rowCount = 21;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
+      assertEquals(fragmentMeta.getFiles(), fragmentMeta.getReferencedLanceFiles());
 
       // Commit fragment
       FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(fragmentMeta));
@@ -336,7 +433,10 @@ public class FragmentTest {
         assertNotNull(updateFragment.getDeletionFile());
 
         Update update =
-            Update.builder().updatedFragments(Collections.singletonList(updateFragment)).build();
+            Update.builder()
+                .updatedFragments(Collections.singletonList(updateFragment))
+                .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
+                .build();
         Dataset dataset3;
         try (Transaction txn =
             new Transaction.Builder().readVersion(dataset2.version()).operation(update).build()) {
@@ -356,7 +456,10 @@ public class FragmentTest {
         assertNotNull(updateFragment.getDeletionFile());
 
         update =
-            Update.builder().updatedFragments(Collections.singletonList(updateFragment)).build();
+            Update.builder()
+                .updatedFragments(Collections.singletonList(updateFragment))
+                .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
+                .build();
         Dataset dataset4;
         try (Transaction txn =
             new Transaction.Builder().readVersion(dataset3.version()).operation(update).build()) {
@@ -376,6 +479,7 @@ public class FragmentTest {
         update =
             Update.builder()
                 .removedFragmentIds(Collections.singletonList(Long.valueOf(fragment.getId())))
+                .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
                 .build();
         Dataset dataset5;
         try (Transaction txn =
@@ -499,6 +603,9 @@ public class FragmentTest {
             stats.getDataFileNums());
 
         assertEquals(30, Arrays.stream(stats.getRowCounts()).sum());
+
+        dataset.delete("id < 5");
+        assertArrayEquals(new long[] {16, 4}, dataset.getFragmentStatistics().getRowCounts());
       }
     }
   }
@@ -513,5 +620,172 @@ public class FragmentTest {
         assertEquals(0, dataset.getFragmentStatistics().size());
       }
     }
+  }
+
+  @Test
+  void testFragmentStatisticsPreservesLegacyMissingRowCount() {
+    String historicalPath =
+        Path.of("..", "test_data", "v0.7.5", "with_deletions")
+            .toAbsolutePath()
+            .normalize()
+            .toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        Dataset dataset = Dataset.open(historicalPath, allocator)) {
+      FragmentStatistics stats = dataset.getFragmentStatistics();
+      assertArrayEquals(new int[] {0}, stats.getIds());
+      assertArrayEquals(new long[] {0}, stats.getRowCounts());
+      assertArrayEquals(new int[] {1}, stats.getDataFileNums());
+    }
+  }
+
+  @Test
+  void testCountRowsConcurrentWithClose(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("count_rows_close_race").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(100);
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(fragmentMeta));
+      Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L));
+      Fragment fragment = dataset.getFragments().get(0);
+
+      int threadCount = 8;
+      ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+      try {
+        CountDownLatch start = new CountDownLatch(1);
+        List<Future<?>> futures = new ArrayList<>();
+        for (int i = 0; i < threadCount; i++) {
+          futures.add(
+              executor.submit(
+                  () -> {
+                    start.await();
+                    // Hammer countRows until close() wins the race. The only acceptable
+                    // failure is the "Dataset is closed" rejection; anything else (a native
+                    // crash or "Null pointer in rust value from Java") means the native
+                    // handle was released while still in use.
+                    while (true) {
+                      try {
+                        fragment.countRows();
+                      } catch (IllegalArgumentException e) {
+                        assertEquals("Dataset is closed", e.getMessage());
+                        return null;
+                      }
+                    }
+                  }));
+        }
+        start.countDown();
+        Thread.sleep(50);
+        dataset.close();
+        for (Future<?> future : futures) {
+          future.get(30, TimeUnit.SECONDS);
+        }
+      } finally {
+        executor.shutdownNow();
+      }
+    }
+  }
+
+  @Test
+  void testAddColumnsByReader(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("testAddColumnsByReader").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.MergeColumnTestDataset testDataset =
+          new TestUtils.MergeColumnTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      int rowCount = 21;
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(fragmentMeta));
+      try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
+        Fragment fragment = dataset.getFragments().get(0);
+
+        // The stream carries only the new column, one value per fragment row in row order;
+        // several small batches exercise the positional zip across batch boundaries. A read
+        // batch size of 5 against stream batches of 8 forces stream batches to be sliced at
+        // non-zero offsets, which the nulls in the stream must survive.
+        FragmentMergeResult result;
+        try (ArrowStreamReader reader = newColumnStream(allocator, rowCount, 8);
+            ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+          Data.exportArrayStream(allocator, reader, stream);
+          result = fragment.addColumns(stream, Optional.of(5L));
+        }
+
+        try (Transaction transaction =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
+                .operation(
+                    Merge.builder()
+                        .fragments(Collections.singletonList(result.getFragmentMetadata()))
+                        .schema(result.getSchema().asArrowSchema())
+                        .build())
+                .build()) {
+          try (Dataset newDs = new CommitBuilder(dataset).execute(transaction)) {
+            try (LanceScanner scanner = newDs.getFragments().get(0).newScan();
+                ArrowReader batches = scanner.scanBatches()) {
+              int row = 0;
+              while (batches.loadNextBatch()) {
+                VectorSchemaRoot root = batches.getVectorSchemaRoot();
+                BigIntVector val = (BigIntVector) root.getVector("val");
+                for (int i = 0; i < root.getRowCount(); i++, row++) {
+                  if (row % 3 == 0) {
+                    assertTrue(val.isNull(i), "row " + row + " should be null");
+                  } else {
+                    assertEquals(row * 2L, val.get(i));
+                  }
+                }
+              }
+              assertEquals(rowCount, row);
+            }
+          }
+        }
+
+        // The stream must cover every live row exactly once: one row short or one row long
+        // must fail instead of silently misaligning values.
+        assertAddColumnsRejected(allocator, fragment, rowCount - 1, Optional.empty());
+        assertAddColumnsRejected(allocator, fragment, rowCount + 1, Optional.empty());
+        // The batch size must fit a u32.
+        assertAddColumnsRejected(allocator, fragment, rowCount, Optional.of(-1L));
+      }
+    }
+  }
+
+  private static void assertAddColumnsRejected(
+      RootAllocator allocator, Fragment fragment, int rows, Optional<Long> batchSize)
+      throws IOException {
+    try (ArrowStreamReader reader = newColumnStream(allocator, rows, 8);
+        ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+      Data.exportArrayStream(allocator, reader, stream);
+      assertThrows(IllegalArgumentException.class, () -> fragment.addColumns(stream, batchSize));
+    }
+  }
+
+  private static ArrowStreamReader newColumnStream(RootAllocator allocator, int rows, int batchSize)
+      throws IOException {
+    Schema schema =
+        new Schema(
+            Collections.singletonList(Field.nullable("val", new ArrowType.Int(64, true))), null);
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+        ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+      writer.start();
+      for (int start = 0; start < rows; start += batchSize) {
+        int batchRows = Math.min(batchSize, rows - start);
+        root.allocateNew();
+        BigIntVector val = (BigIntVector) root.getVector("val");
+        for (int i = 0; i < batchRows; i++) {
+          // Every third row is null to check nulls line up with their rows.
+          if ((start + i) % 3 == 0) {
+            val.setNull(i);
+          } else {
+            val.setSafe(i, (start + i) * 2L);
+          }
+        }
+        root.setRowCount(batchRows);
+        writer.writeBatch();
+      }
+      writer.end();
+    }
+    return new ArrowStreamReader(new ByteArrayInputStream(out.toByteArray()), allocator);
   }
 }

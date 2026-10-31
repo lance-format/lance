@@ -2,9 +2,11 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::io;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::task::Poll;
+use std::time::Instant;
 
 use crate::object_store::ObjectStore as LanceObjectStore;
 use async_trait::async_trait;
@@ -12,7 +14,7 @@ use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use object_store::{MultipartUpload, ObjectStoreExt};
-use object_store::{ObjectStore, Result as OSResult, path::Path};
+use object_store::{ObjectStore, path::Path};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinSet;
 
@@ -26,7 +28,7 @@ use tokio::runtime::Handle;
 /// Start at 5MB.
 const INITIAL_UPLOAD_STEP: usize = 1024 * 1024 * 5;
 
-fn max_upload_parallelism() -> usize {
+pub fn max_upload_parallelism() -> usize {
     static MAX_UPLOAD_PARALLELISM: OnceLock<usize> = OnceLock::new();
     *MAX_UPLOAD_PARALLELISM.get_or_init(|| {
         std::env::var("LANCE_UPLOAD_CONCURRENCY")
@@ -34,6 +36,26 @@ fn max_upload_parallelism() -> usize {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(10)
     })
+}
+
+/// Upper bound on the bytes one multipart upload of `total_bytes` holds at
+/// once: the parts in flight plus the buffer being filled, each at the part
+/// size the growth rule in `ObjectWriter::next_part_buffer` has reached by the
+/// end of the upload.
+pub fn upload_memory_bound_bytes(total_bytes: u64, constant_upload_size: bool) -> u64 {
+    let initial = initial_upload_size() as u64;
+    let step = INITIAL_UPLOAD_STEP as u64;
+    let mut part_size = initial;
+    if !constant_upload_size {
+        let mut covered = 0u64;
+        let mut tier = 0u64;
+        while covered < total_bytes {
+            part_size = initial.max((tier + 1) * step);
+            covered = covered.saturating_add(part_size.saturating_mul(100));
+            tier += 1;
+        }
+    }
+    part_size.saturating_mul(max_upload_parallelism() as u64 + 1)
 }
 
 /// Maximum body size for a single S3 PUT: strictly less than 5 GiB.
@@ -50,7 +72,7 @@ fn clamp_initial_upload_size(raw: usize) -> (usize, bool) {
     (clamped, clamped != raw)
 }
 
-fn initial_upload_size() -> usize {
+pub fn initial_upload_size() -> usize {
     static LANCE_INITIAL_UPLOAD_SIZE: OnceLock<usize> = OnceLock::new();
     *LANCE_INITIAL_UPLOAD_SIZE.get_or_init(|| {
         let Some(raw) = std::env::var("LANCE_INITIAL_UPLOAD_SIZE")
@@ -78,11 +100,17 @@ fn initial_upload_size() -> usize {
 /// PUT request. If the object is larger, the writer will create a multipart
 /// upload and upload parts in parallel.
 ///
+/// Parts stay in flight across writes and flushes, so a writer can hold up to
+/// `LANCE_UPLOAD_CONCURRENCY` part bodies in memory at once. With a large
+/// `LANCE_INITIAL_UPLOAD_SIZE` that product is what bounds the writer's
+/// footprint, not the part size alone.
+///
 /// This implements the `AsyncWrite` trait.
 pub struct ObjectWriter {
     state: UploadState,
     path: Arc<Path>,
     cursor: usize,
+    upload_parallelism: NonZeroUsize,
     buffer: Vec<u8>,
     // TODO: use constant size to support R2
     use_constant_size_upload_parts: bool,
@@ -94,23 +122,123 @@ pub struct WriteResult {
     pub e_tag: Option<String>,
 }
 
+/// An object-store upload failure, annotated with what Lance was uploading.
+///
+/// `object_store` reports its own elapsed time, but its clock starts inside
+/// `RetryContext::new`, which runs on the *first poll* of the request future.
+/// The `elapsed` reported here is measured from the moment Lance handed the
+/// request to the uploader, so the two together tell a slow request (both
+/// durations agree) apart from one whose task sat unpolled before it ever
+/// issued (this duration is much larger). That distinction is what identifies
+/// runtime starvation as the cause of a whole-request timeout, and it is not
+/// recoverable from the object-store error alone.
+#[derive(Debug)]
+struct UploadFailure {
+    context: String,
+    /// The kind `into_io_error` restores. Without it every contextualized
+    /// failure would collapse to `ErrorKind::Other`, changing what callers
+    /// matching on the kind observe.
+    kind: io::ErrorKind,
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl UploadFailure {
+    /// Wraps an object store error.
+    ///
+    /// The `io::ErrorKind` is taken from `object_store`'s own conversion rather
+    /// than a local copy of its mapping, and the error itself is kept as the
+    /// source, so both callers matching on the kind and `Error::is_not_found`
+    /// (which downcasts along the source chain) keep working.
+    fn new(context: String, source: object_store::Error) -> Self {
+        let mapped = io::Error::from(source);
+        let kind = mapped.kind();
+        let source: Box<dyn std::error::Error + Send + Sync> =
+            match mapped.downcast::<object_store::Error>() {
+                Ok(source) => Box::new(source),
+                Err(mapped) => Box::new(mapped),
+            };
+        Self {
+            context,
+            kind,
+            source,
+        }
+    }
+
+    /// Wraps a failure that carries no object store error to map a kind from.
+    fn from_task(context: String, source: tokio::task::JoinError) -> Self {
+        Self {
+            context,
+            kind: io::ErrorKind::Other,
+            source: Box::new(source),
+        }
+    }
+
+    fn into_io_error(self) -> io::Error {
+        let kind = self.kind;
+        io::Error::new(kind, self)
+    }
+}
+
+impl std::fmt::Display for UploadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.context, self.source)
+    }
+}
+
+impl std::error::Error for UploadFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+type UploadResult<T> = std::result::Result<T, UploadFailure>;
+
+/// Identifies a single part upload, for its failure message.
+struct PartUpload {
+    path: Arc<Path>,
+    part_idx: u16,
+    /// Concurrent part uploads, counting this one, when it was submitted.
+    parts_in_flight: usize,
+    /// The part size in effect, which is the buffer capacity this part was
+    /// filled to. [`ObjectWriter::next_part_buffer`] grows the part size every
+    /// 100 parts so one upload can cover a very large object within the
+    /// 10,000-part limit, so on a long upload this is a multiple of
+    /// `LANCE_INITIAL_UPLOAD_SIZE` rather than equal to it. A body smaller than
+    /// this is the final flush.
+    part_size: usize,
+}
+
+/// Describes the upload knobs in effect, for inclusion in failure messages.
+///
+/// Both are process-global and read from the environment, so a failure that is
+/// sensitive to either is impossible to interpret without them. Note that
+/// `LANCE_INITIAL_UPLOAD_SIZE` is the starting part size, not the size in
+/// effect: see [`PartUpload::part_size`].
+fn upload_settings() -> String {
+    format!(
+        "LANCE_INITIAL_UPLOAD_SIZE={} bytes, LANCE_UPLOAD_CONCURRENCY={}",
+        initial_upload_size(),
+        max_upload_parallelism()
+    )
+}
+
 enum UploadState {
     /// The writer has been opened but no data has been written yet. Will be in
     /// this state until the buffer is full or the writer is shut down.
     Started(Arc<dyn ObjectStore>),
     /// The writer is in the process of creating a multipart upload.
-    CreatingUpload(BoxFuture<'static, OSResult<Box<dyn MultipartUpload>>>),
+    CreatingUpload(BoxFuture<'static, UploadResult<Box<dyn MultipartUpload>>>),
     /// The writer is in the process of uploading parts.
     InProgress {
         part_idx: u16,
         upload: Box<dyn MultipartUpload>,
-        futures: JoinSet<OSResult<()>>,
+        futures: JoinSet<UploadResult<()>>,
     },
     /// The writer is in the process of uploading data in a single PUT request.
     /// This happens when shutdown is called before the buffer is full.
-    PuttingSingle(BoxFuture<'static, OSResult<WriteResult>>),
+    PuttingSingle(BoxFuture<'static, UploadResult<WriteResult>>),
     /// The writer is in the process of completing the multipart upload.
-    Completing(BoxFuture<'static, OSResult<WriteResult>>),
+    Completing(BoxFuture<'static, UploadResult<WriteResult>>),
     /// The writer has been shut down and all data has been written.
     Done(WriteResult),
 }
@@ -122,9 +250,20 @@ impl UploadState {
         let this = std::mem::replace(self, Self::Done(WriteResult::default()));
         *self = match this {
             Self::Started(store) => {
+                tracing::Span::current().record("part_count", 1_u64);
+                let started_at = Instant::now();
                 let fut = async move {
                     let size = buffer.len();
-                    let res = store.put(&path, buffer.into()).await?;
+                    let res = store.put(&path, buffer.into()).await.map_err(|source| {
+                        UploadFailure::new(
+                            format!(
+                                "single PUT of {path} failed after {:?} ({size} bytes, {})",
+                                started_at.elapsed(),
+                                upload_settings()
+                            ),
+                            source,
+                        )
+                    })?;
                     Ok(WriteResult {
                         size,
                         e_tag: res.e_tag,
@@ -136,18 +275,41 @@ impl UploadState {
         }
     }
 
-    fn in_progress_to_completing(&mut self) {
+    fn in_progress_to_completing(&mut self, path: Arc<Path>, bytes_written: usize) {
         // To get owned self, we temporarily swap with Done.
         let this = std::mem::replace(self, Self::Done(WriteResult::default()));
         *self = match this {
             Self::InProgress {
                 mut upload,
                 futures,
-                ..
+                part_idx,
             } => {
                 debug_assert!(futures.is_empty());
+                tracing::Span::current().record("part_count", part_idx as u64);
+                let started_at = Instant::now();
                 let fut = async move {
-                    let res = upload.complete().await?;
+                    let res = match upload.complete().await {
+                        Ok(result) => result,
+                        Err(source) => {
+                            let elapsed = started_at.elapsed();
+                            if let Err(error) = upload.abort().await {
+                                tracing::warn!(
+                                    path = %path,
+                                    error = %error,
+                                    "Failed to abort multipart upload after completion error"
+                                );
+                            }
+                            return Err(UploadFailure::new(
+                                format!(
+                                    "completing multipart upload of {path} failed after {:?} \
+                                 ({part_idx} parts, {bytes_written} bytes, {})",
+                                    elapsed,
+                                    upload_settings()
+                                ),
+                                source,
+                            ));
+                        }
+                    };
                     Ok(WriteResult {
                         size: 0, // This will be set properly later.
                         e_tag: res.e_tag,
@@ -161,10 +323,26 @@ impl UploadState {
 }
 
 impl ObjectWriter {
+    /// Creates a writer, rejecting `LANCE_UPLOAD_CONCURRENCY=0` before allocating
+    /// an upload buffer or issuing any requests.
     pub async fn new(object_store: &LanceObjectStore, path: &Path) -> Result<Self> {
+        Self::with_upload_parallelism(object_store, path, max_upload_parallelism())
+    }
+
+    fn with_upload_parallelism(
+        object_store: &LanceObjectStore,
+        path: &Path,
+        upload_parallelism: usize,
+    ) -> Result<Self> {
+        let upload_parallelism = NonZeroUsize::new(upload_parallelism).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "LANCE_UPLOAD_CONCURRENCY must be greater than zero, got {upload_parallelism}"
+            ))
+        })?;
         Ok(Self {
             state: UploadState::Started(object_store.inner.clone()),
             cursor: 0,
+            upload_parallelism,
             path: Arc::new(path.clone()),
             buffer: Vec::with_capacity(initial_upload_size()),
             use_constant_size_upload_parts: object_store.use_constant_size_upload_parts,
@@ -189,12 +367,34 @@ impl ObjectWriter {
     fn put_part(
         upload: &mut dyn MultipartUpload,
         buffer: Bytes,
-    ) -> BoxFuture<'static, OSResult<()>> {
-        log::debug!(
-            "MultipartUpload submitting part with {} bytes",
-            buffer.len()
-        );
-        upload.put_part(buffer.into())
+        part: PartUpload,
+    ) -> BoxFuture<'static, UploadResult<()>> {
+        let body_size = buffer.len();
+        log::debug!("MultipartUpload submitting part with {} bytes", body_size);
+        // Stamped before the future is spawned so the reported duration covers
+        // any time the task spent waiting to be polled, not just the request.
+        let queued_at = Instant::now();
+        let fut = upload.put_part(buffer.into());
+        Box::pin(async move {
+            fut.await.map_err(|source| {
+                let PartUpload {
+                    path,
+                    part_idx,
+                    parts_in_flight,
+                    part_size,
+                } = part;
+                UploadFailure::new(
+                    format!(
+                        "multipart upload of part {part_idx} of {path} failed after {:?} \
+                         ({body_size} bytes, part_size={part_size} bytes, \
+                          parts_in_flight={parts_in_flight} at submission, {})",
+                        queued_at.elapsed(),
+                        upload_settings()
+                    ),
+                    source,
+                )
+            })
+        })
     }
 
     fn poll_tasks(
@@ -209,12 +409,24 @@ impl ObjectWriter {
                     Poll::Ready(Ok(mut upload)) => {
                         let mut futures = JoinSet::new();
 
+                        // Read before the buffer is swapped out: capacity is the
+                        // part size this body was filled to.
+                        let part_size = mut_self.buffer.capacity();
                         let data = Self::next_part_buffer(
                             &mut mut_self.buffer,
                             0,
                             mut_self.use_constant_size_upload_parts,
                         );
-                        futures.spawn(Self::put_part(upload.as_mut(), data));
+                        futures.spawn(Self::put_part(
+                            upload.as_mut(),
+                            data,
+                            PartUpload {
+                                path: mut_self.path.clone(),
+                                part_idx: 0,
+                                parts_in_flight: 1,
+                                part_size,
+                            },
+                        ));
 
                         mut_self.state = UploadState::InProgress {
                             part_idx: 1, // We just used 0
@@ -222,15 +434,24 @@ impl ObjectWriter {
                             upload,
                         };
                     }
-                    Poll::Ready(Err(e)) => return Err(std::io::Error::other(e)),
+                    Poll::Ready(Err(err)) => return Err(err.into_io_error()),
                     Poll::Pending => break,
                 },
                 UploadState::InProgress { futures, .. } => {
                     while let Poll::Ready(Some(res)) = futures.poll_join_next(cx) {
                         match res {
                             Ok(Ok(())) => {}
-                            Err(err) => return Err(std::io::Error::other(err)),
-                            Ok(Err(err)) => return Err(err.into()),
+                            Err(err) => {
+                                return Err(UploadFailure::from_task(
+                                    format!(
+                                        "multipart upload task for {} did not complete",
+                                        mut_self.path
+                                    ),
+                                    err,
+                                )
+                                .into_io_error());
+                            }
+                            Ok(Err(err)) => return Err(err.into_io_error()),
                         }
                     }
                     break;
@@ -241,7 +462,7 @@ impl ObjectWriter {
                             res.size = mut_self.cursor;
                             mut_self.state = UploadState::Done(res)
                         }
-                        Poll::Ready(Err(e)) => return Err(std::io::Error::other(e)),
+                        Poll::Ready(Err(err)) => return Err(err.into_io_error()),
                         Poll::Pending => break,
                     }
                 }
@@ -282,53 +503,92 @@ impl AsyncWrite for ObjectWriter {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::result::Result<usize, std::io::Error>> {
-        self.as_mut().poll_tasks(cx)?;
-
-        // Fill buffer up to remaining capacity.
-        let remaining_capacity = self.buffer.capacity() - self.buffer.len();
-        let bytes_to_write = std::cmp::min(remaining_capacity, buf.len());
-        self.buffer.extend_from_slice(&buf[..bytes_to_write]);
-        self.cursor += bytes_to_write;
-
-        // Rust needs a little help to borrow self mutably and immutably at the same time
-        // through a Pin.
-        let mut_self = &mut *self;
-
-        // Instantiate next request, if available.
-        if mut_self.buffer.capacity() == mut_self.buffer.len() {
-            match &mut mut_self.state {
-                UploadState::Started(store) => {
-                    let path = mut_self.path.clone();
-                    let store = store.clone();
-                    let fut = Box::pin(async move { store.put_multipart(path.as_ref()).await });
-                    self.state = UploadState::CreatingUpload(fut);
-                }
-                // TODO: Make max concurrency configurable from storage options.
-                UploadState::InProgress {
-                    upload,
-                    part_idx,
-                    futures,
-                    ..
-                } if futures.len() < max_upload_parallelism() => {
-                    let data = Self::next_part_buffer(
-                        &mut mut_self.buffer,
-                        *part_idx,
-                        mut_self.use_constant_size_upload_parts,
-                    );
-                    futures.spawn(
-                        Self::put_part(upload.as_mut(), data).instrument(tracing::Span::current()),
-                    );
-                    *part_idx += 1;
-                }
-                _ => {}
+        loop {
+            self.as_mut().poll_tasks(cx)?;
+            // Nothing would wake a Pending zero-length write.
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
             }
-        }
 
-        self.poll_tasks(cx)?;
+            // Fill buffer up to remaining capacity.
+            let remaining_capacity = self.buffer.capacity() - self.buffer.len();
+            let bytes_to_write = std::cmp::min(remaining_capacity, buf.len());
+            self.buffer.extend_from_slice(&buf[..bytes_to_write]);
+            self.cursor += bytes_to_write;
 
-        match bytes_to_write {
-            0 => Poll::Pending,
-            _ => Poll::Ready(Ok(bytes_to_write)),
+            // Rust needs a little help to borrow self mutably and immutably at the same time
+            // through a Pin.
+            let mut_self = &mut *self;
+
+            // Instantiate next request, if available.
+            if mut_self.buffer.capacity() == mut_self.buffer.len() {
+                match &mut mut_self.state {
+                    UploadState::Started(store) => {
+                        let path = mut_self.path.clone();
+                        let store = store.clone();
+                        let started_at = Instant::now();
+                        let fut = Box::pin(async move {
+                            store.put_multipart(path.as_ref()).await.map_err(|source| {
+                                    UploadFailure::new(
+                                        format!(
+                                            "failed to create multipart upload for {path} after {:?} ({})",
+                                            started_at.elapsed(),
+                                            upload_settings()
+                                        ),
+                                        source,
+                                    )
+                                })
+                        });
+                        self.state = UploadState::CreatingUpload(fut);
+                    }
+                    // TODO: Make max concurrency configurable from storage options.
+                    UploadState::InProgress {
+                        upload,
+                        part_idx,
+                        futures,
+                        ..
+                    } if futures.len() < mut_self.upload_parallelism.get() => {
+                        // Read before the buffer is swapped out: capacity is the
+                        // part size this body was filled to, which grows as the
+                        // upload progresses.
+                        let part_size = mut_self.buffer.capacity();
+                        let data = Self::next_part_buffer(
+                            &mut mut_self.buffer,
+                            *part_idx,
+                            mut_self.use_constant_size_upload_parts,
+                        );
+                        let part = PartUpload {
+                            path: mut_self.path.clone(),
+                            part_idx: *part_idx,
+                            parts_in_flight: futures.len() + 1,
+                            part_size,
+                        };
+                        futures.spawn(
+                            Self::put_part(upload.as_mut(), data, part)
+                                .instrument(tracing::Span::current()),
+                        );
+                        *part_idx += 1;
+                    }
+                    _ => {}
+                }
+            }
+
+            self.as_mut().poll_tasks(cx)?;
+
+            if bytes_to_write > 0 {
+                return Poll::Ready(Ok(bytes_to_write));
+            }
+
+            // The final poll can reap parts or finish creating the upload after
+            // the checks above, freeing buffer space or an upload slot. Retry
+            // instead of returning Pending while progress is already possible.
+            if self.buffer.len() < self.buffer.capacity()
+                || matches!(&self.state, UploadState::InProgress { futures, .. }
+                    if futures.len() < self.upload_parallelism.get())
+            {
+                continue;
+            }
+            return Poll::Pending;
         }
     }
 
@@ -343,13 +603,16 @@ impl AsyncWrite for ObjectWriter {
             UploadState::CreatingUpload(_)
             | UploadState::Completing(_)
             | UploadState::PuttingSingle(_) => Poll::Pending,
-            UploadState::InProgress { futures, .. } => {
-                if futures.is_empty() {
-                    Poll::Ready(Ok(()))
-                } else {
-                    Poll::Pending
-                }
-            }
+            // In-flight parts are spawned tasks, so the runtime drives them
+            // whether or not this writer is polled again; `poll_tasks` above
+            // only reaps them. Waiting for them here would serialize every part
+            // upload behind the caller's next batch, because callers flush once
+            // per batch. `poll_shutdown` still drains them before completing the
+            // upload, which is the only point at which the object becomes
+            // readable. Note this never flushed the tail buffer either, so it
+            // was not a "all data has reached the destination" barrier to begin
+            // with.
+            UploadState::InProgress { .. } => Poll::Ready(Ok(())),
         }
     }
 
@@ -375,14 +638,28 @@ impl AsyncWrite for ObjectWriter {
                     self.state.started_to_putting_single(path, part);
                 }
                 UploadState::InProgress {
-                    upload, futures, ..
+                    upload,
+                    futures,
+                    part_idx,
                 } => {
                     // Flush final batch
-                    if !mut_self.buffer.is_empty() && futures.len() < max_upload_parallelism() {
+                    if !mut_self.buffer.is_empty()
+                        && futures.len() < mut_self.upload_parallelism.get()
+                    {
                         // We can just use `take` since we don't need the buffer anymore.
+                        let part_size = mut_self.buffer.capacity();
                         let data = Bytes::from(std::mem::take(&mut mut_self.buffer));
+                        let part = PartUpload {
+                            path: mut_self.path.clone(),
+                            part_idx: *part_idx,
+                            parts_in_flight: futures.len() + 1,
+                            part_size,
+                        };
+                        // Counted like every other part so the part total
+                        // reported when completing the upload is accurate.
+                        *part_idx += 1;
                         futures.spawn(
-                            Self::put_part(upload.as_mut(), data)
+                            Self::put_part(upload.as_mut(), data, part)
                                 .instrument(tracing::Span::current()),
                         );
                         // We need to go back to beginning of loop to poll the
@@ -392,7 +669,20 @@ impl AsyncWrite for ObjectWriter {
 
                     // We handle the transition from in progress to completing here.
                     if futures.is_empty() {
-                        self.state.in_progress_to_completing();
+                        // No task can wake this writer if the tail could not be submitted.
+                        // Never report success while accepted bytes remain buffered.
+                        if !mut_self.buffer.is_empty() {
+                            return Poll::Ready(Err(io::Error::other(format!(
+                                "cannot complete multipart upload of {}: {} bytes remain buffered \
+                                 with no outstanding parts (LANCE_UPLOAD_CONCURRENCY={})",
+                                mut_self.path,
+                                mut_self.buffer.len(),
+                                mut_self.upload_parallelism
+                            ))));
+                        }
+                        let path = mut_self.path.clone();
+                        let bytes_written = mut_self.cursor;
+                        self.state.in_progress_to_completing(path, bytes_written);
                     } else {
                         return Poll::Pending;
                     }
@@ -409,12 +699,10 @@ impl Writer for ObjectWriter {
     }
 
     async fn shutdown(&mut self) -> Result<WriteResult> {
-        AsyncWriteExt::shutdown(self).await.map_err(|e| {
-            Error::io(format!(
-                "failed to shutdown object writer for {}: {}",
-                self.path, e
-            ))
-        })?;
+        // Propagated structurally rather than formatted into a message: every
+        // failure from this writer already names the path, and stringifying it
+        // would flatten the object store error out of the source chain.
+        AsyncWriteExt::shutdown(self).await?;
         if let UploadState::Done(result) = &self.state {
             Ok(result.clone())
         } else {
@@ -426,6 +714,56 @@ impl Writer for ObjectWriter {
 pub struct LocalWriter {
     path: Path,
     state: LocalWriteState,
+    fsync: bool,
+}
+
+#[cfg(test)]
+static INJECTED_CLOSE_FAILURE: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+fn close_file(file: std::fs::File, path: &std::path::Path) -> io::Result<()> {
+    #[cfg(not(test))]
+    let _ = path;
+
+    let result = close_file_raw(file);
+
+    #[cfg(test)]
+    if result.is_ok() {
+        let mut injected = INJECTED_CLOSE_FAILURE.lock().unwrap();
+        if injected.as_deref() == Some(path) {
+            *injected = None;
+            return Err(io::Error::other("injected close failure"));
+        }
+    }
+
+    result
+}
+
+#[cfg(target_family = "unix")]
+fn close_file_raw(file: std::fs::File) -> io::Result<()> {
+    use std::os::fd::IntoRawFd;
+
+    nix::unistd::close(file.into_raw_fd()).map_err(|error| error.into())
+}
+
+#[cfg(target_family = "windows")]
+fn close_file_raw(file: std::fs::File) -> io::Result<()> {
+    use std::os::windows::io::IntoRawHandle;
+
+    // SAFETY: `into_raw_handle` transfers ownership of the handle, and
+    // `CloseHandle` consumes it exactly once.
+    let result = unsafe { windows_sys::Win32::Foundation::CloseHandle(file.into_raw_handle()) };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+fn close_file_raw(file: std::fs::File) -> io::Result<()> {
+    drop(file);
+    Ok(())
 }
 
 #[derive(Default)]
@@ -461,6 +799,7 @@ impl LocalWriter {
     ) -> Self {
         Self {
             path,
+            fsync: false,
             state: LocalWriteState::Writing(Box::new(WritingState {
                 writer: tokio::io::BufWriter::new(file),
                 cursor: 0,
@@ -469,6 +808,11 @@ impl LocalWriter {
                 io_tracker,
             })),
         }
+    }
+
+    pub(crate) fn with_fsync(mut self, fsync: bool) -> Self {
+        self.fsync = fsync;
+        self
     }
 
     fn already_closed_err(path: &Path) -> io::Error {
@@ -483,29 +827,66 @@ impl LocalWriter {
     }
 
     async fn persist(
+        file: tokio::fs::File,
         temp_path: tempfile::TempPath,
         final_path: Path,
         size: usize,
+        fsync: bool,
         io_tracker: Arc<IOTracker>,
         metrics: IoMetricsGuard,
     ) -> Result<WriteResult> {
         let local_path = crate::local::to_local_path(&final_path);
-        let persisted = tokio::task::spawn_blocking(move || -> Result<String> {
-            temp_path.persist(&local_path).map_err(|e| {
-                Error::io(format!(
-                    "failed to persist temp file to {}: {}",
-                    local_path, e.error
-                ))
-            })?;
+        let persisted = async {
+            if fsync {
+                file.sync_all().await.map_err(|e| {
+                    Error::io(format!(
+                        "failed to sync temp file for {}: {}",
+                        final_path, e
+                    ))
+                })?;
+            }
+            let file = file.into_std().await;
+            let final_path_for_close = final_path.clone();
 
-            let metadata = std::fs::metadata(&local_path).map_err(|e| {
-                Error::io(format!("failed to read metadata for {}: {}", local_path, e))
-            })?;
-            Ok(get_etag(&metadata))
-        })
-        .await
-        .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))
-        .and_then(|e_tag| e_tag);
+            tokio::task::spawn_blocking(move || -> Result<String> {
+                close_file(file, std::path::Path::new(&local_path)).map_err(|e| {
+                    Error::io(format!(
+                        "failed to close temp file for {}: {}",
+                        final_path_for_close, e
+                    ))
+                })?;
+
+                temp_path.persist(&local_path).map_err(|e| {
+                    Error::io(format!(
+                        "failed to persist temp file to {}: {}",
+                        local_path, e.error
+                    ))
+                })?;
+
+                #[cfg(unix)]
+                if fsync {
+                    let parent = std::path::Path::new(&local_path).parent().ok_or_else(|| {
+                        Error::io(format!("file {} has no parent directory", local_path))
+                    })?;
+                    std::fs::File::open(parent)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(|e| {
+                            Error::io(format!(
+                                "failed to sync parent directory of {}: {}",
+                                local_path, e
+                            ))
+                        })?;
+                }
+
+                let metadata = std::fs::metadata(&local_path).map_err(|e| {
+                    Error::io(format!("failed to read metadata for {}: {}", local_path, e))
+                })?;
+                Ok(get_etag(&metadata))
+            })
+            .await
+            .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))?
+        }
+        .await;
 
         metrics.record(&persisted, size as u64);
         let e_tag = persisted?;
@@ -555,8 +936,13 @@ impl AsyncWrite for LocalWriter {
         loop {
             match &mut mut_self.state {
                 LocalWriteState::Writing(state) => {
-                    if Pin::new(&mut state.writer).poll_shutdown(cx).is_pending() {
-                        return Poll::Pending;
+                    match Pin::new(&mut state.writer).poll_shutdown(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Err(err)) => {
+                            mut_self.state = LocalWriteState::Poisoned;
+                            return Poll::Ready(Err(err));
+                        }
+                        Poll::Ready(Ok(())) => {}
                     }
 
                     // Write is complete, we can transition to persisting.
@@ -569,9 +955,11 @@ impl AsyncWrite for LocalWriter {
                     mut_self.state = LocalWriteState::Finishing {
                         size,
                         future: Box::pin(Self::persist(
+                            state.writer.into_inner(),
                             state.temp_path,
                             mut_self.path.clone(),
                             size,
+                            mut_self.fsync,
                             state.io_tracker,
                             state.metrics,
                         )),
@@ -580,6 +968,7 @@ impl AsyncWrite for LocalWriter {
                 LocalWriteState::Finishing { future, .. } => match future.poll_unpin(cx) {
                     Poll::Ready(Ok(result)) => mut_self.state = LocalWriteState::Done(result),
                     Poll::Ready(Err(e)) => {
+                        mut_self.state = LocalWriteState::Poisoned;
                         return Poll::Ready(Err(io::Error::other(e)));
                     }
                     Poll::Pending => return Poll::Pending,
@@ -647,9 +1036,634 @@ fn get_inode(_metadata: &std::fs::Metadata) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use futures::stream::BoxStream;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, ObjectMeta, ObjectStoreExt,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
+        UploadPart,
+    };
+    use rstest::rstest;
+    use std::sync::Mutex;
+    use std::time::Duration;
     use tokio::io::AsyncWriteExt;
+    use tokio::sync::Semaphore;
 
     use super::*;
+
+    /// Which stage of an upload the mock store rejects.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FailAt {
+        Nothing,
+        CreateMultipart,
+        PutPart,
+        Complete,
+        SinglePut,
+    }
+
+    /// What the mock store saw, so a test can assert on uploads that are still
+    /// in flight as well as on the object they eventually assemble.
+    #[derive(Debug)]
+    struct UploadObservations {
+        /// One permit per part upload that has begun. A test waits on this
+        /// rather than sampling a counter: `write_all` and a non-waiting
+        /// `flush` can both complete without ever returning `Pending`, so on a
+        /// current-thread runtime the spawned upload tasks may not have run yet.
+        started: Semaphore,
+        /// `(part index, body)` in completion order. The index is recorded
+        /// because it, not completion order, determines the assembled object.
+        parts: Mutex<Vec<(usize, Vec<u8>)>>,
+    }
+
+    impl Default for UploadObservations {
+        fn default() -> Self {
+            Self {
+                started: Semaphore::new(0),
+                parts: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    fn rejected(stage: &'static str) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "FailingUploadStore",
+            source: format!("{stage} rejected by test").into(),
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingUpload {
+        fail_at: FailAt,
+        /// When set, a part upload does not resolve until the gate is given a
+        /// permit, so a test can hold requests in flight.
+        gate: Option<Arc<Semaphore>>,
+        observations: Arc<UploadObservations>,
+        next_part: usize,
+    }
+
+    #[async_trait]
+    impl MultipartUpload for FailingUpload {
+        fn put_part(&mut self, data: PutPayload) -> UploadPart {
+            let fails = self.fail_at == FailAt::PutPart;
+            let part_idx = self.next_part;
+            self.next_part += 1;
+            let gate = self.gate.clone();
+            let observations = self.observations.clone();
+            Box::pin(async move {
+                observations.started.add_permits(1);
+                if let Some(gate) = gate {
+                    // `forget` keeps the permit from being returned on drop, so
+                    // adding N permits releases exactly N parts.
+                    gate.acquire_owned().await.unwrap().forget();
+                }
+                if fails {
+                    return Err(rejected("part"));
+                }
+                let body = data
+                    .iter()
+                    .flat_map(|chunk| chunk.iter().copied())
+                    .collect();
+                observations.parts.lock().unwrap().push((part_idx, body));
+                Ok(())
+            })
+        }
+
+        async fn complete(&mut self) -> OSResult<PutResult> {
+            if self.fail_at == FailAt::Complete {
+                Err(rejected("complete"))
+            } else {
+                Ok(PutResult {
+                    e_tag: None,
+                    version: None,
+                    extensions: Default::default(),
+                })
+            }
+        }
+
+        async fn abort(&mut self) -> OSResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Rejects exactly one stage of an upload so each failure site can be
+    /// exercised on its own, and optionally holds part uploads open.
+    #[derive(Debug)]
+    struct FailingUploadStore {
+        fail_at: FailAt,
+        gate: Option<Arc<Semaphore>>,
+        observations: Arc<UploadObservations>,
+    }
+
+    impl FailingUploadStore {
+        fn new(fail_at: FailAt) -> Self {
+            Self {
+                fail_at,
+                gate: None,
+                observations: Arc::new(UploadObservations::default()),
+            }
+        }
+
+        /// Builds a store whose part uploads stay in flight until the returned
+        /// gate is given permits.
+        fn gated(fail_at: FailAt) -> (Self, Arc<Semaphore>) {
+            let gate = Arc::new(Semaphore::new(0));
+            let store = Self {
+                fail_at,
+                gate: Some(gate.clone()),
+                observations: Arc::new(UploadObservations::default()),
+            };
+            (store, gate)
+        }
+    }
+
+    impl std::fmt::Display for FailingUploadStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailingUploadStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for FailingUploadStore {
+        async fn put_opts(
+            &self,
+            _location: &Path,
+            _bytes: PutPayload,
+            _opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            if self.fail_at == FailAt::SinglePut {
+                Err(rejected("single put"))
+            } else {
+                Ok(PutResult {
+                    e_tag: None,
+                    version: None,
+                    extensions: Default::default(),
+                })
+            }
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            _location: &Path,
+            _opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            if self.fail_at == FailAt::CreateMultipart {
+                Err(rejected("create multipart"))
+            } else {
+                Ok(Box::new(FailingUpload {
+                    fail_at: self.fail_at,
+                    gate: self.gate.clone(),
+                    observations: self.observations.clone(),
+                    next_part: 0,
+                }))
+            }
+        }
+
+        async fn get_opts(&self, _location: &Path, _options: GetOptions) -> OSResult<GetResult> {
+            unimplemented!()
+        }
+
+        fn delete_stream(
+            &self,
+            _locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            unimplemented!()
+        }
+
+        fn list(&self, _prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            unimplemented!()
+        }
+
+        fn list_with_offset(
+            &self,
+            _prefix: Option<&Path>,
+            _offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            unimplemented!()
+        }
+
+        async fn list_with_delimiter(&self, _prefix: Option<&Path>) -> OSResult<ListResult> {
+            unimplemented!()
+        }
+
+        async fn copy_opts(&self, _from: &Path, _to: &Path, _opts: CopyOptions) -> OSResult<()> {
+            unimplemented!()
+        }
+
+        async fn rename_opts(
+            &self,
+            _from: &Path,
+            _to: &Path,
+            _opts: RenameOptions,
+        ) -> OSResult<()> {
+            unimplemented!()
+        }
+    }
+
+    const FAILING_UPLOAD_PATH: &str = "part_7_invert.lance";
+
+    /// Enough bytes for two full multipart parts, so a failing part has a
+    /// sibling in flight. Derived from the configured part size rather than the
+    /// default, since `LANCE_INITIAL_UPLOAD_SIZE` may raise it.
+    fn two_parts() -> usize {
+        initial_upload_size() * 2
+    }
+
+    /// Drives a write against a store that rejects `fail_at`, returning the
+    /// error. The failure can surface either from a write or from shutdown
+    /// depending on when the rejected request is reaped, so both are checked.
+    async fn failing_upload(fail_at: FailAt, num_bytes: usize) -> io::Error {
+        let mut store = LanceObjectStore::memory();
+        store.inner = Arc::new(FailingUploadStore::new(fail_at));
+
+        let mut writer = ObjectWriter::new(&store, &Path::from(FAILING_UPLOAD_PATH))
+            .await
+            .unwrap();
+        let buf = vec![0u8; num_bytes];
+        match writer.write_all(buf.as_slice()).await {
+            Err(err) => err,
+            Ok(()) => AsyncWriteExt::shutdown(&mut writer)
+                .await
+                .expect_err("upload should have failed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_part_upload_failure_reports_upload_context() {
+        let err = failing_upload(FailAt::PutPart, two_parts()).await;
+        let message = err.to_string();
+
+        assert!(
+            message.contains("multipart upload of part"),
+            "should name the failing stage: {message}"
+        );
+        assert!(
+            message.contains(FAILING_UPLOAD_PATH),
+            "should name the object: {message}"
+        );
+        assert!(
+            message.contains(&format!("{} bytes", initial_upload_size())),
+            "should report the body size: {message}"
+        );
+        assert!(
+            message.contains(&format!("part_size={} bytes", initial_upload_size())),
+            "should report the part size in effect: {message}"
+        );
+        assert!(
+            message.contains("parts_in_flight="),
+            "should report upload concurrency in use: {message}"
+        );
+        assert!(
+            message.contains("LANCE_INITIAL_UPLOAD_SIZE")
+                && message.contains("LANCE_UPLOAD_CONCURRENCY"),
+            "should report the knobs governing the request: {message}"
+        );
+        assert!(
+            message.contains("part rejected by test"),
+            "should keep the underlying object store error: {message}"
+        );
+    }
+
+    // The elapsed time is the whole point of the added context: it is what tells
+    // a slow request apart from one whose task was never polled.
+    #[tokio::test]
+    async fn test_part_upload_failure_reports_elapsed_time() {
+        let err = failing_upload(FailAt::PutPart, two_parts()).await;
+        let message = err.to_string();
+        assert!(
+            message.contains("failed after"),
+            "should report how long the request took: {message}"
+        );
+    }
+
+    // `part_size` in the failure message is the live buffer capacity, which is
+    // what makes it report the size actually in effect. The part size grows
+    // every 100 parts, so on a long upload that diverges from
+    // LANCE_INITIAL_UPLOAD_SIZE by a multiple; reporting only the configured
+    // value would understate a late part by that factor. Reaching part 100
+    // through the writer would mean allocating hundreds of MiB, so the growth
+    // is asserted on the buffer the message reads from.
+    #[test]
+    fn test_part_buffer_capacity_tracks_grown_part_size() {
+        let mut buffer = Vec::<u8>::with_capacity(initial_upload_size());
+        assert_eq!(buffer.capacity(), initial_upload_size());
+
+        let _ = ObjectWriter::next_part_buffer(&mut buffer, 0, false);
+        assert_eq!(
+            buffer.capacity(),
+            initial_upload_size(),
+            "early parts stay at the configured size"
+        );
+
+        let _ = ObjectWriter::next_part_buffer(&mut buffer, 100, false);
+        assert_eq!(
+            buffer.capacity(),
+            initial_upload_size().max(2 * INITIAL_UPLOAD_STEP),
+            "the part size has grown past the first step"
+        );
+
+        // A store pinned to constant part sizes never grows, so the reported
+        // size stays equal to the configured one.
+        let _ = ObjectWriter::next_part_buffer(&mut buffer, 100, true);
+        assert_eq!(buffer.capacity(), initial_upload_size());
+    }
+
+    #[tokio::test]
+    async fn test_part_upload_failure_preserves_source_chain() {
+        let err = failing_upload(FailAt::PutPart, two_parts()).await;
+
+        let failure = err
+            .get_ref()
+            .expect("io error should carry the upload failure");
+        let source = std::error::Error::source(failure)
+            .expect("upload failure should expose the object store error");
+        assert!(
+            source.downcast_ref::<object_store::Error>().is_some(),
+            "source should still be the object store error, got: {source}"
+        );
+    }
+
+    /// Adding context must not flatten the `io::ErrorKind` that `object_store`
+    /// maps an error to, since that kind is observable to callers.
+    #[test]
+    fn test_upload_failure_preserves_error_kind() {
+        fn not_found() -> object_store::Error {
+            object_store::Error::NotFound {
+                path: FAILING_UPLOAD_PATH.to_string(),
+                source: "not found".into(),
+            }
+        }
+
+        let unwrapped = io::Error::from(not_found());
+        assert_eq!(unwrapped.kind(), io::ErrorKind::NotFound);
+
+        let wrapped =
+            UploadFailure::new("part upload failed".to_string(), not_found()).into_io_error();
+        assert_eq!(wrapped.kind(), unwrapped.kind());
+    }
+
+    /// `Writer::shutdown` is the public boundary most callers see. The object
+    /// store error has to remain reachable through it, not be flattened into a
+    /// message.
+    #[tokio::test]
+    async fn test_writer_shutdown_preserves_object_store_source() {
+        let mut store = LanceObjectStore::memory();
+        store.inner = Arc::new(FailingUploadStore::new(FailAt::SinglePut));
+        let mut writer = ObjectWriter::new(&store, &Path::from(FAILING_UPLOAD_PATH))
+            .await
+            .unwrap();
+        writer.write_all(&[0u8; 256]).await.unwrap();
+        let err = Writer::shutdown(&mut writer).await.unwrap_err();
+
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&err);
+        let mut found_object_store = false;
+        while let Some(source) = current {
+            if source.downcast_ref::<object_store::Error>().is_some() {
+                found_object_store = true;
+                break;
+            }
+            current = source.source();
+        }
+        assert!(found_object_store, "source chain was flattened: {err:?}");
+
+        assert!(
+            err.to_string().contains(FAILING_UPLOAD_PATH),
+            "should still name the object: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_multipart_failure_reports_upload_context() {
+        let err = failing_upload(FailAt::CreateMultipart, two_parts()).await;
+        let message = err.to_string();
+
+        assert!(
+            message.contains("failed to create multipart upload for"),
+            "should name the failing stage: {message}"
+        );
+        assert!(
+            message.contains(FAILING_UPLOAD_PATH),
+            "should name the object: {message}"
+        );
+        assert!(
+            message.contains("create multipart rejected by test"),
+            "should keep the underlying object store error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_complete_multipart_failure_reports_upload_context() {
+        let num_bytes = two_parts();
+        let err = failing_upload(FailAt::Complete, num_bytes).await;
+        let message = err.to_string();
+
+        assert!(
+            message.contains("completing multipart upload of"),
+            "should name the failing stage: {message}"
+        );
+        assert!(
+            message.contains(&format!("{num_bytes} bytes")),
+            "should report how much had been written: {message}"
+        );
+        assert!(
+            message.contains("complete rejected by test"),
+            "should keep the underlying object store error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_single_put_failure_reports_upload_context() {
+        // Below the multipart threshold, so shutdown takes the single-PUT path.
+        let err = failing_upload(FailAt::SinglePut, 256).await;
+        let message = err.to_string();
+
+        assert!(
+            message.contains("single PUT of"),
+            "should name the failing stage: {message}"
+        );
+        assert!(
+            message.contains(FAILING_UPLOAD_PATH),
+            "should name the object: {message}"
+        );
+        assert!(
+            message.contains("256 bytes"),
+            "should report the body size: {message}"
+        );
+        assert!(
+            message.contains("single put rejected by test"),
+            "should keep the underlying object store error: {message}"
+        );
+    }
+
+    /// Released permits, comfortably above the part count of any test here so
+    /// no test depends on the exact number of parts a payload produces.
+    const GATE_RELEASE: usize = 64;
+
+    /// How long a flush is allowed to take before it counts as waiting. A flush
+    /// that does not wait resolves immediately; this bound only has to be short
+    /// of the test harness timeout.
+    const FLUSH_BOUND: Duration = Duration::from_secs(10);
+
+    /// Blocks until a part upload has begun, so the assertions that follow are
+    /// made against a request that is genuinely in flight.
+    async fn await_part_in_flight(observations: &UploadObservations) {
+        tokio::time::timeout(FLUSH_BOUND, observations.started.acquire())
+            .await
+            .expect("a part upload should have started")
+            .unwrap()
+            .forget();
+    }
+
+    #[tokio::test]
+    async fn test_flush_does_not_wait_for_in_flight_parts() {
+        let (store, gate) = FailingUploadStore::gated(FailAt::Nothing);
+        let observations = store.observations.clone();
+        let mut lance_store = LanceObjectStore::memory();
+        lance_store.inner = Arc::new(store);
+
+        let mut writer = ObjectWriter::new(&lance_store, &Path::from("gated.lance"))
+            .await
+            .unwrap();
+        // Distinct bytes so a part landing out of order is detectable.
+        let payload = (0..two_parts()).map(|i| i as u8).collect::<Vec<_>>();
+        writer.write_all(payload.as_slice()).await.unwrap();
+        await_part_in_flight(&observations).await;
+
+        tokio::time::timeout(FLUSH_BOUND, AsyncWriteExt::flush(&mut writer))
+            .await
+            .expect("flush must not wait for in-flight part uploads")
+            .unwrap();
+
+        assert!(
+            observations.parts.lock().unwrap().is_empty(),
+            "no gated part may have completed before the gate opened"
+        );
+
+        gate.add_permits(GATE_RELEASE);
+        let result = Writer::shutdown(&mut writer).await.unwrap();
+        assert_eq!(result.size, payload.len());
+
+        let mut parts = observations.parts.lock().unwrap().clone();
+        parts.sort_by_key(|(part_idx, _)| *part_idx);
+        let assembled = parts
+            .into_iter()
+            .flat_map(|(_, body)| body)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            assembled, payload,
+            "parts must reassemble into the original bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_part_failure_after_flush_surfaces_at_shutdown() {
+        let (store, gate) = FailingUploadStore::gated(FailAt::PutPart);
+        let observations = store.observations.clone();
+        let mut lance_store = LanceObjectStore::memory();
+        lance_store.inner = Arc::new(store);
+
+        let mut writer = ObjectWriter::new(&lance_store, &Path::from(FAILING_UPLOAD_PATH))
+            .await
+            .unwrap();
+        writer
+            .write_all(vec![0u8; two_parts()].as_slice())
+            .await
+            .unwrap();
+        await_part_in_flight(&observations).await;
+        // The parts are still gated, so nothing has failed yet and flush passes.
+        AsyncWriteExt::flush(&mut writer).await.unwrap();
+
+        // Now let them fail. Shutdown is the first place that can report it, so
+        // no longer waiting in flush must not lose the error.
+        gate.add_permits(GATE_RELEASE);
+        let err = AsyncWriteExt::shutdown(&mut writer)
+            .await
+            .expect_err("a failed part upload must still surface");
+        let message = err.to_string();
+        assert!(
+            message.contains(FAILING_UPLOAD_PATH),
+            "should name the object being written: {message}"
+        );
+    }
+
+    #[test]
+    fn test_zero_upload_parallelism_rejected() {
+        let store = LanceObjectStore::memory();
+        let path = Path::from("zero-concurrency.lance");
+        let error = ObjectWriter::with_upload_parallelism(&store, &path, 0)
+            .err()
+            .expect("zero concurrency must be rejected");
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("LANCE_UPLOAD_CONCURRENCY"));
+        assert!(error.to_string().contains("got 0"));
+    }
+
+    #[rstest]
+    #[case::empty(0, 0)]
+    #[case::below_boundary(1, -1)]
+    #[case::at_boundary(1, 0)]
+    #[case::above_boundary(1, 16)]
+    #[case::multipart_tail(2, 1)]
+    #[tokio::test]
+    async fn test_upload_parallelism_round_trip(
+        #[case] full_parts: usize,
+        #[case] tail: isize,
+        #[values(Some(1), None)] upload_parallelism: Option<usize>,
+    ) {
+        let store = LanceObjectStore::memory();
+        let path = Path::from("round-trip.lance");
+        let mut writer = match upload_parallelism {
+            Some(upload_parallelism) => {
+                ObjectWriter::with_upload_parallelism(&store, &path, upload_parallelism).unwrap()
+            }
+            None => ObjectWriter::new(&store, &path).await.unwrap(),
+        };
+        let size = (initial_upload_size() * full_parts)
+            .checked_add_signed(tail)
+            .unwrap();
+        let payload = (0..size).map(|i| i as u8).collect::<Vec<_>>();
+
+        let result = tokio::time::timeout(Duration::from_millis(500), async {
+            writer.write_all(&payload).await.unwrap();
+            Writer::shutdown(&mut writer).await.unwrap()
+        })
+        .await
+        .expect("valid concurrency must not stall writes or shutdown");
+        assert_eq!(result.size, payload.len());
+        let persisted = store.inner.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(persisted.as_ref(), payload.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_waits_for_tail_at_concurrency_one() {
+        let (store, gate) = FailingUploadStore::gated(FailAt::Nothing);
+        let observations = store.observations.clone();
+        let mut lance_store = LanceObjectStore::memory();
+        lance_store.inner = Arc::new(store);
+        let mut writer =
+            ObjectWriter::with_upload_parallelism(&lance_store, &Path::from("gated-tail.lance"), 1)
+                .unwrap();
+        let payload = (0..initial_upload_size() + 16)
+            .map(|i| i as u8)
+            .collect::<Vec<_>>();
+        writer.write_all(&payload).await.unwrap();
+        await_part_in_flight(&observations).await;
+
+        assert!(futures::poll!(Box::pin(AsyncWriteExt::shutdown(&mut writer))).is_pending());
+        assert_eq!(writer.buffer.len(), 16);
+        assert!(matches!(writer.state, UploadState::InProgress { .. }));
+
+        gate.add_permits(GATE_RELEASE);
+        let result = Writer::shutdown(&mut writer).await.unwrap();
+        assert_eq!(result.size, payload.len());
+        let mut parts = observations.parts.lock().unwrap().clone();
+        parts.sort_by_key(|(part_idx, _)| *part_idx);
+        assert_eq!(parts.len(), 2);
+        let assembled = parts
+            .into_iter()
+            .flat_map(|(_, body)| body)
+            .collect::<Vec<_>>();
+        assert_eq!(assembled, payload);
+    }
 
     #[tokio::test]
     async fn test_write() {
@@ -687,6 +1701,88 @@ mod tests {
         }
         let res = Writer::shutdown(&mut object_writer).await.unwrap();
         assert_eq!(res.size, buf.len() * 5);
+    }
+
+    #[tokio::test]
+    async fn test_poll_write_progresses_after_uploads_drain() {
+        let store = FailingUploadStore::new(FailAt::Nothing);
+        let observations = store.observations.clone();
+        let mut lance_store = LanceObjectStore::memory();
+        lance_store.inner = Arc::new(store);
+        let path = Path::from("drained.lance");
+        let mut writer = ObjectWriter::new(&lance_store, &path).await.unwrap();
+        let upload = lance_store
+            .inner
+            .put_multipart_opts(&path, PutMultipartOptions::default())
+            .await
+            .unwrap();
+
+        // Construct the post-drain state directly, without a timing-dependent race.
+        writer.state = UploadState::InProgress {
+            part_idx: 0,
+            upload,
+            futures: JoinSet::new(),
+        };
+        writer.buffer = vec![0; 32];
+        let capacity = writer.buffer.capacity();
+        writer.buffer.resize(capacity, 0);
+        writer.cursor = capacity;
+
+        let payload = [1; 16];
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut writer).poll_write(&mut cx, &payload),
+            Poll::Ready(Ok(n)) if n == payload.len()
+        ));
+        assert_eq!(writer.cursor, capacity + payload.len());
+
+        let result = Writer::shutdown(&mut writer).await.unwrap();
+        assert_eq!(result.size, capacity + payload.len());
+        let mut parts = observations.parts.lock().unwrap().clone();
+        parts.sort_by_key(|(part_idx, _)| *part_idx);
+        let assembled = parts
+            .into_iter()
+            .flat_map(|(_, body)| body)
+            .collect::<Vec<_>>();
+        let mut expected = vec![0; capacity];
+        expected.extend_from_slice(&payload);
+        assert_eq!(assembled, expected);
+    }
+
+    #[tokio::test]
+    async fn test_poll_write_empty_input() {
+        let store = LanceObjectStore::memory();
+        let path = Path::from("empty.lance");
+        let mut writer = ObjectWriter::new(&store, &path).await.unwrap();
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut writer).poll_write(&mut cx, &[]),
+            Poll::Ready(Ok(0))
+        ));
+        assert_eq!(writer.cursor, 0);
+
+        let upload = store
+            .inner
+            .put_multipart_opts(&path, PutMultipartOptions::default())
+            .await
+            .unwrap();
+        writer.state = UploadState::InProgress {
+            part_idx: 0,
+            upload,
+            futures: JoinSet::new(),
+        };
+        writer.buffer = vec![0; 32];
+        writer.buffer.resize(writer.buffer.capacity(), 0);
+        writer.cursor = writer.buffer.len();
+        let cursor = writer.cursor;
+        assert!(matches!(
+            Pin::new(&mut writer).poll_write(&mut cx, &[]),
+            Poll::Ready(Ok(0))
+        ));
+        assert_eq!(writer.cursor, cursor);
+        writer.abort().await;
     }
 
     #[tokio::test]
@@ -732,6 +1828,86 @@ mod tests {
         let stats = io_tracker.stats();
         assert_eq!(stats.write_iops, 1);
         assert_eq!(stats.written_bytes, data.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_local_writer_flush_failure_does_not_publish() {
+        let tmp = lance_core::utils::tempfile::TempStdDir::default();
+        let file_path = tmp.join("flush_failed.bin");
+        let os_path = Path::from_absolute_path(&file_path).unwrap();
+        let named_temp = tempfile::NamedTempFile::new_in(&*tmp).unwrap();
+        let temp_file_path = named_temp.path().to_owned();
+        let (temp_file, temp_path) = named_temp.into_parts();
+        drop(temp_file);
+
+        let read_only = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&temp_file_path)
+            .unwrap();
+        let mut writer = LocalWriter::new(
+            tokio::fs::File::from_std(read_only),
+            os_path,
+            temp_path,
+            Arc::new(IOTracker::default()),
+        );
+        writer.write_all(b"data").await.unwrap();
+
+        assert!(Writer::shutdown(&mut writer).await.is_err());
+        assert!(!file_path.exists());
+        assert!(!temp_file_path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_local_writer_sync_failure_does_not_publish() {
+        let tmp = lance_core::utils::tempfile::TempStdDir::default();
+        let file_path = tmp.join("unsynced.bin");
+        let os_path = Path::from_absolute_path(&file_path).unwrap();
+        let named_temp = tempfile::NamedTempFile::new_in(&*tmp).unwrap();
+        let temp_file_path = named_temp.path().to_owned();
+        let (temp_file, temp_path) = named_temp.into_parts();
+        drop(temp_file);
+
+        let unsyncable = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let mut writer = LocalWriter::new(
+            tokio::fs::File::from_std(unsyncable),
+            os_path,
+            temp_path,
+            Arc::new(IOTracker::default()),
+        )
+        .with_fsync(true);
+        writer.write_all(b"data").await.unwrap();
+
+        let error = Writer::shutdown(&mut writer).await.unwrap_err();
+        assert!(error.to_string().contains("failed to sync temp file"));
+        assert!(!file_path.exists());
+        assert!(!temp_file_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_local_writer_close_failure_does_not_publish() {
+        let tmp = lance_core::utils::tempfile::TempStdDir::default();
+        let file_path = tmp.join("close_failed.bin");
+        let os_path = Path::from_absolute_path(&file_path).unwrap();
+        let named_temp = tempfile::NamedTempFile::new_in(&*tmp).unwrap();
+        let temp_file_path = named_temp.path().to_owned();
+        let (std_file, temp_path) = named_temp.into_parts();
+        let file = tokio::fs::File::from_std(std_file);
+        let mut writer = LocalWriter::new(file, os_path, temp_path, Arc::new(IOTracker::default()))
+            .with_fsync(true);
+        writer.write_all(b"data").await.unwrap();
+
+        *INJECTED_CLOSE_FAILURE.lock().unwrap() = Some(std::path::PathBuf::from(
+            crate::local::to_local_path(&writer.path),
+        ));
+
+        let error = Writer::shutdown(&mut writer).await.unwrap_err();
+        assert!(error.to_string().contains("failed to close temp file"));
+        assert!(!file_path.exists());
+        assert!(!temp_file_path.exists());
     }
 
     #[tokio::test]

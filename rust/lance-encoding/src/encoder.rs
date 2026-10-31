@@ -173,6 +173,15 @@ pub type EncodeTask = BoxFuture<'static, Result<EncodedPage>>;
 /// tensor field) the tensor field is likely to emit encoded pages much more frequently
 /// than the boolean field.
 pub trait FieldEncoder: Send {
+    /// Validate and prepare an array before any encoder state is mutated.
+    ///
+    /// Batch-oriented callers invoke this for every root field before calling
+    /// [`Self::maybe_encode`], so a later validation failure cannot leave an
+    /// earlier field encoder partially advanced.
+    fn prepare_array(&mut self, array: ArrayRef) -> Result<ArrayRef> {
+        Ok(array)
+    }
+
     /// Buffer the data and, if there is enough data in the buffer to form a page, return
     /// an encoding task to encode the data.
     ///
@@ -200,6 +209,14 @@ pub trait FieldEncoder: Send {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>>;
+
+    /// Prepare the next input to end its current file page.
+    ///
+    /// File writers call this when the next batch reaches a hard file boundary.
+    /// The next batch can then be encoded before its borrowed source is
+    /// released instead of being copied into a queue that outlives it.
+    fn prepare_for_flush(&mut self) {}
+
     /// Flush any remaining data from the buffers into encoding tasks
     ///
     /// Each encode task produces a single page.  The order of these pages will be maintained
@@ -282,6 +299,11 @@ impl Default for EncodingOptions {
 /// chosen before any data is generated and the same field encoder is
 /// used for all data in the field.
 pub trait FieldEncodingStrategy: Send + Sync + std::fmt::Debug {
+    /// Validate one top-level array before any field encoder state is mutated.
+    fn validate_array(&self, _array: &dyn Array, _field: &Field) -> Result<()> {
+        Ok(())
+    }
+
     /// Choose and create an appropriate field encoder for the given
     /// field.
     ///
@@ -349,6 +371,12 @@ impl BatchEncoder {
             .map(|field_encoder| field_encoder.num_columns())
             .sum::<u32>()
     }
+
+    pub fn prepare_for_flush(&mut self) {
+        for encoder in &mut self.field_encoders {
+            encoder.prepare_for_flush();
+        }
+    }
 }
 
 /// An encoded batch of data and a page table describing it
@@ -408,17 +436,23 @@ pub async fn encode_batch(
         keep_original_array: true,
         ..*options
     };
-    let batch_encoder = BatchEncoder::try_new(&lance_schema, encoding_strategy, &options)?;
+    let mut batch_encoder = BatchEncoder::try_new(&lance_schema, encoding_strategy, &options)?;
+    let arrays = batch
+        .columns()
+        .iter()
+        .cloned()
+        .zip(batch_encoder.field_encoders.iter_mut())
+        .map(|(array, encoder)| encoder.prepare_array(array))
+        .collect::<Result<Vec<_>>>()?;
     let mut page_table = Vec::new();
     let mut col_idx_offset = 0;
-    for (arr, mut encoder) in batch.columns().iter().zip(batch_encoder.field_encoders) {
+    for (arr, mut encoder) in arrays.into_iter().zip(batch_encoder.field_encoders) {
         let mut external_buffers =
             OutOfLineBuffers::new(data_buffer.len() as u64, options.buffer_alignment);
         let repdef = RepDefBuilder::default();
         let encoder = encoder.as_mut();
         let num_rows = arr.len() as u64;
-        let mut tasks =
-            encoder.maybe_encode(arr.clone(), &mut external_buffers, repdef, 0, num_rows)?;
+        let mut tasks = encoder.maybe_encode(arr, &mut external_buffers, repdef, 0, num_rows)?;
         tasks.extend(encoder.flush(&mut external_buffers)?);
         for buffer in external_buffers.take_buffers() {
             data_buffer.extend_from_slice(&buffer);
@@ -484,7 +518,67 @@ pub async fn encode_batch(
 mod tests {
     use super::*;
     use crate::testing::{TestEncoding, create_test_field_encoder, test_encoding_strategy};
+    use arrow_array::make_array;
+    use arrow_buffer::Buffer;
+    use arrow_data::ArrayData;
     use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Fields as ArrowFields};
+    use rstest::rstest;
+
+    #[rstest]
+    fn test_nested_variable_width_offsets_are_validated_before_dispatch(
+        #[values(TestEncoding::Array, TestEncoding::StructuralU32)] encoding: TestEncoding,
+        #[values(ArrowDataType::Utf8, ArrowDataType::LargeUtf8)] item_type: ArrowDataType,
+    ) {
+        let offsets = match &item_type {
+            ArrowDataType::Utf8 => Buffer::from_slice_ref([0_i32, 2, 1, 3]),
+            ArrowDataType::LargeUtf8 => Buffer::from_slice_ref([0_i64, 2, 1, 3]),
+            _ => unreachable!(),
+        };
+        let child_data = unsafe {
+            ArrayData::builder(item_type.clone())
+                .len(3)
+                .add_buffer(offsets)
+                .add_buffer(Buffer::from(b"abc"))
+                .build_unchecked()
+        };
+        let data_type =
+            ArrowDataType::Dictionary(Box::new(ArrowDataType::Int32), Box::new(item_type));
+        let array_data = unsafe {
+            ArrayData::builder(data_type.clone())
+                .len(3)
+                .add_buffer(Buffer::from_slice_ref([0_i32, 1, 2]))
+                .add_child_data(child_data)
+                .build_unchecked()
+        };
+        let array = make_array(array_data);
+        let field = Field::try_from(&ArrowField::new("payload", data_type, false)).unwrap();
+        let strategy = test_encoding_strategy(encoding);
+        let mut column_index = ColumnIndexSequence::default();
+        let options = EncodingOptions {
+            cache_bytes_per_column: 0,
+            ..Default::default()
+        };
+        let mut encoder =
+            create_test_field_encoder(strategy.as_ref(), &field, &mut column_index, &options)
+                .unwrap();
+        let mut external_buffers = OutOfLineBuffers::new(0, MIN_PAGE_BUFFER_ALIGNMENT);
+
+        let error = encoder
+            .maybe_encode(array, &mut external_buffers, RepDefBuilder::default(), 0, 3)
+            .err()
+            .expect("malformed nested offsets should fail before task dispatch");
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains("field 'payload'"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            message.contains("non-monotonic offset at position 2"),
+            "unexpected message: {message}"
+        );
+    }
 
     #[test]
     fn test_fixed_size_list_struct_requires_v2_2() {

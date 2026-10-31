@@ -3,7 +3,7 @@
 
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::execution::SendableRecordBatchStream;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use lance_core::Error;
 use lance_core::datatypes::Schema;
 use lance_datafusion::chunker::{break_stream, chunk_stream};
@@ -12,20 +12,19 @@ use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_file::version::stable_file_version;
 use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
-use lance_file::writer::FileWriter;
+use lance_file::writer::{FileWriter, FileWriterOptions};
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
-use lance_io::utils::CachedFileSize;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
 use std::borrow::Cow;
-use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::Result;
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::utils::SchemaAdapter;
-use crate::dataset::write::validate_and_resolve_target_bases_with_primary;
+use crate::dataset::write::{
+    GenericWriter, V2WriterAdapter, validate_and_resolve_target_bases_with_primary,
+};
 use crate::dataset::{DATA_DIR, Dataset, ReadParams, WriteMode, WriteParams};
 
 /// Generates a filename optimized for S3 throughput using a UUID-based approach.
@@ -103,6 +102,12 @@ impl<'a> FragmentCreateBuilder<'a> {
         self
     }
 
+    pub(crate) fn file_writer_options(&self) -> FileWriterOptions {
+        self.write_params
+            .and_then(|params| params.file_writer_options.clone())
+            .unwrap_or_default()
+    }
+
     /// Write a fragment.
     pub async fn write(
         &self,
@@ -110,17 +115,13 @@ impl<'a> FragmentCreateBuilder<'a> {
         id: Option<u64>,
     ) -> Result<Fragment> {
         let (stream, schema) = self.get_stream_and_schema(Box::new(source)).await?;
-        // Convert Arrow JSON columns (`arrow.json`, stored as Utf8) into Lance JSON
-        // (`lance.json`, stored as JSONB-encoded LargeBinary) before writing. The
-        // multi-fragment and dataset write paths perform this through
-        // `versions::write_fragments_direct`;
-        // the single-fragment create path must do the same or the raw UTF-8 string bytes
-        // would be written into a column whose schema declares JSONB, corrupting reads.
-        let stream = SchemaAdapter::new(stream.schema()).to_physical_stream(stream);
         let version = self
             .write_params
             .map(|params| params.storage_version_or_default())
             .unwrap_or_else(stable_file_version);
+        if let Some(params) = self.write_params {
+            crate::dataset::versions::validate_row_limits(version, params)?;
+        }
         crate::dataset::versions::write_fragment(
             version,
             self,
@@ -166,44 +167,27 @@ impl<'a> FragmentCreateBuilder<'a> {
         let mut fragment = Fragment::new(id);
         let full_path = base_path.clone().join(DATA_DIR).join(filename.clone());
         let obj_writer = object_store.create(&full_path).await?;
-        let (mut writer, data_file) = create_writer(obj_writer, schema, filename)?;
-        fragment.files.push(data_file);
+        let (writer, data_file) = create_writer(obj_writer, schema, filename)?;
+        fragment.files.push(data_file.clone());
 
         progress.begin(&fragment).await?;
 
+        let mut writer = V2WriterAdapter::new(writer, Some(data_file), None, None);
         let break_limit = (128 * 1024).min(params.max_rows_per_file);
 
-        let mut broken_stream = break_stream(stream, break_limit)
-            .map_ok(|batch| vec![batch])
-            .boxed();
-        while let Some(batched_chunk) = broken_stream.next().await {
-            let batch_chunk = batched_chunk?;
-            writer.write_batches(batch_chunk.iter()).await?;
+        let mut broken_stream = break_stream(stream, break_limit);
+        while let Some(batch) = broken_stream.next().await {
+            writer.write_batch(&batch?).await?;
         }
 
-        let write_summary = writer.finish().await?;
-        fragment.physical_rows = Some(write_summary.num_rows as usize);
+        let (num_rows, data_file) = writer.finish().await?;
+        fragment.physical_rows = Some(num_rows as usize);
 
         if matches!(fragment.physical_rows, Some(0)) {
             return Err(Error::invalid_input("Input data was empty."));
         }
 
-        let field_ids: Arc<[i32]> = writer
-            .field_id_to_column_indices()
-            .iter()
-            .map(|(field_id, _)| *field_id as i32)
-            .collect::<Vec<_>>()
-            .into();
-        let column_indices: Arc<[i32]> = writer
-            .field_id_to_column_indices()
-            .iter()
-            .map(|(_, column_index)| *column_index as i32)
-            .collect::<Vec<_>>()
-            .into();
-
-        fragment.files[0].fields = field_ids;
-        fragment.files[0].column_indices = column_indices;
-        fragment.files[0].file_size_bytes = CachedFileSize::new(write_summary.size_bytes);
+        fragment.files[0] = data_file;
 
         progress.complete(&fragment).await?;
 
@@ -258,7 +242,10 @@ impl<'a> FragmentCreateBuilder<'a> {
             stream,
             params,
             target_bases_info,
-            Vec::new(),
+            crate::dataset::write::seeds::SeedCollector::disabled(),
+            None,
+            None,
+            None,
         )
         .await
     }
@@ -385,7 +372,8 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::dataset::InsertBuilder;
+    use crate::dataset::transaction::{Operation, Transaction};
+    use crate::dataset::{CommitBuilder, InsertBuilder};
 
     fn test_data() -> Box<dyn RecordBatchReader + Send> {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -491,6 +479,35 @@ mod tests {
         assert_eq!(fragment.files.len(), 1);
         assert_eq!(fragment.files[0].fields.as_ref(), &[3, 1]);
         assert_eq!(fragment.files[0].column_indices.as_ref(), &[0, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_fragment_commit_rejects_system_column() {
+        let tmp_dir = TempStrDir::default();
+        let batch = record_batch!(("_rowid", UInt64, [1])).unwrap();
+        let arrow_schema = batch.schema();
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let fragment = FragmentCreateBuilder::new(&tmp_dir)
+            .write(RecordBatchIterator::new([Ok(batch)], arrow_schema), None)
+            .await
+            .unwrap();
+
+        let transaction = Transaction::new(
+            0,
+            Operation::Overwrite {
+                schema,
+                fragments: vec![fragment],
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            None,
+        );
+        let error = CommitBuilder::new(tmp_dir.as_str())
+            .execute(transaction)
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("reserved name"), "{error}");
     }
 
     #[tokio::test]
@@ -768,6 +785,40 @@ mod tests {
             assert_eq!(f.file_major_version, major_version);
             assert_eq!(f.file_minor_version, minor_version);
         })
+    }
+
+    /// A zero row limit used to panic on V2. On V1 a zero group size wrote
+    /// nothing, and a zero file limit was ignored by `write`.
+    #[rstest]
+    #[case::v2_rows_per_file(LanceFileVersion::Stable, 0, 1024, "max_rows_per_file")]
+    #[case::v1_rows_per_file(LanceFileVersion::Legacy, 0, 1024, "max_rows_per_file")]
+    #[case::v1_rows_per_group(LanceFileVersion::Legacy, 1024, 0, "max_rows_per_group")]
+    #[tokio::test]
+    async fn test_fragment_write_rejects_zero_row_limits(
+        #[case] file_version: LanceFileVersion,
+        #[case] max_rows_per_file: usize,
+        #[case] max_rows_per_group: usize,
+        #[case] param: &str,
+    ) {
+        let tmp_dir = TempStrDir::default();
+        let params = WriteParams {
+            data_storage_version: Some(file_version),
+            max_rows_per_file,
+            max_rows_per_group,
+            ..Default::default()
+        };
+        let builder = FragmentCreateBuilder::new(&tmp_dir).write_params(&params);
+        let errors = [
+            builder.write(test_data(), None).await.unwrap_err(),
+            builder.write_fragments(test_data()).await.unwrap_err(),
+        ];
+        for err in errors {
+            assert!(
+                matches!(&err, Error::InvalidInput { source, .. }
+                if source.to_string().contains(&format!("{param} must be greater than zero"))),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]

@@ -210,6 +210,49 @@ def test_ann_with_refine(test_dataset, benchmark):
     assert result.num_rows > 0
 
 
+N_BATCH_QUERIES = 32
+
+
+@pytest.mark.benchmark(group="query_ann_batch")
+def test_batch_ann_search(test_dataset, benchmark):
+    # One request carrying all query vectors: the index shares each partition's
+    # scan across the batch (issue #6822).
+    queries = np.random.randn(N_BATCH_QUERIES, N_DIMS).astype(np.float32)
+    result = benchmark(
+        test_dataset.to_table,
+        columns=[],
+        with_row_id=True,
+        nearest=dict(
+            column="vector",
+            q=queries,
+            k=100,
+            nprobes=10,
+        ),
+    )
+    assert result.num_rows > 0
+
+
+@pytest.mark.benchmark(group="query_ann_batch")
+def test_repeated_single_ann_search(test_dataset, benchmark):
+    # Baseline: the same query vectors issued one indexed search at a time.
+    queries = np.random.randn(N_BATCH_QUERIES, N_DIMS).astype(np.float32)
+
+    def run():
+        for q in queries:
+            test_dataset.to_table(
+                columns=[],
+                with_row_id=True,
+                nearest=dict(
+                    column="vector",
+                    q=q,
+                    k=100,
+                    nprobes=10,
+                ),
+            )
+
+    benchmark(run)
+
+
 @pytest.mark.benchmark(group="query_ann")
 @pytest.mark.parametrize("selectivity", (0.25, 0.75))
 @pytest.mark.parametrize("prefilter", (False, True))

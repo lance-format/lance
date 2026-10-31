@@ -1,0 +1,6 @@
+fragments_indexed	index_name
+2	name_idx
+
+id	name
+1	red running shoes
+2	blue trail running shoes

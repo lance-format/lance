@@ -15,7 +15,7 @@ package org.lance.index.vector;
 
 import com.google.common.base.MoreObjects;
 
-/** Parameters for building a Rabit Quantizer (RQ) index stage. */
+/** Parameters for building a Rabit Quantizer (RQ) index stage. Defaults to 5 bits per dimension. */
 public class RQBuildParams {
   private final byte numBits;
 
@@ -24,7 +24,7 @@ public class RQBuildParams {
   }
 
   public static class Builder {
-    private byte numBits = 1;
+    private byte numBits = 5;
 
     public Builder() {}
 

@@ -18,10 +18,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Build Requirements
-        run: |
-          sudo apt update
-          sudo apt install -y protobuf-compiler
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
 
       - name: Validate AWS Credentials
         run: |

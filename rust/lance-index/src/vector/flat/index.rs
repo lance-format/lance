@@ -18,7 +18,7 @@ use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    metrics::MetricsCollector,
+    metrics::{IndexTimer, IndexTiming, MetricsCollector},
     prefilter::PreFilter,
     vector::{
         ApproxMode, DIST_COL, Query,
@@ -66,6 +66,21 @@ static ANN_SEARCH_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     .into()
 });
 
+/// A partition goes through the screened top-k scan only when it has more
+/// than this many rows per result. Screening computes a quantized sum for every
+/// row and then rescores its candidates exactly, in SIMD chunks of 16; with few
+/// rows per result most rows end up rescored, so the quantization and sums
+/// cost more than the scoring they skip. With 4-bit PQ at m=96 it lost to the
+/// bulk scan at 2.5 rows per result on x86 (won on Graviton3), and won on both
+/// at 5. Those ratios were measured when this routing was added, before later
+/// changes to candidate selection and the kernels, and have not been re-tuned.
+const MIN_ROWS_PER_RESULT_FOR_TOPK_SCAN: usize = 4;
+
+/// Marker schema for the flat index, which stores no data of its own.
+static FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Schema::new(vec![Field::new("__flat_marker", DataType::UInt64, false)]).into()
+});
+
 #[derive(Default)]
 pub struct FlatQueryParams {
     lower_bound: Option<f32>,
@@ -98,7 +113,7 @@ impl IvfSubIndex for FlatIndex {
     }
 
     fn schema() -> arrow_schema::SchemaRef {
-        Schema::new(vec![Field::new("__flat_marker", DataType::UInt64, false)]).into()
+        FLAT_SCHEMA.clone()
     }
 
     fn search(
@@ -136,6 +151,7 @@ impl IvfSubIndex for FlatIndex {
     ) -> Result<RecordBatch> {
         let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
         let row_ids = storage.row_ids();
+        let query_timer = IndexTimer::new(metrics, IndexTiming::QueryPrepare);
         let dist_calc = storage.dist_calculator_with_scratch(
             query,
             params.dist_q_c,
@@ -145,10 +161,30 @@ impl IvfSubIndex for FlatIndex {
                 approx_mode: params.approx_mode,
             },
         );
+        drop(query_timer);
         let mut res = BinaryHeap::with_capacity(k);
         metrics.record_comparisons(storage.len());
+        // Filtering, distance evaluation and heap updates are fused in fast-scan paths.
+        let distance_timer = IndexTimer::new(metrics, IndexTiming::DistanceTopK);
 
         match prefilter.is_empty() {
+            // The calculator certifies that its top-k scan keeps every row the
+            // push below would, so it can skip scoring most rows.
+            true if storage.len() > k.saturating_mul(MIN_ROWS_PER_RESULT_FOR_TOPK_SCAN)
+                && dist_calc.has_exact_topk_scan() =>
+            {
+                dist_calc.accumulate_topk_with_scratch(
+                    k,
+                    params.lower_bound,
+                    params.upper_bound,
+                    |id| storage.row_id(id),
+                    &mut res,
+                    &mut scratch.distances,
+                    &mut scratch.u16,
+                    &mut scratch.u8,
+                    &mut scratch.u32,
+                );
+            }
             true => {
                 dist_calc.distance_all_with_scratch(
                     k,
@@ -206,6 +242,8 @@ impl IvfSubIndex for FlatIndex {
             }
         };
 
+        drop(distance_timer);
+        let _result_timer = IndexTimer::new(metrics, IndexTiming::ResultMaterialize);
         // we don't need to sort the results by distances here
         // because there's a SortExec node in the query plan which sorts the results from all partitions
         let (row_ids, dists): (Vec<_>, Vec<_>) = res.into_iter().map(|r| (r.id, r.dist.0)).unzip();
@@ -258,6 +296,7 @@ impl IvfSubIndex for FlatIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<()> {
         let row_ids = storage.row_ids();
+        let query_timer = IndexTimer::new(metrics, IndexTiming::QueryPrepare);
         let dist_calc = storage.dist_calculator_with_scratch(
             query,
             params.dist_q_c,
@@ -267,7 +306,10 @@ impl IvfSubIndex for FlatIndex {
                 approx_mode: params.approx_mode,
             },
         );
+        drop(query_timer);
         metrics.record_comparisons(storage.len());
+        // Filtering, distance evaluation and heap updates are fused in fast-scan paths.
+        let distance_timer = IndexTimer::new(metrics, IndexTiming::DistanceTopK);
 
         match prefilter.is_empty() {
             true => {
@@ -299,6 +341,7 @@ impl IvfSubIndex for FlatIndex {
                 );
             }
         };
+        drop(distance_timer);
         Ok(())
     }
 
@@ -517,6 +560,15 @@ mod tests {
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
+
+    #[test]
+    fn test_schema_is_initialized_once() {
+        // The subindex schema is requested per call, so it is shared rather
+        // than rebuilt. Pointer equality is what distinguishes a shared schema
+        // from an equal-but-freshly-allocated one.
+        assert!(Arc::ptr_eq(&FlatIndex::schema(), &FlatIndex::schema()));
+        assert_eq!(FlatIndex::schema().field(0).name(), "__flat_marker");
+    }
 
     struct MaskPreFilter {
         mask: Arc<RowAddrMask>,

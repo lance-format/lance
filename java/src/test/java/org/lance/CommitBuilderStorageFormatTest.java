@@ -20,6 +20,8 @@ import org.lance.operation.OperationTestBase;
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
 import java.util.Collections;
@@ -28,12 +30,11 @@ import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class CommitBuilderStorageFormatTest extends OperationTestBase {
 
   /**
-   * Append to a freshly created (2.1) dataset with the given storage format and return the
+   * Append to a freshly created (2.2) dataset with the given storage format and return the
    * committed dataset's format version.
    */
   private String commitWithStorageFormat(String datasetPath, String storageFormat)
@@ -60,33 +61,29 @@ public class CommitBuilderStorageFormatTest extends OperationTestBase {
   /**
    * The numeric versions are what {@link Dataset#getLanceFileFormatVersion()} returns and what
    * {@link WriteParams.Builder#withDataStorageVersion(String)} accepts, so they must work here too
-   * — a caller that encodes fragments as "2.1" has to be able to commit them as "2.1".
+   * — a caller that encodes fragments as "2.2" has to be able to commit them as "2.2".
    */
   @Test
   void testCanonicalVersionAccepted(@TempDir Path tempDir) throws Exception {
     assertEquals(
-        LanceConstants.FILE_FORMAT_VERSION_2_1,
+        LanceConstants.FILE_FORMAT_VERSION_2_2,
         commitWithStorageFormat(
-            tempDir.resolve("canonical").toString(), LanceConstants.FILE_FORMAT_VERSION_2_1));
+            tempDir.resolve("canonical").toString(), LanceConstants.FILE_FORMAT_VERSION_2_2));
   }
 
   /** The "v"-prefixed spelling shipped in this method's Javadoc and stays accepted. */
   @Test
   void testDeprecatedAliasAccepted(@TempDir Path tempDir) throws Exception {
     assertEquals(
-        LanceConstants.FILE_FORMAT_VERSION_2_1,
-        commitWithStorageFormat(tempDir.resolve("alias").toString(), "v2_1"));
+        LanceConstants.FILE_FORMAT_VERSION_2_2,
+        commitWithStorageFormat(tempDir.resolve("alias").toString(), "v2_2"));
   }
 
-  /**
-   * A delete adds no data files, so nothing about it depends on the storage format — but {@link
-   * CommitBuilder#storageFormat(String)} is still validated against the existing dataset for any
-   * operation other than overwrite. A caller that forwards a configured format on every commit hits
-   * this on row-level operations against a table written in a different version, so the failure is
-   * a mismatch error rather than anything to do with parsing.
-   */
-  @Test
-  void testMismatchedFormatRejectedOnRowLevelOperation(@TempDir Path tempDir) throws Exception {
+  /** Row-level operations preserve the dataset default regardless of the supplied format. */
+  @ParameterizedTest
+  @ValueSource(strings = {"2.1", "2.2"})
+  void testRowLevelOperationPreservesDefault(String storageFormat, @TempDir Path tempDir)
+      throws Exception {
     String datasetPath = tempDir.resolve("mismatch").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
@@ -100,32 +97,19 @@ public class CommitBuilderStorageFormatTest extends OperationTestBase {
               .build()) {
         dataset = new CommitBuilder(dataset).execute(appendTxn);
       }
-      assertEquals(LanceConstants.FILE_FORMAT_VERSION_2_1, dataset.getLanceFileFormatVersion());
+      assertEquals(LanceConstants.FILE_FORMAT_VERSION_2_2, dataset.getLanceFileFormatVersion());
 
       List<Long> fragmentIds =
           dataset.getFragments().stream()
               .map(f -> Long.valueOf(f.getId()))
               .collect(Collectors.toList());
 
-      // "2.2" parses fine, so a failure here is the mismatch guard and not the parser.
-      try (Transaction deleteTxn = deleteAll(fragmentIds)) {
-        IllegalArgumentException error =
-            assertThrows(
-                IllegalArgumentException.class,
-                () ->
-                    new CommitBuilder(dataset)
-                        .storageFormat(LanceConstants.FILE_FORMAT_VERSION_2_2)
-                        .execute(deleteTxn));
-        assertTrue(error.getMessage().contains("Storage format mismatch"), error.getMessage());
-      }
-
-      // The same delete succeeds when the format agrees with the dataset.
       try (Transaction deleteTxn = deleteAll(fragmentIds)) {
         try (Dataset deleted =
-            new CommitBuilder(dataset)
-                .storageFormat(LanceConstants.FILE_FORMAT_VERSION_2_1)
-                .execute(deleteTxn)) {
+            new CommitBuilder(dataset).storageFormat(storageFormat).execute(deleteTxn)) {
           assertEquals(0, deleted.countRows());
+          assertEquals(LanceConstants.FILE_FORMAT_VERSION_2_2, deleted.getLanceFileFormatVersion());
+          assertEquals(10, dataset.countRows());
         }
       }
     }
