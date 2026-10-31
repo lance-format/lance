@@ -16,10 +16,12 @@
 //! Which coordinates an action writes is decided by that action, in its own
 //! module. This module holds the coordinate space and the comparison.
 
+use super::query_contract::QueryContract;
 use super::{Action, CompositeOperation, FieldRef, Ref};
 use crate::transaction::UpdateMap;
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
+use uuid::Uuid;
 
 /// One thing an action set writes.
 ///
@@ -66,6 +68,8 @@ pub enum Coordinate {
     /// once, on one set of fields, so two writers declaring it on fields of
     /// their own collide even though they name different fields' metadata.
     UnenforcedKey(UnenforcedKey),
+    /// One index segment, by uuid.
+    IndexSegment(Uuid),
 }
 
 /// One of the string maps a manifest carries.
@@ -101,7 +105,8 @@ impl Coordinate {
             | Self::BaseName(_)
             | Self::BaseLocation(_)
             | Self::ConfigEntry { .. }
-            | Self::UnenforcedKey(_) => None,
+            | Self::UnenforcedKey(_)
+            | Self::IndexSegment(_) => None,
         }
     }
 
@@ -123,14 +128,37 @@ impl Coordinate {
 /// coordinate is a new variant here and a new row and column there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Mode {
+    /// Needs the coordinate's values not to be replaced in place, but not the
+    /// fragment holding them to survive: what an index segment needs of the
+    /// data it describes. The format gives a reader no way to notice that the
+    /// values were replaced underneath a segment, but it does show that their
+    /// fragment was removed, and a segment naming a removed fragment either
+    /// reaches its rows through the fragment reuse history or loses that
+    /// coverage. So unlike [`Mode::Requires`], a removal of the fragment
+    /// does not collide with it; see [`Footprint::claims_conflict_with`].
+    RequiresUnlessRemoved,
     /// Reads the coordinate and needs it to still hold what it read. Data
     /// written for a committed field requires the field's definition, since
     /// the values are encoded in the type it names. Unlike a write, two sets
     /// may require the same coordinate -- two readers of one column do not
     /// collide.
     Requires,
+    /// Replaces how the coordinate is stored without changing its values: a
+    /// re-encode with `data_change` false. It collides with any write, as a
+    /// write does, but not with a requirement -- an index segment built over
+    /// the values still describes them after they move.
+    Moves,
     /// Replaces the coordinate. Two of these on one coordinate never commute.
     Writes,
+}
+
+impl Mode {
+    /// Whether writing `region` wholesale leaves a claim of this mode on a
+    /// coordinate inside it intact: a removed fragment is visible in the
+    /// metadata, which is all [`Mode::RequiresUnlessRemoved`] needs.
+    fn is_released_by(self, region: &Region) -> bool {
+        self == Self::RequiresUnlessRemoved && matches!(region, Region::Fragment(_))
+    }
 }
 
 /// A part of the manifest an action set touches wholesale, without being able
@@ -158,23 +186,33 @@ impl Region {
 /// `committed` on the same coordinate, where the `committed` set landed after
 /// the `committing` set read.
 ///
-/// | committing \ committed | Writes   | Requires |
-/// |------------------------|----------|----------|
-/// | Writes                 | conflict | ok       |
-/// | Requires               | conflict | ok       |
+/// | committing \ committed | Writes   | Moves    | Requires | RequiresUnlessRemoved |
+/// |------------------------|----------|----------|----------|-----------------------|
+/// | Writes                 | conflict | conflict | ok       | ok                    |
+/// | Moves                  | conflict | conflict | ok       | ok                    |
+/// | Requires               | conflict | ok       | ok       | ok                    |
+/// | RequiresUnlessRemoved  | conflict | ok       | ok       | ok                    |
 ///
-/// The `Requires` column is all "ok": what the committed set required held when
-/// it committed, and it serialized first, so nothing arriving later can
-/// retroactively break it. The `Requires` row is the open question, because
-/// the committing set read before the other landed.
+/// The requirement columns are all "ok": what the committed set required held
+/// when it committed, and it serialized first, so nothing arriving later can
+/// retroactively break it. The requirement rows are the open question, because
+/// the committing set read before the other landed. They collide with a write
+/// and not a move, since a move leaves every value where a reader finds it.
+///
+/// The two requirement rows differ only where the write is a removal of the
+/// whole fragment, which reaches the coordinate through a [`Region`] rather
+/// than claiming it; that difference lives in
+/// [`Footprint::claims_conflict_with`].
 ///
 /// The table is monotone along [`Mode`]'s order in every row and column, which
 /// is what lets one coordinate touched two ways by one set be summarized by
 /// its strongest mode.
 fn pair_conflicts(committing: Mode, committed: Mode) -> bool {
     match (committing, committed) {
-        (Mode::Writes | Mode::Requires, Mode::Writes) => true,
-        (_, Mode::Requires) => false,
+        (_, Mode::Writes) => true,
+        (Mode::Writes | Mode::Moves, Mode::Moves) => true,
+        (Mode::Requires | Mode::RequiresUnlessRemoved, Mode::Moves) => false,
+        (_, Mode::Requires | Mode::RequiresUnlessRemoved) => false,
     }
 }
 
@@ -263,6 +301,70 @@ pub struct Footprint {
     /// append's rows would vanish or survive the reset depending on which
     /// commit landed first -- so it is a flag rather than a region.
     exclusive: bool,
+    /// What this set writes into logical indices. A segment's uuid is a
+    /// coordinate, but the thing two writers can collide over is the index the
+    /// segment joins, which is not a set of ids -- see [`IndexClaim`].
+    index_claims: Vec<IndexClaim>,
+}
+
+/// What an action set writes into one logical index.
+///
+/// An index is the set of segments sharing a name, and the query path unions
+/// them, so two writers may extend one index at the same time -- what they may
+/// not do is describe the same rows twice, or disagree about what the index is.
+#[derive(Debug, Clone, PartialEq)]
+struct IndexClaim {
+    name: String,
+    /// What the set says the index is. `None` for an action that edits a
+    /// segment without restating the index's definition.
+    identity: Option<IndexIdentity>,
+    /// The committed fragments this set brings under the index, or `None` when
+    /// the reach is not stated -- what the system indices carry, and what makes
+    /// a claim collide with every other claim on the same index.
+    ///
+    /// Fragments this operation mints are left out. They have no id in the read
+    /// version, so a concurrent writer cannot be covering one.
+    coverage: Option<HashSet<u64>>,
+}
+
+/// What an index is, for the purpose of deciding whether two writers are
+/// building the same one.
+///
+/// The same rule the apply-time segment check uses: keyed fields, carried
+/// fields, the index type, and the query contract that type defines. The rest
+/// of the details payload and the index version are left out, because segments
+/// of one index may legitimately differ in both -- independently trained, or
+/// built by a newer library.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct IndexIdentity {
+    pub fields: Vec<FieldRef>,
+    /// Which of `fields` are merely carried: two writers that disagree about
+    /// this disagree about what the index answers for, not just what it holds.
+    pub covering_fields: Vec<FieldRef>,
+    /// The type url of the segment's index details, or `None` when it has none.
+    pub type_url: Option<String>,
+    /// What a query against the index expects of every segment, or `None` for
+    /// an index type that defines no contract.
+    pub query_contract: Option<QueryContract>,
+}
+
+impl IndexClaim {
+    fn conflicts_with(&self, other: &Self) -> bool {
+        if self.name != other.name {
+            return false;
+        }
+        if let (Some(ours), Some(theirs)) = (&self.identity, &other.identity)
+            && ours != theirs
+        {
+            return true;
+        }
+        match (&self.coverage, &other.coverage) {
+            (Some(ours), Some(theirs)) => !ours.is_disjoint(theirs),
+            // An unstated reach could be any fragment, including one the other
+            // side is claiming.
+            _ => true,
+        }
+    }
 }
 
 impl Footprint {
@@ -278,6 +380,9 @@ impl Footprint {
     /// a coordinate -- a tightened nullability, a replaced field -- adds
     /// `Precondition`s, which are tested against the facts `committed`
     /// recorded, and are likewise one-way.
+    ///
+    /// Index claims are not coordinates and are compared on their own terms,
+    /// symmetrically.
     pub fn conflicts_with(&self, committed: &Self) -> bool {
         // A wholesale rewrite leaves nothing for a concurrent set to land on --
         // not even an append, whose rows the reset would discard or resurrect
@@ -294,7 +399,17 @@ impl Footprint {
         {
             return true;
         }
-        self.required_fragment_removed_by(committed) || committed.required_fragment_removed_by(self)
+        if self.required_fragment_removed_by(committed)
+            || committed.required_fragment_removed_by(self)
+        {
+            return true;
+        }
+        self.index_claims.iter().any(|ours| {
+            committed
+                .index_claims
+                .iter()
+                .any(|theirs| ours.conflicts_with(theirs))
+        })
     }
 
     /// Whether any coordinate touched by both sets, directly or through a
@@ -312,6 +427,7 @@ impl Footprint {
                 .regions
                 .iter()
                 .filter(|(region, _)| region.contains(coordinate))
+                .filter(|(region, _)| !ours.is_released_by(region))
                 .map(|(_, theirs)| *theirs);
             same_coordinate
                 .into_iter()
@@ -406,7 +522,7 @@ impl Footprint {
         let fields: Vec<FieldRef> = fields.into_iter().collect();
         self.values_written
             .extend(fields.iter().copied().filter_map(committed_field));
-        self.move_field_data(fragment, fields);
+        self.claim_field_data(fragment, fields, Mode::Writes);
     }
 
     /// The data of each field within `fragment`, moved to new files without
@@ -414,11 +530,21 @@ impl Footprint {
     ///
     /// The same claims as [`Self::write_field_data`], except that no values
     /// count as written, so a concurrent change that makes one of the fields
-    /// required is not invalidated by it.
+    /// required is not invalidated by it, and the data is claimed as
+    /// [`Mode::Moves`], so a concurrent index build over it is not either.
     pub(super) fn move_field_data(
         &mut self,
         fragment: Ref,
         fields: impl IntoIterator<Item = FieldRef>,
+    ) {
+        self.claim_field_data(fragment, fields, Mode::Moves);
+    }
+
+    fn claim_field_data(
+        &mut self,
+        fragment: Ref,
+        fields: impl IntoIterator<Item = FieldRef>,
+        mode: Mode,
     ) {
         let fields: Vec<i32> = fields.into_iter().filter_map(committed_field).collect();
         for field in fields.iter().copied() {
@@ -429,7 +555,7 @@ impl Footprint {
         };
         self.require_fragment(fragment);
         for field in fields {
-            self.write(Coordinate::FieldData { fragment, field });
+            self.claim(Coordinate::FieldData { fragment, field }, mode);
         }
     }
 
@@ -480,6 +606,25 @@ impl Footprint {
         }
     }
 
+    /// Record that this set describes `fields` in `fragment` and needs their
+    /// values not to have been replaced in place, though the fragment may
+    /// since have been removed. See [`Mode::RequiresUnlessRemoved`].
+    ///
+    /// A fragment this operation mints records nothing: no concurrent writer
+    /// can have replaced data that did not exist when they planned.
+    pub(super) fn require_field_data_unless_removed(
+        &mut self,
+        fragment: u64,
+        fields: impl IntoIterator<Item = FieldRef>,
+    ) {
+        for field in fields.into_iter().filter_map(committed_field) {
+            self.claim(
+                Coordinate::FieldData { fragment, field },
+                Mode::RequiresUnlessRemoved,
+            );
+        }
+    }
+
     /// A field's entry in the schema.
     pub(super) fn write_field_definition(&mut self, field: FieldRef) {
         if let Some(field) = committed_field(field) {
@@ -499,6 +644,45 @@ impl Footprint {
     /// without claiming anything inside it.
     pub(super) fn require_fragment(&mut self, fragment: u64) {
         self.required_fragments.insert(fragment);
+    }
+
+    /// Record that this set adds a segment to `name`, defining the index as
+    /// `identity` and describing `coverage`.
+    pub(super) fn claim_index_segment(
+        &mut self,
+        name: String,
+        identity: IndexIdentity,
+        coverage: Option<impl IntoIterator<Item = Ref>>,
+    ) {
+        self.index_claims.push(IndexClaim {
+            name,
+            identity: Some(identity),
+            coverage: coverage.map(committed_fragments),
+        });
+    }
+
+    /// Record that this set rewrites the index `name` wholesale, reaching
+    /// whatever segments it holds when the set applies.
+    pub(super) fn rewrite_index(&mut self, name: String) {
+        self.index_claims.push(IndexClaim {
+            name,
+            identity: None,
+            coverage: None,
+        });
+    }
+
+    /// Record that this set brings `fragments` under `name` by widening a
+    /// segment that is already there, without restating what the index is.
+    pub(super) fn extend_index_coverage(
+        &mut self,
+        name: String,
+        fragments: impl IntoIterator<Item = Ref>,
+    ) {
+        self.index_claims.push(IndexClaim {
+            name,
+            identity: None,
+            coverage: Some(committed_fragments(fragments)),
+        });
     }
 
     /// Record that this set removes `fragment` outright: its existence, and
@@ -537,6 +721,13 @@ impl Footprint {
 /// adds, so no concurrent writer can name it either.
 fn committed_field(reference: FieldRef) -> Option<i32> {
     reference.committed().filter(|id| *id >= 0)
+}
+
+fn committed_fragments(fragments: impl IntoIterator<Item = Ref>) -> HashSet<u64> {
+    fragments
+        .into_iter()
+        .filter_map(|fragment| fragment.committed())
+        .collect()
 }
 
 impl From<&CompositeOperation> for Footprint {
@@ -579,6 +770,40 @@ mod tests {
     use lance_core::datatypes::Field;
     use lance_file::version::ConcreteFileVersion;
     use rstest::rstest;
+
+    /// One coordinate touched two ways by one set is summarized by its
+    /// strongest mode, which is only sound while every row and column of the
+    /// table is monotone in that order.
+    #[test]
+    fn test_pair_conflicts_is_monotone_in_mode_order() {
+        let modes = [
+            Mode::RequiresUnlessRemoved,
+            Mode::Requires,
+            Mode::Moves,
+            Mode::Writes,
+        ];
+        assert!(modes.windows(2).all(|pair| pair[0] < pair[1]));
+        for weaker in 0..modes.len() {
+            for stronger in weaker..modes.len() {
+                for other in modes {
+                    assert!(
+                        pair_conflicts(modes[stronger], other)
+                            >= pair_conflicts(modes[weaker], other),
+                        "row {:?} vs {:?} against {other:?}",
+                        modes[stronger],
+                        modes[weaker]
+                    );
+                    assert!(
+                        pair_conflicts(other, modes[stronger])
+                            >= pair_conflicts(other, modes[weaker]),
+                        "column {:?} vs {:?} against {other:?}",
+                        modes[stronger],
+                        modes[weaker]
+                    );
+                }
+            }
+        }
+    }
 
     fn add_fragment(id: Ref) -> Action {
         Action::AddFragment(AddFragment {
