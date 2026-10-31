@@ -1057,7 +1057,15 @@ impl MiniBlockScheduler {
                 .into();
             let dictionary_data_alignment = match dictionary_encoding.compression.as_ref().unwrap()
             {
-                Compression::Variable(_) => 4,
+                // The header is two offsets wide, so this aligns the offsets too
+                Compression::Variable(variable) => match variable
+                    .offsets
+                    .as_ref()
+                    .and_then(|offsets| offsets.compression.as_ref())
+                {
+                    Some(Compression::Flat(offsets)) if offsets.bits_per_value == 64 => 8,
+                    _ => 4,
+                },
                 Compression::Flat(_) => 16,
                 Compression::General(_) => 1,
                 Compression::FixedSizeList(_) => 1,
@@ -1865,6 +1873,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Arc;
 
+    use arrow_array::{ArrayRef, LargeStringArray, StringArray};
     use bytes::Bytes;
     #[cfg(feature = "bitpacking")]
     use lance_bitpacking::BitPacking;
@@ -1872,7 +1881,9 @@ mod tests {
     use rstest::rstest;
 
     use crate::buffer::LanceBuffer;
-    use crate::compression::{DefaultDecompressionStrategy, MiniBlockDecompressor};
+    use crate::compression::{
+        BlockCompressor, DefaultDecompressionStrategy, MiniBlockDecompressor,
+    };
     use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
     use crate::decoder::DecodePageTask;
     use crate::encodings::logical::primitive::chunk_index::{
@@ -1880,6 +1891,7 @@ mod tests {
     };
     use crate::encodings::logical::primitive::tests::encoded_u16_frame;
     use crate::encodings::logical::primitive::{LoadedChunk, MINIBLOCK_ALIGNMENT};
+    use crate::encodings::physical::binary::VariableEncoder;
     #[cfg(feature = "bitpacking")]
     use crate::encodings::physical::bitpacking::InlineBitpacking;
     use crate::encodings::physical::rle::{RleDecompressor, RunLengthWidth};
@@ -3045,6 +3057,65 @@ mod tests {
         let dictionary = scheduler.dictionary.unwrap();
         assert_eq!(dictionary.num_dictionary_items, 1);
         assert_eq!(dictionary.dictionary_data_alignment, 1);
+    }
+
+    #[rstest]
+    #[case::utf8(Arc::new(StringArray::from(vec!["a", "bb", "ccc"])) as ArrayRef, 4, false)]
+    #[case::large_utf8(Arc::new(LargeStringArray::from(vec!["a", "bb", "ccc"])) as ArrayRef, 8, true)]
+    fn test_miniblock_variable_dictionary_offsets_aligned(
+        #[case] values: ArrayRef,
+        #[case] offset_alignment: usize,
+        #[case] copied: bool,
+    ) {
+        let (payload, dictionary_encoding) = VariableEncoder::default()
+            .compress(DataBlock::from_array(values))
+            .unwrap();
+        let payload = payload.unwrap();
+        let layout = metadata::MiniBlockLayout {
+            rep_compression: None,
+            def_compression: None,
+            value_compression: Some(EncodingUtils::flat(64, None)),
+            dictionary: Some(dictionary_encoding),
+            num_dictionary_items: 3,
+            layers: vec![metadata::RepDefLayer::RepdefAllValidItem as i32],
+            num_buffers: 1,
+            repetition_index_depth: 0,
+            num_items: 3,
+            has_large_chunk: false,
+        };
+        let scheduler = super::MiniBlockScheduler::try_new(
+            &[(0, 0), (0, 0), (0, 0)],
+            /*priority=*/ 0,
+            /*items_in_page=*/ 3,
+            &layout,
+            &DefaultDecompressionStrategy::default(),
+        )
+        .unwrap();
+        let dictionary = scheduler.dictionary.unwrap();
+
+        // A read can return the dictionary 4 bytes past an 8-byte boundary
+        let mut padded = vec![0_u8; payload.len() + 8];
+        let start = (12 - padded.as_ptr() as usize % 8) % 8;
+        padded[start..start + payload.len()].copy_from_slice(&payload);
+        let bytes = Bytes::from(padded).slice(start..start + payload.len());
+        assert_eq!(bytes.as_ptr() as usize % 8, 4);
+        let header_len = 2 * offset_alignment;
+        let offsets_in_place = bytes.as_ptr().wrapping_add(header_len);
+
+        let decoded = dictionary
+            .dictionary_decompressor
+            .decompress(
+                Some(LanceBuffer::from_bytes(
+                    bytes,
+                    dictionary.dictionary_data_alignment,
+                )),
+                3,
+            )
+            .unwrap();
+
+        let offsets = &decoded.as_variable_width_ref().unwrap().offsets;
+        assert_eq!(offsets.as_ptr().align_offset(offset_alignment), 0);
+        assert_eq!(offsets.as_ptr() != offsets_in_place, copied);
     }
 
     #[test]
