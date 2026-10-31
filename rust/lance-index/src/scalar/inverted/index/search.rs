@@ -414,7 +414,7 @@ impl InvertedIndex {
     /// Expand fuzzy query tokens against all partitions in this segment.
     ///
     /// `params.max_expansions` caps the whole query's expansion, not any
-    /// single partition's: source terms at the same query position and their
+    /// single partition's: source terms in the same query group and their
     /// per-partition candidates merge into one lexicographically ordered set,
     /// and the remaining budget takes a prefix of it. The selected terms are
     /// a pure function of the segment's vocabulary, so changing source-token
@@ -424,15 +424,17 @@ impl InvertedIndex {
         let initial_capacity = tokens.len().min(params.max_expansions);
         let mut expanded_tokens = Vec::with_capacity(initial_capacity);
         let mut expanded_positions = Vec::with_capacity(initial_capacity);
+        let mut expanded_groups = Vec::with_capacity(initial_capacity);
         let mut seen = HashSet::new();
-        let mut source_terms_by_position = BTreeMap::<u32, Vec<&str>>::new();
+        let mut source_terms_by_group = BTreeMap::<u32, (u32, Vec<&str>)>::new();
         for token_idx in 0..tokens.len() {
-            source_terms_by_position
-                .entry(tokens.position(token_idx))
-                .or_default()
+            source_terms_by_group
+                .entry(tokens.position_for_query(token_idx, params.phrase_slop.is_some()))
+                .or_insert_with(|| (tokens.position(token_idx), Vec::new()))
+                .1
                 .push(tokens.get_token(token_idx));
         }
-        for (position, source_terms) in source_terms_by_position {
+        for (group, (position, source_terms)) in source_terms_by_group {
             let remaining = params.max_expansions.saturating_sub(expanded_tokens.len());
             if remaining == 0 {
                 break;
@@ -458,9 +460,10 @@ impl InvertedIndex {
                 if expanded_tokens.len() >= params.max_expansions {
                     break;
                 }
-                if seen.insert((candidate.clone(), position)) {
+                if seen.insert((candidate.clone(), group)) {
                     expanded_tokens.push(candidate);
                     expanded_positions.push(position);
+                    expanded_groups.push(group);
                 }
             }
         }
@@ -468,7 +471,8 @@ impl InvertedIndex {
             expanded_tokens,
             expanded_positions,
             tokens.token_type().clone(),
-        ))
+        )
+        .with_term_groups(expanded_groups))
     }
 
     /// Search documents that match the query and return row ids sorted by BM25 score.
@@ -590,9 +594,12 @@ impl InvertedIndex {
                 // to keep at least one expansion; a position that expands to
                 // nothing anywhere in the segment can never be matched.
                 let surviving = (0..expanded.len())
-                    .map(|idx| expanded.position(idx))
+                    .map(|idx| expanded.position_for_query(idx, params.phrase_slop.is_some()))
                     .collect::<HashSet<_>>();
-                if (0..tokens.len()).any(|idx| !surviving.contains(&tokens.position(idx))) {
+                if (0..tokens.len()).any(|idx| {
+                    !surviving
+                        .contains(&tokens.position_for_query(idx, params.phrase_slop.is_some()))
+                }) {
                     return Ok(Vec::new());
                 }
             }
