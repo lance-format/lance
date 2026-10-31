@@ -2592,7 +2592,7 @@ async fn build_cleanup_operation<'a>(
         return Ok(None);
     }
 
-    let mut builder = CleanupPolicyBuilder::default();
+    let mut builder = CleanupPolicyBuilder::default().error_if_tagged_old_versions(false);
     if let Some(older_than) = manifest.config.get("lance.auto_cleanup.older_than") {
         let std_older_than = match parse_duration(older_than) {
             Ok(t) => t,
