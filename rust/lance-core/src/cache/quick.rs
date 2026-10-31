@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use async_trait::async_trait;
 use futures::Future;
 
-use super::backend::{CacheBackend, CacheEntry};
+use super::backend::{CacheBackend, CacheEntry, ImmediateCacheRead};
 use super::moka::key_footprint;
 use super::{CacheCodec, InternalCacheKey};
 use crate::Result;
@@ -97,6 +97,20 @@ fn recommended_cache_shards_for_parallelism(
 const ESTIMATED_AVG_ENTRY_BYTES: usize = 64 << 10;
 
 impl QuickCacheBackend {
+    fn get_entry(&self, key: &InternalCacheKey, codec: Option<CacheCodec>) -> Option<CacheEntry> {
+        if (self.priority_active.load(Ordering::Acquire)
+            || codec.is_some_and(|c| c.memory_priority() > 0))
+            && let Some(value) = self
+                .priority
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(key)
+        {
+            return Some(value.entry);
+        }
+        self.cache.get(key).map(|v| v.entry)
+    }
+
     /// Create a backend holding up to `capacity` bytes of weighted entries
     /// (weight = key footprint + declared size), sharded per
     /// [`recommended_cache_shards`].
@@ -206,6 +220,14 @@ impl QuickCacheBackend {
 
 #[async_trait]
 impl CacheBackend for QuickCacheBackend {
+    fn get_immediate(
+        &self,
+        key: &InternalCacheKey,
+        codec: Option<CacheCodec>,
+    ) -> ImmediateCacheRead {
+        ImmediateCacheRead::Ready(self.get_entry(key, codec))
+    }
+
     async fn get_resident(&self, key: &InternalCacheKey) -> Option<CacheEntry> {
         self.priority
             .lock()
@@ -226,17 +248,7 @@ impl CacheBackend for QuickCacheBackend {
     }
 
     async fn get(&self, key: &InternalCacheKey, codec: Option<CacheCodec>) -> Option<CacheEntry> {
-        if (self.priority_active.load(Ordering::Acquire)
-            || codec.is_some_and(|c| c.memory_priority() > 0))
-            && let Some(value) = self
-                .priority
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(key)
-        {
-            return Some(value.entry);
-        }
-        self.cache.get(key).map(|v| v.entry)
+        self.get_entry(key, codec)
     }
 
     async fn insert(
