@@ -16,6 +16,7 @@ use arrow::datatypes::Int32Type;
 use arrow_array::Array;
 use itertools::Itertools;
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::cpu::{Dispatch, Kernel};
 use lance_core::{Error, Result};
 use lance_select::RowAddrMask;
 use smallvec::SmallVec;
@@ -385,7 +386,7 @@ lance_core::dispatch! {
     static FIND_NEXT_GEQ: Dispatch<FindNextGeqFn> = {
         #[cfg(target_arch = "x86_64")]
         {
-            &[FIND_NEXT_GEQ_AVX2, FIND_NEXT_GEQ_LINEAR]
+            &[FIND_NEXT_GEQ_LINEAR_AVX2, FIND_NEXT_GEQ_LINEAR]
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -400,7 +401,7 @@ lance_core::dispatch! {
     static FIND_NEXT_GEQ_IN_BLOCK: Dispatch<FindNextGeqFn> = {
         #[cfg(target_arch = "x86_64")]
         {
-            &[FIND_NEXT_GEQ_AVX2, FIND_NEXT_GEQ_BINARY]
+            &[FIND_NEXT_GEQ_LINEAR_AVX2, FIND_NEXT_GEQ_BINARY]
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -429,8 +430,8 @@ lance_core::target_kernel! {
 #[cfg(target_arch = "x86_64")]
 lance_core::target_kernel! {
     #[target_features("avx2")]
-    #[candidate(FIND_NEXT_GEQ_AVX2: FindNextGeqFn)]
-    fn find_next_geq_avx2_slice(docs: &[u32], pos: usize, target: u32) -> usize {
+    #[candidate(FIND_NEXT_GEQ_LINEAR_AVX2: FindNextGeqFn)]
+    fn find_next_geq_linear_avx2(docs: &[u32], pos: usize, target: u32) -> usize {
         // SAFETY: the AVX2 search reads only `docs[pos..docs.len()]`.
         unsafe { find_next_geq_avx2(docs.as_ptr(), pos, docs.len(), target) }
     }
@@ -2529,6 +2530,8 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // mutating the process-wide environment.
     bulk_and_mode_override: Option<BulkAndMode>,
     #[cfg(test)]
+    portable_merge_kernels: bool,
+    #[cfg(test)]
     bulk_and_searches: usize,
     #[cfg(test)]
     maxscore_single_essential_windows: usize,
@@ -2650,6 +2653,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             and_window_stats: AndWindowStats::default(),
             bulk_and_mode_override: None,
             #[cfg(test)]
+            portable_merge_kernels: false,
+            #[cfg(test)]
             bulk_and_searches: 0,
             #[cfg(test)]
             maxscore_single_essential_windows: 0,
@@ -2676,6 +2681,29 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     fn with_bulk_and_mode(mut self, mode: BulkAndMode) -> Self {
         self.bulk_and_mode_override = Some(mode);
         self
+    }
+
+    /// Test hook: run the bulk-AND merges with their portable kernels, which
+    /// an AVX2 host would otherwise never select.
+    #[cfg(test)]
+    fn with_portable_merge_kernels(mut self) -> Self {
+        self.portable_merge_kernels = true;
+        self
+    }
+
+    /// The bulk-AND merge kernel `dispatch` selects for this host, or its
+    /// portable kernel when a test asks for it.
+    #[inline(always)]
+    fn merge_kernel<F: Copy>(&self, dispatch: &'static Dispatch<F>) -> Kernel<F> {
+        #[cfg(test)]
+        if self.portable_merge_kernels {
+            return dispatch
+                .candidates()
+                .last()
+                .and_then(|portable| portable.kernel())
+                .expect("the last candidate needs no CPU features");
+        }
+        dispatch.get()
     }
 
     /// Test hook for old/new score-first parity in one process.
@@ -4883,16 +4911,16 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
                 match (num_lists, window_started_with_floor) {
                     (1, _) => merge_window_1(&wins, &mut batch_docs, &mut batch_offs),
-                    (2, false) => {
-                        MERGE_WINDOW_DOCS_2
-                            .get()
-                            .call(&wins, &mut batch_docs, &mut batch_offs)
-                    }
-                    (3, false) => {
-                        MERGE_WINDOW_DOCS_3
-                            .get()
-                            .call(&wins, &mut batch_docs, &mut batch_offs)
-                    }
+                    (2, false) => self.merge_kernel(&MERGE_WINDOW_DOCS_2).call(
+                        &wins,
+                        &mut batch_docs,
+                        &mut batch_offs,
+                    ),
+                    (3, false) => self.merge_kernel(&MERGE_WINDOW_DOCS_3).call(
+                        &wins,
+                        &mut batch_docs,
+                        &mut batch_offs,
+                    ),
                     (_, false) if use_pairwise_intersection => {
                         #[cfg(test)]
                         {
@@ -4911,19 +4939,19 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         &mut batch_docs,
                         &mut batch_offs,
                     ),
-                    (2, true) => MERGE_WINDOW_2.get().call(
+                    (2, true) => self.merge_kernel(&MERGE_WINDOW_2).call(
                         &wins,
                         &freq_cannot_beat,
                         &mut batch_docs,
                         &mut batch_offs,
                     ),
-                    (3, true) => MERGE_WINDOW_3.get().call(
+                    (3, true) => self.merge_kernel(&MERGE_WINDOW_3).call(
                         &wins,
                         &freq_cannot_beat,
                         &mut batch_docs,
                         &mut batch_offs,
                     ),
-                    (_, true) => MERGE_WINDOW_N.get().call(
+                    (_, true) => self.merge_kernel(&MERGE_WINDOW_N).call(
                         &wins,
                         &freq_cannot_beat,
                         &mut cursor_scratch,
@@ -12259,7 +12287,7 @@ mod tests {
             rows
         };
 
-        let run = |mode| {
+        let run_with = |mode, portable_merge_kernels| {
             let shared_floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
             let mut wand = Wand::new(
                 Operator::And,
@@ -12269,12 +12297,17 @@ mod tests {
             )
             .with_bulk_and_mode(mode)
             .with_shared_threshold(shared_floor.clone());
+            if portable_merge_kernels {
+                wand = wand.with_portable_merge_kernels();
+            }
             let rows = normalize(wand.search(&params, &NoOpMetricsCollector).unwrap());
             let used_bulk = wand.bulk_and_searches > 0;
             ((rows, shared_floor.load(Ordering::Relaxed)), used_bulk)
         };
+        let run = |mode| run_with(mode, false);
 
         let (bulk, bulk_used) = run(BulkAndMode::On);
+        let (bulk_portable, _) = run_with(BulkAndMode::On, true);
         let (classic, classic_used) = run(BulkAndMode::Off);
         let (auto, auto_used) = run(BulkAndMode::Auto);
         assert!(bulk_used, "on should use bulk conjunction search");
@@ -12282,6 +12315,7 @@ mod tests {
         assert_eq!(auto_used, matches!(num_clauses, 2 | 3));
         assert!(!bulk.0.is_empty(), "test corpus should produce matches");
         assert_eq!(bulk, classic);
+        assert_eq!(bulk_portable, classic, "portable merge kernels");
         assert_eq!(auto, classic);
     }
 
