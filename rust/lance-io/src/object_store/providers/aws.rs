@@ -35,7 +35,10 @@ use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::{NamespaceCredentialsProvider, build_dynamic_credential_provider},
-    throttle::{AimdThrottleState, cloud_http_connector, shared_throttle_state, with_throttling},
+    throttle::{
+        AimdThrottleState, Transport, cloud_http_connector, reject_http_connector_for_opendal,
+        shared_throttle_state, with_throttling,
+    },
 };
 use lance_core::error::{Error, Result};
 use lance_core::utils::parse::str_is_truthy;
@@ -155,7 +158,11 @@ impl AwsStoreProvider {
             .with_retry(retry_config)
             .with_region(region);
 
-        builder = builder.with_http_connector(cloud_http_connector(throttle_state, metrics_base));
+        builder = builder.with_http_connector(cloud_http_connector(
+            throttle_state,
+            metrics_base,
+            Transport::new(params.http_connector.as_ref()),
+        ));
 
         let use_multipart_copy = builder
             .get_config_value(&AmazonS3ConfigKey::CopyIfNotExists)
@@ -260,6 +267,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
         let throttle_state = shared_throttle_state(&store_prefix, params)?;
 
         let (inner, paginated_lister) = if use_opendal {
+            reject_http_connector_for_opendal(params)?;
             // Use OpenDAL implementation
             // Listed in full: no paginated lister covers OpenDAL yet.
             (
@@ -732,6 +740,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
+    use crate::object_store::test_utils::RecordingConnector;
 
     #[rstest::rstest]
     #[case::canonical("aws_region", "region")]
@@ -1177,6 +1186,29 @@ mod tests {
         assert!(err.to_string().contains("aws_credentials"), "got: {err}");
     }
 
+    /// OpenDAL opens its own clients, so a connector handed to it would be dropped.
+    #[tokio::test]
+    async fn test_use_opendal_rejects_an_explicit_http_connector() {
+        let params = ObjectStoreParams {
+            http_connector: Some(Arc::new(RecordingConnector::default())),
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("use_opendal".to_string(), "true".to_string()),
+                    ("region".to_string(), "us-west-2".to_string()),
+                ]),
+            ))),
+            ..Default::default()
+        };
+
+        let url = Url::parse("s3://test-bucket/path").unwrap();
+        let err = AwsStoreProvider.new_store(url, &params).await.unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "got: {err:?}, expected NotSupported"
+        );
+        assert!(err.to_string().contains("http_connector"), "got: {err}");
+    }
+
     /// S3 Express ignores `start-after` and does not list in key order, but it does hand back
     /// continuation tokens, which is all the native store resumes from — so an Express bucket
     /// pages like any other. The OpenDAL arm has no lister to page with at all.
@@ -1205,6 +1237,39 @@ mod tests {
 
         assert!(!store.list_is_lexically_ordered);
         assert_eq!(store.paginated_lister.is_some(), paginated);
+    }
+
+    #[tokio::test]
+    async fn test_s3_store_opens_its_clients_with_the_given_http_connector() {
+        let connector = Arc::new(RecordingConnector::default());
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([
+                    ("region".to_string(), "us-east-1".to_string()),
+                    ("aws_access_key_id".to_string(), "key".to_string()),
+                    ("aws_secret_access_key".to_string(), "secret".to_string()),
+                    ("aws_endpoint".to_string(), "http://127.0.0.1:1".to_string()),
+                    ("allow_http".to_string(), "true".to_string()),
+                ]),
+            ))),
+            http_connector: Some(connector.clone()),
+            ..Default::default()
+        };
+        assert_ne!(params, ObjectStoreParams::default());
+
+        let url = Url::parse("s3://bucket/path").unwrap();
+        let store = AwsStoreProvider.new_store(url, &params).await.unwrap();
+        let found =
+            object_store::ObjectStoreExt::get(store.inner.as_ref(), &Path::from("path/file")).await;
+
+        assert!(
+            matches!(found, Err(object_store::Error::NotFound { .. })),
+            "{found:?}"
+        );
+        assert!(connector.connects.load(Ordering::SeqCst) >= 1);
+        let requests = connector.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(requests[0].ends_with("/bucket/path/file"), "{requests:?}");
     }
 
     #[derive(Debug)]
