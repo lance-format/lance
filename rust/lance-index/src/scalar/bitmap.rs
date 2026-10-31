@@ -17,14 +17,14 @@ use std::{
 };
 
 use arrow::array::BinaryBuilder;
-use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array, new_null_array};
+use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, UInt64Array, new_null_array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use bytes::Bytes;
-use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::ScalarValue;
-use futures::{StreamExt, TryStreamExt, stream};
+use datafusion_physical_plan::SendableRecordBatchStream;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+use futures::{StreamExt, TryStreamExt, stream, stream::BoxStream};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ADDR, Result,
@@ -43,7 +43,9 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use tracing::{instrument, warn};
 
-use super::{AnyQuery, IndexFile, IndexStore, ScalarIndex, SearchOptions};
+use super::{
+    AnyQuery, IndexFile, IndexStore, LOOKUP_BATCH_SIZE, ScalarIndex, SearchOptions, lookup_batch,
+};
 use super::{
     BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult,
     btree::{OrderableScalarValue, filter_keeps_nothing},
@@ -68,6 +70,7 @@ pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 pub const INDEX_STATS_METADATA_KEY: &str = "lance:index_stats";
 const BITMAP_PART_LOOKUP_PREFIX: &str = "part_";
 const BITMAP_PART_LOOKUP_SUFFIX: &str = "_bitmap_page_lookup.lance";
+
 const EXPLICIT_SHARD_ID_TAG: u64 = 0;
 const IMPLICIT_FRAGMENT_ID_TAG: u64 = 1;
 
@@ -1217,6 +1220,80 @@ impl ScalarIndex for BitmapIndex {
 
         let selection = NullableRowAddrSet::new(row_ids, null_row_ids.unwrap_or_default());
         Ok(SearchResult::Exact(selection))
+    }
+
+    fn lookup<'a>(
+        &'a self,
+        keys: ArrayRef,
+        metrics: &'a dyn MetricsCollector,
+    ) -> Result<BoxStream<'a, Result<RecordBatch>>> {
+        if keys.data_type() != &self.value_type {
+            return Err(Error::invalid_input(format!(
+                "bitmap lookup keys have type {} but the index has type {}",
+                keys.data_type(),
+                self.value_type
+            )));
+        }
+        if u32::try_from(keys.len()).is_err() {
+            return Err(Error::invalid_input(format!(
+                "bitmap lookup takes at most {} keys per call, got {}",
+                u32::MAX,
+                keys.len()
+            )));
+        }
+        metrics.record_comparisons(keys.len());
+
+        // Group repeated keys so each bitmap is loaded once.
+        let mut key_positions: BTreeMap<OrderableScalarValue, Vec<u32>> = BTreeMap::new();
+        for idx in (0..keys.len()).filter(|idx| keys.is_valid(*idx)) {
+            let key = OrderableScalarValue(ScalarValue::try_from_array(&keys, idx)?);
+            if self.index_map.contains_key(&key) {
+                key_positions.entry(key).or_default().push(idx as u32);
+            }
+        }
+
+        let results_are_row_addresses = self.results_are_row_addresses();
+        Ok(stream::iter(key_positions)
+            .map(move |(key, positions)| async move {
+                let bitmap = self.load_bitmap(&key, Some(metrics)).await?;
+                if bitmap.row_addrs().is_none() {
+                    return Err(Error::internal(format!(
+                        "bitmap for value {key} covers whole fragments, so its rows cannot be listed"
+                    )));
+                }
+                Ok((bitmap, positions))
+            })
+            .buffer_unordered(get_num_compute_intensive_cpus())
+            .map_ok(move |(bitmap, positions)| {
+                // A value can match many rows, and repeat many times in `keys`,
+                // so its matches are built as they are consumed, in bounded
+                // batches, instead of expanded all at once.
+                let mut rows = Arc::unwrap_or_clone(bitmap).into_addr_iter().peekable();
+                let mut next_position = 0;
+                stream::iter(std::iter::from_fn(move || {
+                    let mut key_indices = Vec::new();
+                    let mut matched_rows = Vec::new();
+                    while key_indices.len() < LOOKUP_BATCH_SIZE
+                        && let Some(&row) = rows.peek()
+                    {
+                        let taken = (positions.len() - next_position)
+                            .min(LOOKUP_BATCH_SIZE - key_indices.len());
+                        key_indices
+                            .extend_from_slice(&positions[next_position..next_position + taken]);
+                        matched_rows.extend(std::iter::repeat_n(row, taken));
+                        next_position += taken;
+                        if next_position == positions.len() {
+                            rows.next();
+                            next_position = 0;
+                        }
+                    }
+                    (!key_indices.is_empty()).then(|| {
+                        lookup_batch(results_are_row_addresses, key_indices, matched_rows)
+                    })
+                }))
+            })
+            .try_flatten()
+            .boxed())
     }
 
     fn can_remap(&self) -> bool {
@@ -2805,8 +2882,13 @@ mod tests {
     use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
     use crate::scalar::OldIndexDataFilter;
     use crate::scalar::lance_format::LanceIndexStore;
-    use arrow_array::{BooleanArray, RecordBatch, StringArray, UInt64Array, record_batch};
+    use crate::scalar::lookup_test_util::{CompactedToFragmentOne, lookup_pairs};
+    use arrow_array::{
+        BooleanArray, Int32Array, RecordBatch, StringArray, UInt64Array, new_empty_array,
+        new_null_array, record_batch,
+    };
     use arrow_schema::{DataType, Field, Schema};
+    use std::collections::HashSet;
 
     /// Sort a (value, row_id) RecordBatch by the value column so that unit tests
     /// match the ordering the production scanner applies via TrainingOrdering::Values.
@@ -2823,7 +2905,7 @@ mod tests {
         let sorted_row_ids = arrow::compute::take(row_ids.as_ref(), &indices, None).unwrap();
         RecordBatch::try_new(batch.schema(), vec![sorted_values, sorted_row_ids]).unwrap()
     }
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
     use lance_core::utils::{address::RowAddress, tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
@@ -3933,6 +4015,163 @@ mod tests {
         );
     }
 
+    /// A bitmap over row -> value: 10 -> null, 0/3 -> "a", 1 -> "b", 2 -> "c".
+    async fn train_lookup_bitmap() -> (TempObjDir, Arc<LanceIndexStore>) {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let batch = record_batch!(
+            (
+                "value",
+                Utf8,
+                [None, Some("a"), Some("a"), Some("b"), Some("c")]
+            ),
+            ("_rowaddr", UInt64, [10, 0, 3, 1, 2])
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream = stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+            .await
+            .unwrap();
+        (tmpdir, store)
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_lookup() {
+        let (_tmpdir, store) = train_lookup_bitmap().await;
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let index = BitmapIndex::load(store, None, &cache, true).await.unwrap();
+
+        // Repeated, null (never matches the null row), and absent keys.
+        let keys = StringArray::from(vec![Some("a"), None, Some("c"), Some("z"), Some("a")]);
+        assert_eq!(
+            lookup_pairs(index.as_ref(), Arc::new(keys)).await,
+            vec![(0, 0), (0, 3), (2, 2), (4, 0), (4, 3)]
+        );
+        let no_keys = new_empty_array(&DataType::Utf8);
+        assert!(lookup_pairs(index.as_ref(), no_keys).await.is_empty());
+        let null_keys = new_null_array(&DataType::Utf8, 3);
+        assert!(lookup_pairs(index.as_ref(), null_keys).await.is_empty());
+
+        let err = index
+            .lookup(Arc::new(UInt64Array::from(vec![1])), &NoOpMetricsCollector)
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string()
+                .contains("bitmap lookup keys have type UInt64 but the index has type Utf8"),
+            "{err}"
+        );
+    }
+
+    /// A key repeated more often than a batch holds is still split across
+    /// batches.
+    #[tokio::test]
+    async fn test_bitmap_lookup_bounds_repeated_keys() {
+        let (_tmpdir, store) = train_lookup_bitmap().await;
+        let index = BitmapIndex::load(store, None, &LanceCache::no_cache(), true)
+            .await
+            .unwrap();
+        let repeats = LOOKUP_BATCH_SIZE + 1;
+        let keys: ArrayRef = Arc::new(StringArray::from(vec!["a"; repeats]));
+
+        let batches = lookup_batches(&index, keys.clone()).await;
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.num_rows() <= LOOKUP_BATCH_SIZE)
+        );
+        // "a" is on rows 0 and 3.
+        let expected = (0..repeats as u32)
+            .flat_map(|key| [(key, 0), (key, 3)])
+            .collect::<Vec<_>>();
+        assert_eq!(lookup_pairs(index.as_ref(), keys).await, expected);
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_lookup_applies_remapping() {
+        let (_tmpdir, store) = train_lookup_bitmap().await;
+        let remapper = CompactedToFragmentOne {
+            deleted: HashSet::from([3]),
+        };
+        let index = BitmapIndex::load(
+            store,
+            Some(Arc::new(remapper)),
+            &LanceCache::no_cache(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let keys = StringArray::from(vec!["a", "c"]);
+        let moved = CompactedToFragmentOne::moved;
+        assert_eq!(
+            lookup_pairs(index.as_ref(), Arc::new(keys)).await,
+            vec![(0, moved(0)), (1, moved(2))]
+        );
+    }
+
+    async fn lookup_batches(index: &BitmapIndex, keys: ArrayRef) -> Vec<RecordBatch> {
+        index
+            .lookup(keys, &NoOpMetricsCollector)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_lookup_bounds_batches() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        // One value on more rows than fit in a lookup batch.
+        let num_rows = 2 * LOOKUP_BATCH_SIZE as u64 + 100;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Int32, false),
+                Field::new(ROW_ADDR, DataType::UInt64, false),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![7; num_rows as usize])),
+                Arc::new(UInt64Array::from_iter_values(0..num_rows)),
+            ],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream = stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+            .await
+            .unwrap();
+        let index = BitmapIndex::load(store, None, &LanceCache::no_cache(), true)
+            .await
+            .unwrap();
+
+        // The key repeats, so every row is matched twice.
+        let keys: ArrayRef = Arc::new(Int32Array::from(vec![7, 7]));
+        let batches = lookup_batches(&index, keys.clone()).await;
+        assert!(batches.len() > 1);
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.num_rows() <= LOOKUP_BATCH_SIZE)
+        );
+        let expected = [0_u32, 1]
+            .into_iter()
+            .flat_map(|key| (0..num_rows).map(move |row| (key, row)))
+            .collect::<Vec<_>>();
+        assert_eq!(lookup_pairs(index.as_ref(), keys).await, expected);
+    }
+
     #[tokio::test]
     async fn test_bitmap_null_handling_in_queries() {
         // Test that bitmap index correctly returns null_list for queries
@@ -4464,6 +4703,14 @@ mod tests {
                 to_keep.contains(RowAddress::from(row_addr).fragment_id())
             }
             Some(OldIndexDataFilter::RowIds(valid)) => valid.contains(row_addr),
+            Some(OldIndexDataFilter::RowAddresses {
+                to_keep,
+                deleted_rows,
+                ..
+            }) => {
+                to_keep.contains(RowAddress::from(row_addr).fragment_id())
+                    && !deleted_rows.contains(row_addr)
+            }
             None => true,
         }
     }
@@ -4499,7 +4746,7 @@ mod tests {
                 let rows = (0..rng.random_range(1..=8))
                     .map(|_| rand_row(&mut rng))
                     .collect::<Vec<_>>();
-                filters.push(match rng.random_range(0..4) {
+                filters.push(match rng.random_range(0..5) {
                     0 => None,
                     1 => Some(OldIndexDataFilter::Fragments {
                         // The bitmap merge reads only `to_keep`.
@@ -4512,6 +4759,15 @@ mod tests {
                             .map(|(_, row_addr)| *row_addr)
                             .collect(),
                     )),
+                    3 => Some(OldIndexDataFilter::RowAddresses {
+                        to_keep: (0..FRAGMENTS).filter(|_| rng.random_bool(0.6)).collect(),
+                        to_remove: RoaringBitmap::new(),
+                        deleted_rows: rows
+                            .iter()
+                            .filter(|_| rng.random_bool(0.4))
+                            .map(|(_, row_addr)| *row_addr)
+                            .collect(),
+                    }),
                     _ => Some(OldIndexDataFilter::Fragments {
                         to_keep: RoaringBitmap::new(),
                         to_remove: RoaringBitmap::new(),

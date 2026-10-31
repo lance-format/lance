@@ -7,7 +7,7 @@ use super::details::target_partition_size_from_details;
 use super::{
     LogicalIvfView, derive_hnsw_params,
     pq::{PQIndex, build_pq_model},
-    utils::{filter_finite_training_data, maybe_sample_training_data},
+    utils::{filter_finite_training_data, maybe_sample_training_data, sample_unseen_training_data},
 };
 use super::{
     builder::{ExistingIndex, IvfIndexBuilder, index_type_string},
@@ -123,7 +123,7 @@ use object_store::path::Path;
 use prost::Message;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use roaring::RoaringBitmap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::Serialize;
 use serde_json::json;
 use std::{
@@ -134,7 +134,7 @@ use std::{
     pin::Pin,
     sync::{Arc, OnceLock},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -585,12 +585,73 @@ fn vector_model_mismatch(indices: &[Arc<dyn VectorIndex>]) -> Option<VectorModel
     None
 }
 
+fn vector_segments_share_merge_model(
+    left: (&TableIndexMetadata, &Arc<dyn VectorIndex>),
+    right: (&TableIndexMetadata, &Arc<dyn VectorIndex>),
+) -> bool {
+    if left.0.index_version != right.0.index_version {
+        return false;
+    }
+
+    let indices = [left.1.clone(), right.1.clone()];
+    validate_vector_query_compatibility(&indices, "merging vector index segments").is_ok()
+        && vector_model_mismatch(&indices).is_none()
+}
+
+/// Partition a logical vector index into groups that remain acceptable to the
+/// distributed merger after compaction remaps their row addresses.
+pub(crate) fn compaction_vector_segment_merge_groups(
+    logical_index: &LogicalIvfView<'_>,
+) -> Vec<Vec<Uuid>> {
+    let can_merge_after_remap = |index: &dyn VectorIndex| {
+        // Legacy readers have no v2 model inspection. HNSW remapping preserves
+        // graphs, whereas merging would rebuild them. PQ/RQ remaps write query
+        // layouts that the row-major distributed merger cannot consume.
+        !index.as_any().is::<IVFIndex>()
+            && matches!(
+                index.sub_index_type(),
+                (
+                    SubIndexType::Flat,
+                    QuantizationType::Flat | QuantizationType::Scalar
+                )
+            )
+    };
+    let segments = logical_index.segments().collect::<Vec<_>>();
+    let mut groups = Vec::<Vec<usize>>::new();
+
+    for segment_idx in 0..segments.len() {
+        if !can_merge_after_remap(segments[segment_idx].1.as_ref()) {
+            groups.push(vec![segment_idx]);
+            continue;
+        }
+        if let Some(group) = groups.iter_mut().find(|group| {
+            can_merge_after_remap(segments[group[0]].1.as_ref())
+                && vector_segments_share_merge_model(segments[group[0]], segments[segment_idx])
+        }) {
+            group.push(segment_idx);
+        } else {
+            groups.push(vec![segment_idx]);
+        }
+    }
+
+    groups
+        .into_iter()
+        .map(|group| {
+            group
+                .into_iter()
+                .map(|segment_idx| segments[segment_idx].0.uuid)
+                .collect()
+        })
+        .collect()
+}
+
 pub(crate) fn vector_segment_compatibility(
     logical_index: &LogicalIvfView<'_>,
     operation: &str,
 ) -> Result<VectorSegmentCompatibility> {
     let indices = logical_index.indices().cloned().collect::<Vec<_>>();
     validate_vector_query_compatibility(&indices, operation)?;
+
     Ok(if vector_model_mismatch(&indices).is_none() {
         VectorSegmentCompatibility::SharedModel
     } else {
@@ -2162,13 +2223,13 @@ impl RemapPageTask {
         mut self,
         reader: Arc<dyn Reader>,
         index: &IVFIndex,
-        mapping: &RowAddrTranslator,
+        mapping: Arc<RowAddrTranslator>,
     ) -> Result<Self> {
         let mut page = index
             .sub_index
             .load(reader, self.offset, self.length as usize)
             .await?;
-        page.remap_streaming(mapping).await?;
+        page.remap_streaming(&mapping).await?;
         self.page = Some(page);
         Ok(self)
     }
@@ -2213,7 +2274,7 @@ fn generate_remap_tasks(offsets: &[usize], lengths: &[u32]) -> Result<Vec<RemapP
 /// thread, and in CI (dev-profile wheel, opt-level 0) it overflowed the
 /// Windows main-thread stack. `remap_index_file_v3` dispatches over an 11-arm
 /// match whose arms each await a different monomorphization of
-/// `IvfIndexBuilder::remap_streaming`; without the box the outer future embeds
+/// `IvfIndexBuilder::remap_with`; without the box the outer future embeds
 /// every specialized builder future, and at opt-level 0 each arm's future is
 /// also materialized as a separate stack temporary while it is polled. Boxing
 /// per arm, in the concrete `Pin<Box<impl Future>>` form (a `dyn Future`
@@ -2221,11 +2282,12 @@ fn generate_remap_tasks(offsets: &[usize], lengths: &[u32]) -> Result<Vec<RemapP
 /// `DatasetIndexRemapper::remap_indices`), leaves one pointer per arm
 /// on the caller's stack. The builder moves into the heap future too, so the
 /// dispatching future does not hold a builder across the await either.
-fn remap_boxed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
+fn remap_boxed<'a, S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     mut builder: IvfIndexBuilder<S, Q>,
-    mapping: &RowAddrTranslator,
-) -> Pin<Box<impl Future<Output = Result<Vec<IndexFile>>> + Send + '_>> {
-    Box::pin(async move { builder.remap_streaming(mapping).await })
+    mapping: &'a RowAddrTranslator,
+    owned_fragments: Option<&'a RoaringBitmap>,
+) -> Pin<Box<impl Future<Output = Result<Vec<IndexFile>>> + Send + 'a>> {
+    Box::pin(async move { builder.remap_with(mapping.clone(), owned_fragments).await })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2235,6 +2297,7 @@ pub(crate) async fn remap_index_file_v3(
     index: Arc<dyn VectorIndex>,
     mapping: &RowAddrTranslator,
     column: String,
+    owned_fragments: Option<&RoaringBitmap>,
 ) -> Result<Vec<IndexFile>> {
     let dataset = dataset.clone();
     let index_dir = dataset.indices_dir().join(new_uuid.to_string());
@@ -2247,6 +2310,7 @@ pub(crate) async fn remap_index_file_v3(
                         dataset, column, index_dir, index,
                     )?,
                     mapping,
+                    owned_fragments,
                 )
                 .await
             }
@@ -2256,6 +2320,7 @@ pub(crate) async fn remap_index_file_v3(
                         dataset, column, index_dir, index,
                     )?,
                     mapping,
+                    owned_fragments,
                 )
                 .await
             }
@@ -2270,6 +2335,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2279,6 +2345,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2288,6 +2355,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2297,6 +2365,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2306,6 +2375,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2315,6 +2385,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2324,6 +2395,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2334,6 +2406,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2343,6 +2416,7 @@ pub(crate) async fn remap_index_file_v3(
                     dataset, column, index_dir, index,
                 )?,
                 mapping,
+                owned_fragments,
             )
             .await
         }
@@ -2383,9 +2457,10 @@ pub(crate) async fn remap_index_file(
     let mut writer = object_store.create(&new_path).await?;
 
     let tasks = generate_remap_tasks(&index.ivf.offsets, &index.ivf.lengths)?;
+    let mapping = Arc::new(mapping.clone());
 
     let mut task_stream = stream::iter(tasks)
-        .map(|task| task.load_and_remap(reader.clone(), index, mapping))
+        .map(|task| task.load_and_remap(reader.clone(), index, mapping.clone()))
         .buffered(object_store.io_parallelism());
 
     let mut ivf = IvfModel {
@@ -2687,11 +2762,27 @@ pub(crate) async fn merge_segments(
             })?,
         );
     }
-    merge_segments_with_row_filters(
+    merge_segments_inner(
         dataset.object_store.as_ref(),
         &dataset.indices_dir(),
         segments,
-        row_filters,
+        Some(row_filters),
+        lance_index::progress::noop_progress(),
+    )
+    .await
+}
+
+/// Merge staging segments whose remap already removed rows not owned by each
+/// source segment.
+pub(crate) async fn merge_remapped_segments(
+    dataset: &Dataset,
+    segments: Vec<TableIndexMetadata>,
+) -> Result<TableIndexMetadata> {
+    merge_segments_inner(
+        dataset.object_store.as_ref(),
+        &dataset.indices_dir(),
+        segments,
+        None,
         lance_index::progress::noop_progress(),
     )
     .await
@@ -2721,15 +2812,21 @@ pub(crate) async fn merge_segments_with_progress(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    merge_segments_with_row_filters(object_store, indices_dir, segments, row_filters, progress)
-        .await
+    merge_segments_inner(
+        object_store,
+        indices_dir,
+        segments,
+        Some(row_filters),
+        progress,
+    )
+    .await
 }
 
-async fn merge_segments_with_row_filters(
+async fn merge_segments_inner(
     object_store: &ObjectStore,
     indices_dir: &Path,
     segments: Vec<TableIndexMetadata>,
-    row_filters: Vec<lance_index::scalar::OldIndexDataFilter>,
+    row_filters: Option<Vec<lance_index::scalar::OldIndexDataFilter>>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<TableIndexMetadata> {
     if segments.is_empty() {
@@ -2769,7 +2866,7 @@ async fn merge_segments_with_row_filters(
         indices_dir,
         &final_dir,
         &segments,
-        &row_filters,
+        row_filters.as_deref(),
         None,
         progress,
     )
@@ -2782,6 +2879,8 @@ async fn merge_segments_with_row_filters(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(files),
+        clustering_id: None,
+        metadata: Default::default(),
         ..merged_segment
     };
     Ok(merged_segment)
@@ -2797,7 +2896,7 @@ async fn merge_segments_to_dir(
     indices_dir: &Path,
     final_dir: &Path,
     segments: &[TableIndexMetadata],
-    row_filters: &[lance_index::scalar::OldIndexDataFilter],
+    row_filters: Option<&[lance_index::scalar::OldIndexDataFilter]>,
     _requested_index_type: Option<IndexType>,
     progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
 ) -> Result<Vec<IndexFile>> {
@@ -2826,14 +2925,24 @@ async fn merge_segments_to_dir(
                 .join(INDEX_FILE_NAME)
         })
         .collect::<Vec<_>>();
-    let auxiliary_file = lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files_with_row_filters(
-        object_store,
-        &aux_paths,
-        final_dir,
-        row_filters,
-        progress.clone(),
-    )
-    .await?;
+    let auxiliary_file = if let Some(row_filters) = row_filters {
+        lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files_with_row_filters(
+            object_store,
+            &aux_paths,
+            final_dir,
+            row_filters,
+            progress.clone(),
+        )
+        .await?
+    } else {
+        lance_index::vector::distributed::index_merger::merge_partial_vector_auxiliary_files(
+            object_store,
+            &aux_paths,
+            final_dir,
+            progress.clone(),
+        )
+        .await?
+    };
     let index_file = write_root_vector_index_from_auxiliary(
         object_store,
         final_dir,
@@ -3419,15 +3528,30 @@ where
     ))
 }
 
+/// Given `drawn_offsets`, the chunk takes only rows absent from that set and
+/// stops drawing once the set holds the paired number of offsets.
 async fn sample_ivf_training_chunk(
     dataset: &Dataset,
     column: &str,
     sample_size_hint: usize,
     metric_type: MetricType,
     fragment_ids: Option<&[u32]>,
+    drawn_offsets: Option<(&Arc<Mutex<RoaringTreemap>>, usize)>,
 ) -> Result<(FixedSizeListArray, MetricType)> {
-    let training_data =
-        maybe_sample_training_data(dataset, column, sample_size_hint, fragment_ids).await?;
+    let training_data = match drawn_offsets {
+        Some((drawn_offsets, max_drawn)) => {
+            sample_unseen_training_data(
+                dataset,
+                column,
+                sample_size_hint,
+                fragment_ids,
+                drawn_offsets.clone(),
+                max_drawn,
+            )
+            .await?
+        }
+        None => maybe_sample_training_data(dataset, column, sample_size_hint, fragment_ids).await?,
+    };
     let (training_data, mt) = if metric_type == MetricType::Cosine {
         let training_data = normalize_fsl_owned(training_data)?;
         (training_data, MetricType::L2)
@@ -4339,6 +4463,7 @@ async fn refine_streaming_kmeans_with_resampling<T: StreamingKMeansArrowType>(
                 step_sample_size,
                 metric_type,
                 fragment_ids,
+                None,
             )
             .await?;
             metric_policy.validate_sample_metric(mt)?;
@@ -4434,6 +4559,7 @@ async fn refine_streaming_hamming_kmodes_with_resampling(
                 step_sample_size,
                 DistanceType::Hamming,
                 fragment_ids,
+                None,
             )
             .await?;
             HAMMING_METRIC_POLICY.validate_sample_metric(metric_type)?;
@@ -4849,6 +4975,17 @@ fn append_local_coreset<T: StreamingKMeansArrowType>(
     on_progress: Arc<dyn Fn(u32, u32) + Send + Sync>,
 ) -> Result<()> {
     let dimension = data.value_length() as usize;
+    // Dot keeps local k below the row count, which leaves a single row with zero
+    let local_k = local_k.max(1);
+    // Rows that fit the local budget are their own summaries: k-means cannot do
+    // better, and its hierarchical form fails on a repeated row when asked for
+    // one cluster per row.
+    if data.len() <= local_k {
+        for row in streaming_kmeans_values::<T>(data)?.chunks_exact(dimension) {
+            coreset.push(row, 1.0, 0.0);
+        }
+        return Ok(());
+    }
     let sample_rate = data.len().div_ceil(local_k).max(1);
     let kmeans = train_ivf_kmeans_step_arrow_array_no_loss(
         None,
@@ -5398,19 +5535,31 @@ async fn train_streaming_coreset_ivf_model_with_algorithm<A: StreamingCoresetAlg
     } else {
         None
     };
-    let fixed_sample_ranges = if let Some(sampler) = &fixed_sampler {
-        let num_rows = dataset.count_rows(None).await?;
-        let sample_size = num_rows.min(num_partitions * total_sample_rate);
-        Some(generate_fixed_training_ranges(
-            num_rows,
-            sample_size,
+    let selection_rows = match fragment_ids {
+        Some(fragment_ids) => dataset.count_rows_in_fragments(fragment_ids).await?,
+        None => dataset.count_rows(None).await?,
+    };
+    let requested_rows = num_partitions * total_sample_rate;
+    let fixed_sample_ranges = fixed_sampler.as_ref().map(|sampler| {
+        generate_fixed_training_ranges(
+            selection_rows,
+            selection_rows.min(requested_rows),
             dataset.object_store.as_ref().block_size(),
             sampler.byte_width,
+        )
+    });
+    // A row sampled by two steps can end up as two identical summaries, which
+    // the final k-means cannot split, so resampled steps skip drawn rows.
+    // Multivector columns, whose rows hold many vectors, keep independent draws.
+    let drawn_offsets = (fixed_sampler.is_none()
+        && matches!(
+            get_vector_type(dataset.schema(), column)?.0,
+            DataType::FixedSizeList(_, _)
         ))
-    } else {
-        None
-    };
+    .then(|| Arc::new(Mutex::new(RoaringTreemap::new())));
+    let independent_steps = fixed_sampler.is_none() && drawn_offsets.is_none();
     let mut sample_offset = 0;
+    let mut requested_read = 0;
 
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<u64>();
     let progress_worker = {
@@ -5448,10 +5597,18 @@ async fn train_streaming_coreset_ivf_model_with_algorithm<A: StreamingCoresetAlg
         let has_decoupled_budget = params.streaming_coreset_rate.is_some();
         let initial_capacity = coreset_budget.min(num_partitions.saturating_mul(16));
         let mut coreset = algorithm.new_coreset(dimension, initial_capacity);
+        let not_enough_vectors = |sampled: usize| {
+            Error::index(format!(
+                "Not enough training vectors for streaming coreset IVF with metric {}. Requires at least {} rows but sampled {} rows",
+                metric_type, num_partitions, sampled
+            ))
+        };
         let mut step = 0;
         while remaining_sample_rate > 0 {
             let step_sample_rate = remaining_sample_rate.min(streaming_sample_rate);
+            remaining_sample_rate -= step_sample_rate;
             let step_sample_size = num_partitions * step_sample_rate;
+            requested_read += step_sample_size;
             step += 1;
             info!(
                 "Streaming coreset IVF training for metric {}: step {}, sample_rate={}, sample_size={}",
@@ -5461,27 +5618,34 @@ async fn train_streaming_coreset_ivf_model_with_algorithm<A: StreamingCoresetAlg
             let (training_data, sampled_metric) = if let (Some(sample_ranges), Some(sampler)) =
                 (&fixed_sample_ranges, &fixed_sampler)
             {
-                let ranges = sample_ranges.chunk(sample_offset, step_sample_size);
+                // Each step reads its share of the planned rows, so a selection
+                // smaller than the requested sample still reaches every step.
+                let chunk_end = (requested_read as u128 * sample_ranges.num_rows() as u128
+                    / requested_rows as u128) as usize;
+                let ranges = sample_ranges.chunk(sample_offset, chunk_end - sample_offset);
                 sample_offset += ranges.iter().map(range_len).sum::<usize>();
                 sampler.sample_ranges(&ranges, metric_type).await?
             } else {
+                // Each step draws at most its share of the selection, nulls
+                // included, so nulls cannot leave the later steps short of rows.
+                let max_drawn = (requested_read as u128 * selection_rows as u128
+                    / requested_rows as u128) as usize;
                 sample_ivf_training_chunk(
                     dataset,
                     column,
                     step_sample_size,
                     metric_type,
                     fragment_ids,
+                    drawn_offsets
+                        .as_ref()
+                        .map(|drawn_offsets| (drawn_offsets, max_drawn)),
                 )
                 .await?
             };
             let training_data = algorithm.prepare_sample(training_data, sampled_metric)?;
-            if training_data.len() < num_partitions {
-                return Err(Error::index(format!(
-                    "Not enough training vectors for streaming coreset IVF with metric {}. Requires at least {} rows but sampled {} rows",
-                    metric_type,
-                    num_partitions,
-                    training_data.len()
-                )));
+            // Independent draws can repeat rows, so each must cover the partitions
+            if independent_steps && training_data.len() < num_partitions {
+                return Err(not_enough_vectors(training_data.len()));
             }
 
             max_training_vectors = max_training_vectors.max(training_data.len());
@@ -5493,6 +5657,11 @@ async fn train_streaming_coreset_ivf_model_with_algorithm<A: StreamingCoresetAlg
                 total_steps,
                 has_decoupled_budget,
             );
+            // Per-step null density is not known in advance. Retain enough summaries
+            // to reach the partition target before returning to the normal local budget.
+            let partition_floor =
+                num_partitions.saturating_sub(algorithm.coreset_len(&coreset));
+            let local_k = local_k.max(partition_floor).min(training_data.len());
             let mut chunk_coreset = algorithm.new_coreset(dimension, local_k);
             algorithm.append_local_coreset(
                 &mut chunk_coreset,
@@ -5510,7 +5679,11 @@ async fn train_streaming_coreset_ivf_model_with_algorithm<A: StreamingCoresetAlg
                 algorithm.coreset_len(&coreset),
                 metric_type
             );
-            remaining_sample_rate -= step_sample_rate;
+        }
+        // A short selection or dense nulls can leave a step fewer rows than
+        // partitions, or none, so only the sample as a whole must cover them.
+        if total_training_vectors < num_partitions {
+            return Err(not_enough_vectors(total_training_vectors));
         }
 
         let coreset_len = algorithm.coreset_len(&coreset);
@@ -5554,6 +5727,13 @@ async fn train_streaming_coreset_ivf_model_with_algorithm<A: StreamingCoresetAlg
                         )
                         .await?
                 };
+        }
+
+        // Float16 samples are widened for coreset training, but residuals and
+        // query preprocessing require centroids in the vector column's type.
+        if get_vector_type(dataset.schema(), column)?.1 == DataType::Float16 {
+            let values = arrow::compute::cast(centroids.values(), &DataType::Float16)?;
+            centroids = FixedSizeListArray::try_new_from_values(values, dimension as i32)?;
         }
 
         Ok((IvfModel::new(centroids, None), coreset_len))
@@ -5643,6 +5823,7 @@ async fn train_streaming_ivf_model(
                 step_sample_size,
                 metric_type,
                 fragment_ids,
+                None,
             )
             .await?;
             if training_data.len() < num_partitions {
@@ -6381,6 +6562,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_ivf_rejects_zero_target_partition_size() {
+        assert_zero_target_rejected(IvfBuildParams::with_target_partition_size(0)).await;
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_rejects_zero_target_with_num_partitions() {
+        assert_zero_target_rejected(IvfBuildParams {
+            target_partition_size: Some(0),
+            ..IvfBuildParams::new(20)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_rejects_zero_target_with_centroids() {
+        let centroids = Arc::new(
+            FixedSizeListArray::try_new_from_values(
+                Float32Array::from(vec![0.0; 2 * DIM]),
+                DIM as i32,
+            )
+            .unwrap(),
+        );
+        assert_zero_target_rejected(IvfBuildParams {
+            target_partition_size: Some(0),
+            centroids: Some(centroids),
+            ..Default::default()
+        })
+        .await;
+    }
+
+    async fn assert_zero_target_rejected(ivf_params: IvfBuildParams) {
+        let test_dir = TempStrDir::default();
+        let (mut dataset, _) = generate_test_dataset(test_dir.as_str(), 0.0..1.0).await;
+        let params = VectorIndexParams::with_ivf_flat_params(MetricType::L2, ivf_params);
+        let err = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("target_partition_size must be greater than zero"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_create_ivf_pq_with_centroids() {
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
@@ -6593,6 +6821,8 @@ mod tests {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         // We need to commit this index to the dataset so that it can be found
@@ -6633,6 +6863,8 @@ mod tests {
             created_at: None, // Test index, not setting timestamp
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
@@ -6693,6 +6925,8 @@ mod tests {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         // We need to commit this new index to the dataset so it can be found
@@ -7779,11 +8013,7 @@ mod tests {
     ) {
         let test_dir = TempStrDir::default();
         let uri = format!("{}/ds", test_dir.as_str());
-        let expected_type = if values.data_type() == &DataType::Float64 {
-            DataType::Float64
-        } else {
-            DataType::Float32
-        };
+        let expected_type = values.data_type().clone();
         let fsl = FixedSizeListArray::try_new_from_values(values, dimension as i32).unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new(
             "vector",
@@ -8101,6 +8331,75 @@ mod tests {
         );
     }
 
+    // 257 partitions at sample rate 8 request 2,056 vectors, more than any case
+    // holds; a nullable column leaves every other vector null, and the first
+    // step of the NaN case reads only vectors the sampler drops as non-finite
+    #[rstest]
+    #[case::fixed_dot_small_remainder(MetricType::Dot, false, 0, 1_050, None, 4)]
+    #[case::fixed_steps_below_partition_count(MetricType::Dot, false, 0, 600, None, 2)]
+    #[case::fixed_dot_empty_first_step(MetricType::Dot, false, 262, 1_050, None, 2)]
+    #[case::fixed_l2_empty_first_step(MetricType::L2, false, 262, 1_050, None, 2)]
+    #[case::nullable_l2_steps_below_partition_count(MetricType::L2, true, 0, 600, None, 4)]
+    #[case::nullable_dot_small_remainder(MetricType::Dot, true, 0, 1_050, None, 4)]
+    #[case::nullable_dot_boundary(MetricType::Dot, true, 0, 520, None, 2)]
+    #[case::nullable_dot_fragments(MetricType::Dot, true, 0, 4_000, Some(vec![0, 1, 3]), 2)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_coreset_trains_on_fewer_rows_than_sample(
+        #[case] metric_type: MetricType,
+        #[case] nullable: bool,
+        #[case] nan_rows: usize,
+        #[case] num_rows: usize,
+        #[case] fragment_ids: Option<Vec<u32>>,
+        #[case] streaming_sample_rate: usize,
+    ) {
+        let test_dir = TempStrDir::default();
+        let mut values = generate_random_array_with_seed::<Float32Type>(num_rows * 8, [7; 32])
+            .values()
+            .to_vec();
+        values[..nan_rows * 8].fill(f32::NAN);
+        let nulls = nullable.then(|| NullBuffer::from_iter((0..num_rows).map(|row| row % 2 == 0)));
+        let vectors = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            8,
+            Arc::new(PrimitiveArray::<Float32Type>::from(values)),
+            nulls,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            vectors.data_type().clone(),
+            nullable,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &format!("{}/rows", test_dir.as_str()),
+            Some(WriteParams {
+                max_rows_per_file: 1_000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut params = IvfBuildParams::new(257);
+        params.sample_rate = 8;
+        params.streaming_sample_rate = Some(streaming_sample_rate);
+        params.max_iters = 1;
+
+        let ivf_model = build_ivf_model(
+            &dataset,
+            "vector",
+            8,
+            metric_type,
+            &params,
+            fragment_ids.as_deref(),
+            noop_progress(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ivf_model.num_partitions(), 257);
+    }
+
     #[rstest]
     #[case::l2(MetricType::L2)]
     #[case::cosine(MetricType::Cosine)]
@@ -8178,6 +8477,121 @@ mod tests {
             .nearest("vector", query.as_ref(), K)
             .unwrap()
             .distance_metric(metric_type)
+            .use_index(false)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let expected_ids = ground_truth["id"].as_primitive::<UInt64Type>().values();
+        let recall = ids.iter().filter(|id| expected_ids.contains(id)).count() as f32 / K as f32;
+        assert!(recall >= 0.5, "recall: {recall}, row ids: {ids:?}");
+    }
+
+    #[rstest]
+    #[case::float16_streaming_fixed(DataType::Float16, false, Some(1), 1)]
+    #[case::float16_streaming_nullable(DataType::Float16, true, Some(1), 1)]
+    #[case::float16_streaming_without_refinement(DataType::Float16, false, Some(1), 0)]
+    #[case::float32_streaming(DataType::Float32, false, Some(1), 1)]
+    #[case::float16_in_memory(DataType::Float16, false, None, 0)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_ivf_rq_build_and_search_float_types(
+        #[case] value_type: DataType,
+        #[case] is_nullable: bool,
+        #[case] streaming_sample_rate: Option<usize>,
+        #[case] refine_passes: usize,
+    ) {
+        const NUM_ROWS: usize = 600;
+        const NUM_PARTITIONS: usize = 257;
+        const DIMENSION: usize = 32;
+        const EXPECTED_ROW: usize = 17;
+        const K: usize = 5;
+
+        let test_dir = TempStrDir::default();
+        let batch = gen_batch()
+            .with_seed(42.into())
+            .col("id", array::step::<UInt64Type>())
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>((DIMENSION as u32).into()),
+            )
+            .into_batch_rows((NUM_ROWS as u64).into())
+            .unwrap();
+        let vectors = batch["vector"].as_fixed_size_list();
+        let values = arrow::compute::cast(vectors.values(), &value_type).unwrap();
+        let vectors = FixedSizeListArray::try_new_from_values(values, DIMENSION as i32).unwrap();
+        let query = vectors.value(EXPECTED_ROW);
+        let batch = batch
+            .replace_column_schema_by_name("vector", vectors.data_type().clone(), Arc::new(vectors))
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            batch.schema().field(0).clone(),
+            batch.schema().field(1).clone().with_nullable(is_nullable),
+        ]));
+        let batch = RecordBatch::try_new(schema, batch.columns().to_vec()).unwrap();
+        let mut dataset = InsertBuilder::new(test_dir.as_str())
+            .with_params(&WriteParams {
+                max_rows_per_file: NUM_ROWS / 2,
+                ..Default::default()
+            })
+            .execute(vec![batch])
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        let mut ivf_params = IvfBuildParams::new(NUM_PARTITIONS);
+        ivf_params.sample_rate = 2;
+        ivf_params.streaming_sample_rate = streaming_sample_rate;
+        ivf_params.streaming_refine_passes = refine_passes;
+        ivf_params.max_iters = 1;
+        let params = VectorIndexParams::with_ivf_rq_params(
+            MetricType::Cosine,
+            ivf_params,
+            RQBuildParams::new(1),
+        );
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        drop(dataset);
+
+        let dataset = Dataset::open(test_dir.as_str()).await.unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+        let index = dataset
+            .open_vector_index("vector", &indices[0].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let model = index.ivf_model();
+        assert_eq!(model.num_partitions(), NUM_PARTITIONS);
+        assert_eq!(model.centroids_array().unwrap().value_type(), value_type);
+
+        let mut scanner = dataset.scan();
+        // Probe and rerank the full fixture to isolate type correctness from
+        // partition training and random one-bit quantization quality.
+        scanner
+            .nearest("vector", query.as_ref(), K)
+            .unwrap()
+            .distance_metric(MetricType::Cosine)
+            .minimum_nprobes(NUM_PARTITIONS)
+            .refine(NUM_ROWS.div_ceil(K) as u32);
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ANNIvfPartition"), "{plan}");
+        let result = scanner.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), K);
+        let ids = result["id"].as_primitive::<UInt64Type>().values();
+        assert_eq!(ids[0], EXPECTED_ROW as u64);
+        assert!(
+            result["_distance"]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .all(|distance| distance.is_finite())
+        );
+
+        let ground_truth = dataset
+            .scan()
+            .nearest("vector", query.as_ref(), K)
+            .unwrap()
+            .distance_metric(MetricType::Cosine)
             .use_index(false)
             .try_into_batch()
             .await
@@ -8332,6 +8746,38 @@ mod tests {
         assert!((coreset.values[0] - 8.0 / 3.0).abs() < 1e-6);
         assert_eq!(coreset.weights, vec![3.0]);
         assert_eq!(coreset.losses, vec![0.0]);
+    }
+
+    // One cluster for each of 300 rows over 150 distinct vectors, and a single
+    // row under Dot, whose local k is zero
+    #[rstest]
+    #[case::repeated_rows(300, 150, 300, &L2_METRIC_POLICY)]
+    #[case::single_dot_row(1, 1, 0, &DOT_METRIC_POLICY)]
+    fn test_local_coreset_keeps_rows_that_fit_its_budget(
+        #[case] num_rows: usize,
+        #[case] distinct_rows: usize,
+        #[case] local_k: usize,
+        #[case] metric_policy: &dyn StreamingFloatKMeansMetricPolicy<Float32Type>,
+    ) {
+        let values = (0..num_rows)
+            .flat_map(|row| [(row % distinct_rows) as f32, 0.0])
+            .collect::<Vec<_>>();
+        let data = streaming_kmeans_fsl_from_values::<Float32Type>(values.clone(), 2).unwrap();
+        let mut coreset = WeightedCoreset::<Float32Type>::new(2, num_rows);
+
+        append_local_coreset(
+            &mut coreset,
+            &data,
+            metric_policy,
+            local_k,
+            1,
+            Arc::new(|_, _| {}),
+        )
+        .unwrap();
+
+        assert_eq!(coreset.values, values);
+        assert_eq!(coreset.weights, vec![1.0; num_rows]);
+        assert_eq!(coreset.losses, vec![0.0; num_rows]);
     }
 
     #[test]
@@ -8629,6 +9075,66 @@ mod tests {
             error.to_string().contains("cannot train 257 centroids"),
             "{error}"
         );
+    }
+
+    // Disjoint steps only need 257 vectors between them, which an all-null
+    // column lacks; multivector steps draw independently, so each of them
+    // must hold 257 on its own
+    #[rstest]
+    #[case::all_null(false, "sampled 0 rows")]
+    #[case::multivector(true, "sampled 200 rows")]
+    #[tokio::test]
+    async fn test_streaming_coreset_rejects_too_few_vectors(
+        #[case] multivector: bool,
+        #[case] sampled: &str,
+    ) {
+        let test_dir = TempStrDir::default();
+        let values = generate_random_array_with_seed::<Float32Type>(200 * 8, [3; 32]);
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let column: ArrayRef = if multivector {
+            let vectors = FixedSizeListArray::try_new(item, 8, Arc::new(values), None).unwrap();
+            Arc::new(arrow_array::ListArray::new(
+                Arc::new(Field::new("item", vectors.data_type().clone(), true)),
+                arrow_buffer::OffsetBuffer::from_lengths(repeat_n(2, 100)),
+                Arc::new(vectors),
+                None,
+            ))
+        } else {
+            let nulls = Some(NullBuffer::new_null(200));
+            Arc::new(FixedSizeListArray::try_new(item, 8, Arc::new(values), nulls).unwrap())
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            column.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &format!("{}/few", test_dir.as_str()),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut params = IvfBuildParams::new(257);
+        params.sample_rate = 8;
+        params.streaming_sample_rate = Some(2);
+        params.max_iters = 1;
+
+        let error = build_ivf_model(
+            &dataset,
+            "vector",
+            8,
+            MetricType::Dot,
+            &params,
+            None,
+            noop_progress(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Not enough training vectors"), "{error}");
+        assert!(error.contains(sampled), "{error}");
     }
 
     #[rstest]
@@ -9011,7 +9517,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case::f16("f16", DataType::Float32)]
+    #[case::f16("f16", DataType::Float16)]
     #[case::f32("f32", DataType::Float32)]
     #[case::f64("f64", DataType::Float64)]
     #[case::int8("int8", DataType::Float32)]
@@ -9277,6 +9783,60 @@ mod tests {
         );
     }
 
+    /// The codebook length matches, but its values are f32 while the column is
+    /// f16. Every create path used to accept it and panic on the first batch
+    /// when quantization read the codebook as f16.
+    #[rstest]
+    #[case::v3(IndexFileVersion::V3)]
+    #[case::legacy(IndexFileVersion::Legacy)]
+    #[tokio::test]
+    async fn test_create_ivf_pq_rejects_codebook_of_another_value_type(
+        #[case] version: IndexFileVersion,
+    ) {
+        const DIM: usize = 32;
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float16, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+        let arr = generate_random_array_with_seed::<Float16Type>(1000 * DIM, [22; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let codebook = Arc::new(generate_random_array_with_seed::<Float32Type>(
+            256 * DIM,
+            [22; 32],
+        ));
+        let mut params = VectorIndexParams::with_ivf_pq_params(
+            MetricType::L2,
+            fast_ivf_params(2),
+            PQBuildParams::with_codebook(4, 8, codebook),
+        );
+        params.version = version;
+        let error = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .expect_err("a codebook of another value type must be rejected");
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains(
+                "PQ codebook value type Float32 does not match the vector value type Float16"
+            ),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn test_create_ivf_flat_f16() {
         let test_dir = TempStrDir::default();
@@ -9434,7 +9994,7 @@ mod tests {
             .chunks(dim)
             .enumerate()
             .map(|(i, vec)| {
-                let dist = distance_type.func()(query, vec);
+                let dist = distance_type.try_func().unwrap()(query, vec);
                 (dist, i as u32)
             })
             .collect_vec();
@@ -9833,6 +10393,84 @@ mod tests {
         dataset.prewarm_index("my_idx").await.unwrap();
         let stats = dataset.object_store.as_ref().io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
+    }
+
+    /// Count this process's descriptors for index files under `prefix`.
+    ///
+    /// Deleted files still match: their `/proc` link keeps the old path with a
+    /// ` (deleted)` suffix.
+    #[cfg(target_os = "linux")]
+    fn count_open_index_fds(prefix: &str) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("read /proc/self/fd")
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .filter(|target| {
+                let target = target.to_string_lossy();
+                target.starts_with(prefix) && target.contains("_indices")
+            })
+            .count()
+    }
+
+    /// A cached legacy index must not keep a descriptor open for the file it
+    /// was loaded from. Creating indexes in a loop mints a new UUID each time;
+    /// before the fix the session index cache pinned one descriptor per UUID,
+    /// which is what let descriptor counts grow with every optimize/rewrite.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_legacy_index_cache_does_not_pin_file_descriptors() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let dim = DIM as i32;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+            false,
+        )]));
+        let vectors = generate_random_array(512 * DIM);
+        let fsl = FixedSizeListArray::try_new_from_values(vectors, dim).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            PQBuildParams::default(),
+        )
+        .version(IndexFileVersion::Legacy)
+        .clone();
+        let query = Float32Array::from_iter_values(repeat_n(0.0, DIM));
+
+        for round in 0..4 {
+            dataset
+                .create_index(
+                    &["vector"],
+                    IndexType::Vector,
+                    Some("my_idx".to_owned()),
+                    &params,
+                    true,
+                )
+                .await
+                .unwrap();
+
+            // Querying opens the index, which caches it for the session.
+            dataset
+                .scan()
+                .nearest("vector", &query, 10)
+                .unwrap()
+                .project(&["_rowid"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+
+            let open_fds = count_open_index_fds(test_dir.as_str());
+            assert_eq!(
+                open_fds, 0,
+                "round {round}: cached legacy index pinned {open_fds} descriptors"
+            );
+        }
     }
 
     #[tokio::test]

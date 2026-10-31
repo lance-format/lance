@@ -41,7 +41,8 @@ pub use compound::{
 };
 #[doc(hidden)]
 pub use cross_column::cross_column_compound_search;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion_execution::SendableRecordBatchStream;
+use documents::DocumentRemapping;
 pub use index::*;
 use lance_core::{Result, cache::LanceCache};
 pub use lance_tokenizer::Language;
@@ -127,15 +128,17 @@ pub(crate) fn final_query_tokens(
     let initial_capacity = query_tokens.len().min(params.max_expansions);
     let mut expanded_tokens = Vec::with_capacity(initial_capacity);
     let mut expanded_positions = Vec::with_capacity(initial_capacity);
+    let mut expanded_groups = Vec::with_capacity(initial_capacity);
     let mut seen = HashSet::new();
-    let mut source_terms_by_position = BTreeMap::<u32, Vec<&str>>::new();
+    let mut source_terms_by_group = BTreeMap::<u32, (u32, Vec<&str>)>::new();
     for token_idx in 0..query_tokens.len() {
-        source_terms_by_position
-            .entry(query_tokens.position(token_idx))
-            .or_default()
+        source_terms_by_group
+            .entry(query_tokens.position_for_query(token_idx, params.phrase_slop.is_some()))
+            .or_insert_with(|| (query_tokens.position(token_idx), Vec::new()))
+            .1
             .push(query_tokens.get_token(token_idx));
     }
-    for (position, source_terms) in source_terms_by_position {
+    for (group, (position, source_terms)) in source_terms_by_group {
         let remaining = params.max_expansions.saturating_sub(expanded_tokens.len());
         if remaining == 0 {
             break;
@@ -162,9 +165,10 @@ pub(crate) fn final_query_tokens(
             if expanded_tokens.len() >= params.max_expansions {
                 break;
             }
-            if seen.insert((candidate.clone(), position)) {
+            if seen.insert((candidate.clone(), group)) {
                 expanded_tokens.push(candidate);
                 expanded_positions.push(position);
+                expanded_groups.push(group);
             }
         }
     }
@@ -172,7 +176,8 @@ pub(crate) fn final_query_tokens(
         expanded_tokens,
         expanded_positions,
         query_tokens.token_type().clone(),
-    ))
+    )
+    .with_term_groups(expanded_groups))
 }
 
 /// Deduplicated terms in first-occurrence order, plus each token's term
@@ -192,11 +197,17 @@ fn unique_terms(tokens: &Tokens) -> (Vec<String>, Box<[usize]>) {
     (terms, term_by_token)
 }
 
-pub(crate) fn has_all_query_positions(query_tokens: &Tokens, final_tokens: &Tokens) -> bool {
+pub(crate) fn has_all_query_positions(
+    query_tokens: &Tokens,
+    final_tokens: &Tokens,
+    is_phrase_query: bool,
+) -> bool {
     let surviving_positions = (0..final_tokens.len())
-        .map(|index| final_tokens.position(index))
+        .map(|index| final_tokens.position_for_query(index, is_phrase_query))
         .collect::<HashSet<_>>();
-    (0..query_tokens.len()).all(|index| surviving_positions.contains(&query_tokens.position(index)))
+    (0..query_tokens.len()).all(|index| {
+        surviving_positions.contains(&query_tokens.position_for_query(index, is_phrase_query))
+    })
 }
 
 const LANCE_FTS_SYNC_DF_ENV: &str = "LANCE_FTS_SYNC_DF";
@@ -306,8 +317,9 @@ fn merge_loaded_bm25_stats(
 /// Expand and score one indexed query leaf exactly once across all segments.
 ///
 /// Expansion consumes one deterministic `max_expansions` budget in query
-/// position order, with terms ordered lexicographically across every physical
-/// segment and partition and deduplicated by `(term, position)`. The scorer's
+/// group order, with terms ordered lexicographically across every physical
+/// segment and partition and deduplicated by `(term, group)`. Match groups
+/// identify independent terms; phrase groups retain tokenizer offsets. The scorer's
 /// document frequencies are then merged for exactly those final terms.
 ///
 /// `base_scorer` is an API-compatibility hook for distributed/mixed callers
@@ -326,7 +338,8 @@ pub async fn prepare_bm25_query(
     })?;
     let (tokens, has_all_query_positions) = if uses_fuzzy_expansion(params.fuzziness) {
         let tokens = Arc::new(final_query_tokens(indices, &query_tokens, params)?);
-        let has_all_query_positions = has_all_query_positions(&query_tokens, tokens.as_ref());
+        let has_all_query_positions =
+            has_all_query_positions(&query_tokens, tokens.as_ref(), params.phrase_slop.is_some());
         (tokens, has_all_query_positions)
     } else {
         (Arc::new(query_tokens), true)
@@ -433,8 +446,9 @@ use crate::scalar::{
     CreatedIndex, RowIdRemapper, ScalarIndex,
     expression::{FtsQueryParser, ScalarQueryParser},
     registry::{
-        BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-        TrainingRequest, single_flight_store_bound_open,
+        BasicTrainer, ScalarIndexCacheKey, ScalarIndexLoad, ScalarIndexPlugin,
+        StoreBoundScalarIndexCacheEntry, TrainingCriteria, TrainingOrdering, TrainingRequest,
+        single_flight_store_bound_open_with_snapshot,
     },
 };
 
@@ -667,16 +681,87 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         load: ScalarIndexLoad<'_>,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let rebind_store = index_store.clone();
-        single_flight_store_bound_open(index_store, cache, load, move |index| async move {
-            let index = index
-                .as_any()
-                .downcast_ref::<InvertedIndex>()
-                .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?;
-            index
-                .with_store(rebind_store, frag_reuse_index)
-                .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
-        })
+        single_flight_store_bound_open_with_snapshot(
+            index_store,
+            cache,
+            load,
+            move |index| async move {
+                let index = index
+                    .as_any()
+                    .downcast_ref::<InvertedIndex>()
+                    .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?;
+                index
+                    .with_store(rebind_store, frag_reuse_index.map(DocumentRemapping::Sync))
+                    .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
+            },
+            |index| self.cache_snapshot(index),
+        )
         .await
+    }
+
+    async fn put_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        cache: &LanceCache,
+        index: Arc<dyn ScalarIndex>,
+    ) -> Result<()> {
+        let snapshot = self.cache_snapshot(index.as_ref())?;
+        cache
+            .insert_unsized_with_key(
+                &ScalarIndexCacheKey,
+                Arc::new(StoreBoundScalarIndexCacheEntry::with_snapshot(
+                    index_store,
+                    index,
+                    snapshot,
+                )),
+            )
+            .await;
+        Ok(())
+    }
+
+    fn cache_snapshot(&self, index: &dyn ScalarIndex) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?
+            .cache_snapshot()
+            .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
+    }
+
+    fn rebind_with_remapping(
+        &self,
+        index: &dyn ScalarIndex,
+        index_store: Arc<dyn IndexStore>,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
+        index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?
+            .with_store(index_store, remapping.map(DocumentRemapping::Batch))
+            .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
+    }
+
+    async fn get_from_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        let Some(entry) = cache.get_unsized_with_key(&ScalarIndexCacheKey).await else {
+            return Ok(None);
+        };
+        if let Some(index) = entry.index_for_store(&index_store) {
+            return Ok(Some(index));
+        }
+        let index = entry.index();
+        index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?
+            .with_store(index_store, frag_reuse_index.map(DocumentRemapping::Sync))
+            .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {

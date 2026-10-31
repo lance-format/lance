@@ -209,6 +209,7 @@ pub struct PrimitiveStructuralEncoder {
     accumulation_queue: AccumulationQueue,
 
     keep_original_array: bool,
+    flush_next: bool,
     accumulated_repdefs: Vec<RepDefBuilder>,
     page_encodings: Arc<[PrimitivePageEncoding]>,
     column_index: u32,
@@ -308,6 +309,7 @@ impl PrimitiveStructuralEncoder {
                 options.keep_original_array,
             ),
             keep_original_array: options.keep_original_array,
+            flush_next: false,
             accumulated_repdefs: Vec::new(),
             column_index,
             page_encodings,
@@ -2051,6 +2053,9 @@ impl PrimitiveStructuralEncoder {
         }
 
         let data_block = DataBlock::from_arrays(&arrays, num_values);
+        // The data block owns the normalized page buffers.  Release any
+        // detached source snapshots before compression allocates its output.
+        drop(arrays);
 
         if let Some(num_levels) = single_row_miniblock_repdef_levels {
             let requested_encoding = encoding_metadata
@@ -2646,14 +2651,73 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
         let array = Self::extract_validity(array, &mut repdef, self.keep_original_array)?;
         self.accumulated_repdefs.push(repdef);
 
-        if let Some((arrays, row_number, num_rows)) =
-            self.accumulation_queue.insert(array, row_number, num_rows)
-        {
-            let accumulated_repdefs = std::mem::take(&mut self.accumulated_repdefs);
-            Ok(self.do_flush(arrays, accumulated_repdefs, row_number, num_rows)?)
+        let pages = if self.flush_next {
+            self.flush_next = false;
+            self.accumulation_queue
+                .insert_for_page_boundary(array, row_number, num_rows)
         } else {
-            Ok(vec![])
+            self.accumulation_queue
+                .insert_with_pages(array, row_number, num_rows)
+        };
+        if pages.is_empty() {
+            return Ok(vec![]);
         }
+
+        let mut tasks = Vec::new();
+        match pages.as_slice() {
+            [page] if page.includes_inserted_array => {
+                let repdefs = std::mem::take(&mut self.accumulated_repdefs);
+                tasks.extend(self.do_flush(
+                    page.arrays.clone(),
+                    repdefs,
+                    page.row_number,
+                    page.num_rows,
+                )?);
+            }
+            [page] => {
+                let current_repdef = self.accumulated_repdefs.pop();
+                let repdefs = std::mem::take(&mut self.accumulated_repdefs);
+                tasks.extend(self.do_flush(
+                    page.arrays.clone(),
+                    repdefs,
+                    page.row_number,
+                    page.num_rows,
+                )?);
+                if let Some(current_repdef) = current_repdef {
+                    self.accumulated_repdefs.push(current_repdef);
+                }
+            }
+            [previous, current] if current.includes_inserted_array => {
+                let current_repdef = self
+                    .accumulated_repdefs
+                    .pop()
+                    .ok_or_else(|| Error::internal("missing current repdef"))?;
+                let repdefs = std::mem::take(&mut self.accumulated_repdefs);
+                tasks.extend(self.do_flush(
+                    previous.arrays.clone(),
+                    repdefs,
+                    previous.row_number,
+                    previous.num_rows,
+                )?);
+                tasks.extend(self.do_flush(
+                    current.arrays.clone(),
+                    vec![current_repdef],
+                    current.row_number,
+                    current.num_rows,
+                )?);
+            }
+            _ => {
+                return Err(Error::internal(format!(
+                    "accumulation queue returned {} pages for one input",
+                    pages.len()
+                )));
+            }
+        }
+        Ok(tasks)
+    }
+
+    fn prepare_for_flush(&mut self) {
+        self.flush_next = true;
     }
 
     // If there is any data left in the buffer then create an encode task from it

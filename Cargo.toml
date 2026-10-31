@@ -4,6 +4,7 @@ members = [
     "rust/lance",
     "rust/lance-arrow",
     "rust/lance-core",
+    "rust/lance-datafusion-exec",
     "rust/lance-datagen",
     "rust/lance-encoding",
     "rust/lance-file",
@@ -34,7 +35,7 @@ resolver = "3"
 
 
 [workspace.package]
-version = "15.0.0-beta.1"
+version = "15.0.0-beta.7"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
 license = "Apache-2.0"
@@ -54,49 +55,51 @@ categories = [
     "development-tools",
     "science",
 ]
-rust-version = "1.94.0"
+rust-version = "1.95.0"
 
 [workspace.dependencies]
 arc-swap = "1.7"
 libc = "0.2.176"
-lance = { version = "=15.0.0-beta.1", path = "./rust/lance", default-features = false }
-lance-arrow = { version = "=15.0.0-beta.1", path = "./rust/lance-arrow" }
-lance-core = { version = "=15.0.0-beta.1", path = "./rust/lance-core" }
-lance-datafusion = { version = "=15.0.0-beta.1", path = "./rust/lance-datafusion" }
-lance-datagen = { version = "=15.0.0-beta.1", path = "./rust/lance-datagen" }
-lance-derive = { version = "=15.0.0-beta.1", path = "./rust/lance-derive" }
-lance-encoding = { version = "=15.0.0-beta.1", path = "./rust/lance-encoding" }
-lance-file = { version = "=15.0.0-beta.1", path = "./rust/lance-file" }
-lance-geo = { version = "=15.0.0-beta.1", path = "./rust/lance-geo" }
-lance-index = { version = "=15.0.0-beta.1", path = "./rust/lance-index" }
-lance-index-core = { version = "=15.0.0-beta.1", path = "./rust/lance-index-core" }
-lance-io = { version = "=15.0.0-beta.1", path = "./rust/lance-io", default-features = false }
-lance-jsonb = { version = "=15.0.0-beta.1", path = "./rust/lance-jsonb" }
-lance-linalg = { version = "=15.0.0-beta.1", path = "./rust/lance-linalg" }
-lance-namespace = { version = "=15.0.0-beta.1", path = "./rust/lance-namespace" }
-lance-namespace-impls = { version = "=15.0.0-beta.1", path = "./rust/lance-namespace-impls" }
+lance = { version = "=15.0.0-beta.7", path = "./rust/lance", default-features = false }
+lance-arrow = { version = "=15.0.0-beta.7", path = "./rust/lance-arrow" }
+lance-core = { version = "=15.0.0-beta.7", path = "./rust/lance-core" }
+lance-datafusion = { version = "=15.0.0-beta.7", path = "./rust/lance-datafusion" }
+lance-datafusion-exec = { version = "=15.0.0-beta.7", path = "./rust/lance-datafusion-exec" }
+lance-datagen = { version = "=15.0.0-beta.7", path = "./rust/lance-datagen" }
+lance-derive = { version = "=15.0.0-beta.7", path = "./rust/lance-derive" }
+lance-encoding = { version = "=15.0.0-beta.7", path = "./rust/lance-encoding" }
+lance-file = { version = "=15.0.0-beta.7", path = "./rust/lance-file" }
+lance-geo = { version = "=15.0.0-beta.7", path = "./rust/lance-geo" }
+lance-index = { version = "=15.0.0-beta.7", path = "./rust/lance-index" }
+lance-index-core = { version = "=15.0.0-beta.7", path = "./rust/lance-index-core" }
+lance-io = { version = "=15.0.0-beta.7", path = "./rust/lance-io", default-features = false }
+lance-jsonb = { version = "=15.0.0-beta.7", path = "./rust/lance-jsonb" }
+lance-linalg = { version = "=15.0.0-beta.7", path = "./rust/lance-linalg" }
+lance-namespace = { version = "=15.0.0-beta.7", path = "./rust/lance-namespace" }
+lance-namespace-impls = { version = "=15.0.0-beta.7", path = "./rust/lance-namespace-impls" }
 lance-namespace-reqwest-client = "0.13.0"
-lance-select = { version = "=15.0.0-beta.1", path = "./rust/lance-select" }
-lance-tokenizer = { version = "=15.0.0-beta.1", path = "./rust/lance-tokenizer" }
-lance-table = { version = "=15.0.0-beta.1", path = "./rust/lance-table" }
-lance-test-macros = { version = "=15.0.0-beta.1", path = "./rust/lance-test-macros" }
-lance-testing = { version = "=15.0.0-beta.1", path = "./rust/lance-testing" }
+lance-select = { version = "=15.0.0-beta.7", path = "./rust/lance-select" }
+lance-tokenizer = { version = "=15.0.0-beta.7", path = "./rust/lance-tokenizer" }
+lance-table = { version = "=15.0.0-beta.7", path = "./rust/lance-table" }
+lance-test-macros = { version = "=15.0.0-beta.7", path = "./rust/lance-test-macros" }
+lance-testing = { version = "=15.0.0-beta.7", path = "./rust/lance-testing" }
 all_asserts = "2.3.1"
 approx = "0.5.1"
+argminmax = "0.7.1"
 # Note that this one does not include pyarrow
-arrow = { version = "58.0.0", optional = false, features = ["prettyprint"] }
-lance-arrow-scalar = { version = "=58.0.0", path = "./rust/arrow-scalar" }
-lance-arrow-stats = { version = "=58.0.0", path = "./rust/arrow-stats" }
-arrow-arith = "58.0.0"
-arrow-array = "58.0.0"
-arrow-buffer = "58.0.0"
-arrow-cast = "58.0.0"
-arrow-data = "58.0.0"
-arrow-ipc = { version = "58.0.0", features = ["zstd"] }
-arrow-ord = "58.0.0"
-arrow-row = "58.0.0"
-arrow-schema = "58.0.0"
-arrow-select = "58.0.0"
+arrow = { version = "59.2.0", optional = false, features = ["prettyprint"] }
+lance-arrow-scalar = { version = "=59.0.0", path = "./rust/arrow-scalar" }
+lance-arrow-stats = { version = "=59.0.0", path = "./rust/arrow-stats" }
+arrow-arith = "59.2.0"
+arrow-array = "59.2.0"
+arrow-buffer = "59.2.0"
+arrow-cast = "59.2.0"
+arrow-data = "59.2.0"
+arrow-ipc = { version = "59.2.0", features = ["zstd"] }
+arrow-ord = "59.2.0"
+arrow-row = "59.2.0"
+arrow-schema = "59.2.0"
+arrow-select = "59.2.0"
 async-recursion = "1.0"
 async-trait = "0.1"
 axum = "0.7"
@@ -109,7 +112,7 @@ half = { "version" = "2.1", default-features = false, features = [
     "std",
     "bytemuck",
 ] }
-lance-bitpacking = { version = "=15.0.0-beta.1", path = "./rust/compression/bitpacking" }
+lance-bitpacking = { version = "=15.0.0-beta.7", path = "./rust/compression/bitpacking" }
 bitpacking = "0.9"
 bitvec = "1"
 blake3 = "1.8.5"
@@ -132,7 +135,7 @@ criterion = { version = "0.8.2", features = [
 crossbeam-queue = "0.3"
 crossbeam-skiplist = "0.1"
 dashmap = "6"
-datafusion = { version = "54.0.0", default-features = false, features = [
+datafusion = { version = "55.0.0", default-features = false, features = [
     "crypto_expressions",
     "datetime_expressions",
     "encoding_expressions",
@@ -142,23 +145,25 @@ datafusion = { version = "54.0.0", default-features = false, features = [
     "string_expressions",
     "unicode_expressions",
 ] }
-datafusion-common = "54.0.0"
-datafusion-functions = { version = "54.0.0", default-features = false, features = ["regex_expressions"] }
-datafusion-sql = "54.0.0"
-datafusion-expr = "54.0.0"
-datafusion-physical-expr = "54.0.0"
-datafusion-physical-plan = "54.0.0"
-datafusion-substrait = { version = "54.0.0", default-features = false }
+datafusion-common = "55.0.0"
+datafusion-functions = { version = "55.0.0", default-features = false, features = ["regex_expressions"] }
+datafusion-sql = "55.0.0"
+datafusion-execution = "55.0.0"
+datafusion-expr = "55.0.0"
+datafusion-functions-nested = "55.0.0"
+datafusion-physical-expr = "55.0.0"
+datafusion-physical-plan = "55.0.0"
+datafusion-substrait = { version = "55.0.0", default-features = false }
 dirs = "6.0.0"
 either = "1.0"
 env_logger = "0.11.7"
 nalgebra = { version = "0.33.2", default-features = false, features = ["std"] }
 fst = { version = "0.4.7", features = ["levenshtein"] }
-fsst = { version = "=15.0.0-beta.1", path = "./rust/compression/fsst" }
+fsst = { version = "=15.0.0-beta.7", path = "./rust/compression/fsst" }
 futures = "0.3"
-geoarrow-array = "0.8"
-geoarrow-schema = "0.8"
-geodatafusion = "0.5.0"
+geoarrow-array = "0.9"
+geoarrow-schema = "0.9"
+geodatafusion = "0.6.0"
 geo-traits = "0.3.0"
 geo-types = "0.7.16"
 hex = "0.4.3"
@@ -189,7 +194,7 @@ goosefs-sdk = { version = "0.2.2", default-features = false }
 # Cache features (`metadata-cache`, `page-cache-io-uring`) belong on the
 # consumer (`lance-io`'s `goosefs` feature), not this workspace pin.
 opendal-service-goosefs = { version = "0.59.2", default-features = false }
-parquet = { version = "58.0.0", default-features = false, features = [
+parquet = { version = "59.2.0", default-features = false, features = [
     "arrow",
     "async",
 ] }
@@ -286,6 +291,3 @@ multiple-crate-versions = "allow"
 single_range_in_vec_init = "allow"
 large_futures = "deny"
 disallowed_macros = "deny"
-
-[patch.crates-io]
-object_store = { git = "https://github.com/apache/arrow-rs-object-store.git", rev = "c10758c207c0103355f940f0c736fb8ecb157b04" }

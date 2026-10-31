@@ -17,13 +17,13 @@ use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef, SortOptions};
 use async_trait::async_trait;
 use bytes::Bytes;
-use datafusion::execution::RecordBatchStream;
-use datafusion::physical_plan::{
+use datafusion_common::{DataFusionError, ScalarValue};
+use datafusion_execution::RecordBatchStream;
+use datafusion_physical_expr::{PhysicalSortExpr, expressions::Column};
+use datafusion_physical_plan::{
     ExecutionPlan, SendableRecordBatchStream, sorts::sort::SortExec,
     stream::RecordBatchStreamAdapter,
 };
-use datafusion_common::{DataFusionError, ScalarValue};
-use datafusion_physical_expr::{PhysicalSortExpr, expressions::Column};
 use futures::{StreamExt, TryStream, TryStreamExt, future::Either, stream::BoxStream};
 use lance_arrow::deepcopy::deep_copy_batch_sliced;
 use lance_core::cache::{
@@ -33,8 +33,8 @@ use lance_core::cache::{
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::{Error, ROW_ADDR, Result};
-use lance_datafusion::exec::{
-    HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec, execute_plan, get_session_context,
+use lance_datafusion_exec::exec::{
+    HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec, execute_plan, new_session_config,
 };
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
@@ -627,7 +627,7 @@ fn sort_labels_by_value(
     // Keep each input batch within one sorted output chunk. DataFusion's
     // in-memory merge reserves comparison keys as it reads each chunk;
     // multi-chunk inputs can exhaust the pool while other chunks remain buffered.
-    let chunk_rows = get_session_context(&options).state().config().batch_size();
+    let chunk_rows = new_session_config(&options).batch_size();
     // Pin the sort's chunk size to the split's, so the two cannot drift apart.
     options.batch_size = Some(chunk_rows);
     let schema = unnested.schema();
@@ -2302,12 +2302,10 @@ mod tests {
     #[serial_test::serial(LANCE_DF_SPILL_POOL)]
     async fn test_null_labels_keep_their_rows_across_a_split_point() {
         const FRAGMENT_1: u64 = 1 << 32;
-        let chunk_rows = get_session_context(&LanceExecutionOptions {
+        let chunk_rows = new_session_config(&LanceExecutionOptions {
             use_spilling: true,
             ..Default::default()
         })
-        .state()
-        .config()
         .batch_size();
         // Row 0 unnests to rows 0..chunk_rows, so its trailing null ends the first
         // piece and the next row's leading null starts the second.

@@ -625,6 +625,7 @@ impl MergeInsertBuilder {
     pub fn mark_sstables_as_compacted<'a>(
         mut slf: PyRefMut<'a, Self>,
         sstables: Vec<Bound<'a, crate::mem_wal::PyCompactedSsTable>>,
+        dir_id: String,
     ) -> PyResult<PyRefMut<'a, Self>> {
         use lance_index::mem_wal::CompactedSsTable;
 
@@ -632,7 +633,8 @@ impl MergeInsertBuilder {
             .iter()
             .map(|sstable| sstable.borrow().to_lance())
             .collect::<PyResult<_>>()?;
-        slf.builder.mark_sstables_as_compacted(compacted_sstables);
+        slf.builder
+            .mark_sstables_as_compacted(dir_id, compacted_sstables);
         Ok(slf)
     }
 }
@@ -951,6 +953,17 @@ fn version_to_py(py: Python<'_>, version: &Version) -> PyResult<Py<PyAny>> {
     )?;
     let tup: Vec<(&String, &String)> = version.metadata.iter().collect();
     dict.set_item("metadata", tup.into_py_dict(py)?)?;
+    dict.into_py_any(py)
+}
+
+fn tag_to_py(py: Python<'_>, tag: TagContents) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("branch", tag.branch)?;
+    dict.set_item("version", tag.version)?;
+    dict.set_item("created_at", tag.created_at)?;
+    dict.set_item("updated_at", tag.updated_at)?;
+    dict.set_item("manifest_size", tag.manifest_size)?;
+    dict.set_item("metadata", tag.metadata)?;
     dict.into_py_any(py)
 }
 
@@ -2413,15 +2426,7 @@ impl Dataset {
         let pylist = PyList::empty(py);
 
         for (tag_name, tag_content) in tags {
-            let dict = PyDict::new(py);
-            dict.set_item("branch", tag_content.branch.clone())?;
-            dict.set_item("version", tag_content.version)?;
-            dict.set_item("created_at", tag_content.created_at)?;
-            dict.set_item("updated_at", tag_content.updated_at)?;
-            dict.set_item("manifest_size", tag_content.manifest_size)?;
-            dict.set_item("metadata", tag_content.metadata.clone())?;
-
-            pylist.append((tag_name.as_str(), dict))?;
+            pylist.append((tag_name, tag_to_py(py, tag_content)?))?;
         }
 
         Ok(pylist.unbind().as_any().clone())
@@ -2432,17 +2437,22 @@ impl Dataset {
         let tags = self_.list_tags()?;
 
         let pytags = PyDict::new(py);
-        for (k, v) in tags.iter() {
-            let dict = PyDict::new(py);
-            dict.set_item("branch", v.branch.clone())?;
-            dict.set_item("version", v.version)?;
-            dict.set_item("created_at", v.created_at)?;
-            dict.set_item("updated_at", v.updated_at)?;
-            dict.set_item("manifest_size", v.manifest_size)?;
-            dict.set_item("metadata", v.metadata.clone())?;
-            pytags.set_item(k, dict.into_py_any(py)?)?;
+        for (tag_name, tag_content) in tags {
+            pytags.set_item(tag_name, tag_to_py(py, tag_content)?)?;
         }
         pytags.into_py_any(py)
+    }
+
+    fn get_tag(self_: PyRef<'_, Self>, tag: String) -> PyResult<Py<PyAny>> {
+        let tag_content =
+            rt().block_on(None, self_.ds.tags().get(&tag))?
+                .map_err(|err| match err {
+                    Error::InvalidRef { .. }
+                    | Error::NotFound { .. }
+                    | Error::RefNotFound { .. } => PyValueError::new_err(err.to_string()),
+                    _ => PyIOError::new_err(err.to_string()),
+                })?;
+        tag_to_py(self_.py(), tag_content)
     }
 
     fn get_version(self_: PyRef<'_, Self>, tag: String) -> PyResult<u64> {
@@ -4008,7 +4018,8 @@ impl Dataset {
     /// has not been initialized.
     ///
     /// The returned dict has `num_shards`, `maintained_indexes`,
-    /// `maintain_all_indexes`, `writer_config_defaults`, and `sharding_specs`.
+    /// `maintain_all_indexes`, `writer_config_defaults`, `sharding_specs`, and
+    /// `dir_id`.
     ///
     /// `maintain_all_indexes` is what distinguishes maintaining every index
     /// the table has from maintaining none: both leave `maintained_indexes`
@@ -4029,6 +4040,7 @@ impl Dataset {
         dict.set_item("maintained_indexes", details.maintained_indexes)?;
         dict.set_item("maintain_all_indexes", details.maintain_all_indexes)?;
         dict.set_item("writer_config_defaults", details.writer_config_defaults)?;
+        dict.set_item("dir_id", details.dir_id)?;
 
         let specs = PyList::empty(py);
         for spec in &details.sharding_specs {
@@ -5989,7 +6001,9 @@ impl PySearchFilter {
             search_effort,
         ) = vector_query_params_from_dict(query, default_k)?;
 
-        let metric_type = Some(metric_type_opt.unwrap_or(MetricType::L2));
+        // Leave an unset metric to the core, which takes it from the index the
+        // search picks, as the `nearest` path does.
+        let metric_type = metric_type_opt;
 
         let vector_query = VectorQuery {
             column,

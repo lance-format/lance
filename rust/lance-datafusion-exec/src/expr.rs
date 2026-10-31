@@ -3,12 +3,16 @@
 
 //! Utilities for working with datafusion expressions
 
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use arrow::compute::cast;
 use arrow_array::{ArrayRef, cast::AsArray};
 use arrow_schema::{DataType, TimeUnit};
-use datafusion_common::ScalarValue;
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
+use datafusion_common::{Column, ScalarValue};
+use datafusion_expr::{Expr, ScalarUDFImpl};
+use datafusion_functions::core::getfield::GetFieldFunc;
 use half::f16;
 
 const MS_PER_DAY: i64 = 86400000;
@@ -606,6 +610,69 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
         // cast in the scalar-index path) coerces by unwrapping its underlying value.
         ScalarValue::Dictionary(_, inner) => safe_coerce_scalar(inner, ty),
         _ => None,
+    }
+}
+
+/// Collect the columns in the expression.
+///
+/// The columns are returned in sorted order.
+///
+/// If the expr refers to nested columns these will be returned
+/// as dotted paths (x.y.z)
+pub fn column_names_in_expr(expr: &Expr) -> Vec<String> {
+    let mut visitor = ColumnCapturingVisitor {
+        current_path: VecDeque::new(),
+        columns: BTreeSet::new(),
+    };
+    expr.visit(&mut visitor).unwrap();
+    visitor.columns.into_iter().collect()
+}
+
+struct ColumnCapturingVisitor {
+    // Current column path. If this is empty, we are not in a column expression.
+    current_path: VecDeque<String>,
+    columns: BTreeSet<String>,
+}
+
+impl TreeNodeVisitor<'_> for ColumnCapturingVisitor {
+    type Node = Expr;
+
+    fn f_down(&mut self, node: &Self::Node) -> datafusion_common::Result<TreeNodeRecursion> {
+        match node {
+            Expr::Column(Column { name, .. }) => {
+                // Build the field path from the column name and any nested fields
+                // The nested field names from get_field already come as literal strings,
+                // so we just need to concatenate them properly
+                let mut path = name.clone();
+                for part in self.current_path.drain(..) {
+                    path.push('.');
+                    // Check if the part needs quoting (contains dots)
+                    if part.contains('.') || part.contains('`') {
+                        // Quote the field name with backticks and escape any existing backticks
+                        let escaped = part.replace('`', "``");
+                        path.push('`');
+                        path.push_str(&escaped);
+                        path.push('`');
+                    } else {
+                        path.push_str(&part);
+                    }
+                }
+                self.columns.insert(path);
+                self.current_path.clear();
+            }
+            Expr::ScalarFunction(udf) if udf.name() == GetFieldFunc::default().name() => {
+                if let Expr::Literal(ScalarValue::Utf8(Some(name)), _) = &udf.args[1] {
+                    self.current_path.push_front(name.clone())
+                } else {
+                    self.current_path.clear();
+                }
+            }
+            _ => {
+                self.current_path.clear();
+            }
+        }
+
+        Ok(TreeNodeRecursion::Continue)
     }
 }
 

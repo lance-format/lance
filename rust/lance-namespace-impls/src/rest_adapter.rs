@@ -3334,12 +3334,18 @@ mod tests {
             use arrow::record_batch::{RecordBatch, RecordBatchIterator};
             use lance::dataset::{Dataset, WriteMode, WriteParams};
             use lance_namespace::LanceNamespace;
+            use lance_namespace::models::CreateNamespaceRequest;
 
             let fixture = RestServerFixture::new().await;
             let namespace = Arc::new(fixture.namespace.clone()) as Arc<dyn LanceNamespace>;
 
             // Use child namespace instead of root
             let table_id = vec!["test_ns".to_string(), "test_table".to_string()];
+
+            // Writing into a namespace that does not exist is rejected, so create it first.
+            let mut create_ns_req = CreateNamespaceRequest::new();
+            create_ns_req.id = Some(vec!["test_ns".to_string()]);
+            namespace.create_namespace(create_ns_req).await.unwrap();
             let schema = Arc::new(ArrowSchema::new(vec![
                 ArrowField::new("a", DataType::Int32, false),
                 ArrowField::new("b", DataType::Int32, false),
@@ -3849,8 +3855,8 @@ mod tests {
                 "branch must be forwarded in the request body and honored by the backend"
             );
 
-            // The directory backend ignores branch on these, or lacks the
-            // operation, so we check the request it received.
+            // The directory backend lacks update_field_metadata, so we check the
+            // branch each operation received.
             let branch = Some("dev".to_string());
             fixture
                 .namespace
@@ -3886,6 +3892,7 @@ mod tests {
             let mut create_index = CreateTableIndexRequest::new("id".into(), "BTREE".into());
             create_index.id = Some(id.clone());
             create_index.name = Some("id_idx".to_string());
+            create_index.branch = branch.clone();
             fixture
                 .namespace
                 .create_table_index(create_index)

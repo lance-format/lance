@@ -1513,6 +1513,17 @@ impl IvfSubIndex for HNSW {
     type BuildParams = HnswBuildParams;
     type QueryParams = HnswQueryParams;
 
+    fn empty_partition_metadata(build_params: Option<&Self::BuildParams>) -> Option<String> {
+        let params = build_params.cloned().unwrap_or_default();
+        let max_level = params.max_level;
+        let metadata = HnswMetadata {
+            entry_point: 0,
+            params,
+            level_offsets: vec![0; max_level as usize + 1],
+        };
+        Some(serde_json::to_string(&metadata).expect("valid HnswMetadata always serializes"))
+    }
+
     fn load(data: RecordBatch) -> Result<Self>
     where
         Self: Sized,

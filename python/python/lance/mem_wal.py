@@ -291,11 +291,11 @@ class ShardWriter:
     def lsm_scanner(
         self, shard_snapshots: Optional[List[ShardSnapshot]] = None
     ) -> "LsmScanner":
-        """Create an LSM scanner that includes the active MemTable.
+        """Create an LSM scanner that includes this writer's in-memory MemTables.
 
-        This scanner covers the base table, the given SSTables,
-        and the current active MemTable — providing strong read-your-writes
-        consistency.
+        This scanner covers the base table, the given SSTables, the current
+        active MemTable, and every frozen MemTable still awaiting flush —
+        providing strong read-your-writes consistency.
 
         Parameters
         ----------
@@ -394,6 +394,16 @@ class LsmScanner:
     def to_batches(self) -> List[pa.RecordBatch]:
         """Execute the scan and return a list of :class:`~pyarrow.RecordBatch`."""
         return list(self._raw.to_batches())
+
+    def to_reader(self) -> pa.RecordBatchReader:
+        """Execute the scan and return a streaming reader.
+
+        Batches are produced as the reader is consumed, so the result is never
+        held in memory all at once. Prefer this over `to_batches` and
+        `to_table` when the result may not fit in memory. JSON columns are
+        returned as Arrow JSON, the same as `Dataset.to_table`.
+        """
+        return self._raw.to_reader()
 
     def to_table(self) -> pa.Table:
         """Execute the scan and return a :class:`~pyarrow.Table`."""

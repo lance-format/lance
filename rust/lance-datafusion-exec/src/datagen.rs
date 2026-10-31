@@ -4,11 +4,9 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatchReader;
-use datafusion::{
-    execution::SendableRecordBatchStream,
-    physical_plan::{ExecutionPlan, stream::RecordBatchStreamAdapter},
-};
 use datafusion_common::DataFusionError;
+use datafusion_execution::SendableRecordBatchStream;
+use datafusion_physical_plan::{ExecutionPlan, stream::RecordBatchStreamAdapter};
 use futures::TryStreamExt;
 use lance_core::Error;
 use lance_datagen::{BatchCount, BatchGeneratorBuilder, ByteCount, RoundingBehavior, RowCount};

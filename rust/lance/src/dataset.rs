@@ -39,8 +39,8 @@ use lance_io::utils::{
 };
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, MAGIC, Manifest,
-    ManifestBuildConfig, RowIdMeta, pb, populate_manifest_schema_dictionaries,
+    ClusteringDefinition, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata,
+    MAGIC, Manifest, ManifestBuildConfig, RowIdMeta, pb, populate_manifest_schema_dictionaries,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -53,6 +53,7 @@ use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
+use rand::{Rng, seq::index::sample as sample_indices};
 use roaring::RoaringBitmap;
 use rowids::get_row_id_index;
 use serde::{Deserialize, Serialize};
@@ -152,8 +153,8 @@ use lance_core::box_error;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{
-    apply_feature_flags, ensure_can_read_manifest, ensure_can_write_manifest,
-    validate_non_reusable_field_id_flags, validate_paired_feature_flags,
+    apply_feature_flags, apply_index_object_metadata_flag, ensure_can_read_manifest,
+    ensure_can_write_manifest, validate_non_reusable_field_id_flags, validate_paired_feature_flags,
 };
 use lance_table::io::deletion::{DELETIONS_DIR, relative_deletion_file_path};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
@@ -180,7 +181,26 @@ pub use write::{
 pub(crate) const INDICES_DIR: &str = "_indices";
 pub(crate) const DATA_DIR: &str = "data";
 pub(crate) const TRANSACTIONS_DIR: &str = "_transactions";
+pub(crate) const BLOBS_DIR: &str = "_blobs";
+pub(crate) const FRAG_REUSE_DIR: &str = "_fri";
 const DEFAULT_MAX_STREAM_COPY_PARALLELISM: usize = 4;
+
+// Full samples already have their final ordering and need no randomness.
+fn sample_row_offsets(rng: &mut impl Rng, num_rows: usize, n: usize) -> Vec<u64> {
+    let sample_size = n.min(num_rows);
+    if sample_size == 0 {
+        return Vec::new();
+    }
+    if sample_size == num_rows {
+        return (0..num_rows as u64).collect();
+    }
+    let mut offsets: Vec<u64> = sample_indices(rng, num_rows, sample_size)
+        .into_iter()
+        .map(|offset| offset as u64)
+        .collect();
+    offsets.sort_unstable();
+    offsets
+}
 
 fn parse_deep_clone_stream_concurrency(value: &str) -> Result<usize> {
     value
@@ -590,30 +610,39 @@ impl Dataset {
         self.checkout_by_ref(None, Some(branch)).await
     }
 
+    /// Create a branch from an existing version with a shallow clone.
+    ///
     /// This is a two-phase operation:
+    /// - Atomically reserve the name by creating the branch metadata (`BranchContents`).
     /// - Create the branch dataset by shallow cloning.
-    /// - Create the branch metadata (a.k.a. `BranchContents`).
     ///
     /// These two phases are not atomic. We consider `BranchContents` as the source of truth
     /// for the branch.
     ///
-    /// The cleanup procedure should:
-    /// - Clean up zombie branch datasets that have no related `BranchContents`.
-    /// - Delete broken `BranchContents` entries that have no related branch dataset.
+    /// A concurrent creator that cannot reserve the name returns a conflict without
+    /// writing to the branch dataset.
     ///
-    /// If `create_branch` stops at phase 1, it may leave a zombie branch dataset,
-    /// which can be cleaned up later. Such a zombie dataset may cause a branch creation
-    /// failure if we use the same name to `create_branch`. In that case, you need to call
-    /// `force_delete_branch` to interactively clean up the zombie dataset.
+    /// If cloning fails or is interrupted, the name remains reserved, since the clone
+    /// commit may have succeeded even if its result is unknown. Use
+    /// [`Self::force_delete_branch`] to clean up the incomplete branch before retrying.
     ///
     /// `"main"` is reserved for the default branch and cannot be used as a new branch name.
+    /// A segment after the first cannot be a reserved dataset directory.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &mut Dataset) -> Result<()> {
+    /// let experiment = dataset.create_branch("experiment", ("main", None), None).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn create_branch(
         &mut self,
         branch: &str,
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
-        refs::check_valid_branch(branch)?;
+        refs::check_new_branch(branch)?;
 
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
         let branch_location = self.branch_location().find_branch(Some(branch))?;
@@ -629,6 +658,11 @@ impl Dataset {
         };
         let transaction = Transaction::new(version_number, clone_op, None);
 
+        // Claim the name before the clone can write into another creator's branch.
+        self.branches()
+            .create(branch, version_number, source_branch.as_deref())
+            .await?;
+
         let builder = CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
             // Fall back to the dataset's own store params
             .with_store_params(
@@ -637,15 +671,13 @@ impl Dataset {
             .with_object_store(Arc::new(self.object_store.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
-        let dataset = builder.execute(transaction).await?;
-
-        // Create BranchContents after shallow_clone
-        self.branches()
-            .create(branch, version_number, source_branch.as_deref())
-            .await?;
-        Ok(dataset)
+        builder.execute(transaction).await
     }
 
+    /// Deletes a branch and removes its directory when safe.
+    ///
+    /// Legacy branches like `outer/data` may share a directory with another
+    /// branch. Their files are retained, so checkout by name may still work.
     pub async fn delete_branch(&mut self, branch: &str) -> Result<()> {
         self.branches().delete(branch, false).await
     }
@@ -766,6 +798,35 @@ impl Dataset {
             _ => e,
         })?;
 
+        let manifest_size = object_reader.size().await.map_err(|err| match err {
+            object_store::Error::NotFound { path, source } => {
+                Error::dataset_not_found(path, source)
+            }
+            _ => Error::io(format!(
+                "failed to read manifest {}: {}",
+                manifest_location.path, err
+            )),
+        })?;
+        if manifest_size < 16 {
+            if manifest_location.size.is_some() {
+                let manifest_location = ManifestLocation {
+                    size: None,
+                    ..manifest_location.clone()
+                };
+                return Box::pin(Self::load_manifest(
+                    object_store,
+                    &manifest_location,
+                    uri,
+                    session,
+                ))
+                .await;
+            }
+            return Err(Error::corrupt_file(
+                manifest_location.path.clone(),
+                format!("Invalid format: manifest is only {manifest_size} bytes (minimum 16)"),
+            ));
+        }
+
         let last_block =
             read_last_block(object_reader.as_ref())
                 .await
@@ -773,7 +834,10 @@ impl Dataset {
                     object_store::Error::NotFound { path, source } => {
                         Error::dataset_not_found(path, source)
                     }
-                    _ => Error::io_source(err.into()),
+                    _ => Error::io(format!(
+                        "failed to read manifest {}: {}",
+                        manifest_location.path, err
+                    )),
                 })?;
 
         // A stale cached size yields a bogus footer offset. Detect it (the block
@@ -1203,6 +1267,14 @@ impl Dataset {
         &self.uri
     }
 
+    /// The commit handler this dataset commits through. Lets a caller wrap it
+    /// for one commit via [`CommitBuilder::with_commit_handler`], for example
+    /// to fence that commit to an exact version, without reopening the
+    /// dataset or knowing how the handler was chosen.
+    pub fn commit_handler(&self) -> Arc<dyn CommitHandler> {
+        self.commit_handler.clone()
+    }
+
     pub fn branch_location(&self) -> BranchLocation {
         BranchLocation {
             path: self.base.clone(),
@@ -1525,6 +1597,8 @@ impl Dataset {
     /// Once a version is removed it can no longer be checked out or restored.  Any data unique
     /// to that version will be lost.
     ///
+    /// Returns an invalid-input error when this dataset is checked out at a detached version.
+    ///
     /// # Arguments
     ///
     /// * `older_than` - Versions older than this will be deleted.
@@ -1565,6 +1639,8 @@ impl Dataset {
     /// Once a version is removed it can no longer be checked out or restored.  Any data unique
     /// to that version will be lost.
     ///
+    /// Returns an invalid-input error when this dataset is checked out at a detached version.
+    ///
     /// # Arguments
     ///
     /// * `policy` - `CleanupPolicy` determines the behaviour of cleanup.
@@ -1584,6 +1660,8 @@ impl Dataset {
     ///
     /// The returned operation can be explained without deleting files, or
     /// executed to re-evaluate the current dataset state and remove files.
+    /// Both return an invalid-input error when this dataset is checked out at a
+    /// detached version.
     pub fn cleanup(&self, policy: CleanupPolicy) -> CleanupOperation<'_> {
         CleanupOperation::new(self, policy)
     }
@@ -1727,7 +1805,8 @@ impl Dataset {
         write_config: &ManifestWriteConfig,
         commit_config: &CommitConfig,
     ) -> Result<()> {
-        let (manifest, manifest_location) = commit_transaction(
+        // Keep the retry and rebase state machine out of every caller's future.
+        let (manifest, manifest_location) = Box::pin(commit_transaction(
             self,
             self.object_store.as_ref(),
             self.commit_handler.as_ref(),
@@ -1737,7 +1816,7 @@ impl Dataset {
             default_commit_retry_timeout(),
             self.manifest_location.naming_scheme,
             None,
-        )
+        ))
         .await?;
 
         self.set_manifest(Arc::new(manifest), manifest_location);
@@ -1922,6 +2001,34 @@ impl Dataset {
         blob::take_blobs_by_addresses(self, row_addrs, column.as_ref()).await
     }
 
+    /// Scan every row of this dataset with its blob v2 columns as values another
+    /// dataset can be written from: the payload bytes of every blob this dataset
+    /// stores, and an External blob's absolute URI and byte range, at any depth.
+    ///
+    /// Each batch holds the payloads of its blobs in memory.
+    pub async fn scan_blobs_as_logical(self: &Arc<Self>) -> Result<DatasetRecordBatchStream> {
+        let mut scan = self.scan();
+        scan.with_row_address();
+        let batches = scan.try_into_stream().await?;
+        let plan = Arc::new(optimize::BlobV2BatchRewritePlan::try_new(
+            self.schema(),
+            lance_io::stream::RecordBatchStream::schema(&batches).as_ref(),
+            false,
+            false,
+        )?);
+        let schema = plan.output_schema().clone();
+        let dataset = self.clone();
+        let batches = batches
+            .and_then(move |batch| {
+                let (plan, dataset) = (plan.clone(), dataset.clone());
+                async move { plan.transform_batch(&dataset, batch).await }
+            })
+            .map_err(|err| datafusion::error::DataFusionError::External(Box::new(err)));
+        Ok(DatasetRecordBatchStream::new(Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, batches),
+        )))
+    }
+
     /// Take [BlobFile] by row indices (offsets in the dataset).
     ///
     /// The result has the same null and empty blob representation as
@@ -2029,27 +2136,35 @@ impl Dataset {
         take::take_scan(self, row_ranges, projection, batch_readahead)
     }
 
-    /// Randomly sample `n` rows from the dataset.
+    /// Randomly sample up to `n` live rows uniformly without replacement.
+    ///
+    /// Returns all available live rows if `n` exceeds their count.
     ///
     /// If `fragment_ids` is provided, sampling is limited to rows from those
     /// fragments in the current dataset version.
     ///
-    /// The returned rows are in row-id order (not random order), which allows
-    /// the underlying take operation to use an efficient sorted code path.
+    /// The returned rows are in ascending logical row-offset order within the
+    /// dataset or selected fragments, allowing efficient sorted reads.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let batch = dataset.sample(10, dataset.schema(), None).await?;
+    /// assert!(batch.num_rows() <= 10);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn sample(
         &self,
         n: usize,
         projection: &Schema,
         fragment_ids: Option<&[u32]>,
     ) -> Result<RecordBatch> {
-        use rand::seq::IteratorRandom;
-
         match fragment_ids {
             None => {
                 let num_rows = self.count_rows(None).await?;
-                let mut ids = (0..num_rows as u64).choose_multiple(&mut rand::rng(), n);
-                ids.sort_unstable();
-                self.take(&ids, projection.clone()).await
+                let offsets = sample_row_offsets(&mut rand::rng(), num_rows, n);
+                self.take(&offsets, projection.clone()).await
             }
             Some(fragment_ids) => {
                 if fragment_ids.is_empty() {
@@ -2063,11 +2178,22 @@ impl Dataset {
                 let num_rows = stream::iter(selected_fragments.iter().cloned())
                     .map(|fragment| async move { fragment.count_rows(None).await })
                     .buffer_unordered(16)
-                    .try_fold(0_u64, |acc, rows| async move { Ok(acc + rows as u64) })
+                    .try_fold(0_u64, |acc, rows| async move {
+                        acc.checked_add(rows as u64).ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "Dataset::sample selected live row count overflow: {acc} + {rows}"
+                            ))
+                        })
+                    })
                     .await?;
 
-                let mut offsets = (0..num_rows).choose_multiple(&mut rand::rng(), n);
-                offsets.sort_unstable();
+                let num_rows = usize::try_from(num_rows).map_err(|_| {
+                    Error::invalid_input(format!(
+                        "Dataset::sample selected live row count {num_rows} exceeds usize::MAX ({})",
+                        usize::MAX
+                    ))
+                })?;
+                let offsets = sample_row_offsets(&mut rand::rng(), num_rows, n);
 
                 let row_addrs = row_offsets_to_row_addresses(&selected_fragments, &offsets).await?;
                 let dataset = Arc::new(self.clone());
@@ -2637,6 +2763,23 @@ impl Dataset {
         index: &IndexMetadata,
     ) -> Result<Arc<ObjectStore>> {
         self.object_store(index.base_id).await
+    }
+
+    /// This table as a reader of `manifest`, another manifest of it, sees its
+    /// files: through that manifest's base paths, with base stores opened
+    /// afresh when those differ, since `base_object_stores` caches by id alone.
+    pub(crate) fn with_manifest_view(&self, manifest: Arc<Manifest>) -> Self {
+        let base_object_stores = if manifest.base_paths == self.manifest.base_paths {
+            self.base_object_stores.clone()
+        } else {
+            Default::default()
+        };
+        Self {
+            fragment_bitmap: Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect()),
+            manifest,
+            base_object_stores,
+            ..self.clone()
+        }
     }
 
     pub(crate) fn dataset_dir_for_deletion(&self, deletion_file: &DeletionFile) -> Result<Path> {
@@ -3778,6 +3921,8 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
     // the ones in between). On non-lexically-ordered stores this uses the version
     // hint to avoid an O(n) listing.
     let io_parallelism = dataset.object_store.as_ref().io_parallelism();
+    // Both stages must poll their input even when the store permits only one I/O.
+    let stage_parallelism = (io_parallelism / 2).max(1);
     let locations = dataset.commit_handler.list_manifest_locations_since(
         &dataset.base,
         dataset.object_store.as_ref(),
@@ -3808,7 +3953,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 Ok((manifest, location))
             }
         })
-        .try_buffer_unordered(io_parallelism / 2);
+        .try_buffer_unordered(stage_parallelism);
     let transactions = manifests
         .map_ok(move |(manifest, location)| async move {
             let manifest_copy = manifest.clone();
@@ -3846,7 +3991,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 };
             Ok((manifest.version, transaction))
         })
-        .try_buffer_unordered(io_parallelism / 2);
+        .try_buffer_unordered(stage_parallelism);
 
     let dataset = async move {
         if let Ok((latest_manifest, location)) = latest_rx.await {
@@ -4027,7 +4172,9 @@ impl Dataset {
     ///
     /// Returns: a new version of dataset.
     ///
-    /// It performs a left-join on the two datasets.
+    /// It performs a left-join on the two datasets. The right-side join column must
+    /// contain unique keys, including at most one null. Duplicate right-side keys
+    /// return an input error before the dataset is modified.
     pub async fn merge(
         &mut self,
         stream: impl RecordBatchReader + Send + 'static,
@@ -4329,6 +4476,9 @@ pub(crate) struct ManifestWriteConfig {
     /// `cleanup_frag_reuse_index` against the current manifest entry; see
     /// `ManifestBuildConfig::tagged_frag_reuse_trim`.
     tagged_frag_reuse_trim: bool, // default false
+    /// The writer's complete desired clustering definitions list for an
+    /// `UpdateConfig` commit; see `ManifestBuildConfig::clustering_definitions`.
+    clustering_definitions: Option<Vec<ClusteringDefinition>>, // default None
 }
 
 impl Default for ManifestWriteConfig {
@@ -4343,6 +4493,7 @@ impl Default for ManifestWriteConfig {
             migration_next_row_id: None,
             activate_non_reusable_field_ids: false,
             tagged_frag_reuse_trim: false,
+            clustering_definitions: None,
         }
     }
 }
@@ -4375,6 +4526,22 @@ impl ManifestWriteConfig {
     ///
     /// The timestamp is resolved here rather than during the build so it goes
     /// through this crate's mockable `SystemTime`.
+    pub(crate) fn has_clustering_definitions(&self) -> bool {
+        self.clustering_definitions.is_some()
+    }
+
+    /// Whether the definitions list names an id the read manifest does not
+    /// hold, i.e. the commit allocates. One pass over each list; the
+    /// allocation itself is validated by the manifest build.
+    pub(crate) fn allocates_clustering_definitions(&self, read: &Manifest) -> bool {
+        self.clustering_definitions.as_ref().is_some_and(|desired| {
+            let current: HashSet<u32> = read.clustering.iter().map(|c| c.id).collect();
+            desired
+                .iter()
+                .any(|definition| !current.contains(&definition.id))
+        })
+    }
+
     pub(crate) fn to_build_config(&self) -> ManifestBuildConfig {
         ManifestBuildConfig {
             auto_set_feature_flags: self.auto_set_feature_flags,
@@ -4385,6 +4552,7 @@ impl ManifestWriteConfig {
             disable_transaction_file: self.disable_transaction_file,
             migration_next_row_id: self.migration_next_row_id,
             activate_non_reusable_field_ids: self.activate_non_reusable_field_ids,
+            clustering_definitions: self.clustering_definitions.clone(),
             spilled_row_lineage: Default::default(),
         }
     }
@@ -4477,6 +4645,15 @@ pub(crate) async fn write_manifest_file(
             manifest,
             indices.as_deref().unwrap_or_default(),
         );
+        // Here as well as in `build_manifest`: the clone and restore paths reach
+        // this write with their index section but without a build, and a clone
+        // starts from a masked writer word.
+        apply_index_object_metadata_flag(manifest, indices.as_deref().unwrap_or_default());
+    }
+    // Restore and clone bypass build_manifest and may copy an older snapshot
+    // that predates the writer fence.
+    if let Some(indices) = &indices {
+        lance_table::feature_flags::apply_row_addr_index_feature_flag(manifest, indices);
     }
     // After the flag reset, so it judges the flags being published. Here rather
     // than in `build_manifest`, which restore and clone bypass.

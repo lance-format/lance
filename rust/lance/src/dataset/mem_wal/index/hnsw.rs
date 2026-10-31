@@ -860,6 +860,41 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
 
+    /// Runs `insert` on a single Rayon thread.
+    ///
+    /// Inserts build the graph in parallel, and which links survive depends on
+    /// how the threads interleave: now and then a node keeps no incoming edge,
+    /// and no search can reach it. A test that needs one particular row found
+    /// must build the same graph every run.
+    fn on_one_thread<R: Send>(insert: impl FnOnce() -> R + Send) -> R {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(insert)
+    }
+
+    #[test]
+    fn test_index_rejects_unallocatable_m_at_insert_boundary() {
+        let m = usize::MAX / 2;
+        let index = HnswMemIndex::with_capacity(
+            1,
+            "vector".to_string(),
+            DistanceType::L2,
+            HnswBuildParams::default().num_edges(m).ef_construction(m),
+            1,
+            1,
+        );
+
+        let error = index.insert(&make_batch(0, 1, 8), 0).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains("neighbor_capacity"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(index.len(), 0);
+    }
+
     fn make_batch(start_id: i32, n: usize, dim: usize) -> RecordBatch {
         let ids: Vec<i32> = (start_id..start_id + n as i32).collect();
         let mut flat: Vec<f32> = Vec::with_capacity(n * dim);
@@ -952,7 +987,7 @@ mod tests {
         );
 
         let batch = make_batch(0, n, dim);
-        index.insert(&batch, 0).unwrap();
+        on_one_thread(|| index.insert(&batch, 0)).unwrap();
         assert_eq!(index.len(), n);
 
         let fsl = batch.column_by_name("vector").unwrap().as_fixed_size_list();
@@ -1015,7 +1050,7 @@ mod tests {
             StoredBatch::new(first, 0, 0),
             StoredBatch::new(second.clone(), 75, 1),
         ];
-        index.insert_batches(&stored).unwrap();
+        on_one_thread(|| index.insert_batches(&stored)).unwrap();
         assert_eq!(index.len(), n);
 
         let fsl = second

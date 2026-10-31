@@ -73,6 +73,10 @@ pub struct ShardWriterConfig {
     /// Unique identifier for this shard (UUID v4).
     pub shard_id: Uuid,
 
+    /// The MemWAL's `dir_id`; this writer's WAL, manifests, and generations live
+    /// under its directory. Empty for the legacy `_mem_wal`.
+    pub dir_id: String,
+
     /// Shard spec ID this shard was created with.
     /// A value of 0 indicates a manually-created shard not governed by any spec.
     pub shard_spec_id: u32,
@@ -278,6 +282,7 @@ impl Default for ShardWriterConfig {
     fn default() -> Self {
         Self {
             shard_id: Uuid::new_v4(),
+            dir_id: String::new(),
             shard_spec_id: 0,
             durable_write: true,
             max_wal_buffer_size: 10 * 1024 * 1024, // 10MB
@@ -1475,6 +1480,7 @@ struct ReplayResult {
 async fn replay_memtable_from_wal(
     object_store: Arc<ObjectStore>,
     base_path: Path,
+    dir_id: &str,
     shard_id: Uuid,
     our_epoch: u64,
     manifest: &ShardManifest,
@@ -1500,7 +1506,7 @@ async fn replay_memtable_from_wal(
     // contents into the base table.
     let start_position = manifest.replay_after_wal_entry_position.saturating_add(1);
 
-    let tailer = WalTailer::new(object_store, base_path, shard_id);
+    let tailer = WalTailer::new(object_store, base_path, dir_id, shard_id);
     let mut position = start_position;
 
     let mut active = make_memtable(base_generation, 0, None)?;
@@ -2256,6 +2262,9 @@ impl SharedWriterState {
         }
     }
 
+    /// Write the batches' blob payloads into the memtable's generation; batches
+    /// pass through untouched when it has no data target. The flag is true when
+    /// the payloads sit in the generation's shared pack, which the WAL flush finishes.
     async fn prepare_batches(
         &self,
         memtable: &MemTable,
@@ -2267,7 +2276,7 @@ impl SharedWriterState {
         };
         let logical_schema = Schema::try_from(schema.storage.as_ref())?;
         let data_dir = target
-            .generation_path(&self.base_path, &self.shard_id)
+            .generation_path(&self.base_path, &self.config.dir_id, &self.shard_id)
             .join(DATA_DIR);
         let source_store_registry = self
             .config
@@ -2795,6 +2804,7 @@ impl ShardWriter {
         .await
     }
 
+    /// Body of [`Self::open`].
     async fn open_inner(
         object_store: Arc<ObjectStore>,
         base_path: Path,
@@ -2829,6 +2839,7 @@ impl ShardWriter {
         let manifest_store = Arc::new(ShardManifestStore::new(
             object_store.clone(),
             &base_path,
+            &config.dir_id,
             shard_id,
             config.manifest_scan_batch_size,
         ));
@@ -2928,6 +2939,7 @@ impl ShardWriter {
         let wal_appender = Arc::new(WalAppender::with_claimed_epoch(
             object_store.clone(),
             base_path.clone(),
+            &config.dir_id,
             shard_id,
             manifest_store.clone(),
             epoch,
@@ -3047,6 +3059,7 @@ impl ShardWriter {
                 object_store.clone(),
                 base_path.clone(),
                 base_uri.clone(),
+                config.dir_id.clone(),
                 shard_id,
                 manifest_store.clone(),
             )
@@ -3068,6 +3081,7 @@ impl ShardWriter {
         } = replay_memtable_from_wal(
             object_store.clone(),
             base_path.clone(),
+            &config.dir_id,
             shard_id,
             epoch,
             manifest,
@@ -3163,6 +3177,7 @@ impl ShardWriter {
                 object_store.clone(),
                 base_path.clone(),
                 base_uri,
+                config.dir_id.clone(),
                 shard_id,
                 manifest_store,
             )
@@ -4243,14 +4258,23 @@ impl ShardWriter {
     ///
     /// Blocks until any flush already mid-`handle()` settles —
     /// cancellation only fires between messages — so no flush task lingers
-    /// after abort returns. Idempotent: a second call re-cancels an
-    /// already-cancelled token and joins an already-emptied task set.
+    /// after abort returns. Cursor waiters are failed before cancellation so
+    /// they cannot be stranded when another dispatcher discards work they
+    /// depend on. Idempotent: a second call re-cancels an already-cancelled
+    /// token and joins an already-emptied task set.
     #[instrument(name = "sw_abort", level = "info", skip_all, fields(shard_id = %self.config.shard_id, epoch = self.epoch))]
     pub async fn abort(&self) -> Result<()> {
         info!(
             "Aborting ShardWriter for shard {} (no flush)",
             self.config.shard_id
         );
+        // A memtable flush may be waiting for an index apply that is still
+        // queued on another dispatcher. Cancellation is biased ahead of queued
+        // messages, so wake the dependent cursor waiter before cancellation can
+        // discard the apply and leave shutdown joining the waiter forever.
+        self.wal_flusher.poison(&Error::writer_poisoned(
+            "ShardWriter aborted while background work was pending",
+        ));
         self.task_executor.shutdown_all().await?;
         Ok(())
     }
@@ -5023,17 +5047,18 @@ impl MemTableFlushHandler {
             //
             // Freeze queues the apply and this flush on separate channels, so
             // without waiting the export can run while the indexes are still
-            // behind the batch store. The generation's vector index would then
-            // be short of rows its own SSTable holds, and SSTable vector search
-            // is index-only -- `fast_search`, no brute-force scan -- so those
-            // rows stop answering once the frozen memtable retires.
+            // behind the batch store. The primary-key sidecar and every
+            // secondary index are exported from that asynchronously maintained
+            // state. A short PK index can make superseded rows visible, while
+            // an empty one publishes no sidecar at all and makes the LSM scan
+            // fail when it opens the generation. A short vector index similarly
+            // loses rows because SSTable vector search is index-only --
+            // `fast_search`, with no brute-force scan.
             //
             // `batch_count` is fixed at freeze, so this waits for a target that
             // cannot move, and the watcher surfaces a poisoned writer rather
             // than blocking on a cursor that will never arrive.
-            if !index_specs.is_empty()
-                && let Some(indexes) = memtable.indexes_arc()
-            {
+            if let Some(indexes) = memtable.indexes_arc() {
                 let target_indexed = memtable.batch_count();
                 self.wal_flusher
                     .track_batch(Some(indexes), target_indexed, 0)
@@ -5492,8 +5517,11 @@ mod tests {
     use object_store::ObjectStoreExt;
     use rstest::rstest;
     use std::collections::HashMap;
+    use std::future::Future;
     use std::num::NonZeroUsize;
+    use std::pin::Pin;
     use std::sync::atomic::AtomicUsize;
+    use std::task::{Context, Wake, Waker};
     use tempfile::TempDir;
 
     async fn create_local_store() -> (Arc<ObjectStore>, Path, String, TempDir) {
@@ -5609,13 +5637,15 @@ mod tests {
         second_watcher.wait().await.unwrap();
         fence.wait().await.unwrap();
 
-        let tailer = WalTailer::new(store.clone(), base_path.clone(), shard_id);
+        let tailer = WalTailer::new(store.clone(), base_path.clone(), "", shard_id);
         let entry = tailer.read_entry(1).await.unwrap().unwrap();
         assert_eq!(entry.batches.len(), 2);
         assert!(tailer.read_entry(2).await.unwrap().is_none());
 
         let target = entry.target.unwrap();
-        let data_dir = target.generation_path(&base_path, &shard_id).join(DATA_DIR);
+        let data_dir = target
+            .generation_path(&base_path, "", &shard_id)
+            .join(DATA_DIR);
         let sidecars = blob_sidecars(store.as_ref(), &data_dir).await;
         assert_eq!(sidecars.len(), 1, "both puts must share one packed object");
         let payload = store
@@ -5671,7 +5701,7 @@ mod tests {
 
         let mut watcher = watcher.unwrap();
         assert!(watcher.wait().await.is_err());
-        let tailer = WalTailer::new(store, base_path, shard_id);
+        let tailer = WalTailer::new(store, base_path, "", shard_id);
         assert!(tailer.read_entry(1).await.unwrap().is_none());
     }
 
@@ -5717,7 +5747,7 @@ mod tests {
 
         assert!(writer.wal_flusher.flush(&source, 1).await.is_err());
         assert!(
-            WalTailer::new(store.clone(), base_path.clone(), shard_id)
+            WalTailer::new(store.clone(), base_path.clone(), "", shard_id)
                 .read_entry(1)
                 .await
                 .unwrap()
@@ -5726,7 +5756,7 @@ mod tests {
         let data_dir = batch_store
             .target()
             .unwrap()
-            .generation_path(&base_path, &shard_id)
+            .generation_path(&base_path, "", &shard_id)
             .join(DATA_DIR);
         assert!(blob_sidecars(store.as_ref(), &data_dir).await.is_empty());
     }
@@ -5806,7 +5836,7 @@ mod tests {
         assert!(error.to_string().contains("terminally failed Blob v2 pack"));
         assert!(first_watcher.unwrap().wait().await.is_err());
         assert!(
-            WalTailer::new(store.clone(), base_path.clone(), shard_id)
+            WalTailer::new(store.clone(), base_path.clone(), "", shard_id)
                 .read_entry(1)
                 .await
                 .unwrap()
@@ -5815,7 +5845,7 @@ mod tests {
         let data_dir = batch_store
             .target()
             .unwrap()
-            .generation_path(&base_path, &shard_id)
+            .generation_path(&base_path, "", &shard_id)
             .join(DATA_DIR);
         assert!(blob_sidecars(store.as_ref(), &data_dir).await.is_empty());
     }
@@ -5870,7 +5900,7 @@ mod tests {
         }
         writer.close().await.unwrap();
 
-        let manifest = ShardManifestStore::new(store.clone(), &base_path, config.shard_id, 2)
+        let manifest = ShardManifestStore::new(store.clone(), &base_path, "", config.shard_id, 2)
             .latest()
             .await
             .unwrap()
@@ -5959,7 +5989,7 @@ mod tests {
                 "the 1 MiB payload must not remain resident: {row_bytes} bytes"
             );
 
-            let tailer = WalTailer::new(store.clone(), base_path.clone(), config.shard_id);
+            let tailer = WalTailer::new(store.clone(), base_path.clone(), "", config.shard_id);
             for position in [1, 2] {
                 let entry = tailer.read_entry(position).await.unwrap().unwrap();
                 assert_eq!(entry.target.as_ref(), Some(&target));
@@ -6024,7 +6054,9 @@ mod tests {
                 Some(BlobV2Layout::Descriptor)
             );
 
-            let data_dir = target.generation_path(&base_path, &shard_id).join(DATA_DIR);
+            let data_dir = target
+                .generation_path(&base_path, "", &shard_id)
+                .join(DATA_DIR);
             let sidecars = blob_sidecars(store.as_ref(), &data_dir).await;
             assert_eq!(sidecars.len(), 3, "two packed puts plus one dedicated blob");
             (target, sidecars)
@@ -6067,7 +6099,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(writer.memtable_stats().await.unwrap().row_count, 10);
-        let data_dir = target.generation_path(&base_path, &shard_id).join(DATA_DIR);
+        let data_dir = target
+            .generation_path(&base_path, "", &shard_id)
+            .join(DATA_DIR);
         let sidecars_after_successor = blob_sidecars(store.as_ref(), &data_dir).await;
         assert_eq!(sidecars_after_successor.len(), sidecars_before.len() + 1);
         assert!(
@@ -6078,7 +6112,7 @@ mod tests {
         );
 
         writer.close().await.unwrap();
-        let manifest = ShardManifestStore::new(store.clone(), &base_path, shard_id, 10)
+        let manifest = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 10)
             .latest()
             .await
             .unwrap()
@@ -6135,7 +6169,9 @@ mod tests {
             }
             WriterMode::WalOnly { .. } => unreachable!(),
         };
-        let data_dir = target.generation_path(&base_path, &shard_id).join(DATA_DIR);
+        let data_dir = target
+            .generation_path(&base_path, "", &shard_id)
+            .join(DATA_DIR);
         assert!(blob_sidecars(store.as_ref(), &data_dir).await.is_empty());
 
         let scanned = writer.scan().await.unwrap().try_into_batch().await.unwrap();
@@ -6196,7 +6232,9 @@ mod tests {
             }
             WriterMode::WalOnly { .. } => unreachable!(),
         };
-        let data_dir = target.generation_path(&base_path, &shard_id).join(DATA_DIR);
+        let data_dir = target
+            .generation_path(&base_path, "", &shard_id)
+            .join(DATA_DIR);
         assert!(blob_sidecars(store.as_ref(), &data_dir).await.is_empty());
 
         writer
@@ -7116,6 +7154,254 @@ mod tests {
             manifest_scan_batch_size: 2,
             ..Default::default()
         }
+    }
+
+    /// Prepare a real frozen memtable with its WAL appended but its PK index
+    /// unapplied. The tests drive the handlers themselves, so no background
+    /// dispatcher can apply the index before the flush reaches its barrier.
+    #[cfg_attr(coverage, coverage(off))]
+    async fn pending_pk_flush() -> (
+        ShardWriter,
+        MemTableFlushHandler,
+        TriggerMemTableFlush,
+        TempDir,
+    ) {
+        let (store, base_path, base_uri, temp) = create_local_store().await;
+        let schema = create_pk_test_schema();
+        let mut writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            ShardWriterConfig {
+                shard_id: Uuid::new_v4(),
+                max_wal_flush_interval: Some(Duration::from_secs(60)),
+                ..Default::default()
+            },
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        writer.task_executor.shutdown_all().await.unwrap();
+
+        let WriterMode::MemTable {
+            state,
+            writer_state,
+            ..
+        } = &mut writer.mode
+        else {
+            unreachable!("the test enables memtables");
+        };
+        let writer_state = Arc::get_mut(writer_state).unwrap();
+        let (index_tx, _index_rx) = mpsc::unbounded_channel();
+        let (flush_tx, mut flush_rx) = mpsc::unbounded_channel();
+        writer_state.index_apply_tx = index_tx;
+        writer_state.memtable_flush_tx = flush_tx;
+        let mut state_guard = state.write().await;
+        let batch = conform_live_batch(
+            create_test_batch(&schema, 1, 2),
+            state_guard.memtable.schema(),
+            &state_guard.schema.pk_columns,
+        )
+        .unwrap();
+        state_guard.memtable.insert_batch_only(batch).await.unwrap();
+        let batch_store = state_guard.memtable.batch_store();
+        let wal_result = writer
+            .wal_flusher
+            .flush(
+                &WalFlushSource::BatchStore {
+                    batch_store: batch_store.clone(),
+                },
+                batch_store.len(),
+            )
+            .await
+            .unwrap();
+        let wal_position = wal_result.entry.unwrap().position;
+        state_guard.last_flushed_wal_entry_position = wal_position;
+        writer_state.freeze_memtable(&mut state_guard).unwrap();
+        drop(state_guard);
+        let message = flush_rx.try_recv().unwrap();
+
+        let handler = MemTableFlushHandler::new(
+            state.clone(),
+            writer_state.memory.clone(),
+            Arc::new(MemTableFlusher::new(
+                store,
+                base_path,
+                base_uri,
+                "",
+                writer.config.shard_id,
+                writer.manifest_store.clone(),
+            )),
+            writer.wal_flusher.clone(),
+            writer.epoch,
+            writer.stats.clone(),
+            None,
+            Duration::ZERO,
+            writer_state.stop_flush_retries.clone(),
+        );
+        (writer, handler, message, temp)
+    }
+
+    /// Poll into the cursor wait and prove that its notification wakes this
+    /// future. Ignore wakes from blocking I/O threads so an unrelated pending
+    /// storage operation cannot satisfy the assertion.
+    #[cfg_attr(coverage, coverage(off))]
+    fn assert_waiting_for_cursor(future: Pin<&mut impl Future>, cursors: &WriterCursors) {
+        struct CursorWake {
+            thread: std::thread::ThreadId,
+            wakes: AtomicUsize,
+        }
+
+        impl Wake for CursorWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                if std::thread::current().id() == self.thread {
+                    self.wakes.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let counter = Arc::new(CursorWake {
+            thread: std::thread::current().id(),
+            wakes: AtomicUsize::new(0),
+        });
+        let waker = Waker::from(counter.clone());
+        assert!(future.poll(&mut Context::from_waker(&waker)).is_pending());
+        counter.wakes.store(0, Ordering::Relaxed);
+        cursors.wake();
+        assert!(
+            counter.wakes.load(Ordering::Relaxed) > 0,
+            "the flush must be waiting on the writer cursor before index application"
+        );
+    }
+
+    /// A PK-only flush must wait for the asynchronous index apply before it
+    /// publishes the SSTable. Otherwise the manifest can name a generation
+    /// whose mandatory PK sidecar has not been written yet.
+    #[tokio::test]
+    async fn test_pk_only_flush_waits_for_index_apply() {
+        let (writer, mut handler, message, temp) = pending_pk_flush().await;
+        let TriggerMemTableFlush::Flush {
+            memtable,
+            index_specs,
+            ..
+        } = message;
+        let schema = handler.state.read().await.schema.logical.clone();
+        let indexes = memtable.indexes_arc().unwrap();
+        assert_eq!(indexes.indexed_count(), 0);
+        let mut flush = Box::pin(handler.flush_memtable(memtable.clone(), &index_specs));
+        assert_waiting_for_cursor(flush.as_mut(), writer.wal_flusher.cursors());
+        assert!(
+            writer
+                .manifest()
+                .await
+                .unwrap()
+                .unwrap()
+                .sstables
+                .is_empty()
+        );
+
+        apply_index_range(
+            writer.wal_flusher.cursors(),
+            TriggerIndexApply {
+                batch_store: memtable.batch_store(),
+                indexes,
+                end_batch_position: memtable.batch_count(),
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), flush)
+            .await
+            .expect("flush did not finish after applying its PK index")
+            .unwrap();
+        let base_uri = format!("file://{}", temp.path().display());
+        assert_eq!(
+            read_sstable_ids_via_lsm(&writer, schema, &base_uri, writer.config.shard_id, None,)
+                .await,
+            vec![1, 2],
+            "the published PK-only SSTable must be readable through the LSM scanner"
+        );
+    }
+
+    /// Abort must wake an in-flight flush before cancellation discards the
+    /// queued index apply that would otherwise advance its cursor.
+    #[tokio::test]
+    async fn test_abort_wakes_flush_waiting_for_index_apply() {
+        let (mut writer, handler, message, _temp) = pending_pk_flush().await;
+        let TriggerMemTableFlush::Flush { memtable, .. } = &message;
+        let memtable = Arc::clone(memtable);
+        writer.task_executor = Arc::new(TaskExecutor::new());
+        let indexes = memtable.indexes_arc().unwrap();
+        let mut completion = memtable.create_memtable_flush_completion();
+        let (flush_tx, flush_rx) = mpsc::unbounded_channel();
+        flush_tx.send(message).unwrap();
+        let mut dispatcher = Box::pin(
+            TaskDispatcher {
+                handler: Box::new(handler),
+                rx: flush_rx,
+                cancellation_token: writer.task_executor.cancellation_token.clone(),
+                name: "memtable_flusher".to_string(),
+            }
+            .run(),
+        );
+        assert_waiting_for_cursor(dispatcher.as_mut(), writer.wal_flusher.cursors());
+        writer
+            .task_executor
+            .tasks
+            .write()
+            .unwrap()
+            .push(("memtable_flusher".to_string(), tokio::spawn(dispatcher)));
+
+        let (index_tx, index_rx) = mpsc::unbounded_channel();
+        index_tx
+            .send(TriggerIndexApply {
+                batch_store: memtable.batch_store(),
+                indexes: indexes.clone(),
+                end_batch_position: memtable.batch_count(),
+            })
+            .unwrap();
+        writer
+            .task_executor
+            .add_handler(
+                "index_applier".to_string(),
+                Box::new(IndexApplyHandler {
+                    cursors: writer.wal_flusher.cursors().clone(),
+                    wal_flusher: writer.wal_flusher.clone(),
+                    stats: writer.stats.clone(),
+                }),
+                index_rx,
+            )
+            .unwrap();
+
+        // On this single-thread runtime neither spawned dispatcher can run
+        // before abort poisons the cursors and cancels their shared token.
+        tokio::time::timeout(Duration::from_secs(1), writer.abort())
+            .await
+            .expect("abort stranded the flush waiting for the cancelled index apply")
+            .unwrap();
+        assert_eq!(
+            indexes.indexed_count(),
+            0,
+            "abort must discard the queued apply"
+        );
+        let Some(DurabilityResult::Failed(message)) = completion.await_value().await else {
+            panic!("the pending flush must report abort's terminal failure");
+        };
+        assert!(message.contains("ShardWriter aborted"), "{message}");
+        assert!(
+            writer
+                .manifest()
+                .await
+                .unwrap()
+                .unwrap()
+                .sstables
+                .is_empty()
+        );
     }
 
     /// Delete a key, then flush: the tombstone and the live row land in the
@@ -9323,7 +9609,7 @@ mod tests {
 
         // Read back via WalTailer. WAL positions are 1-based, so two
         // entries from a fresh shard land at 1 and 2.
-        let tailer = WalTailer::new(store, base_path, shard_id);
+        let tailer = WalTailer::new(store, base_path, "", shard_id);
         assert_eq!(tailer.first_position().await.unwrap(), 1);
         assert_eq!(tailer.next_position().await.unwrap(), 3);
 
@@ -9374,7 +9660,7 @@ mod tests {
 
         // `put` returned, so the batch must already be durable — read the WAL
         // directly, without closing the writer.
-        let tailer = WalTailer::new(store, base_path, shard_id);
+        let tailer = WalTailer::new(store, base_path, "", shard_id);
         assert_eq!(tailer.next_position().await.unwrap(), 2);
         let entry = tailer.read_entry(1).await.unwrap().unwrap();
         assert_eq!(entry.batches.len(), 1);
@@ -9497,7 +9783,7 @@ mod tests {
 
         // All three puts should be in a single WAL entry at position 1
         // (WAL positions are 1-based).
-        let tailer = WalTailer::new(store, base_path, shard_id);
+        let tailer = WalTailer::new(store, base_path, "", shard_id);
         assert_eq!(tailer.next_position().await.unwrap(), 2);
         let entry = tailer.read_entry(1).await.unwrap().unwrap();
         assert_eq!(entry.batches.len(), 3);
@@ -9803,9 +10089,10 @@ mod tests {
             .unwrap();
         assert_eq!(writer.memtable_stats().await.unwrap().row_count, 10);
 
-        // Tear the background tasks down out from under the writer, so the
-        // freeze's dispatch sends hit closed channels.
-        writer.abort().await.unwrap();
+        // Tear the background tasks down without using `abort`, which poisons
+        // the writer before shutdown. This test specifically exercises the
+        // freeze dispatch failure as the first terminal error.
+        writer.task_executor.shutdown_all().await.unwrap();
 
         let err = writer
             .force_freeze_active()
@@ -10093,7 +10380,7 @@ mod tests {
         .close()
         .await
         .unwrap();
-        ShardManifestStore::new(store.clone(), base_path, shard_id, 2)
+        ShardManifestStore::new(store.clone(), base_path, "", shard_id, 2)
             .latest()
             .await
             .unwrap()
@@ -10134,7 +10421,7 @@ mod tests {
             .unwrap();
         let second = writer.force_freeze_active().await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let manifest = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
+        let manifest = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2)
             .latest()
             .await
             .unwrap()
@@ -10150,7 +10437,7 @@ mod tests {
         // Crash: drop without close.
         drop(writer);
 
-        let manifest = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
+        let manifest = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2)
             .latest()
             .await
             .unwrap()
@@ -10250,7 +10537,7 @@ mod tests {
         assert!(writer.close().await.is_err());
 
         controls.clear_write_failures();
-        let manifest = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2)
+        let manifest = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2)
             .latest()
             .await
             .unwrap()
@@ -10368,7 +10655,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tailer = WalTailer::new(store, base_path, shard_id);
+        let tailer = WalTailer::new(store, base_path, "", shard_id);
         let first = tailer.first_position().await.unwrap();
         let next = tailer.next_position().await.unwrap();
         let mut wal_rows = 0;
@@ -10518,7 +10805,7 @@ mod tests {
 
         // And the WAL really holds every row we acked (3 puts x 5 rows).
         writer.close().await.unwrap();
-        let tailer = WalTailer::new(store, base_path, shard_id);
+        let tailer = WalTailer::new(store, base_path, "", shard_id);
         let first = tailer.first_position().await.unwrap();
         let next = tailer.next_position().await.unwrap();
         let mut wal_rows = 0;
@@ -10743,7 +11030,7 @@ mod tests {
         writer.close().await.unwrap();
 
         // Walk the WAL in entry order and collect the ids as replay would see them.
-        let tailer = WalTailer::new(store, base_path, shard_id);
+        let tailer = WalTailer::new(store, base_path, "", shard_id);
         let first = tailer.first_position().await.unwrap();
         let next = tailer.next_position().await.unwrap();
         let mut ids: Vec<i32> = Vec::new();
@@ -10873,7 +11160,7 @@ mod tests {
         // Simulate an external compactor compacting the SSTable.
         // into the base table: drain `sstables` to empty via a
         // direct manifest commit. The cursor stays where the flush put it.
-        let manifest_store = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let manifest_store = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2);
         let pre = manifest_store.latest().await.unwrap().unwrap();
         assert!(
             !pre.sstables.is_empty(),
@@ -11068,12 +11355,14 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
         let appender = WalAppender::with_claimed_epoch(
             store.clone(),
             base_path.clone(),
+            "",
             shard_id,
             manifest_store,
             epoch,
@@ -11140,12 +11429,14 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
         let high_epoch_appender = WalAppender::with_claimed_epoch(
             store.clone(),
             base_path.clone(),
+            "",
             shard_id,
             manifest_store,
             100,
@@ -11298,7 +11589,7 @@ mod tests {
         // Each put should have produced its own WAL entry — three crossings,
         // three entries. Without the regression fix, all three batches end
         // up in a single entry written by `close()`.
-        let tailer = WalTailer::new(store, base_path, shard_id);
+        let tailer = WalTailer::new(store, base_path, "", shard_id);
         let next = tailer.next_position().await.unwrap();
         assert!(
             next >= 3,
@@ -13278,8 +13569,15 @@ mod shard_writer_tests {
         let (store, base_path) = lance_io::object_store::ObjectStore::from_uri(&uri)
             .await
             .expect("Failed to open store");
-        let manifest_store =
-            super::super::manifest::ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let dir_id = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .unwrap()
+            .dir_id;
+        let manifest_store = super::super::manifest::ShardManifestStore::new(
+            store, &base_path, &dir_id, shard_id, 2,
+        );
         let manifest = manifest_store
             .latest()
             .await
@@ -13288,7 +13586,8 @@ mod shard_writer_tests {
         assert_eq!(manifest.sstables.len(), 1);
 
         let sstable = &manifest.sstables[0];
-        let gen_uri = format!("{}/_mem_wal/{}/{}", uri, shard_id, sstable.path);
+        let gen_uri =
+            crate::dataset::mem_wal::util::sstable_uri(&uri, &dir_id, &shard_id, &sstable.path);
         let sstable = Dataset::open(&gen_uri)
             .await
             .expect("Failed to open SSTable");
@@ -13910,10 +14209,14 @@ mod shard_writer_tests {
         }
 
         // Close writer to ensure final flush
+        let dir_id = writer.config().dir_id.clone();
         writer.close().await.expect("Failed to close");
 
         // === VERIFY FILE SYSTEM LAYOUT ===
-        let mem_wal_dir = temp_dir.path().join("_mem_wal").join(shard_id.to_string());
+        let mem_wal_dir = temp_dir
+            .path()
+            .join(crate::dataset::mem_wal::util::mem_wal_dir_name(&dir_id))
+            .join(shard_id.to_string());
         assert!(mem_wal_dir.exists(), "MemWAL directory should exist");
 
         // Check WAL directory
@@ -13944,8 +14247,15 @@ mod shard_writer_tests {
         let (store, base_path) = lance_io::object_store::ObjectStore::from_uri(&uri)
             .await
             .expect("Failed to open store");
-        let manifest_store =
-            super::super::manifest::ShardManifestStore::new(store, &base_path, shard_id, 2);
+        let dir_id = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .unwrap()
+            .dir_id;
+        let manifest_store = super::super::manifest::ShardManifestStore::new(
+            store, &base_path, &dir_id, shard_id, 2,
+        );
         let manifest = manifest_store
             .latest()
             .await
@@ -13959,10 +14269,10 @@ mod shard_writer_tests {
         );
         for sstable in &manifest.sstables {
             // The path stored in manifest is relative to the shard directory
-            // Construct full path: temp_dir/_mem_wal/shard_id/generation_folder
+            // Construct full path: temp_dir/{mem_wal_dir}/shard_id/generation_folder
             let gen_path = temp_dir
                 .path()
-                .join("_mem_wal")
+                .join(crate::dataset::mem_wal::util::mem_wal_dir_name(&dir_id))
                 .join(shard_id.to_string())
                 .join(&sstable.path);
 
@@ -14093,8 +14403,13 @@ mod shard_writer_tests {
         assert_eq!(manifest.sstables.len(), 1);
         let sstable = manifest.sstables[0].clone();
 
-        // The generation landed under `_mem_wal/`, and the base table is untouched.
-        let gen_uri = format!("{}/_mem_wal/{}/{}", uri, shard_id, sstable.path);
+        // The generation landed under the MemWAL directory, and the base table is untouched.
+        let gen_uri = crate::dataset::mem_wal::util::sstable_uri(
+            &uri,
+            &writer.config().dir_id,
+            &shard_id,
+            &sstable.path,
+        );
         let generation = Dataset::open(&gen_uri)
             .await
             .expect("generation must exist at its own path");
@@ -14111,7 +14426,8 @@ mod shard_writer_tests {
         let snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(manifest.current_generation)
             .with_sstable(sstable.generation, sstable.path.clone());
-        let scanner = LsmScanner::new(Arc::new(dataset), vec![snapshot], vec!["id".to_string()]);
+        let scanner = LsmScanner::new(Arc::new(dataset), vec![snapshot], vec!["id".to_string()])
+            .with_mem_wal_dir_id(writer.config().dir_id.clone());
         let rows: usize = scanner
             .try_into_stream()
             .await
@@ -14207,7 +14523,8 @@ mod shard_writer_tests {
         let snapshot = ShardSnapshot::new(shard_id)
             .with_current_generation(manifest.current_generation)
             .with_sstable(sstable.generation, sstable.path.clone());
-        let scanner = LsmScanner::new(Arc::new(dataset), vec![snapshot], vec!["id".to_string()]);
+        let scanner = LsmScanner::new(Arc::new(dataset), vec![snapshot], vec!["id".to_string()])
+            .with_mem_wal_dir_id(writer.config().dir_id.clone());
         let rows: usize = scanner
             .try_into_stream()
             .await
@@ -14298,6 +14615,7 @@ mod shard_writer_tests {
             vec![snapshot],
             vec!["id".to_string()],
         )
+        .with_mem_wal_dir_id(writer.config().dir_id.clone())
         .with_session(dataset.session())
         .with_store_params(store_params)
         .try_into_stream()

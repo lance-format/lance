@@ -8,15 +8,10 @@ use std::iter::Sum;
 use std::ops::AddAssign;
 use std::sync::Arc;
 
-use crate::{Error, Result};
-use arrow_array::{
-    Array, FixedSizeListArray, Float32Array,
-    cast::AsArray,
-    types::{Float16Type, Float32Type, Float64Type, Int8Type},
-};
-use arrow_schema::DataType;
+use crate::Result;
+use argminmax::ArgMinMax;
+use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use half::{bf16, f16};
-use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::cpu::SIMD_SUPPORT;
 #[cfg(target_arch = "x86_64")]
@@ -26,7 +21,7 @@ use num_traits::{AsPrimitive, Num};
 use crate::distance::{
     BatchKernel, HALF_KERNELS_COMPILED, HalfBackend, HalfType, PairKernel,
     U8_U32_ACCUMULATOR_MAX_LEN, assert_batch_output_layout, assert_equal_lengths, half_backend,
-    int8_query_to_f32, x86_half_features,
+    x86_half_features,
 };
 
 /// Calculate the L2 distance between two vectors.
@@ -959,10 +954,18 @@ impl L2Prepared {
 
     /// Return the index of the nearest target to `query`, using `buf` as scratch space.
     ///
-    /// `buf` must have length `num_targets`.
+    /// `buf` must have length `num_targets`. NaN distances are ignored; on ties the
+    /// lowest index wins. Returns `None` if there are no targets or no distance is finite.
     pub fn nearest_into(&self, query: &[f32], buf: &mut [f32]) -> Option<u32> {
         self.distances_into(query, buf);
-        crate::kernels::argmin_value_float(buf.iter().copied()).map(|(idx, _)| idx)
+        let distances: &[f32] = buf;
+        // `argmin` panics on an empty slice, and returns an index even when no
+        // distance is finite (all NaN or infinite).
+        if distances.is_empty() {
+            return None;
+        }
+        let idx = distances.argmin();
+        (distances[idx] < f32::INFINITY).then_some(idx as u32)
     }
 
     /// Return the index of the nearest target to `query`.
@@ -1011,80 +1014,21 @@ pub fn l2_distance_batch_into<T: L2>(from: &[T], to: &[T], dimension: usize, out
     T::l2_batch_into(from, to, dimension, output);
 }
 
-fn do_l2_distance_arrow_batch<T: ArrowFloatType>(
-    from: &T::ArrayType,
-    to: &FixedSizeListArray,
-) -> Result<Arc<Float32Array>>
-where
-    T::Native: L2,
-{
-    let dimension = to.value_length() as usize;
-    debug_assert_eq!(from.len(), dimension);
-
-    // TODO: if we detect there is a run of nulls, should we skip those?
-    let to_values =
-        to.values()
-            .as_any()
-            .downcast_ref::<T::ArrayType>()
-            .ok_or(Error::ComputeError(format!(
-                "Cannot downcast to the same type: {} != {}",
-                T::FLOAT_TYPE,
-                to.value_type()
-            )))?;
-    let mut distances = vec![0.0; to.len()];
-    l2_distance_batch_into(
-        from.as_slice(),
-        to_values.as_slice(),
-        dimension,
-        &mut distances,
-    );
-
-    Ok(Arc::new(Float32Array::new(
-        distances.into(),
-        to.nulls().cloned(),
-    )))
-}
-
-/// Compute L2 distance between a vector and a batch of vectors.
+/// Compute l2 distances, propagating the null buffer of `to`.
 ///
-/// Null buffer of `to` is propagated to the returned array.
-///
-/// Parameters
-///
-/// - `from`: the vector to compute distance from.
-/// - `to`: a list of vectors to compute distance to.
-///
-/// # Errors
-///
-/// Returns an error if `from` is an `Int8` array containing nulls, since a null
-/// query element has no distance to compute. The unsupported-type and downcast
-/// paths return errors of their own; this list is not exhaustive.
-///
-/// # Panics
-///
-/// Panics if the length of `from` is not equal to the dimension (value length) of `to`.
+/// See [`super::DistanceType::batch`] for supported types and input validation.
+#[deprecated(note = "Use DistanceType::L2.batch")]
 pub fn l2_distance_arrow_batch(
     from: &dyn Array,
     to: &FixedSizeListArray,
 ) -> Result<Arc<Float32Array>> {
-    match *from.data_type() {
-        DataType::Float16 => do_l2_distance_arrow_batch::<Float16Type>(from.as_primitive(), to),
-        DataType::Float32 => do_l2_distance_arrow_batch::<Float32Type>(from.as_primitive(), to),
-        DataType::Float64 => do_l2_distance_arrow_batch::<Float64Type>(from.as_primitive(), to),
-        DataType::Int8 => do_l2_distance_arrow_batch::<Float32Type>(
-            &int8_query_to_f32(from.as_primitive::<Int8Type>())?,
-            &to.convert_to_floating_point()?,
-        ),
-        _ => Err(Error::InvalidArgumentError(format!(
-            "Unsupported data type: {}",
-            from.data_type()
-        ))),
-    }
+    super::DistanceType::L2.batch(from, to).map(Arc::new)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{cast::AsArray, types::Float32Type};
 
     use approx::assert_relative_eq;
     use num_traits::ToPrimitive;
@@ -1549,6 +1493,22 @@ mod tests {
 
         assert_relative_eq!(d1[0], 0.0); // q1 == target[0]
         assert_relative_eq!(d2[1], 0.0); // q2 == target[1]
+    }
+
+    /// With dimension 1 and a zero query, the distance to target `t` is `t * t`.
+    /// PQ uses 16 (4-bit) or 256 (8-bit) targets. The 258 targets of `first_of_equal`
+    /// put 2 targets after the last full SIMD vector, so the tie spans both parts.
+    #[rstest::rstest]
+    #[case::last_of_16([vec![3.0; 15], vec![2.0]].concat(), Some(15))]
+    #[case::first_of_equal([3.0, 1.0, -1.0].repeat(86), Some(1))]
+    #[case::skips_nan([vec![f32::NAN; 255], vec![2.0]].concat(), Some(255))]
+    #[case::all_nan(vec![f32::NAN; 16], None)]
+    #[case::all_infinite(vec![f32::INFINITY; 256], None)]
+    #[case::nan_and_infinite([f32::NAN, f32::INFINITY].repeat(8), None)]
+    #[case::no_targets(vec![], None)]
+    fn test_l2_targets_nearest(#[case] targets: Vec<f32>, #[case] expected: Option<u32>) {
+        let prepared = L2Prepared::new(&targets, 1);
+        assert_eq!(prepared.nearest(&[0.0]), expected);
     }
 
     /// `l2_batch_into` must agree with the per-vector `l2` for the f32 batch
