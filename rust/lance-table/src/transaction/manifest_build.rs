@@ -5861,6 +5861,51 @@ mod tests {
         replace_fields(fragment, vec![5], manifest_version, read_version)
     }
 
+    /// The tree encoder of a data replacement has no read version, so it must
+    /// never contradict flat, which keeps an overlay committed after the read.
+    #[test]
+    fn tree_data_replacement_never_contradicts_flat_for_a_newer_overlay() {
+        let file = |path: &str| {
+            DataFile::new(
+                path,
+                vec![5],
+                vec![0],
+                ConcreteFileVersion::V2_0,
+                None,
+                None,
+            )
+        };
+        let mut fragment = Fragment::new(0);
+        fragment.physical_rows = Some(1);
+        fragment.files = vec![file("v.lance")];
+        fragment.overlays = vec![DataOverlayFile {
+            data_file: file("o5.lance"),
+            coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+            committed_version: 3,
+        }];
+        // Read at version 2 and rebased over the overlay committed at
+        // version 3, so the overlay is the newer value.
+        let flat = replace_field_5(fragment.clone(), 3, 2).unwrap();
+        assert_eq!(flat.overlays, fragment.overlays);
+        match crate::fragment_metadata::data_replacement(Some(&fragment), 0, &file("v-new.lance")) {
+            Ok(actions) => {
+                let mut state = std::collections::BTreeMap::from([(0, fragment)]);
+                let buffer = actions
+                    .into_iter()
+                    .zip(1..)
+                    .map(|(action, action_sequence)| pb::FragmentTreeMutation {
+                        action_sequence,
+                        action: Some(action),
+                        ..Default::default()
+                    })
+                    .collect();
+                crate::fragment_metadata::apply_actions(&mut state, buffer).unwrap();
+                assert_eq!(state[&0].overlays, flat.overlays);
+            }
+            Err(error) => assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}"),
+        }
+    }
+
     #[test]
     fn test_data_replacement_rejects_subset_of_legacy_file() {
         // The V1 reader derives its page table offset from the first field in
