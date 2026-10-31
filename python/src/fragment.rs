@@ -127,7 +127,13 @@ impl FileFragment {
             .collect::<Vec<_>>()
             .join(", ");
         write!(s, "{}]", file_path).unwrap();
-        if let Some(deletion) = &self.fragment.metadata().deletion_file {
+        if let Some(deletion) = self
+            .fragment
+            .metadata()
+            .deletion_file
+            .as_ref()
+            .filter(|deletion| !deletion.is_inline())
+        {
             let path = deletion_file_path(&Default::default(), self.id() as u64, deletion);
             write!(s, ", deletion_file='{}'", path).unwrap();
         }
@@ -564,6 +570,7 @@ impl FileFragment {
     fn deletion_file(&self) -> PyResult<Option<String>> {
         let deletion = self.fragment.metadata().deletion_file.clone();
         Ok(deletion
+            .filter(|d| !d.is_inline())
             .map(|d| deletion_file_path(&Default::default(), self.id() as u64, &d).to_string()))
     }
 

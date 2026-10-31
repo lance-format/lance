@@ -616,7 +616,7 @@ impl Manifest {
     /// - total_files_size: Total size of all data files in bytes
     /// - total_fragments: Total number of fragments in the dataset
     /// - total_data_files: Total number of data files across all fragments
-    /// - total_deletion_files: Total number of deletion files
+    /// - total_deletion_files: Total number of external deletion files
     /// - total_data_file_rows: Total number of rows in data files
     /// - total_deletion_file_rows: Total number of deleted rows in deletion files
     /// - total_rows: Total number of rows in the dataset
@@ -638,8 +638,11 @@ impl Manifest {
                             summary.total_files_size += size_bytes.get();
                         }
                     }
-                    // Check and count if the current fragment has a deletion file
-                    if f.deletion_file.is_some() {
+                    // Inline vectors are part of the manifest, not deletion files.
+                    if f.deletion_file
+                        .as_ref()
+                        .is_some_and(|file| !file.is_inline())
+                    {
                         summary.total_deletion_files += 1;
                     }
                     // Sum the number of deleted rows from the deletion file (if available)
@@ -2219,8 +2222,8 @@ mod tests {
         });
 
         let manifest_with_deletion = Manifest::new(
-            schema,
-            Arc::new(vec![fragment_with_deletion]),
+            schema.clone(),
+            Arc::new(vec![fragment_with_deletion.clone()]),
             DataStorageFormat::default(),
             HashMap::new(),
         );
@@ -2233,6 +2236,23 @@ mod tests {
         assert_eq!(deletion_summary.total_deletion_file_rows, 10);
         assert_eq!(deletion_summary.total_data_file_rows, 50);
         assert_eq!(deletion_summary.total_deletion_files, 1);
+
+        fragment_with_deletion
+            .deletion_file
+            .as_mut()
+            .unwrap()
+            .inline = Some(vec![0].into());
+        let manifest_with_inline_deletion = Manifest::new(
+            schema,
+            Arc::new(vec![fragment_with_deletion]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        let inline_summary = manifest_with_inline_deletion.summary();
+        assert_eq!(inline_summary.total_rows, 40);
+        assert_eq!(inline_summary.total_deletion_file_rows, 10);
+        assert_eq!(inline_summary.total_data_file_rows, 50);
+        assert_eq!(inline_summary.total_deletion_files, 0);
 
         //Just verify the transformation is OK
         let stats_map: BTreeMap<String, String> = deletion_summary.into();

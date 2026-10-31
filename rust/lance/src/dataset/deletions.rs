@@ -50,9 +50,10 @@ impl Dataset {
     /// budget to be set in the table config, see
     /// [`INLINE_DELETIONS_MAX_BYTES_CONFIG_KEY`].
     ///
-    /// The move is one way: every later snapshot carries
-    /// `FLAG_INLINE_DELETIONS`, and setting the budget back to `0` only stops
-    /// new inline writes. Upgrade every reader of the table before calling this.
+    /// Snapshots that still contain an inline vector carry
+    /// `FLAG_INLINE_DELETIONS`. The move is one way: setting the budget back to
+    /// `0` only stops new inline writes and does not externalize vectors that
+    /// are already inline. Upgrade every reader of the table before calling this.
     pub async fn inline_deletions(&mut self) -> Result<usize> {
         let max_bytes = self.inline_deletions_max_bytes()?;
         if max_bytes == 0 {
@@ -110,13 +111,15 @@ impl Dataset {
         };
         let deletion_vector = read_dataset_deletion_file(self, fragment.id, deletion_file).await?;
         let bitmap = RoaringBitmap::from(deletion_vector.as_ref());
-        let mut encoded = Vec::with_capacity(bitmap.serialized_size());
-        bitmap.serialize_into(&mut encoded)?;
-        if encoded.len() > max_bytes {
+        let encoded_size = bitmap.serialized_size();
+        if encoded_size > max_bytes {
             return Ok(None);
         }
+        let mut encoded = Vec::with_capacity(encoded_size);
+        bitmap.serialize_into(&mut encoded)?;
         deletion_file.file_type = DeletionFileType::Bitmap;
         deletion_file.num_deleted_rows = Some(bitmap.len() as usize);
+        deletion_file.base_id = None;
         deletion_file.inline = Some(encoded.into());
         Ok(Some(fragment))
     }

@@ -237,7 +237,7 @@ A `DeletionFile` with `inline` set stores its deletion vector in the metadata
 itself, as a serialized Roaring bitmap of deleted row offsets, whatever
 `file_type` says; no file exists under `_deletions/` for it. Readers must
 decode `inline` when present and must not look for the file. Writers set
-`FLAG_INLINE_DELETIONS` (`2^18`) in both `reader_feature_flags` and
+`FLAG_INLINE_DELETIONS` (`2^19`) in both `reader_feature_flags` and
 `writer_feature_flags` of any snapshot that carries one.
 
 After decoding a leaf, readers must verify the following fields against its
