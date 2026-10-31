@@ -254,35 +254,41 @@ mod half_c {
     }
 
     // Each candidate must require what build.rs compiled its object for.
-    #[cfg(all(test, target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     const _: () = {
-        use crate::distance::half_c_objects::{HASWELL, is};
-        assert!(is(COSINE_F16_AVX2.features(), HASWELL));
-        assert!(is(COSINE_BF16_AVX2.features(), HASWELL));
+        use crate::distance::half_c_objects::{HASWELL, same_features};
+        assert!(same_features(COSINE_F16_AVX2.features(), HASWELL));
+        assert!(same_features(COSINE_BF16_AVX2.features(), HASWELL));
     };
-    #[cfg(all(test, target_arch = "x86_64", kernel_support = "avx512_f16"))]
+    #[cfg(all(target_arch = "x86_64", kernel_support = "avx512_f16"))]
     const _: () = {
-        use crate::distance::half_c_objects::{SAPPHIRE_RAPIDS_F16, is};
-        assert!(is(COSINE_F16_AVX512.features(), SAPPHIRE_RAPIDS_F16));
+        use crate::distance::half_c_objects::{SAPPHIRE_RAPIDS_F16, same_features};
+        assert!(same_features(
+            COSINE_F16_AVX512.features(),
+            SAPPHIRE_RAPIDS_F16
+        ));
     };
-    #[cfg(all(test, target_arch = "x86_64", kernel_support = "avx512_bf16"))]
+    #[cfg(all(target_arch = "x86_64", kernel_support = "avx512_bf16"))]
     const _: () = {
-        use crate::distance::half_c_objects::{SAPPHIRE_RAPIDS_BF16, is};
-        assert!(is(COSINE_BF16_AVX512.features(), SAPPHIRE_RAPIDS_BF16));
+        use crate::distance::half_c_objects::{SAPPHIRE_RAPIDS_BF16, same_features};
+        assert!(same_features(
+            COSINE_BF16_AVX512.features(),
+            SAPPHIRE_RAPIDS_BF16
+        ));
     };
-    #[cfg(all(test, target_arch = "aarch64"))]
+    #[cfg(target_arch = "aarch64")]
     const _: () = {
-        use crate::distance::half_c_objects::{ARMV8_2_FP16, is};
-        assert!(is(COSINE_F16_NEON.features(), ARMV8_2_FP16));
-        assert!(is(COSINE_BF16_NEON.features(), ARMV8_2_FP16));
+        use crate::distance::half_c_objects::{ARMV8_2_FP16, same_features};
+        assert!(same_features(COSINE_F16_NEON.features(), ARMV8_2_FP16));
+        assert!(same_features(COSINE_BF16_NEON.features(), ARMV8_2_FP16));
     };
-    #[cfg(all(test, target_arch = "loongarch64"))]
+    #[cfg(target_arch = "loongarch64")]
     const _: () = {
-        use crate::distance::half_c_objects::{LASX, LSX, is};
-        assert!(is(COSINE_F16_LASX.features(), LASX));
-        assert!(is(COSINE_BF16_LASX.features(), LASX));
-        assert!(is(COSINE_F16_LSX.features(), LSX));
-        assert!(is(COSINE_BF16_LSX.features(), LSX));
+        use crate::distance::half_c_objects::{LASX, LSX, same_features};
+        assert!(same_features(COSINE_F16_LASX.features(), LASX));
+        assert!(same_features(COSINE_BF16_LASX.features(), LASX));
+        assert!(same_features(COSINE_F16_LSX.features(), LSX));
+        assert!(same_features(COSINE_BF16_LSX.features(), LSX));
     };
 }
 

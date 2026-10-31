@@ -18,8 +18,8 @@ use arrow_schema::ArrowError;
 /// Declares a safe [`lance_core::target_kernel!`] wrapper and its candidate
 /// for each half-precision C kernel in the caller's `ffi` module.
 ///
-/// The listed features must cover the flags build.rs compiled that kernel's
-/// object with; see `half_c_objects`. The AVX-512 objects target Sapphire
+/// The listed features must be exactly the feature set build.rs compiled that
+/// kernel's object for, as `half_c_objects` spells it. The AVX-512 objects target Sapphire
 /// Rapids, so they require `avx512fp16`, which stands in for that CPU's
 /// features, plus `avx512bf16` for the bf16 object.
 ///
@@ -52,11 +52,12 @@ macro_rules! half_c_kernels {
 
 /// What build.rs compiles each half-precision C object for, as feature sets.
 /// Every `half_c` module checks its candidates against these at compile time.
-#[cfg(all(test, kernel_support = "half"))]
+#[cfg(kernel_support = "half")]
 mod half_c_objects {
     use lance_core::utils::cpu::CpuFeatures;
 
-    pub const fn is(features: CpuFeatures, object: CpuFeatures) -> bool {
+    /// `CpuFeatures` equality, usable in const asserts where `==` is not.
+    pub const fn same_features(features: CpuFeatures, object: CpuFeatures) -> bool {
         features.contains(object) && object.contains(features)
     }
 
