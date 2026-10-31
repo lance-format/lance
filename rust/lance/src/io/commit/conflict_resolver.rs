@@ -14,17 +14,20 @@ use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{
     Dataset,
-    dataset::transaction::{DataOverlayGroup, Operation, RewriteGroup, Transaction, UpdateMode},
+    dataset::transaction::{
+        DataOverlayGroup, Operation, RewriteGroup, Transaction, UpdateMap, UpdateMode,
+    },
 };
 use futures::{StreamExt, TryStreamExt};
+use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result, utils::deletion::DeletionVector};
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_select::{RowAddrTreeMap, RowSetOps};
-use lance_table::format::IndexMetadata;
 use lance_table::format::overlay::OverlayCoverage;
 use lance_table::format::overlay::staleness::{field_affects_index, overlay_affects_index};
 use lance_table::format::pb::fragment_reuse_index_details::{InlineContent, Transition};
+use lance_table::format::{DataFile, IndexMetadata};
 use lance_table::system_index::frag_reuse::FragReuseVersion;
 use lance_table::system_index::frag_reuse::lineage::TaggedLineage;
 use lance_table::system_index::frag_reuse::metadata::is_tagged;
@@ -82,6 +85,8 @@ pub struct TransactionRebase<'a> {
     /// settle it at commit time. A same-name CreateIndex that changed what
     /// the index is (its fields or type) still conflicts.
     staged_replay: bool,
+    /// Field tree at `transaction.read_version`.
+    read_version_schema: Arc<Schema>,
 }
 
 /// Whether a fragment-reuse index would corrupt `index` rather than repair it.
@@ -187,6 +192,88 @@ fn same_logical_index(a: &IndexMetadata, b: &IndexMetadata) -> bool {
     a.fields == b.fields && a.covering_fields == b.covering_fields && type_url(a) == type_url(b)
 }
 
+/// `id` plus its ancestors and descendants.
+///
+/// A packed struct or blob is one physical data-file column and records the
+/// container's id, while an ordinary struct records its descendant leaf ids.
+/// A write and a metadata change can therefore name either end, so containment
+/// runs both ways.
+fn field_lineage(schema: &Schema, id: i32) -> HashSet<i32> {
+    let mut lineage = HashSet::from([id]);
+
+    // On popping a field at `depth`, `path` truncated to `depth` is its
+    // ancestry. `field_by_id` finds the field but not the way down to it.
+    let mut path: Vec<i32> = Vec::new();
+    let mut stack: Vec<(&Field, usize)> = schema.fields.iter().map(|f| (f, 0)).collect();
+    let mut found = None;
+    while let Some((field, depth)) = stack.pop() {
+        path.truncate(depth);
+        if field.id == id {
+            found = Some(field);
+            break;
+        }
+        path.push(field.id);
+        stack.extend(field.children.iter().map(|c| (c, depth + 1)));
+    }
+
+    // Absent field: `path` is the branch the walk gave up on, not an ancestry.
+    let Some(field) = found else {
+        return lineage;
+    };
+
+    lineage.extend(path);
+    let mut subtree = vec![field];
+    while let Some(field) = subtree.pop() {
+        lineage.insert(field.id);
+        subtree.extend(field.children.iter());
+    }
+    lineage
+}
+
+/// Fields these data files carry values for. A negative id is a tombstone.
+fn live_field_ids<'a>(files: impl Iterator<Item = &'a DataFile>) -> Vec<i32> {
+    files
+        .flat_map(|f| f.fields.iter().copied())
+        .filter(|id| *id >= 0)
+        .collect()
+}
+
+/// The fields whose values `operation` produced.
+///
+/// A row rewrite leaves `fields_modified` empty, naming the columns it
+/// recomputed only in the set index maintenance consults -- which is
+/// meaningful only once it wrote a fragment.
+fn value_producing_fields(operation: &Operation) -> Vec<i32> {
+    match operation {
+        Operation::Update {
+            fields_modified,
+            new_fragments,
+            fields_for_preserving_frag_bitmap,
+            ..
+        } => {
+            let rewritten = if new_fragments.is_empty() {
+                &[][..]
+            } else {
+                fields_for_preserving_frag_bitmap
+            };
+            fields_modified
+                .iter()
+                .chain(rewritten)
+                .map(|id| *id as i32)
+                .collect()
+        }
+        Operation::DataReplacement { replacements } => {
+            live_field_ids(replacements.iter().map(|r| &r.1))
+        }
+        Operation::DataOverlay { groups } => live_field_ids(
+            groups
+                .iter()
+                .flat_map(|g| g.overlays.iter().map(|o| &o.data_file)),
+        ),
+        _ => Vec::new(),
+    }
+}
+
 /// Whether `operation` may make a nullability-affecting schema change: a
 /// projection or merge that does not assert `preserves_nullability`. A
 /// tightening projection scanned for nulls at its read version, and a merge
@@ -220,6 +307,10 @@ fn supplies_values(operation: &Operation) -> bool {
     )
 }
 
+fn update_map_changes_metadata(update: &UpdateMap) -> bool {
+    update.replace || !update.update_entries.is_empty()
+}
+
 /// Whether an operation changes schema-level or per-field metadata. A merge
 /// carries the complete schema from its read version, so rebasing either
 /// operation over the other can discard one side's metadata changes.
@@ -235,10 +326,10 @@ fn updates_schema_or_field_metadata(operation: &Operation) -> bool {
 
     schema_metadata_updates
         .as_ref()
-        .is_some_and(|update| update.replace || !update.update_entries.is_empty())
+        .is_some_and(update_map_changes_metadata)
         || field_metadata_updates
             .values()
-            .any(|update| update.replace || !update.update_entries.is_empty())
+            .any(update_map_changes_metadata)
 }
 
 impl<'a> TransactionRebase<'a> {
@@ -246,6 +337,34 @@ impl<'a> TransactionRebase<'a> {
         dataset: &Dataset,
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
+    ) -> Result<Self> {
+        let read_version_schema = if transaction.read_version == 0
+            || dataset.manifest.version == transaction.read_version
+        {
+            Arc::new(dataset.schema().clone())
+        } else {
+            Arc::new(
+                dataset
+                    .checkout_version(transaction.read_version)
+                    .await?
+                    .schema()
+                    .clone(),
+            )
+        };
+        Self::try_new_with_read_version_schema(
+            dataset,
+            transaction,
+            affected_rows,
+            read_version_schema,
+        )
+        .await
+    }
+
+    pub(crate) async fn try_new_with_read_version_schema(
+        dataset: &Dataset,
+        transaction: Transaction,
+        affected_rows: Option<&'a RowAddrTreeMap>,
+        read_version_schema: Arc<Schema>,
     ) -> Result<Self> {
         match &transaction.operation {
             // These operations add new fragments or don't modify any.
@@ -287,6 +406,7 @@ impl<'a> TransactionRebase<'a> {
                     read_fragments,
                     read_schema,
                     reuse: Default::default(),
+                    read_version_schema,
                     staged_replay: false,
                 })
             }
@@ -325,6 +445,7 @@ impl<'a> TransactionRebase<'a> {
                         read_schema: None,
                         reuse: Default::default(),
                         staged_replay: false,
+                        read_version_schema,
                     });
                 }
 
@@ -346,6 +467,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    read_version_schema,
                 })
             }
             Operation::Rewrite {
@@ -385,6 +507,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse,
                     staged_replay: false,
+                    read_version_schema,
                 })
             }
             Operation::DataReplacement { replacements } => {
@@ -408,6 +531,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    read_version_schema,
                 })
             }
             Operation::DataOverlay { groups } => {
@@ -431,6 +555,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    read_version_schema,
                 })
             }
             Operation::Merge { fragments, .. } => {
@@ -453,6 +578,7 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
+                    read_version_schema,
                 })
             }
             // An unrecognized operation cannot be rebased: we don't know what it touches.
@@ -462,6 +588,43 @@ impl<'a> TransactionRebase<'a> {
                 transaction.uuid
             ))),
         }
+    }
+
+    /// A field's metadata is part of its definition, so a write and a metadata
+    /// change to a field it produced values for are not independent.
+    fn check_field_metadata(
+        &self,
+        write: &Operation,
+        field_metadata_updates: &HashMap<i32, UpdateMap>,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
+        let written = value_producing_fields(write);
+        let redefined = field_metadata_updates.iter().find_map(|(id, update)| {
+            if !update_map_changes_metadata(update) {
+                return None;
+            }
+            let lineage = field_lineage(&self.read_version_schema, *id);
+            written
+                .iter()
+                .any(|field| lineage.contains(field))
+                .then_some(*id)
+        });
+        if let Some(field_id) = redefined {
+            if matches!(self.transaction.operation, Operation::UpdateConfig { .. }) {
+                return Err(Error::incompatible_transaction_source(
+                    format!(
+                        "Field metadata update for field {field_id} was planned before concurrent \
+                         transaction {} at version {other_version} rewrote that field. Re-read \
+                         the field and replan the metadata update.",
+                        other_transaction.operation
+                    )
+                    .into(),
+                ));
+            }
+            return Err(self.retryable_conflict_err(other_transaction, other_version));
+        }
+        Ok(())
     }
 
     #[track_caller]
@@ -871,8 +1034,16 @@ impl<'a> TransactionRebase<'a> {
                 Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Clone { .. }
-                | Operation::UpdateConfig { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
+                Operation::UpdateConfig {
+                    field_metadata_updates,
+                    ..
+                } => self.check_field_metadata(
+                    &self.transaction.operation,
+                    field_metadata_updates,
+                    other_transaction,
+                    other_version,
+                ),
                 Operation::Project { schema, .. } => {
                     // A project can drop fields, and this update writes
                     // replacement files for the fields it names. Committing
@@ -1959,9 +2130,17 @@ impl<'a> TransactionRebase<'a> {
     ) -> Result<()> {
         if let Operation::DataReplacement { replacements } = &self.transaction.operation {
             match &other_transaction.operation {
+                Operation::UpdateConfig {
+                    field_metadata_updates,
+                    ..
+                } => self.check_field_metadata(
+                    &self.transaction.operation,
+                    field_metadata_updates,
+                    other_transaction,
+                    other_version,
+                ),
                 Operation::Append { .. }
                 | Operation::Clone { .. }
-                | Operation::UpdateConfig { .. }
                 | Operation::ReserveFragments { .. }
                 // Both a column replacement and an overlay preserve physical row
                 // addresses; the overlay is newer and wins its covered cells.
@@ -2144,11 +2323,19 @@ impl<'a> TransactionRebase<'a> {
             Operation::Append { .. }
             | Operation::CreateIndex { .. }
             | Operation::ReserveFragments { .. }
-            | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. }
             | Operation::Clone { .. }
             | Operation::DataReplacement { .. }
             | Operation::DataOverlay { .. } => Ok(()),
+            Operation::UpdateConfig {
+                field_metadata_updates,
+                ..
+            } => self.check_field_metadata(
+                &self.transaction.operation,
+                field_metadata_updates,
+                other_transaction,
+                other_version,
+            ),
             // A concurrent Project that dropped a field we overlay discards our
             // values for it. Project only prunes the overlays already committed,
             // so ours would otherwise land covering a field that no longer exists.
@@ -2436,17 +2623,22 @@ impl<'a> TransactionRebase<'a> {
                         Ok(())
                     }
                 }
+                write @ (Operation::Update { .. }
+                | Operation::DataReplacement { .. }
+                | Operation::DataOverlay { .. }) => self.check_field_metadata(
+                    write,
+                    field_metadata_updates,
+                    other_transaction,
+                    other_version,
+                ),
                 Operation::Append { .. }
                 | Operation::Clone { .. }
                 | Operation::Delete { .. }
                 | Operation::CreateIndex { .. }
                 | Operation::Rewrite { .. }
-                | Operation::DataReplacement { .. }
-                | Operation::DataOverlay { .. }
                 | Operation::Merge { .. }
                 | Operation::Restore { .. }
                 | Operation::ReserveFragments { .. }
-                | Operation::Update { .. }
                 | Operation::Project { .. }
                 | Operation::UpdateMemWalState { .. }
                 | Operation::UpdateBases { .. } => Ok(()),
@@ -3316,10 +3508,6 @@ async fn initial_fragments_for_rebase(
     }
 
     let dataset = if dataset.manifest.version != transaction.read_version {
-        // The read version may have been garbage-collected by a concurrent
-        // `cleanup_old_versions` between the commit attempt and the rebase.
-        // Propagate the error so the commit fails gracefully instead of
-        // panicking (which aborts the whole process when `panic = "abort"`).
         Cow::Owned(dataset.checkout_version(transaction.read_version).await?)
     } else {
         Cow::Borrowed(dataset)
@@ -3570,6 +3758,7 @@ mod tests {
     use std::{num::NonZero, sync::Arc};
 
     use crate::dataset::transaction::UpdateMode::{RewriteColumns, RewriteRows};
+    use crate::dataset::transaction::{UpdateMap, UpdateMapEntry};
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use lance_core::Error;
@@ -3582,7 +3771,7 @@ mod tests {
     use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
 
     use super::*;
-    use crate::dataset::transaction::{DataReplacementGroup, RewriteGroup, UpdateMap};
+    use crate::dataset::transaction::{DataReplacementGroup, RewriteGroup};
     use crate::dataset::write::WriteMode;
     use crate::session::caches::DeletionFileKey;
     use crate::{
@@ -3590,6 +3779,173 @@ mod tests {
         io,
     };
     use lance_table::format::DataFile;
+    use lance_table::format::overlay::DataOverlayFile;
+
+    /// Names the three `Operation::Update` fields these cases turn on and
+    /// defaults the rest. Ids are `i32` to match the schema.
+    #[derive(Default)]
+    struct UpdateForTest {
+        new_fragments: Vec<Fragment>,
+        fields_modified: Vec<i32>,
+        fields_for_preserving_frag_bitmap: Vec<i32>,
+        update_mode: Option<UpdateMode>,
+    }
+
+    impl From<UpdateForTest> for Operation {
+        fn from(update: UpdateForTest) -> Self {
+            let ids = |fields: Vec<i32>| fields.into_iter().map(|id| id as u32).collect();
+            Self::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![Fragment::new(1)],
+                new_fragments: update.new_fragments,
+                fields_modified: ids(update.fields_modified),
+                compacted_sstables: Vec::new(),
+                fields_for_preserving_frag_bitmap: ids(update.fields_for_preserving_frag_bitmap),
+                update_mode: update.update_mode,
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+            }
+        }
+    }
+
+    /// Two structs, so a case can name one and rewrite the other.
+    fn struct_schema() -> lance_core::datatypes::Schema {
+        let st = |name: &str, children: [&str; 2]| {
+            Field::new(
+                name,
+                DataType::Struct(
+                    children
+                        .iter()
+                        .map(|c| Field::new(*c, DataType::Int32, true))
+                        .collect(),
+                ),
+                true,
+            )
+        };
+        let arrow = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            st("a_st", ["x", "y"]),
+            st("b_st", ["p", "q"]),
+        ]);
+        lance_core::datatypes::Schema::try_from(&arrow).unwrap()
+    }
+
+    /// A metadata change naming field `id`.
+    fn metadata_on(id: i32) -> Operation {
+        Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::from([(
+                id,
+                UpdateMap {
+                    update_entries: vec![UpdateMapEntry {
+                        key: "definition".to_string(),
+                        value: Some("changed".to_string()),
+                    }],
+                    replace: false,
+                },
+            )]),
+        }
+    }
+
+    fn field_id(schema: &lance_core::datatypes::Schema, name: &str) -> i32 {
+        schema.field(name).unwrap().id
+    }
+
+    /// The leaf field ids beneath `name`.
+    fn leaves_of(schema: &lance_core::datatypes::Schema, name: &str) -> Vec<i32> {
+        schema
+            .field(name)
+            .unwrap()
+            .children
+            .iter()
+            .map(|f| f.id)
+            .collect()
+    }
+
+    /// An in-place column rewrite, which names the columns it recomputed.
+    fn update_rewriting(fields_modified: &[i32]) -> Operation {
+        UpdateForTest {
+            fields_modified: fields_modified.to_vec(),
+            update_mode: Some(RewriteColumns),
+            ..Default::default()
+        }
+        .into()
+    }
+
+    /// A row rewrite, as `Dataset::update` and merge insert build it: rows move
+    /// to a new fragment, so the recomputed columns are named only for indices.
+    fn update_moving_rows(value_fields: &[i32]) -> Operation {
+        UpdateForTest {
+            new_fragments: vec![Fragment::new(2)],
+            fields_for_preserving_frag_bitmap: value_fields.to_vec(),
+            update_mode: Some(RewriteRows),
+            ..Default::default()
+        }
+        .into()
+    }
+
+    /// A delete-only merge, which names the whole schema for index maintenance
+    /// but writes no fragment.
+    fn update_deleting(schema: &lance_core::datatypes::Schema) -> Operation {
+        UpdateForTest {
+            fields_for_preserving_frag_bitmap: schema.fields_pre_order().map(|f| f.id).collect(),
+            update_mode: Some(RewriteRows),
+            ..Default::default()
+        }
+        .into()
+    }
+
+    /// A replacement of `fields`; a negative id is a tombstone.
+    fn replacement(fields: &[i32]) -> Operation {
+        Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(
+                1,
+                DataFile::new_legacy_from_fields("f.lance", fields.to_vec(), None),
+            )],
+        }
+    }
+
+    /// An overlay carrying new cell values for `fields`.
+    fn overlay(fields: &[i32]) -> Operation {
+        Operation::DataOverlay {
+            groups: vec![DataOverlayGroup {
+                fragment_id: 1,
+                overlays: vec![DataOverlayFile {
+                    data_file: DataFile::new_legacy_from_fields("o.lance", fields.to_vec(), None),
+                    coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+                    committed_version: 0,
+                }],
+            }],
+        }
+    }
+
+    /// The conflict returned when `ours` rebases against `other`.
+    fn conflict_result(
+        ours: &Operation,
+        other: &Operation,
+        schema: &lance_core::datatypes::Schema,
+    ) -> Result<()> {
+        let mut rebase = TransactionRebase {
+            transaction: Transaction::new(0, ours.clone(), None),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: modified_fragment_ids(ours).collect::<HashSet<_>>(),
+            affected_rows: None,
+            frag_reuse_base: None,
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+            current_lineage: None,
+            current_live: None,
+            untagged_reuse: None,
+            current_schema: None,
+            read_fragments: None,
+            read_schema: None,
+            reuse: Default::default(),
+            staged_replay: false,
+            read_version_schema: Arc::new(schema.clone()),
+        };
+        rebase.check_txn(&Transaction::new(0, other.clone(), None), 1)
+    }
 
     async fn test_dataset(num_rows: usize, num_fragments: usize) -> Dataset {
         let write_params = WriteParams {
@@ -4611,7 +4967,9 @@ mod tests {
                     Retryable,     // rewrite
                     Compatible,    // reserve
                     Retryable,     // update
-                    Compatible,    // update config
+                    // This update rewrote field 0, whose metadata that
+                    // transaction changes.
+                    Retryable, // update config
                 ],
             ),
             (
@@ -4729,7 +5087,7 @@ mod tests {
             ),
             (
                 // Changing field metadata conflicts with another update changing same field
-                // metadata or overwrite
+                // metadata or overwrite, and with a write that rewrote that field's data
                 create_update_config_for_test(
                     None,
                     None,
@@ -4750,7 +5108,10 @@ mod tests {
                     NotCompatible, // overwrite
                     Compatible,    // rewrite
                     Compatible,    // reserve
-                    Compatible,    // update
+                    // That update rewrote field 0, which this transaction
+                    // redefines. The stale metadata plan must be replanned, not
+                    // replayed. The next case redefines a field it did not write.
+                    NotCompatible, // update
                     NotCompatible, // update config
                 ],
             ),
@@ -4808,6 +5169,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
             };
 
             let result = rebase.check_txn(&unknown, 1);
@@ -5055,6 +5417,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -5122,6 +5485,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -5272,6 +5636,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
             };
             let other_txn = Transaction::new(0, other.clone(), None);
             let result = rebase.check_txn(&other_txn, 1);
@@ -5322,6 +5687,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
             };
             let result = append_rebase.check_txn(&Transaction::new(0, merge.clone(), None), 1);
             assert_eq!(
@@ -5345,6 +5711,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
             };
             let result = merge_rebase.check_txn(&Transaction::new(0, append, None), 1);
             assert!(
@@ -5434,6 +5801,7 @@ mod tests {
                         read_schema: None,
                         reuse: Default::default(),
                         staged_replay: false,
+                        read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
                     };
                     let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
                     assert_eq!(
@@ -5493,6 +5861,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            read_version_schema: Default::default(),
         };
         let result = rebase.check_txn(&Transaction::new(0, project, None), 1);
         assert_eq!(
@@ -5635,6 +6004,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
         let update = Transaction::new(
             1,
@@ -5888,6 +6258,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                read_version_schema: Default::default(),
             };
             let result = rebase.check_txn(&Transaction::new(0, theirs, None), 1);
             assert_eq!(result.is_err(), conflicts, "{result:?}");
@@ -5952,6 +6323,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                read_version_schema: Default::default(),
             };
             let result = rebase.check_txn(&merge, 1);
             assert_eq!(result.is_err(), conflicts, "{result:?}");
@@ -5981,6 +6353,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            read_version_schema: Default::default(),
         };
         let result = rebase.check_txn(&install, 1);
         assert!(
@@ -6035,6 +6408,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
 
         let same_name = Transaction::new(
@@ -6100,6 +6474,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
         let different_name_result = rebase.check_txn(&different_name, 1);
         assert!(
@@ -6168,6 +6543,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            read_version_schema: Default::default(),
         };
         let result = rebase.check_txn(&Transaction::new(0, committed_operation, None), 1);
 
@@ -6219,6 +6595,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            read_version_schema: Default::default(),
         };
 
         let result = rebase.check_txn(&Transaction::new(0, drop_operation, None), 1);
@@ -6271,6 +6648,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            read_version_schema: Default::default(),
         };
 
         let result = rebase.check_txn(&Transaction::new(0, removal_operation, None), 1);
@@ -6352,6 +6730,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
             };
             let result = rebase.check_txn(&rewrite, 2);
             if expect_conflict {
@@ -6440,6 +6819,7 @@ mod tests {
                 reuse: Default::default(),
 
                 staged_replay: false,
+                read_version_schema: Default::default(),
             };
             // Disjoint from the rewritten fragment, so this only exercises the
             // stable-row-ids check and not the group-straddling check below it.
@@ -6850,6 +7230,215 @@ mod tests {
         }
     }
 
+    /// Asserts the pair conflicts in both commit orders.
+    fn assert_conflicts_both_ways(
+        write: &Operation,
+        metadata: &Operation,
+        schema: &lance_core::datatypes::Schema,
+    ) {
+        assert!(
+            matches!(
+                conflict_result(write, metadata, schema),
+                Err(Error::RetryableCommitConflict { .. })
+            ),
+            "{write}, {metadata}"
+        );
+        assert!(
+            matches!(
+                conflict_result(metadata, write, schema),
+                Err(Error::IncompatibleTransaction { .. })
+            ),
+            "{metadata}, {write}"
+        );
+    }
+
+    /// Asserts the pair is independent in both commit orders.
+    fn assert_rebases_past(
+        write: &Operation,
+        metadata: &Operation,
+        schema: &lance_core::datatypes::Schema,
+    ) {
+        assert!(
+            conflict_result(write, metadata, schema).is_ok(),
+            "{write}, {metadata}"
+        );
+        assert!(
+            conflict_result(metadata, write, schema).is_ok(),
+            "{metadata}, {write}"
+        );
+    }
+
+    /// Every shape of write that produces values for `fields`.
+    fn writes_of(fields: &[i32]) -> [Operation; 4] {
+        [
+            update_rewriting(fields),
+            update_moving_rows(fields),
+            replacement(fields),
+            overlay(fields),
+        ]
+    }
+
+    /// A write and a metadata change to a field it wrote are not independent,
+    /// whichever commits first.
+    #[test]
+    fn test_a_write_conflicts_with_a_metadata_change_to_a_field_it_wrote() {
+        let schema = struct_schema();
+        let scalar = field_id(&schema, "id");
+        let a_st = field_id(&schema, "a_st");
+        let a_leaves = leaves_of(&schema, "a_st");
+
+        for write in writes_of(&[scalar]) {
+            assert_conflicts_both_ways(&write, &metadata_on(scalar), &schema);
+        }
+
+        // Written as leaves, named by the parent: walks down.
+        for write in writes_of(&a_leaves) {
+            assert_conflicts_both_ways(&write, &metadata_on(a_st), &schema);
+        }
+
+        // Written under the parent, metadata names a child: walks up.
+        for write in writes_of(&[a_st]) {
+            assert_conflicts_both_ways(&write, &metadata_on(a_leaves[0]), &schema);
+        }
+
+        // Blob children have field ids, but the file records the blob's parent
+        // id as its physical column. Metadata on a child must still conflict.
+        let blob_schema = lance_core::datatypes::Schema::try_from(&Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", true),
+        ]))
+        .unwrap();
+        let blob = field_id(&blob_schema, "blob");
+        let blob_child = blob_schema.field("blob").unwrap().children[0].id;
+        for write in writes_of(&[blob]) {
+            assert_conflicts_both_ways(&write, &metadata_on(blob_child), &blob_schema);
+        }
+
+        // A merge UpdateMap with no entries is a no-op. Replacing metadata with
+        // an empty map is still an effective clear and must conflict.
+        let no_op_merge = Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::from([(
+                scalar,
+                UpdateMap {
+                    update_entries: vec![],
+                    replace: false,
+                },
+            )]),
+        };
+        assert_rebases_past(&update_rewriting(&[scalar]), &no_op_merge, &schema);
+
+        let clear = Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::from([(
+                scalar,
+                UpdateMap {
+                    update_entries: vec![],
+                    replace: true,
+                },
+            )]),
+        };
+        assert_conflicts_both_ways(&update_rewriting(&[scalar]), &clear, &schema);
+    }
+
+    /// `commit_transaction` resolves the transaction's read version before
+    /// rebasing, so submitting through an older handle keeps the lineage.
+    #[tokio::test]
+    async fn test_lineage_holds_through_an_older_dataset_handle() {
+        use crate::dataset::NewColumnTransform;
+
+        let mut dataset = test_dataset(5, 1).await;
+        let stale = dataset.clone();
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![Field::new_struct(
+                    "a_st",
+                    vec![Field::new("x", DataType::Int32, true)],
+                    true,
+                )]))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let read_version = dataset.manifest.version;
+        assert!(stale.manifest.version < read_version);
+
+        // The write names the parent and the metadata names the child, and
+        // `stale` carries neither field.
+        let parent = dataset.schema().field("a_st").unwrap().clone();
+        CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new(
+                read_version,
+                metadata_on(parent.children[0].id),
+                None,
+            ))
+            .await
+            .unwrap();
+
+        let write: Operation = UpdateForTest {
+            fields_modified: vec![parent.id],
+            update_mode: Some(RewriteColumns),
+            ..Default::default()
+        }
+        .into();
+        let result = CommitBuilder::new(Arc::new(stale))
+            .execute(Transaction::new(read_version, write, None))
+            .await;
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "{result:?}"
+        );
+    }
+
+    /// Everything the rule deliberately leaves alone.
+    #[test]
+    fn test_a_write_rebases_past_metadata_for_a_field_it_did_not_write() {
+        let schema = struct_schema();
+        let a_st = field_id(&schema, "a_st");
+        let b_st = field_id(&schema, "b_st");
+        let a_leaves = leaves_of(&schema, "a_st");
+
+        // A sibling subtree, neither above nor below anything written.
+        for write in writes_of(&a_leaves) {
+            assert_rebases_past(&write, &metadata_on(b_st), &schema);
+        }
+
+        // A write that names no field, and a delete-only merge.
+        assert_rebases_past(&update_rewriting(&[]), &metadata_on(a_st), &schema);
+        assert_rebases_past(&update_deleting(&schema), &metadata_on(a_st), &schema);
+
+        // Tombstoned ids name no live field.
+        assert_rebases_past(&replacement(&[-2, -2]), &metadata_on(a_st), &schema);
+        assert_rebases_past(&overlay(&[-2, -2]), &metadata_on(a_st), &schema);
+
+        // An absent field must not pick up the branch the search gave up on --
+        // the last one walked, which ends on the field this write names.
+        let absent = schema.fields_pre_order().map(|f| f.id).max().unwrap() + 1;
+        let names_last_walked = update_rewriting(&[field_id(&schema, "id")]);
+        assert_rebases_past(&names_last_walked, &metadata_on(absent), &schema);
+
+        // Metadata that describes no column at all.
+        let entry = UpdateMap {
+            update_entries: vec![UpdateMapEntry {
+                key: "k".to_string(),
+                value: Some("v".to_string()),
+            }],
+            replace: false,
+        };
+        let no_field = Operation::UpdateConfig {
+            config_updates: Some(entry.clone()),
+            table_metadata_updates: Some(entry.clone()),
+            schema_metadata_updates: Some(entry),
+            field_metadata_updates: HashMap::new(),
+        };
+        assert_rebases_past(&update_rewriting(&a_leaves), &no_field, &schema);
+    }
+
     #[tokio::test]
     async fn test_conflicts_data_replacement() {
         use io::commit::conflict_resolver::tests::{ConflictResult::*, modified_fragment_ids};
@@ -7151,6 +7740,7 @@ mod tests {
                 read_schema: None,
                 reuse: Default::default(),
                 staged_replay: false,
+                read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
             };
 
             let result = rebase.check_txn(&txn2, 1);
@@ -7224,6 +7814,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -7272,6 +7863,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -7321,6 +7913,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -7370,6 +7963,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -7429,6 +8023,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
 
         let result = rebase.check_txn(&committed_txn, 1);
@@ -7463,6 +8058,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
 
         let result_higher = rebase_higher.check_txn(&committed_txn, 1);
@@ -7518,6 +8114,7 @@ mod tests {
             read_schema: None,
             reuse: Default::default(),
             staged_replay: false,
+            read_version_schema: Arc::new(lance_core::datatypes::Schema::default()),
         };
 
         // CreateIndex of MemWalIndex should be compatible with UpdateMemWalState

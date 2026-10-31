@@ -1768,6 +1768,8 @@ pub(crate) async fn commit_transaction(
             dataset.clone()
         };
 
+    // `dataset` advances past the read version inside the retry loop.
+    //
     // The version this transaction read, captured before the retry loop moves
     // `dataset` forward. MemWAL index catch-up is derived from it: an index
     // covering every fragment live here holds every row compaction had copied
@@ -1782,6 +1784,7 @@ pub(crate) async fn commit_transaction(
         manifest: read_version_dataset.manifest.as_ref(),
         indices: read_version_indices.as_slice(),
     });
+    let mut rebase_schema = Arc::new(read_version_dataset.schema().clone());
 
     let mut transaction = transaction.clone();
     // What a rewrite on a tagged fragment reuse history assembled for the
@@ -1833,8 +1836,13 @@ pub(crate) async fn commit_transaction(
             // Use small amount of backoff to handle transactions that all
             // started at exact same time better.
 
-            let mut rebase =
-                TransactionRebase::try_new(&original_dataset, transaction, affected_rows).await?;
+            let mut rebase = TransactionRebase::try_new_with_read_version_schema(
+                &original_dataset,
+                transaction,
+                affected_rows,
+                rebase_schema.clone(),
+            )
+            .await?;
             rebase.load_current_lineage(&dataset).await?;
             let seen = other_transactions
                 .iter()
@@ -1881,6 +1889,9 @@ pub(crate) async fn commit_transaction(
             let (rebased, assembly) = rebase.finish_with_tagged_rewrite(&dataset).await?;
             transaction = rebased;
             tagged_rewrite = assembly;
+            if transaction.read_version == dataset.manifest.version {
+                rebase_schema = Arc::new(dataset.schema().clone());
+            }
         } else {
             ensure_can_write_manifest(&dataset.manifest)?;
         }
@@ -2190,7 +2201,7 @@ pub(crate) async fn commit_transaction(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{collections::VecDeque, sync::Mutex};
 
     use arrow_array::types::Int32Type;
     use arrow_array::{Int32Array, Int64Array, RecordBatch, RecordBatchIterator};
@@ -2384,7 +2395,7 @@ mod tests {
 
     #[derive(Debug)]
     struct InjectForeignCommitHandler {
-        foreign: Mutex<Option<(Manifest, lance_table::format::Transaction)>>,
+        foreign: Mutex<VecDeque<(Manifest, lance_table::format::Transaction)>>,
     }
 
     #[async_trait::async_trait]
@@ -2403,7 +2414,7 @@ mod tests {
             naming_scheme: ManifestNamingScheme,
             transaction: Option<lance_table::format::Transaction>,
         ) -> std::result::Result<ManifestLocation, CommitError> {
-            let foreign = self.foreign.lock().unwrap().take();
+            let foreign = self.foreign.lock().unwrap().pop_front();
             if let Some((mut foreign_manifest, foreign_transaction)) = foreign {
                 foreign_manifest.version = manifest.version;
                 RenameCommitHandler
@@ -2438,9 +2449,21 @@ mod tests {
         manifest: Manifest,
         transaction: &Transaction,
     ) -> Arc<dyn CommitHandler> {
-        let transaction = pb::Transaction::try_from(transaction).unwrap().into();
+        inject_foreign_commit_chain_handler(vec![(manifest, transaction.clone())])
+    }
+
+    fn inject_foreign_commit_chain_handler(
+        commits: Vec<(Manifest, Transaction)>,
+    ) -> Arc<dyn CommitHandler> {
+        let commits = commits
+            .into_iter()
+            .map(|(manifest, transaction)| {
+                let transaction = pb::Transaction::try_from(&transaction).unwrap().into();
+                (manifest, transaction)
+            })
+            .collect();
         Arc::new(InjectForeignCommitHandler {
-            foreign: Mutex::new(Some((manifest, transaction))),
+            foreign: Mutex::new(commits),
         })
     }
 
@@ -2569,6 +2592,48 @@ mod tests {
             committed.manifest.fragments[0].files[1].fields.as_ref(),
             &[expected_schema.fields[1].id]
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_rebase_uses_transaction_read_version_snapshot() {
+        let tmp = TempStrDir::default();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(
+                vec![Ok(simple_batch(&simple_schema(), vec![1, 2, 3]))],
+                simple_schema(),
+            ),
+            tmp.as_str(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let foreign_manifest = dataset.manifest.as_ref().clone();
+        let foreign_commits = (0..2)
+            .map(|_| {
+                (
+                    foreign_manifest.clone(),
+                    Transaction::new(
+                        dataset.version().version,
+                        Operation::ReserveFragments { num_fragments: 1 },
+                        None,
+                    ),
+                )
+            })
+            .collect();
+
+        let committed = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_commit_handler(inject_foreign_commit_chain_handler(foreign_commits))
+            .with_max_retries(3)
+            .execute(Transaction::new(
+                dataset.version().version,
+                Operation::ReserveFragments { num_fragments: 1 },
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(committed.version().version, dataset.version().version + 3);
     }
 
     #[tokio::test]
