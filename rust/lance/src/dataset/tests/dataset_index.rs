@@ -900,6 +900,92 @@ async fn test_search_empty(
     }
 }
 
+/// Rows deleted after the index was built must never come back from a vector
+/// search, also when deletions are the only prefilter and each segment's
+/// prefilter is its ownership mask alone. The compacted case retires fragment
+/// ids, so the masks have to restrict to the live fragments as well.
+#[rstest]
+#[tokio::test]
+async fn test_vector_search_excludes_rows_deleted_after_indexing(
+    #[values(false, true)] use_stable_row_id: bool,
+    #[values(false, true)] compact: bool,
+) {
+    let write_params = WriteParams {
+        max_rows_per_file: 300,
+        enable_stable_row_ids: use_stable_row_id,
+        ..Default::default()
+    };
+    let rows = |first_id: u64, num_rows: u64| {
+        gen_batch()
+            .col("id", array::step_custom::<UInt64Type>(first_id, 1))
+            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(16)))
+            .into_reader_rows(RowCount::from(num_rows), BatchCount::from(1))
+    };
+    let mut dataset = Dataset::write(rows(0, 1200), "memory://", Some(write_params.clone()))
+        .await
+        .unwrap();
+    let params = VectorIndexParams::ivf_flat(2, MetricType::L2);
+    dataset
+        .create_index(&["vec"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+    dataset
+        .append(rows(1200, 600), Some(write_params))
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    assert_eq!(dataset.load_indices().await.unwrap().len(), 2);
+
+    dataset.delete("id % 3 = 0").await.unwrap();
+    if compact {
+        crate::dataset::optimize::compact_files(
+            &mut dataset,
+            crate::dataset::optimize::CompactionOptions::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        dataset.delete("id % 3 = 1 AND id % 2 = 0").await.unwrap();
+    }
+
+    let live_ids = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap()["id"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let query = Float32Array::from_iter_values((0..16).map(|i| i as f32 / 16.0));
+    // Probing every partition with k above the row count returns every row the
+    // prefilter lets through, so the result must be exactly the live rows.
+    let results = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .nearest("vec", &query, 2000)
+        .unwrap()
+        .minimum_nprobes(2)
+        .try_into_batch()
+        .await
+        .unwrap();
+    let found_ids = results["id"]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    assert_eq!(found_ids.len(), results.num_rows());
+    assert_eq!(found_ids, live_ids);
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_search_empty_after_delete(

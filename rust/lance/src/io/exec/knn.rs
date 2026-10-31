@@ -1790,6 +1790,13 @@ impl PreFilter for SegmentPreFilter {
         self.base.wait_for_ready().await?;
         let mut final_mask = self.final_mask.lock().unwrap();
         final_mask.get_or_insert_with(|| {
+            // The ownership mask is an allow list of the live rows of this segment's
+            // fragments at the dataset's current version, all of which a deletions-only
+            // base also selects, so the intersection is the ownership mask itself.
+            // Reusing it avoids copying the dataset-wide mask for every segment.
+            if self.base.only_deletions() {
+                return self.ownership_mask.clone();
+            }
             Arc::new(self.base.mask().as_ref().clone() & self.ownership_mask.as_ref().clone())
         });
         Ok(())
@@ -3884,6 +3891,9 @@ mod tests {
             &first_mask,
             cached_mask.as_ref().as_ref().unwrap()
         ));
+        // The base only removes deleted rows (none here), so the segment reuses its
+        // ownership mask instead of intersecting a copy of the dataset-wide mask.
+        assert!(Arc::ptr_eq(&segment_prefilter.mask(), &first_mask));
 
         assert!(
             !segment_prefilter.is_empty(),
