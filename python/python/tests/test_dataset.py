@@ -5743,13 +5743,44 @@ def test_count_index_rows(tmp_path: Path):
     assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
 
 
-def test_dataset_progress(tmp_path: Path):
-    data = pa.table({"a": range(10)})
+@pytest.mark.parametrize(
+    "num_rows",
+    [
+        pytest.param(10, id="exact_multiple"),
+        pytest.param(7, id="last_file_under_limit"),
+    ],
+)
+def test_dataset_progress(tmp_path: Path, num_rows: int):
+    data = pa.table({"a": range(num_rows)})
     progress = ProgressForTest()
     ds = lance.write_dataset(data, tmp_path, max_rows_per_file=5, progress=progress)
     assert len(ds.get_fragments()) == 2
     assert progress.begin_called == 2
     assert progress.complete_called == 2
+
+
+@pytest.mark.parametrize("failing_hook", ["begin", "complete"])
+def test_dataset_progress_failing_hook(tmp_path: Path, failing_hook: str):
+    class FailsOnSecondFile(ProgressForTest):
+        def begin(self, fragment, **kwargs):
+            super().begin(fragment, **kwargs)
+            if failing_hook == "begin" and self.begin_called == 2:
+                raise RuntimeError("injected failure")
+
+        def complete(self, fragment):
+            super().complete(fragment)
+            if failing_hook == "complete" and self.complete_called == 2:
+                raise RuntimeError("injected failure")
+
+    with pytest.raises(OSError, match=f"Failed to call {failing_hook}"):
+        lance.write_dataset(
+            pa.table({"a": range(7)}),
+            tmp_path,
+            max_rows_per_file=5,
+            progress=FailsOnSecondFile(),
+        )
+
+    assert list(tmp_path.glob("data/*")) == []
 
 
 def test_tensor_type(tmp_path: Path):
