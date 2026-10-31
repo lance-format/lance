@@ -2488,7 +2488,7 @@ fn vector_index_type(index: &dyn VectorIndex) -> IndexType {
         }
         (SubIndexType::Hnsw, QuantizationType::Product) => IndexType::IvfHnswPq,
         (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
-        (SubIndexType::Hnsw, QuantizationType::Rabit) => IndexType::Vector,
+        (SubIndexType::Hnsw, QuantizationType::Rabit) => IndexType::IvfHnswRq,
     }
 }
 
@@ -2588,6 +2588,7 @@ mod tests {
     };
     use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+    use lance_core::ROW_ID;
     use lance_core::utils::row_addr_remap::GroupInput;
     use lance_core::utils::tempfile::{TempStdDir, TempStrDir};
     use lance_datagen::{BatchCount, RowCount, array};
@@ -2641,6 +2642,64 @@ mod tests {
             let err = result.unwrap_err().to_string();
             assert!(err.contains("does not support the"), "{err}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_ivf_hnsw_rq_search_recall() {
+        const K: usize = 10;
+        const NUM_QUERIES: usize = 20;
+        let batch = lance_datagen::gen_batch()
+            .col("v", array::rand_vec::<Float32Type>(64.into()))
+            .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
+        let mut dataset = Dataset::write(batch, "memory://", Some(WriteParams::default()))
+            .await
+            .unwrap();
+        let ivf = IvfBuildParams {
+            num_partitions: Some(2),
+            ..Default::default()
+        };
+        let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+            MetricType::L2,
+            ivf,
+            HnswBuildParams::default(),
+            RQBuildParams::default(),
+        );
+        dataset
+            .create_index(&["v"], IndexType::IvfHnswRq, None, &params, false)
+            .await
+            .unwrap();
+
+        let mut hits = 0;
+        for query_id in 0..NUM_QUERIES {
+            let query = Float32Array::from_iter_values(
+                (0..64).map(|d| ((query_id * 31 + d * 17) % 97) as f32 / 97.0),
+            );
+            let mut top_k_row_ids = |use_index: bool| {
+                let dataset = dataset.clone();
+                let query = query.clone();
+                async move {
+                    let batch = dataset
+                        .scan()
+                        .with_row_id()
+                        .nearest("v", &query, K)
+                        .unwrap()
+                        .nprobes(2)
+                        .use_index(use_index)
+                        .try_into_batch()
+                        .await
+                        .unwrap();
+                    batch[ROW_ID]
+                        .as_primitive::<arrow_array::types::UInt64Type>()
+                        .values()
+                        .to_vec()
+                }
+            };
+            let expected = top_k_row_ids(false).await;
+            let actual = top_k_row_ids(true).await;
+            hits += actual.iter().filter(|id| expected.contains(id)).count();
+        }
+        let recall = hits as f32 / (K * NUM_QUERIES) as f32;
+        assert!(recall >= 0.5, "recall {recall}");
     }
 
     #[tokio::test]

@@ -2641,15 +2641,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             (SubIndexType::Flat, QuantizationType::Rabit) => IndexType::IvfRq,
             (SubIndexType::Hnsw, QuantizationType::Product) => IndexType::IvfHnswPq,
             (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
+            (SubIndexType::Hnsw, QuantizationType::Rabit) => IndexType::IvfHnswRq,
             (SubIndexType::Hnsw, QuantizationType::Flat)
             | (SubIndexType::Hnsw, QuantizationType::FlatBin) => IndexType::IvfHnswFlat,
-            (sub_index_type, quantization_type) => {
-                unimplemented!(
-                    "unsupported index type: {}, {}",
-                    sub_index_type,
-                    quantization_type
-                )
-            }
         }
     }
 
