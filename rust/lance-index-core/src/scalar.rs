@@ -5,7 +5,7 @@
 
 use crate::remapping::{RowAddrTranslator, materialize_remap};
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch, UInt32Array, UInt64Array};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion_common::scalar::ScalarValue;
@@ -755,6 +755,12 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         self.search(query, metrics).await
     }
 
+    /// This index as an [`OrderedScalarIndex`], or `None` when it cannot
+    /// stream rows in key order.
+    fn as_ordered(&self) -> Option<&dyn OrderedScalarIndex> {
+        None
+    }
+
     /// Find the rows whose indexed value equals each of `keys`.
     ///
     /// Streams one row per match in batches with [`lookup_schema`]: the
@@ -885,6 +891,51 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     fn value_range(&self) -> Option<(ScalarValue, ScalarValue)> {
         None
     }
+}
+
+/// A [`ScalarIndex`] that streams rows in key order, reached through
+/// [`ScalarIndex::as_ordered`].
+pub trait OrderedScalarIndex: ScalarIndex {
+    /// Stream the rows that satisfy `query` in the key order of `options`, or
+    /// every row, null keys included, when `query` is `None`.
+    ///
+    /// Each batch has two columns: the key, then the row identifier that
+    /// [`ScalarIndex::search`] returns, named `_rowaddr` when
+    /// [`ScalarIndex::results_are_row_addresses`] is true and `_rowid`
+    /// otherwise. A query yields only the rows where it is true, so null keys
+    /// appear only for `IS NULL` and for a range unbounded at both ends, which
+    /// is true for every row. The order of rows with equal keys is up to the
+    /// index.
+    ///
+    /// The stream is complete and exact: it yields every matching row once.
+    /// It has no limit, so a consumer that stops reading early owns that
+    /// truncation and must not report what it read as the full answer.
+    /// Dropping the stream stops further index reads.
+    ///
+    /// An index that finds its files out of key order returns
+    /// [`Error::NotSupported`].
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_schema::SortOptions;
+    /// # use futures::StreamExt;
+    /// # use lance_index_core::metrics::NoOpMetricsCollector;
+    /// # use lance_index_core::scalar::ScalarIndex;
+    /// # async fn test(index: &dyn ScalarIndex) -> lance_core::Result<()> {
+    /// if let Some(index) = index.as_ordered() {
+    ///     let options = SortOptions { descending: true, nulls_first: false };
+    ///     let mut stream = index.search_ordered(None, options, Arc::new(NoOpMetricsCollector))?;
+    ///     let largest_keys = stream.next().await;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn search_ordered(
+        &self,
+        query: Option<&dyn AnyQuery>,
+        options: SortOptions,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<SendableRecordBatchStream>;
 }
 
 /// Abstraction over any type that can remap row IDs during index loading.
