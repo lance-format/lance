@@ -4,6 +4,7 @@
 import base64
 import contextlib
 import importlib
+import json
 import os
 import pickle
 import platform
@@ -1927,6 +1928,225 @@ def test_cleanup_with_retain_versions(tmp_path: Path):
     assert ds.count_rows() == len(ds.to_table())
 
 
+@pytest.mark.parametrize(
+    "invalid_rules,message",
+    [
+        ({}, "requires a cleanup policy"),
+        (
+            {"lance.auto_cleanup.keep_one.older_than": "2days"},
+            "requires a cleanup policy",
+        ),
+        (
+            {"lance.auto_cleanup.keep_one.per_intervl": "1day"},
+            "Unknown retention configuration key",
+        ),
+    ],
+)
+def test_cleanup_retention_rejects_incomplete_activation(
+    tmp_path: Path, invalid_rules, message
+):
+    ds = lance.write_dataset(pa.table({"value": [1, 2]}), tmp_path)
+    with pytest.raises(OSError, match=message):
+        ds.update_config({"lance.auto_cleanup.policy_interval": "1", **invalid_rules})
+    assert lance.dataset(tmp_path).version == 1
+
+
+@pytest.mark.parametrize("shorthand", [False, True])
+def test_cleanup_retention_activation_is_atomic(tmp_path: Path, shorthand):
+    table = pa.table({"value": [1, 2, 3, 4]})
+    ds = lance.write_dataset(table, tmp_path, max_rows_per_file=2)
+    for _ in range(2):
+        ds = lance.write_dataset(table, tmp_path, mode="overwrite", max_rows_per_file=2)
+    ds.update_config(
+        {"lance.auto_cleanup.interval": "1", "lance.auto_cleanup.older_than": "7days"}
+    )
+    before = ds.version
+    config = {"lance.auto_cleanup.policy_interval": "1"}
+    if shorthand:
+        config["lance.auto_cleanup.keep_one.per_interval"] = "1day"
+    else:
+        config["lance.auto_cleanup.policy"] = json.dumps(
+            {
+                "rules": [
+                    {"type": "keep_one", "per_interval": "1day", "older_than": "2days"},
+                    {"type": "remove_all", "older_than": "30days"},
+                ]
+            }
+        )
+    with pytest.raises(OSError, match="remove lance.auto_cleanup.interval"):
+        ds.update_config(config)
+    assert lance.dataset(tmp_path).version == before
+    assert [version["version"] for version in ds.versions()] == list(
+        range(1, before + 1)
+    )
+    config["lance.auto_cleanup.interval"] = None
+    config["lance.auto_cleanup.older_than"] = None
+    applied = ds.update_config(config)
+    assert "lance.auto_cleanup.interval" not in applied
+    assert applied["lance.auto_cleanup.policy_interval"] == "1"
+    assert [version["version"] for version in ds.versions()] == list(
+        range(1, before + 2)
+    )
+    for version in range(1, 4):
+        assert lance.dataset(tmp_path, version=version).to_table() == table
+
+
+@pytest.mark.parametrize("delete_unverified", [False, True])
+def test_cleanup_retention_policy(tmp_path: Path, delete_unverified):
+    options = {"delete_unverified": delete_unverified}
+    assert list(lance.CleanupPolicy().rules) == [lance.RemoveAll(timedelta(days=14))]
+    assert isinstance(lance.KeepOne(timedelta(hours=1)), lance.CleanupRule)
+    assert isinstance(lance.RemoveAll(timedelta(days=30)), lance.CleanupRule)
+    table = pa.table({"a": [1, 2, 3, 4]})
+    ds = lance.write_dataset(table, tmp_path, max_rows_per_file=2)
+    for _ in range(3):
+        ds = lance.write_dataset(table, tmp_path, mode="overwrite", max_rows_per_file=2)
+    policy = lance.CleanupPolicy(
+        rules=[
+            lance.KeepOne(
+                per_interval=timedelta(hours=1), older_than=timedelta(days=2)
+            ),
+            lance.KeepOne(per_interval=timedelta(days=1), older_than=timedelta(days=7)),
+            lance.RemoveAll(older_than=timedelta(days=30)),
+        ]
+    )
+    assert (
+        ds.explain_cleanup_old_versions(policy=policy, **options).stats.old_versions
+        == 0
+    )
+    assert ds.cleanup_old_versions(policy=policy, **options).old_versions == 0
+    assert len(ds.versions()) == 4
+    large_interval = lance.CleanupPolicy(
+        [lance.KeepOne(timedelta(days=365 * 10_000, microseconds=1))]
+    )
+    assert (
+        ds.explain_cleanup_old_versions(
+            policy=large_interval, **options
+        ).stats.old_versions
+        == 0
+    )
+    assert ds.cleanup_old_versions(policy=large_interval, **options).old_versions == 0
+    orphan = tmp_path / "data" / "uncommitted.lance"
+    orphan.write_bytes(b"uncommitted")
+    expiration = lance.CleanupPolicy([lance.RemoveAll(older_than=timedelta(0))])
+    explanation = ds.explain_cleanup_old_versions(policy=expiration, **options)
+    assert len(ds.versions()) == 4
+    assert explanation.stats.old_versions == 3
+    assert orphan.exists()
+    stats = ds.cleanup_old_versions(policy=expiration, **options)
+    assert stats.old_versions == explanation.stats.old_versions
+    assert (
+        stats.data_files_removed
+        == explanation.stats.data_files_removed
+        == 6 + int(delete_unverified)
+    )
+    assert orphan.exists() == (not delete_unverified)
+    assert [version["version"] for version in ds.versions()] == [4]
+    assert ds.to_table() == table
+    assert ds.cleanup_old_versions(policy=expiration, **options).old_versions == 0
+
+
+@pytest.mark.parametrize(
+    "policy,message",
+    [
+        ([], "must not be empty"),
+        ([lance.KeepOne(timedelta(hours=1), timedelta(days=1))], "at least 2 days"),
+        ([lance.KeepOne(timedelta(0))], "keep_one.per_interval"),
+        (
+            [lance.KeepOne(timedelta(hours=1)), lance.KeepOne(timedelta(days=1))],
+            "strictly increasing",
+        ),
+        (
+            [lance.RemoveAll(timedelta(days=30)), lance.KeepOne(timedelta(hours=1))],
+            "final retention rule",
+        ),
+    ],
+)
+def test_cleanup_rejects_invalid_retention_policy(tmp_path: Path, policy, message):
+    policy = lance.CleanupPolicy(rules=policy)
+    ds = lance.write_dataset(pa.table({"a": [1, 2]}), tmp_path)
+    with pytest.raises(OSError, match=message):
+        ds.explain_cleanup_old_versions(policy=policy)
+    with pytest.raises(OSError, match=message):
+        ds.cleanup_old_versions(policy=policy)
+    assert len(ds.versions()) == 1
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    [{"older_than": timedelta(days=7)}, {"keep_one": lance.KeepOne(timedelta(days=1))}],
+)
+def test_cleanup_rejects_conflicting_retention_policy(tmp_path: Path, conflict):
+    ds = lance.write_dataset(pa.table({"a": [1, 2]}), tmp_path)
+    policy = lance.CleanupPolicy([lance.RemoveAll(timedelta(days=30))])
+    with pytest.raises(ValueError, match="policy cannot be combined"):
+        ds.explain_cleanup_old_versions(policy=policy, **conflict)
+    with pytest.raises(ValueError, match="policy cannot be combined"):
+        ds.cleanup_old_versions(policy=policy, **conflict)
+
+
+@pytest.mark.parametrize("period", [timedelta(0), timedelta(microseconds=-1)])
+def test_cleanup_rejects_invalid_keep_one(tmp_path: Path, period):
+    ds = lance.write_dataset(pa.table({"a": [1, 2]}), tmp_path)
+    with pytest.raises(OSError, match="keep_one"):
+        ds.cleanup_old_versions(keep_one=lance.KeepOne(period))
+    with pytest.raises(OSError, match="keep_one"):
+        ds.explain_cleanup_old_versions(keep_one=lance.KeepOne(period))
+    assert len(ds.versions()) == 1
+
+
+def test_cleanup_keeps_one_per_period(tmp_path: Path):
+    uri = tmp_path
+    table = pa.table({"a": [1, 2, 3, 4]})
+    ds = lance.write_dataset(table, uri, max_rows_per_file=2)
+    for _ in range(3):
+        ds = lance.write_dataset(table, uri, mode="overwrite", max_rows_per_file=2)
+    assert (
+        ds.cleanup_old_versions(keep_one=lance.KeepOne(timedelta(days=1))).old_versions
+        == 0
+    )
+    period = timedelta(days=365 * 10_000)
+    explanation = ds.explain_cleanup_old_versions(
+        older_than=timedelta(days=7), keep_one=lance.KeepOne(period, timedelta(days=2))
+    )
+    assert explanation.stats.old_versions == 0
+    assert len(ds.versions()) == 4
+    stats = ds.cleanup_old_versions(
+        older_than=timedelta(days=7), keep_one=lance.KeepOne(period, timedelta(days=2))
+    )
+    assert stats.old_versions == explanation.stats.old_versions
+    assert stats.data_files_removed == explanation.stats.data_files_removed == 0
+    assert stats.bytes_removed == explanation.stats.bytes_removed
+    assert [v["version"] for v in ds.versions()] == [1, 2, 3, 4]
+    assert lance.dataset(uri, version=3).to_table() == table
+    assert ds.to_table() == table
+
+    expiration = dict(
+        older_than=timedelta(0), keep_one=lance.KeepOne(timedelta(days=1))
+    )
+    explanation = ds.explain_cleanup_old_versions(**expiration)
+    assert explanation.stats.old_versions == 3
+    assert ds.cleanup_old_versions(**expiration).old_versions == 3
+    assert [v["version"] for v in ds.versions()] == [4]
+    assert ds.to_table() == table
+
+
+@pytest.mark.parametrize(
+    "age", [timedelta(0), timedelta(days=1), timedelta(days=2, microseconds=-1)]
+)
+def test_cleanup_thinning_requires_two_days(tmp_path: Path, age):
+    ds = lance.write_dataset(pa.table({"a": [1, 2]}), tmp_path)
+    with pytest.raises(OSError, match="older_than must be at least 2 days"):
+        ds.cleanup_old_versions(
+            older_than=timedelta(days=7), keep_one=lance.KeepOne(timedelta(days=1), age)
+        )
+    with pytest.raises(OSError, match="older_than must be at least 2 days"):
+        ds.explain_cleanup_old_versions(
+            older_than=timedelta(days=7), keep_one=lance.KeepOne(timedelta(days=1), age)
+        )
+    assert len(ds.versions()) == 1
+
+
 def test_cleanup_specific_versions(tmp_path: Path):
     base_dir = tmp_path / "cleanup_specific_versions"
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
@@ -2100,6 +2320,34 @@ def test_enable_disable_auto_cleanup(tmp_path):
     lance.write_dataset(table, base_dir, mode="append")
 
     assert len(ds.versions()) == 7
+
+
+@pytest.mark.parametrize("shorthand", [False, True])
+def test_disable_retention_auto_cleanup(tmp_path: Path, shorthand: bool):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    ds = lance.write_dataset(table, tmp_path, mode="create")
+    config = {"lance.auto_cleanup.policy_interval": "1"}
+    if shorthand:
+        config["lance.auto_cleanup.keep_one.per_interval"] = "1day"
+        config["lance.auto_cleanup.keep_one.older_than"] = "2days"
+    else:
+        config["lance.auto_cleanup.policy"] = json.dumps(
+            {"rules": [{"type": "remove_all", "older_than": "0s"}]}
+        )
+    ds.update_config(config)
+    ds = lance.dataset(tmp_path)
+
+    ds.optimize.disable_auto_cleanup()
+    ds = lance.dataset(tmp_path)
+    assert not any(key.startswith("lance.auto_cleanup.") for key in ds.config())
+    before = [version["version"] for version in ds.versions()]
+
+    for _ in range(4):
+        lance.write_dataset(table, tmp_path, mode="append")
+
+    assert [
+        version["version"] for version in lance.dataset(tmp_path).versions()
+    ] == list(range(before[0], before[-1] + 5))
 
 
 def test_cleanup_with_rate_limit(tmp_path):
