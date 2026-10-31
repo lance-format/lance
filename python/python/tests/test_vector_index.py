@@ -4457,9 +4457,15 @@ def test_fts_filter_vector_search(tmp_path):
     assert [300, 255, 252, 249, 246] == ids_result
 
     # Case 3: search with prefilter=false, search_filter=match("text")
+    # Refine approximate IVF-PQ scores so the strict distance order is deterministic.
     scanner = dataset.scanner(
         filter=MatchQuery("text", "text"),
-        nearest={"column": "vector", "q": query_vector, "k": 5},
+        nearest={
+            "column": "vector",
+            "q": query_vector,
+            "k": 5,
+            "refine_factor": 1,
+        },
         prefilter=False,
     )
 

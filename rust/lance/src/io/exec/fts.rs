@@ -4375,20 +4375,20 @@ fn document_matches_query(
     match operator {
         Operator::Or => has_query_token(text, tokenizer, query_tokens),
         Operator::And => {
-            let mut remaining_positions = (0..query_tokens.len())
-                .map(|index| query_tokens.position(index))
+            let mut remaining_groups = (0..query_tokens.len())
+                .map(|index| query_tokens.term_group(index))
                 .collect::<HashSet<_>>();
-            if remaining_positions.is_empty() {
+            if remaining_groups.is_empty() {
                 return false;
             }
             let mut stream = tokenizer.token_stream_for_doc(text);
             while let Some(token) = stream.next() {
                 for index in 0..query_tokens.len() {
                     if token.text == query_tokens.get_token(index) {
-                        remaining_positions.remove(&query_tokens.position(index));
+                        remaining_groups.remove(&query_tokens.term_group(index));
                     }
                 }
-                if remaining_positions.is_empty() {
+                if remaining_groups.is_empty() {
                     return true;
                 }
             }
@@ -6720,8 +6720,8 @@ mod tests {
         FlatMatchFilterExec, FlatMatchQueryExec, FlatStatsCoverage, FlatStatsScope,
         HybridCompoundQueryExec, MatchQueryExec, PhraseQueryExec, SharedFtsScorer,
         SharedFtsScorerExec, WAND_TIE_COMPLETION_BUDGET, WandExactnessCertificate,
-        build_boolean_query_children, classify_wand_exactness_certificate, default_text_tokenizer,
-        open_fts_segments, tokenizer_for_match_query,
+        build_boolean_query_children, classify_wand_exactness_certificate, open_fts_segments,
+        tokenizer_for_match_query,
     };
     use crate::io::exec::utils::IndexMetrics;
     use datafusion::physical_plan::empty::EmptyExec;
@@ -7233,27 +7233,35 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::default(InvertedIndexParams::default(), "alpha", "beta")]
+    #[case::ngram(InvertedIndexParams::default()
+        .base_tokenizer("ngram".into()).ngram_min_length(2).ngram_max_length(2), "ab", "bc cd")]
     #[test]
-    fn document_match_filter_respects_document_boundary() {
-        let mut tokenizer = default_text_tokenizer();
-        let query_tokens = try_collect_query_tokens("alpha", &mut tokenizer).unwrap();
+    fn document_match_filter_respects_document_boundary(
+        #[case] params: InvertedIndexParams,
+        #[case] first: &str,
+        #[case] rest: &str,
+    ) {
+        let document = format!("{first} {rest}");
+        let mut tokenizer = params.build().unwrap();
+        let query_tokens = try_collect_query_tokens(first, &mut tokenizer).unwrap();
         assert!(super::document_matches_query(
-            "alpha beta",
+            &document,
             &mut tokenizer,
             &query_tokens,
             Operator::Or,
         ));
 
-        let mut tokenizer = default_text_tokenizer();
-        let query_tokens = try_collect_query_tokens("alpha beta", &mut tokenizer).unwrap();
+        let query_tokens = try_collect_query_tokens(&document, &mut tokenizer).unwrap();
         assert!(!super::document_matches_query(
-            "alpha",
+            first,
             &mut tokenizer,
             &query_tokens,
             Operator::And,
         ));
         assert!(super::document_matches_query(
-            "alpha beta",
+            &document,
             &mut tokenizer,
             &query_tokens,
             Operator::And,

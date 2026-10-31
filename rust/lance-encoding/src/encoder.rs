@@ -541,11 +541,12 @@ mod tests {
                 .add_buffer(Buffer::from(b"abc"))
                 .build_unchecked()
         };
-        let item_field = Arc::new(ArrowField::new("item", item_type, false));
-        let data_type = ArrowDataType::FixedSizeList(item_field, 1);
+        let data_type =
+            ArrowDataType::Dictionary(Box::new(ArrowDataType::Int32), Box::new(item_type));
         let array_data = unsafe {
             ArrayData::builder(data_type.clone())
                 .len(3)
+                .add_buffer(Buffer::from_slice_ref([0_i32, 1, 2]))
                 .add_child_data(child_data)
                 .build_unchecked()
         };
