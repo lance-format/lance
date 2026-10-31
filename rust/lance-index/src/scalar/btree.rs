@@ -2660,7 +2660,10 @@ fn merge_io_buffer_size(io_parallelism: usize, num_sources: u64) -> u64 {
 /// the merge skip reading the segment entirely.
 pub(super) fn filter_keeps_nothing(filter: &Option<OldIndexDataFilter>) -> bool {
     match filter {
-        Some(OldIndexDataFilter::Fragments { to_keep, .. }) => to_keep.is_empty(),
+        Some(
+            OldIndexDataFilter::Fragments { to_keep, .. }
+            | OldIndexDataFilter::RowAddresses { to_keep, .. },
+        ) => to_keep.is_empty(),
         Some(OldIndexDataFilter::RowIds(valid)) => valid.is_empty(),
         None => false,
     }

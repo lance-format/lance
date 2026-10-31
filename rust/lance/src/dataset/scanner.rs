@@ -792,7 +792,7 @@ impl FilterPlan {
                     plan = scanner.flat_fts_filter(plan, fts_query).await?;
                 }
                 Some(QueryFilter::Vector(vector_query)) => {
-                    plan = scanner.flat_knn(plan, vector_query)?;
+                    plan = scanner.flat_knn(plan, vector_query).await?;
                 }
                 None => {}
             }
@@ -2683,10 +2683,9 @@ impl Scanner {
     /// Change the distance [MetricType], i.e, L2 or Cosine distance.
     ///
     /// When unset, the search ranks by the metric of the vector index it chooses for the
-    /// column, also where it falls back to flat KNN over fragments that index does not
-    /// cover. A search that chooses no index, such as one with [`Self::use_index`] false
-    /// or a full-text filter under [`Self::prefilter`], uses the column type's default:
-    /// Hamming for uint8 vectors and L2 otherwise.
+    /// column, including when it falls back to flat KNN for filtered rows or fragments
+    /// that index does not cover. A search with [`Self::use_index`] false uses the column
+    /// type's default: Hamming for uint8 vectors and L2 otherwise.
     pub fn distance_metric(&mut self, metric_type: MetricType) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.metric_type = Some(metric_type)
@@ -4957,7 +4956,7 @@ impl Scanner {
                         .union_column(&query.column, OnMissing::Error)?;
                     let plan = self.take(fts_plan, projection)?;
 
-                    self.flat_knn(plan, query)?
+                    self.flat_knn(plan, query).await?
                 }
                 None => {
                     self.vector_search(&filter_plan.expr_filter_plan, query)
@@ -5437,7 +5436,8 @@ impl Scanner {
         query: &FullTextSearchQuery,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut params = query.params();
-        if params.limit.is_none() {
+        // A column sort must select the page before relevance can truncate its candidates.
+        if params.limit.is_none() && self.ordering.is_none() {
             let search_limit = match (self.limit, self.offset) {
                 (Some(limit), Some(offset)) => Some((limit + offset) as usize),
                 (Some(limit), None) => Some(limit as usize),
@@ -7193,7 +7193,7 @@ impl Scanner {
                     .union_column(&q.column, OnMissing::Error)
                     .unwrap();
                 let knn_node_with_vector = self.take(ann_node, vector_projection)?;
-                self.flat_knn(knn_node_with_vector, &q)?
+                self.flat_knn(knn_node_with_vector, &q).await?
             } else {
                 ann_node
             }; // vector, _distance, _rowid
@@ -7262,7 +7262,7 @@ impl Scanner {
             if let Some(mask) = self.external_row_mask.clone() {
                 plan = Arc::new(RowAddrMaskFilterExec::new(plan, mask));
             }
-            Ok(self.flat_knn(plan, &q)?)
+            self.flat_knn(plan, &q).await
         }
     }
 
@@ -7582,7 +7582,7 @@ impl Scanner {
                 Some(mask) => Arc::new(RowAddrMaskFilterExec::new(scan_node, mask)) as _,
                 None => scan_node,
             };
-            let topk_fallback = self.flat_knn(scan_node, &q)?;
+            let topk_fallback = self.flat_knn(scan_node, &q).await?;
             let topk_fallback: Arc<dyn ExecutionPlan> =
                 Arc::new(project(topk_fallback, knn_node.schema().as_ref())?);
             flat_inputs.push(topk_fallback);
@@ -7607,7 +7607,7 @@ impl Scanner {
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 stale_node = Arc::new(LanceFilterExec::try_new(expr.clone(), stale_node)?);
             }
-            let topk_stale = self.flat_knn(stale_node, &q)?;
+            let topk_stale = self.flat_knn(stale_node, &q).await?;
             let topk_stale: Arc<dyn ExecutionPlan> =
                 Arc::new(project(topk_stale, knn_node.schema().as_ref())?);
             flat_inputs.push(topk_stale);
@@ -7620,7 +7620,7 @@ impl Scanner {
             unioned,
             datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
         )?;
-        self.flat_knn(Arc::new(unioned), &q)
+        self.flat_knn(Arc::new(unioned), &q).await
     }
 
     #[async_recursion]
@@ -8359,15 +8359,40 @@ impl Scanner {
     }
 
     /// Add a knn search node to the input plan
-    fn flat_knn(&self, input: Arc<dyn ExecutionPlan>, q: &Query) -> Result<Arc<dyn ExecutionPlan>> {
-        // Resolve metric_type if not set (use default for the column's element type)
-        let metric_type = match q.metric_type {
-            Some(m) => m,
-            None => {
-                let (_, element_type) = get_vector_type(self.dataset.schema(), &q.column)?;
-                default_distance_type_for(&element_type)
+    async fn flat_knn(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        q: &Query,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let (_, element_type) = get_vector_type(self.dataset.schema(), &q.column)?;
+        let mut metric_type = q.metric_type;
+        // Ranking FTS hits still needs the index's metric, even though the rows
+        // are scored directly instead of being retrieved through ANN.
+        if metric_type.is_none() && q.use_index {
+            let column_id = self.dataset.schema().field_id(&q.column)?;
+            let indices = self.dataset.load_indices().await?;
+            if let Some(index) = indices.iter().find(|index| {
+                index.fields.first() == Some(&column_id) && crate::index::index_type_is_known(index)
+            }) {
+                let index_metric = if let Some(metric) =
+                    crate::index::vector::details::metric_type_from_index_metadata(index)
+                {
+                    metric
+                } else {
+                    self.dataset
+                        .open_vector_index(&q.column, &index.uuid, &NoOpMetricsCollector)
+                        .await?
+                        .metric_type()
+                };
+                // Match the flat fallback in vector_search for untrained indices
+                // whose recorded metric is incompatible with the column type.
+                if validate_distance_type_for(index_metric, &element_type).is_ok() {
+                    metric_type = Some(index_metric);
+                }
             }
-        };
+        }
+        let metric_type = metric_type.unwrap_or_else(|| default_distance_type_for(&element_type));
+        validate_distance_type_for(metric_type, &element_type)?;
         let input = if self.is_batch_nearest {
             Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
         } else {
@@ -21245,6 +21270,88 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         scanner
             .full_text_search(FullTextSearchQuery::new("4".into()))
             .unwrap();
+        limit_offset_equivalency_test(&scanner).await;
+    }
+
+    #[rstest]
+    #[case::flat(false, false)]
+    #[case::indexed(true, false)]
+    #[case::mixed(true, true)]
+    #[tokio::test]
+    async fn test_fts_ordered_limit_offset(
+        #[case] has_index: bool,
+        #[case] has_append: bool,
+        #[values(None, Some(4))] candidate_limit: Option<i64>,
+    ) {
+        // Longer documents rank lower, opposite to the requested id ordering.
+        let texts: Vec<String> = (0..6)
+            .map(|i| format!("needle {}", "filler ".repeat(20 * i)))
+            .collect();
+        let batch = arrow_array::record_batch!(
+            ("id", Int32, (0..6).collect::<Vec<i32>>()),
+            ("text", Utf8, texts)
+        )
+        .unwrap();
+        let initial_rows = if has_append { 4 } else { 6 };
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.slice(0, initial_rows))], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        if has_index {
+            dataset
+                .create_index(
+                    &["text"],
+                    IndexType::Inverted,
+                    None,
+                    &InvertedIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        if has_append {
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(batch.slice(4, 2))], batch.schema()),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["id", SCORE_COL])
+            .unwrap()
+            .full_text_search(
+                FullTextSearchQuery::new("needle".into())
+                    .with_column("text".into())
+                    .unwrap()
+                    .limit(candidate_limit),
+            )
+            .unwrap()
+            .order_by(Some(vec![ColumnOrdering::desc_nulls_last("id".into())]))
+            .unwrap();
+        let full = scanner.try_into_batch().await.unwrap();
+        let candidate_count = candidate_limit.unwrap_or(6) as i32;
+        assert_eq!(
+            full["id"].as_primitive::<Int32Type>().values().as_ref(),
+            (0..candidate_count).rev().collect::<Vec<_>>()
+        );
+        assert!(
+            full[SCORE_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .windows(2)
+                .all(|scores| scores[0] < scores[1])
+        );
         limit_offset_equivalency_test(&scanner).await;
     }
 

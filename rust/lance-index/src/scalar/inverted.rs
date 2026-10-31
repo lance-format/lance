@@ -128,15 +128,17 @@ pub(crate) fn final_query_tokens(
     let initial_capacity = query_tokens.len().min(params.max_expansions);
     let mut expanded_tokens = Vec::with_capacity(initial_capacity);
     let mut expanded_positions = Vec::with_capacity(initial_capacity);
+    let mut expanded_groups = Vec::with_capacity(initial_capacity);
     let mut seen = HashSet::new();
-    let mut source_terms_by_position = BTreeMap::<u32, Vec<&str>>::new();
+    let mut source_terms_by_group = BTreeMap::<u32, (u32, Vec<&str>)>::new();
     for token_idx in 0..query_tokens.len() {
-        source_terms_by_position
-            .entry(query_tokens.position(token_idx))
-            .or_default()
+        source_terms_by_group
+            .entry(query_tokens.position_for_query(token_idx, params.phrase_slop.is_some()))
+            .or_insert_with(|| (query_tokens.position(token_idx), Vec::new()))
+            .1
             .push(query_tokens.get_token(token_idx));
     }
-    for (position, source_terms) in source_terms_by_position {
+    for (group, (position, source_terms)) in source_terms_by_group {
         let remaining = params.max_expansions.saturating_sub(expanded_tokens.len());
         if remaining == 0 {
             break;
@@ -163,9 +165,10 @@ pub(crate) fn final_query_tokens(
             if expanded_tokens.len() >= params.max_expansions {
                 break;
             }
-            if seen.insert((candidate.clone(), position)) {
+            if seen.insert((candidate.clone(), group)) {
                 expanded_tokens.push(candidate);
                 expanded_positions.push(position);
+                expanded_groups.push(group);
             }
         }
     }
@@ -173,7 +176,8 @@ pub(crate) fn final_query_tokens(
         expanded_tokens,
         expanded_positions,
         query_tokens.token_type().clone(),
-    ))
+    )
+    .with_term_groups(expanded_groups))
 }
 
 /// Deduplicated terms in first-occurrence order, plus each token's term
@@ -193,11 +197,17 @@ fn unique_terms(tokens: &Tokens) -> (Vec<String>, Box<[usize]>) {
     (terms, term_by_token)
 }
 
-pub(crate) fn has_all_query_positions(query_tokens: &Tokens, final_tokens: &Tokens) -> bool {
+pub(crate) fn has_all_query_positions(
+    query_tokens: &Tokens,
+    final_tokens: &Tokens,
+    is_phrase_query: bool,
+) -> bool {
     let surviving_positions = (0..final_tokens.len())
-        .map(|index| final_tokens.position(index))
+        .map(|index| final_tokens.position_for_query(index, is_phrase_query))
         .collect::<HashSet<_>>();
-    (0..query_tokens.len()).all(|index| surviving_positions.contains(&query_tokens.position(index)))
+    (0..query_tokens.len()).all(|index| {
+        surviving_positions.contains(&query_tokens.position_for_query(index, is_phrase_query))
+    })
 }
 
 const LANCE_FTS_SYNC_DF_ENV: &str = "LANCE_FTS_SYNC_DF";
@@ -307,8 +317,9 @@ fn merge_loaded_bm25_stats(
 /// Expand and score one indexed query leaf exactly once across all segments.
 ///
 /// Expansion consumes one deterministic `max_expansions` budget in query
-/// position order, with terms ordered lexicographically across every physical
-/// segment and partition and deduplicated by `(term, position)`. The scorer's
+/// group order, with terms ordered lexicographically across every physical
+/// segment and partition and deduplicated by `(term, group)`. Match groups
+/// identify independent terms; phrase groups retain tokenizer offsets. The scorer's
 /// document frequencies are then merged for exactly those final terms.
 ///
 /// `base_scorer` is an API-compatibility hook for distributed/mixed callers
@@ -327,7 +338,8 @@ pub async fn prepare_bm25_query(
     })?;
     let (tokens, has_all_query_positions) = if uses_fuzzy_expansion(params.fuzziness) {
         let tokens = Arc::new(final_query_tokens(indices, &query_tokens, params)?);
-        let has_all_query_positions = has_all_query_positions(&query_tokens, tokens.as_ref());
+        let has_all_query_positions =
+            has_all_query_positions(&query_tokens, tokens.as_ref(), params.phrase_slop.is_some());
         (tokens, has_all_query_positions)
     } else {
         (Arc::new(query_tokens), true)

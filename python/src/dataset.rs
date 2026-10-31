@@ -36,7 +36,7 @@ use pyo3::{
 use uuid::Uuid;
 
 use lance::dataset::AutoCleanupParams;
-use lance::dataset::cleanup::{CleanupFileKind, CleanupPolicyBuilder};
+use lance::dataset::cleanup::{CleanupFileKind, CleanupPolicyBuilder, parse_cleanup_policy};
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback, ExprFilter,
@@ -836,6 +836,7 @@ pub struct Dataset {
 }
 
 impl Dataset {
+    #[allow(clippy::too_many_arguments)]
     async fn cleanup_operation(
         &self,
         older_than_micros: Option<i64>,
@@ -843,6 +844,8 @@ impl Dataset {
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
         versions: Option<Vec<u64>>,
+        keep_one_micros: Option<(i64, i64)>,
+        policy_json: Option<String>,
     ) -> lance_core::Result<lance::dataset::cleanup::CleanupOperation<'_>> {
         let mut builder = CleanupPolicyBuilder::default();
         if let Some(v) = older_than_micros {
@@ -861,7 +864,29 @@ impl Dataset {
         if let Some(v) = versions {
             builder = builder.versions(v)?;
         }
-        Ok(self.ds.cleanup(builder.build()))
+        let mut operation = self.ds.cleanup(builder.build());
+        if let Some((value, age)) = keep_one_micros {
+            let period = std::time::Duration::from_micros(u64::try_from(value).map_err(|_| {
+                lance::Error::invalid_input(format!(
+                    "keep_one.per_interval must be positive, got {value} microseconds"
+                ))
+            })?);
+            let age = u64::try_from(age).map_err(|_| {
+                lance::Error::invalid_input(format!(
+                    "keep_one.older_than must be at least 2 days, got {age} microseconds"
+                ))
+            })?;
+            operation = operation.with_keep_one(period, std::time::Duration::from_micros(age))?;
+        }
+        if let Some(value) = policy_json {
+            if older_than_micros.is_some() || keep_one_micros.is_some() {
+                return Err(lance::Error::invalid_input(
+                    "policy cannot be combined with older_than or keep_one",
+                ));
+            }
+            operation = operation.with_retention_policy(parse_cleanup_policy(&value)?)?;
+        }
+        Ok(operation)
     }
 }
 
@@ -928,6 +953,17 @@ fn version_to_py(py: Python<'_>, version: &Version) -> PyResult<Py<PyAny>> {
     )?;
     let tup: Vec<(&String, &String)> = version.metadata.iter().collect();
     dict.set_item("metadata", tup.into_py_dict(py)?)?;
+    dict.into_py_any(py)
+}
+
+fn tag_to_py(py: Python<'_>, tag: TagContents) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("branch", tag.branch)?;
+    dict.set_item("version", tag.version)?;
+    dict.set_item("created_at", tag.created_at)?;
+    dict.set_item("updated_at", tag.updated_at)?;
+    dict.set_item("manifest_size", tag.manifest_size)?;
+    dict.set_item("metadata", tag.metadata)?;
     dict.into_py_any(py)
 }
 
@@ -2299,7 +2335,7 @@ impl Dataset {
     }
 
     /// Cleanup old versions from the dataset
-    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, versions = None, delete_concurrency = None))]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, versions = None, delete_concurrency = None, keep_one_micros = None, policy_json = None))]
     #[allow(clippy::too_many_arguments)]
     fn cleanup_old_versions(
         &self,
@@ -2310,6 +2346,8 @@ impl Dataset {
         delete_rate_limit: Option<u64>,
         versions: Option<Vec<u64>>,
         delete_concurrency: Option<usize>,
+        keep_one_micros: Option<(i64, i64)>,
+        policy_json: Option<String>,
     ) -> PyResult<CleanupStats> {
         let stats = rt()
             .block_on(None, async {
@@ -2320,6 +2358,8 @@ impl Dataset {
                         delete_unverified,
                         error_if_tagged_old_versions,
                         versions,
+                        keep_one_micros,
+                        policy_json,
                     )
                     .await?;
                 if let Some(value) = delete_concurrency {
@@ -2336,7 +2376,7 @@ impl Dataset {
 
     /// Explain cleanup old versions from the dataset without deleting files
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, versions = None, include_files = false, max_files = 1000))]
+    #[pyo3(signature = (older_than_micros = None, retain_versions = None, delete_unverified = None, error_if_tagged_old_versions = None, delete_rate_limit = None, versions = None, include_files = false, max_files = 1000, keep_one_micros = None, policy_json = None))]
     fn explain_cleanup_old_versions(
         &self,
         older_than_micros: Option<i64>,
@@ -2347,6 +2387,8 @@ impl Dataset {
         versions: Option<Vec<u64>>,
         include_files: bool,
         max_files: usize,
+        keep_one_micros: Option<(i64, i64)>,
+        policy_json: Option<String>,
     ) -> PyResult<CleanupExplanation> {
         let _ = delete_rate_limit; // Retained in the signature for existing callers.
         let explanation = rt()
@@ -2358,6 +2400,8 @@ impl Dataset {
                         delete_unverified,
                         error_if_tagged_old_versions,
                         versions,
+                        keep_one_micros,
+                        policy_json,
                     )
                     .await?;
                 operation
@@ -2382,15 +2426,7 @@ impl Dataset {
         let pylist = PyList::empty(py);
 
         for (tag_name, tag_content) in tags {
-            let dict = PyDict::new(py);
-            dict.set_item("branch", tag_content.branch.clone())?;
-            dict.set_item("version", tag_content.version)?;
-            dict.set_item("created_at", tag_content.created_at)?;
-            dict.set_item("updated_at", tag_content.updated_at)?;
-            dict.set_item("manifest_size", tag_content.manifest_size)?;
-            dict.set_item("metadata", tag_content.metadata.clone())?;
-
-            pylist.append((tag_name.as_str(), dict))?;
+            pylist.append((tag_name, tag_to_py(py, tag_content)?))?;
         }
 
         Ok(pylist.unbind().as_any().clone())
@@ -2401,17 +2437,22 @@ impl Dataset {
         let tags = self_.list_tags()?;
 
         let pytags = PyDict::new(py);
-        for (k, v) in tags.iter() {
-            let dict = PyDict::new(py);
-            dict.set_item("branch", v.branch.clone())?;
-            dict.set_item("version", v.version)?;
-            dict.set_item("created_at", v.created_at)?;
-            dict.set_item("updated_at", v.updated_at)?;
-            dict.set_item("manifest_size", v.manifest_size)?;
-            dict.set_item("metadata", v.metadata.clone())?;
-            pytags.set_item(k, dict.into_py_any(py)?)?;
+        for (tag_name, tag_content) in tags {
+            pytags.set_item(tag_name, tag_to_py(py, tag_content)?)?;
         }
         pytags.into_py_any(py)
+    }
+
+    fn get_tag(self_: PyRef<'_, Self>, tag: String) -> PyResult<Py<PyAny>> {
+        let tag_content =
+            rt().block_on(None, self_.ds.tags().get(&tag))?
+                .map_err(|err| match err {
+                    Error::InvalidRef { .. }
+                    | Error::NotFound { .. }
+                    | Error::RefNotFound { .. } => PyValueError::new_err(err.to_string()),
+                    _ => PyIOError::new_err(err.to_string()),
+                })?;
+        tag_to_py(self_.py(), tag_content)
     }
 
     fn get_version(self_: PyRef<'_, Self>, tag: String) -> PyResult<u64> {
@@ -3661,6 +3702,15 @@ impl Dataset {
         .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(result)
+    }
+
+    fn inline_deletions(&mut self) -> PyResult<usize> {
+        let mut new_self = self.ds.as_ref().clone();
+        let changed = rt()
+            .block_on(None, new_self.inline_deletions())?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(changed)
     }
 
     #[pyo3(signature = (values, *, replace = false))]

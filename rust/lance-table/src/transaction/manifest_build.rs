@@ -15,7 +15,7 @@ use crate::feature_flags::{
     FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
     apply_index_object_metadata_flag, apply_row_addr_index_feature_flag, ensure_can_read_manifest,
     ensure_can_write_manifest, inherit_sticky_feature_flags, managed_blobs_enabled,
-    validate_non_reusable_field_id_flags,
+    validate_auto_cleanup_config, validate_non_reusable_field_id_flags,
 };
 use crate::format::clustering::{ChangedReferences, validate_clustering_of};
 
@@ -93,6 +93,27 @@ fn range_segments_enabled(manifest: &Manifest) -> bool {
         .config
         .get(RANGE_SEGMENTS_CONFIG_KEY)
         .is_some_and(|value| str_is_truthy(value))
+}
+
+fn changes_auto_cleanup_config(operation: &Operation) -> bool {
+    let is_auto_cleanup_key = |key: &str| key.starts_with("lance.auto_cleanup.");
+    match operation {
+        Operation::Overwrite {
+            config_upsert_values: Some(values),
+            ..
+        } => values.keys().any(|key| is_auto_cleanup_key(key)),
+        Operation::UpdateConfig {
+            config_updates: Some(update),
+            ..
+        } => {
+            update.replace
+                || update
+                    .update_entries
+                    .iter()
+                    .any(|entry| is_auto_cleanup_key(&entry.key))
+        }
+        _ => false,
+    }
 }
 
 /// Re-encode inline row id sequences in their smallest wire form when the
@@ -2207,6 +2228,10 @@ impl Transaction {
                 }
             }
             _ => {}
+        }
+
+        if changes_auto_cleanup_config(&self.operation) {
+            validate_auto_cleanup_config(&manifest)?;
         }
 
         apply_range_segments(&mut manifest, current_manifest)?;
@@ -4336,6 +4361,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(1),
             base_id: None,
+            inline: None,
         };
         updated2.deletion_file = Some(deletion_file.clone());
 
@@ -6954,6 +6980,7 @@ mod tests {
                     file_type: DeletionFileType::Array,
                     num_deleted_rows: Some(1),
                     base_id: None,
+                    inline: None,
                 });
                 Operation::Delete {
                     updated_fragments: vec![deleted],
