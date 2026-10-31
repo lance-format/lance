@@ -30,9 +30,9 @@ A-encoding:
           - "rust/lance-file/**"
 
 # On-disk format: persisted proto definitions and the format spec docs. Keep the
-# explicit proto lists here in sync. Execution-plan schemas (ann,
-# filtered_read, and table_identifier) are intentionally excluded. Format docs
-# are excluded from A-docs (see below) so format changes get A-format only.
+# explicit proto lists here in sync. Execution wire schemas (ann,
+# blob_reference, filtered_read, and table_identifier) are intentionally excluded.
+# Format docs are excluded from A-docs (see below) so format changes get A-format only.
 A-format:
   - changed-files:
       - any-glob-to-any-file:

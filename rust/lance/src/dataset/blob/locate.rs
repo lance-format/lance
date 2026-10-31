@@ -6,7 +6,7 @@ use std::{collections::HashMap, sync::Arc};
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::{Array, StructArray};
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, uri_to_url};
 use object_store::path::Path;
 
 use super::file::{BlobFile, BlobSource, BlobSourceKey, shared_blob_source};
@@ -189,8 +189,81 @@ pub(in crate::dataset) async fn collect_blob_v2_descriptor_files(
     Ok(files)
 }
 
-pub(super) struct BlobV2ReadContext<'a> {
-    dataset: &'a Arc<Dataset>,
+/// Resolved metadata shared by lazy handles and portable reference capture.
+pub(super) struct ResolvedBlob {
+    object_store: Arc<ObjectStore>,
+    path: Path,
+    position: u64,
+    size: Option<u64>,
+    kind: BlobKind,
+    uri: Option<String>,
+    base_id: Option<u32>,
+}
+
+impl ResolvedBlob {
+    async fn into_file(
+        self,
+        source_cache: &mut HashMap<BlobSourceKey, Arc<BlobSource>>,
+    ) -> Result<BlobFile> {
+        let size = match self.size {
+            Some(size) => size,
+            None => self.object_store.size(&self.path).await?,
+        };
+        Ok(BlobFile::with_source(
+            shared_blob_source(source_cache, self.object_store, &self.path),
+            self.position,
+            size,
+            self.kind,
+            self.uri,
+        ))
+    }
+
+    pub(super) fn into_reference(
+        self,
+        dataset: &Dataset,
+        context: &crate::blob::reference::BlobSourceContext,
+    ) -> Result<crate::blob::reference::BlobRef> {
+        let uri = if self.kind == BlobKind::External && self.base_id.is_none() {
+            self.uri
+                .ok_or_else(|| Error::internal("Resolved external blob has no URI"))?
+        } else {
+            let root = match self.base_id {
+                Some(id) => dataset
+                    .manifest()
+                    .base_paths
+                    .get(&id)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!("Blob references unknown base_id {id}"))
+                    })?
+                    .path
+                    .clone(),
+                None => dataset.refs.root()?.uri,
+            };
+            object_uri(dataset, &root, &self.path)?
+        };
+        context.reference(uri, self.position, self.size, self.kind, self.base_id)
+    }
+}
+
+fn object_uri(dataset: &Dataset, root: &str, path: &Path) -> Result<String> {
+    let root_path = ObjectStore::extract_path_from_uri(dataset.session.store_registry(), root)?;
+    let relative = path.prefix_match(&root_path).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "Resolved blob path {path} is outside source root {root}"
+        ))
+    })?;
+    let mut url = uri_to_url(root)?;
+    // Start with the source URI so provider-specific authorities (including
+    // Azure filesystem/account names) survive object-path normalization.
+    url.path_segments_mut()
+        .map_err(|_| Error::invalid_input(format!("Blob source URI cannot contain paths: {root}")))?
+        .pop_if_empty()
+        .extend(relative.map(|part| part.as_ref().to_string()));
+    Ok(url.into())
+}
+
+pub(super) struct BlobV2ReadContext {
+    dataset: Arc<Dataset>,
     blob_field_id: u32,
     fragment_cache: HashMap<u32, BlobReadLocation>,
     store_cache: HashMap<u32, Arc<ObjectStore>>,
@@ -198,10 +271,10 @@ pub(super) struct BlobV2ReadContext<'a> {
     source_cache: HashMap<BlobSourceKey, Arc<BlobSource>>,
 }
 
-impl<'a> BlobV2ReadContext<'a> {
-    pub(super) fn new(dataset: &'a Arc<Dataset>, blob_field_id: u32) -> Self {
+impl BlobV2ReadContext {
+    pub(super) fn new(dataset: &Arc<Dataset>, blob_field_id: u32) -> Self {
         Self {
-            dataset,
+            dataset: dataset.clone(),
             blob_field_id,
             fragment_cache: HashMap::new(),
             store_cache: HashMap::new(),
@@ -216,27 +289,70 @@ impl<'a> BlobV2ReadContext<'a> {
         idx: usize,
         row_addr: u64,
     ) -> Result<Option<BlobFile>> {
+        match self.resolve(columns, idx, row_addr).await? {
+            Some(blob) => Ok(Some(blob.into_file(&mut self.source_cache).await?)),
+            None => Ok(None),
+        }
+    }
+
+    pub(super) async fn capture_reference(
+        &mut self,
+        columns: &BlobV2DescriptorColumns<'_>,
+        idx: usize,
+        row_addr: u64,
+        context: &crate::blob::reference::BlobSourceContext,
+    ) -> Result<Option<crate::blob::reference::BlobRef>> {
+        if columns.is_null_blob(idx) {
+            return Ok(None);
+        }
+        let kind = BlobKind::try_from(columns.kinds.value(idx))?;
+        if kind == BlobKind::External && columns.blob_ids.value(idx) == 0 {
+            // The URI is already absolute. Opening a store is unnecessary for
+            // transport and can perform network I/O, such as S3 region discovery.
+            let size = columns.sizes.value(idx);
+            return context
+                .reference(
+                    columns.blob_uris.value(idx).to_string(),
+                    columns.positions.value(idx),
+                    (size > 0).then_some(size),
+                    kind,
+                    None,
+                )
+                .map(Some);
+        }
+        self.resolve(columns, idx, row_addr)
+            .await?
+            .map(|resolved| resolved.into_reference(&self.dataset, context))
+            .transpose()
+    }
+
+    pub(super) async fn resolve(
+        &mut self,
+        columns: &BlobV2DescriptorColumns<'_>,
+        idx: usize,
+        row_addr: u64,
+    ) -> Result<Option<ResolvedBlob>> {
         if columns.is_null_blob(idx) {
             return Ok(None);
         }
 
         let kind = BlobKind::try_from(columns.kinds.value(idx))?;
-        let file = match kind {
-            BlobKind::Inline => self.collect_inline(columns, idx, row_addr).await?,
-            BlobKind::Dedicated => self.collect_dedicated(columns, idx, row_addr).await?,
-            BlobKind::Packed => self.collect_packed(columns, idx, row_addr).await?,
-            BlobKind::External => self.collect_external(columns, idx).await?,
+        let blob = match kind {
+            BlobKind::Inline => self.resolve_inline(columns, idx, row_addr).await?,
+            BlobKind::Dedicated => self.resolve_dedicated(columns, idx, row_addr).await?,
+            BlobKind::Packed => self.resolve_packed(columns, idx, row_addr).await?,
+            BlobKind::External => self.resolve_external(columns, idx).await?,
             BlobKind::Managed | BlobKind::ManagedWithBase => {
-                self.collect_managed(columns, idx, row_addr).await?
+                self.resolve_managed(columns, idx, row_addr).await?
             }
         };
 
-        Ok(Some(file))
+        Ok(Some(blob))
     }
 
     pub(super) async fn blob_read_location(&mut self, row_addr: u64) -> Result<BlobReadLocation> {
         resolve_blob_read_location(
-            self.dataset,
+            &self.dataset,
             self.blob_field_id,
             row_addr,
             &mut self.fragment_cache,
@@ -245,82 +361,81 @@ impl<'a> BlobV2ReadContext<'a> {
         .await
     }
 
-    pub(super) async fn collect_inline(
+    async fn resolve_inline(
         &mut self,
         columns: &BlobV2DescriptorColumns<'_>,
         idx: usize,
         row_addr: u64,
-    ) -> Result<BlobFile> {
+    ) -> Result<ResolvedBlob> {
         let position = columns.positions.value(idx);
         let size = columns.sizes.value(idx);
         let location = self.blob_read_location(row_addr).await?;
-        let source = shared_blob_source(
-            &mut self.source_cache,
-            location.object_store,
-            &location.data_file_path,
-        );
-        Ok(BlobFile::with_source(
-            source,
+        Ok(ResolvedBlob {
+            object_store: location.object_store,
+            path: location.data_file_path,
             position,
-            size,
-            BlobKind::Inline,
-            None,
-        ))
+            size: Some(size),
+            kind: BlobKind::Inline,
+            uri: None,
+            base_id: location.base_id,
+        })
     }
 
-    async fn collect_dedicated(
+    async fn resolve_dedicated(
         &mut self,
         columns: &BlobV2DescriptorColumns<'_>,
         idx: usize,
         row_addr: u64,
-    ) -> Result<BlobFile> {
+    ) -> Result<ResolvedBlob> {
         let blob_id = columns.blob_ids.value(idx);
         let size = columns.sizes.value(idx);
         let location = self.blob_read_location(row_addr).await?;
         let path = blob_path(&location.data_file_dir, &location.data_file_key, blob_id);
-        let source = shared_blob_source(&mut self.source_cache, location.object_store, &path);
-        Ok(BlobFile::with_source(
-            source,
-            0,
-            size,
-            BlobKind::Dedicated,
-            None,
-        ))
+        Ok(ResolvedBlob {
+            object_store: location.object_store,
+            path,
+            position: 0,
+            size: Some(size),
+            kind: BlobKind::Dedicated,
+            uri: None,
+            base_id: location.base_id,
+        })
     }
 
-    async fn collect_packed(
+    async fn resolve_packed(
         &mut self,
         columns: &BlobV2DescriptorColumns<'_>,
         idx: usize,
         row_addr: u64,
-    ) -> Result<BlobFile> {
+    ) -> Result<ResolvedBlob> {
         let blob_id = columns.blob_ids.value(idx);
         let size = columns.sizes.value(idx);
         let position = columns.positions.value(idx);
         let location = self.blob_read_location(row_addr).await?;
         let path = blob_path(&location.data_file_dir, &location.data_file_key, blob_id);
-        let source = shared_blob_source(&mut self.source_cache, location.object_store, &path);
-        Ok(BlobFile::with_source(
-            source,
+        Ok(ResolvedBlob {
+            object_store: location.object_store,
+            path,
             position,
-            size,
-            BlobKind::Packed,
-            None,
-        ))
+            size: Some(size),
+            kind: BlobKind::Packed,
+            uri: None,
+            base_id: location.base_id,
+        })
     }
 
-    pub(super) async fn collect_managed(
+    pub(super) async fn resolve_managed(
         &mut self,
         columns: &BlobV2DescriptorColumns<'_>,
         idx: usize,
         row_addr: u64,
-    ) -> Result<BlobFile> {
+    ) -> Result<ResolvedBlob> {
         let uri = columns.blob_uris.value(idx);
         let position = columns.positions.value(idx);
         let size = columns.sizes.value(idx);
         let relative = lance_core::utils::blob::validate_managed_reference(uri, position, size)?;
         let base_id = resolve_managed_base_id(
-            self.dataset,
+            &self.dataset,
             self.blob_field_id,
             row_addr,
             columns.managed_base_id(idx),
@@ -345,21 +460,22 @@ impl<'a> BlobV2ReadContext<'a> {
             (self.dataset.base.clone(), self.dataset.object_store.clone())
         };
         let path = join_base_and_relative_path(&root, relative.as_ref())?;
-        let source = shared_blob_source(&mut self.source_cache, store, &path);
-        Ok(BlobFile::with_source(
-            source,
+        Ok(ResolvedBlob {
+            object_store: store,
+            path,
             position,
-            size,
-            BlobKind::Managed,
-            Some(uri.to_string()),
-        ))
+            size: Some(size),
+            kind: BlobKind::Managed,
+            uri: Some(uri.to_string()),
+            base_id,
+        })
     }
 
-    async fn collect_external(
+    async fn resolve_external(
         &mut self,
         columns: &BlobV2DescriptorColumns<'_>,
         idx: usize,
-    ) -> Result<BlobFile> {
+    ) -> Result<ResolvedBlob> {
         let uri_or_path = columns.blob_uris.value(idx).to_string();
         let position = columns.positions.value(idx);
         let size = columns.sizes.value(idx);
@@ -402,19 +518,15 @@ impl<'a> BlobV2ReadContext<'a> {
             let path = join_base_and_relative_path(&base_root, &uri_or_path)?;
             (object_store, path)
         };
-        let size = if size > 0 {
-            size
-        } else {
-            object_store.size(&path).await?
-        };
-        let source = shared_blob_source(&mut self.source_cache, object_store, &path);
-        Ok(BlobFile::with_source(
-            source,
+        Ok(ResolvedBlob {
+            object_store,
+            path,
             position,
-            size,
-            BlobKind::External,
-            Some(uri_or_path),
-        ))
+            size: (size > 0).then_some(size),
+            kind: BlobKind::External,
+            uri: Some(uri_or_path),
+            base_id: (base_id != 0).then_some(base_id),
+        })
     }
 }
 

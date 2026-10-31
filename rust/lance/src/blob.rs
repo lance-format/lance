@@ -15,6 +15,8 @@
 //! this metadata, logical writes use Inline, Packed, and Dedicated descriptors;
 //! prepared Managed descriptors are rejected.
 
+pub mod reference;
+
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::ops::Range;
