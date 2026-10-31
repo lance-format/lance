@@ -7743,53 +7743,84 @@ mod tests {
     }
 
     #[rstest]
-    #[case::without_index(false)]
-    #[case::with_index(true)]
+    #[case::without_index(&[], false)]
+    #[case::zonemap(&[BuiltinIndexType::ZoneMap], false)]
+    #[case::bloom_filter(&[BuiltinIndexType::BloomFilter], false)]
+    #[case::btree(&[BuiltinIndexType::BTree], false)]
+    #[case::mixed(&[BuiltinIndexType::ZoneMap, BuiltinIndexType::BTree], false)]
+    #[case::zonemap_all_deleted(&[BuiltinIndexType::ZoneMap], true)]
+    #[case::bloom_filter_all_deleted(&[BuiltinIndexType::BloomFilter], true)]
     #[tokio::test]
-    async fn test_row_addrs_only_used_with_remappable_index(#[case] has_index: bool) {
-        let data = sample_data();
-        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 9_000))], data.schema());
-        let mut dataset = Dataset::write(
-            reader,
-            "memory://",
-            Some(WriteParams {
-                max_rows_per_file: 3_000,
-                data_storage_version: Some(LanceFileVersion::Legacy),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+    async fn test_row_addrs_only_used_with_remappable_index(
+        #[case] index_types: &[BuiltinIndexType],
+        #[case] is_fully_deleted: bool,
+        #[values(IndexRemapMode::Direct, IndexRemapMode::Compact)] index_remap_mode: IndexRemapMode,
+    ) {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(128))
+            .await
+            .unwrap();
 
-        if has_index {
-            create_scalar_index(&mut dataset, "a", false).await;
+        for builtin in index_types {
+            dataset
+                .create_index(
+                    &["a"],
+                    IndexType::Scalar,
+                    Some(builtin.as_str().to_string()),
+                    &ScalarIndexParams::for_builtin(builtin.clone()),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+
+        if is_fully_deleted {
+            // Stored coverage may retain retired fragment IDs after DELETE.
+            // Appended rows must stay visible before and after compaction.
+            dataset.delete("true").await.unwrap();
+            let mut scanner = dataset.scan();
+            scanner.filter("a = 128").unwrap();
+            assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 0);
+
+            let data = arrow_array::record_batch!(("a", Int32, vec![-1; 256])).unwrap();
+            let reader = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+            dataset
+                .append(
+                    reader,
+                    Some(WriteParams {
+                        max_rows_per_file: 128,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
         }
 
         let options = CompactionOptions {
-            target_rows_per_fragment: 9_000,
+            target_rows_per_fragment: 256,
+            index_remap_mode,
             ..Default::default()
         };
-        let plan = plan_compaction(&dataset, &options).await.unwrap();
-        assert_eq!(plan.tasks().len(), 1);
-
-        let mut result = rewrite_files(Cow::Borrowed(&dataset), plan.tasks()[0].clone(), &options)
+        let original_indices = dataset.load_indices().await.unwrap();
+        let task = TaskData {
+            fragments: dataset.fragments().as_ref().clone(),
+            output_clustering_id: None,
+            output_metadata: HashMap::new(),
+        };
+        let mut result = rewrite_files(Cow::Borrowed(&dataset), task, &options)
             .await
             .unwrap();
-        assert_eq!(result.row_addrs.is_some(), has_index);
+        assert_eq!(result.row_addrs.is_some(), !index_types.is_empty());
 
-        if has_index {
-            let row_addrs_bytes = result
-                .row_addrs
-                .as_ref()
-                .expect("indexed compaction should capture row addresses");
+        if let Some(row_addrs_bytes) = &result.row_addrs {
             let row_addrs =
                 RoaringTreemap::deserialize_from(&mut Cursor::new(row_addrs_bytes)).unwrap();
-            assert_eq!(row_addrs.len(), 9_000);
+            assert_eq!(row_addrs.len(), 256);
             // The captured addresses are contiguous per-fragment ranges, so the
             // persisted blob must be run-optimized: O(fragments) bytes, not
             // O(rows). Without run containers this serializes at ~2 bytes per
-            // address (~18 KB here), so under one byte per address proves the
-            // run form was written.
+            // address, so under one byte per address proves the run form was written.
             assert!(
                 row_addrs_bytes.len() < row_addrs.len() as usize,
                 "serialized row addrs ({} bytes for {} addresses) should be \
@@ -7797,20 +7828,61 @@ mod tests {
                 row_addrs_bytes.len(),
                 row_addrs.len()
             );
-        } else {
-            // Simulate a stale worker result that captured row addresses before the
-            // dataset no longer needed a remapper. Invalid bytes ensure the commit
-            // does not attempt to deserialize or materialize the unused map.
+        }
+        if !index_types.contains(&BuiltinIndexType::BTree) {
+            // Invalid bytes prove commit skips decoding and building the map
+            // when no index on the table supports remapping.
             result.row_addrs = Some(b"not a roaring treemap".to_vec());
-            commit_compaction(
-                &mut dataset,
-                vec![result],
-                Arc::new(DatasetIndexRemapperOptions::default()),
-                &options,
-            )
-            .await
-            .unwrap();
-            assert_eq!(dataset.get_fragments().len(), 1);
+        }
+        commit_compaction(
+            &mut dataset,
+            vec![result],
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+        let current_indices = dataset.load_indices().await.unwrap();
+        for original in original_indices.iter() {
+            let current = current_indices
+                .iter()
+                .find(|index| index.name == original.name)
+                .unwrap();
+            if original.name == BuiltinIndexType::BTree.as_str() {
+                assert_ne!(current.uuid, original.uuid);
+            } else {
+                assert_eq!(current.uuid, original.uuid);
+                assert_eq!(current.fragment_bitmap, original.fragment_bitmap);
+                assert!(
+                    current
+                        .effective_fragment_bitmap(dataset.fragment_bitmap.as_ref())
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+        let mut scanner = dataset.scan();
+        scanner.filter("a = 128").unwrap();
+        assert_eq!(
+            scanner.try_into_batch().await.unwrap().num_rows(),
+            usize::from(!is_fully_deleted)
+        );
+
+        if is_fully_deleted {
+            let mut scanner = dataset.scan();
+            scanner.filter("a = -1").unwrap();
+            assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 256);
+
+            dataset.optimize_indices(&Default::default()).await.unwrap();
+            let mut scanner = dataset.scan();
+            scanner.filter("a = -1").unwrap();
+            assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 256);
+            let indices = dataset.load_indices().await.unwrap();
+            assert_eq!(
+                indices[0].fragment_bitmap.as_ref(),
+                Some(dataset.fragment_bitmap.as_ref())
+            );
         }
     }
 

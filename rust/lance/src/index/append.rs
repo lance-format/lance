@@ -982,12 +982,26 @@ async fn merge_scalar_indices<'a>(
         None => split_segment_coverage(dataset.as_ref(), selected_old_indices.iter().copied()),
     };
 
+    // Keep honoring the deprecated instance-level check for external plugins
+    // that predate ScalarIndexPlugin::can_remap. Short-circuit so their `false`
+    // never reaches the metadata check or a remap attempt.
+    #[allow(deprecated)]
+    let is_remappable = if reference_index.can_remap() {
+        let reference_details =
+            fetch_index_details(dataset.as_ref(), field_path, reference_idx).await?;
+        IndexDetails(reference_details.clone())
+            .get_plugin()?
+            .can_remap(reference_details.as_ref())?
+    } else {
+        false
+    };
+
     // A remapping merge is stamped with the manifest it read (below): its sources were
     // translated through the fragment-reuse index, so the trim may retire the versions they
     // predate, and overlay masking will trust it for every overlay up to that manifest.
     // Entries carried over from a source never incorporate overlays committed after it was
     // built, so those rows are dropped from the carried-over data and re-read instead.
-    let (stale_rows, scan_selection) = if reference_index.can_remap() {
+    let (stale_rows, scan_selection) = if is_remappable {
         overlay_rescan(
             dataset.as_ref(),
             &selected_old_indices,
@@ -1269,7 +1283,7 @@ async fn merge_scalar_indices<'a>(
                 }
             }
         };
-        let new_dataset_version = if reference_index.can_remap() {
+        let new_dataset_version = if is_remappable {
             dataset.manifest.version
         } else {
             selected_old_indices

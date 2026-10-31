@@ -842,6 +842,10 @@ impl BasicTrainer for MinHashLshIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for MinHashLshIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(true)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
