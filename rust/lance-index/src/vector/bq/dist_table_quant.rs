@@ -146,6 +146,8 @@ fn dequant_overflows(table_len: usize, qmin: f32, qmax: f32) -> bool {
 }
 
 /// Declares a dispatch over one operation's AVX-512, AVX2 and portable kernels.
+/// Off x86_64 it still declares the dispatch, holding only the portable
+/// kernel, so callers need no `cfg` of their own.
 macro_rules! x86_dispatch {
     ($name:ident: $kernel_type:ty = $avx512:ident, $avx2:ident, $portable:ident) => {
         lance_core::dispatch! {
@@ -380,6 +382,8 @@ mod x86 {
             factor: f32,
             out: &mut [MaybeUninit<u8>],
         ) {
+            // A safe kernel writing through raw pointers, so the bound must
+            // hold in release builds too.
             assert_eq!(values.len(), out.len());
             let min = _mm512_set1_ps(qmin);
             let factor_v = _mm512_set1_ps(factor);
@@ -408,6 +412,8 @@ mod x86 {
             factor: f32,
             out: &mut [MaybeUninit<u16>],
         ) {
+            // A safe kernel writing through raw pointers, so the bound must
+            // hold in release builds too.
             assert_eq!(values.len(), out.len());
             let min = _mm512_set1_ps(qmin);
             let factor_v = _mm512_set1_ps(factor);
@@ -450,6 +456,8 @@ mod x86 {
             factor: f32,
             out: &mut [MaybeUninit<u8>],
         ) {
+            // A safe kernel writing through raw pointers, so the bound must
+            // hold in release builds too.
             assert_eq!(values.len(), out.len());
             let min = _mm256_set1_ps(qmin);
             let factor_v = _mm256_set1_ps(factor);
@@ -487,6 +495,8 @@ mod x86 {
             factor: f32,
             out: &mut [MaybeUninit<u16>],
         ) {
+            // A safe kernel writing through raw pointers, so the bound must
+            // hold in release builds too.
             assert_eq!(values.len(), out.len());
             let min = _mm256_set1_ps(qmin);
             let factor_v = _mm256_set1_ps(factor);
