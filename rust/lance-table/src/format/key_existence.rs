@@ -70,6 +70,7 @@ pub struct KeyExistenceFilterBuilder {
     sbbf: Sbbf,
     field_ids: Vec<i32>,
     item_count: usize,
+    is_saturated: bool,
 }
 
 impl KeyExistenceFilterBuilder {
@@ -83,12 +84,46 @@ impl KeyExistenceFilterBuilder {
             sbbf,
             field_ids,
             item_count: 0,
+            is_saturated: false,
         }
     }
 
     pub fn insert(&mut self, key: KeyValue) -> Result<()> {
         self.sbbf.insert(&key.to_bytes()[..]);
         self.item_count += 1;
+        Ok(())
+    }
+
+    /// Record an inserted row using the merge join's key columns.
+    ///
+    /// Top-level NULL keys never match under SQL equality. For other values
+    /// that cannot be represented by `KeyValue`, saturate the existing bloom
+    /// filter so concurrent inserts conservatively conflict instead of losing
+    /// protection. This preserves the transaction's serialized format.
+    pub fn insert_row(
+        &mut self,
+        batch: &RecordBatch,
+        row_idx: usize,
+        on_columns: &[String],
+    ) -> Result<()> {
+        for name in on_columns {
+            let column = batch.column_by_name(name).ok_or_else(|| {
+                lance_core::Error::internal(format!("Merge key column '{name}' is missing"))
+            })?;
+            if column.is_null(row_idx) {
+                return Ok(());
+            }
+        }
+        if let Some(key) = extract_key_value_from_batch(batch, row_idx, on_columns) {
+            self.insert(key)?;
+        } else {
+            if !self.is_saturated {
+                self.sbbf = Sbbf::new(&vec![u8::MAX; self.sbbf.size_bytes()])
+                    .map_err(|e| lance_core::Error::internal(e.to_string()))?;
+                self.is_saturated = true;
+            }
+            self.item_count += 1;
+        }
         Ok(())
     }
 
@@ -160,7 +195,7 @@ pub enum FilterType {
 }
 
 /// Tracks keys of inserted rows for conflict detection.
-/// Only created when ON columns match the schema's unenforced primary key.
+/// Uses the merge's ON columns, independently of primary key metadata.
 #[derive(Debug, Clone, DeepSizeOf, PartialEq)]
 pub struct KeyExistenceFilter {
     pub field_ids: Vec<i32>,
@@ -396,6 +431,47 @@ mod tests {
     use arrow_array::builder::{Int32Builder, ListBuilder, StringBuilder};
     use arrow_array::{Int32Array, RecordBatch, StringArray, StructArray};
     use arrow_schema::{Field, Schema};
+
+    #[test]
+    fn test_insert_row_conservative_filter_and_nulls() {
+        let batch = arrow_array::record_batch!(
+            ("id", Float64, [Some(1.0), None]),
+            ("part", Int32, [Some(2), Some(2)])
+        )
+        .unwrap();
+        let keys = vec!["id".to_string(), "part".to_string()];
+        let mut nulls = KeyExistenceFilterBuilder::new(vec![0, 1]);
+        nulls.insert_row(&batch, 1, &keys).unwrap();
+        assert!(nulls.is_empty());
+        let mut unknown = KeyExistenceFilterBuilder::new(vec![0, 1]);
+        unknown.insert_row(&batch, 0, &keys).unwrap();
+        let mut known = KeyExistenceFilterBuilder::new(vec![0, 1]);
+        known
+            .insert(KeyValue::Composite(vec![
+                KeyValue::Int64(1),
+                KeyValue::Int64(2),
+            ]))
+            .unwrap();
+        assert!(unknown.might_intersect(&known).unwrap());
+        assert!(!unknown.might_intersect(&nulls).unwrap());
+        let proto = pb::transaction::KeyExistenceFilter::from(&unknown);
+        let restored = KeyExistenceFilter::try_from(&proto).unwrap();
+        assert_eq!(restored, unknown.build());
+        assert!(restored.intersects(&known.build()).unwrap().0);
+    }
+
+    #[test]
+    fn test_insert_row_composite_key() {
+        let batch = arrow_array::record_batch!(("id", Int32, [1]), ("part", Utf8, ["x"])).unwrap();
+        let mut filter = KeyExistenceFilterBuilder::new(vec![0, 1]);
+        filter
+            .insert_row(&batch, 0, &["id".into(), "part".into()])
+            .unwrap();
+        assert!(filter.contains(&KeyValue::Composite(vec![
+            KeyValue::Int64(1),
+            KeyValue::String("x".into())
+        ])));
+    }
 
     #[test]
     fn test_extract_key_value_from_batch_list_int() {
