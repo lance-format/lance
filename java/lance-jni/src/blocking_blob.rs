@@ -95,6 +95,43 @@ fn transform_vec<'local>(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeTakeBlobsByAddresses<'local>(
+    mut env: JNIEnv<'local>,
+    jdataset: JObject,
+    row_addresses_obj: JObject, // List<Long>
+    column: JString,
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_take_blobs_by_addresses(&mut env, jdataset, row_addresses_obj, column)
+    )
+}
+
+fn inner_take_blobs_by_addresses<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+    row_addresses_obj: JObject, // List<Long>
+    column: JString,
+) -> Result<JObject<'local>> {
+    let row_addresses: Vec<u64> = env
+        .get_longs(&row_addresses_obj)?
+        .into_iter()
+        .map(|address| address as u64)
+        .collect();
+    let column: String = column.extract(env)?;
+    let blobs = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        block_on(Arc::new(dataset.inner.clone()).take_blobs_by_addresses(&row_addresses, column))?
+    };
+    let j_blobs = blobs
+        .into_iter()
+        .map(|blob| blob.map(BlockingBlobFile::from))
+        .collect();
+    transform_vec(env, j_blobs)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_lance_Dataset_nativeTakeBlobsByIndices<'local>(
     mut env: JNIEnv<'local>,
     jdataset: JObject,

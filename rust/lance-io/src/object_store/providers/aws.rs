@@ -24,7 +24,7 @@ use object_store::{
     StaticCredentialProvider,
     aws::{
         AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential,
-        AwsCredentialProvider,
+        AwsCredentialProvider, S3CopyIfNotExists,
     },
 };
 use tokio::sync::{Mutex, RwLock};
@@ -39,6 +39,10 @@ use crate::object_store::{
 };
 use lance_core::error::{Error, Result};
 use lance_core::utils::parse::str_is_truthy;
+
+mod conditional_copy;
+
+use conditional_copy::ConditionalS3Store;
 
 #[derive(Default, Debug)]
 pub struct AwsStoreProvider;
@@ -86,9 +90,8 @@ impl AwsStoreProvider {
         mut resolved_s3_options: ResolvedS3StorageOptions,
         is_s3_express: bool,
         throttle_state: Option<&AimdThrottleState>,
-        // Concrete rather than `dyn`, so the caller keeps the handle a paginated listing
-        // needs: `PaginatedListStore` is a separate trait from `ObjectStore`.
-    ) -> Result<Arc<AmazonS3>> {
+        // Keep the concrete client for paginated listing alongside the copy adapter.
+    ) -> Result<(Arc<dyn OSObjectStore>, Arc<AmazonS3>)> {
         // Use a low retry count since the AIMD throttle layer handles
         // throttle recovery with its own retry loop.
         let retry_config = RetryConfig {
@@ -132,8 +135,17 @@ impl AwsStoreProvider {
         base_path.set_query(None);
 
         // we can't use parse_url_opts here because we need to manually set the credentials provider
-        let mut builder =
-            AmazonS3Builder::new().with_client_options(storage_options.client_options()?);
+        // Reuse the same transport settings for the completion client, including
+        // settings that with_config would otherwise apply only to this builder.
+        let mut client_options = storage_options.client_options()?;
+        for (key, value) in &resolved_s3_options.options {
+            if let AmazonS3ConfigKey::Client(key) = key {
+                client_options = client_options.with_config(*key, value);
+            }
+        }
+        let mut builder = AmazonS3Builder::new()
+            .with_client_options(client_options.clone())
+            .with_copy_if_not_exists(S3CopyIfNotExists::Multipart);
         for (key, value) in resolved_s3_options.options {
             builder = builder.with_config(key, value);
         }
@@ -145,7 +157,20 @@ impl AwsStoreProvider {
 
         builder = builder.with_http_connector(cloud_http_connector(throttle_state, metrics_base));
 
-        Ok(Arc::new(builder.build()?))
+        let use_multipart_copy = builder
+            .get_config_value(&AmazonS3ConfigKey::CopyIfNotExists)
+            .is_some_and(|mode| mode.trim() == "multipart");
+        let store = Arc::new(builder.clone().build()?);
+        let inner: Arc<dyn OSObjectStore> = if use_multipart_copy {
+            Arc::new(ConditionalS3Store::new(
+                store.clone(),
+                builder,
+                client_options,
+            )?)
+        } else {
+            store.clone()
+        };
+        Ok((inner, store))
     }
 
     async fn build_opendal_s3_store(
@@ -248,7 +273,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
             )
         } else {
             // Use default Amazon S3 implementation
-            let store = self
+            let (inner, store) = self
                 .build_amazon_s3_store(
                     &mut base_path,
                     params,
@@ -258,10 +283,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
                     throttle_state.as_ref(),
                 )
                 .await?;
-            (
-                store.clone() as Arc<dyn OSObjectStore>,
-                Some(store as Arc<dyn PaginatedListStore>),
-            )
+            (inner, Some(store as Arc<dyn PaginatedListStore>))
         };
         let (inner, paginated_lister) =
             with_throttling(throttle_state, !use_opendal, inner, paginated_lister);
@@ -269,11 +291,11 @@ impl ObjectStoreProvider for AwsStoreProvider {
         Ok(ObjectStore {
             inner,
             local_dir_operations: None,
+            local_fsync: false,
             scheme: String::from(base_path.scheme()),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts,
-            supports_conditional_multipart_put: !use_opendal,
             list_is_lexically_ordered: !is_s3_express,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
@@ -1125,7 +1147,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.scheme, "s3");
-        assert!(!store.supports_conditional_multipart_put);
     }
 
     /// A credential provider handed to the OpenDAL arm would be dropped, and
@@ -1184,10 +1205,6 @@ mod tests {
 
         assert!(!store.list_is_lexically_ordered);
         assert_eq!(store.paginated_lister.is_some(), paginated);
-        assert_eq!(
-            store.supports_conditional_multipart_put,
-            use_opendal == "false"
-        );
     }
 
     #[derive(Debug)]

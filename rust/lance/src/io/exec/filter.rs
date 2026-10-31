@@ -3,6 +3,11 @@
 
 use std::sync::Arc;
 
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::ChildStats;
+use datafusion::physical_plan::StatisticsArgs;
+use datafusion::physical_plan::replace_children_if_necessary;
 use datafusion::{catalog::Session, execution::TaskContext, logical_expr::Expr};
 use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
@@ -78,15 +83,22 @@ impl ExecutionPlan for LanceFilterExec {
         self.filter.maintains_input_order()
     }
 
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        self.filter.apply_expressions(f)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Rewrap the result in a LanceFilterExec to preserve the logical expression
-        let new_filter_plan = self.filter.clone().with_new_children(children)?;
+        let new_filter_plan = replace_children_if_necessary(self.filter.clone(), children)?;
         let new_filter = new_filter_plan
             .downcast_ref::<FilterExec>()
-            .expect("FilterExec::with_new_children should return FilterExec")
+            .expect("replacing FilterExec children should return FilterExec")
             .clone();
         Ok(Arc::new(Self {
             expr: self.expr.clone(),
@@ -106,8 +118,16 @@ impl ExecutionPlan for LanceFilterExec {
         self.filter.metrics()
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
-        self.filter.partition_statistics(partition)
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        self.filter.child_stats_requests(partition)
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
+    ) -> DataFusionResult<Arc<Statistics>> {
+        self.filter.statistics_from_inputs(input_stats, args)
     }
 
     fn cardinality_effect(&self) -> datafusion_physical_plan::execution_plan::CardinalityEffect {

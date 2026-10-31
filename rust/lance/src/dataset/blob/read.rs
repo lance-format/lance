@@ -1053,12 +1053,14 @@ mod tests {
     use crate::dataset::blob::locate::collect_blob_files_v1;
     use crate::dataset::blob::read::plan::{BlobEntry, plan_blob_read_plans};
     use crate::dataset::blob::test_util::{
-        gated_range_store, recording_range_store, recording_range_store_with_url,
+        gated_range_store, managed_blob_schema, recording_range_store,
+        recording_range_store_with_url,
     };
     use crate::{
         Dataset,
-        blob::{BlobArrayBuilder, blob_field},
+        blob::{BlobArrayBuilder, BlobDescriptorArrayBuilder, ManagedBlobWriter, blob_field},
         dataset::WriteParams,
+        dataset::optimize::compact_files,
     };
     use arrow_array::RecordBatch;
     use arrow_array::{ArrayRef, LargeBinaryArray, RecordBatchIterator, StructArray, UInt64Array};
@@ -1072,6 +1074,8 @@ mod tests {
     use lance_core::datatypes::BlobKind;
     use lance_core::{Error, utils::tempfile::TempStrDir};
     use lance_file::version::LanceFileVersion;
+    use lance_io::object_store::ObjectStore;
+    use lance_table::format::BasePath;
     use object_store::path::Path;
     use rstest::rstest;
     use std::collections::HashMap;
@@ -1080,6 +1084,119 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use std::time::Duration;
+
+    #[rstest]
+    #[tokio::test]
+    async fn prepared_managed_sharing_reuses_physical_ranges(
+        #[values(None, Some(7), Some(u32::MAX))] base_id: Option<u32>,
+        #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
+    ) {
+        let dir = TempStrDir::default();
+        let root = Path::from_absolute_path(dir.to_string()).unwrap();
+        let mut writer = ManagedBlobWriter::try_new(ObjectStore::local(), root, base_id)
+            .await
+            .unwrap();
+        let payload_path = writer.path().clone();
+        writer
+            .write_blobs([
+                Some(b"shared".as_slice()),
+                Some(b"".as_slice()),
+                None,
+                Some(b"unused".as_slice()),
+            ])
+            .await
+            .unwrap();
+        let values = writer.finish().await.unwrap();
+        let mut builder = BlobDescriptorArrayBuilder::new("blob");
+        builder
+            .extend([0, 0, 1, 2, 0].map(|i| values[i].clone()))
+            .unwrap();
+        let (field, array) = builder.finish().unwrap().into_parts();
+        let schema = Arc::new(managed_blob_schema(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &dir,
+            Some(WriteParams {
+                data_storage_version: Some(version),
+                max_rows_per_file: 2,
+                initial_bases: base_id
+                    .map(|id| vec![BasePath::new(id, dir.to_string(), None, false)]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        for compacted in [false, true] {
+            if compacted {
+                let payload_store = dataset.object_store(base_id).await.unwrap();
+                let _ = payload_store.io_stats_incremental();
+                compact_files(&mut dataset, Default::default(), None)
+                    .await
+                    .unwrap();
+                assert_eq!(dataset.get_fragments().len(), 1);
+                let stats = payload_store.io_stats_incremental();
+                assert!(
+                    stats.requests.iter().all(|request| {
+                        !request.path.as_ref().contains("/_blobs/")
+                            || !request.method.starts_with("put")
+                    }),
+                    "{stats:?}"
+                );
+            }
+            let dataset = Arc::new(dataset.clone());
+            let blobs = dataset
+                .take_blobs_by_indices(&[0, 1, 2, 3, 4], "blob")
+                .await
+                .unwrap();
+            assert!(blobs[3].is_none());
+            assert!(blobs[2].as_ref().unwrap().read().await.unwrap().is_empty());
+            for i in [0, 1, 4] {
+                assert_eq!(blobs[i].as_ref().unwrap().source.path, payload_path);
+                assert_eq!(
+                    blobs[i].as_ref().unwrap().read().await.unwrap(),
+                    b"shared"[..]
+                );
+            }
+            // Descriptor lookup is warm, but payload reads are submitted through
+            // the real dataset planner. Duplicate and overlapping selections
+            // must share the same physical range in this single read plan.
+            let payload_store = dataset.object_store(base_id).await.unwrap();
+            let _ = payload_store.io_stats_incremental();
+            let results = dataset
+                .read_blob_ranges("blob")
+                .unwrap()
+                .with_row_indices(vec![
+                    BlobRangeRequest::new(4, 1, 3),
+                    BlobRangeRequest::new(0, 1, 3),
+                    BlobRangeRequest::new(1, 2, 2),
+                ])
+                .execute()
+                .await
+                .unwrap();
+            let stats = payload_store.io_stats_incremental();
+            assert_eq!(results[0].data.as_deref(), Some(b"har".as_slice()));
+            assert_eq!(results[1].data.as_deref(), Some(b"har".as_slice()));
+            assert_eq!(results[2].data.as_deref(), Some(b"ar".as_slice()));
+            let requests = stats
+                .requests
+                .iter()
+                .filter(|request| request.path == payload_path)
+                .collect::<Vec<_>>();
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert_eq!(requests[0].range, Some(1..4));
+            let objects = std::fs::read_dir(std::path::Path::new(dir.as_str()).join("_blobs"))
+                .unwrap()
+                .collect::<Vec<_>>();
+            assert_eq!(objects.len(), 1);
+            assert_eq!(
+                std::fs::read(objects[0].as_ref().unwrap().path()).unwrap(),
+                b"sharedunused"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_execute_blob_entries_preserves_order_and_coalesces() {

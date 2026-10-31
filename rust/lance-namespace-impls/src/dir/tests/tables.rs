@@ -826,7 +826,7 @@ async fn test_alter_table_alter_columns_rename() {
 
 #[tokio::test]
 async fn test_get_table_stats() {
-    use lance_namespace::models::GetTableStatsRequest;
+    use lance_namespace::models::{CountTableRowsRequest, GetTableStatsRequest};
 
     let (namespace, _temp_dir) = create_test_namespace().await;
     create_scalar_table(&namespace, "items").await;
@@ -835,9 +835,33 @@ async fn test_get_table_stats() {
     let mut req = GetTableStatsRequest::new();
     req.id = Some(vec!["items".to_string()]);
 
-    let response = namespace.get_table_stats(req).await.unwrap();
+    let response = namespace.get_table_stats(req.clone()).await.unwrap();
     assert_eq!(response.num_rows, 3);
     assert_eq!(response.num_indices, 1);
+
+    // Stats and row counts read the branch the request names, and a
+    // version resolves on that branch.
+    create_branch_with_commits(&namespace, "items", "exp", 1).await;
+    req.branch = Some("exp".to_string());
+    let response = namespace.get_table_stats(req).await.unwrap();
+    assert_eq!(response.num_rows, 5);
+
+    let versions = list_versions(&namespace, "items", Some("exp")).await;
+    let branch_latest = versions.unwrap().iter().map(|v| v.version).max();
+    let count = |branch: Option<&str>, version: Option<i64>| CountTableRowsRequest {
+        id: Some(vec!["items".to_string()]),
+        branch: branch.map(str::to_string),
+        version,
+        ..Default::default()
+    };
+    let on_main = namespace.count_table_rows(count(None, None)).await;
+    assert_eq!(on_main.unwrap(), 3);
+    let on_branch = namespace.count_table_rows(count(Some("exp"), None)).await;
+    assert_eq!(on_branch.unwrap(), 5);
+    let at_version = count(Some("exp"), branch_latest);
+    assert_eq!(namespace.count_table_rows(at_version).await.unwrap(), 5);
+    let missing_on_main = count(None, branch_latest);
+    assert!(namespace.count_table_rows(missing_on_main).await.is_err());
 }
 
 #[tokio::test]

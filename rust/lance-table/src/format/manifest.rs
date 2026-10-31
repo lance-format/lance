@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::{Fragment, InlineRowIds, RowIdMeta};
+use super::{ClusteringDefinition, Fragment, InlineRowIds, RowIdMeta};
 use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_READER_FLAGS, STICKY_WRITER_FLAGS};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
@@ -109,6 +109,17 @@ pub struct Manifest {
 
     /* external base paths */
     pub base_paths: HashMap<u32, BasePath>,
+
+    /// Immutable clustering definitions referenced by fragment and index
+    /// segment `clustering_id`. Every referenced definition stays in the
+    /// manifest: a definition is removed only while nothing references it, and
+    /// is never redefined in place.
+    pub clustering: Vec<ClusteringDefinition>,
+
+    /// Highest clustering ID ever allocated in this lineage; zero before the
+    /// first. Allocation takes `max_clustering_id + 1` and the value never
+    /// decreases, including after definition removal or restore.
+    pub max_clustering_id: u32,
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -210,6 +221,8 @@ impl Manifest {
             config: HashMap::new(),
             table_metadata: HashMap::new(),
             base_paths,
+            clustering: Vec::new(),
+            max_clustering_id: 0,
         }
     }
 
@@ -242,6 +255,8 @@ impl Manifest {
             config: previous.config.clone(),
             table_metadata: previous.table_metadata.clone(),
             base_paths: previous.base_paths.clone(),
+            clustering: previous.clustering.clone(),
+            max_clustering_id: previous.max_clustering_id,
         }
     }
 
@@ -319,6 +334,10 @@ impl Manifest {
                 base_paths
             },
             table_metadata: self.table_metadata.clone(),
+            // The clone keeps the source fragments and segments, so it keeps
+            // the definitions they reference and the allocation high-water mark.
+            clustering: self.clustering.clone(),
+            max_clustering_id: self.max_clustering_id,
         }
     }
 
@@ -811,6 +830,24 @@ pub struct ManifestBuildConfig {
     pub migration_next_row_id: Option<u64>,
     /// Whether this commit atomically activates non-reusable field IDs.
     pub activate_non_reusable_field_ids: bool,
+    /// For an `UpdateConfig` commit only: the COMPLETE list of clustering
+    /// definitions the writer wants the next manifest to hold, built from the
+    /// manifest it read. A current definition the list keeps must be unchanged
+    /// (matched by id, content identical, order not significant); one it omits
+    /// is removed, which is allowed only while no fragment or index segment in
+    /// the landing snapshot references it; new ids continue `max_clustering_id`
+    /// in order, and the mark never moves backwards. `None` leaves the
+    /// definitions alone. This is a commit-time input, not part of the
+    /// transaction: the transaction file stays a plain `UpdateConfig` and the
+    /// manifest is the durable record of the definitions. Applied against the
+    /// manifest the commit actually lands on, so a list built from a stale
+    /// snapshot (a changed current definition, an omitted definition the writer
+    /// never read, or a new id that no longer continues the mark) is a
+    /// non-retryable commit conflict: the writer reloads and rebuilds the list.
+    /// A list identical to the current one is a no-op. Allocating a definition
+    /// on a table with reusable field ids activates non-reusable field ids in
+    /// the same commit, since definitions key on field ids.
+    pub clustering_definitions: Option<Vec<ClusteringDefinition>>,
     /// Row lineage sequences of the current manifest's fragments that live
     /// outside the manifest, read ahead of the build. An update that rewrites
     /// rows needs the existing row ids and created-at versions to carry each
@@ -1116,6 +1153,12 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .iter()
                 .map(|item| (item.id, item.clone().into()))
                 .collect(),
+            clustering: p
+                .clustering
+                .into_iter()
+                .map(ClusteringDefinition::try_from)
+                .collect::<Result<Vec<_>>>()?,
+            max_clustering_id: p.max_clustering_id,
         })
     }
 }
@@ -1143,8 +1186,8 @@ impl From<&Manifest> for pb::Manifest {
                 .collect(),
             version: m.version,
             branch: m.branch.clone(),
-            clustering: Vec::new(),
-            max_clustering_id: 0,
+            clustering: m.clustering.iter().map(pb::Clustering::from).collect(),
+            max_clustering_id: m.max_clustering_id,
             writer_version: m
                 .writer_version
                 .as_ref()
@@ -1254,8 +1297,9 @@ impl SelfDescribingFileReader for V1FileReader {
 mod tests {
     use crate::feature_flags::{FLAG_NON_REUSABLE_FIELD_IDS, FLAG_USE_V2_FORMAT_DEPRECATED};
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage, TOMBSTONE_FIELD_ID};
-    use crate::format::{DataFile, DeletionFile, DeletionFileType};
+    use crate::format::{DataFile, DeletionFile, DeletionFileType, IndexMetadata};
     use std::num::NonZero;
+    use uuid::Uuid;
 
     use super::*;
 
@@ -1273,7 +1317,8 @@ mod tests {
             ),
             ("org.example.empty".into(), String::new()),
         ]);
-        // Test the persisted messages only; runtime maintenance is not enabled yet.
+        // The persisted messages and the runtime structs both carry the fields;
+        // the writer flag stays unsupported until maintenance rules are complete.
         let manifest = pb::Manifest {
             writer_feature_flags: crate::feature_flags::FLAG_OBJECT_METADATA,
             max_clustering_id: 7,
@@ -1329,10 +1374,11 @@ mod tests {
         assert_eq!(manifest.reader_feature_flags, 0);
         let segments = pb::IndexSection {
             indices: vec![pb::IndexMetadata {
+                uuid: Some((&Uuid::new_v4()).into()),
                 name: "vectors".into(),
                 fields: vec![1],
                 clustering_id: Some(5),
-                metadata,
+                metadata: metadata.clone(),
                 ..Default::default()
             }],
         };
@@ -1343,6 +1389,46 @@ mod tests {
         assert_eq!(manifest.clustering.len(), 2);
         assert_eq!(manifest.max_clustering_id, 7);
         assert_eq!(manifest.fragments[2].clustering_id, None);
+
+        // Runtime round trip: decode into the structs and encode back.
+        let runtime = Manifest::try_from(manifest.clone()).unwrap();
+        assert_eq!(runtime.max_clustering_id, 7);
+        assert_eq!(
+            runtime.clustering,
+            vec![
+                ClusteringDefinition {
+                    id: 1,
+                    columns: vec![0, 1],
+                    provider: "org.example.cluster".into(),
+                    version: 8,
+                },
+                ClusteringDefinition {
+                    id: 5,
+                    columns: vec![1],
+                    provider: "org.example.other".into(),
+                    version: 9,
+                },
+            ]
+        );
+        assert_eq!(runtime.fragments[0].clustering_id, Some(1));
+        assert_eq!(runtime.fragments[0].metadata, metadata);
+        assert_eq!(runtime.fragments[1].clustering_id, Some(5));
+        assert!(runtime.fragments[1].metadata.is_empty());
+        assert_eq!(runtime.fragments[2].clustering_id, None);
+        assert_eq!(runtime.fragments[2].metadata, metadata);
+        let encoded = pb::Manifest::from(&runtime);
+        assert_eq!(encoded.clustering, manifest.clustering);
+        assert_eq!(encoded.max_clustering_id, manifest.max_clustering_id);
+        for (encoded, original) in encoded.fragments.iter().zip(manifest.fragments.iter()) {
+            assert_eq!(encoded.clustering_id, original.clustering_id);
+            assert_eq!(encoded.metadata, original.metadata);
+        }
+        let segment = IndexMetadata::try_from(segments.indices[0].clone()).unwrap();
+        assert_eq!(segment.clustering_id, Some(5));
+        assert_eq!(segment.metadata, metadata);
+        let encoded = pb::IndexMetadata::from(&segment);
+        assert_eq!(encoded.clustering_id, Some(5));
+        assert_eq!(encoded.metadata, metadata);
         let allocation_only = pb::Manifest {
             writer_feature_flags: crate::feature_flags::FLAG_OBJECT_METADATA,
             max_clustering_id: manifest.max_clustering_id,
@@ -1363,6 +1449,29 @@ mod tests {
                 .clustering_id,
             Some(0)
         );
+    }
+
+    #[test]
+    fn new_from_previous_keeps_clustering_definitions_and_high_water_mark() {
+        let schema = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int32, false)]);
+        let mut previous = Manifest::new(
+            Schema::try_from(&schema).unwrap(),
+            Arc::new(vec![]),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        );
+        previous.clustering = vec![ClusteringDefinition {
+            id: 2,
+            columns: vec![0],
+            provider: "org.example.cluster".into(),
+            version: 1,
+        }];
+        previous.max_clustering_id = 4;
+
+        let next =
+            Manifest::new_from_previous(&previous, previous.schema.clone(), Arc::new(vec![]));
+        assert_eq!(next.clustering, previous.clustering);
+        assert_eq!(next.max_clustering_id, 4);
     }
 
     /// A shallow clone points every local file at the parent through `base_id`.
@@ -1791,6 +1900,8 @@ mod tests {
                 physical_rows: None,
                 created_at_version_meta: None,
                 last_updated_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
             Fragment {
                 id: 1,
@@ -1804,6 +1915,8 @@ mod tests {
                 physical_rows: None,
                 created_at_version_meta: None,
                 last_updated_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
         ];
 
@@ -1836,6 +1949,8 @@ mod tests {
             physical_rows: None,
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         fragment.overlays = vec![DataOverlayFile {
             data_file: DataFile::new_legacy_from_fields("overlay.lance", vec![43], None),

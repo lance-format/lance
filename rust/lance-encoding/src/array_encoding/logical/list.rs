@@ -4,7 +4,7 @@
 use std::{
     collections::VecDeque,
     ops::Range,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, Weak},
 };
 
 use arrow_array::{
@@ -27,8 +27,8 @@ use crate::{
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     decoder::{
         DecodeArrayTask, DecodeBatchScheduler, DrainLimit, FieldScheduler, FilterExpression,
-        ListPriorityRange, LogicalPageDecoder, MessageType, NextDecodeTask, PageEncoding,
-        PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
+        LateReadGuard, ListPriorityRange, LogicalPageDecoder, MessageType, NextDecodeTask,
+        PageEncoding, PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
     encoder::{
         ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder,
@@ -342,6 +342,8 @@ async fn indirect_schedule_task(
     io: Arc<dyn EncodingsIo>,
     cache: Arc<LanceCache>,
     priority: Box<dyn PriorityRange>,
+    late_read_guard: Option<LateReadGuard>,
+    decoder_interest: Weak<()>,
 ) -> Result<IndirectlyLoaded> {
     let num_offsets = offsets_decoder.num_rows();
     // We know the offsets are a primitive array and thus will not need additional
@@ -370,6 +372,11 @@ async fn indirect_schedule_task(
             validity,
         });
     }
+    if decoder_interest.strong_count() == 0 {
+        return Err(Error::internal(
+            "the list page decoder was dropped before its items were scheduled",
+        ));
+    }
     let item_ranges = item_ranges.into_iter().collect::<Vec<_>>();
     let num_items = item_ranges.iter().map(|r| r.end - r.start).sum::<u64>();
 
@@ -382,7 +389,8 @@ async fn indirect_schedule_task(
         Arc::new(indirect_root_scheduler),
         root_fields.clone(),
         cache,
-    );
+    )
+    .with_outer_batch(late_read_guard.as_ref());
     let mut root_decoder = SimpleStructDecoder::new(root_fields, num_items);
 
     let priority = Box::new(ListPriorityRange::new(priority, offsets.clone()));
@@ -478,7 +486,11 @@ impl SchedulingJob for ListFieldSchedulingJob<'_> {
         } else {
             base_io
         };
+        // Held until the items are scheduled, so their reads join this step's
+        // group. Skipped when the items' reads bypass the batch.
+        let late_read_guard = Arc::ptr_eq(&io, context.io()).then(|| context.late_read_guard());
         let cache = context.cache().clone();
+        let decoder_interest = Arc::new(());
 
         // Immediately spawn the indirect scheduling
         let indirect_fut = tokio::spawn(indirect_schedule_task(
@@ -490,6 +502,8 @@ impl SchedulingJob for ListFieldSchedulingJob<'_> {
             io,
             cache,
             priority.box_clone(),
+            late_read_guard,
+            Arc::downgrade(&decoder_interest),
         ));
 
         // Return a decoder
@@ -502,6 +516,7 @@ impl SchedulingJob for ListFieldSchedulingJob<'_> {
             items_field: self.scheduler.items_field.clone(),
             num_rows,
             unloaded: Some(indirect_fut),
+            _decoder_interest: decoder_interest,
             offset_type: self.scheduler.offset_type.clone(),
             data_type: self.scheduler.list_type.clone(),
         });
@@ -616,6 +631,8 @@ impl FieldScheduler for ListFieldScheduler {
 #[derive(Debug)]
 struct ListPageDecoder {
     unloaded: Option<JoinHandle<Result<IndirectlyLoaded>>>,
+    /// Lets the indirect scheduling task skip the items once this decoder is gone.
+    _decoder_interest: Arc<()>,
     // offsets and validity will have already been decoded as part of the indirect I/O
     offsets: Arc<[u64]>,
     validity: BooleanBuffer,
@@ -870,7 +887,11 @@ impl LogicalPageDecoder for ListPageDecoder {
 
     fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
         if num_rows == 0 {
-            return Ok(DrainLimit { rows: 0, bytes: 0 });
+            return Ok(DrainLimit {
+                rows: 0,
+                bytes: 0,
+                dictionary_rows: None,
+            });
         }
         let start_index = self.rows_drained as usize;
         let end_index = start_index + num_rows as usize;
@@ -888,6 +909,7 @@ impl LogicalPageDecoder for ListPageDecoder {
         // The item array has its own offset buffers with their own budget; shrink to
         // the largest whole number of lists whose items also fit.
         let mut item_bytes = 0u64;
+        let mut dictionary_rows = None;
         let mut safe_end_index = start_index + safe_rows as usize;
         let requested_items = self.offsets[safe_end_index] - start_offset;
         if requested_items > 0
@@ -895,6 +917,11 @@ impl LogicalPageDecoder for ListPageDecoder {
         {
             let item_limit = item_decoder.max_rows_to_drain(requested_items, byte_budget)?;
             item_bytes = item_limit.bytes;
+            dictionary_rows = item_limit.dictionary_rows.map(|item_rows| {
+                let max_item_offset = start_offset + item_rows;
+                self.offsets[start_index + 1..=end_index]
+                    .partition_point(|offset| *offset <= max_item_offset) as u64
+            });
             if item_limit.rows < requested_items {
                 let max_item_offset = start_offset + item_limit.rows;
                 safe_rows = self.offsets[start_index + 1..=safe_end_index]
@@ -914,6 +941,7 @@ impl LogicalPageDecoder for ListPageDecoder {
         Ok(DrainLimit {
             rows: safe_rows,
             bytes,
+            dictionary_rows,
         })
     }
 
@@ -1387,7 +1415,7 @@ mod tests {
     use arrow_schema::{DataType, Field};
 
     use super::*;
-    use crate::decoder::LogicalPageDecoder;
+    use crate::decoder::{DecoderReady, DrainLimit, LogicalPageDecoder, NextDecodeTask};
 
     #[test]
     fn oversized_binary_batch_error_is_actionable() {
@@ -1428,6 +1456,7 @@ mod tests {
     fn list_decoder_overflow_reports_row_span() {
         let mut decoder = ListPageDecoder {
             unloaded: None,
+            _decoder_interest: Arc::default(),
             offsets: Arc::<[u64]>::from(vec![0_u64, 1, 2, 3, 3 + i32::MAX as u64 + 1]),
             validity: BooleanBuffer::from_iter([true, true, true, true]),
             item_decoder: None,
@@ -1453,6 +1482,7 @@ mod tests {
         let items_field = Arc::new(Field::new("item", DataType::Int32, true));
         ListPageDecoder {
             unloaded: None,
+            _decoder_interest: Arc::default(),
             validity: BooleanBuffer::new_set(offsets.len() - 1),
             num_rows: offsets.len() as u64 - 1,
             offsets: offsets.into(),
@@ -1462,6 +1492,52 @@ mod tests {
             data_type: DataType::List(items_field.clone()),
             items_field,
             offset_type: DataType::Int32,
+        }
+    }
+
+    #[derive(Debug)]
+    struct RowLimitItemDecoder {
+        num_rows: u64,
+        row_limit: u64,
+        data_type: DataType,
+    }
+
+    impl LogicalPageDecoder for RowLimitItemDecoder {
+        fn wait_for_loaded(
+            &mut self,
+            _loaded_need: u64,
+        ) -> futures::future::BoxFuture<'_, Result<()>> {
+            std::future::ready(Ok(())).boxed()
+        }
+
+        fn rows_loaded(&self) -> u64 {
+            self.num_rows
+        }
+
+        fn num_rows(&self) -> u64 {
+            self.num_rows
+        }
+
+        fn rows_drained(&self) -> u64 {
+            0
+        }
+
+        fn drain(&mut self, _num_rows: u64) -> Result<NextDecodeTask> {
+            Err(lance_core::Error::internal(
+                "row-limit item decoder is used only for planning".to_string(),
+            ))
+        }
+
+        fn max_rows_to_drain(&self, num_rows: u64, _byte_budget: u64) -> Result<DrainLimit> {
+            Ok(DrainLimit {
+                rows: num_rows,
+                bytes: 0,
+                dictionary_rows: Some(self.row_limit),
+            })
+        }
+
+        fn data_type(&self) -> &DataType {
+            &self.data_type
         }
     }
 
@@ -1501,5 +1577,30 @@ mod tests {
         let decoder = list_page_decoder(vec![0, i32::MAX as u64 + 1]);
         let limit = decoder.max_rows_to_drain(1, FULL_BUDGET).unwrap();
         assert_eq!(limit.rows, 0);
+    }
+
+    #[test]
+    fn test_list_page_translates_item_row_limit_to_parent_rows() {
+        let mut decoder = list_page_decoder(vec![0, 2, 5, 6]);
+        let item_fields =
+            arrow_schema::Fields::from(vec![Field::new("item", DataType::Int32, true)]);
+        let mut item_decoder = SimpleStructDecoder::new(item_fields, 6);
+        item_decoder
+            .accept_child(DecoderReady {
+                decoder: Box::new(RowLimitItemDecoder {
+                    num_rows: 6,
+                    row_limit: 5,
+                    data_type: DataType::Int32,
+                }),
+                path: std::collections::VecDeque::from([0]),
+            })
+            .unwrap();
+        decoder.item_decoder = Some(item_decoder);
+
+        let limit = decoder.max_rows_to_drain(3, FULL_BUDGET).unwrap();
+
+        assert_eq!(limit.rows, 3);
+        assert_eq!(limit.bytes, 6);
+        assert_eq!(limit.dictionary_rows, Some(2));
     }
 }

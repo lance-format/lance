@@ -39,10 +39,9 @@ use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
-/// Default-plugin registry, used only to load the standalone PK BTree by its
-/// `BTreeIndexDetails` type. Built once.
+/// Use the dataset registry when opening the standalone primary-key BTree.
 static PK_BTREE_REGISTRY: LazyLock<Arc<IndexPluginRegistry>> =
-    LazyLock::new(IndexPluginRegistry::with_default_plugins);
+    LazyLock::new(|| crate::index::scalar::SCALAR_INDEX_PLUGIN_REGISTRY.clone());
 
 /// One newer generation's PK membership, used to decide whether it shadows an
 /// older source's row.

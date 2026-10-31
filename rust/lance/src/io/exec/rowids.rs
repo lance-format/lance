@@ -8,8 +8,12 @@ use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array, cast::AsArray, type
 use arrow_schema::{Schema, SchemaRef};
 use datafusion::common::ColumnStatistics;
 use datafusion::common::stats::Precision;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::ChildStats;
+use datafusion::physical_plan::StatisticsArgs;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
@@ -259,6 +263,13 @@ impl ExecutionPlan for AddRowAddrExec {
         vec![false]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -288,11 +299,16 @@ impl ExecutionPlan for AddRowAddrExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn partition_statistics(
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
         &self,
-        partition: Option<usize>,
-    ) -> Result<Arc<datafusion::physical_plan::Statistics>> {
-        let mut stats = Arc::unwrap_or_clone(self.input.partition_statistics(partition)?);
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        let mut stats = Statistics::clone(&input_stats[0]);
 
         let row_id_col_stats = stats.column_statistics.get(self.rowid_pos).ok_or_else(|| {
             DataFusionError::Internal("RowAddrExec: rowid column stats not found".into())
@@ -526,8 +542,16 @@ impl ExecutionPlan for AddRowOffsetExec {
         vec![false]
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        let mut stats = Arc::unwrap_or_clone(self.input.partition_statistics(partition)?);
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        let mut stats = Statistics::clone(&input_stats[0]);
         stats
             .column_statistics
             .push(ColumnStatistics::new_unknown());
@@ -542,6 +566,13 @@ impl ExecutionPlan for AddRowOffsetExec {
 
     fn cardinality_effect(&self) -> CardinalityEffect {
         CardinalityEffect::Equal
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -593,6 +624,8 @@ impl ExecutionPlan for AddRowOffsetExec {
 mod test {
     use arrow_array::{Int32Array, RecordBatchIterator, record_batch};
     use arrow_schema::{DataType, Field};
+    use datafusion::physical_plan::StatisticsArgs;
+    use datafusion::physical_plan::StatisticsContext;
     use datafusion::{datasource::memory::MemorySourceConfig, prelude::SessionContext};
     use futures::TryStreamExt;
     use lance_core::{ROW_ADDR, ROW_ID_FIELD};
@@ -728,7 +761,9 @@ mod test {
         let memory_exec =
             MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], schema, None).unwrap();
         let exec = AddRowAddrExec::try_new(memory_exec, dataset.clone(), 0).unwrap();
-        let stats = exec.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&exec, &StatisticsArgs::new())
+            .unwrap();
         let result = apply_to_batch(batch, dataset).await.unwrap();
 
         assert_eq!(stats.num_rows, Precision::Exact(3));
@@ -767,9 +802,12 @@ mod test {
             )
             .unwrap()
         };
-        let input_stats = input.partition_statistics(partition).unwrap();
+        let args = StatisticsArgs::new().with_partition(partition);
+        let input_stats = StatisticsContext::new()
+            .compute(input.as_ref(), &args)
+            .unwrap();
         let exec = AddRowOffsetExec::internal_new(input.clone(), Arc::new(HashMap::new())).unwrap();
-        let stats = exec.partition_statistics(partition).unwrap();
+        let stats = StatisticsContext::new().compute(&exec, &args).unwrap();
 
         assert_eq!(stats.column_statistics.len(), exec.schema().fields().len());
         assert_eq!(stats.num_rows, input_stats.num_rows);
@@ -786,7 +824,12 @@ mod test {
         if !has_unknown_statistics {
             assert!(matches!(input_stats.total_byte_size, Precision::Exact(_)));
         }
-        assert_eq!(input.partition_statistics(partition).unwrap(), input_stats);
+        assert_eq!(
+            StatisticsContext::new()
+                .compute(input.as_ref(), &args)
+                .unwrap(),
+            input_stats
+        );
     }
 
     #[test]

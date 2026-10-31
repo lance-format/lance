@@ -97,14 +97,35 @@ def test_lance_schema_from_protos_rejects_missing_parent():
         LanceSchema._from_protos("{}", field_proto)
 
 
-def test_lance_schema_from_pyarrow_ignores_field_id_metadata():
+def test_lance_schema_from_pyarrow_keeps_field_id_metadata():
     arrow_schema = pa.schema(
-        [pa.field("x", pa.int32(), metadata={b"lance:field_id": b"42"})]
+        [
+            pa.field("x", pa.int32(), metadata={b"lance:field_id": b"42"}),
+            pa.field("y", pa.int32()),
+        ]
     )
 
     schema = LanceSchema.from_pyarrow(arrow_schema)
 
-    assert schema.fields()[0].id() == 0
+    assert [field.id() for field in schema.fields()] == [42, 43]
+
+
+def test_create_through_lance_schema_keeps_supplied_field_ids(tmp_path: Path):
+    def field(name, field_id):
+        return pa.field(
+            name, pa.int32(), metadata={b"lance:field_id": str(field_id).encode()}
+        )
+
+    schema = pa.schema([field("a", 1), field("b", 0)])
+    table = pa.table({"a": [10, 20], "b": [100, 200]}, schema=schema)
+    fragment = lance.fragment.LanceFragment.create(tmp_path, table)
+
+    operation = lance.LanceOperation.Overwrite(
+        LanceSchema.from_pyarrow(schema), [fragment]
+    )
+    dataset = lance.LanceDataset.commit(tmp_path, operation)
+
+    assert dataset.to_table().to_pydict() == {"a": [10, 20], "b": [100, 200]}
 
 
 def test_lance_schema_field_lookup(tmp_path: Path):

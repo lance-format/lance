@@ -64,13 +64,43 @@ impl std::fmt::Debug for ResolvedRemapping {
     }
 }
 
+/// Cache key for fragment reuse history with `index_version = 0` and the
+/// mappings decoded from it.
+///
+/// A writer can change the history without changing its UUID. Include the
+/// history contents and storage location in the key so we don't reuse an old
+/// mapping. Referenced files are immutable once published.
+pub(crate) fn v0_cache_identity(dataset: &Dataset, entry: &IndexMetadata) -> Uuid {
+    fn update_sized(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"lance.frag_reuse.v0_cache_identity");
+    hasher.update(entry.uuid.as_bytes());
+    if let Some(base_id) = entry.base_id {
+        hasher.update(&base_id.to_le_bytes());
+        if let Some(base) = dataset.manifest.base_paths.get(&base_id) {
+            hasher.update(&[u8::from(base.is_dataset_root)]);
+            update_sized(&mut hasher, base.path.as_bytes());
+        }
+    }
+    if let Some(details) = &entry.index_details {
+        update_sized(&mut hasher, details.type_url.as_bytes());
+        update_sized(&mut hasher, &details.value);
+    }
+    let mut identity = [0; 16];
+    identity.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    Uuid::from_bytes(identity)
+}
+
 /// The FRI identity that belongs in an index's cache namespace, if any.
 ///
 /// Only a v0 history is applied while the index is decoded (its remapper is
-/// handed to the plugin's load path), so only then does the FRI entry's UUID
-/// identify cached content. Under a tagged history the FRI UUID is
-/// deliberately left out: every rewrite and trim mints a new one, even for
-/// transitions a segment never touches, and the translated namespace from
+/// handed to the plugin's load path), so only then does the history, by its
+/// [`v0_cache_identity`], identify cached content. Under a tagged history the
+/// FRI is deliberately left out: every rewrite and trim mints a new UUID, even
+/// for transitions a segment never touches, and the translated namespace from
 /// [`scoped_index_cache`] already carries the segment's own translation
 /// identity.
 pub(crate) fn fri_cache_id(resolved: &Option<(Uuid, ResolvedRemapping)>) -> Option<&Uuid> {
@@ -353,6 +383,82 @@ async fn fri_query_plan(
         .await
 }
 
+/// Resolve the current fragment coverage for committed query segments.
+///
+/// Tagged histories derive coverage from [`FriQueryPlan`]; all other histories use the segment
+/// metadata resolved for the query listing. Query callers must not substitute provenance for
+/// derived coverage, and an unknown or unavailable plan is refused instead of treated as empty
+/// coverage.
+pub(crate) async fn resolve_query_segment_coverages(
+    dataset: &Dataset,
+    segments: &[&IndexMetadata],
+) -> lance_core::Result<Vec<RoaringBitmap>> {
+    let direct = |segment: &IndexMetadata| {
+        segment
+            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Index '{}' segment {} is missing fragment coverage",
+                    segment.name, segment.uuid
+                ))
+            })
+    };
+
+    let stored = super::load_all_indices(dataset).await?;
+    let Some(fri) = stored
+        .iter()
+        .find(|entry| entry.name == FRAG_REUSE_INDEX_NAME)
+    else {
+        return segments.iter().map(|segment| direct(segment)).collect();
+    };
+    if fri.index_version == 0 {
+        return segments.iter().map(|segment| direct(segment)).collect();
+    }
+    if fri.index_version != 1 {
+        return Err(Error::not_supported(format!(
+            "FRI index_version {} is unsupported. Please upgrade to a newer version",
+            fri.index_version
+        )));
+    }
+
+    let mapping = super::frag_reuse_reader::FragmentReuseIndex::open(dataset, fri).await?;
+    let plan = fri_query_plan(dataset, fri, &stored, &mapping).await?;
+    let stored_by_uuid: HashMap<Uuid, &IndexMetadata> =
+        stored.iter().map(|entry| (entry.uuid, entry)).collect();
+    segments
+        .iter()
+        .map(|segment| match plan.segments.get(&segment.uuid) {
+            Some(SegmentRemappingPlan::Identity) => {
+                let stored = stored_by_uuid.get(&segment.uuid).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "Index segment {} is not registered in the manifest",
+                        segment.uuid
+                    ))
+                })?;
+                direct(stored)
+            }
+            Some(SegmentRemappingPlan::Translate { coverage, .. }) => Ok(coverage.clone()),
+            Some(SegmentRemappingPlan::MissingCoverage(reason)) => {
+                Err(Error::not_supported(format!(
+                    "FRI query coverage is unavailable for segment {} ({reason})",
+                    segment.uuid
+                )))
+            }
+            None if stored_by_uuid.contains_key(&segment.uuid) => {
+                Err(Error::not_supported(format!(
+                    "FRI query coverage is unavailable for segment {} (the reader derives no \
+                     coverage for it)",
+                    segment.uuid
+                )))
+            }
+            None => Err(Error::invalid_input(format!(
+                "Index segment {} is not registered in the manifest",
+                segment.uuid
+            ))),
+        })
+        .collect()
+}
+
 /// Why the reader derives no coverage for the registered segment `index` on
 /// this snapshot, or `None` when it derives coverage (or identity) for it.
 /// Maintenance that rewrites a segment (remap) decides its eligibility from
@@ -473,7 +579,9 @@ pub(crate) async fn plan_staged_segments(
     Ok(Some(plans))
 }
 
-/// Resolve the FRI remapper shared by scalar and vector index loading.
+/// Resolve the FRI remapper shared by scalar and vector index loading, with
+/// its cache identity: [`v0_cache_identity`] for `index_version = 0`, or the
+/// entry UUID for tagged history.
 pub(super) async fn open_row_id_remapping(
     dataset: &Dataset,
     index: &IndexMetadata,
@@ -510,7 +618,7 @@ pub(super) async fn open_row_id_remapping_with_plan(
     if fri.index_version == 0 {
         return Ok(dataset.open_frag_reuse_index(metrics).await?.map(|legacy| {
             (
-                legacy.uuid,
+                v0_cache_identity(dataset, fri),
                 ResolvedRemapping::V0(Arc::new(CompactFragReuseIndexHandle(legacy))),
             )
         }));
@@ -810,6 +918,8 @@ pub(crate) async fn build_frag_reuse_index_metadata(
         base_id: None,
         // Fragment reuse index is inline (no files)
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     // Spares the commit's history check from reading the file back.
     if let Some(Content::External(file)) = &proto.content {
@@ -1312,6 +1422,8 @@ pub async fn frag_reuse_entry_appending(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     })
 }
 
@@ -1938,6 +2050,8 @@ pub(crate) async fn build_tagged_frag_reuse_entry(
         // The row-map files live in their own directories referenced from the
         // transitions, not under this entry's uuid.
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     })
 }
 
@@ -2311,6 +2425,8 @@ pub(crate) async fn relocate_tagged_entry_for_clone(
             // The relocated entry lives in the clone.
             base_id: None,
             files: entry.files.clone(),
+            clustering_id: None,
+            metadata: Default::default(),
         },
         spilled,
     ))
@@ -2333,6 +2449,7 @@ pub(crate) async fn collect_tagged_row_map_paths(
     dataset: &Dataset,
     entry: &IndexMetadata,
 ) -> lance_core::Result<Vec<(String, Path)>> {
+    use crate::dataset::FRAG_REUSE_DIR;
     use futures::TryStreamExt;
     use lance_index::frag_reuse::stable_partition::MAPPING_FILE;
     use lance_table::system_index::frag_reuse::ledger::Mapping;
@@ -2371,7 +2488,7 @@ pub(crate) async fn collect_tagged_row_map_paths(
         };
         let map_dir = base_root
             .clone()
-            .join("_fri")
+            .join(FRAG_REUSE_DIR)
             .join(reference.map_id.as_str());
         let mut mapping_size = None;
         let mut stream = dataset.object_store.read_dir_all(&map_dir, None);
@@ -2393,7 +2510,7 @@ pub(crate) async fn collect_tagged_row_map_paths(
                         mapping_size = Some(meta.size);
                     }
                     paths.push((
-                        format!("_fri/{}/{relative}", reference.map_id),
+                        format!("{FRAG_REUSE_DIR}/{}/{relative}", reference.map_id),
                         base_root.clone(),
                     ));
                 }
@@ -2502,6 +2619,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -3363,6 +3482,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let error = dataset
             .apply_commit(
@@ -3799,6 +3920,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let error = crate::dataset::write::CommitBuilder::new(Arc::new(dataset))
             .with_detached(true)
