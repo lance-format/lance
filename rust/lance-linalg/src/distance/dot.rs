@@ -1203,8 +1203,34 @@ mod tests {
                 candidate.name(),
                 x.len()
             );
+            // The C candidates' safe wrappers clamp the length to the shorter
+            // slice, so extra elements on either side must not change the
+            // result. The scalar candidate is the one without features.
+            if candidate.features().is_empty() {
+                continue;
+            }
+            for (x, y) in [(x, &[y, x].concat()[..]), (&[x, y].concat()[..], y)] {
+                let clamped = kernel.call(x, y);
+                prop_assert!(
+                    clamped.to_bits() == got.to_bits(),
+                    "{} at lengths {} and {}: {clamped} != {got}",
+                    candidate.name(),
+                    x.len(),
+                    y.len()
+                );
+            }
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_dot_half_kernels_short_lengths() {
+        run_vector_pair_proptest(arbitrary_f16, 0..4, |x, y| {
+            check_half_dot_kernels(&DOT_F16, &x, &y)
+        });
+        run_vector_pair_proptest(arbitrary_bf16, 0..4, |x, y| {
+            check_half_dot_kernels(&DOT_BF16, &x, &y)
+        });
     }
 
     #[rstest::rstest]

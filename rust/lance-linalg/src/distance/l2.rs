@@ -1522,7 +1522,7 @@ mod tests {
 
     /// Every host-supported half-precision kernel must agree with an f64
     /// reference.
-    fn check_half_l2_kernels<T: ToPrimitive>(
+    fn check_half_l2_kernels<T: ToPrimitive + Copy>(
         dispatch: &Dispatch<PairKernel<T>>,
         x: &[T],
         y: &[T],
@@ -1541,6 +1541,22 @@ mod tests {
                 candidate.name(),
                 x.len()
             );
+            // The C candidates' safe wrappers clamp the length to the shorter
+            // slice, so extra elements on either side must not change the
+            // result. The scalar candidate is the one without features.
+            if candidate.features().is_empty() {
+                continue;
+            }
+            for (x, y) in [(x, &[y, x].concat()[..]), (&[x, y].concat()[..], y)] {
+                let clamped = kernel.call(x, y);
+                prop_assert!(
+                    clamped.to_bits() == got.to_bits(),
+                    "{} at lengths {} and {}: {clamped} != {got}",
+                    candidate.name(),
+                    x.len(),
+                    y.len()
+                );
+            }
         }
         Ok(())
     }
@@ -1573,6 +1589,34 @@ mod tests {
             }
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_l2_half_kernels_short_lengths() {
+        run_vector_pair_proptest(arbitrary_f16, 0..4, |x, y| {
+            check_half_l2_kernels(&L2_F16, &x, &y)
+        });
+        run_vector_pair_proptest(arbitrary_bf16, 0..4, |x, y| {
+            check_half_l2_kernels(&L2_BF16, &x, &y)
+        });
+    }
+
+    /// With `fp16kernels` on a target build.rs supports, the C kernels must
+    /// be candidates; otherwise every candidate test passes on scalar alone.
+    #[cfg(all(
+        feature = "fp16kernels",
+        not(target_os = "windows"),
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "loongarch64"
+        )
+    ))]
+    #[test]
+    fn test_half_c_kernels_are_candidates() {
+        assert!(L2_F16.candidates().len() > 1);
+        assert!(L2_F16_BATCH.candidates().len() > 1);
+        assert!(L2_BF16.candidates().len() > 1);
     }
 
     #[test]
