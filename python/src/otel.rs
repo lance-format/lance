@@ -258,6 +258,9 @@ fn register_bounds() {
     for (name, values) in lance_io::object_store::metrics::histogram_bounds() {
         bounds.insert((*name).to_string(), Arc::from(*values));
     }
+    for (name, values) in lance_core::memory::histogram_bounds() {
+        bounds.insert((*name).to_string(), Arc::from(*values));
+    }
 }
 
 /// Describe every metric-emitting subsystem so the catalog is populated. Must
@@ -265,6 +268,7 @@ fn register_bounds() {
 /// `describe_metrics()` here.
 fn describe_all() {
     lance_io::object_store::metrics::describe_metrics();
+    lance_core::memory::describe_metrics();
 }
 
 enum MetricValue {
@@ -419,7 +423,10 @@ pub fn snapshot_lance_metrics(py: Python<'_>) -> Vec<PyMetricPoint> {
     let Some(registry) = REGISTRY.get() else {
         return Vec::new();
     };
-    let points = py.detach(|| collect_points(registry));
+    let points = py.detach(|| {
+        lance_core::memory::refresh_metrics();
+        collect_points(registry)
+    });
     points.into_iter().map(PyMetricPoint::from).collect()
 }
 
@@ -617,7 +624,8 @@ mod tests {
     }
 
     #[test]
-    fn describe_all_covers_object_store_metrics() {
+    fn describe_all_covers_emitted_metrics() {
+        use lance_core::memory;
         use lance_io::object_store::metrics as os;
 
         let registry = Arc::new(Registry::new(LanceStorage));
@@ -636,5 +644,31 @@ mod tests {
         assert!(matches!(kind(os::METRIC_RETRYABLE), MetricKind::Counter));
         assert!(matches!(kind(os::METRIC_IN_FLIGHT), MetricKind::Gauge));
         assert!(matches!(kind(os::METRIC_DURATION), MetricKind::Histogram));
+        for gauge in [
+            memory::METRIC_RSS,
+            memory::METRIC_RSS_PEAK,
+            memory::METRIC_CGROUP,
+            memory::METRIC_CGROUP_LIMIT,
+        ] {
+            assert!(matches!(kind(gauge), MetricKind::Gauge), "{gauge}");
+        }
+        assert!(matches!(
+            kind(memory::METRIC_STAGE_PEAK),
+            MetricKind::Histogram
+        ));
+        assert!(matches!(
+            kind(memory::METRIC_OPERATION_PEAK),
+            MetricKind::Histogram
+        ));
+    }
+
+    #[test]
+    fn register_bounds_covers_memory_peaks() {
+        use lance_core::memory;
+
+        register_bounds();
+        for name in [memory::METRIC_STAGE_PEAK, memory::METRIC_OPERATION_PEAK] {
+            assert_eq!(&*bounds_for(name), memory::PEAK_BOUNDS, "{name}");
+        }
     }
 }

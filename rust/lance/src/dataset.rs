@@ -136,6 +136,7 @@ use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuil
 use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
+use crate::index::memory_progress::{ObservedBuild, ObservedOperation};
 use crate::io::commit::{
     commit_detached_transaction, commit_new_dataset, commit_transaction,
     default_commit_retry_timeout, detect_overlapping_fragments, fix_schema,
@@ -150,6 +151,7 @@ pub use blob::{
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
 use lance_core::box_error;
+use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::{
@@ -4198,14 +4200,20 @@ impl Dataset {
         let index_dir = self.indices_dir().join(index_uuid.to_string());
         match index_type {
             IndexType::Inverted => {
-                // Call merge_index_files function for inverted index
+                let observed = ObservedBuild::start(
+                    progress,
+                    ObservedOperation::MergeIndexMetadata,
+                    || BuiltinIndexType::Inverted.as_str().to_string(),
+                )?;
                 lance_index::scalar::inverted::builder::merge_index_files(
                     self.object_store.as_ref(),
                     &index_dir,
                     Arc::new(store),
-                    progress,
+                    observed.progress(),
                 )
-                .await
+                .await?;
+                observed.finish();
+                Ok(())
             }
             IndexType::BTree => {
                 Err(Error::invalid_input(
