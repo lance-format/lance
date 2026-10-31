@@ -3998,8 +3998,11 @@ class LanceDataset(pa.dataset.Dataset):
             This is for the ``INVERTED`` index. The language for stemming
             and stop words. This is only used when `stem` or `remove_stop_words` is true
         max_token_length: Optional[int], default 40
-            This is for the ``INVERTED`` index. The maximum token length.
-            Any token longer than this will be removed.
+            This is for the ``INVERTED`` index. The exclusive token length limit
+            in UTF-8 bytes, not characters. Tokens of this length or longer are
+            removed. For example, the default removes both 40 ASCII characters
+            and 20 repetitions of ``é`` (40 UTF-8 bytes). Set to ``None`` to
+            disable the limit.
         lower_case: bool, default True
             This is for the ``INVERTED`` index. If True, the index will convert all
             text to lowercase.
