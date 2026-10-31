@@ -246,6 +246,95 @@ async fn test_geo_rtree_index() {
 }
 
 #[rstest]
+#[case::without_crs(None, false)]
+#[case::crs_at_build(Some(r#"{"crs":"OGC:CRS84"}"#), true)]
+#[case::crs_added_before_refresh(Some(r#"{"crs":"OGC:CRS84"}"#), false)]
+#[tokio::test]
+async fn test_rtree_crs(#[case] crs_metadata: Option<&str>, #[case] has_crs_at_build: bool) {
+    let point_type = PointType::new(Dimension::XY, Default::default());
+    let mut points = PointBuilder::new(point_type.clone());
+    for x in [Some(1.0), None, Some(10.0), None, Some(2.0), None] {
+        points.push_point(x.map(|x| geo_types::point!(x: x, y: x)).as_ref());
+    }
+    let mut point_field = point_type.to_field("point", true);
+    if has_crs_at_build {
+        point_field.metadata_mut().insert(
+            "ARROW:extension:metadata".to_string(),
+            crs_metadata.unwrap().to_string(),
+        );
+    }
+    let batch = record_batch!(("id", Int32, [0, 1, 2, 3, 4, 5]))
+        .unwrap()
+        .try_with_column(point_field, points.finish().to_array_ref())
+        .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.slice(0, 4))], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    dataset
+        .create_index(
+            &["point"],
+            IndexType::RTree,
+            Some("point_idx".to_string()),
+            &ScalarIndexParams::new("RTree".to_string()),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(batch.slice(4, 2))], batch.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+    if let Some(metadata) = crs_metadata {
+        dataset
+            .update_field_metadata()
+            .update("point", [("ARROW:extension:metadata", metadata)])
+            .unwrap()
+            .await
+            .unwrap();
+    }
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(1))
+        .await
+        .unwrap();
+    let stats: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics("point_idx").await.unwrap()).unwrap();
+    assert_eq!(stats["num_unindexed_rows"], 0);
+    if let Some(metadata) = crs_metadata {
+        assert_eq!(
+            dataset.schema().field("point").unwrap().metadata["ARROW:extension:metadata"],
+            metadata
+        );
+    }
+    for (predicate, expected) in [
+        (
+            "ST_Intersects(point, ST_GeomFromText('POLYGON ((0 0, 3 0, 3 3, 0 3, 0 0))'))",
+            vec![0, 4],
+        ),
+        ("point IS NULL", vec![1, 3, 5]),
+    ] {
+        let mut scan = dataset.scan();
+        scan.project(&["id"]).unwrap().filter(predicate).unwrap();
+        assert_contains!(scan.explain_plan(false).await.unwrap(), "ScalarIndexQuery");
+        let result = scan.try_into_batch().await.unwrap();
+        let mut ids = result["id"].as_primitive::<Int32Type>().values().to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, expected, "predicate: {predicate}");
+    }
+}
+
+#[rstest]
 #[case::stale_unspecified(false, None)]
 #[case::latest_unspecified(true, None)]
 #[case::stale_rewrite_columns(false, Some(UpdateMode::RewriteColumns))]

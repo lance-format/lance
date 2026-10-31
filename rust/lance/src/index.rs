@@ -4382,6 +4382,18 @@ impl Dataset {
         let tailing_bytes = read_last_block(reader.as_ref()).await?;
         let (major_version, minor_version) = read_version(&tailing_bytes)?;
 
+        // Legacy vector indexes are cached whole and can outlive the files they
+        // were opened from: cleanup unlinks old index files while the cache still
+        // holds an entry for them. Anything stored in the cached index must
+        // therefore reopen the file per read instead of pinning a descriptor.
+        let lazy_reader = vector::open_cache_reader(
+            object_store.clone(),
+            &index_file,
+            INDEX_FILE_NAME,
+            &file_sizes,
+        )
+        .await?;
+
         // Namespace the index cache by the UUID of the index. v2+ partition
         // entries are store-free and remain reusable across object-store
         // generations alongside their serializable state.
@@ -4411,7 +4423,7 @@ impl Dataset {
                             dataset,
                             uuid,
                             vector_index,
-                            reader,
+                            lazy_reader,
                             frag_reuse_index,
                         )
                         .await?;
@@ -4426,7 +4438,7 @@ impl Dataset {
             (0, 2) => {
                 info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
                 let reader = V1FileReader::try_new_self_described_from_reader(
-                    reader.clone(),
+                    lazy_reader,
                     Some(&self.metadata_cache.file_metadata_cache(&index_file)),
                 )
                 .await?;

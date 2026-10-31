@@ -1074,7 +1074,13 @@ def test_take_system_columns_values(tmp_path: Path, column_name: str):
     table = pa.table({"a": range(100), "b": range(100, 200)})
     base_dir = tmp_path / "test_take_system_columns_values"
     # Use max_rows_per_file to create multiple fragments
-    lance.write_dataset(table, base_dir, max_rows_per_file=25)
+    lance.write_dataset(
+        table,
+        base_dir,
+        max_rows_per_file=25,
+        enable_stable_row_ids=column_name
+        in ("_row_created_at_version", "_row_last_updated_at_version"),
+    )
     dataset = lance.dataset(base_dir)
 
     indices = [0, 5, 10, 50, 99]
@@ -1114,7 +1120,7 @@ def test_take_system_columns_column_ordering(tmp_path: Path):
     """Test that column ordering is preserved when using system columns."""
     table = pa.table({"a": range(50), "b": range(50, 100)})
     base_dir = tmp_path / "test_take_column_ordering"
-    lance.write_dataset(table, base_dir)
+    lance.write_dataset(table, base_dir, enable_stable_row_ids=True)
     dataset = lance.dataset(base_dir)
 
     indices = [0, 1, 2]

@@ -4172,7 +4172,9 @@ impl Dataset {
     ///
     /// Returns: a new version of dataset.
     ///
-    /// It performs a left-join on the two datasets.
+    /// It performs a left-join on the two datasets. The right-side join column must
+    /// contain unique keys, including at most one null. Duplicate right-side keys
+    /// return an input error before the dataset is modified.
     pub async fn merge(
         &mut self,
         stream: impl RecordBatchReader + Send + 'static,

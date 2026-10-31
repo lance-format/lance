@@ -27,7 +27,7 @@ use futures::future::BoxFuture;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, stream};
 use geoarrow_array::array::{RectArray, from_arrow_array};
 use geoarrow_array::builder::RectBuilder;
-use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor, IntoArrow};
+use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
 use geoarrow_schema::{Dimension, RectType};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{
@@ -958,7 +958,9 @@ impl RTreeIndexPlugin {
                 let bbox_array = extract_bounding_boxes(geometry_array, geometry_field)?;
 
                 let bbox_schema = Arc::new(ArrowSchema::new(vec![
-                    bbox_array.extension_type().clone().to_field("bbox", true),
+                    // Index bounds use a fixed schema; CRS metadata stays on the
+                    // dataset's geometry field.
+                    BBOX_FIELD.as_ref().clone().with_nullable(true),
                     ArrowField::new(ROW_ID, DataType::UInt64, false),
                 ]));
                 RecordBatch::try_new(

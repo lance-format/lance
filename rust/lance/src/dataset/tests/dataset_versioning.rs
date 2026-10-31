@@ -11,9 +11,9 @@ use std::time::Duration;
 use std::vec;
 
 use crate::Dataset;
-use crate::dataset::UpdateBuilder;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction};
+use crate::dataset::{AutoCleanupParams, UpdateBuilder};
 use crate::datatypes::Schema;
 use crate::io::commit::load_and_sort_new_transactions;
 use lance_table::io::commit::ManifestNamingScheme;
@@ -836,6 +836,51 @@ async fn test_concurrent_tag_creation_conflict() {
         dataset.tags().get_version("race").await.unwrap(),
         successful_version.unwrap()
     );
+}
+
+/// A tag on an old version must not stop auto cleanup: the tagged version stays
+/// and the untagged ones are still removed.
+#[tokio::test]
+async fn test_auto_cleanup_keeps_tagged_versions() {
+    let test_uri = TempStrDir::default();
+    let mut tagged_batch = None;
+    for version in 1..=4u32 {
+        // The mock clock does not advance on its own, and with `older_than` zero a
+        // version is old only if it was committed before the current time.
+        MockClock::set_system_time(Duration::from_secs(version.into()));
+        let batch = u32_batch(version * 10..version * 10 + 10);
+        let params = if version == 1 {
+            WriteParams {
+                auto_cleanup: Some(AutoCleanupParams {
+                    interval: 1,
+                    older_than: chrono::TimeDelta::zero(),
+                }),
+                ..Default::default()
+            }
+        } else {
+            WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }
+        };
+        let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+        let dataset = Dataset::write(reader, test_uri.as_str(), Some(params))
+            .await
+            .unwrap();
+        if version == 1 {
+            dataset.tags().create("keep", 1).await.unwrap();
+            tagged_batch = Some(dataset.scan().try_into_batch().await.unwrap());
+        }
+    }
+
+    // A commit cleans up from the version before it, so that version stays.
+    let dataset = Dataset::open(test_uri.as_str()).await.unwrap();
+    let versions = dataset.versions().await.unwrap();
+    let versions: Vec<u64> = versions.iter().map(|v| v.version).collect();
+    assert_eq!(versions, [1, 3, 4]);
+    let tagged = dataset.checkout_version("keep").await.unwrap();
+    let batch = tagged.scan().try_into_batch().await.unwrap();
+    assert_eq!(Some(batch), tagged_batch);
 }
 
 #[rstest]
