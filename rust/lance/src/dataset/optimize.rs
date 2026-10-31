@@ -19500,6 +19500,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(4),
             base_id: None,
+            inline: None,
         });
         let normalized = normalize_source_fragments(&dataset, &[fragment])
             .await

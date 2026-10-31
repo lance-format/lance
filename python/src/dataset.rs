@@ -3704,6 +3704,15 @@ impl Dataset {
         Ok(result)
     }
 
+    fn inline_deletions(&mut self) -> PyResult<usize> {
+        let mut new_self = self.ds.as_ref().clone();
+        let changed = rt()
+            .block_on(None, new_self.inline_deletions())?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(changed)
+    }
+
     #[pyo3(signature = (values, *, replace = false))]
     fn update_config(
         &mut self,

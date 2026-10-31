@@ -4146,6 +4146,7 @@ impl MergeInsertJob {
                 written_fragments.push(written);
             }
             if let Some(deletion_file) = &updated.deletion_file
+                && !deletion_file.is_inline()
                 && original
                     .is_none_or(|original| original.deletion_file.as_ref() != Some(deletion_file))
             {

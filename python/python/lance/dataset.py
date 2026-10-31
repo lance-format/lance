@@ -8324,6 +8324,46 @@ class DatasetOptimizer:
         }
         return Compaction.execute(self._dataset, opts)
 
+    def inline_deletions(self) -> int:
+        """Move small deletion vectors from ``_deletions/`` files into the manifest.
+
+        A reader fetches every deletion file it needs with one request each, so
+        on a table where most fragments carry a few deleted rows the first
+        ``take`` of a process costs one request per fragment. Deletion vectors
+        stored in the manifest arrive with it instead.
+
+        The budget comes from the table config key
+        ``lance.deletions.inline_max_bytes``: a deletion vector whose bitmap
+        encoding is at most that many bytes is stored inline, both by this
+        call and by later deletes. Set it with :meth:`LanceDataset.update_config`
+        first. Readers must support the ``FLAG_INLINE_DELETIONS`` feature flag
+        once a fragment stores its deletions inline, and the move is one way:
+        setting the budget back to ``0`` stops new inline writes but leaves the
+        moved vectors in the manifest, so upgrade every reader of the table
+        before calling this.
+
+        Returns
+        -------
+        int
+            The number of fragments whose deletion vector moved into the
+            manifest. Nothing is committed when it is zero.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> ds = lance.write_dataset(pa.table({"a": range(100)}), "memory://inline")
+        >>> ds.delete("a < 10")
+        {'num_deleted_rows': 10}
+        >>> ds.update_config({"lance.deletions.inline_max_bytes": "65536"})
+        {'lance.deletions.inline_max_bytes': '65536'}
+        >>> ds.optimize.inline_deletions()
+        1
+        >>> ds.count_rows()
+        90
+        """
+        return self._dataset._ds.inline_deletions()
+
     def optimize_indices(self, **kwargs) -> None:
         """Optimizes index performance.
 

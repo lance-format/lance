@@ -4361,6 +4361,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(1),
             base_id: None,
+            inline: None,
         };
         updated2.deletion_file = Some(deletion_file.clone());
 
@@ -6979,6 +6980,7 @@ mod tests {
                     file_type: DeletionFileType::Array,
                     num_deleted_rows: Some(1),
                     base_id: None,
+                    inline: None,
                 });
                 Operation::Delete {
                     updated_fragments: vec![deleted],

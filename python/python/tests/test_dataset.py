@@ -5821,6 +5821,46 @@ def test_default_scan_options(tmp_path: Path):
     assert dataset.schema.names == ["a", "b", "_rowaddr"]
 
 
+def test_inline_deletions(tmp_path: Path):
+    import json
+
+    ds = lance.write_dataset(pa.table({"a": range(40)}), tmp_path, max_rows_per_file=10)
+    ds.delete("a in (3, 17, 18, 39)")
+    deletion_files = [f.metadata.deletion_file for f in ds.get_fragments()]
+    assert sum(f is not None for f in deletion_files) == 3
+    assert all(f is None or f.inline is None for f in deletion_files)
+
+    with pytest.raises(OSError, match="lance.deletions.inline_max_bytes"):
+        ds.optimize.inline_deletions()
+    ds.update_config({"lance.deletions.inline_max_bytes": "4096"})
+    assert ds.optimize.inline_deletions() == 3
+    assert ds.optimize.inline_deletions() == 0
+
+    reopened = lance.dataset(tmp_path)
+    assert reopened.count_rows() == 36
+    assert sorted(reopened.to_table()["a"].to_pylist()) == [
+        v for v in range(40) if v not in (3, 17, 18, 39)
+    ]
+    for fragment in reopened.get_fragments():
+        deletion_file = fragment.metadata.deletion_file
+        if deletion_file is not None:
+            assert deletion_file.inline is not None
+            assert deletion_file.file_type == "bitmap"
+            assert deletion_file.path(fragment.fragment_id) is None
+            assert fragment.deletion_file() is None
+            assert "_deletions/" not in repr(fragment)
+            # Round-tripping the metadata through JSON keeps the vector.
+            round_trip = lance.fragment.FragmentMetadata.from_json(
+                json.dumps(fragment.metadata.to_json())
+            )
+            assert round_trip.deletion_file.inline == deletion_file.inline
+
+    # Later deletes stay inline as well.
+    reopened.delete("a = 0")
+    assert reopened.get_fragments()[0].metadata.deletion_file.inline is not None
+    assert reopened.count_rows() == 35
+
+
 def test_scan_with_row_ids(tmp_path: Path):
     """Test expose physical row ids in the scanner."""
     data = pa.table({"a": range(1000)})

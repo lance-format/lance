@@ -1314,6 +1314,7 @@ impl<'a> CleanupTask<'a> {
             let delpath = fragment
                 .deletion_file
                 .as_ref()
+                .filter(|delfile| !delfile.is_inline())
                 .map(|delfile| deletion_file_path(&self.dataset.base, fragment.id, delfile));
             if let Some(delpath) = delpath {
                 let relative_path = remove_prefix(&delpath, &self.dataset.base);
@@ -2428,7 +2429,10 @@ impl<'a> CleanupTask<'a> {
                     is_referenced = true;
                 }
             }
-            if let Some(del_file) = fragment.deletion_file.as_ref()
+            if let Some(del_file) = fragment
+                .deletion_file
+                .as_ref()
+                .filter(|file| !file.is_inline())
                 && parent_base_ids.contains(&del_file.base_id)
             {
                 let deletion_path = deletion_file_path(&self.dataset.base, fragment.id, del_file);
@@ -5882,6 +5886,94 @@ mod tests {
                 .data_paths
                 .contains(&overlay_path),
             "the inherited overlay must be promoted into the parent's keep set"
+        );
+    }
+
+    #[tokio::test]
+    async fn lineage_retention_skips_inline_deletion_paths() {
+        use lance_table::format::{DeletionFile, DeletionFileType};
+        use lance_table::transaction::{Operation, Transaction};
+        use roaring::RoaringBitmap;
+
+        MockClock::set_system_time(Duration::ZERO);
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+
+        let mut dataset = fixture.open().await.unwrap();
+        let mut fragments = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.metadata().clone())
+            .collect::<Vec<_>>();
+        let mut encoded = Vec::new();
+        RoaringBitmap::from_iter([0_u32])
+            .serialize_into(&mut encoded)
+            .unwrap();
+        fragments[0].deletion_file = Some(DeletionFile {
+            read_version: dataset.manifest.version,
+            id: 7,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            inline: Some(encoded.into()),
+        });
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::Delete {
+                updated_fragments: fragments,
+                deleted_fragment_ids: vec![],
+                predicate: "inline deletion".to_string(),
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        let branch = fixture
+            .create_branch_and_load(&mut dataset, "child", (None, None))
+            .await
+            .unwrap();
+        let inherited = branch
+            .manifest
+            .fragments
+            .iter()
+            .find_map(|fragment| fragment.deletion_file.as_ref())
+            .expect("branch should inherit the inline deletion");
+        assert!(inherited.is_inline());
+        assert!(
+            inherited.base_id.is_some(),
+            "the branch should resolve the inherited metadata through base_id"
+        );
+
+        dataset.update_config([("after", "branch")]).await.unwrap();
+        MockClock::advance_system_time(Duration::from_secs(1));
+        let operation = dataset.cleanup(
+            CleanupPolicyBuilder::default()
+                .before_timestamp(utc_now())
+                .build(),
+        );
+        let task = CleanupTask::new(&operation, CleanupAction::Execute).unwrap();
+        let referenced_branches = task.find_referenced_branches().await.unwrap();
+        assert!(referenced_branches.iter().any(|(name, _)| name == "child"));
+        let inspection = task
+            .retain_branch_lineage_files(
+                CleanupInspection::default(),
+                &referenced_branches,
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !inspection.referenced_files.data_paths.is_empty(),
+            "the inherited data files should remain referenced"
+        );
+        assert!(
+            inspection.referenced_files.delete_paths.is_empty(),
+            "an inline deletion must not create a referenced _deletions path: {:?}",
+            inspection.referenced_files.delete_paths
         );
     }
 
