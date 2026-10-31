@@ -1591,36 +1591,45 @@ pub extern "system" fn Java_org_lance_Dataset_nativeOptimizeIndices(
     );
 }
 
-fn inner_optimize_indices(
+/// `OptimizeOptions` from its Java counterpart; the defaults for `null`.
+pub(crate) fn optimize_options_from_java(
     env: &mut JNIEnv,
-    java_dataset: JObject,
-    java_options: JObject, // OptimizeOptions
-) -> Result<()> {
+    java_options: &JObject, // OptimizeOptions
+) -> Result<OptimizeOptions> {
     let mut options = OptimizeOptions::default();
 
     if !java_options.is_null() {
         options.num_indices_to_merge =
-            env.get_optional_usize_from_method(&java_options, "getNumIndicesToMerge")?;
+            env.get_optional_usize_from_method(java_options, "getNumIndicesToMerge")?;
 
         // getIndexNames(): Optional<List<String>>
         let index_names_obj = env
-            .call_method(
-                &java_options,
-                "getIndexNames",
-                "()Ljava/util/Optional;",
-                &[],
-            )?
+            .call_method(java_options, "getIndexNames", "()Ljava/util/Optional;", &[])?
             .l()?;
         let index_names = env.get_strings_opt(&index_names_obj)?;
         options.index_names = index_names;
 
         // isRetrain(): boolean
         let retrain = env
-            .call_method(&java_options, "isRetrain", "()Z", &[])?
+            .call_method(java_options, "isRetrain", "()Z", &[])?
             .z()?;
         options.retrain = retrain;
+
+        options.max_rows_per_task =
+            env.get_optional_u64_from_method(java_options, "getMaxRowsPerTask")?;
+        options.max_rows_per_segment =
+            env.get_optional_u64_from_method(java_options, "getMaxRowsPerSegment")?;
     }
 
+    Ok(options)
+}
+
+fn inner_optimize_indices(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    java_options: JObject, // OptimizeOptions
+) -> Result<()> {
+    let options = optimize_options_from_java(env, &java_options)?;
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
     block_on(dataset_guard.inner.optimize_indices(&options))?;

@@ -29,12 +29,20 @@ public class OptimizeOptions {
   private final Optional<Integer> numIndicesToMerge;
   private final Optional<List<String>> indexNames;
   private final boolean retrain;
+  private final Optional<Long> maxRowsPerTask;
+  private final Optional<Long> maxRowsPerSegment;
 
   private OptimizeOptions(
-      Optional<Integer> numIndicesToMerge, Optional<List<String>> indexNames, boolean retrain) {
+      Optional<Integer> numIndicesToMerge,
+      Optional<List<String>> indexNames,
+      boolean retrain,
+      Optional<Long> maxRowsPerTask,
+      Optional<Long> maxRowsPerSegment) {
     this.numIndicesToMerge = numIndicesToMerge;
     this.indexNames = indexNames;
     this.retrain = retrain;
+    this.maxRowsPerTask = maxRowsPerTask;
+    this.maxRowsPerSegment = maxRowsPerSegment;
   }
 
   /** Number of indices to merge per index name. */
@@ -55,6 +63,30 @@ public class OptimizeOptions {
     return retrain;
   }
 
+  /**
+   * Upper bound on the rows one build task covers. Default: unbounded.
+   *
+   * <p>Unindexed fragments are packed into tasks of at most this many rows, and of at most {@link
+   * #getMaxRowsPerSegment()}, since a task's output is never split (nor is a fragment); with
+   * neither set each index is one task. Setting either bound splits the build of every index that
+   * can merge segments, in {@link org.lance.Dataset#optimizeIndices(OptimizeOptions)} as in the
+   * distributed plan; see {@link org.lance.index.optimize.OptimizeIndices} for how that differs.
+   */
+  public Optional<Long> getMaxRowsPerTask() {
+    return maxRowsPerTask;
+  }
+
+  /**
+   * Upper bound on the rows one committed segment holds. Default: unbounded.
+   *
+   * <p>Existing segments and new tasks are packed into output segments of at most this many rows;
+   * unset merges everything into one segment. See {@link #getMaxRowsPerTask()} for what setting it
+   * changes.
+   */
+  public Optional<Long> getMaxRowsPerSegment() {
+    return maxRowsPerSegment;
+  }
+
   /** Create a new builder for {@link OptimizeOptions}. */
   public static Builder builder() {
     return new Builder();
@@ -65,6 +97,8 @@ public class OptimizeOptions {
     private Optional<Integer> numIndicesToMerge = Optional.empty();
     private Optional<List<String>> indexNames = Optional.empty();
     private boolean retrain = false;
+    private Optional<Long> maxRowsPerTask = Optional.empty();
+    private Optional<Long> maxRowsPerSegment = Optional.empty();
 
     private Builder() {}
 
@@ -98,8 +132,30 @@ public class OptimizeOptions {
       return this;
     }
 
+    /**
+     * Bound the rows one build task covers; see {@link OptimizeOptions#getMaxRowsPerTask()}.
+     *
+     * @param maxRowsPerTask upper bound on the rows one task indexes
+     */
+    public Builder maxRowsPerTask(long maxRowsPerTask) {
+      this.maxRowsPerTask = Optional.of(maxRowsPerTask);
+      return this;
+    }
+
+    /**
+     * Bound the rows one committed segment holds; see {@link
+     * OptimizeOptions#getMaxRowsPerSegment()}.
+     *
+     * @param maxRowsPerSegment upper bound on the rows one segment holds
+     */
+    public Builder maxRowsPerSegment(long maxRowsPerSegment) {
+      this.maxRowsPerSegment = Optional.of(maxRowsPerSegment);
+      return this;
+    }
+
     public OptimizeOptions build() {
-      return new OptimizeOptions(numIndicesToMerge, indexNames, retrain);
+      return new OptimizeOptions(
+          numIndicesToMerge, indexNames, retrain, maxRowsPerTask, maxRowsPerSegment);
     }
   }
 }
