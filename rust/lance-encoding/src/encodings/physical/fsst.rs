@@ -213,6 +213,10 @@ impl FsstPerValueDecompressor {
 }
 
 impl VariablePerValueDecompressor for FsstPerValueDecompressor {
+    fn allocates_output(&self) -> bool {
+        true
+    }
+
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
         // Step 1. Run inner decompressor
         let compressed_variable_data = self

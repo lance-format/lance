@@ -930,8 +930,6 @@ impl VariableFullZipDecoder {
         }
 
         let sliced_data = data.slice_with_length(data_start, data_end - data_start);
-        // Copy into a compact buffer so each output batch owns only what it references.
-        let sliced_data = LanceBuffer::copy_slice(&sliced_data);
         let rebased_offsets = LanceBuffer::reinterpret_vec(rebased_offsets);
         Ok((sliced_data, rebased_offsets))
     }
@@ -1130,6 +1128,13 @@ impl StructuralPageDecoder for VariableFullZipDecoder {
         // Keep each batch's variable data buffer bounded to the selected rows.
         let (data, offsets) =
             Self::slice_batch_data_and_rebase_offsets(&self.data, &offsets, self.bits_per_offset)?;
+        // Copy into a compact buffer so each output batch owns only what it references,
+        // unless the decompressor writes its output to new buffers anyway.
+        let data = if self.decompressor.allocates_output() {
+            data
+        } else {
+            LanceBuffer::copy_slice(&data)
+        };
 
         let repdef_start = self.repdef_starts[start];
         let repdef_end = self.repdef_starts[end];
