@@ -51,6 +51,7 @@ pub struct LowerBoundTerms {
 }
 
 /// Classify rows using the stored additive factors without rescaling them.
+#[deprecated(note = "use `ScaledPruneMaskFn` with `scaled_prune_mask_kernel`")]
 pub type PruneMaskFn = fn(
     &[f32; PRUNE_LANES],
     &[f32; PRUNE_LANES],
@@ -61,7 +62,11 @@ pub type PruneMaskFn = fn(
     Option<f32>,
 ) -> (u16, u16);
 
-/// Resolve the unscaled prune-mask kernel, preserving the public kernel API.
+/// Resolve the unscaled prune-mask kernel as a safe function pointer.
+#[deprecated(
+    note = "use `scaled_prune_mask_kernel` with `add_factor_scale: 1.0, add_factor_offset: 0.0`"
+)]
+#[allow(deprecated)]
 pub fn prune_mask_kernel() -> PruneMaskFn {
     |dists, scales, adds, errors, terms, upper, heap| {
         scaled_prune_mask_kernel().call(
@@ -85,7 +90,7 @@ pub fn prune_mask_kernel() -> PruneMaskFn {
 /// Per-query constants of the lower-bound formula, mirroring
 /// `RabitDistCalculator::raw_query_lower_bound` term by term.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ScaledLowerBoundTerms {
+pub struct ScaledLowerBoundTerms {
     /// `0.5 * sum_q`, subtracted from the binary inner product.
     pub half_sum_q: f32,
     /// Scales the stored centroid correction for dot queries; one for L2.
@@ -111,7 +116,7 @@ pub(crate) struct ScaledLowerBoundTerms {
 ///
 /// The formula constants are passed by reference because `Kernel::call`
 /// only takes by-value parameters of types lance-core names.
-pub(crate) type ScaledPruneMaskFn = unsafe fn(
+pub type ScaledPruneMaskFn = unsafe fn(
     &[f32; PRUNE_LANES],
     &[f32; PRUNE_LANES],
     &[f32; PRUNE_LANES],
@@ -138,7 +143,7 @@ lance_core::dispatch! {
 
 /// The prune-mask kernel for the running CPU; the caller can keep it for
 /// per-partition use.
-pub(crate) fn scaled_prune_mask_kernel() -> Kernel<ScaledPruneMaskFn> {
+pub fn scaled_prune_mask_kernel() -> Kernel<ScaledPruneMaskFn> {
     SCALED_PRUNE_MASKS.get()
 }
 
@@ -424,6 +429,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_public_prune_kernel_keeps_unscaled_factors() {
         let result = prune_mask_kernel()(
             &[0.0; PRUNE_LANES],
