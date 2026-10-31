@@ -788,9 +788,6 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         false
     }
 
-    /// Returns true if the remap operation is supported
-    fn can_remap(&self) -> bool;
-
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     ///
     /// Legacy remapping API using an in-memory mapping. Retained for existing

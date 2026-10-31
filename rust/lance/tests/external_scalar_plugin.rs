@@ -85,6 +85,10 @@ impl BasicTrainer for ExampleIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for ExampleIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(false)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }

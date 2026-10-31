@@ -547,10 +547,6 @@ impl ScalarIndex for BloomFilterIndex {
         true
     }
 
-    fn can_remap(&self) -> bool {
-        false
-    }
-
     async fn remap(
         &self,
         _mapping: &RowAddrRemap,
@@ -1473,6 +1469,10 @@ impl BasicTrainer for BloomFilterIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BloomFilterIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(false)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }

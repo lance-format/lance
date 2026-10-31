@@ -1072,10 +1072,6 @@ impl ScalarIndex for ZoneMapIndex {
         true
     }
 
-    fn can_remap(&self) -> bool {
-        false
-    }
-
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
@@ -2065,6 +2061,10 @@ impl BasicTrainer for ZoneMapIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for ZoneMapIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(false)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }

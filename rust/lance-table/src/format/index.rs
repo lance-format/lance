@@ -256,13 +256,9 @@ impl IndexMetadata {
     /// fragments, rather than just losing coverage of them until rebuilt.
     ///
     /// Of the address-domain types, BTree, Bitmap and LabelList's indexes support
-    /// this today (`ScalarIndex::can_remap`); ZoneMap, BloomFilter and FM always
-    /// report `RemapResult::Drop`, so remapping is never worth attempting for them.
-    /// `can_remap()` lives on the opened index and can vary per instance in
-    /// principle, but every implementation today is a type-level constant, so
-    /// this metadata-only check -- answering whether a remap is worth
-    /// attempting, not whether one will succeed opening the index -- is exact
-    /// in practice, not just a cheap approximation.
+    /// this today (`ScalarIndexPlugin::can_remap`); ZoneMap, BloomFilter and FM
+    /// cannot remap. This gate recognizes the supported built-in address-domain
+    /// formats without opening index files.
     pub fn supports_eager_remap(&self) -> bool {
         self.index_details.as_ref().is_some_and(|details| {
             Self::is_btree_addr_domain(details, self.index_version)

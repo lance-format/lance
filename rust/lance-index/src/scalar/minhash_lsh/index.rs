@@ -1333,10 +1333,6 @@ impl ScalarIndex for MinHashLshIndex {
         )))
     }
 
-    fn can_remap(&self) -> bool {
-        true
-    }
-
     async fn remap(
         &self,
         mapping: &RowAddrRemap,

@@ -176,10 +176,6 @@ impl ScalarIndex for JsonIndex {
         self.target_index.results_are_row_addresses()
     }
 
-    fn can_remap(&self) -> bool {
-        self.target_index.can_remap()
-    }
-
     async fn remap(
         &self,
         mapping: &RowAddrRemap,
@@ -1137,6 +1133,17 @@ impl BasicTrainer for JsonIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for JsonIndexPlugin {
+    fn can_remap(&self, details: &prost_types::Any) -> Result<bool> {
+        let details = crate::pb::JsonIndexDetails::decode(details.value.as_slice())?;
+        let target_details = details
+            .target_details
+            .as_ref()
+            .ok_or_else(|| Error::invalid_input("JSON index details are missing target_details"))?;
+        self.registry()?
+            .get_plugin_by_details(target_details)?
+            .can_remap(target_details)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -1408,6 +1415,58 @@ mod tests {
         );
         assert_eq!(json_wrapped_target_type("not json"), None);
         assert_eq!(json_wrapped_target_type(r#"{"path":"x"}"#), None);
+    }
+
+    #[rstest]
+    #[case::btree(
+        prost_types::Any::from_msg(&crate::pbold::BTreeIndexDetails::default()).unwrap(),
+        true
+    )]
+    #[case::zonemap(
+        prost_types::Any::from_msg(&crate::pbold::ZoneMapIndexDetails::default()).unwrap(),
+        false
+    )]
+    fn test_json_can_remap_delegates_to_target(
+        #[case] target_details: prost_types::Any,
+        #[case] expected: bool,
+    ) {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let details = prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
+            path: "$.value".to_string(),
+            target_details: Some(target_details),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(plugin.can_remap(&details).unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::missing_target(None, "missing target_details")]
+    #[case::unknown_target(
+        Some(prost_types::Any {
+            type_url: "type.googleapis.com/example.UnknownIndexDetails".to_string(),
+            value: Vec::new(),
+        }),
+        "No scalar index plugin found"
+    )]
+    fn test_json_can_remap_rejects_invalid_target(
+        #[case] target_details: Option<prost_types::Any>,
+        #[case] message: &str,
+    ) {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let details = prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
+            path: "$.value".to_string(),
+            target_details,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let error = plugin.can_remap(&details).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(message), "{error}");
     }
 
     #[test]

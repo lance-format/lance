@@ -139,6 +139,21 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// Returns true if the index returns an exact answer (e.g. not AtMost)
     fn provides_exact_answer(&self) -> bool;
 
+    /// Whether the persisted index described by these details supports remapping.
+    ///
+    /// This check must not read index files. It describes physical index segments,
+    /// not query-time wrappers that combine multiple segments. Details must belong
+    /// to this plugin; malformed details needed to determine support return an error.
+    ///
+    /// ```
+    /// # fn example(details: &prost_types::Any) -> lance_core::Result<bool> {
+    /// let registry = lance_index::registry::IndexPluginRegistry::with_default_plugins();
+    /// let plugin = registry.get_plugin_by_details(details)?;
+    /// plugin.can_remap(details)
+    /// # }
+    /// ```
+    fn can_remap(&self, details: &prost_types::Any) -> Result<bool>;
+
     /// The version of the index plugin
     ///
     /// We assume that indexes are not forwards compatible.  If an index was written with a

@@ -1095,10 +1095,6 @@ impl ScalarIndex for InvertedIndex {
         }
     }
 
-    fn can_remap(&self) -> bool {
-        true
-    }
-
     async fn remap(
         &self,
         mapping: &RowAddrRemap,
