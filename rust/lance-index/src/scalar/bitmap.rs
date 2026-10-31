@@ -4703,6 +4703,14 @@ mod tests {
                 to_keep.contains(RowAddress::from(row_addr).fragment_id())
             }
             Some(OldIndexDataFilter::RowIds(valid)) => valid.contains(row_addr),
+            Some(OldIndexDataFilter::RowAddresses {
+                to_keep,
+                deleted_rows,
+                ..
+            }) => {
+                to_keep.contains(RowAddress::from(row_addr).fragment_id())
+                    && !deleted_rows.contains(row_addr)
+            }
             None => true,
         }
     }
@@ -4738,7 +4746,7 @@ mod tests {
                 let rows = (0..rng.random_range(1..=8))
                     .map(|_| rand_row(&mut rng))
                     .collect::<Vec<_>>();
-                filters.push(match rng.random_range(0..4) {
+                filters.push(match rng.random_range(0..5) {
                     0 => None,
                     1 => Some(OldIndexDataFilter::Fragments {
                         // The bitmap merge reads only `to_keep`.
@@ -4751,6 +4759,15 @@ mod tests {
                             .map(|(_, row_addr)| *row_addr)
                             .collect(),
                     )),
+                    3 => Some(OldIndexDataFilter::RowAddresses {
+                        to_keep: (0..FRAGMENTS).filter(|_| rng.random_bool(0.6)).collect(),
+                        to_remove: RoaringBitmap::new(),
+                        deleted_rows: rows
+                            .iter()
+                            .filter(|_| rng.random_bool(0.4))
+                            .map(|(_, row_addr)| *row_addr)
+                            .collect(),
+                    }),
                     _ => Some(OldIndexDataFilter::Fragments {
                         to_keep: RoaringBitmap::new(),
                         to_remove: RoaringBitmap::new(),

@@ -3960,9 +3960,8 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
     if let Some(frag_reuse_index_meta) =
         indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
     {
-        let fri_key = FragReuseIndexKey {
-            uuid: &frag_reuse_index_meta.uuid,
-        };
+        let identity = frag_reuse::v0_cache_identity(dataset, frag_reuse_index_meta);
+        let fri_key = FragReuseIndexKey { uuid: &identity };
         let frag_reuse_index = dataset
             .index_cache
             .get_or_insert_with_key(fri_key, || async move {
@@ -4110,7 +4109,7 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
     async fn initialize_indices(&mut self, source_dataset: &Dataset) -> Result<()>;
 }
 
-/// The FRI UUID that belongs in the vector cache keys before any remapping
+/// The FRI identity that belongs in the vector cache keys before any remapping
 /// is resolved: only a v0 history, whose remapper is applied while the index
 /// is decoded, identifies cached content (see [`frag_reuse::fri_cache_id`]).
 async fn v0_frag_reuse_cache_id(dataset: &Dataset) -> Option<Uuid> {
@@ -4119,7 +4118,22 @@ async fn v0_frag_reuse_cache_id(dataset: &Dataset) -> Option<Uuid> {
         .ok()?
         .iter()
         .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME && idx.index_version == 0)
-        .map(|idx| idx.uuid)
+        .map(|idx| frag_reuse::v0_cache_identity(dataset, idx))
+}
+
+/// The FRI part of a cache key for content read alongside the dataset's
+/// history: [`frag_reuse::v0_cache_identity`] for `index_version = 0`, or the
+/// entry UUID for tagged history, which every change to that history replaces.
+pub(crate) async fn frag_reuse_cache_scope(dataset: &Dataset) -> Option<Uuid> {
+    load_all_indices(dataset)
+        .await
+        .ok()?
+        .iter()
+        .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+        .map(|idx| match idx.index_version {
+            0 => frag_reuse::v0_cache_identity(dataset, idx),
+            _ => idx.uuid,
+        })
 }
 
 impl Dataset {
@@ -4829,9 +4843,8 @@ impl DatasetIndexInternalExt for Dataset {
                 };
             }
             let frag_reuse_uuid = frag_reuse_index_meta.uuid;
-            let frag_reuse_key = FragReuseIndexKey {
-                uuid: &frag_reuse_uuid,
-            };
+            let identity = frag_reuse::v0_cache_identity(self, &frag_reuse_index_meta);
+            let frag_reuse_key = FragReuseIndexKey { uuid: &identity };
 
             let index = self
                 .index_cache
@@ -4863,7 +4876,7 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(None);
         };
 
-        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
+        let frag_reuse_uuid = frag_reuse_cache_scope(self).await;
         let cache_key = MemWalCacheKey::new(&mem_wal_meta.uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_with_key(&cache_key).await {
             log::debug!("Found MemWAL index in cache uuid: {}", mem_wal_meta.uuid);
@@ -15519,10 +15532,9 @@ mod tests {
     /// bitmap into the current space through the fragment-reuse index and leaves
     /// a `None` one alone, so the reconstruction has to make that move itself.
     ///
-    /// Without it, a deferred compaction is enough to defeat both guards: the
-    /// coverage still names the fragments the rows moved out of, which no later
-    /// rewrite can intersect, so the planner stops holding anything back and the
-    /// commit boundary waves the rewrite through.
+    /// Without it, coverage still names the fragments the rows moved out of:
+    /// deferred planning loses the boundary between indexed and unindexed rows,
+    /// and the unreadable-index commit guard cannot detect a covered rewrite.
     #[tokio::test]
     async fn test_reconstructed_coverage_follows_a_deferred_compaction() {
         use crate::dataset::index::DatasetIndexRemapperOptions;
@@ -15635,10 +15647,29 @@ mod tests {
         .unwrap();
         assert_eq!(dataset.get_fragments().len(), 3);
 
-        // The planner half: the appended pair coalesces, fragment 2 is held back.
-        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+        // Eager planning refuses pending FRI moves before considering coverage.
+        let version = dataset.version().version;
+        let err = compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        assert!(err.to_string().contains("pending remaps"), "{err}");
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.version().version, version);
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        // Deferred planning still honors the reconstructed boundary: the
+        // appended pair coalesces and the indexed fragment 2 is left alone.
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(metrics.fragments_removed, 2);
         assert_eq!(metrics.fragments_added, 1);
         assert!(

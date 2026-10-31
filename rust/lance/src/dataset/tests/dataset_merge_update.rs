@@ -5352,14 +5352,13 @@ async fn test_stale_append_vs_column_added_by_merge(
     }
 }
 
-/// A cast rewrites the column under a new field id, so a stale append omits it
-/// and its rows read as null. Casting a non-nullable column therefore claims
-/// non-null and conflicts; casting a nullable one does not.
+/// A cast replaces the written field id, so a stale append must conflict even
+/// when the column is nullable to prevent its values silently reading as null.
 #[rstest]
-#[case::cast_of_required_conflicts(true, true)]
-#[case::cast_of_nullable_commits(false, false)]
+#[case::cast_of_required_conflicts(true)]
+#[case::cast_of_nullable_conflicts(false)]
 #[tokio::test]
-async fn test_stale_append_vs_cast(#[case] tighten_first: bool, #[case] expect_conflict: bool) {
+async fn test_stale_append_vs_cast(#[case] tighten_first: bool) {
     let batch = arrow_array::record_batch!(("value", Int32, [1, 2])).unwrap();
     let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
     let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
@@ -5387,31 +5386,35 @@ async fn test_stale_append_vs_cast(#[case] tighten_first: bool, #[case] expect_c
         .await
         .unwrap();
 
-    let result = CommitBuilder::new(Arc::new(dataset)).execute(append).await;
-    assert_eq!(
-        result.is_err(),
-        expect_conflict,
-        "tighten_first={tighten_first}: got {result:?}"
+    let error = CommitBuilder::new(Arc::new(dataset.clone()))
+        .execute(append)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { .. }),
+        "{error}"
     );
-    if let Ok(committed) = result {
-        committed.scan().try_into_batch().await.unwrap();
-    }
+    assert!(
+        error.to_string().contains("concurrent transaction Merge"),
+        "{error}"
+    );
+
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(dataset.version().version, if tighten_first { 3 } else { 2 });
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(
+        batch["value"].as_ref(),
+        &arrow_array::Int64Array::from(vec![1, 2])
+    );
 }
 
-/// A nested cast assigns a new field id to the child. An append staged before
-/// the cast still writes the old id, and transaction rebasing does not rewrite
-/// its data through the cast. Under a required parent, accepting that append
-/// would make the replacement child unreadable, so it must conflict. Supporting
-/// that case requires smarter rebasing, not a file-format change. A nullable
-/// parent can mask the missing child, so that append remains compatible.
+/// A nested cast replaces the child's field id. A stale append must conflict
+/// regardless of parent nullability to avoid losing the written child values.
 #[rstest]
-#[case::nullable_child_required_parent_conflicts(false, true)]
-#[case::nullable_child_nullable_parent_commits(true, false)]
+#[case::nullable_child_required_parent_conflicts(false)]
+#[case::nullable_child_nullable_parent_conflicts(true)]
 #[tokio::test]
-async fn test_stale_append_vs_nested_cast(
-    #[case] parent_nullable: bool,
-    #[case] expect_conflict: bool,
-) {
+async fn test_stale_append_vs_nested_cast(#[case] parent_nullable: bool) {
     let child = Arc::new(ArrowField::new("c", DataType::Int32, true));
     let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
         "b",
@@ -5454,24 +5457,28 @@ async fn test_stale_append_vs_nested_cast(
         .await
         .unwrap();
 
-    let result = CommitBuilder::new(Arc::new(dataset)).execute(append).await;
-    assert_eq!(
-        result.is_err(),
-        expect_conflict,
-        "parent_nullable={parent_nullable}: got {result:?}"
+    let error = CommitBuilder::new(Arc::new(dataset.clone()))
+        .execute(append)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { .. }),
+        "{error}"
     );
-    if let Ok(committed) = result {
-        let batch = committed.scan().try_into_batch().await.unwrap();
-        assert_eq!(batch.num_rows(), 3);
-        assert_eq!(
-            batch["b"]
-                .as_struct()
-                .column_by_name("c")
-                .unwrap()
-                .null_count(),
-            1
-        );
-    }
+    assert!(
+        error.to_string().contains("concurrent transaction Merge"),
+        "{error}"
+    );
+
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(dataset.version().version, 2);
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    assert_eq!(batch["b"].null_count(), 0);
+    assert_eq!(
+        batch["b"].as_struct().column_by_name("c").unwrap().as_ref(),
+        &arrow_array::Int64Array::from(vec![1, 2])
+    );
 }
 
 /// A subcolumn addition (V2.2+) merges a new child into an existing struct.
