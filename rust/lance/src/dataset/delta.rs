@@ -558,21 +558,22 @@ impl DatasetDelta {
         } else {
             self.base_dataset.checkout_version(end_version).await?
         };
-        for version in [begin_version, end_version] {
-            // Version 0 denotes an empty snapshot and has no manifest to validate.
-            if version == 0 {
-                continue;
-            }
-            let endpoint = if version == dataset.manifest.version {
-                dataset.clone()
+        if begin_version != 0 && begin_version != end_version {
+            let begin = if begin_version == self.base_dataset.version().version {
+                self.base_dataset.clone()
             } else {
-                self.base_dataset.checkout_version(version).await?
+                self.base_dataset.checkout_version(begin_version).await?
             };
-            if !endpoint.manifest.uses_stable_row_ids() {
+            if !begin.manifest.uses_stable_row_ids() {
                 return Err(Error::invalid_input(format!(
-                    "row changes require stable row ids, version {version} does not use them"
+                    "row changes require stable row ids, version {begin_version} does not use them"
                 )));
             }
+        }
+        if end_version != 0 && !dataset.manifest.uses_stable_row_ids() {
+            return Err(Error::invalid_input(format!(
+                "row changes require stable row ids, version {end_version} does not use them"
+            )));
         }
         let inserted_filter = || {
             format!(
