@@ -2322,6 +2322,34 @@ def test_enable_disable_auto_cleanup(tmp_path):
     assert len(ds.versions()) == 7
 
 
+@pytest.mark.parametrize("shorthand", [False, True])
+def test_disable_retention_auto_cleanup(tmp_path: Path, shorthand: bool):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    ds = lance.write_dataset(table, tmp_path, mode="create")
+    config = {"lance.auto_cleanup.policy_interval": "1"}
+    if shorthand:
+        config["lance.auto_cleanup.keep_one.per_interval"] = "1day"
+        config["lance.auto_cleanup.keep_one.older_than"] = "2days"
+    else:
+        config["lance.auto_cleanup.policy"] = json.dumps(
+            {"rules": [{"type": "remove_all", "older_than": "0s"}]}
+        )
+    ds.update_config(config)
+    ds = lance.dataset(tmp_path)
+
+    ds.optimize.disable_auto_cleanup()
+    ds = lance.dataset(tmp_path)
+    assert not any(key.startswith("lance.auto_cleanup.") for key in ds.config())
+    before = [version["version"] for version in ds.versions()]
+
+    for _ in range(4):
+        lance.write_dataset(table, tmp_path, mode="append")
+
+    assert [
+        version["version"] for version in lance.dataset(tmp_path).versions()
+    ] == list(range(before[0], before[-1] + 5))
+
+
 def test_cleanup_with_rate_limit(tmp_path):
     """Test that cleanup_old_versions works with delete_rate_limit parameter."""
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})

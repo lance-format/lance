@@ -56,8 +56,11 @@ public class CleanupOperation {
    * versions and branch dependencies remain protected. The delay bounds exposure to delayed hint
    * writes; it does not make hint updates monotonic.
    *
-   * <p>Example: {@code dataset.cleanup(policy).withKeepOne(Duration.ofDays(1),
-   * Duration.ofDays(2)).execute()}.
+   * <p>This replaces any retention rules already carried by the {@link CleanupPolicy}. To combine
+   * multiple rules, pass them to the policy constructor or builder and do not call this method.
+   *
+   * <p>Example: {@code dataset.cleanup(CleanupPolicy.builder().build())
+   * .withKeepOne(Duration.ofDays(1), Duration.ofDays(2)).execute()}.
    *
    * @param perInterval positive bucket width with millisecond precision
    * @param olderThan full-history window, at least two days with millisecond precision

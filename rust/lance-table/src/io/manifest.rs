@@ -25,7 +25,6 @@ use lance_io::{
     utils::{ChunkedBuf, METADATA_READ_CHUNK_SIZE, read_message, read_range_in_chunks},
 };
 
-use crate::feature_flags::validate_auto_cleanup_config;
 use crate::format::{DataStorageFormat, IndexMetadata, MAGIC, Manifest, Transaction, pb};
 
 use super::commit::ManifestLocation;
@@ -226,7 +225,6 @@ pub async fn write_manifest(
     indices: Option<Vec<IndexMetadata>>,
     transaction: Option<Transaction>,
 ) -> Result<usize> {
-    validate_auto_cleanup_config(manifest)?;
     match manifest.data_storage_format.version {
         ConcreteFileVersion::V1 => {
             write_schema_dictionaries(writer, &mut manifest.schema).await?;

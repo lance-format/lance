@@ -57,6 +57,15 @@ class RetentionCleanupCompatibility:
             )
         assert dataset.to_table()["value"].to_pylist() == [3, 3, 3, 3, 99]
 
+    def enable_legacy_interval(self):
+        dataset = lance.dataset(self.path)
+        dataset.update_config(
+            {
+                "lance.auto_cleanup.interval": "1",
+                "lance.auto_cleanup.older_than": "30days",
+            }
+        )
+
 
 @pytest.mark.compat
 @pytest.mark.parametrize("shorthand", [False, True])
@@ -87,6 +96,42 @@ def test_retention_auto_cleanup_remains_safe_for_released_writers(
     dataset = lance.write_dataset(pa.table({"value": [100]}), case.path, mode="append")
     assert [v["version"] for v in dataset.versions()] == [1, 2, 3, 4, 5, 6]
     assert dataset.to_table()["value"].to_pylist() == [3, 3, 3, 3, 99, 100]
+
+
+@pytest.mark.compat
+def test_released_legacy_interval_does_not_block_upgraded_writes(
+    venv_factory, tmp_path
+):
+    case = RetentionCleanupCompatibility(tmp_path / "retention.lance")
+    released = venv_factory.get_venv("13.0.0")
+    released.execute_method(case, "create_released")
+    dataset = lance.dataset(case.path)
+    dataset.update_config(
+        {
+            "lance.auto_cleanup.policy_interval": "1",
+            "lance.auto_cleanup.policy": json.dumps(
+                {
+                    "rules": [
+                        {
+                            "type": "keep_one",
+                            "per_interval": "1h",
+                            "older_than": "2days",
+                        },
+                        {
+                            "type": "keep_one",
+                            "per_interval": "1day",
+                            "older_than": "7days",
+                        },
+                        {"type": "remove_all", "older_than": "30days"},
+                    ]
+                }
+            ),
+        }
+    )
+    released.execute_method(case, "enable_legacy_interval")
+    dataset = lance.write_dataset(pa.table({"value": [100]}), case.path, mode="append")
+    assert [v["version"] for v in dataset.versions()] == [1, 2, 3, 4, 5, 6]
+    assert dataset.to_table()["value"].to_pylist() == [3, 3, 3, 3, 100]
 
 
 class ManagedBlobCompatibility:

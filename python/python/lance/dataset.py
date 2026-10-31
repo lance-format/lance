@@ -8375,10 +8375,16 @@ class DatasetOptimizer:
         )
 
     def disable_auto_cleanup(self, **kwargs):
-        """Disable autocleaning via delete related keys."""
-        self._dataset._ds.delete_config_keys(
-            ["lance.auto_cleanup.interval", "lance.auto_cleanup.older_than"]
-        )
+        """Disable every automatic cleanup activation form."""
+        config = self._dataset.config()
+        keys = [
+            "lance.auto_cleanup.interval",
+            "lance.auto_cleanup.older_than",
+            "lance.auto_cleanup.policy_interval",
+            "lance.auto_cleanup.policy",
+            *(key for key in config if key.startswith("lance.auto_cleanup.keep_one.")),
+        ]
+        self._dataset._ds.delete_config_keys(keys)
 
 
 class Tags:
