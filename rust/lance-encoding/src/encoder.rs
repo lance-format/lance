@@ -209,6 +209,14 @@ pub trait FieldEncoder: Send {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>>;
+
+    /// Prepare the next input to end its current file page.
+    ///
+    /// File writers call this when the next batch reaches a hard file boundary.
+    /// The next batch can then be encoded before its borrowed source is
+    /// released instead of being copied into a queue that outlives it.
+    fn prepare_for_flush(&mut self) {}
+
     /// Flush any remaining data from the buffers into encoding tasks
     ///
     /// Each encode task produces a single page.  The order of these pages will be maintained
@@ -362,6 +370,12 @@ impl BatchEncoder {
             .iter()
             .map(|field_encoder| field_encoder.num_columns())
             .sum::<u32>()
+    }
+
+    pub fn prepare_for_flush(&mut self) {
+        for encoder in &mut self.field_encoders {
+            encoder.prepare_for_flush();
+        }
     }
 }
 
@@ -527,11 +541,12 @@ mod tests {
                 .add_buffer(Buffer::from(b"abc"))
                 .build_unchecked()
         };
-        let item_field = Arc::new(ArrowField::new("item", item_type, false));
-        let data_type = ArrowDataType::FixedSizeList(item_field, 1);
+        let data_type =
+            ArrowDataType::Dictionary(Box::new(ArrowDataType::Int32), Box::new(item_type));
         let array_data = unsafe {
             ArrayData::builder(data_type.clone())
                 .len(3)
+                .add_buffer(Buffer::from_slice_ref([0_i32, 1, 2]))
                 .add_child_data(child_data)
                 .build_unchecked()
         };

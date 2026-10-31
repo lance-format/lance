@@ -18,7 +18,7 @@ use lance_core::{Error, Result};
 
 use crate::{
     decoder::{
-        DecodedArray, FilterExpression, ScheduledScanLine, SchedulerContext,
+        DecodedArray, DrainLimit, FilterExpression, ScheduledScanLine, SchedulerContext,
         StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
         StructuralSchedulingJob,
     },
@@ -226,6 +226,57 @@ impl StructuralFixedSizeListDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralFixedSizeListDecoder {
+    fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
+        let dimension = match &self.data_type {
+            DataType::FixedSizeList(_, dimension) => *dimension as u64,
+            _ => {
+                return Err(Error::internal(
+                    "FixedSizeListDecoder has non-FSL data type".to_string(),
+                ));
+            }
+        };
+        if dimension == 0 {
+            return Ok(DrainLimit {
+                rows: num_rows,
+                bytes: 0,
+                dictionary_rows: None,
+            });
+        }
+
+        let child_rows = num_rows.checked_mul(dimension).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Planning {} FixedSizeList rows with dimension {} overflows child row count",
+                num_rows, dimension
+            ))
+        })?;
+        let child_limit = self.child.max_rows_to_drain(child_rows, byte_budget)?;
+        let safe_rows = child_limit.rows / dimension;
+        let dictionary_rows = child_limit
+            .dictionary_rows
+            .map(|dictionary_rows| dictionary_rows / dimension);
+        if safe_rows == 0 {
+            return Ok(DrainLimit {
+                rows: 0,
+                bytes: 0,
+                dictionary_rows,
+            });
+        }
+
+        let planned_child_rows = safe_rows * dimension;
+        let bytes = if planned_child_rows == child_limit.rows {
+            child_limit.bytes
+        } else {
+            self.child
+                .max_rows_to_drain(planned_child_rows, byte_budget)?
+                .bytes
+        };
+        Ok(DrainLimit {
+            rows: safe_rows,
+            bytes,
+            dictionary_rows,
+        })
+    }
+
     fn accept_page(&mut self, child: crate::decoder::LoadedPageShard) -> Result<()> {
         self.child.accept_page(child)
     }
@@ -549,7 +600,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        Array, FixedSizeListArray,
+        Array, ArrayRef, FixedSizeListArray,
         builder::{Int32Builder, ListBuilder},
         cast::AsArray,
     };
@@ -562,7 +613,9 @@ mod tests {
             STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
             STRUCTURAL_ENCODING_MINIBLOCK,
         },
-        testing::{TestCases, TestEncoding, check_specific_random},
+        testing::{
+            TestCases, TestEncoding, check_round_trip_encoding_of_data, check_specific_random,
+        },
     };
 
     fn make_fsl_struct_type(struct_fields: Fields, dimension: i32) -> DataType {
@@ -761,6 +814,37 @@ mod tests {
         assert!(err.to_string().contains("Unsupported data type"));
     }
 
+    /// Only fixed-size lists that carry string values are refused. Null lists and
+    /// lists of null items still round-trip.
+    #[rstest]
+    #[case::null_lists(true)]
+    #[case::null_items(false)]
+    #[tokio::test]
+    async fn test_null_fsl_of_strings_round_trip(#[case] null_lists: bool) {
+        let num_lists = 300;
+        let (items, nulls): (ArrayRef, _) = if null_lists {
+            let items = (0..num_lists * 2).map(|i| format!("s{i}"));
+            (
+                Arc::new(arrow_array::StringArray::from_iter_values(items)),
+                Some(arrow_buffer::NullBuffer::new_null(num_lists)),
+            )
+        } else {
+            (
+                arrow_array::new_null_array(&DataType::Utf8, num_lists * 2),
+                None,
+            )
+        };
+        let fsl = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            2,
+            items,
+            nulls,
+        );
+        let test_cases = TestCases::default()
+            .with_encodings([TestEncoding::StructuralU16, TestEncoding::StructuralU32]);
+        check_round_trip_encoding_of_data(vec![Arc::new(fsl)], &test_cases, HashMap::new()).await;
+    }
+
     #[test]
     fn test_filter_nested_fsl_garbage() {
         // Create FSL<List<Int32>> with dimension 2: [[[1], [2]], [[3], [4]], [[5], [6]]]
@@ -800,5 +884,45 @@ mod tests {
         let result = filter_nested_fsl_garbage(&fsl, &[false, true, false], 2);
         // Should return the same array unchanged
         assert_eq!(result.len(), 3);
+    }
+
+    /// A null-free nested FSL written with a forced full-zip layout goes through the
+    /// per-value path that flattens it. Both layers are nullable, as Arrow and pyarrow
+    /// build them by default, and the data carries no nulls.
+    #[rstest]
+    #[case::outer_wider(22, 3)]
+    #[case::inner_wider(3, 22)]
+    #[tokio::test]
+    async fn test_nested_fsl_full_zip_round_trip(#[case] outer_dim: i32, #[case] inner_dim: i32) {
+        let num_rows = 3;
+        let inner_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let leaf = Arc::new(arrow_array::Int32Array::from_iter_values(
+            0..num_rows * outer_dim * inner_dim,
+        ));
+        let inner = FixedSizeListArray::new(inner_field.clone(), inner_dim, leaf, None);
+        let outer = FixedSizeListArray::new(
+            Arc::new(Field::new(
+                "item",
+                DataType::FixedSizeList(inner_field, inner_dim),
+                true,
+            )),
+            outer_dim,
+            Arc::new(inner),
+            None,
+        );
+
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(outer)],
+            &TestCases::default()
+                .with_structural_encodings()
+                .with_range(0..1)
+                .with_range(1..3)
+                .with_indices(vec![0, 2]),
+            HashMap::from([(
+                STRUCTURAL_ENCODING_META_KEY.to_string(),
+                STRUCTURAL_ENCODING_FULLZIP.to_string(),
+            )]),
+        )
+        .await;
     }
 }
