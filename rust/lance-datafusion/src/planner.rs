@@ -27,18 +27,18 @@ use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
-    AggregateUDF, Case, ColumnarValue, GetFieldAccess, ScalarFunctionArgs, ScalarUDF,
-    ScalarUDFImpl, Signature, Volatility, WindowUDF,
+    AggregateUDF, ColumnarValue, GetFieldAccess, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
+    Signature, Volatility, WindowUDF,
 };
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::planner::{
     ContextProvider, NullOrdering, ParserOptions, PlannerContext, SqlToRel,
 };
 use datafusion::sql::sqlparser::ast::{
-    AccessExpr, Array as SQLArray, BinaryOperator, CaseWhen, CeilFloorKind,
-    DataType as SQLDataType, DateTimeField, ExactNumberInfo, Expr as SQLExpr, Function,
-    FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectNamePart, Subscript,
-    TimezoneInfo, TypedString, UnaryOperator, Value, ValueWithSpan,
+    AccessExpr, Array as SQLArray, BinaryOperator, CeilFloorKind, DataType as SQLDataType,
+    DateTimeField, ExactNumberInfo, Expr as SQLExpr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArguments, Ident, ObjectNamePart, Subscript, TimezoneInfo, TypedString, UnaryOperator,
+    Value, ValueWithSpan,
 };
 use datafusion::{
     common::Column,
@@ -703,34 +703,6 @@ impl Planner {
             SQLExpr::BinaryOp { left, op, right } => self.binary_expr(left, op, right),
             SQLExpr::UnaryOp { op, expr } => self.unary_expr(op, expr),
             SQLExpr::Value(value) => self.value(&value.value),
-            SQLExpr::Case {
-                operand,
-                conditions,
-                else_result,
-                ..
-            } => {
-                let operand = operand
-                    .as_ref()
-                    .map(|expr| self.parse_sql_expr(expr))
-                    .transpose()?
-                    .map(Box::new);
-                let when_then_expr = conditions
-                    .iter()
-                    .map(|CaseWhen { condition, result }| {
-                        Ok((
-                            Box::new(self.parse_sql_expr(condition)?),
-                            Box::new(self.parse_sql_expr(result)?),
-                        ))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let else_expr = else_result
-                    .as_ref()
-                    .map(|expr| self.parse_sql_expr(expr))
-                    .transpose()?
-                    .map(Box::new);
-
-                Ok(Expr::Case(Case::new(operand, when_then_expr, else_expr)))
-            }
             SQLExpr::Array(SQLArray { elem, .. }) => {
                 let mut values = vec![];
 
@@ -1338,11 +1310,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_filter_scalar_and_conditional_expressions() {
+    fn test_parse_filter_scalar_expressions() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::Float32, true),
             Field::new("text", DataType::Utf8, true),
-            Field::new("category", DataType::Int32, true),
         ]));
         let planner = Planner::new(schema.clone());
         let batch = RecordBatch::try_new(
@@ -1360,7 +1331,6 @@ mod tests {
                     Some("lance"),
                     None,
                 ])),
-                Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(1), None])),
             ],
         )
         .unwrap();
@@ -1373,14 +1343,6 @@ mod tests {
             (
                 "ceil(value) = 2",
                 vec![Some(true), Some(false), Some(true), None],
-            ),
-            (
-                "CASE WHEN value > 1 THEN 'high' ELSE 'low' END = 'high'",
-                vec![Some(true), Some(false), Some(true), Some(false)],
-            ),
-            (
-                "CASE category WHEN 1 THEN 'one' ELSE 'other' END = 'one'",
-                vec![Some(true), Some(false), Some(true), Some(false)],
             ),
             (
                 "substring(text FROM 2 FOR 3) = 'ell'",
@@ -1406,74 +1368,41 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_case_matches_float32_comparisons() {
-        let batch = arrow_array::record_batch!((
+    #[rstest::rstest]
+    #[case("CASE WHEN value > 1 THEN TRUE ELSE FALSE END")]
+    #[case("CASE value WHEN 1 THEN TRUE ELSE FALSE END")]
+    fn test_case_filters_remain_unsupported(#[case] filter: &str) {
+        let planner = Planner::new(Arc::new(Schema::new(vec![Field::new(
             "value",
-            Float32,
-            [Some(1.2), Some(-0.0), Some(0.0), None]
-        ))
-        .unwrap();
-        let planner = Planner::new(batch.schema());
+            DataType::Int32,
+            true,
+        )])));
+        let error = planner.parse_filter(filter).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("not supported SQL"));
+    }
 
-        let cases = [
-            (
-                "value = 1.2",
-                vec![Some(true), Some(false), Some(false), None],
-            ),
-            (
-                "CASE WHEN value = 1.2 THEN 1 ELSE 0 END = 1",
-                vec![Some(true), Some(false), Some(false), Some(false)],
-            ),
-            (
-                "CASE value WHEN 1.2 THEN 1 ELSE 0 END = 1",
-                vec![Some(true), Some(false), Some(false), Some(false)],
-            ),
-            (
-                "value = 0.0",
-                vec![Some(false), Some(true), Some(true), None],
-            ),
-            (
-                "CASE value WHEN 0.0 THEN 'z' ELSE 'n' END = 'z'",
-                vec![Some(false), Some(true), Some(true), Some(false)],
-            ),
-            (
-                "CASE WHEN value = 0.0 THEN 'z' ELSE 'n' END = 'z'",
-                vec![Some(false), Some(true), Some(true), Some(false)],
-            ),
-            (
-                "CASE WHEN value = 1.2 THEN CASE value WHEN 0.0 THEN 'zero' ELSE 'pos' END ELSE 'n' END = 'pos'",
-                vec![Some(true), Some(false), Some(false), Some(false)],
-            ),
-            (
-                "CASE value WHEN 0.0 THEN 'first' WHEN -0.0 THEN 'second' ELSE 'n' END = 'first'",
-                vec![Some(false), Some(true), Some(true), Some(false)],
-            ),
-            (
-                "CASE -0.0 WHEN 0.0 THEN 'z' ELSE 'n' END = 'z'",
-                vec![Some(true); 4],
-            ),
-        ];
-        for (filter, expected) in cases {
-            let expr = planner
-                .optimize_expr(planner.parse_filter(filter).unwrap())
-                .unwrap();
-            if filter.contains("CASE value WHEN 0.0") {
-                assert_eq!(
-                    planner.optimize_expr(expr.clone()).unwrap(),
-                    expr,
-                    "{filter}"
-                );
-            }
-            let result = planner
-                .create_physical_expr(&expr)
-                .unwrap()
-                .evaluate(&batch)
-                .unwrap()
-                .into_array(batch.num_rows())
-                .unwrap();
-            assert_eq!(result.as_ref(), &BooleanArray::from(expected), "{filter}");
-        }
+    #[rstest::rstest]
+    #[case("id + 0.5 > 1.0", vec![Some(false), Some(true), Some(true), None])]
+    #[case("id + 300 = 300", vec![Some(true), Some(false), Some(false), None])]
+    fn test_arithmetic_filter_preserves_numeric_promotion(
+        #[case] filter: &str,
+        #[case] expected: Vec<Option<bool>>,
+    ) {
+        let batch =
+            arrow_array::record_batch!(("id", UInt8, [Some(0), Some(1), Some(2), None])).unwrap();
+        let planner = Planner::new(batch.schema());
+        let expr = planner
+            .optimize_expr(planner.parse_filter(filter).unwrap())
+            .unwrap();
+        let result = planner
+            .create_physical_expr(&expr)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        assert_eq!(result.as_ref(), &BooleanArray::from(expected), "{filter}");
     }
 
     #[test]
@@ -1491,29 +1420,6 @@ mod tests {
             predicates.into_array(0).unwrap().as_ref(),
             &BooleanArray::from(vec![false, true])
         );
-
-        let expr = planner
-            .optimize_expr(
-                planner
-                    .parse_filter(&format!("CASE id WHEN {value} THEN 1 ELSE 0 END = 1"))
-                    .unwrap(),
-            )
-            .unwrap();
-        let predicates = planner
-            .create_physical_expr(&expr)
-            .unwrap()
-            .evaluate(&batch)
-            .unwrap();
-        assert_eq!(
-            predicates.into_array(0).unwrap().as_ref(),
-            &BooleanArray::from(vec![false, true])
-        );
-
-        let error = planner
-            .parse_filter("CASE id WHEN -1 THEN 1 ELSE 0 END = 1")
-            .unwrap_err();
-        assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains("could not convert to literal"));
 
         let expr = planner
             .parse_expr("arrow_cast(NULL, 'Time32(Second)')")
