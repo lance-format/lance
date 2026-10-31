@@ -378,7 +378,12 @@ impl IndexDetails {
             // subtype (IVF_PQ / IVF_RQ / ...), so compatibility filtering cannot
             // do per-subtype version checks here. Use the highest supported
             // vector index version as a safe upper bound; older binaries still
-            // ignore newer indices based on their own lower bound.
+            // ignore newer indices based on their own lower bound. IVF_HNSW_RQ is
+            // the exception: it always records its HNSW config and RQ compression,
+            // which no other subtype combines, so it gets its own version.
+            if crate::index::vector::details::is_ivf_hnsw_rq(&self.0) {
+                return Ok(IndexType::IvfHnswRq.version() as u32);
+            }
             Ok(IndexType::max_vector_version())
         } else {
             self.get_plugin().map(|p| p.version())

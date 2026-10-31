@@ -537,7 +537,8 @@ impl<'a> CreateIndexBuilder<'a> {
                 | IndexType::IvfRq
                 | IndexType::IvfHnswFlat
                 | IndexType::IvfHnswPq
-                | IndexType::IvfHnswSq,
+                | IndexType::IvfHnswSq
+                | IndexType::IvfHnswRq,
                 LANCE_VECTOR_INDEX,
             ) => {
                 // Vector index params.
@@ -1018,6 +1019,7 @@ fn is_builtin_vector_index(index_type: IndexType, params: &dyn IndexParams) -> b
                 | IndexType::IvfHnswFlat
                 | IndexType::IvfHnswPq
                 | IndexType::IvfHnswSq
+                | IndexType::IvfHnswRq
         )
         && params.as_any().is::<VectorIndexParams>()
 }
@@ -1154,6 +1156,7 @@ mod tests {
         AnyQuery, BloomFilterQuery, FullTextSearchQuery, LabelListQuery, SargableQuery,
         SearchResult, TextQuery, TokenQuery, inverted::tokenizer::InvertedIndexParams,
     };
+    use lance_index::vector::bq::RQBuildParams;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
@@ -4899,8 +4902,14 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::ivf_rq(IndexType::IvfRq)]
+    #[case::ivf_hnsw_rq(IndexType::IvfHnswRq)]
     #[tokio::test]
-    async fn test_create_index_ivf_rq_preserves_index_version() {
+    async fn test_create_index_ivf_rq_preserves_index_version(
+        #[case] index_type: IndexType,
+        #[values(false, true)] enable_stable_row_ids: bool,
+    ) {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
 
@@ -4914,20 +4923,40 @@ mod tests {
                 lance_datagen::RowCount::from(128),
                 lance_datagen::BatchCount::from(2),
             );
-        let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
-
-        let params = VectorIndexParams::ivf_rq(4, 1, DistanceType::L2);
-
-        let committed = dataset
-            .create_index(&["vector"], IndexType::IvfRq, None, &params, false)
+        let write_params = WriteParams {
+            enable_stable_row_ids,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, &dataset_uri, Some(write_params))
             .await
             .unwrap();
 
-        assert_eq!(committed.index_version, IndexType::IvfRq.version());
+        let params = match index_type {
+            IndexType::IvfHnswRq => VectorIndexParams::with_ivf_hnsw_rq_params(
+                DistanceType::L2,
+                IvfBuildParams::new(4),
+                HnswBuildParams::default(),
+                RQBuildParams::new(1),
+            ),
+            _ => VectorIndexParams::ivf_rq(4, 1, DistanceType::L2),
+        };
+
+        let created = dataset
+            .create_index(&["vector"], index_type, None, &params, false)
+            .await;
+        // Stable row ids are not the row addresses IVF_HNSW_RQ's version means.
+        if index_type == IndexType::IvfHnswRq && enable_stable_row_ids {
+            let err = created.unwrap_err();
+            assert!(err.to_string().contains("stable row ids"), "{err}");
+            return;
+        }
+        let committed = created.unwrap();
+
+        assert_eq!(committed.index_version, index_type.version());
 
         let loaded = dataset.load_indices_by_name(&committed.name).await.unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].index_version, IndexType::IvfRq.version());
+        assert_eq!(loaded[0].index_version, index_type.version());
     }
 
     #[tokio::test]

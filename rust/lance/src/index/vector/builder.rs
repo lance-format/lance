@@ -220,7 +220,7 @@ async fn remap_hnsw_partition<S: IvfSubIndex + 'static, Q: Quantization>(
     } else {
         mapping.as_ref()
     };
-    let storage = old_storage.remap(mapping)?;
+    let mut storage = old_storage.remap(mapping)?;
     let graph = index.read_sub_index_batch(partition_id, None, None).await?;
 
     let mut new_ids = Vec::with_capacity(old_storage.len());
@@ -234,10 +234,17 @@ async fn remap_hnsw_partition<S: IvfSubIndex + 'static, Q: Quantization>(
         }
     }
     let num_deleted = old_storage.len() - num_kept as usize;
+    // Carrying the graph over needs no distances; repairing or rebuilding it
+    // scores rows against each other, which RQ derives from the centroid.
+    let with_centroid = |storage: Q::Storage| match index.ivf_model().centroid(partition_id) {
+        Some(centroid) => storage.with_centroid(centroid.as_ref()),
+        None => Ok(storage),
+    };
     if num_kept as usize == storage.len() {
         let repaired = if num_deleted == 0 {
             remap_graph_batch(&graph, &new_ids)
         } else {
+            storage = with_centroid(storage)?;
             remap_graph_repair(&graph, &new_ids, &storage)
         };
         match repaired {
@@ -255,6 +262,7 @@ async fn remap_hnsw_partition<S: IvfSubIndex + 'static, Q: Quantization>(
             storage.len()
         );
     }
+    let storage = with_centroid(storage)?;
     let index = S::load(graph)?.remap(mapping, &storage)?;
     Ok((storage, index))
 }
@@ -1211,6 +1219,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let distance_type = self.distance_type;
         let column = self.column.clone();
         let frag_reuse_index = self.frag_reuse_index.clone();
+        let centroids = self.ivf.as_ref().and_then(|ivf| ivf.centroids.clone());
         if self.optimize_options.is_none()
             && self.existing_indices.is_empty()
             && partition_adjustment.is_none()
@@ -1223,12 +1232,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 sub_index_params,
                 column,
                 frag_reuse_index,
+                centroids,
                 FreshPartitionBuildLimits::default(),
             );
         }
         let partition_adjustment = Arc::new(partition_adjustment);
         let build_iter = (0..num_partitions).map(move |partition| {
             let output_partition_id = partition;
+            let centroid = centroids.as_ref().map(|c| c.value(output_partition_id));
             let reader = reader.clone();
             let indices = merge_indices.clone();
             let distance_type = distance_type;
@@ -1323,6 +1334,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                         batches,
                         column,
                         frag_reuse_index,
+                        centroid,
                     )?;
                     Ok(Budgeted::untracked(PartitionBuildResult {
                         partition_id: output_partition_id,
@@ -1346,6 +1358,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         sub_index_params: S::BuildParams,
         column: String,
         frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
+        centroids: Option<FixedSizeListArray>,
         limits: FreshPartitionBuildLimits,
     ) -> Result<BuildStream<S, Q>> {
         let concurrency = get_num_compute_intensive_cpus().max(1);
@@ -1357,6 +1370,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             let sub_index_params = sub_index_params.clone();
             let column = column.clone();
             let frag_reuse_index = frag_reuse_index.clone();
+            let centroids = centroids.clone();
             let cpu_permits = cpu_permits.clone();
             async move {
                 if next_partition_id == num_partitions {
@@ -1467,6 +1481,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                                 let sub_index_params = sub_index_params.clone();
                                 let column = column.clone();
                                 let frag_reuse_index = frag_reuse_index.clone();
+                                let centroid =
+                                    centroids.as_ref().map(|c| c.value(input.partition_id));
                                 let cpu_permits = cpu_permits.clone();
                                 async move {
                                     let partition_id = input.partition_id;
@@ -1493,6 +1509,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                                             input.batches,
                                             column,
                                             frag_reuse_index,
+                                            centroid,
                                         )?;
                                         Ok(Some((storage, sub_index, loss)))
                                     })
@@ -1552,12 +1569,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         batches: Vec<RecordBatch>,
         column: String,
         frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
+        centroid: Option<ArrayRef>,
     ) -> Result<(Q::Storage, S)> {
         let frag_reuse_index = frag_reuse_index
             .map(|index| Arc::new(CompactFragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
-        let storage =
+        let mut storage =
             StorageBuilder::new_with_remapper(column, distance_type, quantizer, frag_reuse_index)?
+                .with_graph_sub_index(S::name() == HNSW::name())
                 .build(batches)?;
+        if let Some(centroid) = centroid {
+            storage = storage.with_centroid(centroid.as_ref())?;
+        }
         let sub_index = S::index_vectors(&storage, sub_index_params)?;
 
         Ok((storage, sub_index))
@@ -3622,6 +3644,7 @@ mod tests {
                 FlatQuantizer::new(2, DistanceType::L2),
                 (),
                 "vector".to_string(),
+                None,
                 None,
                 FreshPartitionBuildLimits {
                     window_bytes: 2,

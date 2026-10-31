@@ -253,6 +253,7 @@ fn ex_code_storage_load(c: &mut Criterion) {
         num_bits: NUM_BITS,
         packed: true,
         query_estimator: RabitQueryEstimator::RawQuery,
+        graph_sub_index: false,
     };
     let code_len = LOAD_DIM / 8;
     let binary_codes = (0..LOAD_ROWS * code_len)
@@ -671,6 +672,7 @@ fn build_transform(c: &mut Criterion) {
                     num_bits,
                     packed: false,
                     query_estimator: RabitQueryEstimator::RawQuery,
+                    graph_sub_index: false,
                 };
                 let rq = RabitQuantizer::try_from(
                     RabitQuantizer::from_metadata(&metadata, DistanceType::L2).unwrap(),

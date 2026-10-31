@@ -4230,6 +4230,7 @@ class LanceDataset(pa.dataset.Dataset):
             "IVF_HNSW_FLAT",
             "IVF_HNSW_PQ",
             "IVF_HNSW_SQ",
+            "IVF_HNSW_RQ",
             "IVF_RQ",
         ]
         if index_type not in valid_index_types:
@@ -4566,7 +4567,8 @@ class LanceDataset(pa.dataset.Dataset):
             The column to be indexed.
         index_type : str
             The type of the index.
-            ``"IVF_PQ, IVF_HNSW_PQ and IVF_HNSW_SQ"`` are supported now.
+            ``"IVF_PQ, IVF_HNSW_PQ, IVF_HNSW_SQ, IVF_HNSW_RQ and IVF_RQ"`` are
+            supported now.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -4697,7 +4699,7 @@ class LanceDataset(pa.dataset.Dataset):
             - index_file_version
                 The version of the index file. Default is "V3".
 
-        Optional parameters for `IVF_RQ`:
+        Optional parameters for `IVF_RQ` and `IVF_HNSW_RQ`:
 
             - num_bits
                 The number of bits for RQ (Rabit Quantization). Default is 5.
@@ -4734,6 +4736,18 @@ class LanceDataset(pa.dataset.Dataset):
                 "vector",
                 "IVF_HNSW_SQ",
                 num_partitions=256,
+            )
+
+        .. code-block:: python
+
+            import lance
+
+            dataset = lance.dataset("/tmp/sift.lance")
+            dataset.create_index(
+                "vector",
+                "IVF_HNSW_RQ",
+                num_partitions=256,
+                num_bits=5,
             )
 
         Experimental Accelerator (GPU) support:
@@ -4877,7 +4891,7 @@ class LanceDataset(pa.dataset.Dataset):
           interprets partition ids within that segment. Keep independently
           trained segments as separate physical segments unless the merge
           workflow can preserve or reconcile the model state.
-        - ``rabitq_model`` (``IVF_RQ`` only): a JSON string produced by
+        - ``rabitq_model`` (``IVF_RQ`` and ``IVF_HNSW_RQ``): a JSON string produced by
           ``lance.lance.indices.build_rq_model``. It must be identical across all
           workers for their segments to be mergeable, since it pins the RaBitQ
           rotation so every segment rotates vectors the same way. If omitted, each

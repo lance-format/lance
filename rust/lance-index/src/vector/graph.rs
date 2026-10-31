@@ -474,6 +474,24 @@ pub fn beam_search(
     (results.into_sorted_vec(), comparisons)
 }
 
+/// Accepts scores in `[lower_bound, upper_bound)`. A bounded query asks
+/// [`DistCalculator::in_range`], which judges the final score.
+pub(crate) fn range_filter<'a, C: DistCalculator>(
+    params: &HnswQueryParams,
+    dist_calc: &'a C,
+) -> impl Fn(u32, OrderedFloat) -> bool + use<'a, C> {
+    let bounded = params.lower_bound.is_some() || params.upper_bound.is_some();
+    let lower_bound = params.lower_bound.unwrap_or(f32::MIN);
+    let upper_bound = params.upper_bound.unwrap_or(f32::MAX);
+    move |node_id, dist| {
+        if bounded {
+            dist_calc.in_range(node_id, dist.0, lower_bound, upper_bound)
+        } else {
+            dist.0 >= lower_bound && dist.0 < upper_bound
+        }
+    }
+}
+
 /// Like [beam_search] but over a [BorrowingGraph]. Also returns the number of
 /// distances computed.
 pub fn beam_search_borrowed(
@@ -519,13 +537,9 @@ pub fn beam_search_borrowed(
         return (results.into_sorted_vec(), comparisons);
     }
 
-    let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
-    let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
+    let in_range = range_filter(params, dist_calc);
 
-    if bitset.map(|bitset| bitset.contains(ep.id)).unwrap_or(true)
-        && ep.dist >= lower_bound
-        && ep.dist < upper_bound
-    {
+    if bitset.map(|bitset| bitset.contains(ep.id)).unwrap_or(true) && in_range(ep.id, ep.dist) {
         results.push(ep.clone());
     }
 
@@ -533,8 +547,7 @@ pub fn beam_search_borrowed(
         bitset
             .map(|bitset| bitset.contains(node_id))
             .unwrap_or(true)
-            && dist >= lower_bound
-            && dist < upper_bound
+            && in_range(node_id, dist)
     };
     beam_search_loop!(
         candidates,
@@ -586,8 +599,7 @@ pub fn beam_search_acorn(
     expanded: &mut Visited,
 ) -> (Vec<OrderedNode>, usize) {
     let ef = params.ef;
-    let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
-    let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
+    let in_range = range_filter(params, dist_calc);
     let passing_total = bitset.count_ones();
     let mut candidates = BinaryHeap::with_capacity(ef);
     let mut results = BinaryHeap::with_capacity(ef);
@@ -603,7 +615,7 @@ pub fn beam_search_acorn(
     // the entry point seeds the traversal even if it fails the mask
     visited.insert(ep.id);
     candidates.push(Reverse(ep.clone()));
-    if bitset.contains(ep.id) && ep.dist >= lower_bound && ep.dist < upper_bound {
+    if bitset.contains(ep.id) && in_range(ep.id, ep.dist) {
         results.push(ep.clone());
     }
 
@@ -616,7 +628,7 @@ pub fn beam_search_acorn(
         visited.insert(seed);
         let dist: OrderedFloat = dist_calc.distance(seed).into();
         comparisons += 1;
-        if dist >= lower_bound && dist < upper_bound {
+        if in_range(seed, dist) {
             push_result(&mut results, (dist, seed).into(), ef);
         }
         candidates.push(Reverse((dist, seed).into()));
@@ -645,7 +657,7 @@ pub fn beam_search_acorn(
                             visited.insert(neighbor);
                             let dist: OrderedFloat = dist_calc.distance(neighbor).into();
                             comparisons += 1;
-                            if dist >= lower_bound && dist < upper_bound {
+                            if in_range(neighbor, dist) {
                                 push_result(&mut results, (dist, neighbor).into(), ef);
                             }
                             candidates.push(Reverse((dist, neighbor).into()));
@@ -696,7 +708,7 @@ pub fn beam_search_acorn(
                 let dist: OrderedFloat = dist_calc.distance(node).into();
                 comparisons += 1;
                 if dist <= furthest_distance(&results) || results.len() < ef {
-                    if dist >= lower_bound && dist < upper_bound {
+                    if in_range(node, dist) {
                         push_result(&mut results, (dist, node).into(), ef);
                     }
                     candidates.push(Reverse((dist, node).into()));

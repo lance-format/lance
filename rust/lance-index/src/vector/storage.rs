@@ -151,6 +151,13 @@ pub trait DistCalculator {
 
     fn prefetch(&self, _id: u32) {}
 
+    /// Whether the final score of `id` lies in `[lower, upper)`, given its
+    /// score `dist` from [`Self::distance`]. Calculators whose scores
+    /// [`VectorStore::rerank`] replaces judge the replacement.
+    fn in_range(&self, _id: u32, dist: f32, lower: f32, upper: f32) -> bool {
+        dist >= lower && dist < upper
+    }
+
     /// Whether [`Self::accumulate_topk_with_scratch`] can replace scoring every
     /// row with [`Self::distance_all`] and pushing each score into a top-k heap.
     ///
@@ -551,6 +558,19 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
             .iter()
             .all(|other| candidate.dist < OrderedFloat(dist_cal_candidate.distance(other.id)))
     }
+
+    /// Re-scores and re-sorts the candidates of a graph search. Returns
+    /// `false`, the default, when the search scores are final.
+    fn rerank(&self, _query: ArrayRef, _dist_q_c: f32, _results: &mut [OrderedNode]) -> bool {
+        false
+    }
+
+    /// Hands a partition's storage its IVF `centroid` before a graph is built
+    /// on it. RQ derives its code-to-code factors from it and keeps only
+    /// those; other storages ignore it.
+    fn with_centroid(self, _centroid: &dyn Array) -> Result<Self> {
+        Ok(self)
+    }
 }
 
 pub struct StorageBuilder<Q: Quantization> {
@@ -559,6 +579,7 @@ pub struct StorageBuilder<Q: Quantization> {
     quantizer: Q,
 
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    graph_sub_index: bool,
 }
 
 impl<Q: Quantization> StorageBuilder<Q> {
@@ -585,7 +606,15 @@ impl<Q: Quantization> StorageBuilder<Q> {
             distance_type,
             quantizer,
             frag_reuse_index,
+            graph_sub_index: false,
         })
+    }
+
+    /// Sets whether an HNSW sub-index walks the storage, which the quantizer's
+    /// own metadata does not record.
+    pub fn with_graph_sub_index(mut self, graph_sub_index: bool) -> Self {
+        self.graph_sub_index = graph_sub_index;
+        self
     }
 
     pub fn build(&self, batches: Vec<RecordBatch>) -> Result<Q::Storage> {
@@ -608,9 +637,11 @@ impl<Q: Quantization> StorageBuilder<Q> {
         debug_assert!(batch.column_by_name(ROW_ID).is_some());
         debug_assert!(batch.column_by_name(self.quantizer.column()).is_some());
 
+        let mut metadata = self.quantizer.metadata(None);
+        metadata.set_graph_sub_index(self.graph_sub_index);
         Q::Storage::try_from_batch_with_remapper(
             batch,
-            &self.quantizer.metadata(None),
+            &metadata,
             self.distance_type,
             self.frag_reuse_index.clone(),
         )
@@ -1558,6 +1589,13 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         &self.metadata
     }
 
+    /// Sets whether an HNSW sub-index walks the partitions, which the file
+    /// itself does not record.
+    pub fn with_graph_sub_index(mut self, graph_sub_index: bool) -> Self {
+        self.metadata.set_graph_sub_index(graph_sub_index);
+        self
+    }
+
     pub fn distance_type(&self) -> DistanceType {
         self.distance_type
     }
@@ -1865,12 +1903,15 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// Whether this file exposes the current RaBitQ sign/ex plane primitives.
     /// Historical native encodings and one-bit indices keep their ordinary
     /// partition reader; they are not adapted into the new scan path.
+    /// `IVF_HNSW_RQ` walks whole partitions, so it stays on whole-partition
+    /// reads.
     pub fn supports_rabit_planes(&self) -> bool {
         let Ok(Quantizer::Rabit(rq)) = self.quantizer() else {
             return false;
         };
         let metadata = rq.metadata_ref();
         (2..=9).contains(&metadata.num_bits)
+            && !metadata.graph_sub_index
             && metadata.packed
             && metadata.query_estimator == RabitQueryEstimator::RawQuery
             && self

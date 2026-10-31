@@ -1266,7 +1266,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         ivf: &IvfModel,
         storage: &IvfQuantizationStorage<Q>,
     ) -> Result<Option<Arc<RabitSearchCache>>> {
-        if Q::quantization_type() != QuantizationType::Rabit {
+        // HNSW walks its graph without the flat raw-query scan state.
+        if Q::quantization_type() != QuantizationType::Rabit || S::name() == HNSW::name() {
             return Ok(None);
         }
         let Quantizer::Rabit(rq) = storage.quantizer()? else {
@@ -1305,7 +1306,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         &self,
         query: &ArrayRef,
     ) -> Result<Option<Arc<RabitRawQueryContext>>> {
-        if Q::quantization_type() != QuantizationType::Rabit || self.use_query_residual {
+        if Q::quantization_type() != QuantizationType::Rabit
+            || self.use_query_residual
+            || S::name() == HNSW::name()
+        {
             return Ok(None);
         }
         let Quantizer::Rabit(rq) = self.storage.quantizer()? else {
@@ -1598,7 +1602,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         ivf: &IvfModel,
         storage: &IvfQuantizationStorage<Q>,
     ) -> QueryScratchCapacity {
-        if Q::quantization_type() != QuantizationType::Rabit {
+        // Only the flat RaBitQ scan reads the per-row scratch buffers; HNSW
+        // walks its graph without them.
+        if Q::quantization_type() != QuantizationType::Rabit
+            || S::name() != <FlatIndex as IvfSubIndex>::name()
+        {
             return QueryScratchCapacity::default();
         }
 
@@ -1723,6 +1731,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 IvfQuantizationStorage::try_new_with_remapper(storage_reader, None).await?
             }
         };
+        let storage = storage.with_graph_sub_index(S::name() == HNSW::name());
         let resident_columns = Self::resident_columns_at_open(
             &storage,
             context.file_cache.as_ref(),
@@ -2649,13 +2658,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
             (SubIndexType::Hnsw, QuantizationType::Flat)
             | (SubIndexType::Hnsw, QuantizationType::FlatBin) => IndexType::IvfHnswFlat,
-            (sub_index_type, quantization_type) => {
-                unimplemented!(
-                    "unsupported index type: {}, {}",
-                    sub_index_type,
-                    quantization_type
-                )
-            }
+            (SubIndexType::Hnsw, QuantizationType::Rabit) => IndexType::IvfHnswRq,
         }
     }
 
@@ -3620,6 +3623,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         }
         Some(ResolvedRemapping::V1Identity) | None => make_storage(None),
     };
+    let storage = storage.with_graph_sub_index(S::name() == HNSW::name());
     // Bind the store as an open does: the state holds none, so a state read
     // back from a persistent tier binds to the one the index cache holds or
     // the file's live indexes share, and any state pins nothing.

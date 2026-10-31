@@ -14,7 +14,8 @@ use std::sync::{
 use arrow::array::AsArray;
 use arrow::datatypes::{Float16Type, Float32Type, Float64Type, UInt8Type, UInt64Type};
 use arrow_array::{
-    Array, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt32Array,
+    UInt64Array,
 };
 use arrow_schema::{DataType, Field, SchemaRef};
 use async_trait::async_trait;
@@ -38,6 +39,7 @@ use lance_linalg::simd::{SIMD, f32::f32x16};
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::AsPrimitive;
 use prost::Message;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
@@ -49,10 +51,14 @@ use crate::vector::bq::dist_table_quant::{
 };
 use crate::vector::bq::ex_dot::{
     EX_DOT_BLOCK_DIMS, ExDotFn, blocked_ex_code_bytes, ex_dot_kernel, pad_query_into,
-    padded_query_len, repack_sequential_row, sequential_matches_blocked,
+    padded_query_len, repack_sequential_row, sequential_matches_blocked, unpack_blocked_row,
 };
 use crate::vector::bq::prune::{PRUNE_LANES, ScaledLowerBoundTerms, scaled_prune_mask_kernel};
 use crate::vector::bq::rotation::{apply_fast_rotation, apply_fast_rotation_in_place};
+use crate::vector::bq::sym::{
+    SymCode, SymFactors, WarmupQuery, derive_sym_factors, prepare_warmup_query, sign_word_bytes,
+    sign_words_from_codes, sym_dist, warmup_ip_x0_q,
+};
 use crate::vector::bq::transform::{
     ADD_FACTORS_COLUMN, ERROR_FACTORS_COLUMN, EX_ADD_FACTORS_COLUMN, EX_SCALE_FACTORS_COLUMN,
     SCALE_FACTORS_COLUMN,
@@ -67,6 +73,7 @@ use crate::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use crate::vector::storage::{
     DistCalculator, DistanceCalculatorOptions, QueryResidual, RabitRawQueryContext, VectorStore,
 };
+use crate::vector::utils::do_prefetch;
 
 mod scan;
 pub use scan::{ExRows, SignStage, StagePruneCounts, SurvivorRow, select_full_survivors};
@@ -324,6 +331,10 @@ pub struct RabitQuantizationMetadata {
     pub packed: bool,
     #[serde(default = "default_query_estimator_compat")]
     pub query_estimator: RabitQueryEstimator,
+    /// Whether an HNSW sub-index (`IVF_HNSW_RQ`) walks these codes. Set from
+    /// the build params or the sub-index type; never persisted.
+    #[serde(skip)]
+    pub graph_sub_index: bool,
 }
 
 impl RabitQuantizationMetadata {
@@ -489,6 +500,10 @@ impl QuantizerMetadata for RabitQuantizationMetadata {
         self.rotate_mat_position = Some(index);
     }
 
+    fn set_graph_sub_index(&mut self, graph_sub_index: bool) {
+        self.graph_sub_index = graph_sub_index;
+    }
+
     fn parse_buffer(&mut self, bytes: Bytes) -> Result<()> {
         if self.rotation_type != RQRotationType::Matrix {
             return Ok(());
@@ -556,6 +571,33 @@ pub struct RabitQuantizationStorage {
     packed_ex_codes: Option<FixedSizeListArray>,
     ex_add_factors: Option<Float32Array>,
     ex_scale_factors: Option<Float32Array>,
+    /// `IVF_HNSW_RQ` state, loaded once with the partition and shared by
+    /// clones.
+    sym: Option<Arc<SymState>>,
+}
+
+/// The per-row SymRaBitQ state of an `IVF_HNSW_RQ` partition, derived at
+/// load; nothing of it is stored.
+#[derive(Debug, Clone)]
+struct SymState {
+    /// `_rabit_codes` sign bits regrouped into the sym kernels' word layout,
+    /// [`sign_word_bytes`] per row.
+    signs: UInt8Array,
+    /// Code-to-code factors, derived only for a graph build
+    /// ([`VectorStore::with_centroid`]); empty when searching.
+    factors: Vec<SymFactors>,
+}
+
+impl SymState {
+    /// Regroups the sign bits of the row-major `codes`.
+    fn new(codes: &FixedSizeListArray) -> Self {
+        let code_len = codes.value_length() as usize;
+        let code_values = codes.values().as_primitive::<UInt8Type>().values();
+        Self {
+            signs: UInt8Array::from(sign_words_from_codes(code_values, code_len)),
+            factors: Vec::new(),
+        }
+    }
 }
 
 impl DeepSizeOf for RabitQuantizationStorage {
@@ -567,12 +609,111 @@ impl DeepSizeOf for RabitQuantizationStorage {
                 .as_ref()
                 .map(|codes| (codes as &dyn Array).deep_size_of_children(context))
                 .unwrap_or_default()
+            + self
+                .sym
+                .as_ref()
+                .map(|sym| {
+                    (&sym.signs as &dyn Array).deep_size_of_children(context)
+                        + sym.factors.capacity() * std::mem::size_of::<SymFactors>()
+                })
+                .unwrap_or_default()
     }
 }
 
 impl RabitQuantizationStorage {
     fn code_dim(&self) -> usize {
         self.metadata.code_dim()
+    }
+
+    fn sym_table<'a>(&'a self, sym: &'a SymState) -> SymTable<'a> {
+        let (ex, ex_stride) = match self.ex_codes.as_ref() {
+            Some(ex) => (
+                ex.values().as_primitive::<UInt8Type>().values().as_ref(),
+                ex.value_length() as usize,
+            ),
+            None => (&[][..], 0),
+        };
+        SymTable {
+            signs: sym.signs.values(),
+            sign_stride: sign_word_bytes(self.code_dim()),
+            ex,
+            ex_stride,
+            factors: &sym.factors,
+            dim: self.code_dim(),
+            num_bits: self.metadata.num_bits,
+            distance_type: self.distance_type,
+        }
+    }
+
+    /// `sym` with the code-to-code factors [`derive_sym_factors`] rebuilds
+    /// from the RQ factors and the partition `centroid`.
+    fn derive_sym_state(&self, sym: &SymState, centroid: &dyn Array) -> SymState {
+        let dim = self.code_dim();
+        let rotated = self.rotate_query_vector(dim, centroid);
+        let (add, scale) = match (&self.ex_add_factors, &self.ex_scale_factors) {
+            (Some(add), Some(scale)) => (add.values(), scale.values()),
+            _ => (self.add_factors.values(), self.scale_factors.values()),
+        };
+        let (num_bits, distance_type) = (self.metadata.num_bits, self.distance_type);
+        let table = self.sym_table(sym);
+        let factors = (0..self.len())
+            .into_par_iter()
+            .map_init(Vec::new, |ex_codes, id| {
+                let (signs, ex) = table.bits(id);
+                if num_bits > 1 {
+                    unpack_blocked_row(ex, num_bits - 1, dim, ex_codes);
+                }
+                derive_sym_factors(
+                    signs,
+                    ex_codes,
+                    &rotated,
+                    add[id],
+                    scale[id],
+                    num_bits,
+                    distance_type,
+                )
+            })
+            .collect();
+        SymState {
+            signs: sym.signs.clone(),
+            factors,
+        }
+    }
+
+    /// A query calculator over the full RQ codes; `dist_calculator` adds the
+    /// `IVF_HNSW_RQ` walk on top.
+    fn code_calculator(&self, qr: &dyn Array, dist_q_c: f32) -> RabitDistCalculator<'_> {
+        let code_dim = self.code_dim();
+        let rotated_qr = self.rotate_query_vector(code_dim, qr);
+        let dist_table = build_dist_table_direct::<Float32Type>(&rotated_qr);
+        let query_factors = match self.metadata.query_estimator {
+            RabitQueryEstimator::ResidualQuery => RabitQueryFactors {
+                add_scale: 1.0,
+                add_offset: 0.0,
+                add: self.residual_query_factor(dist_q_c),
+                error: 0.0,
+            },
+            RabitQueryEstimator::RawQuery => self.raw_query_factors(dist_q_c, &rotated_qr, None),
+        };
+        let sum_q = rotated_qr.iter().copied().sum();
+        // The kernels read the rotated query directly; only unaligned dims
+        // need a zero-padded copy.
+        let ex_query = if code_dim.is_multiple_of(EX_DOT_BLOCK_DIMS) {
+            rotated_qr
+        } else {
+            let mut padded = vec![0.0; padded_query_len(code_dim)];
+            pad_query_into(&rotated_qr, &mut padded);
+            padded
+        };
+
+        self.distance_calculator_from_parts(RabitDistCalculatorParts {
+            dim: code_dim,
+            dist_table: Cow::Owned(dist_table),
+            ex_query: Cow::Owned(ex_query),
+            sum_q,
+            query_factors,
+            approx_mode: ApproxMode::Normal,
+        })
     }
 
     fn residual_query_factor(&self, dist_q_c: f32) -> f32 {
@@ -897,6 +1038,71 @@ struct RabitQueryFactors {
     error: f32,
 }
 
+/// The `IVF_HNSW_RQ` codes of a partition, read row by row.
+#[derive(Clone, Copy)]
+struct SymTable<'a> {
+    signs: &'a [u8],
+    sign_stride: usize,
+    ex: &'a [u8],
+    ex_stride: usize,
+    factors: &'a [SymFactors],
+    dim: usize,
+    num_bits: u8,
+    distance_type: DistanceType,
+}
+
+impl<'a> SymTable<'a> {
+    /// The sign words and ex codes of `id`.
+    fn bits(&self, id: usize) -> (&'a [u8], &'a [u8]) {
+        (
+            &self.signs[id * self.sign_stride..(id + 1) * self.sign_stride],
+            &self.ex[id * self.ex_stride..(id + 1) * self.ex_stride],
+        )
+    }
+
+    fn code(&self, id: usize) -> SymCode<'a> {
+        let (signs, ex) = self.bits(id);
+        SymCode {
+            signs,
+            ex,
+            factors: self.factors[id],
+        }
+    }
+}
+
+/// Code-to-code distances from one row, for building the HNSW graph.
+struct SymFromIdCalculator<'a> {
+    source: SymCode<'a>,
+    table: SymTable<'a>,
+}
+
+impl SymFromIdCalculator<'_> {
+    fn distance(&self, id: u32) -> f32 {
+        let table = &self.table;
+        let target = table.code(id as usize);
+        sym_dist(
+            &self.source,
+            &target,
+            table.dim,
+            table.num_bits,
+            table.distance_type,
+        )
+    }
+
+    fn prefetch(&self, id: u32) {
+        let target = self.table.code(id as usize);
+        do_prefetch(target.signs.as_ptr_range());
+        do_prefetch(target.ex.as_ptr_range());
+    }
+}
+
+/// The 1-bit HNSW walk of `IVF_HNSW_RQ`: sign words and the 4-bit query.
+struct SymWalk<'a> {
+    signs: &'a [u8],
+    stride: usize,
+    query: WarmupQuery,
+}
+
 struct RabitDistCalculatorParts<'a> {
     dim: usize,
     dist_table: Cow<'a, [f32]>,
@@ -963,6 +1169,11 @@ pub struct RabitDistCalculator<'a> {
 
     sum_q: f32,
     sqrt_d: f32,
+    /// Set by `dist_calculator_from_id`: distances between two codes.
+    sym: Option<SymFromIdCalculator<'a>>,
+    /// Set on `IVF_HNSW_RQ` query calculators: `distance` is the 1-bit walk
+    /// score, which `rerank` replaces.
+    sym_walk: Option<SymWalk<'a>>,
 }
 
 impl<'a> RabitDistCalculator<'a> {
@@ -1011,6 +1222,8 @@ impl<'a> RabitDistCalculator<'a> {
             add_factor_offset: 0.0,
             sqrt_d: (dim as f32 * num_bits as f32).sqrt(),
             sum_q,
+            sym: None,
+            sym_walk: None,
         }
     }
 
@@ -1339,6 +1552,64 @@ impl<'a> RabitDistCalculator<'a> {
     pub(crate) fn raw_query_lower_bound(&self, id: usize, binary_ip: f32) -> Option<f32> {
         let error_factors = self.error_factors?;
         Some(self.raw_query_binary_distance(id, binary_ip) - error_factors[id] * self.query_error)
+    }
+
+    /// How far the walk score of `id` may lie from its reranked score, as
+    /// [`DistCalculator::in_range`] trusts it: the warmup query's quantization
+    /// error plus RaBitQ's 1-bit error bound (with high probability) twice,
+    /// since the 1-bit and the reranked estimates each stay within it of the
+    /// true distance. Unbounded without error factors.
+    #[inline]
+    fn walk_score_error(&self, id: usize, warmup: &WarmupQuery) -> f32 {
+        match self.error_factors {
+            Some(error_factors) => {
+                2.0 * error_factors[id] * self.query_error
+                    + self.scale_factors[id].abs() * warmup.ip_error_bound
+            }
+            None => f32::INFINITY,
+        }
+    }
+
+    /// Score of `id` from its RQ codes, ignoring the sym warmup; for the walk
+    /// calculator this is the score [`VectorStore::rerank`] assigns.
+    #[inline(always)]
+    fn code_distance(&self, id: usize) -> f32 {
+        let code_len = rabit_binary_code_bytes(self.dim);
+        let num_vectors = self.codes.len() / code_len;
+        let dist =
+            compute_single_rq_distance(self.codes, id, num_vectors, code_len, &self.dist_table);
+
+        match self.query_estimator {
+            RabitQueryEstimator::ResidualQuery => {
+                // distance between quantized residual vector and residual query vector
+                let dist_vq_qr = (2.0 * dist - self.sum_q) / self.sqrt_d;
+                dist_vq_qr * self.scale_factors[id] + self.add_factors[id] + self.query_factor
+            }
+            RabitQueryEstimator::RawQuery => {
+                let ex_bits = self.num_bits - 1;
+                if ex_bits == 0 || self.approx_mode == ApproxMode::Fast {
+                    return self.raw_query_binary_distance(id, dist);
+                }
+
+                let ex_codes = self
+                    .ex_codes
+                    .expect("raw-query multi-bit RQ requires ex codes");
+                let ex_add_factors = self
+                    .ex_add_factors
+                    .expect("raw-query multi-bit RQ requires ex add factors");
+                let ex_scale_factors = self
+                    .ex_scale_factors
+                    .expect("raw-query multi-bit RQ requires ex scale factors");
+                self.raw_query_multi_bit_exact_distance(
+                    id,
+                    dist,
+                    ex_bits,
+                    ex_codes,
+                    ex_add_factors,
+                    ex_scale_factors,
+                )
+            }
+        }
     }
 
     #[inline]
@@ -1898,43 +2169,37 @@ pub(crate) fn load_blocked_ex_codes(
 impl DistCalculator for RabitDistCalculator<'_> {
     #[inline(always)]
     fn distance(&self, id: u32) -> f32 {
-        let id = id as usize;
-        let code_len = rabit_binary_code_bytes(self.dim);
-        let num_vectors = self.codes.len() / code_len;
-        let dist =
-            compute_single_rq_distance(self.codes, id, num_vectors, code_len, &self.dist_table);
-
-        match self.query_estimator {
-            RabitQueryEstimator::ResidualQuery => {
-                // distance between quantized residual vector and residual query vector
-                let dist_vq_qr = (2.0 * dist - self.sum_q) / self.sqrt_d;
-                dist_vq_qr * self.scale_factors[id] + self.add_factors[id] + self.query_factor
-            }
-            RabitQueryEstimator::RawQuery => {
-                let ex_bits = self.num_bits - 1;
-                if ex_bits == 0 || self.approx_mode == ApproxMode::Fast {
-                    return self.raw_query_binary_distance(id, dist);
-                }
-
-                let ex_codes = self
-                    .ex_codes
-                    .expect("raw-query multi-bit RQ requires ex codes");
-                let ex_add_factors = self
-                    .ex_add_factors
-                    .expect("raw-query multi-bit RQ requires ex add factors");
-                let ex_scale_factors = self
-                    .ex_scale_factors
-                    .expect("raw-query multi-bit RQ requires ex scale factors");
-                self.raw_query_multi_bit_exact_distance(
-                    id,
-                    dist,
-                    ex_bits,
-                    ex_codes,
-                    ex_add_factors,
-                    ex_scale_factors,
-                )
-            }
+        if let Some(sym) = &self.sym {
+            return sym.distance(id);
         }
+        if let Some(walk) = &self.sym_walk {
+            let id = id as usize;
+            let signs = &walk.signs[id * walk.stride..(id + 1) * walk.stride];
+            let query = &walk.query;
+            let ip = warmup_ip_x0_q(signs, &query.planes, query.delta, query.vl);
+            // Same factor wrap as `raw_query_binary_distance`, with the 4-bit
+            // warmup query standing in for the exact 1-bit inner product.
+            return self.add_factor_scale * (self.add_factors[id] - self.add_factor_offset)
+                + self.query_factor
+                + self.scale_factors[id] * (ip + query.k1xsumq);
+        }
+        self.code_distance(id as usize)
+    }
+
+    fn in_range(&self, id: u32, dist: f32, lower: f32, upper: f32) -> bool {
+        let Some(walk) = &self.sym_walk else {
+            return dist >= lower && dist < upper;
+        };
+        let id = id as usize;
+        let error = self.walk_score_error(id, &walk.query);
+        if dist + error < lower || dist - error >= upper {
+            return false;
+        }
+        if dist - error >= lower && dist + error < upper {
+            return true;
+        }
+        let reranked = self.code_distance(id);
+        reranked >= lower && reranked < upper
     }
 
     #[inline(always)]
@@ -1962,6 +2227,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
         quantized_dists_table: &mut Vec<u8>,
         hacc_quantized_dists: &mut Vec<u32>,
     ) {
+        debug_assert!(self.sym.is_none(), "code-to-code distances are per id");
         let code_len = rabit_binary_code_bytes(self.dim);
         let n = self.codes.len() / code_len;
         if n == 0 {
@@ -2002,6 +2268,28 @@ impl DistCalculator for RabitDistCalculator<'_> {
         );
     }
 
+    #[inline(always)]
+    fn prefetch(&self, id: u32) {
+        if let Some(sym) = &self.sym {
+            sym.prefetch(id);
+            return;
+        }
+        let id = id as usize;
+        if let Some(walk) = &self.sym_walk {
+            // The walk reads the sign words and add/scale, which live in
+            // separate columns.
+            do_prefetch(walk.signs[id * walk.stride..(id + 1) * walk.stride].as_ptr_range());
+            do_prefetch(self.add_factors[id..id + 1].as_ptr_range());
+            do_prefetch(self.scale_factors[id..id + 1].as_ptr_range());
+        } else if let Some(ex) = self.ex_codes
+            && self.ex_code_len > 0
+        {
+            // `rerank` rescores with the ex codes.
+            let off = id * self.ex_code_len;
+            do_prefetch(ex[off..off + self.ex_code_len].as_ptr_range());
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn accumulate_topk_with_scratch(
         &self,
@@ -2015,6 +2303,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
         quantized_dists_table: &mut Vec<u8>,
         hacc_quantized_dists: &mut Vec<u32>,
     ) {
+        debug_assert!(self.sym.is_none(), "code-to-code distances are per id");
         if k == 0 {
             return;
         }
@@ -2207,37 +2496,18 @@ impl VectorStore for RabitQuantizationStorage {
     // qr = (q-c)
     #[inline(never)]
     fn dist_calculator(&self, qr: Arc<dyn Array>, dist_q_c: f32) -> Self::DistanceCalculator<'_> {
-        let code_dim = self.code_dim();
-        let rotated_qr = self.rotate_query_vector(code_dim, &qr);
-        let dist_table = build_dist_table_direct::<Float32Type>(&rotated_qr);
-        let query_factors = match self.metadata.query_estimator {
-            RabitQueryEstimator::ResidualQuery => RabitQueryFactors {
-                add_scale: 1.0,
-                add_offset: 0.0,
-                add: self.residual_query_factor(dist_q_c),
-                error: 0.0,
-            },
-            RabitQueryEstimator::RawQuery => self.raw_query_factors(dist_q_c, &rotated_qr, None),
-        };
-        let sum_q = rotated_qr.iter().copied().sum();
-        // The kernels read the rotated query directly; only unaligned dims
-        // need a zero-padded copy.
-        let ex_query = if code_dim.is_multiple_of(EX_DOT_BLOCK_DIMS) {
-            rotated_qr
-        } else {
-            let mut padded = vec![0.0; padded_query_len(code_dim)];
-            pad_query_into(&rotated_qr, &mut padded);
-            padded
-        };
-
-        self.distance_calculator_from_parts(RabitDistCalculatorParts {
-            dim: code_dim,
-            dist_table: Cow::Owned(dist_table),
-            ex_query: Cow::Owned(ex_query),
-            sum_q,
-            query_factors,
-            approx_mode: ApproxMode::Normal,
-        })
+        let mut calc = self.code_calculator(qr.as_ref(), dist_q_c);
+        // `IVF_HNSW_RQ` walks its graph on the 1-bit warmup; `rerank` and
+        // `dist_calculator_from_id` build their calculators without it.
+        if let Some(sym) = &self.sym {
+            let rotated = &calc.ex_query.as_ref()[..calc.dim];
+            calc.sym_walk = Some(SymWalk {
+                signs: sym.signs.values(),
+                stride: sign_word_bytes(calc.dim),
+                query: prepare_warmup_query(rotated),
+            });
+        }
+        calc
     }
 
     // qr = (q-c)
@@ -2342,10 +2612,55 @@ impl VectorStore for RabitQuantizationStorage {
         })
     }
 
-    // TODO: implement this
-    // This method is required for HNSW, we can't support HNSW_RABIT before this is implemented
-    fn dist_calculator_from_id(&self, _: u32) -> Self::DistanceCalculator<'_> {
-        unimplemented!("RabitQ does not support dist_calculator_from_id")
+    fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
+        let Some(sym) = &self.sym else {
+            unimplemented!("RabitQ does not support dist_calculator_from_id")
+        };
+        assert_eq!(
+            sym.factors.len(),
+            self.len(),
+            "IVF_HNSW_RQ graph builds need the partition centroid (VectorStore::with_centroid)"
+        );
+        let table = self.sym_table(sym);
+        let mut calc = self.distance_calculator_from_parts(RabitDistCalculatorParts {
+            dim: self.code_dim(),
+            dist_table: Cow::Owned(Vec::new()),
+            ex_query: Cow::Owned(Vec::new()),
+            sum_q: 0.0,
+            query_factors: RabitQueryFactors {
+                add_scale: 1.0,
+                add_offset: 0.0,
+                add: 0.0,
+                error: 0.0,
+            },
+            approx_mode: ApproxMode::Normal,
+        });
+        calc.sym = Some(SymFromIdCalculator {
+            source: table.code(id as usize),
+            table,
+        });
+        calc
+    }
+
+    fn rerank(&self, query: ArrayRef, dist_q_c: f32, results: &mut [OrderedNode]) -> bool {
+        // The walk scored the candidates with the 4-bit warmup query; rescore
+        // them with the full query and codes.
+        let calc = self.code_calculator(query.as_ref(), dist_q_c);
+        for i in 0..results.len() {
+            if let Some(next) = results.get(i + 1) {
+                calc.prefetch(next.id);
+            }
+            results[i].dist = OrderedFloat(calc.distance(results[i].id));
+        }
+        results.sort_unstable_by_key(|node| node.dist);
+        true
+    }
+
+    fn with_centroid(mut self, centroid: &dyn Array) -> Result<Self> {
+        if let Some(sym) = self.sym.as_ref() {
+            self.sym = Some(Arc::new(self.derive_sym_state(sym, centroid)));
+        }
+        Ok(self)
     }
 }
 
@@ -2603,6 +2918,13 @@ impl QuantizerStorage for RabitQuantizationStorage {
                 expected_code_bytes
             )));
         }
+        if metadata.graph_sub_index && metadata.query_estimator != RabitQueryEstimator::RawQuery {
+            return Err(Error::invalid_input(
+                "IVF_HNSW_RQ needs the raw-query estimator: rebuild the index, or pass a \
+                 raw-query rabitq_model"
+                    .to_string(),
+            ));
+        }
         let add_factors = batch[ADD_FACTORS_COLUMN]
             .as_primitive::<Float32Type>()
             .clone();
@@ -2665,6 +2987,16 @@ impl QuantizerStorage for RabitQuantizationStorage {
                 metadata.num_bits
             )));
         }
+        let sym = if metadata.graph_sub_index {
+            let row_major_codes = if metadata.packed {
+                Cow::Owned(unpack_codes(&codes))
+            } else {
+                Cow::Borrowed(&codes)
+            };
+            Some(Arc::new(SymState::new(&row_major_codes)))
+        } else {
+            None
+        };
 
         let (batch, codes) = if !metadata.packed {
             let codes = pack_codes(&codes);
@@ -2693,6 +3025,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             packed_ex_codes,
             ex_add_factors,
             ex_scale_factors,
+            sym,
         };
 
         match build_frag_reuse_mapping(fri.as_deref(), &storage.row_ids) {
@@ -2784,6 +3117,11 @@ impl QuantizerStorage for RabitQuantizationStorage {
         let ex_scale_factors = batch
             .column_by_name(EX_SCALE_FACTORS_COLUMN)
             .map(|factors| factors.as_primitive::<Float32Type>().clone());
+        // The caller re-derives the factors of a graph it rebuilds.
+        let sym = self
+            .sym
+            .as_ref()
+            .map(|_| Arc::new(SymState::new(&new_codes)));
 
         Ok(Self {
             metadata: self.metadata.clone(),
@@ -2798,6 +3136,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             ex_add_factors,
             ex_scale_factors,
             row_ids: new_row_ids,
+            sym,
         })
     }
 }
@@ -2922,8 +3261,16 @@ mod tests {
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
 
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::prefilter::{NoFilter, PreFilter};
+    use crate::vector::bq::transform::RQTransformer;
     use crate::vector::bq::{RQRotationType, builder::RabitQuantizer};
+    use crate::vector::hnsw::HNSW;
+    use crate::vector::hnsw::builder::{HnswBuildParams, HnswQueryParams};
     use crate::vector::quantizer::{Quantization, QuantizerStorage};
+    use crate::vector::transform::Transformer;
+    use crate::vector::v3::subindex::IvfSubIndex;
+    use crate::vector::{CENTROID_DIST_COLUMN, DIST_COL, PART_ID_COLUMN};
 
     fn build_dist_table_not_optimized<T: ArrowFloatType>(
         sub_vec: &[T::Native],
@@ -3362,6 +3709,7 @@ mod tests {
             num_bits: 2,
             packed: false,
             query_estimator: RabitQueryEstimator::RawQuery,
+            graph_sub_index: false,
         };
         let codes =
             FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0xff, 0xff]), 1).unwrap();
@@ -3488,6 +3836,7 @@ mod tests {
                         num_bits,
                         packed: false,
                         query_estimator: RabitQueryEstimator::RawQuery,
+                        graph_sub_index: false,
                     };
                     let codes = FixedSizeListArray::try_new_from_values(
                         UInt8Array::from(code_bytes),
@@ -3652,6 +4001,7 @@ mod tests {
             num_bits: 2,
             packed: false,
             query_estimator: RabitQueryEstimator::RawQuery,
+            graph_sub_index: false,
         };
         let codes =
             FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0xff, 0xff]), 1).unwrap();
@@ -3823,6 +4173,7 @@ mod tests {
             num_bits,
             packed: false,
             query_estimator: RabitQueryEstimator::RawQuery,
+            graph_sub_index: false,
         };
         let code_len = rabit_binary_code_bytes(code_dim);
         let codes = FixedSizeListArray::try_new_from_values(
@@ -4027,6 +4378,7 @@ mod tests {
             num_bits,
             packed: false,
             query_estimator: RabitQueryEstimator::RawQuery,
+            graph_sub_index: false,
         };
         let codes = FixedSizeListArray::try_new_from_values(
             UInt8Array::from_iter_values((0..num_rows).map(|idx| (idx * 19) as u8)),
@@ -4111,6 +4463,7 @@ mod tests {
             num_bits,
             packed: false,
             query_estimator: RabitQueryEstimator::RawQuery,
+            graph_sub_index: false,
         };
         let codes = FixedSizeListArray::try_new_from_values(
             UInt8Array::from_iter_values((0..num_rows).map(|idx| (idx * 19) as u8)),
@@ -4429,6 +4782,7 @@ mod tests {
             num_bits: 1,
             packed: false,
             query_estimator: RabitQueryEstimator::RawQuery,
+            graph_sub_index: false,
         };
         let codes =
             FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0xff, 0x00]), 1).unwrap();
@@ -4463,6 +4817,7 @@ mod tests {
             num_bits: 2,
             packed: false,
             query_estimator: RabitQueryEstimator::RawQuery,
+            graph_sub_index: false,
         };
         let codes =
             FixedSizeListArray::try_new_from_values(UInt8Array::from(vec![0xff, 0xff]), 1).unwrap();
@@ -5172,5 +5527,358 @@ mod tests {
                  error {error} over the {quantization_bound} quantization bound",
             );
         }
+    }
+
+    /// `residuals` encoded by the production transformer as one `IVF_HNSW_RQ`
+    /// partition around `centroid`, with its graph factors derived.
+    fn encode_sym_partition(
+        rq: &RabitQuantizer,
+        distance_type: DistanceType,
+        residuals: FixedSizeListArray,
+        centroid: &Float32Array,
+    ) -> RabitQuantizationStorage {
+        let num_rows = residuals.len();
+        let centroid_dists: Vec<f32> = residuals
+            .values()
+            .as_primitive::<Float32Type>()
+            .values()
+            .chunks_exact(centroid.len())
+            .map(|row| row.iter().map(|value| value * value).sum())
+            .collect();
+        let centroids =
+            FixedSizeListArray::try_new_from_values(centroid.clone(), centroid.len() as i32)
+                .unwrap();
+        let transformer =
+            RQTransformer::new(rq.clone(), distance_type, centroids, "vector").unwrap();
+        let batch = RecordBatch::try_from_iter(vec![
+            ("vector", Arc::new(residuals) as ArrayRef),
+            (
+                PART_ID_COLUMN,
+                Arc::new(UInt32Array::from(vec![0u32; num_rows])) as ArrayRef,
+            ),
+            (
+                CENTROID_DIST_COLUMN,
+                Arc::new(Float32Array::from(centroid_dists)) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let batch = transformer
+            .transform(&batch)
+            .unwrap()
+            .try_with_column(
+                lance_core::ROW_ID_FIELD.clone(),
+                Arc::new(UInt64Array::from_iter_values(0..num_rows as u64)) as ArrayRef,
+            )
+            .unwrap();
+        RabitQuantizationStorage::try_from_batch(batch, &rq.metadata(None), distance_type, None)
+            .unwrap()
+            .with_centroid(centroid)
+            .unwrap()
+    }
+
+    /// An `IVF_HNSW_RQ` partition of `num_rows` 64-dim rows around a nonzero
+    /// centroid.
+    fn sym_storage(
+        num_bits: u8,
+        distance_type: DistanceType,
+        num_rows: usize,
+    ) -> RabitQuantizationStorage {
+        let dim = 64;
+        let residuals = Float32Array::from_iter_values((0..num_rows * dim).map(|i| {
+            let (row, d) = (i / dim, i % dim);
+            (((row * 7 + d * 3) % 11) as f32 - 5.0) * 0.05 * (1 + row % 4) as f32
+        }));
+        let residuals = FixedSizeListArray::try_new_from_values(residuals, dim as i32).unwrap();
+        let mut rq = RabitQuantizer::new_with_rotation::<Float32Type>(
+            num_bits,
+            dim as i32,
+            RQRotationType::Fast,
+        );
+        rq.metadata.graph_sub_index = true;
+        let centroid = Float32Array::from(vec![0.25; dim]);
+        encode_sym_partition(&rq, distance_type, residuals, &centroid)
+    }
+
+    /// `IVF_HNSW_RQ` stores no factors of its own: rebuilt from the RQ factors
+    /// and the centroid, they score every pair as the factors of the rotated
+    /// residuals do, to f32 rounding at the scale the pair's terms cancel at.
+    #[rstest]
+    fn test_sym_factors_derive_from_rq_factors(
+        #[values(1, 2, 3, 5, 8, 9)] num_bits: u8,
+        #[values(DistanceType::L2, DistanceType::Dot)] distance_type: DistanceType,
+        #[values(RQRotationType::Fast, RQRotationType::Matrix)] rotation_type: RQRotationType,
+        #[values(64, 104)] dim: usize,
+    ) {
+        let num_rows = 48;
+        let mut rng = SmallRng::seed_from_u64(dim as u64 * 131 + num_bits as u64);
+        let centroid =
+            Float32Array::from_iter_values((0..dim).map(|_| rng.random_range(-2.0f32..2.0)));
+        let residuals = Float32Array::from_iter_values(
+            (0..num_rows * dim)
+                .map(|i| rng.random_range(-1.0f32..1.0) * (0.1 + (i / dim % 7) as f32 * 0.15)),
+        );
+        let residuals = FixedSizeListArray::try_new_from_values(residuals, dim as i32).unwrap();
+        let mut rq =
+            RabitQuantizer::new_with_rotation::<Float32Type>(num_bits, dim as i32, rotation_type);
+        rq.metadata.graph_sub_index = true;
+
+        // The reference factors, from the rotated residuals themselves.
+        let split = rq.quantize_split(&residuals).unwrap();
+        let rotated = split.rotated_residuals.unwrap();
+        let ex_codes = split
+            .ex_code_values
+            .unwrap_or_else(|| vec![0; rotated.len()]);
+        let centroids =
+            FixedSizeListArray::try_new_from_values(centroid.clone(), dim as i32).unwrap();
+        let rotated_centroid = rq.rotate_fsl_to_f32(&centroids).unwrap();
+        let centroid_norm_sq: f32 = rotated_centroid.iter().map(|value| value * value).sum();
+        let code_dim = rotated_centroid.len();
+        let code_bias = ((1u32 << num_bits) - 1) as f32 / 2.0;
+        // Each row's factors and `‖r‖²`.
+        let reference: Vec<(SymFactors, f32)> = rotated
+            .chunks_exact(code_dim)
+            .zip(ex_codes.chunks_exact(code_dim))
+            .map(|(row, ex)| {
+                let (mut norm_sq, mut ip, mut ip_cent) = (0.0f32, 0.0f32, 0.0f32);
+                for ((&r, &ex), &c) in row.iter().zip(ex).zip(&rotated_centroid) {
+                    let code = ((r.is_sign_positive() as u32) << (num_bits - 1)) + ex as u32;
+                    norm_sq += r * r;
+                    ip += r * (code as f32 - code_bias);
+                    ip_cent += r * c;
+                }
+                let base = match distance_type {
+                    DistanceType::Dot => ip_cent + 0.5 * centroid_norm_sq,
+                    _ => norm_sq,
+                };
+                let kappa = if norm_sq > 0.0 { norm_sq / ip } else { 0.0 };
+                (SymFactors { kappa, base }, norm_sq)
+            })
+            .collect();
+
+        let storage = encode_sym_partition(&rq, distance_type, residuals, &centroid);
+        let table = storage.sym_table(storage.sym.as_ref().unwrap());
+        let reference_code = |id: usize| {
+            let (signs, ex) = table.bits(id);
+            SymCode {
+                signs,
+                ex,
+                factors: reference[id].0,
+            }
+        };
+        for a in 0..num_rows {
+            for b in a + 1..num_rows {
+                let (ra, rb) = (reference_code(a), reference_code(b));
+                let want = sym_dist(&ra, &rb, code_dim, num_bits, distance_type);
+                let got = sym_dist(
+                    &table.code(a),
+                    &table.code(b),
+                    code_dim,
+                    num_bits,
+                    distance_type,
+                );
+                let ((fa, norm_a), (fb, norm_b)) = (reference[a], reference[b]);
+                let scale = match distance_type {
+                    DistanceType::Dot => {
+                        1.0 + fa.base.abs() + fb.base.abs() + (norm_a * norm_b).sqrt()
+                    }
+                    _ => norm_a + norm_b,
+                };
+                assert!(
+                    (got - want).abs() <= 1e-5 * scale,
+                    "rows {a}, {b}: {got} vs {want}"
+                );
+            }
+        }
+    }
+
+    fn residual_query_array(dim: usize) -> (ArrayRef, f32) {
+        let values: Vec<f32> = (0..dim).map(|d| ((d % 5) as f32 - 2.0) * 0.2).collect();
+        let dist_q_c = values.iter().map(|value| value * value).sum();
+        (Arc::new(Float32Array::from(values)) as ArrayRef, dist_q_c)
+    }
+
+    /// The walk wraps the 4-bit warmup inner product with the raw-query
+    /// factors, whose add-factor scale differs from the identity for Dot.
+    #[rstest]
+    fn test_sym_walk_uses_raw_query_factor_wrap(
+        #[values(1, 5)] num_bits: u8,
+        #[values(DistanceType::L2, DistanceType::Dot)] distance_type: DistanceType,
+    ) {
+        let storage = sym_storage(num_bits, distance_type, 4);
+        let sym = storage.sym.as_ref().unwrap();
+        let (query, dist_q_c) = residual_query_array(storage.code_dim());
+        let calc = storage.dist_calculator(query.clone(), dist_q_c);
+        let rotated = storage.rotate_query_vector(storage.code_dim(), query.as_ref());
+        let warmup = prepare_warmup_query(&rotated);
+        let factors = storage.raw_query_factors(dist_q_c, &rotated, None);
+        let stride = sign_word_bytes(storage.code_dim());
+        for id in 0..storage.len() {
+            let signs = &sym.signs.values()[id * stride..(id + 1) * stride];
+            let ip = warmup_ip_x0_q(signs, &warmup.planes, warmup.delta, warmup.vl);
+            let want = factors.add_scale * (storage.add_factors.value(id) - factors.add_offset)
+                + factors.add
+                + storage.scale_factors.value(id) * (ip + warmup.k1xsumq);
+            let got = calc.distance(id as u32);
+            assert!(
+                (got - want).abs() <= 1e-5 * want.abs().max(1.0),
+                "{id}: {got} != {want}"
+            );
+        }
+    }
+
+    struct AllowedRowsPreFilter {
+        mask: Arc<lance_select::RowAddrMask>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::prefilter::PreFilter for AllowedRowsPreFilter {
+        async fn wait_for_ready(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_empty(&self) -> bool {
+            false
+        }
+
+        fn mask(&self) -> Arc<lance_select::RowAddrMask> {
+            self.mask.clone()
+        }
+
+        fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+            self.mask.selected_indices(row_ids)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum RangeSearchPath {
+        Graph,
+        SparseMask,
+        Acorn,
+    }
+
+    /// HNSW range bounds judge the reranked score, not the warmup score, on
+    /// the graph walk, the sparse-mask flat scan and the ACORN walk, at 1 bit
+    /// too. 32 rows put a one-row mask below HNSW's 10% flat-scan threshold.
+    #[rstest]
+    #[case::graph_drops_reranked_out(RangeSearchPath::Graph, false)]
+    #[case::graph_keeps_reranked_in(RangeSearchPath::Graph, true)]
+    #[case::sparse_mask_drops_reranked_out(RangeSearchPath::SparseMask, false)]
+    #[case::sparse_mask_keeps_reranked_in(RangeSearchPath::SparseMask, true)]
+    #[case::acorn_drops_reranked_out(RangeSearchPath::Acorn, false)]
+    #[case::acorn_keeps_reranked_in(RangeSearchPath::Acorn, true)]
+    fn test_hnsw_range_bounds_apply_to_reranked_distance(
+        #[case] path: RangeSearchPath,
+        #[case] reranked_in_range: bool,
+        #[values(1, 5)] num_bits: u8,
+    ) {
+        let num_rows = 32usize;
+        let storage = sym_storage(num_bits, DistanceType::L2, num_rows);
+        let hnsw = HNSW::index_vectors(&storage, HnswBuildParams::default()).unwrap();
+        let (query, dist_q_c) = residual_query_array(storage.code_dim());
+
+        let walk = storage.dist_calculator(query.clone(), dist_q_c);
+        let warmup: Vec<f32> = (0..num_rows as u32).map(|id| walk.distance(id)).collect();
+        let mut reranked: Vec<OrderedNode> = warmup
+            .iter()
+            .enumerate()
+            .map(|(id, dist)| OrderedNode::new(id as u32, (*dist).into()))
+            .collect();
+        // `rerank` rescores with the full codes and sorts.
+        assert!(storage.rerank(query.clone(), dist_q_c, &mut reranked));
+        assert!(reranked.is_sorted_by_key(|node| node.dist));
+        let full = storage.code_calculator(query.as_ref(), dist_q_c);
+        let final_dist: Vec<f32> = (0..num_rows as u32).map(|id| full.distance(id)).collect();
+        assert!(
+            reranked
+                .iter()
+                .all(|node| node.dist.0 == final_dist[node.id as usize])
+        );
+        let target = (0..num_rows)
+            .max_by(|&a, &b| {
+                let gap = |id: usize| (warmup[id] - final_dist[id]).abs();
+                gap(a).total_cmp(&gap(b))
+            })
+            .unwrap();
+        let (walk_dist, exact_dist) = (warmup[target], final_dist[target]);
+        assert!((walk_dist - exact_dist).abs() > 1e-3);
+        // Close to the warmup score so the bound stays within the target's
+        // walk score error for any rotation.
+        let bound = walk_dist + (exact_dist - walk_dist) / 4.0;
+        // The bound separates the two scores, admitting only one of them.
+        let (lower, upper) = if (exact_dist < walk_dist) != reranked_in_range {
+            (Some(bound), None)
+        } else {
+            (None, Some(bound))
+        };
+
+        let allowed_rows = |rows: Vec<u64>| -> Arc<dyn PreFilter> {
+            Arc::new(AllowedRowsPreFilter {
+                mask: Arc::new(lance_select::RowAddrMask::from_allowed(
+                    lance_select::RowAddrTreeMap::from_iter(rows),
+                )),
+            })
+        };
+        let prefilter = match path {
+            RangeSearchPath::Graph => Arc::new(NoFilter) as Arc<dyn PreFilter>,
+            RangeSearchPath::SparseMask => allowed_rows(vec![target as u64]),
+            RangeSearchPath::Acorn => {
+                let excluded = (target + 1) % num_rows;
+                allowed_rows(
+                    (0..num_rows)
+                        .filter(|&row| row != excluded)
+                        .map(|row| row as u64)
+                        .collect(),
+                )
+            }
+        };
+        let batch = hnsw
+            .search(
+                query.clone(),
+                num_rows,
+                HnswQueryParams {
+                    ef: num_rows,
+                    lower_bound: lower,
+                    upper_bound: upper,
+                    dist_q_c,
+                    use_acorn: matches!(path, RangeSearchPath::Acorn),
+                },
+                &storage,
+                prefilter,
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        let dists = batch[DIST_COL].as_primitive::<Float32Type>().values();
+        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+        let context = format!(
+            "target={target} warmup={walk_dist} reranked={exact_dist} \
+             lower={lower:?} upper={upper:?} returned={row_ids:?} {dists:?}"
+        );
+        for dist in dists.iter() {
+            assert!(
+                *dist >= lower.unwrap_or(f32::MIN) && *dist < upper.unwrap_or(f32::MAX),
+                "{context}"
+            );
+        }
+        assert_eq!(
+            row_ids.contains(&(target as u64)),
+            reranked_in_range,
+            "{context}"
+        );
+    }
+
+    #[test]
+    fn test_try_from_batch_requires_raw_query_for_hnsw() {
+        let codes = make_test_codes(4, 64);
+        let code_dim = codes.value_length() as usize * 8;
+        let ex_codes = make_test_ex_codes(codes.len(), code_dim, 2);
+        let batch = make_test_batch_with_ex(codes, ex_codes);
+        let mut metadata = make_test_metadata(code_dim);
+        metadata.num_bits = 2;
+        metadata.graph_sub_index = true;
+        metadata.query_estimator = RabitQueryEstimator::ResidualQuery;
+        let err =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+                .unwrap_err();
+        assert!(err.to_string().contains("raw-query estimator"), "{err}");
     }
 }

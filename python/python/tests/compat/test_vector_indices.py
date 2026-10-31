@@ -356,3 +356,49 @@ class IvfRqVectorIndex(UpgradeDowngradeTest):
         ds.insert(data)
         ds.optimize.optimize_indices()
         ds.optimize.compact_files()
+
+
+@compat_test(min_version="4.0.0-beta.8")
+class IvfHnswRqVectorIndex(UpgradeDowngradeTest):
+    """Test that releases without IVF_HNSW_RQ ignore it.
+
+    IVF_HNSW_RQ records an index version above the vector versions they read,
+    so they answer vector queries by a flat search instead of failing to open
+    the index. Only the current build can create it.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create(self):
+        """Create a dataset that the current build indexes with IVF_HNSW_RQ."""
+        shutil.rmtree(self.path, ignore_errors=True)
+        ndims = 32
+        nvecs = 512
+
+        data = pa.table(
+            {
+                "id": pa.array(range(nvecs)),
+                "vec": pa.FixedSizeListArray.from_arrays(
+                    pc.random(ndims * nvecs).cast(pa.float32()), ndims
+                ),
+            }
+        )
+        dataset = lance.write_dataset(
+            data,
+            self.path,
+            data_storage_version=safe_data_storage_version(self.compat_version),
+        )
+        if not self._running_in_old_venv:
+            dataset.create_index("vec", "IVF_HNSW_RQ", num_partitions=1, num_bits=5)
+
+    def check_read(self):
+        """Verify vector queries run, exactly so where the index is skipped."""
+        ds = lance.dataset(self.path)
+        q = np.random.random(32).astype(np.float32)
+        nearest = {"q": q, "k": 4, "column": "vec"}
+        result = ds.to_table(nearest=nearest, columns=["id"])
+        assert result.num_rows == 4
+        if self._running_in_old_venv:
+            exact = ds.to_table(nearest={**nearest, "use_index": False}, columns=["id"])
+            assert result["id"].to_pylist() == exact["id"].to_pylist()

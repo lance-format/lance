@@ -41,6 +41,7 @@ use crate::vector::graph::{
 };
 use crate::vector::graph::{
     Visited, beam_search_acorn, beam_search_borrowed, greedy_search, greedy_search_borrowed,
+    range_filter,
 };
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::v3::subindex::IvfSubIndex;
@@ -641,12 +642,11 @@ impl HNSW {
         prefilter_bitset: Visited,
         params: &HnswQueryParams,
     ) -> (Vec<OrderedNode>, usize) {
-        let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
-        let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
         // every set bit gets exactly one distance on both branches below
         let comparisons = prefilter_bitset.count_ones();
 
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
+        let in_range = range_filter(params, &dist_calc);
         let mut heap = BinaryHeap::<OrderedNode>::with_capacity(k);
 
         match self.inner.params.prefetch_distance {
@@ -670,7 +670,7 @@ impl HNSW {
                     }
 
                     let dist: OrderedFloat = dist_calc.distance(node_id).into();
-                    if dist < lower_bound || dist >= upper_bound {
+                    if !in_range(node_id, dist) {
                         continue;
                     }
                     if heap.len() < k {
@@ -684,7 +684,7 @@ impl HNSW {
             _ => {
                 for node_id in prefilter_bitset.iter_ones().map(|i| i as u32) {
                     let dist: OrderedFloat = dist_calc.distance(node_id).into();
-                    if dist < lower_bound || dist >= upper_bound {
+                    if !in_range(node_id, dist) {
                         continue;
                     }
                     if heap.len() < k {
@@ -1721,8 +1721,10 @@ impl IvfSubIndex for HNSW {
             .visited_generator_queue
             .pop()
             .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
-        let (results, comparisons) = if prefilter.is_empty() {
-            self.search_basic(query, k, &params, None, storage)?
+        let rerank_query = query.clone();
+        // Every path keeps `ef` candidates for `VectorStore::rerank`.
+        let (mut results, comparisons) = if prefilter.is_empty() {
+            self.search_basic(query, params.ef, &params, None, storage)?
         } else {
             // the bitset must be moved into a callee on every path so its
             // borrow of `prefilter_generator` ends before the push below
@@ -1735,33 +1737,50 @@ impl IvfSubIndex for HNSW {
             if remained == storage.len() {
                 // mask passes every row: same as unfiltered
                 drop(prefilter_bitset);
-                self.search_basic(query, k, &params, None, storage)?
+                self.search_basic(query, params.ef, &params, None, storage)?
             } else if remained < self.len() * 10 / 100 {
                 // few matching rows: brute force is cheaper and exact
-                self.flat_search(storage, query, k, prefilter_bitset, &params)
+                self.flat_search(storage, query, params.ef, prefilter_bitset, &params)
             } else if params.use_acorn {
-                let (acorn_results, acorn_comparisons) =
-                    self.search_acorn(query.clone(), k, &params, &prefilter_bitset, storage)?;
+                let (acorn_results, acorn_comparisons) = self.search_acorn(
+                    query.clone(),
+                    params.ef,
+                    &params,
+                    &prefilter_bitset,
+                    storage,
+                )?;
                 // under-delivery means the budget ran out on a fragmented
                 // mask, except range-bounded queries which return short
                 // legitimately
                 let bounded = params.lower_bound.is_some() || params.upper_bound.is_some();
                 if !bounded && acorn_results.len() < k.min(remained) {
                     // the abandoned ACORN traversal still cost its distances
-                    let (results, basic_comparisons) =
-                        self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?;
+                    let (results, basic_comparisons) = self.search_basic(
+                        query,
+                        params.ef,
+                        &params,
+                        Some(prefilter_bitset),
+                        storage,
+                    )?;
                     (results, acorn_comparisons + basic_comparisons)
                 } else {
                     drop(prefilter_bitset);
                     (acorn_results, acorn_comparisons)
                 }
             } else {
-                self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?
+                self.search_basic(query, params.ef, &params, Some(prefilter_bitset), storage)?
             }
         };
         metrics.record_comparisons(comparisons);
         // if the queue is full, we just don't push it back, so ignore the error here
         let _ = self.inner.visited_generator_queue.push(prefilter_generator);
+        if storage.rerank(rerank_query, params.dist_q_c, &mut results) {
+            // The search applied the bounds to the scores rerank replaced.
+            let lower = params.lower_bound.unwrap_or(f32::MIN);
+            let upper = params.upper_bound.unwrap_or(f32::MAX);
+            results.retain(|node| node.dist.0 >= lower && node.dist.0 < upper);
+        }
+        results.truncate(k);
 
         // need to unique by row ids in case of searching multivector
         let (row_ids, dists): (Vec<_>, Vec<_>) = results

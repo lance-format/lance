@@ -302,10 +302,11 @@ fn train_pq_model<'py>(
 
 /// Mint one RaBitQ rotation and return it as a JSON string.
 ///
-/// Distributed IVF_RQ builds must pin a single rotation across all workers so that
-/// independently built per-fragment segments rotate vectors identically and their
-/// binary codes remain comparable when merged. A driver calls this once and broadcasts
-/// the resulting string to every `create_index_uncommitted(..., rabitq_model=...)` call.
+/// Distributed IVF_RQ and IVF_HNSW_RQ builds must pin a single rotation across all
+/// workers so that independently built per-fragment segments rotate vectors identically
+/// and their binary codes remain comparable when merged. A driver calls this once and
+/// broadcasts the resulting string to every `create_index_uncommitted(..., rabitq_model=...)`
+/// call.
 ///
 /// The rotation is always the "fast" rotation since its sign vector is JSON-serializable,
 /// whereas the "matrix" rotation stores a dense matrix in a binary buffer that is dropped by

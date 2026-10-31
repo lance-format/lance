@@ -24,6 +24,7 @@ use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::raw_body::{read_raw_batch, write_raw_batch};
 use lance_index::vector::bq::storage::{RabitQuantizationMetadata, RabitQueryEstimator};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatMetadata, FlatQuantizer};
+use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::pq::storage::ProductQuantizationMetadata;
 use lance_index::vector::quantizer::{Quantization, QuantizerStorage};
@@ -501,6 +502,7 @@ impl<S: IvfSubIndex> CacheCodecImpl for PartitionEntry<S, RabitQuantizer> {
             // The storage batch already has packed codes; skip re-packing.
             packed: true,
             query_estimator,
+            graph_sub_index: S::name() == HNSW::name(),
         };
         let storage = <RabitQuantizer as Quantization>::Storage::try_from_batch(
             storage_batch,
@@ -1068,6 +1070,12 @@ mod tests {
             restored.storage.metadata().query_estimator,
             RabitQueryEstimator::RawQuery
         );
+        assert!(!restored.storage.metadata().graph_sub_index);
+
+        // The sub-index flag is not serialized; an HNSW partition restores it.
+        let entry = PartitionEntry::<HNSW, RabitQuantizer>::new(HNSW::empty(), restored.storage);
+        let restored = de_body::<PartitionEntry<HNSW, RabitQuantizer>>(ser_body(&entry)).unwrap();
+        assert!(restored.storage.metadata().graph_sub_index);
     }
 
     /// Matrix rotation writes an extra `rotate_mat` IPC section between the

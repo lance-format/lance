@@ -242,6 +242,10 @@ pub trait QuantizerMetadata:
         // do nothing
     }
 
+    /// Whether an HNSW sub-index walks the storage. Only RQ reads it; it is
+    /// not persisted.
+    fn set_graph_sub_index(&mut self, _graph_sub_index: bool) {}
+
     // parse the extra metadata bytes from global buffer,
     // and set the metadata fields
     fn parse_buffer(&mut self, _bytes: Bytes) -> Result<()> {

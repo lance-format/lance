@@ -237,6 +237,7 @@ impl RabitQuantizationStorage {
             packed_ex_codes: None,
             ex_add_factors: None,
             ex_scale_factors: None,
+            sym: None,
         })
     }
 
