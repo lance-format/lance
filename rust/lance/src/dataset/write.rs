@@ -1221,6 +1221,18 @@ where
                 let last_fragment = fragments.last_mut().unwrap();
                 last_fragment.physical_rows = Some(num_rows as usize);
                 last_fragment.files.push(data_file);
+                // Notify after pushing the data file so it's tracked for cleanup
+                // if the callback fails.
+                if let Err(e) = params.progress.complete(last_fragment).await {
+                    cleanup_data_fragments(
+                        &object_store,
+                        base_dir,
+                        cleanup_bases.as_deref(),
+                        &fragments,
+                    )
+                    .await;
+                    return Err(e);
+                }
                 if let Some(cb) = &params.write_progress {
                     cb.call(WriteStats {
                         bytes_written: bytes_completed,
@@ -2673,15 +2685,19 @@ mod tests {
     use std::collections::HashMap;
     #[cfg(windows)]
     use std::path::{Component, Prefix};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use arrow_array::{
         Int32Array, LargeBinaryArray, RecordBatchIterator, RecordBatchReader, StringArray,
         StringViewArray, StructArray, UInt64Array,
     };
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+    use async_trait::async_trait;
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
     use datafusion_physical_plan::RecordBatchStream;
     use futures::TryStreamExt;
+    use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::chunker::chunk_stream;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_file::version::ConcreteFileVersion;
@@ -5033,10 +5049,9 @@ mod tests {
     async fn test_cleanup_data_files_on_failed_write_multi_file() {
         // Verify cleanup when a failure occurs after one file has already been completed
         // (i.e., max_rows_per_file causes a file boundary before the error).
-        use lance_core::utils::tempfile::TempStrDir;
-
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
+        let progress = Arc::new(RecordingProgress::default());
 
         let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
@@ -5050,7 +5065,8 @@ mod tests {
                 .await
                 .unwrap();
 
-        // 3 rows per file; 2 good batches of 3 rows (fills one file), then error.
+        // 3 rows per file; the first batch fills one file, the second leaves the
+        // next file open when the stream fails.
         let good_batch = RecordBatch::try_new(
             arrow_schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
@@ -5058,7 +5074,7 @@ mod tests {
         .unwrap();
         let items: Vec<std::result::Result<RecordBatch, DataFusionError>> = vec![
             Ok(good_batch.clone()),
-            Ok(good_batch.clone()),
+            Ok(good_batch.slice(0, 1)),
             Err(DataFusionError::External("injected failure".into())),
         ];
         let stream = Box::pin(RecordBatchStreamAdapter::new(
@@ -5075,6 +5091,7 @@ mod tests {
             stream,
             WriteParams {
                 max_rows_per_file: 3,
+                progress: progress.clone(),
                 ..Default::default()
             },
             None,
@@ -5085,11 +5102,210 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err(), "Expected write to fail");
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, Error::External { .. }),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("injected failure"),
+            "unexpected error: {error}"
+        );
+        // The closed file is reported, the one open at the failure is not.
+        let calls = progress.calls.lock().unwrap();
+        assert!(
+            matches!(
+                calls.as_slice(),
+                [HookCall::Begin(_), HookCall::Complete(closed), HookCall::Begin(_)]
+                    if closed.physical_rows == Some(3)
+            ),
+            "unexpected calls: {calls:?}"
+        );
         assert_eq!(
             count_data_files(test_uri),
             0,
             "All data files (including completed ones) should be cleaned up on failure"
+        );
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum HookCall {
+        Begin(Fragment),
+        Complete(Fragment),
+    }
+
+    /// Records every hook call with the fragment it saw, and fails the `complete`
+    /// call numbered `fail_complete_at`, counted from 1.
+    #[derive(Debug, Default)]
+    struct RecordingProgress {
+        calls: Mutex<Vec<HookCall>>,
+        fail_complete_at: Option<usize>,
+    }
+
+    #[async_trait]
+    impl WriteFragmentProgress for RecordingProgress {
+        async fn begin(&self, fragment: &Fragment) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(HookCall::Begin(fragment.clone()));
+            Ok(())
+        }
+
+        async fn complete(&self, fragment: &Fragment) -> Result<()> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(HookCall::Complete(fragment.clone()));
+            let completed = calls
+                .iter()
+                .filter(|call| matches!(call, HookCall::Complete(_)))
+                .count();
+            if self.fail_complete_at == Some(completed) {
+                return Err(Error::invalid_input(format!(
+                    "injected failure of complete call {completed}"
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    fn id_batch(num_rows: u64) -> RecordBatch {
+        gen_batch()
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .into_batch_rows(RowCount::from(num_rows))
+            .unwrap()
+    }
+
+    async fn write_id_batches(
+        test_uri: &str,
+        items: Vec<std::result::Result<RecordBatch, DataFusionError>>,
+        params: WriteParams,
+    ) -> Result<Vec<Fragment>> {
+        let arrow_schema = id_batch(0).schema();
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let (object_store, base_dir) =
+            ObjectStore::from_uri_and_params(Default::default(), test_uri, &Default::default())
+                .await
+                .unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            arrow_schema,
+            futures::stream::iter(items),
+        ));
+
+        versions::write_fragments_direct(
+            ConcreteFileVersion::V2_1,
+            None,
+            object_store,
+            &base_dir,
+            &schema,
+            stream,
+            params,
+            None,
+            seeds::SeedCollector::disabled(),
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[rstest]
+    #[case::exact_multiple(10, vec![5, 5])]
+    #[case::last_file_under_limit(7, vec![5, 2])]
+    #[case::single_file_under_limit(3, vec![3])]
+    #[case::empty_batch(0, vec![])]
+    #[tokio::test]
+    async fn test_progress_completes_every_file(
+        #[case] num_rows: u64,
+        #[case] expected_file_rows: Vec<usize>,
+    ) {
+        let test_dir = TempStrDir::default();
+        let progress = Arc::new(RecordingProgress::default());
+        let params = WriteParams {
+            max_rows_per_file: 5,
+            progress: progress.clone(),
+            ..Default::default()
+        };
+
+        let fragments = write_id_batches(test_dir.as_str(), vec![Ok(id_batch(num_rows))], params)
+            .await
+            .unwrap();
+
+        let written_rows = fragments
+            .iter()
+            .map(|fragment| fragment.physical_rows.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(written_rows, expected_file_rows);
+        assert!(fragments.iter().all(|fragment| fragment.files.len() == 1));
+        assert_eq!(
+            count_data_files(test_dir.as_str()),
+            expected_file_rows.len()
+        );
+        // A file completes before the next one begins, and only `complete` sees it.
+        let expected_calls = fragments
+            .iter()
+            .flat_map(|fragment| {
+                [
+                    HookCall::Begin(Fragment::new(0)),
+                    HookCall::Complete(fragment.clone()),
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(*progress.calls.lock().unwrap(), expected_calls);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_data_files_on_failed_complete_of_last_file() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let progress = Arc::new(RecordingProgress {
+            fail_complete_at: Some(2),
+            ..Default::default()
+        });
+        let files_reported = Arc::new(AtomicU32::new(0));
+        let params = WriteParams {
+            max_rows_per_file: 5,
+            progress: progress.clone(),
+            write_progress: Some(WriteProgressFn::new({
+                let files_reported = files_reported.clone();
+                move |stats| files_reported.store(stats.files_written, Ordering::SeqCst)
+            })),
+            ..Default::default()
+        };
+
+        let error = write_id_batches(test_uri, vec![Ok(id_batch(7))], params)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("injected failure of complete call 2"),
+            "unexpected error: {error}"
+        );
+        // Two rows are under the row limit, so the failing call is for the file
+        // closed after the write loop.
+        let calls = progress.calls.lock().unwrap();
+        assert!(
+            matches!(
+                calls.as_slice(),
+                [
+                    HookCall::Begin(_),
+                    HookCall::Complete(closed),
+                    HookCall::Begin(_),
+                    HookCall::Complete(last),
+                ] if closed.physical_rows == Some(5) && last.physical_rows == Some(2)
+            ),
+            "unexpected calls: {calls:?}"
+        );
+        assert_eq!(files_reported.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            count_data_files(test_uri),
+            0,
+            "All data files should be cleaned up when the hook fails"
         );
     }
 
@@ -5245,12 +5461,16 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::stream_error(3, None)]
+    #[case::complete_of_last_file(2, Some(2))]
     #[tokio::test]
-    async fn test_cleanup_routed_data_files_on_failed_write() {
+    async fn test_cleanup_routed_data_files_on_failed_write(
+        #[case] second_batch_rows: usize,
+        #[case] fail_complete_at: Option<usize>,
+    ) {
         // Files already completed in target bases must be removed when the
         // write later fails.
-        use lance_core::utils::tempfile::TempStrDir;
-
         let primary_dir = TempStrDir::default();
         let base1_dir = TempStrDir::default();
 
@@ -5283,12 +5503,14 @@ mod tests {
         .unwrap();
 
         // 3 rows per file: the first batch fills and completes a file in the
-        // target base, then the stream fails.
-        let items: Vec<std::result::Result<RecordBatch, DataFusionError>> = vec![
+        // target base, then the stream fails or the hook fails on the last file.
+        let mut items: Vec<std::result::Result<RecordBatch, DataFusionError>> = vec![
             Ok(good_batch.clone()),
-            Ok(good_batch.clone()),
-            Err(DataFusionError::External("injected failure".into())),
+            Ok(good_batch.slice(0, second_batch_rows)),
         ];
+        if fail_complete_at.is_none() {
+            items.push(Err(DataFusionError::External("injected failure".into())));
+        }
         let stream = Box::pin(RecordBatchStreamAdapter::new(
             arrow_schema.clone(),
             futures::stream::iter(items),
@@ -5300,6 +5522,10 @@ mod tests {
             base_dir: base1_path,
             is_dataset_root: true,
         }];
+        let progress = Arc::new(RecordingProgress {
+            fail_complete_at,
+            ..Default::default()
+        });
 
         let result = versions::write_fragments_direct(
             ConcreteFileVersion::V2_1,
@@ -5310,6 +5536,7 @@ mod tests {
             stream,
             WriteParams {
                 max_rows_per_file: 3,
+                progress: progress.clone(),
                 ..Default::default()
             },
             Some(target_bases),
@@ -5320,7 +5547,28 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err(), "Expected write to fail");
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("injected failure"),
+            "unexpected error: {error}"
+        );
+        // Both files went through the target base before the failure.
+        let completed = progress
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|call| match call {
+                HookCall::Complete(fragment) => {
+                    Some((fragment.physical_rows, fragment.files[0].base_id))
+                }
+                HookCall::Begin(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            completed,
+            vec![(Some(3), Some(1)), (Some(second_batch_rows), Some(1))]
+        );
         assert_eq!(
             count_data_files(base1_dir.as_str()),
             0,

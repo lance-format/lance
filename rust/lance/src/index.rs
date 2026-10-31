@@ -2056,7 +2056,7 @@ pub(crate) async fn remap_index(
     // values in the first place, and each index type's `remap` rewrites only the
     // schema that type knows about, so the remapped segment would still declare
     // payload its storage no longer holds. Withdraw it instead, exactly as an
-    // index whose type reports `can_remap() == false` is withdrawn below: an
+    // index whose plugin reports `can_remap(details) == false` is withdrawn below: an
     // absent index costs a fallback scan, whereas a surviving false declaration
     // is answered from data that is not there. Erroring here would instead block
     // compaction of the whole table.
@@ -2125,7 +2125,18 @@ pub(crate) async fn remap_index(
             let scalar_index = dataset
                 .open_scalar_index(&field_path, index_id, &NoOpMetricsCollector)
                 .await?;
+            // Keep the deprecated instance-level check for external indexes
+            // written before ScalarIndexPlugin::can_remap existed. The plugin
+            // capability below covers built-ins and new implementations.
+            #[allow(deprecated)]
             if !scalar_index.can_remap() {
+                return Ok(RemapResult::Drop);
+            }
+            let details = fetch_index_details(dataset, &field_path, matched).await?;
+            if !IndexDetails(details.clone())
+                .get_plugin()?
+                .can_remap(details.as_ref())?
+            {
                 return Ok(RemapResult::Drop);
             }
 
@@ -4382,6 +4393,18 @@ impl Dataset {
         let tailing_bytes = read_last_block(reader.as_ref()).await?;
         let (major_version, minor_version) = read_version(&tailing_bytes)?;
 
+        // Legacy vector indexes are cached whole and can outlive the files they
+        // were opened from: cleanup unlinks old index files while the cache still
+        // holds an entry for them. Anything stored in the cached index must
+        // therefore reopen the file per read instead of pinning a descriptor.
+        let lazy_reader = vector::open_cache_reader(
+            object_store.clone(),
+            &index_file,
+            INDEX_FILE_NAME,
+            &file_sizes,
+        )
+        .await?;
+
         // Namespace the index cache by the UUID of the index. v2+ partition
         // entries are store-free and remain reusable across object-store
         // generations alongside their serializable state.
@@ -4411,7 +4434,7 @@ impl Dataset {
                             dataset,
                             uuid,
                             vector_index,
-                            reader,
+                            lazy_reader,
                             frag_reuse_index,
                         )
                         .await?;
@@ -4426,7 +4449,7 @@ impl Dataset {
             (0, 2) => {
                 info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
                 let reader = V1FileReader::try_new_self_described_from_reader(
-                    reader.clone(),
+                    lazy_reader,
                     Some(&self.metadata_cache.file_metadata_cache(&index_file)),
                 )
                 .await?;
@@ -6859,16 +6882,47 @@ mod tests {
         assert_eq!(stats["num_indexed_rows"], 512);
     }
 
+    #[rstest]
+    #[case::missing_details("v0.18.2/index_no_details.lance", None)]
+    #[case::v036(
+        "0.36.0/btree_in_index_pkg.lance",
+        Some("/lance.index.pb.BTreeIndexDetails")
+    )]
     #[tokio::test]
-    async fn test_v036_scalar_details_are_still_known() {
-        let test_dir = copy_test_data_to_tmp("0.36.0/btree_in_index_pkg.lance").unwrap();
+    async fn test_historical_scalar_indices_support_remapping(
+        #[case] fixture: &str,
+        #[case] type_url: Option<&str>,
+    ) {
+        let test_dir = copy_test_data_to_tmp(fixture).unwrap();
         let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
         let indices = dataset.load_indices().await.unwrap();
-        let details = indices[0].index_details.clone().unwrap();
+        assert!(!indices.is_empty());
 
-        assert_eq!(details.type_url, "/lance.index.pb.BTreeIndexDetails");
-        assert_eq!(IndexDetails(details).get_plugin().unwrap().name(), "BTree");
-        assert!(index_type_is_known(&indices[0]));
+        for index in indices.iter() {
+            assert_eq!(
+                index
+                    .index_details
+                    .as_ref()
+                    .map(|details| details.type_url.as_str()),
+                type_url
+            );
+            if let Some(details) = &index.index_details {
+                assert_eq!(
+                    IndexDetails(details.clone()).get_plugin().unwrap().name(),
+                    "BTree"
+                );
+            }
+            assert!(index_type_is_known(index));
+            let result = remap_index(
+                &dataset,
+                &index.uuid,
+                &RowAddrTranslator::sync(RowAddrRemap::empty()),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(result, RemapResult::Remapped(_)), "{result:?}");
+        }
     }
 
     #[tokio::test]

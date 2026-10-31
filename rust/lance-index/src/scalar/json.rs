@@ -176,6 +176,7 @@ impl ScalarIndex for JsonIndex {
         self.target_index.results_are_row_addresses()
     }
 
+    #[allow(deprecated)]
     fn can_remap(&self) -> bool {
         self.target_index.can_remap()
     }
@@ -1137,6 +1138,47 @@ impl BasicTrainer for JsonIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for JsonIndexPlugin {
+    fn can_remap(&self, details: &prost_types::Any) -> Result<bool> {
+        let details = match crate::pb::JsonIndexDetails::decode(details.value.as_slice()) {
+            Ok(details) => details,
+            Err(error) => {
+                log::warn!(
+                    "Cannot determine whether a JSON index supports remapping because its \
+                     details cannot be decoded: {error}"
+                );
+                return Ok(false);
+            }
+        };
+        let Some(target_details) = details.target_details.as_ref() else {
+            log::warn!(
+                "Cannot determine whether a JSON index supports remapping because its details \
+                 are missing target_details"
+            );
+            return Ok(false);
+        };
+        let registry = self.registry()?;
+        let target_plugin = match registry.get_plugin_by_details(target_details) {
+            Ok(plugin) => plugin,
+            Err(error) => {
+                log::warn!(
+                    "Cannot determine whether a JSON index supports remapping because its \
+                     target plugin cannot be found: {error}"
+                );
+                return Ok(false);
+            }
+        };
+        match target_plugin.can_remap(target_details) {
+            Ok(can_remap) => Ok(can_remap),
+            Err(error) => {
+                log::warn!(
+                    "Cannot determine whether a JSON index supports remapping because its \
+                     target plugin cannot answer: {error}"
+                );
+                Ok(false)
+            }
+        }
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -1408,6 +1450,66 @@ mod tests {
         );
         assert_eq!(json_wrapped_target_type("not json"), None);
         assert_eq!(json_wrapped_target_type(r#"{"path":"x"}"#), None);
+    }
+
+    #[rstest]
+    #[case::btree(
+        prost_types::Any::from_msg(&crate::pbold::BTreeIndexDetails::default()).unwrap(),
+        true
+    )]
+    #[case::zonemap(
+        prost_types::Any::from_msg(&crate::pbold::ZoneMapIndexDetails::default()).unwrap(),
+        false
+    )]
+    fn test_json_can_remap_delegates_to_target(
+        #[case] target_details: prost_types::Any,
+        #[case] expected: bool,
+    ) {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let details = prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
+            path: "$.value".to_string(),
+            target_details: Some(target_details),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(plugin.can_remap(&details).unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::missing_target(None)]
+    #[case::unknown_target(
+        Some(prost_types::Any {
+            type_url: "type.googleapis.com/example.UnknownIndexDetails".to_string(),
+            value: Vec::new(),
+        })
+    )]
+    fn test_json_can_remap_defaults_to_false_for_invalid_target(
+        #[case] target_details: Option<prost_types::Any>,
+    ) {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let details = prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
+            path: "$.value".to_string(),
+            target_details,
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(!plugin.can_remap(&details).unwrap());
+    }
+
+    #[test]
+    fn test_json_can_remap_defaults_to_false_for_malformed_details() {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let details = prost_types::Any {
+            type_url: String::new(),
+            value: b"not a json index".to_vec(),
+        };
+
+        assert!(!plugin.can_remap(&details).unwrap());
     }
 
     #[test]

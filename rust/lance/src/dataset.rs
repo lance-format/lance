@@ -72,6 +72,7 @@ pub mod builder;
 pub mod cleanup;
 mod data_file;
 mod data_file_part;
+pub mod deletions;
 pub mod delta;
 pub mod files;
 pub mod fragment;
@@ -3851,7 +3852,11 @@ impl Dataset {
                     }
                 }
             }
-            if let Some(deletion_file) = &fragment.deletion_file {
+            if let Some(deletion_file) = fragment
+                .deletion_file
+                .as_ref()
+                .filter(|file| !file.is_inline())
+            {
                 let base_root = if let Some(base_id) = deletion_file.base_id {
                     let base_path =
                         self.manifest.base_paths.get(&base_id).ok_or_else(|| {

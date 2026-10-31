@@ -3953,6 +3953,7 @@ mod tests {
             file_type: lance_table::format::DeletionFileType::Array,
             num_deleted_rows: Some(1),
             base_id: None,
+            inline: None,
         });
         let error = build_frag_reuse_rewrite_entry(
             &dataset,
@@ -5815,6 +5816,7 @@ mod tests {
             harness.read_version,
             &deletion_vector,
             &harness.dataset.object_store,
+            0,
         )
         .await
         .unwrap()
@@ -6012,6 +6014,7 @@ mod tests {
             dataset.manifest.version,
             &deletion_vector,
             &dataset.object_store,
+            0,
         )
         .await
         .unwrap()
@@ -6062,6 +6065,7 @@ mod tests {
             dataset.manifest.version,
             &deletion_vector,
             &dataset.object_store,
+            0,
         )
         .await
         .unwrap()
@@ -6088,6 +6092,7 @@ mod tests {
             read_version,
             &deletion_vector,
             &dataset.object_store,
+            0,
         )
         .await
         .unwrap()
@@ -6199,6 +6204,7 @@ mod tests {
             read_version,
             &deletion_vector,
             &dataset.object_store,
+            0,
         )
         .await
         .unwrap()
@@ -6346,6 +6352,7 @@ mod tests {
                 base_version,
                 &deletion_vector,
                 &dataset.object_store,
+                0,
             )
             .await
             .unwrap()
@@ -6515,6 +6522,7 @@ mod tests {
             harness.read_version,
             &forged,
             &harness.dataset.object_store,
+            0,
         )
         .await
         .unwrap()

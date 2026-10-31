@@ -3412,6 +3412,7 @@ impl FileFragment {
             self.dataset.version_id(),
             &deletion_vector,
             self.dataset.object_store.as_ref(),
+            self.dataset.inline_deletions_max_bytes()?,
         )
         .await?;
 
@@ -7752,6 +7753,7 @@ mod tests {
             dataset.version().version,
             &deletion_vector,
             &dataset.object_store,
+            0,
         )
         .await
         .unwrap()
@@ -7792,6 +7794,7 @@ mod tests {
             dataset.version().version,
             &deletion_vector,
             &dataset.object_store,
+            0,
         )
         .await
         .unwrap()
@@ -7958,6 +7961,7 @@ mod tests {
             dataset.version().version,
             &deletion_vector,
             dataset.object_store.as_ref(),
+            0,
         )
         .await
         .unwrap();

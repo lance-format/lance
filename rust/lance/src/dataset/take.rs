@@ -1114,6 +1114,7 @@ mod test {
             dataset.version().version,
             &DeletionVector::from_iter(0..4),
             &dataset.object_store,
+            0,
         )
         .await
         .unwrap();
