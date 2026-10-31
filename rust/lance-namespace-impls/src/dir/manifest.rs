@@ -2545,7 +2545,7 @@ impl ManifestNamespace {
             .into());
         }
 
-        let mut scanner = self.manifest_scanner().await?;
+        let (mut scanner, has_escaped_ids) = self.manifest_scanner().await?;
         scanner.filter("object_type = 'table'")?;
         scanner.project(&["object_id", "location"])?;
         let mut stream = scanner.try_into_stream().await?;
@@ -2554,7 +2554,7 @@ impl ManifestNamespace {
             let locations = Self::get_string_column(&batch, "location")?;
             for row in 0..batch.num_rows() {
                 let other_id = Self::required_string_value(object_ids, row, "object_id")?;
-                if other_id == object_id {
+                if Self::canonical_object_id(other_id, has_escaped_ids) == object_id {
                     continue;
                 }
                 let other_location = Self::required_string_value(locations, row, "location")?;
@@ -5034,6 +5034,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(original.count_rows(None).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_manifest_drop_legacy_percent_id() {
+        let temp_dir = copy_test_data_to_tmp("v6.0.1/dir_manifest/namespace").unwrap();
+        let root = temp_dir.to_str().unwrap();
+        let manifest_uri = format!("{root}/{MANIFEST_TABLE_NAME}");
+        let dataset = DatasetBuilder::from_uri(&manifest_uri)
+            .load()
+            .await
+            .unwrap();
+        let mut update = lance::dataset::UpdateBuilder::new(Arc::new(dataset));
+        update = update.set("object_id", "'a%24b'").unwrap();
+        update = update.set("base_objects", "['a%24b']").unwrap();
+        update.build().unwrap().execute().await.unwrap();
+
+        let namespace = DirectoryNamespaceBuilder::new(root)
+            .dir_listing_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        let mut drop = DropTableRequest::new();
+        drop.id = Some(vec!["a%24b".to_string()]);
+        let response = namespace.drop_table(drop).await.unwrap();
+        assert!(response.location.is_some());
+
+        let mut exists = TableExistsRequest::new();
+        exists.id = Some(vec!["a%24b".to_string()]);
+        let error = namespace.table_exists(exists).await.unwrap_err();
+        assert!(matches!(
+            error,
+            lance_core::Error::Namespace { ref source, .. }
+                if matches!(
+                    source.downcast_ref(),
+                    Some(lance_namespace::error::NamespaceError::TableNotFound { .. })
+                )
+        ));
+        assert!(error.to_string().contains("Table not found"));
     }
 
     #[derive(Debug)]
