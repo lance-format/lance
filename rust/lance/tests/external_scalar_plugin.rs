@@ -301,7 +301,14 @@ async fn legacy_external_plugin_can_remap_false_stays_on_fallback() {
     .await
     .unwrap();
     assert_eq!(dataset.fragments().len(), 1);
-    assert_eq!(dataset.load_indices().await.unwrap(), before);
+    let after = dataset.load_indices().await.unwrap();
+    assert_eq!(after.len(), before.len());
+    // `created_at` is re-encoded at a different subsecond precision on
+    // Windows, so compare the stable fields that identify an untouched index.
+    assert_eq!(after[0].uuid, before[0].uuid);
+    assert_eq!(after[0].fragment_bitmap, before[0].fragment_bitmap);
+    assert_eq!(after[0].index_details, before[0].index_details);
+    assert_eq!(after[0].index_version, before[0].index_version);
 
     let mut full_scan = dataset.scan();
     full_scan
