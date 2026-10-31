@@ -729,6 +729,23 @@ impl Transaction {
             config.migration_next_row_id,
         )?;
         let (original_indices, prepared_indices, frag_reuse) = prepared.into_parts();
+        if let Operation::CompositeOperation(composite_operation) = &self.operation {
+            let current_manifest = current_manifest.ok_or_else(|| {
+                Error::invalid_input(
+                    "an action-based transaction describes a change to an existing dataset; \
+                     it cannot create one",
+                )
+            })?;
+            return self.build_manifest_from_actions(
+                composite_operation,
+                current_manifest,
+                original_indices,
+                transaction_file_path,
+                config,
+                read_version_state,
+            );
+        }
+
         if config.use_stable_row_ids
             && config.migration_next_row_id.is_none()
             && current_manifest
@@ -793,7 +810,7 @@ impl Transaction {
         }
 
         // Get the schema and the final fragment list
-        let mut schema = match self.operation {
+        let schema = match self.operation {
             Operation::Overwrite { ref schema, .. } => schema.clone(),
             Operation::Merge { ref schema, .. } => schema.clone(),
             Operation::Project { ref schema, .. } => schema.clone(),
@@ -1835,6 +1852,12 @@ impl Transaction {
                 // Base paths are handled in the manifest creation section below
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
+            Operation::CompositeOperation(_) => {
+                // Handled by build_manifest_from_actions before this match.
+                return Err(Error::internal(
+                    "an action-based operation reached the legacy manifest build".to_string(),
+                ));
+            }
         };
 
         // A removed fragment can remain in a stored index bitmap. Reusing its
@@ -1868,38 +1891,12 @@ impl Transaction {
         }
         drop(original_indices);
 
-        // If a fragment was reserved then it may not belong at the end of the fragments list.
-        final_fragments.sort_by_key(|frag| frag.id);
+        Self::normalize_fragments(&mut final_fragments)?;
 
-        // Clean up data files that only contain tombstoned fields
-        Self::remove_tombstoned_data_files(&mut final_fragments);
-
-        // Enforce the newest-last overlay ordering invariant at the write
-        // boundary. Load normalizes with a sort; this rejects any commit path
-        // that assembled a fragment's overlays out of order.
-        for fragment in &final_fragments {
-            if !fragment.overlays.is_empty() {
-                crate::format::overlay::verify_overlays_newest_last(&fragment.overlays)?;
-            }
-        }
-
-        // A spilled row lineage sequence lives only in its carrier file. An
-        // operation that dropped or duplicated that file would otherwise go
-        // unnoticed until the next read, by which time cleanup may have
-        // deleted the only copy. Every fragment is checked, not only the ones
-        // this operation touched: the check reads metadata only, skips
-        // fragments that spill nothing, and also refuses to build on a
-        // manifest that already lost a carrier.
-        for fragment in &final_fragments {
-            fragment.validate_row_lineage_carriers()?;
-        }
-
-        let user_requested_version = match (&config.storage_format, config.use_legacy_format) {
-            (Some(storage_format), _) => Some(storage_format.lance_file_format()),
-            (None, Some(true)) => Some(ConcreteFileVersion::V1),
-            (None, Some(false)) => Some(ConcreteFileVersion::V2_0),
-            (None, None) => None,
-        };
+        // If this is an overwrite operation and the user has requested a specific
+        // version then overwrite with that version. Otherwise, if the user didn't
+        // request a specific version, then keep whatever version we had before.
+        let overwrite_storage_format = matches!(self.operation, Operation::Overwrite { .. });
 
         // Applied once the final index list is known, so it sees exactly the
         // indices this commit publishes rather than what any one operation arm
@@ -1913,130 +1910,19 @@ impl Transaction {
             )?;
         }
 
-        // Blob is one logical column across file versions. Publishing its first
-        // 2.2+ file also publishes the logical v2 view, without replacing older files.
-        // Blob children are not independent physical columns; retain the root ID
-        // and allocate logical child IDs against the current manifest on commit.
-        let legacy_blob_ids = schema
-            .fields_pre_order()
-            .filter(|field| field.is_blob() && !field.is_blob_v2())
-            .map(|field| field.id)
-            .collect::<HashSet<_>>();
-        if !legacy_blob_ids.is_empty() {
-            let mut blob_v2_fields = std::collections::BTreeSet::new();
-            for file in final_fragments
-                .iter()
-                .flat_map(|fragment| fragment.referenced_lance_files())
-            {
-                if matches!(
-                    file.file_version()?,
-                    ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
-                ) {
-                    blob_v2_fields.extend(
-                        file.fields
-                            .iter()
-                            .copied()
-                            .filter(|id| legacy_blob_ids.contains(id)),
-                    );
-                }
-            }
-            let mut next_field_id = current_manifest
-                .map(|manifest| manifest.max_field_id())
-                .unwrap_or(-1)
-                .max(schema.max_field_id().unwrap_or(-1))
-                + 1;
-            for id in blob_v2_fields {
-                if let Some(field) = schema.mut_field_by_id(id) {
-                    field.promote_blob_v2()?;
-                    field.set_id(field.parent_id, &mut next_field_id);
-                }
-            }
-        }
-
-        let mut manifest = if let Some(current_manifest) = current_manifest {
-            // OVERWRITE with initial_bases on existing dataset is not allowed (caught by validation)
-            // So we always use new_from_previous which preserves base_paths
-            let mut prev_manifest =
-                Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments));
-
-            if let (Some(user_requested_version), Operation::Overwrite { .. }) =
-                (user_requested_version, &self.operation)
-            {
-                // If this is an overwrite operation and the user has requested a specific version
-                // then overwrite with that version.  Otherwise, if the user didn't request a specific
-                // version, then overwrite with whatever version we had before.
-                prev_manifest.data_storage_format = DataStorageFormat::new(user_requested_version);
-            }
-
-            prev_manifest
-        } else {
-            let data_storage_format =
-                Self::data_storage_format_from_files(&final_fragments, user_requested_version)?;
-            Manifest::new(
-                schema,
-                Arc::new(final_fragments),
-                data_storage_format,
-                reference_paths,
-            )
-        };
-
-        if config.activate_non_reusable_field_ids {
-            let already_active = current_manifest
-                .map(|manifest| manifest.uses_non_reusable_field_ids())
-                .unwrap_or(false);
-            if !already_active {
-                manifest.activate_non_reusable_field_ids();
-                manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
-            }
-        }
-
-        manifest.tag.clone_from(&self.tag);
-
-        if config.auto_set_feature_flags {
-            // Internal operations (e.g. CreateIndex) build with the default config,
-            // which has use_stable_row_ids = false. Without inheriting from the previous
-            // manifest, apply_feature_flags would clear FLAG_STABLE_ROW_IDS.
-            let inherited = current_manifest
-                .map(|m| m.uses_stable_row_ids())
-                .unwrap_or(false);
-            let use_stable_row_ids = config.use_stable_row_ids || inherited;
-            apply_feature_flags(
-                &mut manifest,
-                use_stable_row_ids,
-                config.disable_transaction_file,
-            )?;
-        }
-        // Set after apply_feature_flags, which resets both flag words -- and a
-        // `Manifest` only points at its index section, so the flag cannot be
-        // derived there.
-        //
-        // Derived fresh from `final_indices` on every commit, never inherited.
-        // Every manifest this reaches starts without the covering bit, so there
-        // is no stale bit to clear. Dropping the last covering index lifts the
-        // fence by simply not setting it again. Inheriting it from the previous
-        // manifest instead would make the fence permanent.
-        //
-        // Both words: a reader that selects a vector index by membership of
-        // `fields` would answer a query on a merely-carried column with an index
-        // keyed on another one, and a writer that treats every entry of `fields`
-        // as keyed would mismaintain it.
-        if final_indices
-            .iter()
-            .any(|index| !index.covering_fields.is_empty())
-        {
-            manifest.reader_feature_flags |= FLAG_COVERED_INDEX_METADATA;
-            manifest.writer_feature_flags |= FLAG_COVERED_INDEX_METADATA;
-        }
-        apply_row_addr_index_feature_flag(&mut manifest, &final_indices);
+        let mut manifest = self.assemble_manifest(
+            current_manifest,
+            schema,
+            final_fragments,
+            &final_indices,
+            reference_paths,
+            overwrite_storage_format,
+            config,
+        )?;
 
         if let Some(current_manifest) = current_manifest {
             inherit_sticky_feature_flags(&mut manifest, current_manifest)?;
         }
-
-        manifest.set_timestamp(config.timestamp_nanos);
-
-        manifest.update_max_fragment_id();
-        manifest.update_max_field_id();
 
         match &self.operation {
             Operation::Overwrite {
@@ -2317,6 +2203,196 @@ impl Transaction {
             }
         }
         None
+    }
+
+    /// Put an assembled fragment list into the shape the manifest requires:
+    /// ordered by id, with no data file left holding only tombstoned fields,
+    /// with each fragment's overlays in oldest-to-newest order, and with every
+    /// spilled row lineage sequence still in its carrier file.
+    pub(super) fn normalize_fragments(fragments: &mut [Fragment]) -> Result<()> {
+        // If a fragment was reserved then it may not belong at the end of the list.
+        fragments.sort_by_key(|frag| frag.id);
+
+        Self::remove_tombstoned_data_files(fragments);
+
+        // Enforce the newest-last overlay ordering invariant at the write
+        // boundary. Load normalizes with a sort; this rejects any commit path
+        // that assembled a fragment's overlays out of order.
+        for fragment in fragments.iter() {
+            if !fragment.overlays.is_empty() {
+                crate::format::overlay::verify_overlays_newest_last(&fragment.overlays)?;
+            }
+        }
+
+        // A spilled row lineage sequence lives only in its carrier file. An
+        // operation that dropped or duplicated that file would otherwise go
+        // unnoticed until the next read, by which time cleanup may have
+        // deleted the only copy. Every fragment is checked, not only the ones
+        // this operation touched: the check reads metadata only, skips
+        // fragments that spill nothing, and also refuses to build on a
+        // manifest that already lost a carrier.
+        for fragment in fragments.iter() {
+            fragment.validate_row_lineage_carriers()?;
+        }
+        Ok(())
+    }
+
+    fn user_requested_version(config: &ManifestBuildConfig) -> Option<ConcreteFileVersion> {
+        match (&config.storage_format, config.use_legacy_format) {
+            (Some(storage_format), _) => Some(storage_format.lance_file_format()),
+            (None, Some(true)) => Some(ConcreteFileVersion::V1),
+            (None, Some(false)) => Some(ConcreteFileVersion::V2_0),
+            (None, None) => None,
+        }
+    }
+
+    /// Build the manifest itself from an already-decided schema and fragment
+    /// list, and apply the settings that every operation shares: blob v2
+    /// promotion, the tag, feature flags, timestamp, and the fragment and field
+    /// id watermarks.
+    ///
+    /// `indices` is the index list this commit publishes, which the covered
+    /// index fence is derived from. A `Manifest` only points at its index
+    /// section, so the list cannot be read back off the manifest and is passed
+    /// alongside the schema and fragments.
+    ///
+    /// `overwrite_storage_format` replaces the inherited storage format with the
+    /// user-requested one, for operations that rewrite the whole dataset.
+    // The manifest simply has this many inputs, and threading them through a
+    // parameter struct would only move the list.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn assemble_manifest(
+        &self,
+        current_manifest: Option<&Manifest>,
+        mut schema: lance_core::datatypes::Schema,
+        fragments: Vec<Fragment>,
+        indices: &[IndexMetadata],
+        reference_paths: HashMap<u32, crate::format::BasePath>,
+        overwrite_storage_format: bool,
+        config: &ManifestBuildConfig,
+    ) -> Result<Manifest> {
+        let user_requested_version = Self::user_requested_version(config);
+
+        // Blob is one logical column across file versions. Publishing its first
+        // 2.2+ file also publishes the logical v2 view, without replacing older files.
+        // Blob children are not independent physical columns; retain the root ID
+        // and allocate logical child IDs against the current manifest on commit.
+        let legacy_blob_ids = schema
+            .fields_pre_order()
+            .filter(|field| field.is_blob() && !field.is_blob_v2())
+            .map(|field| field.id)
+            .collect::<HashSet<_>>();
+        if !legacy_blob_ids.is_empty() {
+            let mut blob_v2_fields = std::collections::BTreeSet::new();
+            for file in fragments
+                .iter()
+                .flat_map(|fragment| fragment.referenced_lance_files())
+            {
+                if matches!(
+                    file.file_version()?,
+                    ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+                ) {
+                    blob_v2_fields.extend(
+                        file.fields
+                            .iter()
+                            .copied()
+                            .filter(|id| legacy_blob_ids.contains(id)),
+                    );
+                }
+            }
+            let mut next_field_id = current_manifest
+                .map(|manifest| manifest.max_field_id())
+                .unwrap_or(-1)
+                .max(schema.max_field_id().unwrap_or(-1))
+                + 1;
+            for id in blob_v2_fields {
+                if let Some(field) = schema.mut_field_by_id(id) {
+                    field.promote_blob_v2()?;
+                    field.set_id(field.parent_id, &mut next_field_id);
+                }
+            }
+        }
+
+        let mut manifest = if let Some(current_manifest) = current_manifest {
+            // OVERWRITE with initial_bases on existing dataset is not allowed (caught by validation)
+            // So we always use new_from_previous which preserves base_paths
+            let mut prev_manifest =
+                Manifest::new_from_previous(current_manifest, schema, Arc::new(fragments));
+
+            if let (true, Some(user_requested_version)) =
+                (overwrite_storage_format, user_requested_version)
+            {
+                prev_manifest.data_storage_format = DataStorageFormat::new(user_requested_version);
+            }
+
+            prev_manifest
+        } else {
+            let data_storage_format =
+                Self::data_storage_format_from_files(&fragments, user_requested_version)?;
+            Manifest::new(
+                schema,
+                Arc::new(fragments),
+                data_storage_format,
+                reference_paths,
+            )
+        };
+
+        if config.activate_non_reusable_field_ids {
+            let already_active = current_manifest
+                .map(|manifest| manifest.uses_non_reusable_field_ids())
+                .unwrap_or(false);
+            if !already_active {
+                manifest.activate_non_reusable_field_ids();
+                manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
+            }
+        }
+
+        manifest.tag.clone_from(&self.tag);
+
+        if config.auto_set_feature_flags {
+            // Internal operations (e.g. CreateIndex) build with the default config,
+            // which has use_stable_row_ids = false. Without inheriting from the previous
+            // manifest, apply_feature_flags would clear FLAG_STABLE_ROW_IDS.
+            let inherited = current_manifest
+                .map(|m| m.uses_stable_row_ids())
+                .unwrap_or(false);
+            let use_stable_row_ids = config.use_stable_row_ids || inherited;
+            apply_feature_flags(
+                &mut manifest,
+                use_stable_row_ids,
+                config.disable_transaction_file,
+            )?;
+        }
+
+        // Set after apply_feature_flags, which resets both flag words -- and a
+        // `Manifest` only points at its index section, so the flag cannot be
+        // derived there.
+        //
+        // Derived fresh from the published indices on every commit, never
+        // inherited. Every manifest this reaches starts without the covering
+        // bit, so there is no stale bit to clear. Dropping the last covering
+        // index lifts the fence by simply not setting it again. Inheriting it
+        // from the previous manifest instead would make the fence permanent.
+        //
+        // Both words: a reader that selects a vector index by membership of
+        // `fields` would answer a query on a merely-carried column with an index
+        // keyed on another one, and a writer that treats every entry of `fields`
+        // as keyed would mismaintain it.
+        if indices
+            .iter()
+            .any(|index| !index.covering_fields.is_empty())
+        {
+            manifest.reader_feature_flags |= FLAG_COVERED_INDEX_METADATA;
+            manifest.writer_feature_flags |= FLAG_COVERED_INDEX_METADATA;
+        }
+        apply_row_addr_index_feature_flag(&mut manifest, indices);
+
+        manifest.set_timestamp(config.timestamp_nanos);
+
+        manifest.update_max_fragment_id();
+        manifest.update_max_field_id();
+
+        Ok(manifest)
     }
 
     /// Remove data files that only contain tombstoned fields (-2)

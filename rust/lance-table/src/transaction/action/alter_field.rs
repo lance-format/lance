@@ -1,0 +1,200 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! Alter facets of an existing field in place.
+
+use super::apply::ApplyState;
+use super::proto::required;
+use super::{Coordinate, FieldRef, Footprint};
+use crate::format::pb_actions;
+use lance_core::deepsize::DeepSizeOf;
+use lance_core::{Error, Result};
+
+/// Alter facets of an existing field in place, preserving its id.
+///
+/// Each facet is independently optional -- present means "change this", absent
+/// means "leave it alone".
+///
+/// There is no type facet: a field id is durable identity, so a cast may not
+/// keep it. A cast is a [`DropField`](super::DropField), an
+/// [`AddField`](super::AddField) under the same name, and the data.
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
+pub struct AlterField {
+    pub field: FieldRef,
+    pub name: Option<String>,
+    pub nullable: Option<bool>,
+}
+
+impl AlterField {
+    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+        let field_id = state.resolve_schema_field(self.field, "AlterField")?;
+        let missing = || {
+            Error::invalid_input(format!(
+                "AlterField names field {field_id}, which does not exist"
+            ))
+        };
+        if let Some(name) = &self.name {
+            let field = state.schema().field_by_id(field_id).ok_or_else(missing)?;
+            if *name != field.name {
+                let parent_id = (field.parent_id >= 0).then_some(field.parent_id);
+                state.check_field_name(parent_id, name, "AlterField")?;
+            }
+        }
+        let field = state
+            .schema_mut()
+            .field_by_id_mut(field_id)
+            .ok_or_else(missing)?;
+        if let Some(name) = &self.name {
+            field.name.clone_from(name);
+        }
+        if let Some(nullable) = self.nullable {
+            field.nullable = nullable;
+        }
+        Ok(())
+    }
+
+    /// Renaming or changing nullability leaves the values alone.
+    pub(super) fn is_data_change(&self) -> bool {
+        false
+    }
+
+    /// The field's definition, and the name a rename takes -- a name is a
+    /// coordinate whether a field is added under it or moved to it.
+    ///
+    /// Tightening to non-nullable is only valid against the values it read,
+    /// and applying it does not look at any. Values written since, or rows
+    /// added that leave the field unset, may hold nulls. Landing first, it
+    /// makes the field required like a non-nullable add does, which fences a
+    /// stale append whether or not that append names the field -- including a
+    /// field minted in this set, which no other writer can name.
+    pub(super) fn footprint(&self, footprint: &mut Footprint) {
+        footprint.write_field_definition(self.field);
+        if self.nullable == Some(false) {
+            footprint.require_no_values_written(self.field);
+            footprint.add_required_column();
+        }
+        if let Some(name) = &self.name {
+            footprint.write(Coordinate::FieldName(name.clone()));
+        }
+    }
+}
+
+impl From<&AlterField> for pb_actions::AlterField {
+    fn from(value: &AlterField) -> Self {
+        Self {
+            field: Some(value.field.into()),
+            name: value.name.clone(),
+            nullable: value.nullable,
+        }
+    }
+}
+
+impl TryFrom<pb_actions::AlterField> for AlterField {
+    type Error = Error;
+
+    fn try_from(message: pb_actions::AlterField) -> Result<Self> {
+        Ok(Self {
+            field: required(message.field, "AlterField.field")?.try_into()?,
+            name: message.name,
+            nullable: message.nullable,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transaction::action::test_support::{
+        added_field, apply, apply_with_indices, backed_manifest,
+    };
+    use crate::transaction::action::{Action, AddField};
+    use crate::transaction::test_support::sample_index_metadata;
+
+    #[test]
+    fn test_alter_field_renames_without_touching_indices() {
+        let (next, indices) = apply_with_indices(
+            &backed_manifest(),
+            vec![Action::AlterField(AlterField {
+                field: FieldRef::Committed(0),
+                name: Some("renamed".into()),
+                nullable: Some(true),
+            })],
+            vec![sample_index_metadata("idx")],
+        )
+        .unwrap();
+
+        let field = next.schema.field_by_id(0).unwrap();
+        assert_eq!(field.name, "renamed");
+        assert!(field.nullable);
+        // A rename does not change the values the index recorded.
+        assert!(indices[0].fragment_bitmap.as_ref().unwrap().contains(0));
+    }
+
+    #[test]
+    fn test_alter_field_rejects_a_missing_field() {
+        let error = apply(
+            &backed_manifest(),
+            vec![Action::AlterField(AlterField {
+                field: FieldRef::Committed(7),
+                name: Some("nope".into()),
+                nullable: None,
+            })],
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("field 7"), "{error}");
+    }
+
+    #[test]
+    fn test_alter_field_rejects_renaming_onto_a_sibling() {
+        let taken = Action::AddField(AddField {
+            local: 0,
+            parent: None,
+            def: added_field("taken"),
+        });
+        let rename = |name: &str| {
+            Action::AlterField(AlterField {
+                field: FieldRef::Committed(0),
+                name: Some(name.into()),
+                nullable: None,
+            })
+        };
+
+        let error = apply(&backed_manifest(), vec![taken.clone(), rename("taken")]).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("unique among siblings"),
+            "{error}"
+        );
+
+        // Restating a field's own name is not a collision with itself.
+        let next = apply(&backed_manifest(), vec![taken, rename("id")]).unwrap();
+        assert_eq!(next.schema.field_by_id(0).unwrap().name, "id");
+    }
+
+    #[test]
+    fn test_alter_field_can_name_a_field_minted_in_the_same_operation() {
+        // A squash of "add column" and "rename column" lowers to exactly this,
+        // and has no committed id to name the field by.
+        let next = apply(
+            &backed_manifest(),
+            vec![
+                Action::AddField(AddField {
+                    local: 0,
+                    parent: None,
+                    def: added_field("before"),
+                }),
+                Action::AlterField(AlterField {
+                    field: FieldRef::Local(0),
+                    name: Some("after".into()),
+                    nullable: None,
+                }),
+            ],
+        )
+        .unwrap();
+
+        assert!(next.schema.field("before").is_none());
+        assert!(next.schema.field("after").is_some());
+    }
+}

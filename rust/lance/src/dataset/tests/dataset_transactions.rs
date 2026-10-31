@@ -2575,3 +2575,1154 @@ async fn test_covering_commit_fences_the_table_with_a_feature_flag() {
         "dropping the last covering index must clear the fence"
     );
 }
+
+mod composite {
+    //! End-to-end coverage for committing an action set against a real dataset.
+    //!
+    //! Each of these is a single commit that does work a named operation would
+    //! have needed several commits for: a fragment is added and then modified, a
+    //! field is added and then filled, all inside one version. That is what the
+    //! action vocabulary buys -- steps that reference each other's minted ids can
+    //! be squashed into one atomic manifest change.
+    //!
+    //! The commit path checks that a referenced data file exists, so these tests
+    //! point their actions at files the fixture dataset already wrote. The
+    //! resulting datasets are inspected through their manifests rather than read --
+    //! the files hold the wrong columns for where they end up attached.
+
+    use std::sync::Arc;
+
+    use crate::dataset::{CommitBuilder, InsertBuilder, WriteParams};
+    use crate::index::DatasetIndexExt;
+    use crate::{Dataset, Error, Result};
+    use arrow_array::{Int32Array, RecordBatch, StructArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use futures::stream;
+    use lance_core::datatypes::Field as LanceField;
+    use lance_index::IndexType;
+    use lance_index::scalar::ScalarIndexParams;
+    use lance_table::feature_flags::FLAG_COVERED_INDEX_METADATA;
+    use lance_table::format::{
+        BasePath, DataFile, DeletionFile, DeletionFileType, IndexMetadata, RowIdMeta,
+    };
+    use lance_table::rowids::{RowIdSequence, write_row_ids};
+    use lance_table::transaction::action::{
+        Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation,
+        ConfigUpdate, DropField, FieldRef, Ref, RemoveFragment, ReserveFragmentIds, ReserveRowIds,
+        ResetTable, SetDeletionFile, TombstoneFieldData, UserStep,
+    };
+    use lance_table::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
+    use roaring::RoaringBitmap;
+    use std::collections::{HashMap, HashSet};
+    use uuid::Uuid;
+
+    /// A two-fragment dataset, so its two data files can stand in for the files an
+    /// action set would otherwise have had to write. Its column is nullable, so
+    /// a test may mint a fragment without writing data for it.
+    async fn test_dataset(enable_stable_row_ids: bool) -> Dataset {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let data =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from_iter_values(0..10))])
+                .unwrap();
+
+        InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                enable_stable_row_ids,
+                max_rows_per_file: 5,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap()
+    }
+
+    /// A data file of `fragment`, as an `AddDataFile` carries it: with no
+    /// field list of its own, since the action's `field_ids` is that list.
+    fn existing_data_file(dataset: &Dataset, fragment: usize) -> DataFile {
+        without_fields(dataset.fragments()[fragment].files[0].clone())
+    }
+
+    fn without_fields(file: DataFile) -> DataFile {
+        DataFile {
+            fields: Arc::from([]),
+            ..file
+        }
+    }
+
+    fn int32_field(name: &str) -> LanceField {
+        LanceField::try_from(Field::new(name, DataType::Int32, true)).unwrap()
+    }
+
+    fn composite_txn(read_version: u64, actions: Vec<Action>) -> Transaction {
+        Transaction::new(
+            read_version,
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                "step", actions,
+            )])),
+            None,
+        )
+    }
+
+    async fn try_commit(dataset: Dataset, actions: Vec<Action>) -> Result<Dataset> {
+        let read_version = dataset.version().version;
+        CommitBuilder::new(Arc::new(dataset))
+            .with_experimental_composite_operations(true)
+            .execute(composite_txn(read_version, actions))
+            .await
+    }
+
+    async fn commit(dataset: Dataset, actions: Vec<Action>) -> Dataset {
+        try_commit(dataset, actions).await.unwrap()
+    }
+
+    /// The covering fence is re-derived from the published index list on every
+    /// commit rather than inherited -- `Manifest::new_from_previous` zeroes both
+    /// flag words -- so every build path has to re-derive it. See
+    /// `test_covering_commit_fences_the_table_with_a_feature_flag` for what the
+    /// fence protects; without this, the first composite operation on a covered
+    /// table republishes its covering indices with the fence down.
+    #[tokio::test]
+    async fn test_a_composite_commit_keeps_the_covering_fence() {
+        // Two columns, so the index can be keyed on one and merely carry the
+        // other -- a covering index needs at least one field left indexed.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..10)),
+                Arc::new(Int32Array::from_iter_values(10..20)),
+            ],
+        )
+        .unwrap();
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 5,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap();
+
+        let index = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "covered_idx".to_string(),
+            fields: vec![0, 1],
+            covering_fields: vec![1],
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0u32, 1])),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            clustering_id: None,
+            metadata: Default::default(),
+        };
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![index],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+            0,
+            "precondition: the covering commit fenced the table"
+        );
+
+        // Any action set will do -- the fence is a property of the index list
+        // this commit publishes, not of what the actions touch.
+        let dataset = commit(
+            dataset,
+            vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 1 })],
+        )
+        .await;
+
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+            0,
+            "an action commit must not lift the covering fence"
+        );
+        assert_ne!(
+            dataset.manifest.writer_feature_flags & FLAG_COVERED_INDEX_METADATA,
+            0,
+            "an action commit must not lift the writer half of the fence"
+        );
+    }
+
+    /// Transaction V2 has no compatibility contract, so a caller has to say so
+    /// before a composite operation is written into a dataset's history.
+    #[tokio::test]
+    async fn test_committing_a_composite_operation_requires_opting_in() {
+        let dataset = test_dataset(false).await;
+        let read_version = dataset.version().version;
+
+        let error = CommitBuilder::new(Arc::new(dataset))
+            .execute(composite_txn(
+                read_version,
+                vec![Action::RemoveFragment(RemoveFragment {
+                    fragment: Ref::Committed(0),
+                    data_change: true,
+                })],
+            ))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("with_experimental_composite_operations"),
+            "{error}"
+        );
+    }
+
+    /// Version independence: the same action set, committed after losing any
+    /// number of races, lands the same change it would have landed alone.
+    ///
+    /// This is the property [`Ref::Local`] exists for. Each replay re-resolves
+    /// the local tokens against whatever version won, so the ids come out
+    /// different every time while the shape -- which field the minted fragment
+    /// carries data for, and where it sits in the schema -- does not. A writer
+    /// that stamped ids in itself would either collide with a racer or silently
+    /// bind its data to the racer's field.
+    #[rstest::rstest]
+    #[case::uncontended(0)]
+    #[case::one_loss(1)]
+    #[case::three_losses(3)]
+    #[tokio::test]
+    async fn test_an_action_set_lands_the_same_change_however_many_races_it_loses(
+        #[case] losses: usize,
+    ) {
+        let dataset = Arc::new(test_dataset(false).await);
+        let read_version = dataset.version().version;
+        let fragments_before = dataset.fragments().len();
+        let borrowed_file = existing_data_file(&dataset, 0);
+
+        // Each racer mints in the same three id spaces this action set does, so
+        // every one of them moves the ids it would otherwise have taken.
+        for racer in 0..losses {
+            CommitBuilder::new(dataset.clone())
+                .with_experimental_composite_operations(true)
+                .execute(composite_txn(
+                    dataset.version().version,
+                    vec![
+                        Action::AddField(AddField {
+                            local: 0,
+                            parent: None,
+                            def: int32_field(&format!("racer_{racer}")),
+                        }),
+                        Action::AddFragment(AddFragment {
+                            id: Ref::Local(0),
+                            physical_rows: 5,
+                            row_id_meta: None,
+                            last_updated_at_version_meta: None,
+                            created_at_version_meta: None,
+                            data_change: true,
+                        }),
+                    ],
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Still reading the version it was built against, so it has to relocate
+        // onto everything the racers committed.
+        let committed = CommitBuilder::new(dataset)
+            .with_experimental_composite_operations(true)
+            .execute(composite_txn(
+                read_version,
+                vec![
+                    Action::AddField(AddField {
+                        local: 0,
+                        parent: None,
+                        def: int32_field("mine"),
+                    }),
+                    Action::AddFragment(AddFragment {
+                        id: Ref::Local(0),
+                        physical_rows: 5,
+                        row_id_meta: None,
+                        last_updated_at_version_meta: None,
+                        created_at_version_meta: None,
+                        data_change: true,
+                    }),
+                    Action::AddDataFile(AddDataFile {
+                        fragment: Ref::Local(0),
+                        file: without_fields(borrowed_file),
+                        field_ids: vec![FieldRef::Local(0)],
+                        data_change: true,
+                        base: None,
+                    }),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        // The change itself: one new field named "mine", one new fragment, and
+        // that fragment's one data file backing exactly that field. None of it
+        // depends on how many commits landed in between.
+        let mine = committed
+            .schema()
+            .fields
+            .iter()
+            .find(|field| field.name == "mine")
+            .expect("the field this action set added should be in the schema");
+        assert_eq!(
+            committed.fragments().len(),
+            fragments_before + losses + 1,
+            "every racer and this set should each have added one fragment"
+        );
+
+        let minted = committed.fragments().last().unwrap();
+        assert_eq!(minted.files.len(), 1);
+        assert_eq!(
+            minted.files[0].fields.as_ref(),
+            &[mine.id],
+            "the data file must be bound to the field this set minted, not a racer's"
+        );
+
+        // Distinct ids all round: relocation re-resolved rather than reused.
+        let field_ids: HashSet<i32> = committed.schema().fields.iter().map(|f| f.id).collect();
+        assert_eq!(field_ids.len(), committed.schema().fields.len());
+        let fragment_ids: HashSet<u64> = committed.fragments().iter().map(|f| f.id).collect();
+        assert_eq!(fragment_ids.len(), committed.fragments().len());
+    }
+
+    /// The rest of the vocabulary, one commit each. These carry no
+    /// cross-referencing between steps -- that is covered above -- and exist so
+    /// that every action is exercised through the real commit path, not only
+    /// through `build_manifest`.
+    #[tokio::test]
+    async fn test_one_commit_adds_a_base() {
+        let dataset = test_dataset(false).await;
+
+        let dataset = commit(
+            dataset,
+            vec![Action::AddBase(AddBase {
+                local: 0,
+                base: BasePath::new(
+                    0,
+                    "s3://elsewhere/data".into(),
+                    Some("staging".into()),
+                    false,
+                ),
+            })],
+        )
+        .await;
+
+        let base = dataset
+            .manifest()
+            .base_paths
+            .values()
+            .find(|base| base.name.as_deref() == Some("staging"))
+            .expect("the base should be in the manifest");
+        assert_eq!(base.path, "s3://elsewhere/data");
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_removes_a_fragment() {
+        let dataset = test_dataset(false).await;
+        let removed = dataset.fragments()[0].id;
+
+        let dataset = commit(
+            dataset,
+            vec![Action::RemoveFragment(RemoveFragment {
+                fragment: Ref::Committed(removed),
+                data_change: true,
+            })],
+        )
+        .await;
+
+        assert_eq!(dataset.fragments().len(), 1);
+        assert!(dataset.fragments().iter().all(|f| f.id != removed));
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_sets_a_deletion_file() {
+        let dataset = test_dataset(false).await;
+        let fragment_id = dataset.fragments()[0].id;
+        let read_version = dataset.version().version;
+
+        let dataset = commit(
+            dataset,
+            vec![Action::SetDeletionFile(SetDeletionFile {
+                fragment: fragment_id,
+                deletion_file: Some(DeletionFile {
+                    read_version,
+                    id: 1,
+                    file_type: DeletionFileType::Array,
+                    num_deleted_rows: Some(2),
+                    base_id: None,
+                }),
+                data_change: true,
+                base: None,
+            })],
+        )
+        .await;
+
+        let deletion = dataset.fragments()[0]
+            .deletion_file
+            .as_ref()
+            .expect("the fragment should carry a deletion file");
+        assert_eq!(deletion.num_deleted_rows, Some(2));
+        assert_eq!(deletion.read_version, read_version);
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_alters_a_field() {
+        let dataset = test_dataset(false).await;
+        let field_id = dataset.schema().fields[0].id;
+
+        let dataset = commit(
+            dataset,
+            vec![Action::AlterField(AlterField {
+                field: FieldRef::Committed(field_id),
+                name: Some("renamed".into()),
+                nullable: Some(true),
+            })],
+        )
+        .await;
+
+        let field = dataset.schema().field_by_id(field_id).unwrap();
+        assert_eq!(field.name, "renamed");
+        assert!(field.nullable);
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_resets_the_table() {
+        let dataset = test_dataset(false).await;
+        assert_eq!(dataset.fragments().len(), 2);
+
+        let dataset = commit(dataset, vec![Action::ResetTable(ResetTable)]).await;
+
+        assert!(dataset.fragments().is_empty());
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_updates_the_config() {
+        let dataset = test_dataset(false).await;
+
+        let dataset = commit(
+            dataset,
+            vec![Action::ConfigUpdate(ConfigUpdate {
+                config: Some(UpdateMap {
+                    update_entries: vec![UpdateMapEntry {
+                        key: "owner".into(),
+                        value: Some("analytics".into()),
+                    }],
+                    replace: false,
+                }),
+                table_metadata: None,
+                schema_metadata: None,
+                field_metadata: Vec::new(),
+            })],
+        )
+        .await;
+
+        assert_eq!(
+            dataset.manifest().config.get("owner").map(String::as_str),
+            Some("analytics")
+        );
+    }
+
+    /// `SetDeletionFile` carries an absolute post-image -- the whole deletion
+    /// file, computed against the read version -- and apply writes it in
+    /// blindly. That is only safe because two sets touching the same fragment's
+    /// deletions collide on `Coordinate::FragmentDeletions`: without the
+    /// conflict, the loser's deletions would be silently dropped rather than
+    /// recomputed. This pins that.
+    #[tokio::test]
+    async fn test_two_action_sets_setting_the_same_deletion_file_conflict() {
+        let dataset = Arc::new(test_dataset(false).await);
+        let read_version = dataset.version().version;
+        let fragment_id = dataset.fragments()[0].id;
+
+        let delete = |id: u64| {
+            composite_txn(
+                read_version,
+                vec![Action::SetDeletionFile(SetDeletionFile {
+                    fragment: fragment_id,
+                    deletion_file: Some(DeletionFile {
+                        read_version,
+                        id,
+                        file_type: DeletionFileType::Array,
+                        num_deleted_rows: Some(1),
+                        base_id: None,
+                    }),
+                    data_change: true,
+                    base: None,
+                })],
+            )
+        };
+
+        CommitBuilder::new(dataset.clone())
+            .with_experimental_composite_operations(true)
+            .execute(delete(1))
+            .await
+            .unwrap();
+
+        let error = CommitBuilder::new(dataset)
+            .with_experimental_composite_operations(true)
+            .with_max_retries(0)
+            .execute(delete(2))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_adds_a_fragment_and_then_modifies_it() {
+        let dataset = test_dataset(false).await;
+        let before = dataset.version().version;
+        let first_file = existing_data_file(&dataset, 0);
+        let second_file = existing_data_file(&dataset, 1);
+        let second_path = second_file.path.clone();
+
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 4,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file: first_file,
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+                // The same commit then replaces the data it just added, naming the
+                // fragment by the token it was minted under.
+                Action::TombstoneFieldData(TombstoneFieldData {
+                    fragment: Ref::Local(0),
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file: second_file,
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ],
+        )
+        .await;
+
+        assert_eq!(dataset.version().version, before + 1);
+        let fragments = dataset.fragments();
+        assert_eq!(fragments.len(), 3);
+        let added = fragments.last().unwrap();
+        assert_eq!(added.physical_rows, Some(4));
+        // The tombstoned file is gone; only the replacement survives the commit.
+        let paths = added
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec![second_path]);
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_adds_a_field_and_then_fills_it() {
+        let dataset = test_dataset(false).await;
+        let fragment_id = dataset.fragments()[0].id;
+        let file = existing_data_file(&dataset, 1);
+        let path = file.path.clone();
+
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::AddField(AddField {
+                    local: 0,
+                    parent: None,
+                    def: lance_core::datatypes::Field::try_from(Field::new(
+                        "b",
+                        DataType::Int32,
+                        true,
+                    ))
+                    .unwrap(),
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(fragment_id),
+                    file: without_fields(file),
+                    field_ids: vec![FieldRef::Local(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ],
+        )
+        .await;
+
+        let field = dataset.schema().field("b").expect("field b was added");
+        let fragment = &dataset.fragments()[0];
+        let added = fragment
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .expect("the new field's data file was attached");
+        // The file points at the id the commit minted, which the caller never knew.
+        assert_eq!(added.fields.as_ref(), &[field.id]);
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_swaps_a_field_for_a_new_one() {
+        let dataset = test_dataset(false).await;
+        let fragment_id = dataset.fragments()[0].id;
+        let file = existing_data_file(&dataset, 1);
+
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::DropField(DropField {
+                    field: FieldRef::Committed(0),
+                }),
+                Action::AddField(AddField {
+                    local: 0,
+                    parent: None,
+                    def: lance_core::datatypes::Field::try_from(Field::new(
+                        "a",
+                        DataType::Int64,
+                        true,
+                    ))
+                    .unwrap(),
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(fragment_id),
+                    file: without_fields(file),
+                    field_ids: vec![FieldRef::Local(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ],
+        )
+        .await;
+
+        // Dropping "a" and adding a new "a" of a different type is one version, and
+        // the new field gets a fresh id rather than inheriting the dropped one.
+        let schema = dataset.schema();
+        assert_eq!(schema.fields.len(), 1);
+        let field = schema.field("a").unwrap();
+        assert_ne!(field.id, 0);
+        assert_eq!(field.logical_type.to_string(), "int64");
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_assigns_row_ids_to_the_fragments_it_mints() {
+        let dataset = test_dataset(true).await;
+        let next_row_id = dataset.manifest().next_row_id;
+        assert_eq!(next_row_id, 10);
+
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 4,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(1),
+                    physical_rows: 6,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+            ],
+        )
+        .await;
+
+        assert_eq!(dataset.manifest().next_row_id, 20);
+        for fragment in dataset.fragments().iter().skip(2) {
+            assert!(
+                fragment.row_id_meta.is_some(),
+                "fragment {} was minted without row ids",
+                fragment.id
+            );
+            assert!(fragment.created_at_version_meta.is_some());
+        }
+    }
+
+    /// The flow a writer needs when it has to know ids before it commits --
+    /// because it is baking them into an index it writes in the same commit as
+    /// the data. One reservation commit, then one commit carrying both.
+    #[tokio::test]
+    async fn test_a_reservation_lets_a_later_commit_name_its_ids() {
+        let dataset = test_dataset(true).await;
+        let file = existing_data_file(&dataset, 0);
+        assert_eq!(dataset.manifest.max_fragment_id, Some(1));
+        assert_eq!(dataset.manifest.next_row_id, 10);
+
+        let reserved = commit(
+            dataset,
+            vec![
+                Action::ReserveFragmentIds(ReserveFragmentIds { count: 1 }),
+                Action::ReserveRowIds(ReserveRowIds { count: 5 }),
+            ],
+        )
+        .await;
+
+        // The writer reads its range off the committed high-water marks: one
+        // fragment id ending at 2, and five row ids ending at 15.
+        assert_eq!(reserved.manifest.max_fragment_id, Some(2));
+        assert_eq!(reserved.manifest.next_row_id, 15);
+
+        let written = commit(
+            reserved,
+            vec![
+                Action::AddFragment(AddFragment {
+                    id: Ref::Committed(2),
+                    physical_rows: 5,
+                    row_id_meta: Some(RowIdMeta::Inline(
+                        write_row_ids(&RowIdSequence::from(10u64..15)).into(),
+                    )),
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(2),
+                    file: without_fields(file),
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            written.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        // Both reservations were consumed rather than added to: the fragment
+        // landed on the id it named, and the rows kept the ids they arrived
+        // with instead of being numbered again.
+        assert_eq!(written.manifest.max_fragment_id, Some(2));
+        assert_eq!(written.manifest.next_row_id, 15);
+    }
+
+    #[tokio::test]
+    async fn test_two_action_sets_on_disjoint_coordinates_both_commit() {
+        let dataset = Arc::new(test_dataset(false).await);
+        let read_version = dataset.version().version;
+
+        let append = |local| {
+            vec![Action::AddFragment(AddFragment {
+                id: Ref::Local(local),
+                physical_rows: 4,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            })]
+        };
+
+        let first = CommitBuilder::new(dataset.clone())
+            .with_experimental_composite_operations(true)
+            .execute(Transaction::new(
+                read_version,
+                Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                    "step",
+                    append(0),
+                )])),
+                None,
+            ))
+            .await
+            .unwrap();
+
+        // The second commit still reads the original version, so it has to be
+        // checked against the first. Both only mint, so neither writes anything
+        // the other does.
+        let second = CommitBuilder::new(dataset)
+            .with_experimental_composite_operations(true)
+            .execute(Transaction::new(
+                read_version,
+                Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                    "step",
+                    append(0),
+                )])),
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(second.version().version, first.version().version + 1);
+        assert_eq!(second.fragments().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_two_action_sets_writing_the_same_field_data_conflict() {
+        let dataset = Arc::new(test_dataset(false).await);
+        let read_version = dataset.version().version;
+        let fragment_id = dataset.fragments()[0].id;
+
+        let tombstone = || {
+            Transaction::new(
+                read_version,
+                Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                    "step",
+                    vec![Action::TombstoneFieldData(TombstoneFieldData {
+                        fragment: Ref::Committed(fragment_id),
+                        field_ids: vec![FieldRef::Committed(0)],
+                        data_change: true,
+                    })],
+                )])),
+                None,
+            )
+        };
+
+        CommitBuilder::new(dataset.clone())
+            .with_experimental_composite_operations(true)
+            .execute(tombstone())
+            .await
+            .unwrap();
+
+        let error = CommitBuilder::new(dataset)
+            .with_experimental_composite_operations(true)
+            .with_max_retries(0)
+            .execute(tombstone())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("preempted"),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn append_with_field_zero(dataset: &Dataset) -> Vec<Action> {
+        vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 5,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(0),
+                file: existing_data_file(dataset, 0),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: true,
+                base: None,
+            }),
+        ]
+    }
+
+    /// Commit `actions` against `dataset`'s version, expecting to lose a race.
+    async fn commit_expecting_conflict(dataset: &Dataset, read_version: u64, actions: Vec<Action>) {
+        let error = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_experimental_composite_operations(true)
+            .with_max_retries(0)
+            .execute(composite_txn(read_version, actions))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
+    }
+
+    fn add_non_nullable_b_over_existing_data(dataset: &Dataset) -> Vec<Action> {
+        let mut actions = vec![Action::AddField(AddField {
+            local: 0,
+            parent: None,
+            def: LanceField::try_from(Field::new("b", DataType::Int32, false)).unwrap(),
+        })];
+        for (index, fragment) in dataset.fragments().iter().enumerate() {
+            actions.push(Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment.id),
+                file: existing_data_file(dataset, index),
+                field_ids: vec![FieldRef::Local(0)],
+                data_change: true,
+                base: None,
+            }));
+        }
+        actions
+    }
+
+    /// A stale append mints rows that carry no value for a column added while it
+    /// was being prepared, and the column is not nullable.
+    #[tokio::test]
+    async fn test_non_nullable_add_conflicts_with_a_stale_append_in_either_order() {
+        let original = test_dataset(false).await;
+        let read_version = original.version().version;
+        let with_b = commit(
+            original.clone(),
+            add_non_nullable_b_over_existing_data(&original),
+        )
+        .await;
+        commit_expecting_conflict(&with_b, read_version, append_with_field_zero(&original)).await;
+
+        let original = test_dataset(false).await;
+        let appended = commit(original.clone(), append_with_field_zero(&original)).await;
+        commit_expecting_conflict(
+            &appended,
+            read_version,
+            add_non_nullable_b_over_existing_data(&original),
+        )
+        .await;
+    }
+
+    async fn nullable_test_dataset() -> Dataset {
+        commit(
+            test_dataset(false).await,
+            vec![Action::AlterField(AlterField {
+                field: FieldRef::Committed(0),
+                name: None,
+                nullable: Some(true),
+            })],
+        )
+        .await
+    }
+
+    fn tighten_field_zero() -> Vec<Action> {
+        vec![Action::AlterField(AlterField {
+            field: FieldRef::Committed(0),
+            name: None,
+            nullable: Some(false),
+        })]
+    }
+
+    /// The tightening was valid against the version it read, but nulls written
+    /// since are never revalidated by applying it.
+    #[tokio::test]
+    async fn test_tightening_conflicts_with_a_concurrent_append_in_either_order() {
+        let nullable = nullable_test_dataset().await;
+        let read_version = nullable.version().version;
+        let appended = commit(nullable.clone(), append_with_field_zero(&nullable)).await;
+        commit_expecting_conflict(&appended, read_version, tighten_field_zero()).await;
+
+        let nullable = nullable_test_dataset().await;
+        let tightened = commit(nullable.clone(), tighten_field_zero()).await;
+        commit_expecting_conflict(&tightened, read_version, append_with_field_zero(&nullable))
+            .await;
+    }
+
+    /// Adding a nullable field and tightening it in one set promises a value in
+    /// every row, which a stale append cannot keep.
+    #[rstest::rstest]
+    #[case::add_and_tighten_first(false)]
+    #[case::append_first(true)]
+    #[tokio::test]
+    async fn test_adding_then_tightening_a_local_field_conflicts_with_a_stale_append(
+        #[case] append_first: bool,
+    ) {
+        let original = test_dataset(false).await;
+        let read_version = original.version().version;
+        let mut add_and_tighten = vec![
+            Action::AddField(AddField {
+                local: 0,
+                parent: None,
+                def: int32_field("b"),
+            }),
+            Action::AlterField(AlterField {
+                field: FieldRef::Local(0),
+                name: None,
+                nullable: Some(false),
+            }),
+        ];
+        for (index, fragment) in original.fragments().iter().enumerate() {
+            add_and_tighten.push(Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment.id),
+                file: existing_data_file(&original, index),
+                field_ids: vec![FieldRef::Local(0)],
+                data_change: true,
+                base: None,
+            }));
+        }
+        let append = append_with_field_zero(&original);
+        let (first, stale) = if append_first {
+            (append, add_and_tighten)
+        } else {
+            (add_and_tighten, append)
+        };
+        let current = commit(original, first).await;
+        commit_expecting_conflict(&current, read_version, stale).await;
+    }
+
+    /// A stale append that never names the tightened field still leaves it null
+    /// in every row it adds.
+    #[rstest::rstest]
+    #[case::tightening_first(false)]
+    #[case::append_first(true)]
+    #[tokio::test]
+    async fn test_tightening_conflicts_with_an_append_omitting_the_field(
+        #[case] append_first: bool,
+    ) {
+        let nullable = nullable_test_dataset().await;
+        let with_b = commit(
+            nullable,
+            vec![Action::AddField(AddField {
+                local: 0,
+                parent: None,
+                def: int32_field("b"),
+            })],
+        )
+        .await;
+        let read_version = with_b.version().version;
+        let b = with_b.schema().field("b").unwrap().id;
+        let append_only_b = vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 5,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(0),
+                file: existing_data_file(&with_b, 0),
+                field_ids: vec![FieldRef::Committed(b)],
+                data_change: true,
+                base: None,
+            }),
+        ];
+        let (first, stale) = if append_first {
+            (append_only_b, tighten_field_zero())
+        } else {
+            (tighten_field_zero(), append_only_b)
+        };
+        let current = commit(with_b, first).await;
+        commit_expecting_conflict(&current, read_version, stale).await;
+    }
+
+    /// Detached commits allocate field ids from their own parent's watermark, so
+    /// two of them, or one and the main line, can mint the same id for
+    /// different fields.
+    #[tokio::test]
+    async fn test_detached_composite_add_field_is_rejected_once_field_ids_are_non_reusable() {
+        let mut original = test_dataset(false).await;
+        original.migrate_manifest_paths_v2().await.unwrap();
+        original.migrate_to_non_reusable_field_ids().await.unwrap();
+        let read_version = original.version().version;
+        let original = Arc::new(original);
+        let detached = |actions| {
+            CommitBuilder::new(original.clone())
+                .with_experimental_composite_operations(true)
+                .with_detached(true)
+                .execute(composite_txn(read_version, actions))
+        };
+
+        let error = detached(vec![Action::AddField(AddField {
+            local: 0,
+            parent: None,
+            def: int32_field("detached"),
+        })])
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("Detached"), "{error}");
+
+        detached(vec![Action::AlterField(AlterField {
+            field: FieldRef::Committed(0),
+            name: Some("renamed".into()),
+            nullable: None,
+        })])
+        .await
+        .unwrap();
+    }
+
+    fn packed_batch(values: Vec<i32>) -> RecordBatch {
+        let child = Arc::new(Field::new("x", DataType::Int32, false));
+        let field =
+            Field::new("s", DataType::Struct(vec![child.clone()].into()), false).with_metadata(
+                HashMap::from([("lance-encoding:packed".to_string(), "true".to_string())]),
+            );
+        let array = StructArray::from(vec![(
+            child,
+            Arc::new(Int32Array::from(values)) as arrow_array::ArrayRef,
+        )]);
+        RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(array)]).unwrap()
+    }
+
+    /// A packed struct is stored under the parent's field id, so rewriting it
+    /// changes what an index on a child recorded.
+    #[tokio::test]
+    async fn test_packed_parent_rewrite_removes_the_fragment_from_a_child_index() {
+        let mut original = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            })
+            .execute(vec![packed_batch(vec![1, 2, 3, 4])])
+            .await
+            .unwrap();
+        original
+            .create_index(
+                &["s.x"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        let fragment = original.get_fragments().remove(0);
+        let (fragment_id, file) = fragment
+            .write_columns(
+                stream::iter(vec![Ok(packed_batch(vec![9, 10]))]),
+                original.schema(),
+            )
+            .await
+            .map(|group| (group.0, group.1))
+            .unwrap();
+        let fields: Vec<FieldRef> = file
+            .fields
+            .iter()
+            .map(|id| FieldRef::Committed(*id))
+            .collect();
+
+        let updated = commit(
+            original,
+            vec![
+                Action::TombstoneFieldData(TombstoneFieldData {
+                    fragment: Ref::Committed(fragment_id),
+                    field_ids: fields.clone(),
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(fragment_id),
+                    file: without_fields(file),
+                    field_ids: fields,
+                    data_change: true,
+                    base: None,
+                }),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            updated.count_rows(Some("s.x = 9".into())).await.unwrap(),
+            1,
+            "the indexed predicate missed the new value"
+        );
+    }
+}

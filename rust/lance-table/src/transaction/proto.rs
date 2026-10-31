@@ -13,6 +13,7 @@ use crate::format::pb;
 use crate::format::pb_actions;
 use crate::format::{BasePath, Fragment, IndexFile, IndexMetadata, overlay::DataOverlayFile};
 use crate::system_index::mem_wal::CompactedSsTable;
+use crate::transaction::action::CompositeOperation;
 use crate::transaction::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
     UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets, translate_config_updates,
@@ -411,18 +412,14 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(DataOverlayGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
             },
-            Some(pb::transaction::Operation::CompositeOperation(_)) => {
+            Some(pb::transaction::Operation::CompositeOperation(composite_operation)) => {
                 // Action-based transactions (Transaction V2) are an experimental
-                // wire format (discussion #5960). This version of Lance recognizes
-                // the message but has no support for it: reject on load, fail-closed. Because
-                // load_and_sort_new_transactions collects transactions with
-                // try_collect, a concurrent V2 commit in the conflict window
-                // aborts the whole commit rather than being silently skipped.
-                // Do NOT make this parsing lenient.
-                return Err(Error::not_supported(
-                    "action-based transactions (Transaction V2) are not supported \
-                     by this version of Lance; please upgrade",
-                ));
+                // wire format (discussion #5960). Parsing is fail-closed: an action this build
+                // does not implement is an error, never a skipped element.
+                // load_and_sort_new_transactions collects concurrent transactions
+                // with try_collect, so such a transaction aborts the commit rather
+                // than being silently treated as a no-op. Do NOT make this lenient.
+                Operation::CompositeOperation(CompositeOperation::try_from(composite_operation)?)
             }
             // prost drops unrecognized oneof fields, so an operation from a
             // newer writer is indistinguishable from a missing one.
@@ -742,6 +739,11 @@ impl TryFrom<&Transaction> for pb::Transaction {
                     value.uuid
                 )));
             }
+            Operation::CompositeOperation(composite_operation) => {
+                pb::transaction::Operation::CompositeOperation(
+                    pb_actions::CompositeOperation::from(composite_operation),
+                )
+            }
         };
 
         let transaction_properties = value
@@ -850,6 +852,13 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
+    use crate::transaction::action::{
+        Action, AddDataFile, AddFragment, FieldRef, Ref, RemoveFragment, UserStep,
+    };
+    use crate::transaction::operation::RewriteGroup;
+    use lance_file::version::ConcreteFileVersion;
+    use prost::Message;
+    use rstest::rstest;
 
     #[test]
     fn test_rewrite_frag_reuse_update_stays_in_memory() {
@@ -950,27 +959,64 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_operation_rejected_on_load() {
-        // Action-based transactions (Transaction V2) are an experimental wire
-        // format that this version of Lance does not support. Loading one must fail closed
-        // (never be silently skipped or leniently parsed), so that a concurrent
-        // V2 commit in the conflict window aborts an in-flight commit.
+    fn test_composite_operation_round_trips_through_transaction() {
+        let uuid = Uuid::new_v4().to_string();
+        let transaction = Transaction {
+            read_version: 4,
+            uuid: uuid.clone(),
+            operation: Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                "append batch",
+                vec![Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 1,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                })],
+            )])),
+            tag: None,
+            transaction_properties: None,
+        };
+
+        let message = pb::Transaction::try_from(&transaction).unwrap();
+        // The identity lives on the envelope alone. The operation carries the
+        // steps, and their descriptions are what keeps history readable.
+        assert_eq!(message.uuid, uuid);
+        assert_eq!(message.read_version, 4);
+        match &message.operation {
+            Some(pb::transaction::Operation::CompositeOperation(composite_operation)) => {
+                let descriptions: Vec<&str> = composite_operation
+                    .steps
+                    .iter()
+                    .map(|step| step.description.as_str())
+                    .collect();
+                assert_eq!(descriptions, ["append batch"]);
+            }
+            other => panic!("expected CompositeOperation, got {other:?}"),
+        }
+
+        assert_eq!(Transaction::try_from(message).unwrap(), transaction);
+    }
+
+    #[test]
+    fn test_unimplemented_action_fails_closed_on_load() {
+        // The vocabulary is larger than what is implemented. Loading a
+        // transaction that uses an unimplemented action must fail rather than
+        // parse leniently: load_and_sort_new_transactions collects concurrent
+        // transactions with try_collect, so this aborts an in-flight commit
+        // instead of letting it proceed against a change it cannot see.
         let message = pb::Transaction {
             read_version: 1,
             uuid: Uuid::new_v4().to_string(),
             operation: Some(pb::transaction::Operation::CompositeOperation(
                 pb_actions::CompositeOperation {
                     steps: vec![pb_actions::UserStep {
-                        description: "append batch".to_string(),
+                        description: "refresh row versions".to_string(),
                         actions: vec![pb_actions::Action {
-                            action: Some(pb_actions::action::Action::AddFragment(
-                                pb_actions::AddFragment {
-                                    id: Some(pb_actions::Ref {
-                                        kind: Some(pb_actions::r#ref::Kind::Local(0)),
-                                    }),
-                                    physical_rows: 1,
-                                    data_change: Some(true),
-                                    ..Default::default()
+                            action: Some(pb_actions::action::Action::RefreshRowVersionMetadata(
+                                pb_actions::RefreshRowVersionMetadata {
+                                    fragment_ids: vec![1],
                                 },
                             )),
                         }],
@@ -984,6 +1030,114 @@ mod tests {
         assert!(
             matches!(err, Error::NotSupported { .. }),
             "expected NotSupported, got: {err:?}"
+        );
+    }
+
+    const WIDE_COLUMNS: i32 = 200;
+
+    fn wide_data_file(index: usize, fields: Vec<i32>) -> DataFile {
+        DataFile::new(
+            format!("data/{:032x}.lance", index),
+            fields,
+            (0..WIDE_COLUMNS).collect(),
+            ConcreteFileVersion::V2_0,
+            std::num::NonZero::new(64 << 20),
+            None,
+        )
+    }
+
+    fn wide_fragment(id: u64) -> Fragment {
+        let mut fragment = Fragment::new(id);
+        fragment.physical_rows = Some(1_000_000);
+        fragment.files = vec![wide_data_file(id as usize, (0..WIDE_COLUMNS).collect())];
+        fragment
+    }
+
+    /// The composite spelling of minting `count` wide fragments: `file.fields`
+    /// empty and `field_ids` the file's only field list.
+    fn mint_wide_fragments(count: usize, data_change: bool) -> Vec<Action> {
+        (0..count)
+            .flat_map(|index| {
+                let token = index as u32;
+                [
+                    Action::AddFragment(AddFragment {
+                        id: Ref::Local(token),
+                        physical_rows: 1_000_000,
+                        row_id_meta: None,
+                        last_updated_at_version_meta: None,
+                        created_at_version_meta: None,
+                        data_change,
+                    }),
+                    Action::AddDataFile(AddDataFile {
+                        fragment: Ref::Local(token),
+                        file: wide_data_file(index, Vec::new()),
+                        field_ids: (0..WIDE_COLUMNS).map(FieldRef::Committed).collect(),
+                        data_change,
+                        base: None,
+                    }),
+                ]
+            })
+            .collect()
+    }
+
+    fn encoded_len(operation: Operation) -> usize {
+        let transaction = Transaction::new(1, operation, None);
+        pb::Transaction::try_from(&transaction)
+            .unwrap()
+            .encoded_len()
+    }
+
+    fn composite(actions: Vec<Action>) -> Operation {
+        Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+            "step", actions,
+        )]))
+    }
+
+    /// A wide table makes the per-column cost of an action set visible: 100
+    /// fragments of 200 columns each, appended, and compacted 10 to 1.
+    ///
+    /// Each bound is what the format costs today plus ~10%, so it only catches
+    /// growth. What remains of the append's overhead is `field_ids`: a
+    /// `FieldRef` per column costs a few bytes more than a packed `int32`.
+    #[rstest]
+    #[case::append(
+        Operation::Append { fragments: (0..100).map(wide_fragment).collect() },
+        composite(mint_wide_fragments(100, true)),
+        2.3,
+    )]
+    #[case::compaction(
+        Operation::Rewrite {
+            groups: vec![RewriteGroup {
+                old_fragments: (0..100).map(wide_fragment).collect(),
+                new_fragments: (100..110).map(wide_fragment).collect(),
+            }],
+            rewritten_indices: vec![],
+            frag_reuse_index: None,
+        },
+        composite(
+            (0..100)
+                .map(|id| {
+                    Action::RemoveFragment(RemoveFragment {
+                        fragment: Ref::Committed(id),
+                        data_change: false,
+                    })
+                })
+                .chain(mint_wide_fragments(10, false))
+                .collect(),
+        ),
+        0.23,
+    )]
+    fn test_a_wide_action_set_stays_within_a_bound_of_the_legacy_size(
+        #[case] legacy: Operation,
+        #[case] actions: Operation,
+        #[case] max_ratio: f64,
+    ) {
+        let legacy = encoded_len(legacy);
+        let actions = encoded_len(actions);
+        assert!(
+            actions as f64 <= legacy as f64 * max_ratio,
+            "the action set encodes to {actions} bytes, more than {max_ratio}x the legacy \
+             operation's {legacy}"
         );
     }
 }
