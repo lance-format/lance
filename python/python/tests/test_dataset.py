@@ -1554,15 +1554,49 @@ def test_polar_scan(tmp_path: Path):
     # kind of filter
     check_pushdown_filt((pl.col("a") + 3) < 100, "(a + 3) < 100")
 
-    # I can't seem to get struct["x"] to work in Lance but maybe there is
-    # a way.  For now, let's compare it directly to the pyarrow compute version
+    # Compare with the PyArrow expression filter, which reaches the scanner as a
+    # nested Substrait field reference.
+    polars_df = pl.scan_pyarrow_dataset(dataset).filter(
+        pl.col("struct").struct.field("x") < 10
+    )
+    df = dataset.to_table(filter=pc.field("struct", "x") < 10).to_pandas()
+    assert len(df) == 10
+    tm.assert_frame_equal(polars_df.collect().to_pandas(), df)
 
-    # Doesn't yet work today :( due to upstream issue (datafusion's substrait parser
-    # doesn't yet handle nested refs)
-    # if pa.cpp_version_info.major >= 14:
-    #     polars_df = pl.scan_pyarrow_dataset(dataset).filter(pl.col("struct.x") < 10)
-    #     df = dataset.to_table(filter=pc.field("struct", "x") < 10).to_pandas()
-    #     tm.assert_frame_equal(polars_df.collect().to_pandas(), df)
+
+def test_filter_on_struct_field_expression(tmp_path: Path):
+    rows = [{"x": i, "inner": {"y": i % 3}} for i in range(10)]
+    table = pa.table(
+        {
+            "id": pa.array(range(12), pa.int64()),
+            "meta": pa.array(
+                rows + [{"x": None, "inner": None}, None],
+                pa.struct(
+                    [("x", pa.int64()), ("inner", pa.struct([("y", pa.int64())]))]
+                ),
+            ),
+        }
+    )
+    ds = lance.write_dataset(table, tmp_path, max_rows_per_file=4)
+    by_x = pc.field("meta", "x") >= 6
+    by_y = pc.field("meta", "inner", "y") == 0
+
+    assert ds.to_table(filter=by_x)["id"].to_pylist() == [6, 7, 8, 9]
+    assert ds.to_table(filter=by_y)["id"].to_pylist() == [0, 3, 6, 9]
+    assert ds.count_rows(filter=by_x) == 4
+    assert ds.get_fragments()[1].to_table(filter=by_x)["id"].to_pylist() == [6, 7]
+
+    # The filter decodes to the same expression as `meta.x >= 6`, so it can use
+    # an index on the struct field.
+    ds.create_scalar_index("meta.x", "BTREE")
+    assert "ScalarIndexQuery" in ds.scanner(filter=by_x).explain_plan()
+    assert ds.to_table(filter=by_x)["id"].to_pylist() == [6, 7, 8, 9]
+    is_null = pc.field("meta", "x").is_null()
+    assert ds.to_table(filter=is_null)["id"].to_pylist() == [10, 11]
+
+    ds.update({"id": "id + 100"}, where=by_y)
+    ds.delete(by_x)
+    assert sorted(ds.to_table()["id"].to_pylist()) == [1, 2, 4, 5, 10, 11, 100, 103]
 
 
 def test_count_fragments(tmp_path: Path):
