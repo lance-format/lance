@@ -2,9 +2,12 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use half::{bf16, f16};
+use lance_core::utils::cpu::Dispatch;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseResult, TestRunner};
 use std::ops::Range;
+
+use crate::distance::{BatchKernel, PairKernel};
 
 const CASES_PER_DIMENSION_SHARD: u32 = 16;
 const MIN_TEST_DIMENSION: usize = 4;
@@ -124,6 +127,41 @@ where
         ..Config::default()
     });
     runner.run(&strategy, property).unwrap();
+}
+
+/// Checks that `batch` mirrors `pair` candidate for candidate, and that each
+/// host-supported batch kernel writes, bit for bit, what its pair kernel
+/// returns for each vector. The batch is `[y, x]`.
+pub fn check_batch_matches_pair<T: Copy>(
+    pair: &Dispatch<PairKernel<T>>,
+    batch: &Dispatch<BatchKernel<T>>,
+    x: &[T],
+    y: &[T],
+) -> TestCaseResult {
+    prop_assert_eq!(pair.candidates().len(), batch.candidates().len());
+    let vectors = [y, x].concat();
+    for (pair, batch) in pair.candidates().iter().zip(batch.candidates()) {
+        prop_assert!(
+            pair.features() == batch.features(),
+            "{} and {} need different features",
+            pair.name(),
+            batch.name()
+        );
+        let (Some(pair_kernel), Some(batch_kernel)) = (pair.kernel(), batch.kernel()) else {
+            continue;
+        };
+        let mut got = [f32::NAN; 2];
+        batch_kernel.call(x, &vectors, x.len(), &mut got);
+        let want = [pair_kernel.call(x, y), pair_kernel.call(x, x)];
+        prop_assert!(
+            got.map(f32::to_bits) == want.map(f32::to_bits),
+            "{} at dim {}: {got:?} != {} {want:?}",
+            batch.name(),
+            x.len(),
+            pair.name()
+        );
+    }
+    Ok(())
 }
 
 /// Input pairs shared by the u8 distance kernel tests.
