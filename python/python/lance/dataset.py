@@ -7040,32 +7040,64 @@ class ColumnOrdering:
     nulls_first: bool = False
 
 
-def _needs_substrait_placeholder(t: pa.DataType) -> bool:
+def _needs_substrait_placeholder(t: pa.DataType, nested: bool = False) -> bool:
     """Return True if *t* contains a type that PyArrow's substrait serializer
-    cannot handle at any nesting depth.
+    or Lance's substrait decoder cannot handle.
 
-    Three cases require a placeholder:
+    These require a placeholder at any nesting depth:
 
     * ``fixed_size_list`` — substrait has no equivalent type.
+    * ``large_list``, ``duration`` and ``decimal256`` — PyArrow has no
+      substrait conversion for them.
     * Arrow extension types (e.g. ``fixed_shape_tensor``) — substrait cannot
       represent them.
     * A struct whose fields carry non-``None`` metadata — substrait rejects
       such structs.  Extension types leave ``metadata={}`` on struct fields
       after a lance round-trip; ``{}`` is non-``None``.
+    * ``time64("us")`` — PyArrow writes it as substrait ``time``, which Lance
+      cannot decode.
+
+    Unsigned integers, ``large_string``, ``large_binary``, ``date64``,
+    ``time32`` and ``time64`` need one only inside a list, struct or map.
+    PyArrow 16 and later write them as user-defined types; Lance drops those
+    from the top level of the schema but cannot decode them when nested.  It
+    writes a dictionary as its value type, so the value type decides.
     """
-    if pa.types.is_fixed_size_list(t):
+    if (
+        pa.types.is_fixed_size_list(t)
+        or pa.types.is_large_list(t)
+        or pa.types.is_duration(t)
+        or pa.types.is_decimal256(t)
+        or (pa.types.is_time64(t) and t.unit == "us")
+    ):
         return True
     if isinstance(t, pa.lib.BaseExtensionType):
         return True
+    if nested and (
+        pa.types.is_unsigned_integer(t)
+        or pa.types.is_large_string(t)
+        or pa.types.is_large_binary(t)
+        or pa.types.is_date64(t)
+        or pa.types.is_time32(t)
+        or pa.types.is_time64(t)
+    ):
+        return True
+    if pa.types.is_dictionary(t):
+        return _needs_substrait_placeholder(t.value_type, nested)
     if pa.types.is_struct(t):
         for i in range(t.num_fields):
             f = t.field(i)
             if f.metadata is not None:
                 return True
-            if _needs_substrait_placeholder(f.type):
+            if _needs_substrait_placeholder(f.type, nested=True):
                 return True
-    if pa.types.is_list(t) or pa.types.is_large_list(t):
-        return _needs_substrait_placeholder(t.value_type)
+    if pa.types.is_list(t):
+        return _needs_substrait_placeholder(t.value_type, nested=True)
+    if pa.types.is_map(t):
+        return any(
+            _needs_substrait_placeholder(child, nested=True)
+            for child in (t.key_type, t.item_type)
+        )
     return False
 
 
