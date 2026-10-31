@@ -40,8 +40,10 @@ use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
 use lance_datagen::{BatchCount, RowCount, array};
 
 use crate::datafusion::LanceTableProvider;
+use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::SessionContext;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance_datafusion::udf::register_functions;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
@@ -1740,6 +1742,188 @@ async fn test_alter_columns_rename_and_cast(
     assert_eq!(data["id"].as_ref(), &Int64Array::from(vec![1, 2, 3]));
     assert_eq!(data["full_name"].as_ref(), batch["name"].as_ref());
     Ok(())
+}
+
+#[rstest::rstest]
+#[case::cast(false)]
+#[case::drop_and_readd(true)]
+#[tokio::test]
+async fn test_append_conflicts_with_concurrent_schema_change(
+    #[case] drop_and_readd: bool,
+    #[values(false, true)] streaming_write: bool,
+) {
+    let batch = record_batch!(
+        ("id", Int64, [1, 2, 3, 4]),
+        ("x", Int64, [Some(5), None, Some(7), Some(9)])
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            session: Some(Arc::new(Session::default())),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+    let session = dataset.session();
+    let mut changed = dataset.clone();
+    let change_schema = async move {
+        if drop_and_readd {
+            changed.drop_columns(&["x"]).await.unwrap();
+            changed
+                .add_columns(
+                    NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![
+                        ArrowField::new("x", DataType::Int64, true),
+                    ]))),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        } else {
+            changed
+                .alter_columns(&[ColumnAlteration::new("x".into()).cast_to(DataType::Int32)])
+                .await
+                .unwrap();
+        }
+    };
+    let append_batch = record_batch!(("id", Int64, [5, 6]), ("x", Int64, [Some(3), None])).unwrap();
+    let error = if streaming_write {
+        // The writer peeks the first batch before opening the URI. Change the
+        // schema on the second poll, after the append has resolved its schema.
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            append_batch.schema(),
+            futures::stream::iter([Ok(append_batch.clone())]).chain(futures::stream::once(
+                async move {
+                    change_schema.await;
+                    Ok(append_batch)
+                },
+            )),
+        ));
+        InsertBuilder::new(dataset.uri())
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                session: Some(session),
+                ..Default::default()
+            })
+            .execute_stream(stream)
+            .await
+            .unwrap_err()
+    } else {
+        change_schema.await;
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(append_batch.clone())], append_batch.schema()),
+                None,
+            )
+            .await
+            .unwrap_err()
+    };
+    assert!(matches!(error, Error::RetryableCommitConflict { .. }));
+    let message = error.to_string();
+    assert!(
+        message.contains("Append") && message.contains("Please retry"),
+        "{message}"
+    );
+
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(
+        dataset.version().version,
+        if drop_and_readd { 3 } else { 2 }
+    );
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 4);
+    let retry = if drop_and_readd {
+        record_batch!(("id", Int64, [5]), ("x", Int64, [3])).unwrap()
+    } else {
+        record_batch!(("id", Int64, [5]), ("x", Int32, [3])).unwrap()
+    };
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(retry.clone())], retry.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let rows = dataset
+        .scan()
+        .filter("id = 5")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(rows.num_rows(), 1);
+    assert_eq!(rows["x"].null_count(), 0);
+    if drop_and_readd {
+        assert_eq!(rows["x"].as_primitive::<Int64Type>().value(0), 3);
+    } else {
+        assert_eq!(rows["x"].as_primitive::<Int32Type>().value(0), 3);
+    }
+}
+
+#[rstest::rstest]
+#[case::rename("rename")]
+#[case::nullable_add("add")]
+#[case::drop("drop")]
+#[tokio::test]
+async fn test_append_allows_compatible_concurrent_schema_change(#[case] change: &str) {
+    let batch = record_batch!(("id", Int64, [1, 2]), ("x", Int64, [Some(5), None])).unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let mut changed = dataset.clone();
+    if change == "drop" {
+        changed.drop_columns(&["x"]).await.unwrap();
+    } else if change == "rename" {
+        changed
+            .alter_columns(&[ColumnAlteration::new("x".into()).rename("y".into())])
+            .await
+            .unwrap();
+    } else {
+        changed
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "y",
+                    DataType::Int64,
+                    true,
+                )]))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let rows = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(rows.num_rows(), 4);
+    assert_eq!(rows["id"].as_ref(), &Int64Array::from(vec![1, 2, 1, 2]));
+    if change == "drop" {
+        assert!(rows.schema().field_with_name("x").is_err());
+    } else {
+        assert_eq!(
+            rows[if change == "rename" { "y" } else { "x" }].as_ref(),
+            &Int64Array::from(vec![Some(5), None, Some(5), None])
+        );
+    }
+    if change == "add" {
+        assert_eq!(rows["y"].null_count(), 4);
+    }
 }
 
 // Which clause rejects the lossy round-trip depends on the hole's

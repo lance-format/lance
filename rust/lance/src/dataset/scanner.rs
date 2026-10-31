@@ -5436,7 +5436,8 @@ impl Scanner {
         query: &FullTextSearchQuery,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut params = query.params();
-        if params.limit.is_none() {
+        // A column sort must select the page before relevance can truncate its candidates.
+        if params.limit.is_none() && self.ordering.is_none() {
             let search_limit = match (self.limit, self.offset) {
                 (Some(limit), Some(offset)) => Some((limit + offset) as usize),
                 (Some(limit), None) => Some(limit as usize),
@@ -21269,6 +21270,88 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         scanner
             .full_text_search(FullTextSearchQuery::new("4".into()))
             .unwrap();
+        limit_offset_equivalency_test(&scanner).await;
+    }
+
+    #[rstest]
+    #[case::flat(false, false)]
+    #[case::indexed(true, false)]
+    #[case::mixed(true, true)]
+    #[tokio::test]
+    async fn test_fts_ordered_limit_offset(
+        #[case] has_index: bool,
+        #[case] has_append: bool,
+        #[values(None, Some(4))] candidate_limit: Option<i64>,
+    ) {
+        // Longer documents rank lower, opposite to the requested id ordering.
+        let texts: Vec<String> = (0..6)
+            .map(|i| format!("needle {}", "filler ".repeat(20 * i)))
+            .collect();
+        let batch = arrow_array::record_batch!(
+            ("id", Int32, (0..6).collect::<Vec<i32>>()),
+            ("text", Utf8, texts)
+        )
+        .unwrap();
+        let initial_rows = if has_append { 4 } else { 6 };
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.slice(0, initial_rows))], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        if has_index {
+            dataset
+                .create_index(
+                    &["text"],
+                    IndexType::Inverted,
+                    None,
+                    &InvertedIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        if has_append {
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(batch.slice(4, 2))], batch.schema()),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["id", SCORE_COL])
+            .unwrap()
+            .full_text_search(
+                FullTextSearchQuery::new("needle".into())
+                    .with_column("text".into())
+                    .unwrap()
+                    .limit(candidate_limit),
+            )
+            .unwrap()
+            .order_by(Some(vec![ColumnOrdering::desc_nulls_last("id".into())]))
+            .unwrap();
+        let full = scanner.try_into_batch().await.unwrap();
+        let candidate_count = candidate_limit.unwrap_or(6) as i32;
+        assert_eq!(
+            full["id"].as_primitive::<Int32Type>().values().as_ref(),
+            (0..candidate_count).rev().collect::<Vec<_>>()
+        );
+        assert!(
+            full[SCORE_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .windows(2)
+                .all(|scores| scores[0] < scores[1])
+        );
         limit_offset_equivalency_test(&scanner).await;
     }
 

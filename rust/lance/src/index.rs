@@ -4382,6 +4382,18 @@ impl Dataset {
         let tailing_bytes = read_last_block(reader.as_ref()).await?;
         let (major_version, minor_version) = read_version(&tailing_bytes)?;
 
+        // Legacy vector indexes are cached whole and can outlive the files they
+        // were opened from: cleanup unlinks old index files while the cache still
+        // holds an entry for them. Anything stored in the cached index must
+        // therefore reopen the file per read instead of pinning a descriptor.
+        let lazy_reader = vector::open_cache_reader(
+            object_store.clone(),
+            &index_file,
+            INDEX_FILE_NAME,
+            &file_sizes,
+        )
+        .await?;
+
         // Namespace the index cache by the UUID of the index. v2+ partition
         // entries are store-free and remain reusable across object-store
         // generations alongside their serializable state.
@@ -4411,7 +4423,7 @@ impl Dataset {
                             dataset,
                             uuid,
                             vector_index,
-                            reader,
+                            lazy_reader,
                             frag_reuse_index,
                         )
                         .await?;
@@ -4426,7 +4438,7 @@ impl Dataset {
             (0, 2) => {
                 info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
                 let reader = V1FileReader::try_new_self_described_from_reader(
-                    reader.clone(),
+                    lazy_reader,
                     Some(&self.metadata_cache.file_metadata_cache(&index_file)),
                 )
                 .await?;
@@ -15532,10 +15544,9 @@ mod tests {
     /// bitmap into the current space through the fragment-reuse index and leaves
     /// a `None` one alone, so the reconstruction has to make that move itself.
     ///
-    /// Without it, a deferred compaction is enough to defeat both guards: the
-    /// coverage still names the fragments the rows moved out of, which no later
-    /// rewrite can intersect, so the planner stops holding anything back and the
-    /// commit boundary waves the rewrite through.
+    /// Without it, coverage still names the fragments the rows moved out of:
+    /// deferred planning loses the boundary between indexed and unindexed rows,
+    /// and the unreadable-index commit guard cannot detect a covered rewrite.
     #[tokio::test]
     async fn test_reconstructed_coverage_follows_a_deferred_compaction() {
         use crate::dataset::index::DatasetIndexRemapperOptions;
@@ -15648,10 +15659,29 @@ mod tests {
         .unwrap();
         assert_eq!(dataset.get_fragments().len(), 3);
 
-        // The planner half: the appended pair coalesces, fragment 2 is held back.
-        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+        // Eager planning refuses pending FRI moves before considering coverage.
+        let version = dataset.version().version;
+        let err = compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        assert!(err.to_string().contains("pending remaps"), "{err}");
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.version().version, version);
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        // Deferred planning still honors the reconstructed boundary: the
+        // appended pair coalesces and the indexed fragment 2 is left alone.
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(metrics.fragments_removed, 2);
         assert_eq!(metrics.fragments_added, 1);
         assert!(

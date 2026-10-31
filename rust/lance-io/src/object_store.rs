@@ -5,9 +5,11 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::io::ErrorKind;
 use std::ops::Range;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -174,6 +176,17 @@ pub trait ObjectStoreExt {
 #[async_trait]
 pub(super) trait LocalDirOperations: std::fmt::Debug + Send + Sync {
     async fn remove_dir_all(&self, path: &Path) -> Result<()>;
+    async fn canonicalize(&self, path: &Path) -> Result<Option<PathBuf>>;
+}
+
+pub(crate) fn canonicalize_local_io_result(
+    result: std::io::Result<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    match result {
+        Ok(path) => Ok(Some(path)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[async_trait]
@@ -788,6 +801,35 @@ impl ObjectStore {
     /// their inner object-store implementation instead of direct filesystem access.
     pub fn has_direct_local_paths(&self) -> bool {
         self.is_local() && self.store_prefix == self.scheme
+    }
+
+    /// Canonicalize a local object path, resolving rooted and UNC stores through
+    /// their filesystem root mapping.
+    ///
+    /// Returns `Ok(None)` for non-local stores and when the filesystem identity cannot
+    /// be resolved, including missing paths and unsupported local root mappings. Other
+    /// local filesystem errors are returned to the caller.
+    ///
+    /// ```
+    /// # use lance_core::Result;
+    /// # use lance_io::object_store::ObjectStore;
+    /// # use object_store::path::Path;
+    /// # async fn same_directory(store: &ObjectStore, a: &Path, b: &Path) -> Result<bool> {
+    /// let a = store.canonicalize_local_path(a).await?;
+    /// let b = store.canonicalize_local_path(b).await?;
+    /// # Ok(a.is_some() && a == b)
+    /// # }
+    /// ```
+    pub async fn canonicalize_local_path(&self, path: &Path) -> Result<Option<PathBuf>> {
+        if let Some(local_dir_operations) = &self.local_dir_operations {
+            return local_dir_operations.canonicalize(path).await;
+        }
+        if self.has_direct_local_paths() || self.scheme == "file-object-store" {
+            return canonicalize_local_io_result(
+                tokio::fs::canonicalize(super::local::to_local_path(path)).await,
+            );
+        }
+        Ok(None)
     }
 
     pub fn is_cloud(&self) -> bool {
@@ -2188,6 +2230,26 @@ mod tests {
     use std::ops::Range;
     use std::path::Path as StdPath;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn test_canonicalize_local_io_result() {
+        let path = PathBuf::from("/tmp/lance-canonical");
+        assert_eq!(
+            canonicalize_local_io_result(Ok(path.clone())).unwrap(),
+            Some(path)
+        );
+        assert_eq!(
+            canonicalize_local_io_result(Err(std::io::Error::from(std::io::ErrorKind::NotFound,)))
+                .unwrap(),
+            None
+        );
+
+        let error = canonicalize_local_io_result(Err(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )))
+        .unwrap_err();
+        assert!(matches!(error, Error::IO { .. }), "{error:?}");
+    }
 
     #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
     fn canonical_test_config_key<K: FromStr + AsRef<str>>(key: &str) -> Option<String> {
