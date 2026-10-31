@@ -30,6 +30,7 @@ use lance_table::system_index::frag_reuse::lineage::TaggedLineage;
 use lance_table::system_index::frag_reuse::metadata::is_tagged;
 use lance_table::system_index::is_system_index;
 use lance_table::transaction::TaggedRewriteAssembly;
+use lance_table::transaction::action::Footprint;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
 use roaring::RoaringBitmap;
 use std::{
@@ -258,7 +259,11 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateMemWalState { .. }
             | Operation::Clone { .. }
             | Operation::Restore { .. }
-            | Operation::UpdateBases { .. } => {
+            | Operation::UpdateBases { .. }
+            // An action set can modify fragments, but conflicts against it are
+            // settled by comparing footprints, which are derived from the
+            // actions rather than from collected rebase state.
+            | Operation::CompositeOperation(_) => {
                 let is_create_index =
                     matches!(transaction.operation, Operation::CreateIndex { .. });
                 let read_fragments = is_create_index.then(|| dataset.fragments().clone());
@@ -692,7 +697,19 @@ impl<'a> TransactionRebase<'a> {
             Operation::UpdateMemWalState { .. } => {
                 self.check_update_mem_wal_state_txn(other_transaction, other_version)
             }
-            Operation::Clone { .. } => Ok(()),
+            // Clone has no checker of its own, so the cross-form rule has to be
+            // stated here: it is compatible with every named operation, but a
+            // concurrent action set still fails closed like everywhere else.
+            Operation::Clone { .. } => {
+                if matches!(
+                    &other_transaction.operation,
+                    Operation::CompositeOperation(_)
+                ) {
+                    self.check_action_txn(other_transaction, other_version)
+                } else {
+                    Ok(())
+                }
+            }
             Operation::UpdateBases { .. } => {
                 self.check_add_bases_txn(other_transaction, other_version)
             }
@@ -700,7 +717,38 @@ impl<'a> TransactionRebase<'a> {
             Operation::Unknown { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
+            Operation::CompositeOperation(_) => {
+                self.check_action_txn(other_transaction, other_version)
+            }
         }
+    }
+
+    /// Whether an action-based transaction conflicts with `other_transaction`.
+    ///
+    /// Reached from both directions: when the transaction being committed is
+    /// action-based, and when a concurrent one is.
+    ///
+    /// Two action sets are compared by footprint. Anything else -- a named
+    /// operation on the other side -- conflicts unconditionally. The two forms
+    /// describe a change in different vocabularies, and deciding whether a
+    /// named operation's post-image overlaps an action set's coordinates would
+    /// mean specifying every named operation in terms of coordinates. Until that
+    /// exists, a mixed pair fails closed rather than guessing.
+    fn check_action_txn(
+        &mut self,
+        other_transaction: &Transaction,
+        other_version: u64,
+    ) -> Result<()> {
+        let (Operation::CompositeOperation(ours), Operation::CompositeOperation(theirs)) =
+            (&self.transaction.operation, &other_transaction.operation)
+        else {
+            return Err(self.retryable_conflict_err(other_transaction, other_version));
+        };
+
+        if Footprint::from(ours).conflicts_with(&Footprint::from(theirs)) {
+            return Err(self.retryable_conflict_err(other_transaction, other_version));
+        }
+        Ok(())
     }
 
     fn check_delete_txn(
@@ -710,6 +758,10 @@ impl<'a> TransactionRebase<'a> {
     ) -> Result<()> {
         if let Operation::Delete { .. } = &self.transaction.operation {
             match &other_transaction.operation {
+                // A mixed named/action pair fails closed; see check_action_txn.
+                Operation::CompositeOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Clone { .. }
@@ -868,6 +920,10 @@ impl<'a> TransactionRebase<'a> {
             }
 
             match &other_transaction.operation {
+                // A mixed named/action pair fails closed; see check_action_txn.
+                Operation::CompositeOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 Operation::CreateIndex { .. }
                 | Operation::ReserveFragments { .. }
                 | Operation::Clone { .. }
@@ -1081,6 +1137,10 @@ impl<'a> TransactionRebase<'a> {
         {
             let self_is_tagged_trim = is_tagged_trim_operation(new_indices, removed_indices);
             match &other_transaction.operation {
+                // A mixed named/action pair fails closed; see check_action_txn.
+                Operation::CompositeOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 Operation::Append { .. }
                 | Operation::Clone { .. }
                 // An overlay committed after this index's version is newer than
@@ -1575,6 +1635,10 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
+                // A mixed named/action pair fails closed; see check_action_txn.
+                Operation::CompositeOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 // Rewrite is only compatible with operations that don't touch
                 // existing fragments or update fragments we don't touch.
                 Operation::Append { .. }
@@ -1872,6 +1936,10 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // A mixed named/action pair fails closed; see check_action_txn.
+            Operation::CompositeOperation(_) => {
+                self.check_action_txn(other_transaction, other_version)
+            }
             Operation::Overwrite { .. } => {
                 if self
                     .transaction
@@ -1925,6 +1993,10 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // A mixed named/action pair fails closed; see check_action_txn.
+            Operation::CompositeOperation(_) => {
+                self.check_action_txn(other_transaction, other_version)
+            }
             // Append is not compatible with any operation that completely
             // overwrites the schema.
             Operation::Overwrite { .. }
@@ -1959,6 +2031,10 @@ impl<'a> TransactionRebase<'a> {
     ) -> Result<()> {
         if let Operation::DataReplacement { replacements } = &self.transaction.operation {
             match &other_transaction.operation {
+                // A mixed named/action pair fails closed; see check_action_txn.
+                Operation::CompositeOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 Operation::Append { .. }
                 | Operation::Clone { .. }
                 | Operation::UpdateConfig { .. }
@@ -2141,6 +2217,10 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // A mixed named/action pair fails closed; see check_action_txn.
+            Operation::CompositeOperation(_) => {
+                self.check_action_txn(other_transaction, other_version)
+            }
             Operation::Append { .. }
             | Operation::CreateIndex { .. }
             | Operation::ReserveFragments { .. }
@@ -2264,6 +2344,10 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // A mixed named/action pair fails closed; see check_action_txn.
+            Operation::CompositeOperation(_) => {
+                self.check_action_txn(other_transaction, other_version)
+            }
             // See the MemWAL exception in check_create_index_txn.
             Operation::CreateIndex { new_indices, .. } => {
                 if new_indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
@@ -2305,6 +2389,10 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // A mixed named/action pair fails closed; see check_action_txn.
+            Operation::CompositeOperation(_) => {
+                self.check_action_txn(other_transaction, other_version)
+            }
             Operation::Append { .. }
             | Operation::Delete { .. }
             | Operation::Overwrite { .. }
@@ -2336,6 +2424,10 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // A mixed named/action pair fails closed; see check_action_txn.
+            Operation::CompositeOperation(_) => {
+                self.check_action_txn(other_transaction, other_version)
+            }
             Operation::Overwrite { .. } | Operation::Restore { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
             }
@@ -2366,6 +2458,10 @@ impl<'a> TransactionRebase<'a> {
         other_version: u64,
     ) -> Result<()> {
         match &other_transaction.operation {
+            // A mixed named/action pair fails closed; see check_action_txn.
+            Operation::CompositeOperation(_) => {
+                self.check_action_txn(other_transaction, other_version)
+            }
             // Project is compatible with anything that doesn't change the schema
             Operation::Append { .. }
             | Operation::Update { .. }
@@ -2406,6 +2502,10 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
+                // A mixed named/action pair fails closed; see check_action_txn.
+                Operation::CompositeOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 Operation::Overwrite { .. } => {
                     // Updates to schema metadata or field metadata conflict with any kind
                     // of overwrite.
@@ -2473,6 +2573,10 @@ impl<'a> TransactionRebase<'a> {
         } = &self.transaction.operation
         {
             match &other_transaction.operation {
+                // A mixed named/action pair fails closed; see check_action_txn.
+                Operation::CompositeOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 Operation::UpdateMemWalState {
                     compacted_sstables: other_compacted_sstables,
                     ..
@@ -2575,8 +2679,27 @@ impl<'a> TransactionRebase<'a> {
                     }
                     Ok(())
                 }
+                // A mixed named/action pair fails closed; see check_action_txn.
+                Operation::CompositeOperation(_) => {
+                    self.check_action_txn(other_transaction, other_version)
+                }
                 // UpdateBases doesn't conflict with data operations
-                _ => Ok(()),
+                Operation::Append { .. }
+                | Operation::Delete { .. }
+                | Operation::Overwrite { .. }
+                | Operation::CreateIndex { .. }
+                | Operation::Rewrite { .. }
+                | Operation::DataReplacement { .. }
+                | Operation::DataOverlay { .. }
+                | Operation::Merge { .. }
+                | Operation::Restore { .. }
+                | Operation::ReserveFragments { .. }
+                | Operation::Update { .. }
+                | Operation::Project { .. }
+                | Operation::Clone { .. }
+                | Operation::UpdateConfig { .. }
+                | Operation::UpdateMemWalState { .. }
+                | Operation::Unknown { .. } => Ok(()),
             }
         } else {
             Err(wrong_operation_err(&self.transaction.operation))
@@ -2650,7 +2773,12 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Clone { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateMemWalState { .. }
-            | Operation::UpdateBases { .. } => Ok(self.transaction),
+            | Operation::UpdateBases { .. }
+            // An action set needs no rewriting to move to a newer version: its
+            // minted ids are allocated when the actions are applied, against
+            // whichever manifest they land on, and its committed references
+            // name coordinates that do not move.
+            | Operation::CompositeOperation(_) => Ok(self.transaction),
             Operation::Unknown { .. } => Err(Error::not_supported(format!(
                 "Transaction {} has an operation written by a newer version of Lance \
                  and cannot be committed by this version",
@@ -3580,6 +3708,10 @@ mod tests {
     use lance_table::format::IndexMetadata;
     use lance_table::format::{InlineRowIds, RowIdMeta};
     use lance_table::io::deletion::{deletion_file_path, read_deletion_file};
+    use lance_table::transaction::action::{
+        Action as TxnAction, CompositeOperation, FieldRef, Ref as ActionRef, TombstoneFieldData,
+        UserStep,
+    };
 
     use super::*;
     use crate::dataset::transaction::{DataReplacementGroup, RewriteGroup, UpdateMap};
@@ -6504,6 +6636,153 @@ mod tests {
         assert!(rebase.check_txn(&txn2, 2).is_ok());
     }
 
+    fn action_txn(actions: Vec<TxnAction>) -> Transaction {
+        Transaction::new_from_version(
+            1,
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                "step", actions,
+            )])),
+        )
+    }
+
+    fn tombstone_txn(fragment: u64, field: i32) -> Transaction {
+        action_txn(vec![TxnAction::TombstoneFieldData(TombstoneFieldData {
+            fragment: ActionRef::Committed(fragment),
+            field_ids: vec![FieldRef::Committed(field)],
+            data_change: true,
+        })])
+    }
+
+    /// Assert the verdict holds whichever transaction is the one rebasing.
+    async fn assert_conflict(dataset: &Dataset, a: Transaction, b: Transaction, expected: bool) {
+        for (ours, theirs) in [(a.clone(), b.clone()), (b, a)] {
+            let mut rebase = TransactionRebase::try_new(dataset, ours, None)
+                .await
+                .unwrap();
+            assert_eq!(rebase.check_txn(&theirs, 2).is_err(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_action_txns_on_disjoint_coordinates_do_not_conflict() {
+        let dataset = test_dataset(10, 2).await;
+        assert_conflict(&dataset, tombstone_txn(0, 0), tombstone_txn(1, 0), false).await;
+        assert_conflict(&dataset, tombstone_txn(0, 0), tombstone_txn(0, 1), false).await;
+    }
+
+    #[tokio::test]
+    async fn test_action_txns_writing_the_same_field_data_conflict() {
+        let dataset = test_dataset(10, 2).await;
+        assert_conflict(&dataset, tombstone_txn(0, 0), tombstone_txn(0, 0), true).await;
+    }
+
+    /// A named operation on the other side conflicts whatever it names, even
+    /// when it plainly touches nothing the action set does. Footprints are only
+    /// defined over actions, so there is nothing to compare a post-image
+    /// against; the pair fails closed rather than guessing.
+    #[rstest::rstest]
+    #[case::append(Operation::Append {
+        fragments: vec![{
+            let mut fragment = Fragment::new(0);
+            fragment.physical_rows = Some(5);
+            fragment
+        }],
+    })]
+    #[case::delete(Operation::Delete {
+        updated_fragments: vec![],
+        deleted_fragment_ids: vec![7],
+        predicate: "a > 5".into(),
+    })]
+    #[case::update_config(Operation::UpdateConfig {
+        config_updates: None,
+        table_metadata_updates: None,
+        schema_metadata_updates: None,
+        field_metadata_updates: HashMap::new(),
+    })]
+    // The two operations whose checkers would otherwise answer Ok without
+    // inspecting the other side: UpdateBases, which treats every named operation
+    // as compatible, and Clone, which has no checker of its own.
+    #[case::update_bases(Operation::UpdateBases {
+        new_bases: vec![lance_table::format::BasePath {
+            id: 1,
+            path: "s3://bucket/base".to_string(),
+            name: Some("base".to_string()),
+            is_dataset_root: false,
+        }],
+    })]
+    #[case::clone(Operation::Clone {
+        is_shallow: true,
+        ref_name: None,
+        ref_version: 1,
+        ref_path: "memory://source".to_string(),
+        branch_name: None,
+    })]
+    #[case::update(Operation::Update {
+        removed_fragment_ids: vec![],
+        updated_fragments: vec![],
+        new_fragments: vec![],
+        fields_modified: vec![],
+        compacted_sstables: vec![],
+        mem_wal_dir_id: None,
+        fields_for_preserving_frag_bitmap: vec![],
+        update_mode: None,
+        inserted_rows_filter: None,
+        updated_fragment_offsets: None,
+    })]
+    #[case::create_index(Operation::CreateIndex {
+        new_indices: vec![],
+        removed_indices: vec![],
+    })]
+    #[case::rewrite(Operation::Rewrite {
+        groups: vec![],
+        rewritten_indices: vec![],
+        frag_reuse_index: None,
+    })]
+    #[case::overwrite(Operation::Overwrite {
+        fragments: vec![],
+        schema: lance_core::datatypes::Schema::default(),
+        config_upsert_values: None,
+        initial_bases: None,
+    })]
+    #[case::data_replacement(Operation::DataReplacement { replacements: vec![] })]
+    #[case::data_overlay(Operation::DataOverlay { groups: vec![] })]
+    #[case::merge(Operation::Merge {
+        fragments: vec![],
+        schema: lance_core::datatypes::Schema::default(),
+        preserves_nullability: true,
+    })]
+    #[case::restore(Operation::Restore { version: 1 })]
+    #[case::reserve_fragments(Operation::ReserveFragments { num_fragments: 1 })]
+    #[case::project(Operation::Project {
+        schema: lance_core::datatypes::Schema::default(),
+        preserves_nullability: true,
+    })]
+    #[case::update_mem_wal_state(Operation::UpdateMemWalState {
+        compacted_sstables: vec![],
+        dir_id: String::new(),
+    })]
+    #[tokio::test]
+    async fn test_a_legacy_operation_conflicts_with_an_action_txn(#[case] legacy: Operation) {
+        let dataset = test_dataset(10, 2).await;
+        let legacy = Transaction::new_from_version(1, legacy);
+        let action = tombstone_txn(0, 0);
+
+        // Retryable, not incompatible: the mixed pair may well commute, so the
+        // loser re-runs against the winner rather than giving up.
+        for (ours, theirs) in [(action.clone(), legacy.clone()), (legacy, action)] {
+            let ours_name = ours.operation.to_string();
+            let mut rebase = TransactionRebase::try_new(&dataset, ours, None)
+                .await
+                .unwrap();
+            let result = rebase.check_txn(&theirs, 2);
+            assert!(
+                matches!(result, Err(Error::RetryableCommitConflict { .. })),
+                "{ours_name} against {}: expected a retryable conflict, got {result:?}",
+                theirs.operation
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_add_bases_name_conflict() {
         let dataset = test_dataset(10, 2).await;
@@ -6815,7 +7094,8 @@ mod tests {
             | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. }
             | Operation::Restore { .. }
-            | Operation::UpdateMemWalState { .. } => Box::new(std::iter::empty()),
+            | Operation::UpdateMemWalState { .. }
+            | Operation::CompositeOperation(_) => Box::new(std::iter::empty()),
             Operation::Delete {
                 updated_fragments,
                 deleted_fragment_ids,

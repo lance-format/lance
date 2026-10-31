@@ -362,7 +362,8 @@ impl Transaction {
                     Ordering::Less => {
                         // Partial row IDs - need to fill the remaining ones
                         let remaining_rows = physical_rows - existing_row_count;
-                        let new_row_ids = *next_row_id..(*next_row_id + remaining_rows);
+                        let end = advance_row_id_counter(*next_row_id, remaining_rows)?;
+                        let new_row_ids = *next_row_id..end;
 
                         // Merge existing and new row IDs
                         let combined_sequence = match &fragment.row_id_meta {
@@ -382,7 +383,7 @@ impl Transaction {
 
                         let serialized = write_row_ids(&combined_sequence);
                         fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
-                        *next_row_id += remaining_rows;
+                        *next_row_id = end;
                     }
                     Ordering::Greater => {
                         // More row IDs than physical rows - this shouldn't happen
@@ -393,16 +394,28 @@ impl Transaction {
                     }
                 }
             } else {
-                let row_ids = *next_row_id..(*next_row_id + physical_rows);
+                let end = advance_row_id_counter(*next_row_id, physical_rows)?;
+                let row_ids = *next_row_id..end;
                 let sequence = RowIdSequence::from(row_ids);
                 // TODO: write to a separate file if large. Possibly share a file with other fragments.
                 let serialized = write_row_ids(&sequence);
                 fragment.row_id_meta = Some(RowIdMeta::Inline(serialized.into()));
-                *next_row_id += physical_rows;
+                *next_row_id = end;
             }
         }
         Ok(())
     }
+}
+
+/// Where the row id counter stands after handing out `count` ids from
+/// `next_row_id`, or an error once the counter is spent.
+fn advance_row_id_counter(next_row_id: u64, count: u64) -> Result<u64> {
+    next_row_id.checked_add(count).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "the row id counter is exhausted: assigning {count} row ids from {next_row_id} \
+             overflows it"
+        ))
+    })
 }
 
 #[cfg(test)]

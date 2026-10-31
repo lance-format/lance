@@ -627,6 +627,11 @@ same id, name, or path.
     on the unrecognized operation. For conflict checking that failure aborts
     the older writer's commit, which is the safe outcome.
 
+    Writing is gated twice while the feature is experimental: the calling code
+    opts in per commit, and the deployment sets
+    `LANCE_ENABLE_UNSTABLE_TRANSACTION_V2` in the environment. Release builds
+    refuse without both.
+
 Every operation above is a single named verb. A transaction may instead carry a
 `CompositeOperation`: an ordered list of granular *actions* that apply
 atomically as one manifest change. This lets one commit express a change no
