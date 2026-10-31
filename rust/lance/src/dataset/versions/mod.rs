@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow_schema::{DataType, Field as ArrowField};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::catalog::Session;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::ExecutionPlan;
@@ -49,6 +49,7 @@ use super::schema_evolution::optimize::{
     ChainedNewColumnTransformOptimizer, SqlToAllNullsOptimizer,
 };
 use super::statistics::FieldStatistics;
+use super::write::dictionary_budget::DictionaryValueBudget;
 use super::write::seeds::SeedCollector;
 use super::write::{self, GenericWriter, TargetBaseInfo, WriteMode, WriteParams, WriterOptions};
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
@@ -314,6 +315,18 @@ pub async fn write_fragments_direct(
         }
         ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => None,
     };
+    // The 2.0 writer stores a null as one more dictionary value and keeps its own key-type
+    // check, so its files are not split here. Neither is a write that must produce the one
+    // preassigned file; the encoder then rejects the overflowing column.
+    let dictionary_budget = match version {
+        ConcreteFileVersion::V2_1 | ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
+            match preassigned_data_file_name {
+                Some(_) => None,
+                None => DictionaryValueBudget::try_new(&ArrowSchema::from(schema))?,
+            }
+        }
+        ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 => None,
+    };
     write::do_write_fragments_impl(
         dataset,
         object_store,
@@ -330,6 +343,7 @@ pub async fn write_fragments_direct(
         file_row_counts,
         preassigned_data_file_name,
         created_blob_payloads,
+        dictionary_budget,
     )
     .await
 }

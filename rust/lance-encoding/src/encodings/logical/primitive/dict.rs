@@ -14,6 +14,7 @@ pub const DICT_INDICES_BITS_PER_VALUE: u64 = 32;
 use arrow_array::{
     Array, DictionaryArray, PrimitiveArray, UInt64Array,
     cast::AsArray,
+    make_array,
     types::{
         ArrowDictionaryKeyType, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type,
         UInt32Type, UInt64Type,
@@ -170,6 +171,51 @@ pub(super) fn clear_out_of_range_null_keys(array: Arc<dyn Array>) -> Result<Arc<
             array.data_type()
         ))),
     }
+}
+
+/// Returns the values the structural encoder can store for any slice of one dictionary
+/// chunk.
+///
+/// The encoder moves null values into the keys and drops the key validity, so the key
+/// under a null slot selects a value as well.  When a slice holds a null slot whose key is
+/// out of range, the encoder points all of that slice's null slots at key 0 instead.  The
+/// result therefore holds the first value, the value of every valid key, and the value of
+/// every in-range key under a null slot.  The first value is also where an all-null chunk
+/// without values points its keys.  A chunk without values yields an empty array.
+pub fn encoded_dictionary_values(array: Arc<dyn Array>) -> Result<Arc<dyn Array>> {
+    let array = normalize_dict_nulls(array)?;
+    let dictionary = array.as_any_dictionary_opt().expect_ok()?;
+    let values = dictionary.values();
+    if values.is_empty() {
+        return Ok(values.clone());
+    }
+    // The physical key of every slot, null or not.  A key that is negative or does not fit
+    // `i64` is out of range.
+    let physical_keys = make_array(
+        dictionary
+            .keys()
+            .to_data()
+            .into_builder()
+            .nulls(None)
+            .build()?,
+    );
+    let physical_keys = arrow_cast::cast(&physical_keys, &DataType::Int64)?;
+    let mut is_selected = vec![false; values.len()];
+    is_selected[0] = true;
+    for key in physical_keys.as_primitive::<Int64Type>().iter().flatten() {
+        if let Some(is_selected) = usize::try_from(key)
+            .ok()
+            .and_then(|key| is_selected.get_mut(key))
+        {
+            *is_selected = true;
+        }
+    }
+    let indices = is_selected
+        .iter()
+        .enumerate()
+        .filter_map(|(index, is_selected)| is_selected.then_some(index as u64))
+        .collect::<UInt64Array>();
+    Ok(arrow_select::take::take(values, &indices, None)?)
 }
 
 fn dict_encode_variable_width<T>(
@@ -507,8 +553,39 @@ mod tests {
         buffer::LanceBuffer,
         data::{BlockInfo, FixedWidthDataBlock},
     };
-    use arrow_array::{Array, StringArray};
+    use arrow_array::{Array, Int8Array, StringArray};
+    use arrow_buffer::{NullBuffer, ScalarBuffer};
+    use rstest::rstest;
     use std::sync::Arc;
+
+    #[rstest]
+    // Index 3 is reached only through a null slot; index 100 is out of range and skipped.
+    #[case::keys_under_nulls(
+        vec![Some("a"), Some("b"), Some("c"), Some("d"), Some("e")],
+        vec![1, 3, 100],
+        vec![true, false, false],
+        vec!["a", "b", "d"]
+    )]
+    // The null value moves into the keys, so only the valid values remain.
+    #[case::null_values(
+        vec![Some("a"), None, Some("c")],
+        vec![0, 1, 2],
+        vec![true, true, true],
+        vec!["a", "c"]
+    )]
+    fn test_encoded_dictionary_values(
+        #[case] values: Vec<Option<&str>>,
+        #[case] keys: Vec<i8>,
+        #[case] validity: Vec<bool>,
+        #[case] expected: Vec<&str>,
+    ) {
+        let keys = Int8Array::new(ScalarBuffer::from(keys), Some(NullBuffer::from(validity)));
+        let dictionary =
+            DictionaryArray::<Int8Type>::try_new(keys, Arc::new(StringArray::from(values)))
+                .unwrap();
+        let encoded = encoded_dictionary_values(Arc::new(dictionary)).unwrap();
+        assert_eq!(encoded.as_string::<i32>(), &StringArray::from(expected));
+    }
 
     #[test]
     fn test_fixed_row_dictionary_preserves_float_bits_and_budgets() {
