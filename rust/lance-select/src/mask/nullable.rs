@@ -78,7 +78,15 @@ impl NullableRowAddrSet {
         self.selected.clone() - self.nulls.clone()
     }
 
-    /// Split into the raw `selected` and `nulls` sets, the inverse of [`Self::new`].
+    /// Consume the selection and return its raw selected and null sets without copying.
+    ///
+    /// ```
+    /// use lance_select::{NullableRowAddrSet, RowAddrTreeMap};
+    /// let set = NullableRowAddrSet::new(RowAddrTreeMap::new(), RowAddrTreeMap::new());
+    /// let (selected, nulls) = set.into_parts();
+    /// assert_eq!(selected, RowAddrTreeMap::new());
+    /// assert_eq!(nulls, RowAddrTreeMap::new());
+    /// ```
     pub fn into_parts(self) -> (RowAddrTreeMap, RowAddrTreeMap) {
         (self.selected, self.nulls)
     }
