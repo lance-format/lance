@@ -577,6 +577,18 @@ impl DirectoryNamespace {
         }
     }
 
+    /// Refuse a non-main branch for an operation that only runs on main, rather
+    /// than running it on main.
+    pub(super) fn ensure_main_branch(branch: Option<&str>, operation: &str) -> Result<()> {
+        match Self::normalized_branch(branch)? {
+            Some(branch) => Err(NamespaceError::Unsupported {
+                message: format!("{} does not support branch '{}'", operation, branch),
+            }
+            .into()),
+            None => Ok(()),
+        }
+    }
+
     pub(super) async fn open_validated_branch(
         &self,
         table_uri: &str,
@@ -694,6 +706,7 @@ impl DirectoryNamespace {
     pub(super) async fn write_reader_to_table(
         &self,
         table_uri: &str,
+        branch: Option<&str>,
         reader: Box<dyn arrow::record_batch::RecordBatchReader + Send>,
         mode: WriteMode,
         extra_storage_options: Option<HashMap<String, String>>,
@@ -720,11 +733,18 @@ impl DirectoryNamespace {
             ..Default::default()
         };
 
-        let dataset = Dataset::write(reader, table_uri, Some(write_params))
-            .await
-            .map_err(|e| NamespaceError::Internal {
-                message: format!("Failed to write table at '{}': {}", table_uri, e),
-            })?;
+        let written = match branch {
+            // Writing through the branch dataset puts the data files and the commit
+            // under the branch tree.
+            Some(branch) => {
+                let dataset = self.open_validated_branch(table_uri, branch).await?;
+                Dataset::write(reader, Arc::new(dataset), Some(write_params)).await
+            }
+            None => Dataset::write(reader, table_uri, Some(write_params)).await,
+        };
+        let dataset = written.map_err(|e| NamespaceError::Internal {
+            message: format!("Failed to write table at '{}': {}", table_uri, e),
+        })?;
 
         Ok(dataset)
     }

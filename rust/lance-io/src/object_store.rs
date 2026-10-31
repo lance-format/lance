@@ -5,9 +5,11 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::io::ErrorKind;
 use std::ops::Range;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -105,6 +107,10 @@ pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock:
 
 pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
+/// Storage option that sets the registry-wide minimum prune threshold of the
+/// object store cache; see [`StorageOptions::object_store_cache_prune_threshold`].
+pub const OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION: &str = "object_store_cache_prune_threshold";
+
 #[derive(Debug)]
 struct StreamCopyError {
     stage: &'static str,
@@ -170,6 +176,17 @@ pub trait ObjectStoreExt {
 #[async_trait]
 pub(super) trait LocalDirOperations: std::fmt::Debug + Send + Sync {
     async fn remove_dir_all(&self, path: &Path) -> Result<()>;
+    async fn canonicalize(&self, path: &Path) -> Result<Option<PathBuf>>;
+}
+
+pub(crate) fn canonicalize_local_io_result(
+    result: std::io::Result<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    match result {
+        Ok(path) => Ok(Some(path)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[async_trait]
@@ -784,6 +801,35 @@ impl ObjectStore {
     /// their inner object-store implementation instead of direct filesystem access.
     pub fn has_direct_local_paths(&self) -> bool {
         self.is_local() && self.store_prefix == self.scheme
+    }
+
+    /// Canonicalize a local object path, resolving rooted and UNC stores through
+    /// their filesystem root mapping.
+    ///
+    /// Returns `Ok(None)` for non-local stores and when the filesystem identity cannot
+    /// be resolved, including missing paths and unsupported local root mappings. Other
+    /// local filesystem errors are returned to the caller.
+    ///
+    /// ```
+    /// # use lance_core::Result;
+    /// # use lance_io::object_store::ObjectStore;
+    /// # use object_store::path::Path;
+    /// # async fn same_directory(store: &ObjectStore, a: &Path, b: &Path) -> Result<bool> {
+    /// let a = store.canonicalize_local_path(a).await?;
+    /// let b = store.canonicalize_local_path(b).await?;
+    /// # Ok(a.is_some() && a == b)
+    /// # }
+    /// ```
+    pub async fn canonicalize_local_path(&self, path: &Path) -> Result<Option<PathBuf>> {
+        if let Some(local_dir_operations) = &self.local_dir_operations {
+            return local_dir_operations.canonicalize(path).await;
+        }
+        if self.has_direct_local_paths() || self.scheme == "file-object-store" {
+            return canonicalize_local_io_result(
+                tokio::fs::canonicalize(super::local::to_local_path(path)).await,
+            );
+        }
+        Ok(None)
     }
 
     pub fn is_cloud(&self) -> bool {
@@ -1946,6 +1992,26 @@ impl StorageOptions {
         Ok(Some(block_size))
     }
 
+    /// Minimum cache size at which the session's object store registry sweeps
+    /// out entries whose store is no longer in use; `0` disables the sweep.
+    /// See [`ObjectStoreRegistry::get_store()`].
+    pub fn object_store_cache_prune_threshold(&self) -> Result<Option<usize>> {
+        let Some((_, value)) = self
+            .0
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION))
+        else {
+            return Ok(None);
+        };
+        let threshold = value.trim().parse::<usize>().map_err(|err| {
+            Error::invalid_input(format!(
+                "storage option {OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION} must be a \
+                 non-negative integer, got `{value}`: {err}"
+            ))
+        })?;
+        Ok(Some(threshold))
+    }
+
     /// Whether local writes must sync files and directory entries before returning.
     pub(crate) fn local_fsync(&self) -> Result<bool> {
         let Some((_, value)) = self
@@ -2164,6 +2230,26 @@ mod tests {
     use std::ops::Range;
     use std::path::Path as StdPath;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn test_canonicalize_local_io_result() {
+        let path = PathBuf::from("/tmp/lance-canonical");
+        assert_eq!(
+            canonicalize_local_io_result(Ok(path.clone())).unwrap(),
+            Some(path)
+        );
+        assert_eq!(
+            canonicalize_local_io_result(Err(std::io::Error::from(std::io::ErrorKind::NotFound,)))
+                .unwrap(),
+            None
+        );
+
+        let error = canonicalize_local_io_result(Err(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )))
+        .unwrap_err();
+        assert!(matches!(error, Error::IO { .. }), "{error:?}");
+    }
 
     #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
     fn canonical_test_config_key<K: FromStr + AsRef<str>>(key: &str) -> Option<String> {
@@ -2513,13 +2599,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_tilde_expansion() {
-        let uri = "~/foo.lance";
-        write_to_file(&format!("{uri}/test_file"), "TILDE").unwrap();
-        let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
-        let contents = read_from_store(store.as_ref(), &path.clone().join("test_file"))
-            .await
-            .unwrap();
-        assert_eq!(contents, "TILDE");
+        // Resolving the path is sufficient to verify expansion and avoids writing
+        // into the real user's home directory.
+        let expected_path = std::env::home_dir()
+            .expect("home directory should be available")
+            .join("foo.lance");
+        let (store, path) = ObjectStore::from_uri("~/foo.lance").await.unwrap();
+
+        assert!(store.is_local());
+        assert_eq!(
+            path,
+            Path::from_absolute_path(expected_path).expect("home path should be absolute")
+        );
     }
 
     #[tokio::test]
