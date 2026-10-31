@@ -582,7 +582,10 @@ fn tokens_may_match(
     // without allocating two hash tables for every leaf in every partition.
     let mut positions = SmallVec::<[(u32, bool); 8]>::new();
     for index in 0..tokens.len() {
-        positions.push((tokens.position(index), in_dictionary(index)));
+        positions.push((
+            tokens.position_for_query(index, is_phrase_query),
+            in_dictionary(index),
+        ));
     }
     summarize_position_matches(positions).every_position_matched
 }
@@ -977,6 +980,7 @@ impl InvertedPartition {
     pub fn expand_fuzzy(&self, tokens: &Tokens, params: &FtsSearchParams) -> Result<Tokens> {
         let mut new_tokens = Vec::with_capacity(min(tokens.len(), params.max_expansions));
         let mut new_positions = Vec::with_capacity(new_tokens.capacity());
+        let mut new_groups = Vec::with_capacity(new_tokens.capacity());
         let mut seen = HashSet::new();
         let mut seen_source_terms = HashSet::new();
         for token_idx in 0..tokens.len() {
@@ -986,7 +990,8 @@ impl InvertedPartition {
             }
             let token = tokens.get_token(token_idx);
             let position = tokens.position(token_idx);
-            if !seen_source_terms.insert((position, token)) {
+            let group = tokens.position_for_query(token_idx, params.phrase_slop.is_some());
+            if !seen_source_terms.insert((group, token)) {
                 continue;
             }
             let mut candidates = BTreeSet::new();
@@ -996,17 +1001,17 @@ impl InvertedPartition {
                 if new_tokens.len() >= params.max_expansions {
                     break;
                 }
-                if seen.insert((candidate.clone(), position)) {
+                if seen.insert((candidate.clone(), group)) {
                     new_tokens.push(candidate);
                     new_positions.push(position);
+                    new_groups.push(group);
                 }
             }
         }
-        Ok(Tokens::with_positions(
-            new_tokens,
-            new_positions,
-            tokens.token_type().clone(),
-        ))
+        Ok(
+            Tokens::with_positions(new_tokens, new_positions, tokens.token_type().clone())
+                .with_term_groups(new_groups),
+        )
     }
 
     /// Collect up to `limit` fuzzy candidates for one query token from this
@@ -1401,13 +1406,13 @@ impl InvertedPartition {
         } = options;
         let is_phrase_query = params.phrase_slop.is_some();
         let is_and_query = operator == Operator::And;
-        // The caller passes final tokens after any fuzzy expansion. Positions
+        // The caller passes final tokens after any fuzzy expansion. Query groups
         // identify alternatives that must share one posting iterator,
         // including code identifier subwords and fuzzy expansions.
         let mut token_ids = Vec::with_capacity(tokens.len());
         let mut position_matches = SmallVec::<[(u32, bool); 8]>::new();
         for index in 0..tokens.len() {
-            let position = tokens.position(index);
+            let position = tokens.position_for_query(index, is_phrase_query);
             let token_id = match &term_ids {
                 Some(term_ids) => term_ids.token_id(index),
                 None => self.map(tokens.get_token(index)),

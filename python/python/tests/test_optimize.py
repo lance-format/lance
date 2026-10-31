@@ -815,7 +815,7 @@ def test_public_compaction_records_only_when_deferred_with_stable_row_ids(
     if index_type == "BTREE":
         # Without defer_index_remap a BTree is remapped eagerly, which is
         # refused while the history holds versions.
-        with pytest.raises(OSError, match="run optimize_indices first"):
+        with pytest.raises(OSError, match="pending remaps"):
             dataset.optimize.compact_files(
                 target_rows_per_fragment=4_000, num_threads=1
             )

@@ -1220,85 +1220,83 @@ fn inner_create_index<'local>(
 
     let params = params_result?;
 
-    let index_metadata = match progress {
-        Some(progress) => {
-            // Progress callbacks may re-enter read-only methods on this Dataset. Clone the Dataset
-            // and release the native field guard before the long-running build so those callbacks
-            // do not deadlock on the field mutex.
-            let mut working_dataset = {
-                let dataset_guard = unsafe {
-                    env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
-                }?;
-                dataset_guard.inner.clone()
-            };
-            let initial_version = working_dataset.version().version;
-            let index_metadata = execute_create_index(
-                &mut working_dataset,
-                &columns_slice,
-                index_type,
-                params.as_ref(),
-                replace,
-                train,
-                name,
-                fragment_ids,
-                index_uuid,
-                batch_reader,
-                Some(progress),
+    let index_metadata = if progress.is_some() || skip_commit {
+        // Progress callbacks may re-enter read-only methods on this Dataset. Clone the Dataset
+        // and release the native field guard before the long-running build so those callbacks
+        // do not deadlock on the field mutex. Uncommitted builds never publish a new version, so
+        // they also build on a clone instead of serializing every build on this handle.
+        let mut working_dataset = {
+            let dataset_guard = unsafe {
+                env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
+            }?;
+            dataset_guard.inner.clone()
+        };
+        let initial_version = working_dataset.version().version;
+        let index_metadata = execute_create_index(
+            &mut working_dataset,
+            &columns_slice,
+            index_type,
+            params.as_ref(),
+            replace,
+            train,
+            name,
+            fragment_ids,
+            index_uuid,
+            batch_reader,
+            progress,
+            skip_commit,
+        )
+        .inspect_err(|_| {
+            // A committed build may fail while materializing its return metadata. The clone
+            // has already observed the durable commit, so publish it before propagating.
+            if should_publish_working_dataset_on_error(
                 skip_commit,
-            )
-            .inspect_err(|_| {
-                // A committed build may fail while materializing its return metadata. The clone
-                // has already observed the durable commit, so publish it before propagating.
-                if should_publish_working_dataset_on_error(
-                    skip_commit,
-                    initial_version,
-                    working_dataset.version().version,
-                ) {
-                    match unsafe {
-                        env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
-                    } {
-                        Ok(mut dataset_guard) => {
-                            dataset_guard.inner = working_dataset.clone();
-                        }
-                        Err(publish_error) => {
-                            log::warn!(
-                                "Failed to publish committed dataset version {} after create-index failure: {}",
-                                working_dataset.version().version,
-                                publish_error
-                            );
-                        }
+                initial_version,
+                working_dataset.version().version,
+            ) {
+                match unsafe {
+                    env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
+                } {
+                    Ok(mut dataset_guard) => {
+                        dataset_guard.inner = working_dataset.clone();
+                    }
+                    Err(publish_error) => {
+                        log::warn!(
+                            "Failed to publish committed dataset version {} after create-index failure: {}",
+                            working_dataset.version().version,
+                            publish_error
+                        );
                     }
                 }
-            })?;
-
-            if !skip_commit {
-                let mut dataset_guard = unsafe {
-                    env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
-                }?;
-                dataset_guard.inner = working_dataset;
             }
-            index_metadata
-        }
-        None => {
-            // Preserve the existing no-progress path, including its native-field locking behavior.
+        })?;
+
+        if !skip_commit {
             let mut dataset_guard = unsafe {
-                env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET)
+                env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
             }?;
-            execute_create_index(
-                &mut dataset_guard.inner,
-                &columns_slice,
-                index_type,
-                params.as_ref(),
-                replace,
-                train,
-                name,
-                fragment_ids,
-                index_uuid,
-                batch_reader,
-                None,
-                skip_commit,
-            )?
+            dataset_guard.inner = working_dataset;
         }
+        index_metadata
+    } else {
+        // Preserve the existing committed no-progress path, including its native-field locking
+        // behavior.
+        let mut dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        execute_create_index(
+            &mut dataset_guard.inner,
+            &columns_slice,
+            index_type,
+            params.as_ref(),
+            replace,
+            train,
+            name,
+            fragment_ids,
+            index_uuid,
+            batch_reader,
+            None,
+            skip_commit,
+        )?
     };
 
     (&index_metadata).into_java(env)
