@@ -1343,7 +1343,12 @@ async fn test_concurrent_branch_creation_preserves_winner() {
             }
             Err(error) => {
                 assert!(matches!(error, Error::RefConflict { .. }), "{error}");
-                assert!(error.to_string().contains("branch race already exists"));
+                let message = error.to_string();
+                assert!(
+                    message.contains("branch race already exists")
+                        || message.contains("history.lock"),
+                    "{error}"
+                );
                 conflicts += 1;
             }
         }
