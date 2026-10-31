@@ -298,7 +298,11 @@ pub(crate) fn unpack_blocked_row(codes: &[u8], ex_bits: u8, dim: usize, values: 
 /// as-is for aligned dims, otherwise zero-padded via [`pad_query_into`]);
 /// `codes` is the blocked row slice. Rows shorter than the padded query
 /// length are treated as zero-padded.
-pub type ExDotFn = unsafe fn(&[f32], &[u8]) -> f32;
+pub type ExDotKernelFn = unsafe fn(&[f32], &[u8]) -> f32;
+
+/// Safe function-pointer form of [`ExDotKernelFn`].
+#[deprecated(note = "use `ExDotKernelFn` with `ex_dot_host_kernel`")]
+pub type ExDotFn = fn(&[f32], &[u8]) -> f32;
 
 /// Declares one dispatch per `ex_bits`. On x86 the AVX-512 baseline kernels
 /// of the two- and six-bit widths stay listed behind their four-chain
@@ -307,7 +311,7 @@ pub type ExDotFn = unsafe fn(&[f32], &[u8]) -> f32;
 macro_rules! ex_dot_dispatch {
     ($($name:ident = x86[$($x86:ident),*], neon $neon:ident, $scalar:ident;)*) => {$(
         lance_core::dispatch! {
-            static $name: Dispatch<ExDotFn> = {
+            static $name: Dispatch<ExDotKernelFn> = {
                 #[cfg(target_arch = "x86_64")]
                 {
                     &[$(x86::$x86,)* $scalar]
@@ -339,7 +343,7 @@ ex_dot_dispatch! {
     EX_DOT_U8 = x86[EX_DOT_U8_AVX512, EX_DOT_U8_AVX2], neon EX_DOT_U8_NEON, EX_DOT_U8_SCALAR;
 }
 
-fn ex_dot_dispatch(ex_bits: u8) -> &'static Dispatch<ExDotFn> {
+fn ex_dot_dispatch(ex_bits: u8) -> &'static Dispatch<ExDotKernelFn> {
     match ex_bits {
         1 => &EX_DOT_U1,
         2 => &EX_DOT_U2,
@@ -355,16 +359,79 @@ fn ex_dot_dispatch(ex_bits: u8) -> &'static Dispatch<ExDotFn> {
 
 /// The dot kernel for `ex_bits` on the running CPU; the caller can keep it
 /// for per-candidate use.
-pub fn ex_dot_kernel(ex_bits: u8) -> Kernel<ExDotFn> {
+pub fn ex_dot_host_kernel(ex_bits: u8) -> Kernel<ExDotKernelFn> {
     debug_assert!((1..=8).contains(&ex_bits));
     ex_dot_dispatch(ex_bits).get()
+}
+
+/// Resolve the dot kernel for `ex_bits` as a safe function pointer.
+#[deprecated(note = "use `ex_dot_host_kernel`, which avoids the extra indirect call")]
+#[allow(deprecated)]
+pub fn ex_dot_kernel(ex_bits: u8) -> ExDotFn {
+    match ex_bits {
+        1 => |query, codes| EX_DOT_U1.get().call(query, codes),
+        2 => |query, codes| EX_DOT_U2.get().call(query, codes),
+        3 => |query, codes| EX_DOT_U3.get().call(query, codes),
+        4 => |query, codes| EX_DOT_U4.get().call(query, codes),
+        5 => |query, codes| EX_DOT_U5.get().call(query, codes),
+        6 => |query, codes| EX_DOT_U6.get().call(query, codes),
+        7 => |query, codes| EX_DOT_U7.get().call(query, codes),
+        8 => |query, codes| EX_DOT_U8.get().call(query, codes),
+        _ => unreachable!("invalid RabitQ ex_bits={ex_bits}"),
+    }
+}
+
+/// The host-supported dot kernels for `ex_bits`, named by function, after the
+/// dispatched one.
+#[deprecated(note = "iterate the candidates of the `ex_bits` dispatch instead")]
+#[allow(deprecated)]
+pub fn ex_dot_kernel_variants(ex_bits: u8) -> Vec<(&'static str, ExDotFn)> {
+    // A safe `fn` pointer cannot capture the candidate, so each one gets a
+    // monomorphized wrapper keyed by its position in the dispatch.
+    fn candidate<const EX_BITS: u8, const INDEX: usize>(query: &[f32], codes: &[u8]) -> f32 {
+        ex_dot_dispatch(EX_BITS).candidates()[INDEX]
+            .kernel()
+            .expect("only host-supported candidates are listed")
+            .call(query, codes)
+    }
+    fn candidates<const EX_BITS: u8>() -> [ExDotFn; 4] {
+        [
+            candidate::<EX_BITS, 0>,
+            candidate::<EX_BITS, 1>,
+            candidate::<EX_BITS, 2>,
+            candidate::<EX_BITS, 3>,
+        ]
+    }
+    let wrappers = match ex_bits {
+        1 => candidates::<1>(),
+        2 => candidates::<2>(),
+        3 => candidates::<3>(),
+        4 => candidates::<4>(),
+        5 => candidates::<5>(),
+        6 => candidates::<6>(),
+        7 => candidates::<7>(),
+        8 => candidates::<8>(),
+        _ => unreachable!("invalid RabitQ ex_bits={ex_bits}"),
+    };
+    let dispatch = ex_dot_dispatch(ex_bits);
+    assert!(dispatch.candidates().len() <= wrappers.len());
+    let mut variants = vec![("dispatched", ex_dot_kernel(ex_bits))];
+    variants.extend(
+        dispatch
+            .candidates()
+            .iter()
+            .zip(wrappers)
+            .filter(|(candidate, _)| candidate.kernel().is_some())
+            .map(|(candidate, wrapper)| (candidate.name(), wrapper)),
+    );
+    variants
 }
 
 macro_rules! scalar_kernels {
     ($($candidate:ident = $name:ident::<$ex_bits:literal>;)*) => {$(
         lance_core::target_kernel! {
             #[target_features()]
-            #[candidate($candidate: ExDotFn)]
+            #[candidate($candidate: ExDotKernelFn)]
             fn $name(ex_query: &[f32], codes: &[u8]) -> f32 {
                 ex_dot_scalar::<$ex_bits>(ex_query, codes)
             }
@@ -414,6 +481,12 @@ fn ex_dot_scalar<const EX_BITS: u8>(ex_query: &[f32], codes: &[u8]) -> f32 {
     }
     sum
 }
+
+// The layered and prefix kernels below still select with feature checks and
+// `LazyLock` rather than `Dispatch`. The prefix kernels are generic over their
+// plane widths, and a `static` cannot depend on a generic parameter, so they
+// need one hand-written dispatch per width pair. Converting them is left to a
+// follow-up so this change stays limited to the single-plane kernels.
 
 /// Dot product of an `f32` query and full codes stored as high/low blocked
 /// planes. The selected kernel fixes their widths and combines the codes
@@ -610,7 +683,7 @@ fn ex_dot_layered_scalar(ex_query: &[f32], hi: &[u8], lo: &[u8]) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::ExDotFn;
+    use super::ExDotKernelFn;
     use std::arch::x86_64::*;
 
     /// Broadcast a byte to the 8 bytes of a `u64`.
@@ -779,7 +852,7 @@ mod x86 {
         ($name:ident, $candidate:ident, $unpack:ident, $ex_bits:expr, $runs:expr) => {
             lance_core::target_kernel! {
                 #[target_features("avx2", "fma")]
-                #[candidate(pub(super) $candidate: ExDotFn)]
+                #[candidate(pub(super) $candidate: ExDotKernelFn)]
                 fn $name(ex_query: &[f32], codes: &[u8]) -> f32 {
                     const GROUP_DIMS: usize = if $runs == 1 { 16 } else { 64 };
                     const GROUP_BYTES: usize = GROUP_DIMS * $ex_bits / 8;
@@ -831,7 +904,7 @@ mod x86 {
         ($name:ident, $candidate:ident, $unpack:ident, $ex_bits:expr, $runs:expr) => {
             lance_core::target_kernel! {
                 #[target_features("avx512f")]
-                #[candidate(pub(super) $candidate: ExDotFn)]
+                #[candidate(pub(super) $candidate: ExDotKernelFn)]
                 fn $name(ex_query: &[f32], codes: &[u8]) -> f32 {
                     const GROUP_DIMS: usize = if $runs == 1 { 16 } else { 64 };
                     const GROUP_BYTES: usize = GROUP_DIMS * $ex_bits / 8;
@@ -882,7 +955,7 @@ mod x86 {
         ($name:ident, $candidate:ident, $unpack:ident, $bits:expr, $fallback:ident) => {
             lance_core::target_kernel! {
                 #[target_features("avx512f")]
-                #[candidate(pub(super) $candidate: ExDotFn)]
+                #[candidate(pub(super) $candidate: ExDotKernelFn)]
                 fn $name(query: &[f32], codes: &[u8]) -> f32 {
                     if !query.len().is_multiple_of(64) || codes.len() != query.len() * $bits / 8 {
                         return $fallback(query, codes);
@@ -1369,7 +1442,7 @@ mod x86 {
 
 #[cfg(target_arch = "aarch64")]
 mod neon {
-    use super::ExDotFn;
+    use super::ExDotKernelFn;
     use std::arch::aarch64::*;
 
     #[inline]
@@ -1507,7 +1580,7 @@ mod neon {
         ($name:ident, $candidate:ident, $unpack:ident, $ex_bits:expr, $runs:expr) => {
             lance_core::target_kernel! {
                 #[target_features("neon")]
-                #[candidate(pub(super) $candidate: ExDotFn)]
+                #[candidate(pub(super) $candidate: ExDotKernelFn)]
                 fn $name(ex_query: &[f32], codes: &[u8]) -> f32 {
                     const GROUP_DIMS: usize = if $runs == 1 { 16 } else { 64 };
                     const GROUP_BYTES: usize = GROUP_DIMS * $ex_bits / 8;
@@ -1712,6 +1785,43 @@ mod tests {
                 "ex_bits={ex_bits} dim={dim} kernel={name}: {actual} != {expected}"
             );
         }
+        #[allow(deprecated)]
+        let variants = ex_dot_kernel_variants(ex_bits);
+        assert_eq!(
+            variants.len(),
+            1 + ex_dot_dispatch(ex_bits)
+                .candidates()
+                .iter()
+                .filter(|candidate| candidate.kernel().is_some())
+                .count()
+        );
+        for (name, kernel) in variants {
+            let actual = kernel(&ex_query, &codes) as f64;
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "ex_bits={ex_bits} dim={dim} deprecated variant={name}: {actual} != {expected}"
+            );
+        }
+    }
+
+    /// The four-chain kernels must win over the AVX-512 baseline they fall
+    /// back to, and AVX-512 over AVX2.
+    #[cfg(target_arch = "x86_64")]
+    #[rstest]
+    fn test_ex_dot_x86_selection_order(#[values(1, 2, 3, 4, 5, 6, 7, 8)] ex_bits: u8) {
+        let names = ex_dot_dispatch(ex_bits)
+            .candidates()
+            .iter()
+            .map(|candidate| candidate.name())
+            .collect::<Vec<_>>();
+        let mut expected = Vec::new();
+        if matches!(ex_bits, 2 | 6) {
+            expected.push(format!("dot_u{ex_bits}_four_chain"));
+        }
+        expected.push(format!("dot_u{ex_bits}_avx512"));
+        expected.push(format!("dot_u{ex_bits}_avx2"));
+        expected.push(format!("ex_dot_u{ex_bits}_scalar"));
+        assert_eq!(names, expected);
     }
 
     #[rstest]
@@ -1738,7 +1848,7 @@ mod tests {
         pack_blocked_row(&high, layout.high_bits, &mut hi);
         pack_blocked_row(&low, layout.low_bits, &mut lo);
         query.resize(padded_query_len(dim), 0.0);
-        let expected = ex_dot_kernel(bits - 1).call(&query, &packed);
+        let expected = ex_dot_host_kernel(bits - 1).call(&query, &packed);
         for (name, kernel) in ex_dot_prefix_kernel_variants(bits) {
             assert_eq!(
                 kernel(&query, &hi, &lo),
@@ -1753,7 +1863,7 @@ mod tests {
         query.resize(padded_query_len(dim), 0.0);
         assert_eq!(
             ex_dot_prefix_kernel(bits)(&query, &hi, &lo).to_bits(),
-            ex_dot_kernel(bits - 1).call(&query, &packed).to_bits(),
+            ex_dot_host_kernel(bits - 1).call(&query, &packed).to_bits(),
             "dispatched bits={bits}, dim={dim}"
         );
     }
@@ -1776,9 +1886,9 @@ mod tests {
                 }
             })
             .collect();
-        let expected = ex_dot_kernel(8).call(&query, &full);
-        let two_pass =
-            16.0 * ex_dot_kernel(4).call(&query, &hi) + ex_dot_kernel(4).call(&query, &lo);
+        let expected = ex_dot_host_kernel(8).call(&query, &full);
+        let two_pass = 16.0 * ex_dot_host_kernel(4).call(&query, &hi)
+            + ex_dot_host_kernel(4).call(&query, &lo);
         let tolerance = expected.abs().max(1.0) * 1e-4;
         assert!(
             (two_pass - expected).abs() <= tolerance,

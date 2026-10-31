@@ -52,7 +52,7 @@ use crate::vector::bq::dist_table_quant::{
     DistTableDequant, quantize_dist_table_into, quantize_dist_table_u16_into,
 };
 use crate::vector::bq::ex_dot::{
-    EX_DOT_BLOCK_DIMS, ExDotFn, blocked_ex_code_bytes, ex_dot_kernel, pad_query_into,
+    EX_DOT_BLOCK_DIMS, ExDotKernelFn, blocked_ex_code_bytes, ex_dot_host_kernel, pad_query_into,
     padded_query_len, repack_sequential_row, sequential_matches_blocked,
 };
 use crate::vector::bq::pairwise::{RQKernel, RQPairScorer};
@@ -1028,7 +1028,7 @@ pub struct RabitDistCalculator<'a> {
     // the rotated query, zero-padded to a 64-dim multiple when needed; also
     // the source for the FastScan ex LUT on the legacy bypass path
     ex_query: Cow<'a, [f32]>,
-    ex_dot: Option<Kernel<ExDotFn>>,
+    ex_dot: Option<Kernel<ExDotKernelFn>>,
     add_factors: &'a [f32],
     scale_factors: &'a [f32],
     error_factors: Option<&'a [f32]>,
@@ -1076,7 +1076,7 @@ impl<'a> RabitDistCalculator<'a> {
         query_error: f32,
         approx_mode: ApproxMode,
     ) -> Self {
-        let ex_dot = (num_bits > 1).then(|| ex_dot_kernel(num_bits - 1));
+        let ex_dot = (num_bits > 1).then(|| ex_dot_host_kernel(num_bits - 1));
         Self {
             dim,
             num_bits,
