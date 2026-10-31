@@ -889,6 +889,26 @@ impl ObjectStore {
         &self.io_tracker
     }
 
+    /// A cumulative counter named `name` on the `metrics` facade, labelled
+    /// like this store's object store metrics (`base`, and `dataset` in
+    /// dataset mode) so work on the store's data is attributed the way its IO
+    /// is. Unlabelled for a store that is not metered (see `meter_store`); a
+    /// no-op without the `metrics` feature.
+    #[cfg(feature = "metrics")]
+    pub fn counter(&self, name: &'static str) -> StoreCounter {
+        let labels = self
+            .io_tracker
+            .metrics_base()
+            .map(metrics::store_labels)
+            .unwrap_or_default();
+        StoreCounter(::metrics::counter!(name, labels))
+    }
+
+    #[cfg(not(feature = "metrics"))]
+    pub fn counter(&self, _name: &'static str) -> StoreCounter {
+        StoreCounter()
+    }
+
     /// Get a snapshot of current IO statistics without resetting counters
     ///
     /// Returns the current IO statistics without modifying the internal state.
@@ -2167,6 +2187,30 @@ impl ObjectStore {
             // Type-erased on the way in, so there is no telling if it can paginate.
             paginated_lister: None,
         }
+    }
+}
+
+/// Wall time of a scan's decode tasks in nanoseconds, summed over tasks and
+/// labelled like the store's object store metrics (`base`, and `dataset` in
+/// dataset mode). Tasks run concurrently, so the counter's rate is the number
+/// of batches decoding at once. Mirrors the scan node's `decode_time` plan
+/// metric, as a cumulative counter a scrape can read while the scan runs.
+pub const METRIC_SCAN_DECODE_TIME: &str = "lance_scan_decode_time_nanoseconds_total";
+/// Time scan partitions spent waiting for their next batch's I/O to be
+/// scheduled, in nanoseconds, labelled like [`METRIC_SCAN_DECODE_TIME`].
+/// Mirrors the scan node's `task_wait_time` plan metric.
+pub const METRIC_SCAN_TASK_WAIT_TIME: &str = "lance_scan_task_wait_time_nanoseconds_total";
+
+/// A cumulative counter on the `metrics` facade carrying a store's labels; see
+/// [`ObjectStore::counter`]. A no-op without the `metrics` feature.
+pub struct StoreCounter(#[cfg(feature = "metrics")] ::metrics::Counter);
+
+impl StoreCounter {
+    pub fn increment(&self, value: u64) {
+        #[cfg(feature = "metrics")]
+        self.0.increment(value);
+        #[cfg(not(feature = "metrics"))]
+        let _ = value;
     }
 }
 
