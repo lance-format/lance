@@ -96,6 +96,25 @@ pub trait LanceTokenizer: Send + Sync + std::fmt::Debug {
     fn discount_overlaps(&self) -> bool {
         false
     }
+
+    /// Whether query tokens form independent term groups regardless of position.
+    ///
+    /// Ngrams emit a placeholder position of zero, which does not indicate
+    /// alternatives. Query collection gives each of these tokens its own group;
+    /// other tokenizers retain genuine same-position alternatives.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lance_index::scalar::InvertedIndexParams;
+    ///
+    /// let tokenizer = InvertedIndexParams::default().base_tokenizer("ngram".into()).build()?;
+    /// assert!(tokenizer.query_tokens_are_independent());
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    fn query_tokens_are_independent(&self) -> bool {
+        false
+    }
 }
 
 impl Clone for Box<dyn LanceTokenizer> {
@@ -108,6 +127,7 @@ impl Clone for Box<dyn LanceTokenizer> {
 pub struct TextTokenizer {
     tokenizer: TextAnalyzer,
     pub(super) discount_overlaps: bool,
+    pub(super) has_independent_query_tokens: bool,
 }
 
 impl std::fmt::Debug for TextTokenizer {
@@ -121,6 +141,7 @@ impl TextTokenizer {
         Self {
             tokenizer,
             discount_overlaps: false,
+            has_independent_query_tokens: false,
         }
     }
 }
@@ -144,6 +165,10 @@ impl LanceTokenizer for TextTokenizer {
 
     fn discount_overlaps(&self) -> bool {
         self.discount_overlaps
+    }
+
+    fn query_tokens_are_independent(&self) -> bool {
+        self.has_independent_query_tokens
     }
 }
 

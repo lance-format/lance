@@ -1204,8 +1204,9 @@ public class Dataset implements Closeable {
   /**
    * Creates a new index on the dataset.
    *
-   * <p>Concurrent {@link #createIndex} / {@link #mergeIndexMetadata} calls on the same Dataset
-   * handle are serialized.
+   * <p>Concurrent {@link #createIndex} / {@link #mergeIndexMetadata} calls that commit on the same
+   * Dataset handle are serialized. Uncommitted builds (with fragment ids, or a BTree build from
+   * preprocessed data) only read this handle's snapshot and may run concurrently.
    *
    * @param options options for building index
    * @return the metadata of the created index
@@ -1222,8 +1223,8 @@ public class Dataset implements Closeable {
    * callback must be thread-safe because Lance may invoke it concurrently from native runtime
    * threads. Callbacks may re-enter read-only methods on this Dataset. Conflicting write re-entry
    * from a callback is rejected; unrelated concurrent callers keep their normal wait behavior.
-   * Concurrent {@link #createIndex} / {@link #mergeIndexMetadata} calls on the same Dataset handle
-   * are serialized.
+   * Concurrent {@link #createIndex} / {@link #mergeIndexMetadata} calls that commit on the same
+   * Dataset handle are serialized; uncommitted builds may run concurrently.
    *
    * <pre>{@code
    * Index index = dataset.createIndex(options, new IndexBuildProgress() {
@@ -1249,7 +1250,15 @@ public class Dataset implements Closeable {
     }
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      acquireIndexBuildLock();
+      // Uncommitted builds only read this handle's snapshot and never publish a new version, so
+      // they skip the build lock. Mirrors skip_commit in the JNI layer.
+      boolean commits =
+          !options.getFragmentIds().isPresent()
+              && !(options.getIndexType() == IndexType.BTREE
+                  && options.getPreprocessedData().isPresent());
+      if (commits) {
+        acquireIndexBuildLock();
+      }
       try {
         if (progress == null) {
           return nativeCreateIndex(
@@ -1275,7 +1284,9 @@ public class Dataset implements Closeable {
             options.getPreprocessedData().map(ArrowArrayStream::memoryAddress),
             new ContextIndexBuildProgress(this, progress));
       } finally {
-        indexBuildLock.unlock();
+        if (commits) {
+          indexBuildLock.unlock();
+        }
       }
     }
   }
@@ -1345,7 +1356,7 @@ public class Dataset implements Closeable {
    *
    * <p>Callback re-entry semantics match {@link #createIndex(IndexOptions, IndexBuildProgress)}:
    * read-only Dataset methods are allowed, conflicting write re-entry is rejected, and concurrent
-   * create/merge builds on this handle are serialized.
+   * committing create/merge builds on this handle are serialized.
    *
    * @param indexUUID shared UUID used by the distributed index parts
    * @param indexType type of index metadata to merge

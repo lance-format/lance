@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::{Dataset, Error, Result};
 use arrow_array::ArrayRef;
 use arrow_array::{Array, RecordBatch, RecordBatchReader, new_null_array};
+use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_row::{OwnedRow, RowConverter, Rows, SortField};
 use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use arrow_select::interleave::interleave;
@@ -37,6 +38,8 @@ impl HashJoiner {
     /// Create a new `HashJoiner`, building the hash index.
     ///
     /// Will run in parallel over batches using all available cores.
+    /// Returns an input error if the right-side join column contains duplicate keys,
+    /// including duplicate nulls.
     pub async fn try_new(reader: Box<dyn RecordBatchReader + Send>, on: &str) -> Result<Self> {
         // Check column exist
         let schema = reader.schema();
@@ -81,10 +84,19 @@ impl HashJoiner {
                 let map = map.clone();
                 async move {
                     let column = batch[on].clone();
+                    let on = on.to_owned();
                     let task_result = task::spawn_blocking(move || {
-                        let rows = column_to_rows(column)?;
+                        let rows = column_to_rows(column.clone())?;
                         for (row_i, row) in rows.iter().enumerate() {
-                            map.insert(row.owned(), (batch_i, row_i));
+                            if map.insert(row.owned(), (batch_i, row_i)).is_some() {
+                                let options = FormatOptions::default().with_null("NULL");
+                                let formatter = ArrayFormatter::try_new(column.as_ref(), &options)?;
+                                let key = formatter.value(row_i);
+                                return Err(Error::invalid_input(format!(
+                                    "Duplicate right-side join key in column '{on}': {key} \
+                                     (batch {batch_i}, row {row_i}). Right-side join keys must be unique."
+                                )));
+                            }
                         }
                         Ok(())
                     })

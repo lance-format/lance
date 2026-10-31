@@ -432,6 +432,7 @@ impl DatasetDelta {
     ///
     /// This returns rows where `_row_created_at_version` is greater than `begin_version`
     /// and less than or equal to `end_version`.
+    /// Rows and their values are read as of the resolved end version.
     /// Available inline row-version metadata is used to prune fragments before reading data files.
     ///
     /// The result always includes:
@@ -471,6 +472,7 @@ impl DatasetDelta {
     /// This returns rows where `_row_last_updated_at_version` is greater than `begin_version`
     /// and less than or equal to `end_version`, but `_row_created_at_version` is less than
     /// or equal to `begin_version` (to exclude newly inserted rows).
+    /// Rows and their values are read as of the resolved end version.
     /// Available inline row-version metadata is used to prune fragments before reading data files.
     ///
     /// The result always includes:
@@ -515,6 +517,7 @@ impl DatasetDelta {
     /// Condition 2:
     ///     This returns rows where `_row_created_at_version` is greater than `begin_version`
     ///     and less than or equal to `end_version`.
+    /// Rows and their values are read as of the resolved end version.
     /// Available inline row-version metadata is used to prune fragments before reading data files.
     ///
     /// The result always includes:
@@ -549,13 +552,19 @@ impl DatasetDelta {
 
     async fn scan_rows(&self, change: RowChange) -> Result<DatasetRecordBatchStream> {
         let (begin_version, end_version) = self.resolve_range().await?;
+        // Version 0 is the empty snapshot and has no manifest to check out.
+        let dataset = if end_version == 0 || end_version == self.base_dataset.version().version {
+            self.base_dataset.clone()
+        } else {
+            self.base_dataset.checkout_version(end_version).await?
+        };
         for version in [begin_version, end_version] {
             // Version 0 denotes an empty snapshot and has no manifest to validate.
             if version == 0 {
                 continue;
             }
-            let endpoint = if version == self.base_dataset.manifest.version {
-                self.base_dataset.clone()
+            let endpoint = if version == dataset.manifest.version {
+                dataset.clone()
             } else {
                 self.base_dataset.checkout_version(version).await?
             };
@@ -581,7 +590,7 @@ impl DatasetDelta {
             RowChange::Upserted => format!("({}) OR ({})", inserted_filter(), updated_filter()),
         };
 
-        let fragments = pruned_fragments(&self.base_dataset.manifest.fragments, |fragment| {
+        let fragments = pruned_fragments(&dataset.manifest.fragments, |fragment| {
             let in_range = |version| version > begin_version && version <= end_version;
             let may_have_inserts = || {
                 version_meta_may_match(
@@ -611,7 +620,7 @@ impl DatasetDelta {
             }
         });
 
-        let mut scanner = self.base_dataset.scan();
+        let mut scanner = dataset.scan();
         if let Some(fragments) = fragments {
             scanner.with_fragments(fragments);
         }
@@ -1252,7 +1261,7 @@ mod tests {
     #[case::inserted(
         RowChange::Inserted,
         "_row_created_at_version > 1 AND _row_created_at_version <= 3",
-        vec![13, 14, 15]
+        vec![12, 13, 14, 15]
     )]
     #[case::updated(
         RowChange::Updated,
@@ -1262,7 +1271,7 @@ mod tests {
     #[case::upserted(
         RowChange::Upserted,
         "(_row_created_at_version > 1 AND _row_created_at_version <= 3) OR (_row_created_at_version <= 1 AND _row_last_updated_at_version > 1 AND _row_last_updated_at_version <= 3)",
-        vec![1, 13, 14, 15]
+        vec![1, 12, 13, 14, 15]
     )]
     #[tokio::test]
     async fn test_delta_prunes_version_fragments(
@@ -1296,8 +1305,6 @@ mod tests {
         let updated_file = dataset.manifest.fragments.last().unwrap().files[0]
             .path
             .clone();
-        dataset = write_dataset_temp(&dir, 16, 4, 1, "later", true, true).await;
-        dataset.delete("key = 12").await.unwrap();
 
         let columns = &[
             WILDCARD,
@@ -1309,7 +1316,7 @@ mod tests {
             let delta = dataset
                 .delta()
                 .with_begin_version(1)
-                .with_end_version(3)
+                .with_end_version(dataset.version().version)
                 .build()
                 .unwrap();
             let stream = match change {
@@ -1395,6 +1402,7 @@ mod tests {
     }
 
     #[rstest]
+    #[case::empty_snapshot(0, 0)]
     #[case::same_version(1, 1)]
     #[case::unchanged_range(2, 3)]
     #[case::reversed_range(3, 1)]
@@ -1440,6 +1448,30 @@ mod tests {
                     .filename()
                     .is_some_and(|filename| filename.ends_with(".lance")))
         );
+    }
+
+    #[rstest]
+    #[case::inserted(RowChange::Inserted)]
+    #[case::updated(RowChange::Updated)]
+    #[case::upserted(RowChange::Upserted)]
+    #[tokio::test]
+    async fn test_delta_rows_missing_end_version(#[case] change: RowChange) {
+        let dataset = create_test_dataset(4, 1, "value", true).await;
+        let delta = dataset
+            .delta()
+            .with_begin_version(4)
+            .with_end_version(5)
+            .build()
+            .unwrap();
+        let error = match change {
+            RowChange::Inserted => delta.get_inserted_rows().await,
+            RowChange::Updated => delta.get_updated_rows().await,
+            RowChange::Upserted => delta.get_upserted_rows().await,
+        }
+        .err()
+        .unwrap();
+        assert!(matches!(error, lance_core::Error::DatasetNotFound { .. }));
+        assert!(error.to_string().contains("_versions/5.manifest"));
     }
 
     #[tokio::test]
@@ -2214,6 +2246,76 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::inserted(RowChange::Inserted, vec![(4, "inserted", 2, 2, 4)])]
+    #[case::updated(RowChange::Updated, vec![(0, "updated", 1, 3, 0)])]
+    #[case::upserted(RowChange::Upserted, vec![(0, "updated", 1, 3, 0), (4, "inserted", 2, 2, 4)])]
+    #[tokio::test]
+    async fn test_delta_rows_at_end_version(
+        #[case] change: RowChange,
+        #[case] expected: Vec<(i32, &str, u64, u64, u64)>,
+        #[values(1, 3, 5)] handle_version: u64,
+    ) {
+        let dir = lance_core::utils::tempfile::TempStrDir::default();
+        MockClock::set_system_time(std::time::Duration::from_secs(10));
+        let dataset = write_dataset_temp(&dir, 0, 2, 2, "initial", true, false).await;
+        assert_eq!(dataset.version().version, 1);
+        MockClock::set_system_time(std::time::Duration::from_secs(20));
+        let dataset = write_dataset_temp(&dir, 4, 1, 1, "inserted", true, true).await;
+        assert_eq!(dataset.get_fragments().len(), 2);
+        MockClock::set_system_time(std::time::Duration::from_secs(30));
+        let dataset = update_where(dataset, "key = 0", "updated").await;
+        MockClock::set_system_time(std::time::Duration::from_secs(40));
+        let mut dataset = update_where(dataset, "key = 0", "later").await;
+        MockClock::set_system_time(std::time::Duration::from_secs(50));
+        dataset.delete("key = 4").await.unwrap();
+        assert_eq!(dataset.version().version, 5);
+        let dataset = dataset.checkout_version(handle_version).await.unwrap();
+
+        let mut builders = vec![
+            dataset.delta().with_begin_version(1).with_end_version(3),
+            dataset
+                .delta()
+                .with_begin_date(chrono::DateTime::from_timestamp(15, 0).unwrap())
+                .with_end_date(chrono::DateTime::from_timestamp(35, 0).unwrap()),
+        ];
+        if handle_version == 1 {
+            builders.push(dataset.delta().compared_against_version(3));
+        } else if handle_version == 3 {
+            builders.push(dataset.delta().compared_against_version(1));
+        }
+
+        for builder in builders {
+            let delta = builder.build().unwrap();
+            let stream = match change {
+                RowChange::Inserted => delta.get_inserted_rows().await,
+                RowChange::Updated => delta.get_updated_rows().await,
+                RowChange::Upserted => delta.get_upserted_rows().await,
+            }
+            .unwrap();
+            let batch = collect_stream(stream).await;
+            let keys = batch["key"].as_primitive::<Int32Type>();
+            let values = batch["value"].as_string::<i32>();
+            let created = batch[ROW_CREATED_AT_VERSION].as_primitive::<UInt64Type>();
+            let updated = batch[ROW_LAST_UPDATED_AT_VERSION].as_primitive::<UInt64Type>();
+            let ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+            let mut actual = (0..batch.num_rows())
+                .map(|i| {
+                    (
+                        keys.value(i),
+                        values.value(i),
+                        created.value(i),
+                        updated.value(i),
+                        ids.value(i),
+                    )
+                })
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "{change:?} on version {handle_version}");
+        }
+        assert_eq!(dataset.version().version, handle_version);
+    }
+
     #[tokio::test]
     async fn test_get_inserted_rows() {
         // Create initial dataset (version 1)
@@ -2435,7 +2537,10 @@ mod tests {
     #[case::begin(false)]
     #[case::end(true)]
     #[tokio::test]
-    async fn test_mixed_stable_id_endpoints_are_rejected(#[case] has_unsupported_end: bool) {
+    async fn test_mixed_stable_id_endpoints_are_rejected(
+        #[case] has_unsupported_end: bool,
+        #[values(false, true)] has_historical_handle: bool,
+    ) {
         let dir = lance_core::utils::tempfile::TempStrDir::default();
         let mut dataset = write_dataset_temp(&dir, 0, 2, 1, "v1", false, false).await;
         dataset.migrate_to_stable_row_ids().await.unwrap();
@@ -2461,9 +2566,14 @@ mod tests {
         } else {
             (1, 1)
         };
+        let end_version = dataset.manifest.version;
+        if has_historical_handle {
+            dataset = dataset.checkout_version(1).await.unwrap();
+        }
         let delta = dataset
             .delta()
-            .compared_against_version(begin_version)
+            .with_begin_version(begin_version)
+            .with_end_version(end_version)
             .build()
             .unwrap();
         for result in [
@@ -2939,10 +3049,8 @@ mod tests {
         let stream = delta.get_updated_rows().await.unwrap();
         let result = collect_stream(stream).await;
 
-        // Should have 20 rows (keys 0-9 and 20-29)
-        // Note: keys 10-19 were updated in v2 but then updated again in v4,
-        // so they have _row_last_updated_at_version = 4, not 2
-        assert_eq!(result.num_rows(), 20);
+        // All 30 rows are returned as of version 2, including those updated again in version 4.
+        assert_eq!(result.num_rows(), 30);
         assert!(result.column_by_name(ROW_ID).is_some());
         assert!(result.column_by_name(ROW_CREATED_AT_VERSION).is_some());
         assert!(result.column_by_name(ROW_LAST_UPDATED_AT_VERSION).is_some());
@@ -2958,9 +3066,7 @@ mod tests {
         for i in 0..result.num_rows() {
             assert_eq!(created_at[i], 1); // Created at version 1
             assert_eq!(updated_at[i], 2); // Updated at version 2
-            // Keys should be in range [0, 30) but excluding [10, 20)
             assert!(keys[i] < 30);
-            assert!(keys[i] < 10 || keys[i] >= 20);
         }
 
         // Test 2: Get updated rows between version 2 and 3
@@ -3064,7 +3170,7 @@ mod tests {
                 // Inserted rows from version 2
                 assert!((50..70).contains(&key));
                 assert_eq!(created_at[i], 2);
-                assert_eq!(updated_at[i], if key == 50 { 4 } else { 2 });
+                assert_eq!(updated_at[i], 2);
             }
         }
     }
@@ -3154,10 +3260,15 @@ mod tests {
 
         let begin_ts = chrono::DateTime::<chrono::Utc>::from_timestamp(15, 0).unwrap();
 
+        let ds = ds.checkout_version(1).await.unwrap();
         let delta = ds.delta().with_begin_date(begin_ts).build().unwrap();
 
         let txs = delta.list_transactions().await.unwrap();
         // Should include transactions at v2 and v3
         assert_eq!(txs.len(), 2);
+        let batch = collect_stream(delta.get_updated_rows().await.unwrap()).await;
+        let mut keys = batch["key"].as_primitive::<Int32Type>().values().to_vec();
+        keys.sort_unstable();
+        assert_eq!(keys, (0..10).collect::<Vec<_>>());
     }
 }
