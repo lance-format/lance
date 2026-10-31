@@ -4306,6 +4306,83 @@ def test_distributed_ivf_pq_order_invariance(tmp_path: Path):
         assert np.allclose(a, b, atol=1e-6)
 
 
+@pytest.mark.parametrize("prefilter", [True, False])
+@pytest.mark.parametrize(
+    "index_metric,metric,use_index,expected_ids",
+    [
+        (None, None, True, [0, 1]),
+        ("cosine", None, True, [2, 3]),
+        ("dot", None, True, [4, 5]),
+        ("cosine", "cosine", True, [2, 3]),
+        ("cosine", "l2", True, [0, 1]),
+        ("cosine", None, False, [0, 1]),
+        ("cosine", "cosine", False, [2, 3]),
+    ],
+)
+def test_vector_search_filter_metric(
+    tmp_path, prefilter, index_metric, metric, use_index, expected_ids
+):
+    # Each metric has a disjoint top two, so an L2 fallback cannot pass by chance.
+    vectors = [[1, 0.1], [1, 0.2], [3, 0], [4, 0.01], [10, 4], [9, 5], None]
+    table = pa.table(
+        {
+            "id": range(len(vectors)),
+            "vector": pa.array(vectors, type=pa.list_(pa.float32(), 2)),
+            "text": ["match"] * len(vectors),
+        }
+    )
+    ds = lance.write_dataset(table, tmp_path, max_rows_per_file=2)
+    if index_metric is not None:
+        ds.create_index(
+            "vector",
+            "IVF_FLAT",
+            metric=index_metric,
+            num_partitions=1,
+            ivf_centroids=np.array([[1, 0]], dtype=np.float32),
+        )
+    ds.create_scalar_index("text", "INVERTED")
+
+    scanner = ds.scanner(
+        columns=["id"],
+        filter=VectorSearchQuery(
+            "vector", [1, 0], k=2, metric=metric, use_index=use_index
+        ),
+        full_text_query=MatchQuery("match", column="text"),
+        prefilter=prefilter,
+    )
+    uses_ann = (
+        prefilter
+        and use_index
+        and index_metric is not None
+        and metric in (None, index_metric)
+    )
+    assert ("ANNIvf" in scanner.explain_plan()) == uses_ann
+    assert sorted(scanner.to_table()["id"].to_pylist()) == expected_ids
+
+
+@pytest.mark.parametrize("prefilter", [True, False])
+def test_fts_filter_binary_default_metric(tmp_path, prefilter):
+    ds = lance.write_dataset(
+        pa.table(
+            {
+                "id": [0, 1, 2],
+                "vector": pa.array([[128, 0], [3, 0], None], pa.list_(pa.uint8(), 2)),
+                "text": ["match"] * 3,
+            }
+        ),
+        tmp_path,
+        max_rows_per_file=1,
+    )
+    ds.create_scalar_index("text", "INVERTED")
+    result = ds.to_table(
+        columns=["id"],
+        nearest={"column": "vector", "q": np.array([0, 0], dtype=np.uint8), "k": 1},
+        filter=MatchQuery("match", column="text"),
+        prefilter=prefilter,
+    )
+    assert result["id"].to_pylist() == [0]
+
+
 def test_fts_filter_vector_search(tmp_path):
     # Create dataset with vector and text columns
     ids = list(range(1, 301))

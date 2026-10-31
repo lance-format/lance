@@ -1384,6 +1384,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         scratch: &mut QueryScratch,
     ) -> Result<RecordBatch> {
         let _stage_timer = IndexTimer::new(metrics, IndexTiming::Search);
+        if prepared.pre_filter.selects_nothing() {
+            return Ok(RecordBatch::new_empty(VECTOR_RESULT_SCHEMA.clone()));
+        }
         let PreparedPartitionSearch {
             query,
             pre_filter,
@@ -1468,6 +1471,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         metrics: &dyn MetricsCollector,
     ) -> Result<()> {
         let _stage_timer = IndexTimer::new(metrics, IndexTiming::Search);
+        if prepared.pre_filter.selects_nothing() {
+            return Ok(());
+        }
         let PreparedPartitionSearch {
             query,
             pre_filter,
@@ -2779,6 +2785,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             .await?;
             (part_entry, pre_filter)
         };
+        if pre_filter.selects_nothing() {
+            return Ok(RecordBatch::new_empty(VECTOR_RESULT_SCHEMA.clone()));
+        }
 
         let partition_centroid = self.ivf.centroid(partition_id);
         let rq_search_cache = self.rq_search_cache.clone();

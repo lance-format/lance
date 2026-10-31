@@ -3697,13 +3697,20 @@ async fn append_age_fragment(dataset: &mut Dataset, ids: std::ops::Range<i32>) {
 #[case::bitmap(IndexType::Bitmap)]
 #[case::zonemap(IndexType::ZoneMap)]
 #[tokio::test]
-async fn test_optimize_preserves_scalar_overlay_masking(#[case] index_type: IndexType) {
-    let mut dataset = create_base_dataset().await;
+async fn test_optimize_preserves_scalar_overlay_masking(
+    #[case] index_type: IndexType,
+    #[values(false, true)] has_deletions: bool,
+    #[values(false, true)] has_stable_row_ids: bool,
+) {
+    let mut dataset = create_base_dataset_with(has_stable_row_ids).await;
     dataset
         .create_index(&["age"], index_type, None, &scalar_params(index_type), true)
         .await
         .unwrap();
     let source = dataset.load_indices_by_name("age_idx").await.unwrap()[0].clone();
+    if has_deletions {
+        dataset.delete("id = 0").await.unwrap();
+    }
 
     // Overlay fragment 0, offset 1 (id=1): age 10 -> 999, committed after the index.
     let mut dataset = commit_overlay(
@@ -3746,6 +3753,34 @@ async fn test_optimize_preserves_scalar_overlay_masking(#[case] index_type: Inde
     );
     // A row untouched by the overlay is unaffected.
     assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
+    assert_eq!(
+        ids_matching(&dataset, "age = 0").await,
+        if has_deletions { vec![] } else { vec![0] }
+    );
+
+    let indexed = dataset
+        .scan()
+        .filter("age >= 0")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let scanned = dataset
+        .scan()
+        .filter("age >= 0")
+        .unwrap()
+        .use_scalar_index(false)
+        .try_into_batch()
+        .await
+        .unwrap();
+    let rows = |batch: &RecordBatch| {
+        let ids = batch["id"].as_primitive::<Int32Type>();
+        let ages = batch["age"].as_primitive::<Int32Type>();
+        let mut rows = ids.iter().zip(ages.iter()).collect::<Vec<_>>();
+        rows.sort_unstable();
+        rows
+    };
+    assert_eq!(rows(&indexed), rows(&scanned));
 
     let merged = dataset.load_indices_by_name("age_idx").await.unwrap();
     assert_eq!(merged.len(), 1);

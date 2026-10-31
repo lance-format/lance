@@ -931,6 +931,17 @@ fn version_to_py(py: Python<'_>, version: &Version) -> PyResult<Py<PyAny>> {
     dict.into_py_any(py)
 }
 
+fn tag_to_py(py: Python<'_>, tag: TagContents) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("branch", tag.branch)?;
+    dict.set_item("version", tag.version)?;
+    dict.set_item("created_at", tag.created_at)?;
+    dict.set_item("updated_at", tag.updated_at)?;
+    dict.set_item("manifest_size", tag.manifest_size)?;
+    dict.set_item("metadata", tag.metadata)?;
+    dict.into_py_any(py)
+}
+
 #[pymethods]
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
@@ -2382,15 +2393,7 @@ impl Dataset {
         let pylist = PyList::empty(py);
 
         for (tag_name, tag_content) in tags {
-            let dict = PyDict::new(py);
-            dict.set_item("branch", tag_content.branch.clone())?;
-            dict.set_item("version", tag_content.version)?;
-            dict.set_item("created_at", tag_content.created_at)?;
-            dict.set_item("updated_at", tag_content.updated_at)?;
-            dict.set_item("manifest_size", tag_content.manifest_size)?;
-            dict.set_item("metadata", tag_content.metadata.clone())?;
-
-            pylist.append((tag_name.as_str(), dict))?;
+            pylist.append((tag_name, tag_to_py(py, tag_content)?))?;
         }
 
         Ok(pylist.unbind().as_any().clone())
@@ -2401,17 +2404,22 @@ impl Dataset {
         let tags = self_.list_tags()?;
 
         let pytags = PyDict::new(py);
-        for (k, v) in tags.iter() {
-            let dict = PyDict::new(py);
-            dict.set_item("branch", v.branch.clone())?;
-            dict.set_item("version", v.version)?;
-            dict.set_item("created_at", v.created_at)?;
-            dict.set_item("updated_at", v.updated_at)?;
-            dict.set_item("manifest_size", v.manifest_size)?;
-            dict.set_item("metadata", v.metadata.clone())?;
-            pytags.set_item(k, dict.into_py_any(py)?)?;
+        for (tag_name, tag_content) in tags {
+            pytags.set_item(tag_name, tag_to_py(py, tag_content)?)?;
         }
         pytags.into_py_any(py)
+    }
+
+    fn get_tag(self_: PyRef<'_, Self>, tag: String) -> PyResult<Py<PyAny>> {
+        let tag_content =
+            rt().block_on(None, self_.ds.tags().get(&tag))?
+                .map_err(|err| match err {
+                    Error::InvalidRef { .. }
+                    | Error::NotFound { .. }
+                    | Error::RefNotFound { .. } => PyValueError::new_err(err.to_string()),
+                    _ => PyIOError::new_err(err.to_string()),
+                })?;
+        tag_to_py(self_.py(), tag_content)
     }
 
     fn get_version(self_: PyRef<'_, Self>, tag: String) -> PyResult<u64> {
