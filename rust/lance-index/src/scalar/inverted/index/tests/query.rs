@@ -538,8 +538,11 @@ async fn test_fuzzy_and_groups_expansions_by_original_position() {
     );
 }
 
+#[rstest::rstest]
 #[tokio::test]
-async fn test_fuzzy_expansion_cap_applies_to_whole_query() {
+async fn test_fuzzy_expansion_cap_applies_to_whole_query(
+    #[values(false, true)] has_independent_groups: bool,
+) {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
         ObjectStore::local().into(),
@@ -567,22 +570,48 @@ async fn test_fuzzy_expansion_cap_applies_to_whole_query() {
     let params = FtsSearchParams::new()
         .with_fuzziness(Some(1))
         .with_max_expansions(3);
-    let tokens = Tokens::new(vec!["alphx".to_owned(), "betx".to_owned()], DocType::Text);
+    let tokens = Tokens::with_positions(
+        vec!["alphx".to_owned(), "betx".to_owned()],
+        if has_independent_groups {
+            vec![0, 0]
+        } else {
+            vec![0, 1]
+        },
+        DocType::Text,
+    )
+    .with_term_groups(vec![0, 1]);
 
-    let expanded = partition.expand_fuzzy(&tokens, &params).unwrap();
-    let expanded_terms = (0..expanded.len())
-        .map(|idx| (expanded.get_token(idx).to_owned(), expanded.position(idx)))
-        .collect::<Vec<_>>();
+    for expanded in [
+        partition.expand_fuzzy(&tokens, &params).unwrap(),
+        index.expand_fuzzy_tokens(&tokens, &params).unwrap(),
+        crate::scalar::inverted::final_query_tokens(std::slice::from_ref(&index), &tokens, &params)
+            .unwrap(),
+    ] {
+        let expanded_terms = (0..expanded.len())
+            .map(|idx| (expanded.get_token(idx).to_owned(), expanded.term_group(idx)))
+            .collect::<Vec<_>>();
 
-    assert_eq!(
-        expanded_terms,
-        vec![
-            ("alpha".to_owned(), 0),
-            ("alphi".to_owned(), 0),
-            ("beta".to_owned(), 1),
-        ],
-        "max_expansions should cap the whole fuzzy query, not each token"
-    );
+        assert_eq!(
+            expanded_terms,
+            vec![
+                ("alpha".to_owned(), 0),
+                ("alphi".to_owned(), 0),
+                ("beta".to_owned(), 1),
+            ],
+            "max_expansions should cap the whole fuzzy query, not each token"
+        );
+        assert_eq!(
+            (0..expanded.len())
+                .map(|index| expanded.position(index))
+                .collect::<Vec<_>>(),
+            if has_independent_groups {
+                vec![0, 0, 0]
+            } else {
+                vec![0, 0, 1]
+            },
+            "fuzzy expansion must preserve phrase positions separately from Match groups"
+        );
+    }
 }
 
 /// Write one partition holding `variants` in order, with one
