@@ -181,6 +181,8 @@ pub use write::{
 pub(crate) const INDICES_DIR: &str = "_indices";
 pub(crate) const DATA_DIR: &str = "data";
 pub(crate) const TRANSACTIONS_DIR: &str = "_transactions";
+pub(crate) const BLOBS_DIR: &str = "_blobs";
+pub(crate) const FRAG_REUSE_DIR: &str = "_fri";
 const DEFAULT_MAX_STREAM_COPY_PARALLELISM: usize = 4;
 
 // Full samples already have their final ordering and need no randomness.
@@ -608,30 +610,39 @@ impl Dataset {
         self.checkout_by_ref(None, Some(branch)).await
     }
 
+    /// Create a branch from an existing version with a shallow clone.
+    ///
     /// This is a two-phase operation:
+    /// - Atomically reserve the name by creating the branch metadata (`BranchContents`).
     /// - Create the branch dataset by shallow cloning.
-    /// - Create the branch metadata (a.k.a. `BranchContents`).
     ///
     /// These two phases are not atomic. We consider `BranchContents` as the source of truth
     /// for the branch.
     ///
-    /// The cleanup procedure should:
-    /// - Clean up zombie branch datasets that have no related `BranchContents`.
-    /// - Delete broken `BranchContents` entries that have no related branch dataset.
+    /// A concurrent creator that cannot reserve the name returns a conflict without
+    /// writing to the branch dataset.
     ///
-    /// If `create_branch` stops at phase 1, it may leave a zombie branch dataset,
-    /// which can be cleaned up later. Such a zombie dataset may cause a branch creation
-    /// failure if we use the same name to `create_branch`. In that case, you need to call
-    /// `force_delete_branch` to interactively clean up the zombie dataset.
+    /// If cloning fails or is interrupted, the name remains reserved, since the clone
+    /// commit may have succeeded even if its result is unknown. Use
+    /// [`Self::force_delete_branch`] to clean up the incomplete branch before retrying.
     ///
     /// `"main"` is reserved for the default branch and cannot be used as a new branch name.
+    /// A segment after the first cannot be a reserved dataset directory.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &mut Dataset) -> Result<()> {
+    /// let experiment = dataset.create_branch("experiment", ("main", None), None).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn create_branch(
         &mut self,
         branch: &str,
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
-        refs::check_valid_branch(branch)?;
+        refs::check_new_branch(branch)?;
 
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
         let branch_location = self.branch_location().find_branch(Some(branch))?;
@@ -647,6 +658,11 @@ impl Dataset {
         };
         let transaction = Transaction::new(version_number, clone_op, None);
 
+        // Claim the name before the clone can write into another creator's branch.
+        self.branches()
+            .create(branch, version_number, source_branch.as_deref())
+            .await?;
+
         let builder = CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
             // Fall back to the dataset's own store params
             .with_store_params(
@@ -655,15 +671,13 @@ impl Dataset {
             .with_object_store(Arc::new(self.object_store.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
-        let dataset = builder.execute(transaction).await?;
-
-        // Create BranchContents after shallow_clone
-        self.branches()
-            .create(branch, version_number, source_branch.as_deref())
-            .await?;
-        Ok(dataset)
+        builder.execute(transaction).await
     }
 
+    /// Deletes a branch and removes its directory when safe.
+    ///
+    /// Legacy branches like `outer/data` may share a directory with another
+    /// branch. Their files are retained, so checkout by name may still work.
     pub async fn delete_branch(&mut self, branch: &str) -> Result<()> {
         self.branches().delete(branch, false).await
     }
