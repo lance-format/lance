@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::any::Any;
 use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, atomic};
 use std::time::Duration;
@@ -184,6 +185,27 @@ pub fn spawn_cpu<
 >(
     func: F,
 ) -> impl Future<Output = std::result::Result<R, E>> {
+    // Type-erase the closure so tokio's blocking-task machinery (task cell,
+    // harness, vtable, drop glue) is instantiated once here rather than once
+    // per closure type in every calling crate. The output is mapped with a fn
+    // item rather than a closure so the wrapper is generic only over `R` and `E`.
+    spawn_cpu_erased(Box::new(move || Box::new(func()) as ErasedOutput))
+        .map(downcast_output::<std::result::Result<R, E>>)
+}
+
+type ErasedOutput = Box<dyn Any + Send>;
+
+fn downcast_output<T: 'static>(output: ErasedOutput) -> T {
+    // Infallible: the only producer of `output` is the closure boxed in
+    // `spawn_cpu`, which returns exactly `T`.
+    *output
+        .downcast::<T>()
+        .expect("spawn_cpu output has the type produced by its closure")
+}
+
+fn spawn_cpu_erased(
+    func: Box<dyn FnOnce() -> ErasedOutput + Send>,
+) -> impl Future<Output = ErasedOutput> {
     // Propagate the current span into the task
     let span = Span::current();
     let handle = global_cpu_runtime().spawn_blocking(move || {
