@@ -65,6 +65,10 @@ macro_rules! for_each_action {
             SetDeletionFile,
             AlterField,
             DropField,
+            AddIndexSegment,
+            RemoveIndexSegment,
+            AdjustIndexCoverage,
+            DropIndex,
             ReserveFragmentIds,
             ReserveRowIds,
             ResetTable,
@@ -77,13 +81,18 @@ mod add_base;
 mod add_data_file;
 mod add_field;
 mod add_fragment;
+mod add_index_segment;
+mod adjust_index_coverage;
 mod alter_field;
 mod apply;
 mod config_update;
 mod drop_field;
+mod drop_index;
 mod footprint;
 mod proto;
+mod query_contract;
 mod remove_fragment;
+mod remove_index_segment;
 mod reserve_fragment_ids;
 mod reserve_row_ids;
 mod reset_table;
@@ -97,11 +106,15 @@ pub use add_base::AddBase;
 pub use add_data_file::AddDataFile;
 pub use add_field::AddField;
 pub use add_fragment::AddFragment;
+pub use add_index_segment::AddIndexSegment;
+pub use adjust_index_coverage::AdjustIndexCoverage;
 pub use alter_field::AlterField;
 pub use config_update::{ConfigUpdate, FieldMetadataUpdate};
 pub use drop_field::DropField;
+pub use drop_index::DropIndex;
 pub use footprint::{ConfigMap, Coordinate, Footprint};
 pub use remove_fragment::RemoveFragment;
+pub use remove_index_segment::RemoveIndexSegment;
 pub use reserve_fragment_ids::ReserveFragmentIds;
 pub use reserve_row_ids::ReserveRowIds;
 pub use reset_table::ResetTable;
@@ -441,6 +454,45 @@ mod tests {
             data_change: true,
         });
         assert!(remove.is_data_change());
+
+        // An index segment is derived state unless the writer says otherwise,
+        // as the MemWAL index does for the rows it holds.
+        for data_change in [false, true] {
+            let add = Action::AddIndexSegment(AddIndexSegment {
+                uuid: uuid::Uuid::from_u128(1),
+                name: "by_a".into(),
+                fields: vec![FieldRef::Committed(0)],
+                covering_fields: Vec::new(),
+                index_details: None,
+                index_version: 1,
+                covered_fragments: Some(vec![Ref::Committed(0)]),
+                files: Vec::new(),
+                base: None,
+                created_at: None,
+                dataset_version: None,
+                data_change,
+            });
+            assert_eq!(add.is_data_change(), data_change);
+            let remove = Action::RemoveIndexSegment(RemoveIndexSegment {
+                uuid: uuid::Uuid::from_u128(1),
+                name: "by_a".into(),
+                data_change,
+            });
+            assert_eq!(remove.is_data_change(), data_change);
+        }
+
+        let adjust = Action::AdjustIndexCoverage(AdjustIndexCoverage {
+            uuid: uuid::Uuid::from_u128(1),
+            name: "by_a".into(),
+            add_fragments: vec![Ref::Committed(1)],
+            remove_fragments: vec![0],
+            fields: vec![FieldRef::Committed(0)],
+            covering_fields: Vec::new(),
+        });
+        assert!(
+            !adjust.is_data_change(),
+            "coverage changes no row a reader sees"
+        );
     }
 
     #[test]

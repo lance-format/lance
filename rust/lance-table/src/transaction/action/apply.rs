@@ -23,6 +23,7 @@
 //! modules program against. What each action does with it lives in that action's
 //! own module.
 
+use super::query_contract::QueryContract;
 use super::{CompositeOperation, FieldId, FieldRef, Ref};
 use crate::feature_flags::{apply_index_object_metadata_flag, inherit_sticky_feature_flags};
 use crate::format::overlay::staleness::field_affects_index;
@@ -31,6 +32,7 @@ use crate::format::{
 };
 use crate::rowids::read_row_ids;
 use crate::rowids::version::build_version_meta;
+use crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
 use crate::transaction::validate::schema_fragments_valid;
@@ -38,7 +40,8 @@ use crate::transaction::{LogicalIndexSegments, ReadVersionState, Transaction};
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result, is_system_column};
 use roaring::RoaringTreemap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use uuid::Uuid;
 
 /// The field id written into a data file's field list once the file no longer
 /// backs that field. A file whose every slot is tombstoned is dropped.
@@ -107,6 +110,8 @@ impl Transaction {
         let mut state = ApplyState::new(
             current_manifest,
             current_indices,
+            config,
+            self.read_version,
             ReadMarks::of(read_manifest),
         );
         for action in composite_operation.iter_actions() {
@@ -116,7 +121,6 @@ impl Transaction {
         state.into_manifest(
             self,
             transaction_file_path,
-            config,
             mem_wal_segments_before.as_ref(),
             read_version_state,
         )
@@ -152,6 +156,8 @@ pub(super) struct ApplyState<'a> {
     /// attempt, the latest committed version on a retry.
     current_manifest: &'a Manifest,
     read_marks: ReadMarks,
+    /// How the manifest this delta produces is to be assembled.
+    build_config: &'a ManifestBuildConfig,
     schema: Schema,
     fragments: Vec<Fragment>,
     /// Base paths minted by this operation. Kept apart from the manifest's own
@@ -159,7 +165,9 @@ pub(super) struct ApplyState<'a> {
     /// committed on top of.
     new_bases: Vec<BasePath>,
     existing_base_paths: HashMap<u32, BasePath>,
-    /// The index segments of the version being committed on top of.
+    /// The index segments, as the actions have left them so far. Index
+    /// actions edit this list; the assembly then prunes whatever the data
+    /// actions invalidated.
     indices: Vec<IndexMetadata>,
     /// The manifest's string maps. Unlike the schema and the fragment list,
     /// these are inherited wholesale by the manifest assembly, so an edit has
@@ -195,18 +203,19 @@ pub(super) struct ApplyState<'a> {
     /// reserved range is always the top `count` ids of the resulting watermark.
     reserved_row_ids: u64,
 
-    /// Fields whose backing data changed, per fragment. An index covering such
-    /// a field no longer describes that fragment's contents.
-    rebound_fields: HashMap<u64, HashSet<i32>>,
+    /// Names of the logical indices this operation added a segment to or
+    /// adjusted, whose segment sets are validated once the operation has run.
+    touched_index_names: BTreeSet<String>,
 
     /// Every field a [`TombstoneFieldData`](super::TombstoneFieldData) freed,
     /// by fragment and field, so a re-encode can be checked to re-bind what it
     /// tombstoned.
     tombstoned_fields: HashMap<(u64, i32), TombstonedField>,
 
-    /// Whether the table was reset, which discards every index outright rather
-    /// than pruning fragments out of them.
-    reset: bool,
+    /// The version the transaction was built against. Not the current
+    /// manifest's version: on a retry the set is replayed onto something newer,
+    /// and what an action saw is still the version it read.
+    read_version: u64,
 }
 
 /// A field a [`TombstoneFieldData`](super::TombstoneFieldData) freed.
@@ -218,10 +227,18 @@ struct TombstonedField {
 }
 
 impl<'a> ApplyState<'a> {
-    fn new(manifest: &'a Manifest, indices: Vec<IndexMetadata>, read_marks: ReadMarks) -> Self {
+    fn new(
+        manifest: &'a Manifest,
+        indices: Vec<IndexMetadata>,
+        build_config: &'a ManifestBuildConfig,
+        read_version: u64,
+        read_marks: ReadMarks,
+    ) -> Self {
         Self {
             current_manifest: manifest,
+            read_version,
             read_marks,
+            build_config,
             schema: manifest.schema.clone(),
             fragments: manifest.fragments.as_ref().clone(),
             indices,
@@ -238,9 +255,8 @@ impl<'a> ApplyState<'a> {
             new_fragments: HashSet::new(),
             reserved_fragment_ids: 0,
             reserved_row_ids: 0,
-            rebound_fields: HashMap::new(),
+            touched_index_names: BTreeSet::new(),
             tombstoned_fields: HashMap::new(),
-            reset: false,
         }
     }
 
@@ -249,11 +265,11 @@ impl<'a> ApplyState<'a> {
         mut self,
         transaction: &Transaction,
         transaction_file_path: &str,
-        config: &ManifestBuildConfig,
         mem_wal_segments_before: Option<&LogicalIndexSegments>,
         read_version_state: Option<ReadVersionState<'_>>,
     ) -> Result<(Manifest, Vec<IndexMetadata>)> {
         let current_manifest = self.current_manifest;
+        let config = self.build_config;
         let new_version = current_manifest.version + 1;
 
         self.check_spilled_lineage_is_bound()?;
@@ -270,9 +286,8 @@ impl<'a> ApplyState<'a> {
             schema,
             mut fragments,
             mut indices,
+            touched_index_names,
             new_bases,
-            rebound_fields,
-            reset,
             fragment_high_water,
             field_high_water,
             config: dataset_config,
@@ -280,11 +295,8 @@ impl<'a> ApplyState<'a> {
             ..
         } = self;
 
-        if reset {
-            indices.clear();
-        }
-        prune_rebound_fields_from_indices(&mut indices, &rebound_fields, &current_manifest.schema)?;
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
+        validate_index_segment_sets(&indices, &touched_index_names)?;
 
         Transaction::normalize_fragments(&mut fragments)?;
         check_required_fields_are_stored(current_manifest, &schema, &fragments)?;
@@ -352,6 +364,89 @@ impl<'a> ApplyState<'a> {
 
     pub(super) fn uses_stable_row_ids(&self) -> bool {
         self.current_manifest.uses_stable_row_ids()
+    }
+
+    /// The version the transaction read, which is the newest data an index
+    /// segment added by this operation can have been built from.
+    ///
+    /// Deliberately not the current manifest's version. A set that loses a race
+    /// is replayed against whatever won, and a segment built before that still
+    /// reflects only what its writer could see -- stamping it with the newer
+    /// version would claim coverage of rows it never read.
+    pub(super) fn read_version(&self) -> u64 {
+        self.read_version
+    }
+
+    /// Add an index segment. A segment's uuid identifies it, so re-adding one
+    /// that is already there is a mistake rather than a replacement -- swapping
+    /// a segment out is a [`RemoveIndexSegment`](super::RemoveIndexSegment)
+    /// followed by an add.
+    pub(super) fn add_index_segment(&mut self, segment: IndexMetadata) -> Result<()> {
+        if self.indices.iter().any(|index| index.uuid == segment.uuid) {
+            return Err(Error::invalid_input(format!(
+                "index segment {} is already part of the dataset; a segment is added once",
+                segment.uuid
+            )));
+        }
+        self.touched_index_names.insert(segment.name.clone());
+        self.indices.push(segment);
+        Ok(())
+    }
+
+    /// Drop an index segment by uuid. A removal that names a segment the
+    /// dataset does not have is a mistake rather than a no-op: it means the
+    /// operation was planned against a different set of segments.
+    pub(super) fn remove_index_segment(&mut self, uuid: Uuid, name: &str) -> Result<()> {
+        let Some(position) = self.index_segment_position(uuid, name)? else {
+            return Err(Error::invalid_input(format!(
+                "index segment {uuid} is not part of the dataset, so it cannot be removed"
+            )));
+        };
+        self.indices.remove(position);
+        Ok(())
+    }
+
+    /// Remove every segment of the index `name`.
+    pub(super) fn drop_index(&mut self, name: &str) -> Result<()> {
+        let before = self.indices.len();
+        self.indices.retain(|index| index.name != name);
+        if self.indices.len() == before {
+            return Err(Error::invalid_input(format!(
+                "DropIndex names index '{name}', which has no segment in the dataset"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Where the segment `uuid` lives, checking on the way that it really
+    /// belongs to `name`. A mismatch means the operation was planned against a
+    /// different set of segments, the same way a missing segment does.
+    fn index_segment_position(&self, uuid: Uuid, name: &str) -> Result<Option<usize>> {
+        let Some(position) = self.indices.iter().position(|index| index.uuid == uuid) else {
+            return Ok(None);
+        };
+        let found = &self.indices[position].name;
+        if found != name {
+            return Err(Error::invalid_input(format!(
+                "index segment {uuid} belongs to index '{found}', but the action names it as part \
+                 of index '{name}'"
+            )));
+        }
+        Ok(Some(position))
+    }
+
+    pub(super) fn index_segment_mut(
+        &mut self,
+        uuid: Uuid,
+        name: &str,
+    ) -> Result<&mut IndexMetadata> {
+        let Some(position) = self.index_segment_position(uuid, name)? else {
+            return Err(Error::invalid_input(format!(
+                "index segment {uuid} is not part of the dataset, so it cannot be adjusted"
+            )));
+        };
+        self.touched_index_names.insert(name.to_string());
+        Ok(&mut self.indices[position])
     }
 
     pub(super) fn schema(&self) -> &Schema {
@@ -442,7 +537,6 @@ impl<'a> ApplyState<'a> {
             return false;
         }
         self.new_fragments.remove(&fragment_id);
-        self.rebound_fields.remove(&fragment_id);
         self.tombstoned_fields
             .retain(|(fragment, _), _| *fragment != fragment_id);
         true
@@ -455,10 +549,9 @@ impl<'a> ApplyState<'a> {
         self.schema.fields.clear();
         self.schema.metadata.clear();
         self.fragments.clear();
+        self.indices.clear();
         self.new_fragments.clear();
-        self.rebound_fields.clear();
         self.tombstoned_fields.clear();
-        self.reset = true;
     }
 
     /// The base paths this apply can see: the current manifest's, plus the ones
@@ -684,15 +777,22 @@ impl<'a> ApplyState<'a> {
 
     /// Record that these fields' data in this fragment no longer matches what
     /// an index built over them recorded.
+    ///
+    /// Prunes the segments present now rather than at assembly: a segment an
+    /// later action in this operation adds was built over the new data, so the
+    /// rebind does not invalidate it.
     pub(super) fn rebind_fields(
         &mut self,
         fragment_id: u64,
         fields: impl IntoIterator<Item = i32>,
-    ) {
-        self.rebound_fields
-            .entry(fragment_id)
-            .or_default()
-            .extend(fields);
+    ) -> Result<()> {
+        let fields: Vec<i32> = fields.into_iter().collect();
+        prune_rebound_fields_from_indices(
+            &mut self.indices,
+            fragment_id,
+            &fields,
+            &self.current_manifest.schema,
+        )
     }
 
     /// Record that a [`TombstoneFieldData`](super::TombstoneFieldData) freed
@@ -987,22 +1087,21 @@ fn required_field_ids(schema: &Schema) -> HashSet<i32> {
 /// design and are keyed on no column, so a rewrite never affects them.
 fn prune_rebound_fields_from_indices(
     indices: &mut [IndexMetadata],
-    rebound: &HashMap<u64, HashSet<i32>>,
+    fragment_id: u64,
+    fields: &[i32],
     base_schema: &Schema,
 ) -> Result<()> {
-    if rebound.is_empty() {
+    let Ok(fragment_id) = u32::try_from(fragment_id) else {
         return Ok(());
-    }
+    };
     for index in indices.iter_mut() {
-        let affected_field = |fields: &HashSet<i32>| {
-            fields
-                .iter()
-                .copied()
-                .find(|field| field_affects_index(*field, &index.fields, base_schema))
-        };
+        let affected_field = fields
+            .iter()
+            .copied()
+            .find(|field| field_affects_index(*field, &index.fields, base_schema));
         let Some(bitmap) = index.fragment_bitmap.as_mut() else {
             if !is_system_index(index)
-                && let Some(field) = rebound.values().find_map(affected_field)
+                && let Some(field) = affected_field
             {
                 return Err(Error::invalid_input(format!(
                     "index '{}' has unknown coverage; migrate or rebuild it before rewriting \
@@ -1012,13 +1111,25 @@ fn prune_rebound_fields_from_indices(
             }
             continue;
         };
-        for (fragment_id, fields) in rebound {
-            if affected_field(fields).is_some()
-                && let Ok(fragment_id) = u32::try_from(*fragment_id)
-            {
-                bitmap.remove(fragment_id);
-            }
+        if affected_field.is_some() {
+            bitmap.remove(fragment_id);
         }
+    }
+    Ok(())
+}
+
+/// Refuse an index action naming the fragment reuse history. The history is
+/// not an index on the action path -- its own actions append to and trim it,
+/// merged onto the current history at every attempt -- so an index action
+/// naming it could only splice in a snapshot or drop records a concurrent
+/// writer appended.
+pub(super) fn reject_frag_reuse_history(action: &str, name: &str) -> Result<()> {
+    if name == FRAG_REUSE_INDEX_NAME {
+        return Err(Error::invalid_input(format!(
+            "{action} names '{FRAG_REUSE_INDEX_NAME}', the fragment reuse history, which is not \
+             an index an index action may change; use AppendFragReuseTransition or \
+             TrimFragReuse"
+        )));
     }
     Ok(())
 }
@@ -1037,6 +1148,91 @@ fn display_mark(mark: Option<u64>) -> String {
         || "unset (no id handed out)".to_string(),
         |mark| mark.to_string(),
     )
+}
+
+/// Check that the segments left under each touched index name still form one
+/// logical index.
+///
+/// The query path unions a logical index's segments, so they must agree on
+/// what the index is: the same keyed and carried fields, resolved to ids (a
+/// `Local` token means a different field in each operation that mints one), the
+/// same index type, and the same [`QueryContract`] -- a vector segment under
+/// another metric would mix incomparable distances into one answer. And they
+/// must not describe a fragment twice, which
+/// would double-count its rows. The check runs on the final set rather than the
+/// actions, so a segment added by an earlier commit is compared too. This is the
+/// same rule `build_index_metadata_from_segments` holds a staged build to.
+///
+/// Only names this operation touched are checked, so an operation is not blamed
+/// for an inconsistency it did not introduce.
+fn validate_index_segment_sets(
+    indices: &[IndexMetadata],
+    touched: &BTreeSet<String>,
+) -> Result<()> {
+    for name in touched {
+        let mut segments = indices.iter().filter(|index| &index.name == name);
+        let Some(first) = segments.next() else {
+            continue;
+        };
+        let type_url = |index: &IndexMetadata| {
+            index
+                .index_details
+                .as_ref()
+                .map(|details| details.type_url.clone())
+        };
+        let contract = |index: &IndexMetadata| QueryContract::of(index.index_details.as_deref());
+        let mut covered = first.fragment_bitmap.clone().unwrap_or_default();
+        for segment in segments {
+            if segment.fields != first.fields || segment.covering_fields != first.covering_fields {
+                return Err(Error::invalid_input(format!(
+                    "index '{name}' has segment {} over fields {:?} (carried {:?}) beside segment {} \
+                     over fields {:?} (carried {:?}); the segments of one index must agree",
+                    segment.uuid,
+                    segment.fields,
+                    segment.covering_fields,
+                    first.uuid,
+                    first.fields,
+                    first.covering_fields
+                )));
+            }
+            if type_url(segment) != type_url(first) {
+                return Err(Error::invalid_input(format!(
+                    "index '{name}' has segment {} of type {:?} beside segment {} of type {:?}; \
+                     the segments of one index must be the same type",
+                    segment.uuid,
+                    type_url(segment),
+                    first.uuid,
+                    type_url(first)
+                )));
+            }
+            if let (Some(ours), Some(theirs)) = (contract(segment), contract(first))
+                && let Some(mismatch) = ours.mismatch(&theirs)
+            {
+                return Err(Error::invalid_input(format!(
+                    "index '{name}' has segment {} with {} {} beside segment {} with {} {}; the \
+                     segments of one index must answer the same queries",
+                    segment.uuid,
+                    mismatch.facet,
+                    mismatch.ours,
+                    first.uuid,
+                    mismatch.facet,
+                    mismatch.theirs
+                )));
+            }
+            let Some(bitmap) = &segment.fragment_bitmap else {
+                continue;
+            };
+            if let Some(fragment) = (&covered & bitmap).min() {
+                return Err(Error::invalid_input(format!(
+                    "index '{name}' has segment {} covering fragment {fragment}, which another \
+                     segment of the index already covers; its rows would be counted twice",
+                    segment.uuid
+                )));
+            }
+            covered |= bitmap;
+        }
+    }
+    Ok(())
 }
 
 fn unbound_token_err(space: &str, token: u32) -> Error {
@@ -1076,9 +1272,10 @@ mod tests {
         one_column_file,
     };
     use crate::transaction::action::{
-        Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation,
-        ConfigUpdate, DropField, FieldMetadataUpdate, RemoveFragment, ReserveFragmentIds,
-        ResetTable, SetDeletionFile, TombstoneFieldData, UserStep,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage,
+        AlterField, CompositeOperation, ConfigUpdate, DropField, DropIndex, FieldMetadataUpdate,
+        RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ResetTable, SetDeletionFile,
+        TombstoneFieldData, UserStep,
     };
     use crate::transaction::test_support::{
         default_build_config, make_stable_row_id_manifest, sample_index_metadata, sample_manifest,
@@ -2100,5 +2297,51 @@ mod tests {
         .unwrap();
 
         assert_ne!(manifest.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
+    }
+
+    /// The fragment reuse history is not an index on the action path: no
+    /// index action may name it, so it changes only through its own actions.
+    #[rstest]
+    #[case::add_segment(|uuid: Uuid| Action::AddIndexSegment(AddIndexSegment {
+        uuid: Uuid::from_u128(uuid.as_u128() + 1),
+        name: FRAG_REUSE_INDEX_NAME.into(),
+        fields: Vec::new(),
+        covering_fields: Vec::new(),
+        index_details: None,
+        index_version: 1,
+        covered_fragments: None,
+        files: Vec::new(),
+        base: None,
+        created_at: None,
+        dataset_version: None,
+        data_change: false,
+    }))]
+    #[case::remove_segment(|uuid| Action::RemoveIndexSegment(RemoveIndexSegment {
+        uuid,
+        name: FRAG_REUSE_INDEX_NAME.into(),
+        data_change: false,
+    }))]
+    #[case::adjust_coverage(|uuid| Action::AdjustIndexCoverage(AdjustIndexCoverage {
+        uuid,
+        name: FRAG_REUSE_INDEX_NAME.into(),
+        add_fragments: Vec::new(),
+        remove_fragments: vec![0],
+        fields: Vec::new(),
+        covering_fields: Vec::new(),
+    }))]
+    #[case::drop_index(|_| Action::DropIndex(DropIndex {
+        name: FRAG_REUSE_INDEX_NAME.into(),
+    }))]
+    fn test_an_index_action_may_not_name_the_fragment_reuse_history(
+        #[case] action: fn(Uuid) -> Action,
+    ) {
+        let mut entry = sample_index_metadata(FRAG_REUSE_INDEX_NAME);
+        entry.fields.clear();
+        entry.index_version = 0;
+        let error = apply_with_indices(&backed_manifest(), vec![action(entry.uuid)], vec![entry])
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains(FRAG_REUSE_INDEX_NAME), "{error}");
     }
 }

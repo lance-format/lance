@@ -2593,13 +2593,17 @@ mod composite {
     use std::sync::Arc;
 
     use crate::dataset::{CommitBuilder, InsertBuilder, WriteParams};
-    use crate::index::DatasetIndexExt;
+    use crate::index::{DatasetIndexExt, load_all_indices};
     use crate::{Dataset, Error, Result};
     use arrow_array::{Int32Array, RecordBatch, StructArray};
     use arrow_schema::{DataType, Field, Schema};
     use futures::stream;
     use lance_core::datatypes::Field as LanceField;
     use lance_index::IndexType;
+    use lance_index::pb::vector_index_details::{
+        Compression, FlatCompression, ProductQuantization, RabitQuantization, ScalarQuantization,
+    };
+    use lance_index::pb::{HnswParameters, VectorIndexDetails, VectorMetricType};
     use lance_index::scalar::ScalarIndexParams;
     use lance_table::feature_flags::FLAG_COVERED_INDEX_METADATA;
     use lance_table::format::{
@@ -2607,9 +2611,10 @@ mod composite {
     };
     use lance_table::rowids::{RowIdSequence, write_row_ids};
     use lance_table::transaction::action::{
-        Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation,
-        ConfigUpdate, DropField, FieldRef, Ref, RemoveFragment, ReserveFragmentIds, ReserveRowIds,
-        ResetTable, SetDeletionFile, TombstoneFieldData, UserStep,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AdjustIndexCoverage,
+        AlterField, CompositeOperation, ConfigUpdate, DropField, FieldRef, Ref, RemoveFragment,
+        RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable, SetDeletionFile,
+        TombstoneFieldData, UserStep,
     };
     use lance_table::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
     use roaring::RoaringBitmap;
@@ -3724,5 +3729,730 @@ mod composite {
             1,
             "the indexed predicate missed the new value"
         );
+    }
+
+    /// An index segment naming `covered`, with no files of its own -- these
+    /// tests inspect the manifest's index section rather than opening the index.
+    fn index_segment(name: &str, covered: Vec<Ref>) -> AddIndexSegment {
+        AddIndexSegment {
+            uuid: Uuid::new_v4(),
+            name: name.into(),
+            fields: vec![FieldRef::Committed(0)],
+            covering_fields: Vec::new(),
+            index_details: None,
+            index_version: 1,
+            covered_fragments: Some(covered),
+            files: Vec::new(),
+            base: None,
+            created_at: None,
+            dataset_version: None,
+            data_change: false,
+        }
+    }
+
+    async fn index_coverage(dataset: &Dataset, name: &str) -> Vec<u32> {
+        let indices = load_all_indices(dataset).await.unwrap();
+        let segment = indices
+            .iter()
+            .find(|index| index.name == name)
+            .expect("index segment should be committed");
+        segment
+            .fragment_bitmap
+            .as_ref()
+            .expect("coverage should be recorded")
+            .iter()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_appends_and_indexes_what_it_appended() {
+        let dataset = test_dataset(false).await;
+        let existing = dataset.fragments()[0].id;
+        let file = existing_data_file(&dataset, 0);
+
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 5,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file,
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+                // The index covers the fragment this same commit minted, which
+                // has no id until the commit lands.
+                Action::AddIndexSegment(index_segment(
+                    "by_a",
+                    vec![Ref::Committed(existing), Ref::Local(0)],
+                )),
+            ],
+        )
+        .await;
+
+        let appended = dataset.fragments().last().unwrap().id;
+        assert_eq!(
+            index_coverage(&dataset, "by_a").await,
+            vec![existing as u32, appended as u32]
+        );
+    }
+
+    /// One commit adds a column, fills it in every committed fragment, and
+    /// indexes it, naming the field by the token it has until the commit lands.
+    ///
+    /// The transaction layer accepts this, but no index builder can write the
+    /// segment's files for it: a builder reads the column through the committed
+    /// schema, which does not have it yet. The segment below records coverage
+    /// only.
+    #[tokio::test]
+    async fn test_one_commit_adds_fills_and_indexes_a_field() {
+        let mut dataset = test_dataset(false).await;
+        let params = ScalarIndexParams::default();
+        let error = dataset
+            .create_index_builder(&["b"], IndexType::BTree, &params)
+            .execute_uncommitted()
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("column 'b' does not exist"),
+            "{error}"
+        );
+
+        let mut actions = vec![Action::AddField(AddField {
+            local: 0,
+            parent: None,
+            def: int32_field("b"),
+        })];
+        let mut covered = Vec::new();
+        for (index, fragment) in dataset.fragments().iter().enumerate() {
+            actions.push(Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment.id),
+                file: existing_data_file(&dataset, index),
+                field_ids: vec![FieldRef::Local(0)],
+                data_change: true,
+                base: None,
+            }));
+            covered.push(Ref::Committed(fragment.id));
+        }
+        actions.push(Action::AddIndexSegment(AddIndexSegment {
+            fields: vec![FieldRef::Local(0)],
+            ..index_segment("by_b", covered)
+        }));
+        let dataset = commit(dataset, actions).await;
+
+        let b = dataset.schema().field("b").expect("field b was added").id;
+        let indices = load_all_indices(&dataset).await.unwrap();
+        let segment = indices.iter().find(|index| index.name == "by_b").unwrap();
+        assert_eq!(segment.fields, vec![b]);
+        assert_eq!(index_coverage(&dataset, "by_b").await, vec![0, 1]);
+        let values = dataset
+            .scan()
+            .project(&["b"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            values.column(0).as_ref(),
+            &Int32Array::from_iter_values(0..10) as &dyn arrow_array::Array
+        );
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_replaces_an_index_segment() {
+        let dataset = test_dataset(false).await;
+        let old = index_segment("by_a", vec![Ref::Committed(0)]);
+        let old_uuid = old.uuid;
+        let dataset = commit(dataset, vec![Action::AddIndexSegment(old)]).await;
+
+        let new = index_segment("by_a", vec![Ref::Committed(0), Ref::Committed(1)]);
+        let new_uuid = new.uuid;
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::RemoveIndexSegment(RemoveIndexSegment {
+                    uuid: old_uuid,
+                    name: "by_a".into(),
+                    data_change: false,
+                }),
+                Action::AddIndexSegment(new),
+            ],
+        )
+        .await;
+
+        let uuids = load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .map(|index| index.uuid)
+            .collect::<Vec<_>>();
+        assert_eq!(uuids, vec![new_uuid]);
+    }
+
+    /// Commit `actions` against `dataset` as it was, whatever has landed since.
+    /// This is what a concurrent writer does: it planned at that version and
+    /// arrives at the commit after someone else got there first.
+    async fn commit_from_stale(dataset: Arc<Dataset>, actions: Vec<Action>) -> Result<Dataset> {
+        let read_version = dataset.version().version;
+        CommitBuilder::new(dataset)
+            .with_experimental_composite_operations(true)
+            .execute(composite_txn(read_version, actions))
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_two_writers_extend_one_index_over_disjoint_fragments() {
+        let dataset = test_dataset(false).await;
+        let stale = Arc::new(dataset.clone());
+
+        // The first writer wins the race; the second arrives against a version
+        // it has not seen.
+        commit(
+            dataset,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(0)],
+            ))],
+        )
+        .await;
+
+        let dataset = commit_from_stale(
+            stale,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(1)],
+            ))],
+        )
+        .await
+        .expect("segments over disjoint fragments both belong to the index");
+
+        let mut coverage = load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| index.name == "by_a")
+            .map(|index| index.fragment_bitmap.as_ref().unwrap().iter().collect())
+            .collect::<Vec<Vec<u32>>>();
+        coverage.sort();
+        assert_eq!(coverage, vec![vec![0], vec![1]]);
+    }
+
+    #[tokio::test]
+    async fn test_two_writers_indexing_the_same_fragment_conflict() {
+        let dataset = test_dataset(false).await;
+        let stale = Arc::new(dataset.clone());
+
+        commit(
+            dataset,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(0)],
+            ))],
+        )
+        .await;
+
+        let error = commit_from_stale(
+            stale,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(0)],
+            ))],
+        )
+        .await
+        .expect_err("two segments describing one fragment would double-count its rows");
+
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
+    }
+
+    /// Replace field 0's data in fragment 0, the way an in-place column
+    /// rewrite does.
+    fn rewrite_field_zero(file: DataFile) -> Vec<Action> {
+        vec![
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(0),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(0),
+                file,
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: true,
+                base: None,
+            }),
+        ]
+    }
+
+    /// The coverage of `name`, or `None` when no segment carries the name.
+    async fn index_coverage_opt(dataset: &Dataset, name: &str) -> Option<Vec<u32>> {
+        let indices = load_all_indices(dataset).await.unwrap();
+        let segment = indices.iter().find(|index| index.name == name)?;
+        Some(
+            segment
+                .fragment_bitmap
+                .as_ref()
+                .expect("coverage should be recorded")
+                .iter()
+                .collect(),
+        )
+    }
+
+    /// Control for the test below: when the rewrite is the *later* commit, the
+    /// coverage is repaired. `TombstoneFieldData::apply` rebinds the field,
+    /// which prunes the fragment from every index the manifest carries.
+    #[tokio::test]
+    async fn test_a_rewrite_prunes_an_index_segment_committed_before_it() {
+        let dataset = test_dataset(false).await;
+        let file = existing_data_file(&dataset, 0);
+
+        let dataset = commit(
+            dataset,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(0)],
+            ))],
+        )
+        .await;
+        assert_eq!(index_coverage(&dataset, "by_a").await, vec![0]);
+
+        let dataset = commit(dataset, rewrite_field_zero(file)).await;
+
+        assert_eq!(
+            index_coverage_opt(&dataset, "by_a")
+                .await
+                .unwrap_or_default(),
+            Vec::<u32>::new(),
+            "the rewrite should have dropped fragment 0 from the coverage"
+        );
+    }
+
+    /// The same two commits in the other order must reach the same place.
+    ///
+    /// The format spec's third invalidation case -- a fragment has had one of
+    /// the index's columns updated in place -- "cannot be detected just by
+    /// examining metadata", so a reader trusts `fragment_bitmap` and has no
+    /// recourse. Keeping it honest is a write-path obligation.
+    ///
+    /// Apply-time pruning only discharges that obligation when the rewrite is
+    /// the later commit, as the control above shows. A segment built before the
+    /// rewrite but committed after it carries no rebind of its own, so nothing
+    /// prunes it. Its footprint has to catch it instead: the segment requires
+    /// the `FieldData` coordinates the rewrite writes.
+    #[tokio::test]
+    async fn test_an_index_segment_staged_before_a_rewrite_conflicts_with_it() {
+        let dataset = test_dataset(false).await;
+        let stale = Arc::new(dataset.clone());
+        let file = existing_data_file(&dataset, 0);
+
+        // The rewrite wins the race.
+        commit(dataset, rewrite_field_zero(file)).await;
+
+        // The loser built its segment from the values the rewrite replaced.
+        let committed = commit_from_stale(
+            stale,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(0)],
+            ))],
+        )
+        .await;
+
+        // Rejected, because the segment requires the data it describes and the
+        // rewrite wrote it. Dropping fragment 0 from the arriving segment's
+        // coverage would also be sound and would waste less work -- it is what
+        // the legacy path does for `Operation::Update` -- but an action set is
+        // never rewritten to move to a newer version, so there is nowhere to
+        // put that here.
+        let error = committed.expect_err("the segment describes replaced values");
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_commit_extends_an_index_segments_coverage() {
+        let dataset = test_dataset(false).await;
+        let segment = index_segment("by_a", vec![Ref::Committed(0)]);
+        let uuid = segment.uuid;
+        let dataset = commit(dataset, vec![Action::AddIndexSegment(segment)]).await;
+        assert_eq!(index_coverage(&dataset, "by_a").await, vec![0]);
+
+        let dataset = commit(
+            dataset,
+            vec![Action::AdjustIndexCoverage(AdjustIndexCoverage {
+                uuid,
+                name: "by_a".into(),
+                add_fragments: vec![Ref::Committed(1)],
+                remove_fragments: vec![0],
+                fields: vec![FieldRef::Committed(0)],
+                covering_fields: Vec::new(),
+            })],
+        )
+        .await;
+
+        assert_eq!(index_coverage(&dataset, "by_a").await, vec![1]);
+    }
+
+    /// Commit a segment a builder staged, as the action set a writer would
+    /// compose for it.
+    fn add_built_segment(metadata: IndexMetadata) -> Action {
+        Action::AddIndexSegment(AddIndexSegment {
+            uuid: metadata.uuid,
+            name: metadata.name,
+            fields: metadata
+                .fields
+                .into_iter()
+                .map(FieldRef::Committed)
+                .collect(),
+            covering_fields: Vec::new(),
+            index_details: metadata.index_details,
+            index_version: metadata.index_version,
+            covered_fragments: metadata
+                .fragment_bitmap
+                .map(|ids| ids.iter().map(|id| Ref::Committed(id as u64)).collect()),
+            files: metadata.files.unwrap_or_default(),
+            base: metadata.base_id.map(|id| Ref::Committed(id as u64)),
+            created_at: metadata.created_at,
+            dataset_version: Some(metadata.dataset_version),
+            data_change: false,
+        })
+    }
+
+    /// Two segments under one name keyed on different columns would have the
+    /// query path union values from the wrong column.
+    #[tokio::test]
+    async fn test_a_segment_cannot_join_an_index_keyed_on_another_column() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..10)),
+                Arc::new(Int32Array::from_iter_values(100..110)),
+            ],
+        )
+        .unwrap();
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 5,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap();
+        let params = ScalarIndexParams::default();
+        let first = dataset
+            .create_index_builder(&["a"], IndexType::BTree, &params)
+            .name("shared".into())
+            .fragments(vec![0])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let second = dataset
+            .create_index_builder(&["b"], IndexType::BTree, &params)
+            .name("shared".into())
+            .fragments(vec![1])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+        let dataset = commit(dataset, vec![add_built_segment(first)]).await;
+        let error = try_commit(dataset, vec![add_built_segment(second)])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("shared"), "{error}");
+    }
+
+    /// A segment built before a rewrite the operation already reads would
+    /// resurrect the rewritten values, and the format has no way to detect an
+    /// in-place column rewrite from metadata alone.
+    #[tokio::test]
+    async fn test_a_segment_built_before_the_version_read_is_rejected() {
+        let mut dataset = test_dataset(false).await;
+        let staged = dataset
+            .create_index_builder(&["a"], IndexType::BTree, &ScalarIndexParams::default())
+            .name("shared".into())
+            .fragments(vec![1])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let file = existing_data_file(&dataset, 0);
+        let rewritten = commit(
+            dataset,
+            vec![
+                Action::TombstoneFieldData(TombstoneFieldData {
+                    fragment: Ref::Committed(1),
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(1),
+                    file,
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ],
+        )
+        .await;
+
+        let error = try_commit(rewritten, vec![add_built_segment(staged)])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("build snapshot"), "{error}");
+    }
+
+    /// A segment committed through the action path lands as the builder staged
+    /// it, and the query path can open and use it.
+    #[tokio::test]
+    async fn test_a_segment_built_at_the_version_read_commits() {
+        let mut dataset = test_dataset(false).await;
+        let staged = dataset
+            .create_index_builder(&["a"], IndexType::BTree, &ScalarIndexParams::default())
+            .name("shared".into())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+        let dataset = commit(dataset, vec![add_built_segment(staged.clone())]).await;
+
+        let indices = load_all_indices(&dataset).await.unwrap();
+        let committed = indices.iter().find(|index| index.name == "shared").unwrap();
+        assert_eq!(committed, &staged);
+
+        let mut scan = dataset.scan();
+        scan.filter("a = 3").unwrap();
+        let plan = scan.explain_plan(true).await.unwrap();
+        assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["a"].as_ref(),
+            &Int32Array::from(vec![3]) as &dyn arrow_array::Array
+        );
+    }
+
+    /// A built segment states the version it was built from, which is the
+    /// version its writer read. Losing the race to an unrelated append does
+    /// not change that, so the retry still commits.
+    #[tokio::test]
+    async fn test_a_built_segment_commits_after_an_unrelated_append() {
+        let mut dataset = test_dataset(false).await;
+        let read_version = dataset.version().version;
+        let staged = dataset
+            .create_index_builder(&["a"], IndexType::BTree, &ScalarIndexParams::default())
+            .name("shared".into())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let stale = Arc::new(dataset.clone());
+        let file = existing_data_file(&dataset, 0);
+
+        commit(
+            dataset,
+            vec![
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 5,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file,
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ],
+        )
+        .await;
+
+        let dataset = commit_from_stale(stale, vec![add_built_segment(staged)])
+            .await
+            .expect("an append does not touch what the segment describes");
+
+        let indices = load_all_indices(&dataset).await.unwrap();
+        let segment = indices.iter().find(|index| index.name == "shared").unwrap();
+        assert_eq!(segment.dataset_version, read_version);
+        assert_eq!(index_coverage(&dataset, "shared").await, vec![0, 1]);
+    }
+
+    /// `lance-table` reads the query contract out of `VectorIndexDetails`
+    /// through a mirror of the message, since the generated type lives in
+    /// `lance-index`. Encoding with the generated type keeps the two in step.
+    #[rstest::rstest]
+    #[case::sub_index(true, Compression::Flat(FlatCompression {}), Some("sub-index"))]
+    #[case::quantization(
+        false,
+        Compression::Pq(ProductQuantization { num_bits: 8, num_sub_vectors: 4 }),
+        Some("quantization Product")
+    )]
+    #[case::scalar(false, Compression::Sq(ScalarQuantization { num_bits: 8 }), Some("Scalar"))]
+    #[case::rabit(
+        false,
+        Compression::Rq(RabitQuantization { num_bits: 1, rotation_type: 0 }),
+        Some("Rabit")
+    )]
+    #[case::same_contract(false, Compression::Flat(FlatCompression {}), None)]
+    #[tokio::test]
+    async fn test_the_vector_query_contract_reads_the_generated_details(
+        #[case] hnsw: bool,
+        #[case] compression: Compression,
+        #[case] rejected_for: Option<&str>,
+    ) {
+        let details = |hnsw: bool, compression: Compression, target_partition_size: u64| {
+            Some(Arc::new(
+                prost_types::Any::from_msg(&VectorIndexDetails {
+                    metric_type: VectorMetricType::L2.into(),
+                    target_partition_size,
+                    hnsw_index_config: hnsw.then(HnswParameters::default),
+                    compression: Some(compression),
+                    runtime_hints: Default::default(),
+                })
+                .unwrap(),
+            ))
+        };
+        let dataset = test_dataset(false).await;
+        let dataset = commit(
+            dataset,
+            vec![Action::AddIndexSegment(AddIndexSegment {
+                index_details: details(false, Compression::Flat(FlatCompression {}), 1024),
+                ..index_segment("shared", vec![Ref::Committed(0)])
+            })],
+        )
+        .await;
+
+        let result = try_commit(
+            dataset,
+            vec![Action::AddIndexSegment(AddIndexSegment {
+                index_details: details(hnsw, compression, 4096),
+                ..index_segment("shared", vec![Ref::Committed(1)])
+            })],
+        )
+        .await;
+
+        match rejected_for {
+            None => {
+                result.unwrap();
+            }
+            Some(reason) => {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+                assert!(error.to_string().contains(reason), "{error}");
+            }
+        }
+    }
+
+    /// Two vector segments under one name are unioned by the query path, so
+    /// they must answer the same query contract. An L2 segment beside a Dot
+    /// segment would rank one half of the dataset by the wrong distance.
+    /// Independently trained models are fine; the metric is not.
+    #[tokio::test]
+    async fn test_vector_segments_with_different_metrics_cannot_share_an_index() {
+        use crate::index::vector::VectorIndexParams;
+        use arrow_array::{Array, FixedSizeListArray, Float32Array};
+        use lance_arrow::FixedSizeListArrayExt;
+        use lance_linalg::distance::DistanceType;
+
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![
+                2.0, 0.0, 3.0, 0.0, 4.0, 0.0, 5.0, 0.0, 100.0, 0.0, 101.0, 0.0, 102.0, 0.0, 103.0,
+                0.0,
+            ]),
+            2,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("vector", vectors.data_type().clone(), false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7])),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 4,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap();
+        // Built under a name of its own, since the builder refuses one the
+        // dataset already has, then staged to join `shared`.
+        async fn build(
+            dataset: &mut Dataset,
+            fragment: u32,
+            metric: DistanceType,
+        ) -> IndexMetadata {
+            let staged = dataset
+                .create_index_builder(
+                    &["vector"],
+                    IndexType::Vector,
+                    &VectorIndexParams::ivf_flat(1, metric),
+                )
+                .name(format!("staged_{fragment}"))
+                .fragments(vec![fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            IndexMetadata {
+                name: "shared".into(),
+                ..staged
+            }
+        }
+        let l2 = build(&mut dataset, 0, DistanceType::L2).await;
+        let dot = build(&mut dataset, 1, DistanceType::Dot).await;
+
+        // The legacy segment commit rejects the pair; the action path must too.
+        let error = dataset
+            .commit_existing_index_segments("shared", "vector", vec![l2.clone(), dot.clone()])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("metric"), "{error}");
+
+        // Concurrently: both writers read the same version.
+        let stale = Arc::new(dataset.clone());
+        let mut dataset = commit(dataset, vec![add_built_segment(l2)]).await;
+        let error = commit_from_stale(stale, vec![add_built_segment(dot)])
+            .await
+            .expect_err("a Dot segment cannot join an L2 index");
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
+
+        // Sequentially: the second writer built from the version with the L2
+        // segment, so only the final segment set can catch it.
+        let dot = build(&mut dataset, 1, DistanceType::Dot).await;
+        let error = try_commit(dataset, vec![add_built_segment(dot)])
+            .await
+            .expect_err("a Dot segment cannot join an L2 index");
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("metric"), "{error}");
     }
 }
