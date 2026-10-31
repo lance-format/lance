@@ -2579,17 +2579,6 @@ impl LanceNamespace for DirectoryNamespace {
             .load_dataset(&table_uri, None, "create_table_branch")
             .await?;
 
-        // Best-effort pre-check: a duplicate returns a clean TableBranchAlreadyExists conflict
-        // instead of the opaque Internal error create_branch raises on a pre-existing branch. A
-        // concurrent create can still race past this window. Remove once lance-core create_branch
-        // returns RefConflict up front.
-        if dataset.branches().get(&request.name).await.is_ok() {
-            return Err(NamespaceError::TableBranchAlreadyExists {
-                message: format!("branch '{}' for table at '{}'", request.name, table_uri),
-            }
-            .into());
-        }
-
         dataset
             .create_branch(
                 &request.name,
