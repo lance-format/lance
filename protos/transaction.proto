@@ -3,6 +3,7 @@
 
 syntax = "proto3";
 
+import "clustering.proto";
 import "file.proto";
 import "table.proto";
 import "google/protobuf/any.proto";
@@ -349,6 +350,23 @@ message Transaction {
     UpdateMap table_metadata_updates = 7;
     UpdateMap schema_metadata_updates = 8;
     map<int32, UpdateMap> field_metadata_updates = 9;
+    /* Clustering definitions this transaction allocates, in id order. Empty
+     * when the transaction allocates nothing.
+     *
+     * Each id is explicit: the writer sets it to the Manifest.max_clustering_id
+     * it read plus one (plus two for a second definition, and so on), and the
+     * commit checks it against the manifest the transaction is applied to.
+     * When the mark has moved, the transaction fails with a commit conflict
+     * that must not be retried as is, because the ids and any id-bearing
+     * table_metadata keys in the same transaction are stale; the writer reads
+     * the new mark and submits a new transaction. The commit appends the
+     * definitions to Manifest.clustering, raises max_clustering_id to the last
+     * id and applies table_metadata_updates in the same version, so a
+     * definition and the provider metadata that refers to it appear together.
+     *
+     * Append-only: this operation never modifies or removes a definition.
+     */
+    repeated Clustering new_clustering_definitions = 10;
 
     // Deprecated -------------------------------
     map<string, string> upsert_values = 1;
