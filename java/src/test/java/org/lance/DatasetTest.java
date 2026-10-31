@@ -20,6 +20,7 @@ import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
+import org.lance.index.IndexSegmentStatistics;
 import org.lance.index.IndexType;
 import org.lance.index.OptimizeOptions;
 import org.lance.index.scalar.BTreeIndexParams;
@@ -57,7 +58,11 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -2662,6 +2667,90 @@ public class DatasetTest {
             "BTree",
             stats.get("index_type"),
             "Index statistics should contain index_type information");
+
+        Index physicalSegment =
+            dataset.getIndexes().stream()
+                .filter(index -> TestVectorDataset.indexName.equals(index.name()))
+                .findFirst()
+                .orElseThrow();
+        IndexSegmentStatistics segmentStatistics =
+            dataset
+                .getIndexSegmentStatistics(
+                    TestVectorDataset.indexName, Collections.singletonList(physicalSegment.uuid()))
+                .get(0);
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream output = new ObjectOutputStream(bytes)) {
+          output.writeObject(segmentStatistics);
+        }
+        IndexSegmentStatistics restored;
+        try (ObjectInputStream input =
+            new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+          restored = (IndexSegmentStatistics) input.readObject();
+        }
+        assertEquals(segmentStatistics.getIndexUuid(), restored.getIndexUuid());
+        assertEquals(
+            stats,
+            dataset.getIndexStatisticsFromSegments(
+                TestVectorDataset.indexName, Collections.singletonList(restored)));
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset.getIndexStatisticsFromSegments(
+                    TestVectorDataset.indexName, Arrays.asList(restored, restored)));
+        dataset.delete("i = 0");
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset.getIndexStatisticsFromSegments(
+                    TestVectorDataset.indexName, Collections.singletonList(restored)));
+        assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset.getIndexSegmentStatistics(
+                    "", Collections.singletonList(physicalSegment.uuid())));
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> dataset.getIndexSegmentStatistics(TestVectorDataset.indexName, null));
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> dataset.getIndexStatisticsFromSegments(TestVectorDataset.indexName, null));
+      }
+    }
+  }
+
+  @Test
+  public void testIndexStatisticsForDetachedVersion(@TempDir Path tempDir) throws Exception {
+    try (RootAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.toString());
+      testDataset.createEmptyDataset(true).close();
+      try (Dataset dataset = testDataset.write(1, 5)) {
+        dataset.createIndex(
+            Collections.singletonList("id"),
+            IndexType.BTREE,
+            Optional.of("id_idx"),
+            IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("btree")).build(),
+            true);
+        Append append =
+            Append.builder()
+                .fragments(Collections.singletonList(testDataset.createNewFragment(3)))
+                .build();
+        SourcedTransaction transaction = dataset.newTransactionBuilder().operation(append).build();
+        try (Dataset detached = dataset.commitTransaction(transaction.transaction(), true, false)) {
+          assertTrue(detached.version() < 0);
+          Map<String, Object> expected = detached.getIndexStatistics("id_idx");
+          assertEquals(5L, ((Number) expected.get("num_indexed_rows")).longValue());
+          assertEquals(3L, ((Number) expected.get("num_unindexed_rows")).longValue());
+          List<IndexSegmentStatistics> statistics =
+              detached.getIndexSegmentStatistics(
+                  "id_idx", Collections.singletonList(detached.getIndexes().get(0).uuid()));
+          assertEquals(1, statistics.size());
+          assertEquals(detached.version(), statistics.get(0).getReadVersion());
+          assertEquals(expected, detached.getIndexStatisticsFromSegments("id_idx", statistics));
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> dataset.getIndexStatisticsFromSegments("id_idx", statistics));
+        }
       }
     }
   }
