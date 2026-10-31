@@ -38,6 +38,8 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::{TempDir, TempStrDir};
 use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
 use lance_datagen::{BatchCount, RowCount, array};
+use lance_index::IndexType;
+use lance_index::scalar::ScalarIndexParams;
 
 use crate::datafusion::LanceTableProvider;
 use datafusion::prelude::SessionContext;
@@ -690,9 +692,6 @@ async fn test_inline_transaction() {
 
 #[tokio::test]
 async fn test_read_version_transaction_does_not_populate_caches() {
-    use lance_index::IndexType;
-    use lance_index::scalar::ScalarIndexParams;
-
     let test_uri = TempStrDir::default();
     let mut dataset = write_versions(&test_uri, 1, true).await;
     // Index the table so historical manifests carry an IndexSection that a
@@ -1061,6 +1060,315 @@ async fn test_read_transaction_recovers_from_stale_manifest_size() {
         .unwrap();
     assert_eq!(recovered, ds.read_transaction().await.unwrap());
     assert!(recovered.is_some());
+}
+
+/// A fresh handle at the latest version, with a session of its own so no
+/// manifest is cached.
+async fn open_uncached(uri: &str) -> Dataset {
+    DatasetBuilder::from_uri(uri)
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap()
+}
+
+/// Read `version`'s transaction with `read_transaction_by_version` on `handle`
+/// and with `read_version_transaction` (which always reads the manifest) on a
+/// fresh handle, assert they agree, and return the transaction with the bytes
+/// the first read fetched by ranged reads.
+async fn read_both_ways(handle: &Dataset, version: u64) -> (Option<Transaction>, u64) {
+    handle.object_store.io_stats_incremental();
+    let by_layout = handle.read_transaction_by_version(version).await.unwrap();
+    let stats = handle.object_store.io_stats_incremental();
+
+    let by_manifest = open_uncached(handle.uri())
+        .await
+        .read_version_transaction(version)
+        .await
+        .unwrap()
+        .transaction;
+    assert_eq!(by_layout, by_manifest, "version {version}");
+    if let (Some(a), Some(b)) = (&by_layout, &by_manifest) {
+        assert_eq!(a.uuid, b.uuid);
+        assert_eq!(a.read_version, b.read_version);
+        assert_eq!(a.operation, b.operation);
+        assert_eq!(a.transaction_properties, b.transaction_properties);
+    }
+    (by_layout, ranged_read_bytes(&stats))
+}
+
+/// Writes `[padding config] [index] [appends with properties]` so that the
+/// manifests are large, the early ones have no index section and the later
+/// ones do. Returns the latest handle.
+async fn write_versions_with_index(uri: &str) -> Dataset {
+    let mut ds = write_versions(uri, 1, true).await; // v1
+    let padding = "x".repeat(MANIFEST_PADDING_BYTES);
+    ds.update_config([("padding", padding.as_str())])
+        .await
+        .unwrap(); // v2
+    ds.create_index(
+        &["key"],
+        IndexType::BTree,
+        None,
+        &ScalarIndexParams::default(),
+        true,
+    )
+    .await
+    .unwrap(); // v3
+    for i in 0..3 {
+        let properties = HashMap::from([("append".to_string(), i.to_string())]);
+        ds.append(
+            gen_rows(),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                transaction_properties: Some(Arc::new(properties)),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap(); // v4..v6
+    }
+    assert_eq!(ds.version().version, 6);
+    ds
+}
+
+#[tokio::test]
+async fn test_read_transaction_by_version_from_layout_matches_manifest_read() {
+    let test_uri = TempStrDir::default();
+    write_versions_with_index(&test_uri).await;
+    let latest = open_uncached(&test_uri).await;
+
+    for version in 1..=6u64 {
+        let checked_out = latest.checkout_version(version).await.unwrap();
+        let manifest = checked_out.manifest();
+        // Version 2's transaction holds the padding config, which is over
+        // the inline limit, so it is in an external file and read through
+        // the manifest.
+        assert_eq!(manifest.transaction_section.is_some(), version != 2);
+        // The first versions have at most one section, the indexed ones two.
+        assert_eq!(manifest.index_section.is_some(), version >= 3);
+        let manifest_size = manifest_size(&checked_out).await;
+
+        // Read from a handle at another version with nothing cached, so the
+        // layout read is used for every version but the handle's own.
+        let handle = if version == 6 {
+            open_uncached_at(&test_uri, 1).await
+        } else {
+            open_uncached(&test_uri).await
+        };
+        let (transaction, ranged_bytes) = read_both_ways(&handle, version).await;
+        assert!(transaction.is_some());
+        if version >= 3 {
+            // The manifest carries the padding config; the layout read
+            // fetches the first block, the footer and the (small)
+            // transaction. Version 2's transaction holds the padding itself.
+            assert!(manifest_size > MANIFEST_PADDING_BYTES as u64);
+            assert!(
+                ranged_bytes < 16 * 1024,
+                "version {version}: read {ranged_bytes} of {manifest_size} bytes"
+            );
+        }
+    }
+
+    // Properties survive the layout read.
+    let transaction = latest
+        .read_transaction_by_version(5)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        transaction
+            .transaction_properties
+            .as_ref()
+            .and_then(|properties| properties.get("append"))
+            .map(String::as_str),
+        Some("1")
+    );
+    assert!(matches!(transaction.operation, Operation::Append { .. }));
+
+    // Missing versions still surface as DatasetNotFound.
+    let err = latest.read_transaction_by_version(9999).await.unwrap_err();
+    assert!(
+        matches!(err, crate::Error::DatasetNotFound { .. }),
+        "expected DatasetNotFound for a missing version, got {err:?}"
+    );
+}
+
+async fn open_uncached_at(uri: &str, version: u64) -> Dataset {
+    DatasetBuilder::from_uri(uri)
+        .with_version(version)
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap()
+}
+
+/// A corrupt index section prefix does not affect the manifest or its
+/// transaction, but breaks the layout; the read falls back to the manifest.
+#[tokio::test]
+async fn test_read_transaction_by_version_falls_back_on_unexpected_layout() {
+    let test_uri = TempStrDir::default();
+    let latest = write_versions_with_index(&test_uri).await;
+    let version = 4;
+    let location = latest
+        .commit_handler
+        .resolve_version_location(&latest.base, version, &latest.object_store.inner)
+        .await
+        .unwrap();
+    let mut bytes = latest
+        .object_store
+        .inner
+        .get(&location.path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap()
+        .to_vec();
+    let original = open_uncached(&test_uri)
+        .await
+        .read_version_transaction(version)
+        .await
+        .unwrap()
+        .transaction;
+    bytes[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+    latest
+        .object_store
+        .inner
+        .put(&location.path, bytes.into())
+        .await
+        .unwrap();
+
+    let (transaction, ranged_bytes) =
+        read_both_ways(&open_uncached(&test_uri).await, version).await;
+    assert_eq!(transaction, original);
+    assert!(transaction.is_some());
+    assert!(
+        ranged_bytes > MANIFEST_PADDING_BYTES as u64,
+        "expected the manifest to be read, read {ranged_bytes} bytes"
+    );
+}
+
+/// The transactions a commit checks against (every version after its read
+/// version) match per-version manifest reads, while only the latest manifest
+/// is read in full.
+#[tokio::test]
+async fn test_load_new_transactions_reads_only_latest_manifest() {
+    let test_uri = TempStrDir::default();
+    write_versions_with_index(&test_uri).await;
+    let latest_manifest_size = manifest_size(&open_uncached(&test_uri).await).await;
+
+    let stale = open_uncached_at(&test_uri, 1).await;
+    stale.object_store.io_stats_incremental();
+    let (latest, transactions) = crate::io::commit::load_and_sort_new_transactions(&stale)
+        .await
+        .unwrap();
+    let ranged_bytes = ranged_read_bytes(&stale.object_store.io_stats_incremental());
+
+    assert_eq!(latest.version().version, 6);
+    let versions = transactions.iter().map(|(v, _)| *v).collect::<Vec<_>>();
+    assert_eq!(versions, (2..=6).collect::<Vec<_>>());
+    let reader = open_uncached(&test_uri).await;
+    for (version, transaction) in &transactions {
+        let expected = reader
+            .read_version_transaction(*version)
+            .await
+            .unwrap()
+            .transaction
+            .unwrap();
+        assert_eq!(transaction.as_ref(), &expected, "version {version}");
+    }
+    // The latest manifest and version 2's transaction (which holds the
+    // padding config) are large; reading every manifest would cost about
+    // five times the latest manifest.
+    assert!(
+        ranged_bytes < 2 * latest_manifest_size + 64 * 1024,
+        "read {ranged_bytes} bytes; the latest manifest is {latest_manifest_size} bytes"
+    );
+}
+
+/// A branch handle reads each version's manifest, which carries the branch
+/// check; the result matches `read_version_transaction`.
+#[tokio::test]
+async fn test_read_transaction_by_version_on_branch() {
+    let test_uri = TempStrDir::default();
+    let mut main_ds = write_versions(&test_uri, 2, true).await;
+    let branch_ds = main_ds.create_branch("dev", 2, None).await.unwrap();
+    let branch_ds = Dataset::write(
+        gen_rows(),
+        branch_ds.uri(),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(branch_ds.manifest().branch.as_deref(), Some("dev"));
+    for version in branch_ds.versions().await.unwrap() {
+        let by_version = branch_ds
+            .read_transaction_by_version(version.version)
+            .await
+            .unwrap();
+        let expected = branch_ds
+            .read_version_transaction(version.version)
+            .await
+            .unwrap()
+            .transaction;
+        assert_eq!(by_version, expected, "version {}", version.version);
+    }
+}
+
+/// A version without an inline transaction falls back to the manifest, which
+/// points at an external transaction file.
+#[tokio::test]
+async fn test_read_transaction_by_version_falls_back_without_inline_transaction() {
+    let test_uri = TempStrDir::default();
+    let ds = write_versions(&test_uri, 1, true).await;
+    let transaction = Transaction::new(
+        ds.manifest().version,
+        Operation::Append { fragments: vec![] },
+        None,
+    );
+    let transaction_file = crate::io::commit::write_transaction_file(
+        ds.object_store.as_ref(),
+        &ds.base,
+        &lance_table::format::pb::Transaction::try_from(&transaction).unwrap(),
+    )
+    .await
+    .unwrap();
+    let (mut manifest, indices) = transaction
+        .build_manifest(
+            Some(ds.manifest.as_ref()),
+            ds.load_indices().await.unwrap().as_ref().clone(),
+            &transaction_file,
+            &ManifestWriteConfig::default().to_build_config(),
+        )
+        .unwrap();
+    let location = write_manifest_file(
+        ds.object_store.as_ref(),
+        ds.commit_handler.as_ref(),
+        &ds.base,
+        &mut manifest,
+        if indices.is_empty() {
+            None
+        } else {
+            Some(indices)
+        },
+        &ManifestWriteConfig::default(),
+        ds.manifest_location.naming_scheme,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    let written = ds.checkout_version(location.version).await.unwrap();
+    assert!(written.manifest.transaction_section.is_none());
+    assert!(written.manifest.transaction_file.is_some());
+
+    let handle = open_uncached_at(&test_uri, 1).await;
+    let (read, _) = read_both_ways(&handle, location.version).await;
+    assert_eq!(read, Some(transaction));
 }
 
 #[tokio::test]

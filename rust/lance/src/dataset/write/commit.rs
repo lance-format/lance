@@ -1033,14 +1033,15 @@ mod tests {
 
         let io_stats = new_ds.object_store.as_ref().io_stats_incremental();
 
-        // If there is a conflict with two transaction, the retry should require io requests:
+        // If there is a conflict with other transactions, the retry should require io requests:
         // * 1 list version
-        // * num_other_txns read manifests (cache-able)
-        // * num_other_txns read txn files (cache-able)
+        // * 1 read of the latest manifest, which the retry checks out (cache-able)
+        // * num_other_txns - 1 ranged reads of the older versions' inline transactions (cache-able)
+        // * 1 read of the latest version's transaction (cache-able)
         // * 1 write txn file
         // * 1 write manifest
-        // For total of 3 + 2 * num_other_txns io requests. If we have caching enabled, we can skip 2 * num_other_txns
-        // of those. We should be able to read in 5 hops.
+        // For total of 4 + num_other_txns io requests. If we have caching enabled, we can skip
+        // 1 + num_other_txns of those. We should be able to read in 5 hops.
         if use_cache {
             assert_io_eq!(io_stats, read_iops, 1); // Just list versions
             assert_io_eq!(io_stats, num_stages, 3);
@@ -1048,7 +1049,7 @@ mod tests {
             // We need to read the other manifests and transactions.
 
             use lance_io::assert_io_lt;
-            assert_io_eq!(io_stats, read_iops, 1 + num_other_txns * 2);
+            assert_io_eq!(io_stats, read_iops, 2 + num_other_txns);
             // It's possible to read the txns for some versions before we
             // finish reading later versions and so the entire "read versions
             // and txs" may appear as 1 hop instead of 2.

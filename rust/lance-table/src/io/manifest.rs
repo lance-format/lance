@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 use futures::TryStreamExt;
 use lance_file::{
     version::ConcreteFileVersion,
@@ -21,7 +21,7 @@ use tracing::instrument;
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_io::{
     object_store::ObjectStore,
-    traits::{WriteExt, Writer},
+    traits::{Reader, WriteExt, Writer},
     utils::{ChunkedBuf, METADATA_READ_CHUNK_SIZE, read_message, read_range_in_chunks},
 };
 
@@ -134,6 +134,197 @@ fn decode_manifest(buf: impl Buf, recorded_length: usize) -> Result<Manifest> {
     let mut manifest = Manifest::try_from(proto)?;
     manifest.detach_sparse_inline_row_ids(recorded_length);
     Ok(manifest)
+}
+
+/// Bytes of the little-endian u32 length prefix that precedes every section
+/// message of a manifest file (index section, inline transaction, manifest).
+const LEN_PREFIX_LEN: usize = 4;
+
+/// Bytes of the footer that follows the manifest message: its i64 position,
+/// the u16 major and minor versions and the magic.
+const FOOTER_LEN: usize = 16;
+
+/// First byte of a non-empty `pb::IndexSection`: field 1 (`indices`),
+/// length-delimited.
+const INDEX_SECTION_FIRST_KEY: u8 = (1 << 3) | 2;
+
+/// Possible first bytes of a `pb::Transaction` as written by prost, which
+/// encodes fields in field-number order: field 1 (`read_version`, varint), or
+/// field 2 (`uuid`, length-delimited) when `read_version` is 0.
+const TRANSACTION_FIRST_KEYS: [u8; 2] = [1 << 3, (2 << 3) | 2];
+
+/// What [`read_inline_transaction_by_layout`] learned from a manifest file.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InlineTransactionLookup {
+    /// The file's sections are laid out so that its last section before the
+    /// manifest message can only be an inline transaction, which decoded to
+    /// this message.
+    Found(Box<pb::Transaction>),
+    /// The layout does not prove where the inline transaction is, or that the
+    /// file has one. The reason is for logs. The manifest must be read to
+    /// learn the transaction; this is never evidence that there is none.
+    Inconclusive(&'static str),
+}
+
+/// Read the inline transaction of a manifest file from its section layout,
+/// without reading or decoding the manifest message.
+///
+/// A manifest file is `[dictionaries (legacy files only)] [index section]
+/// [inline transaction] [manifest message] [footer]`, where every section is
+/// optional and is a u32 length prefix followed by a protobuf message. The
+/// footer gives the manifest message's position. The transaction is found
+/// when the sections before the manifest message are exactly one of:
+///
+/// - one section starting with a transaction's first field key
+///   ([`TRANSACTION_FIRST_KEYS`]);
+/// - an index section (empty, or starting with [`INDEX_SECTION_FIRST_KEY`])
+///   followed by a section starting with a transaction's first field key.
+///
+/// Every length prefix must equal the distance to the next section exactly.
+/// Any other layout, a reader size that does not end at the footer (a stale
+/// size) and a message that fails to decode are inconclusive too.
+///
+/// Costs one round trip (the first block and the footer, read concurrently)
+/// when the transaction fits in the first block, and one more otherwise.
+///
+/// # Example
+///
+/// ```no_run
+/// # use lance_io::object_store::ObjectStore;
+/// # use lance_table::io::manifest::{InlineTransactionLookup, read_inline_transaction_by_layout};
+/// # use object_store::path::Path;
+/// # async fn example(store: &ObjectStore, manifest_path: &Path) -> lance_core::Result<()> {
+/// let reader = store.open(manifest_path).await?;
+/// match read_inline_transaction_by_layout(reader.as_ref()).await? {
+///     InlineTransactionLookup::Found(transaction) => {
+///         println!("built on version {}", transaction.read_version);
+///     }
+///     // Not evidence of a missing transaction: read the manifest, which
+///     // locates an inline transaction, an external file or none.
+///     InlineTransactionLookup::Inconclusive(reason) => {
+///         println!("reading the manifest: {reason}");
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
+pub async fn read_inline_transaction_by_layout(
+    reader: &dyn Reader,
+) -> Result<InlineTransactionLookup> {
+    let file_size = reader.size().await?;
+    // One section with a non-empty body, a manifest prefix and the footer.
+    if file_size < LEN_PREFIX_LEN + 1 + LEN_PREFIX_LEN + FOOTER_LEN {
+        return Ok(InlineTransactionLookup::Inconclusive(
+            "file is too small to hold a section",
+        ));
+    }
+    let head_len = file_size.min(reader.block_size().max(LEN_PREFIX_LEN + 1));
+    let footer_range = file_size - FOOTER_LEN..file_size;
+    let (head, footer) = if head_len == file_size {
+        let all = reader.get_range(0..file_size).await?;
+        let footer = all.slice(footer_range);
+        (all, footer)
+    } else {
+        futures::try_join!(
+            reader.get_range(0..head_len),
+            reader.get_range(footer_range)
+        )?
+    };
+    if head.len() != head_len || footer.len() != FOOTER_LEN || !footer.ends_with(MAGIC) {
+        return Ok(InlineTransactionLookup::Inconclusive(
+            "no footer at the end of the reader",
+        ));
+    }
+    let Ok(manifest_pos) = usize::try_from(LittleEndian::read_i64(&footer[..8])) else {
+        return Ok(InlineTransactionLookup::Inconclusive(
+            "negative manifest position",
+        ));
+    };
+    if manifest_pos > file_size - LEN_PREFIX_LEN - FOOTER_LEN {
+        return Ok(InlineTransactionLookup::Inconclusive(
+            "manifest position past the end of the file",
+        ));
+    }
+
+    let start = match transaction_section_start(&head, manifest_pos) {
+        Ok(start) => start,
+        Err(reason) => return Ok(InlineTransactionLookup::Inconclusive(reason)),
+    };
+    let section = if manifest_pos <= head.len() {
+        head.slice(start..manifest_pos)
+    } else {
+        let rest = reader
+            .get_range(head.len().max(start)..manifest_pos)
+            .await?;
+        if start >= head.len() {
+            rest
+        } else {
+            let mut joined = BytesMut::with_capacity(manifest_pos - start);
+            joined.extend_from_slice(&head[start..]);
+            joined.extend_from_slice(&rest);
+            joined.freeze()
+        }
+    };
+    if section.len() != manifest_pos - start {
+        return Ok(InlineTransactionLookup::Inconclusive(
+            "short read of the transaction section",
+        ));
+    }
+
+    let body = &section[LEN_PREFIX_LEN..];
+    if LittleEndian::read_u32(&section[..LEN_PREFIX_LEN]) as usize != body.len() {
+        return Ok(InlineTransactionLookup::Inconclusive(
+            "last section's length prefix does not reach the manifest",
+        ));
+    }
+    if !body
+        .first()
+        .is_some_and(|key| TRANSACTION_FIRST_KEYS.contains(key))
+    {
+        return Ok(InlineTransactionLookup::Inconclusive(
+            "last section is not a transaction",
+        ));
+    }
+    match pb::Transaction::decode(body) {
+        Ok(transaction) => Ok(InlineTransactionLookup::Found(Box::new(transaction))),
+        Err(_) => Ok(InlineTransactionLookup::Inconclusive(
+            "last section does not decode as a transaction",
+        )),
+    }
+}
+
+/// The position of the section that, by the layout rules of
+/// [`read_inline_transaction_by_layout`], must be the inline transaction of a
+/// manifest file whose manifest message is at `manifest_pos`, given `head`,
+/// the first bytes of the file. The section's own prefix and first byte are
+/// left for the caller to check.
+///
+/// `head` must hold at least the first section's prefix and first body byte.
+fn transaction_section_start(
+    head: &[u8],
+    manifest_pos: usize,
+) -> std::result::Result<usize, &'static str> {
+    let first_len = LittleEndian::read_u32(&head[..LEN_PREFIX_LEN]) as usize;
+    let second = LEN_PREFIX_LEN + first_len;
+    if second == manifest_pos {
+        return Ok(0);
+    }
+    // The first section must be an index section and a non-empty second
+    // section must end at the manifest.
+    if second + LEN_PREFIX_LEN + 1 > manifest_pos {
+        return Err("sections do not end at the manifest");
+    }
+    if first_len != 0 && head[LEN_PREFIX_LEN] != INDEX_SECTION_FIRST_KEY {
+        return Err("first of two sections is not an index section");
+    }
+    // The candidate's prefix must equal its length, so a longer candidate
+    // can never match. Reject it before its bytes are read: it arises when
+    // the first section's prefix wrapped, and would span the rest of that
+    // section.
+    if manifest_pos - second - LEN_PREFIX_LEN > u32::MAX as usize {
+        return Err("second section is longer than a length prefix can hold");
+    }
+    Ok(second)
 }
 
 #[instrument(level = "debug", skip(object_store, manifest))]
@@ -413,5 +604,240 @@ mod test {
             .unwrap();
         let schema = ArrowSchema::from(reader.schema());
         assert_eq!(schema.metadata().get("lance:extra").unwrap(), "for_test");
+    }
+
+    /// Sections to write in front of a manifest message, in file order.
+    #[allow(clippy::large_enum_variant)]
+    enum TestSection {
+        Index(pb::IndexSection),
+        Transaction(pb::Transaction),
+        Raw(Vec<u8>),
+    }
+
+    /// Write a manifest file holding `sections`, the manifest message and the
+    /// footer, and return its size.
+    async fn write_manifest_file_with_sections(
+        store: &ObjectStore,
+        path: &Path,
+        sections: &[TestSection],
+    ) -> usize {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new("a", DataType::Int64, false)]);
+        let manifest = Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        let mut writer = store.create(path).await.unwrap();
+        for section in sections {
+            match section {
+                TestSection::Index(index) => {
+                    writer.write_protobuf(index).await.unwrap();
+                }
+                TestSection::Transaction(transaction) => {
+                    writer.write_protobuf(transaction).await.unwrap();
+                }
+                TestSection::Raw(bytes) => writer.write_all(bytes).await.unwrap(),
+            }
+        }
+        let pos = writer.write_struct(&manifest).await.unwrap();
+        writer
+            .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+            .await
+            .unwrap();
+        Writer::shutdown(writer.as_mut()).await.unwrap().size
+    }
+
+    async fn lookup(store: &ObjectStore, path: &Path) -> InlineTransactionLookup {
+        let reader = store.open(path).await.unwrap();
+        read_inline_transaction_by_layout(reader.as_ref())
+            .await
+            .unwrap()
+    }
+
+    fn test_transaction(read_version: u64, padding: usize) -> pb::Transaction {
+        pb::Transaction {
+            read_version,
+            uuid: "layout transaction".to_string(),
+            tag: "x".repeat(padding),
+            transaction_properties: HashMap::from([("k".to_string(), "v".to_string())]),
+            operation: Some(pb::transaction::Operation::Append(
+                pb::transaction::Append { fragments: vec![] },
+            )),
+        }
+    }
+
+    fn non_empty_index_section() -> pb::IndexSection {
+        pb::IndexSection {
+            indices: vec![pb::IndexMetadata {
+                name: "idx".to_string(),
+                dataset_version: 3,
+                ..Default::default()
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_inline_transaction_by_layout_finds_transaction() {
+        let store = ObjectStore::memory();
+        let path = Path::from("layout");
+        // Read version 0 leaves field 1 out, so the message starts at the uuid.
+        // A large tag puts the section past the first block.
+        for transaction in [
+            test_transaction(7, 0),
+            test_transaction(0, 0),
+            test_transaction(7, 300 * 1024),
+        ] {
+            let layouts = [
+                vec![TestSection::Transaction(transaction.clone())],
+                vec![
+                    TestSection::Index(pb::IndexSection::default()),
+                    TestSection::Transaction(transaction.clone()),
+                ],
+                vec![
+                    TestSection::Index(non_empty_index_section()),
+                    TestSection::Transaction(transaction.clone()),
+                ],
+            ];
+            for sections in layouts {
+                write_manifest_file_with_sections(&store, &path, &sections).await;
+                assert_eq!(
+                    lookup(&store, &path).await,
+                    InlineTransactionLookup::Found(Box::new(transaction.clone()))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_inline_transaction_by_layout_is_inconclusive_without_proof() {
+        let store = ObjectStore::memory();
+        let path = Path::from("layout");
+        let transaction = test_transaction(7, 0);
+        let encoded = transaction.encode_to_vec();
+        let mut wrong_prefix = ((encoded.len() + 2) as u32).to_le_bytes().to_vec();
+        wrong_prefix.extend_from_slice(&encoded);
+        wrong_prefix.push(0);
+
+        let layouts = [
+            // No sections, an index section alone (the transaction may be in
+            // an external file), and an empty one.
+            (vec![], "sections do not end at the manifest"),
+            (
+                vec![TestSection::Index(non_empty_index_section())],
+                "last section is not a transaction",
+            ),
+            (
+                vec![TestSection::Index(pb::IndexSection::default())],
+                "last section is not a transaction",
+            ),
+            // Three sections, as with legacy dictionaries in front.
+            (
+                vec![
+                    TestSection::Raw(vec![1, 2, 3, 4, 5, 6, 7, 8]),
+                    TestSection::Index(non_empty_index_section()),
+                    TestSection::Transaction(transaction.clone()),
+                ],
+                "sections do not end at the manifest",
+            ),
+            // A prefix that does not match the section's length.
+            (
+                vec![TestSection::Raw(wrong_prefix)],
+                "sections do not end at the manifest",
+            ),
+            // Two sections whose first is not an index section.
+            (
+                vec![
+                    TestSection::Transaction(transaction.clone()),
+                    TestSection::Transaction(transaction.clone()),
+                ],
+                "first of two sections is not an index section",
+            ),
+        ];
+        for (sections, reason) in layouts {
+            write_manifest_file_with_sections(&store, &path, &sections).await;
+            assert_eq!(
+                lookup(&store, &path).await,
+                InlineTransactionLookup::Inconclusive(reason)
+            );
+        }
+
+        // A section whose first byte is a transaction key but that does not
+        // decode.
+        let mut garbage = vec![1 << 3];
+        garbage.extend_from_slice(&[0xFF; 12]);
+        let mut raw = (garbage.len() as u32).to_le_bytes().to_vec();
+        raw.extend_from_slice(&garbage);
+        write_manifest_file_with_sections(&store, &path, &[TestSection::Raw(raw)]).await;
+        assert_eq!(
+            lookup(&store, &path).await,
+            InlineTransactionLookup::Inconclusive("last section does not decode as a transaction")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inline_transaction_by_layout_with_stale_size() {
+        let store = ObjectStore::memory();
+        let path = Path::from("layout");
+        let transaction = test_transaction(7, 0);
+        let size = write_manifest_file_with_sections(
+            &store,
+            &path,
+            &[TestSection::Transaction(transaction.clone())],
+        )
+        .await;
+
+        // A size short of the true size does not end at the footer.
+        let short = store.open_with_size(&path, size - 1).await.unwrap();
+        assert_eq!(
+            read_inline_transaction_by_layout(short.as_ref())
+                .await
+                .unwrap(),
+            InlineTransactionLookup::Inconclusive("no footer at the end of the reader")
+        );
+        // A size past the end fails to read; callers fall back on errors too.
+        let long = store.open_with_size(&path, size + 100).await.unwrap();
+        assert!(!matches!(
+            read_inline_transaction_by_layout(long.as_ref()).await,
+            Ok(InlineTransactionLookup::Found(_))
+        ));
+        let exact = store.open_with_size(&path, size).await.unwrap();
+        assert_eq!(
+            read_inline_transaction_by_layout(exact.as_ref())
+                .await
+                .unwrap(),
+            InlineTransactionLookup::Found(Box::new(transaction))
+        );
+    }
+
+    #[test]
+    fn test_transaction_section_start() {
+        let mut head = vec![0u8; 64];
+        // One 20 byte section.
+        head[..4].copy_from_slice(&20u32.to_le_bytes());
+        assert_eq!(transaction_section_start(&head, 24), Ok(0));
+        // An empty index section followed by another section.
+        head[..4].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(transaction_section_start(&head, 30), Ok(4));
+        // The second section must hold a prefix and at least one byte.
+        assert!(transaction_section_start(&head, 8).is_err());
+        assert_eq!(transaction_section_start(&head, 9), Ok(4));
+        // A non-empty first section must look like an index section.
+        head[..4].copy_from_slice(&10u32.to_le_bytes());
+        head[4] = INDEX_SECTION_FIRST_KEY;
+        assert_eq!(transaction_section_start(&head, 40), Ok(14));
+        head[4] = TRANSACTION_FIRST_KEYS[0];
+        assert!(transaction_section_start(&head, 40).is_err());
+        // A first section running past the manifest.
+        head[4] = INDEX_SECTION_FIRST_KEY;
+        assert!(transaction_section_start(&head, 12).is_err());
+        // A first section whose prefix wrapped leaves a candidate longer than
+        // any prefix describes; it is rejected without reading it.
+        #[cfg(target_pointer_width = "64")]
+        {
+            let candidate_end = 14 + LEN_PREFIX_LEN + u32::MAX as usize;
+            assert_eq!(transaction_section_start(&head, candidate_end), Ok(14));
+            assert!(transaction_section_start(&head, candidate_end + 1).is_err());
+        }
     }
 }

@@ -49,7 +49,10 @@ use lance_table::io::commit::{
 };
 
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
-use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
+use lance_table::io::manifest::{
+    InlineTransactionLookup, read_inline_transaction_by_layout, read_manifest,
+    read_manifest_indexes,
+};
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
@@ -64,7 +67,7 @@ use std::num::NonZero;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 pub(crate) mod blob;
 pub(crate) mod branch_location;
@@ -1439,7 +1442,17 @@ impl Dataset {
             .commit_handler
             .resolve_version_location(&self.base, version, &self.object_store.inner)
             .await?;
+        self.read_version_transaction_at(version, manifest_location)
+            .await
+    }
 
+    /// [`Self::read_version_transaction`] for a version other than the
+    /// checked-out one, whose manifest is at `manifest_location`.
+    async fn read_version_transaction_at(
+        &self,
+        version: u64,
+        manifest_location: ManifestLocation,
+    ) -> Result<VersionTransaction> {
         // Mirror `get_manifest`: only a location with a known size (and hence
         // a trustworthy e_tag) identifies a cache entry precisely enough to
         // reuse without re-reading the manifest body.
@@ -1505,7 +1518,11 @@ impl Dataset {
     /// then this will return None.
     ///
     /// Does not populate the session caches; see
-    /// [`Self::read_version_transaction`].
+    /// [`Self::read_version_transaction`]. Unlike that method, a version other
+    /// than the checked-out one is first read from its manifest file's section
+    /// layout with a few small ranged reads, without downloading or decoding
+    /// its manifest (see [`read_inline_transaction_by_layout`]); the manifest
+    /// is read only when that cannot prove the transaction.
     ///
     /// # Example
     ///
@@ -1518,7 +1535,109 @@ impl Dataset {
     /// # }
     /// ```
     pub async fn read_transaction_by_version(&self, version: u64) -> Result<Option<Transaction>> {
-        Ok(self.read_version_transaction(version).await?.transaction)
+        if version == self.manifest.version {
+            return Ok(self.read_version_transaction(version).await?.transaction);
+        }
+        let manifest_location = self
+            .commit_handler
+            .resolve_version_location(&self.base, version, &self.object_store.inner)
+            .await?;
+        if let Some(transaction) = self
+            .read_transaction_from_layout(version, &manifest_location)
+            .await
+        {
+            return Ok(Some(transaction));
+        }
+        Ok(self
+            .read_version_transaction_at(version, manifest_location)
+            .await?
+            .transaction)
+    }
+
+    /// The inline transaction of `version`, whose manifest file is at
+    /// `location`, read from the file's section layout without reading the
+    /// manifest message.
+    ///
+    /// `None` means the layout read did not prove the transaction, never that
+    /// the version has none: the caller must read the manifest, which settles
+    /// whether there is a transaction (inline, in an external file, or none)
+    /// and surfaces any error. So does a failed layout read, which is only
+    /// logged here because the manifest read repeats the request. A found
+    /// transaction must also have a uuid and a read version below `version`.
+    ///
+    /// The layout read cannot check which branch the manifest belongs to, as
+    /// [`Self::read_version_transaction`] does from the manifest. So it is
+    /// only attempted on a main-branch handle for a location directly in the
+    /// main branch's versions directory, where no other branch writes
+    /// manifests (a branch's live under `tree/<branch>`). It is not attempted
+    /// either when the location's size is unknown, or when the session already
+    /// caches the manifest, from which one section read serves the
+    /// transaction.
+    async fn read_transaction_from_layout(
+        &self,
+        version: u64,
+        location: &ManifestLocation,
+    ) -> Option<Transaction> {
+        let size = location.size?;
+        let in_main_versions_dir = location
+            .path
+            .prefix_match(&self.versions_dir())
+            .is_some_and(|mut rest| rest.next().is_some() && rest.next().is_none());
+        if self.manifest.branch.is_some() || !in_main_versions_dir {
+            return None;
+        }
+        let manifest_key = ManifestKey {
+            version: location.version,
+            e_tag: location.e_tag.as_deref(),
+        };
+        if self
+            .metadata_cache
+            .get_with_key(&manifest_key)
+            .await
+            .is_some()
+        {
+            return None;
+        }
+
+        let lookup = async {
+            let reader = self
+                .object_store
+                .open_with_size(&location.path, size as usize)
+                .await?;
+            read_inline_transaction_by_layout(reader.as_ref()).await
+        }
+        .await;
+        let reason = match lookup {
+            Ok(InlineTransactionLookup::Found(message)) => {
+                if message.uuid.is_empty() {
+                    "transaction has no uuid"
+                } else if message.read_version >= version {
+                    "transaction's read version is not below its version"
+                } else {
+                    match Transaction::try_from(*message) {
+                        Ok(transaction) => return Some(transaction),
+                        Err(_) => "transaction message is not a valid transaction",
+                    }
+                }
+            }
+            Ok(InlineTransactionLookup::Inconclusive(reason)) => reason,
+            Err(err) => {
+                debug!(
+                    version,
+                    path = %location.path,
+                    error = %err,
+                    "layout read of the transaction failed"
+                );
+                "layout read failed"
+            }
+        };
+        debug!(
+            version,
+            path = %location.path,
+            reason,
+            "reading the manifest to find the transaction"
+        );
+        None
     }
 
     /// List transactions for the dataset, up to a maximum number.
@@ -3926,10 +4045,18 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
     let (latest_tx, latest_rx) = tokio::sync::oneshot::channel();
     let mut latest_tx = Some(latest_tx);
 
+    // Only the latest manifest is needed in full: the dataset is checked out
+    // at it. The other versions contribute only their transactions, which are
+    // read from their manifest files' layout when it proves them (see
+    // `Dataset::read_transaction_from_layout`), so a long window of new
+    // versions does not download and decode every manifest.
     let manifests = locations
         .map_ok(move |location| {
             let latest_tx = latest_tx.take();
             async move {
+                let Some(latest_tx) = latest_tx else {
+                    return Ok((None, location));
+                };
                 let manifest = Dataset::get_manifest(
                     dataset.object_store.as_ref(),
                     &location,
@@ -3937,31 +4064,49 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                     dataset.session.as_ref(),
                 )
                 .await?;
-
-                if let Some(latest_tx) = latest_tx {
-                    // We ignore the error, since we don't care if the receiver is dropped.
-                    let _ = latest_tx.send((manifest.clone(), location.clone()));
-                }
-
-                Ok((manifest, location))
+                // We ignore the error, since we don't care if the receiver is dropped.
+                let _ = latest_tx.send((manifest.clone(), location.clone()));
+                Ok((Some(manifest), location))
             }
         })
         .try_buffer_unordered(stage_parallelism);
     let transactions = manifests
         .map_ok(move |(manifest, location)| async move {
-            let manifest_copy = manifest.clone();
             let tx_key = TransactionKey {
-                version: manifest.version,
+                version: location.version,
             };
-            let transaction =
-                if let Some(cached) = dataset.metadata_cache.get_with_key(&tx_key).await {
-                    cached
-                } else {
+            if let Some(cached) = dataset.metadata_cache.get_with_key(&tx_key).await {
+                return Ok((location.version, cached));
+            }
+            let from_layout = match manifest {
+                Some(_) => None,
+                None => {
+                    dataset
+                        .read_transaction_from_layout(location.version, &location)
+                        .await
+                }
+            };
+            let (version, transaction) = match from_layout {
+                Some(transaction) => (location.version, Arc::new(transaction)),
+                None => {
+                    let manifest = match manifest {
+                        Some(manifest) => manifest,
+                        None => {
+                            Dataset::get_manifest(
+                                dataset.object_store.as_ref(),
+                                &location,
+                                &dataset.uri,
+                                dataset.session.as_ref(),
+                            )
+                            .await?
+                        }
+                    };
+                    let version = manifest.version;
                     let dataset_version = Dataset::checkout_manifest(
                         dataset.object_store.clone(),
                         dataset.base.clone(),
                         dataset.uri.clone(),
-                        manifest_copy.clone(),
+                        manifest,
                         location,
                         dataset.session(),
                         dataset.commit_handler.clone(),
@@ -3969,20 +4114,20 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         dataset.store_params.as_deref().cloned(),
                         dataset.base_store_params.clone(),
                     )?;
-                    let loaded =
-                        Arc::new(dataset_version.read_transaction().await?.ok_or_else(|| {
-                            Error::internal(format!(
-                                "Dataset version {} does not have a transaction file",
-                                manifest_copy.version
-                            ))
-                        })?);
-                    dataset
-                        .metadata_cache
-                        .insert_with_key(&tx_key, loaded.clone())
-                        .await;
-                    loaded
-                };
-            Ok((manifest.version, transaction))
+                    let loaded = dataset_version.read_transaction().await?.ok_or_else(|| {
+                        Error::internal(format!(
+                            "Dataset version {version} does not have a transaction file"
+                        ))
+                    })?;
+                    (version, Arc::new(loaded))
+                }
+            };
+            let tx_key = TransactionKey { version };
+            dataset
+                .metadata_cache
+                .insert_with_key(&tx_key, transaction.clone())
+                .await;
+            Ok((version, transaction))
         })
         .try_buffer_unordered(stage_parallelism);
 
