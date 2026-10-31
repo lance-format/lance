@@ -281,6 +281,10 @@ pub struct CompactionOptions {
     /// indexes remain valid and their fragment bitmaps are updated.  Modern indexes
     /// store row addresses and these indexes need to be remapped as if we were not using
     /// stable row ids. An existing fragment reuse index does not by itself enable recording.
+    ///
+    /// Eager remapping is rejected while a fragment reuse index still has pending
+    /// moves from an earlier deferred compaction. Continue deferring the remap, or
+    /// explicitly remap the indices and clean up the fragment reuse index first.
     pub defer_index_remap: bool,
     /// How the old-to-new row-address mapping used to remap indices is built.
     /// Defaults to [`IndexRemapMode::Direct`].
@@ -1002,7 +1006,9 @@ impl DefaultCompactionPlanner {
             } else {
                 None
             };
-        if eager_remap_capable == Some(true) {
+        if !self.options.defer_index_remap
+            && (!dataset.manifest.uses_stable_row_ids() || eager_remap_capable == Some(true))
+        {
             reject_eager_remap_over_undrained_fri(dataset).await?;
         }
 
@@ -1288,7 +1294,9 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             } else {
                 None
             };
-        if eager_remap_capable == Some(true) {
+        if !self.options.defer_index_remap
+            && (!dataset.manifest.uses_stable_row_ids() || eager_remap_capable == Some(true))
+        {
             reject_eager_remap_over_undrained_fri(dataset).await?;
         }
 
@@ -3128,8 +3136,8 @@ async fn has_eager_remappable_index(dataset: &Dataset) -> Result<bool> {
         .any(|index| !is_system_index(index) && index.supports_eager_remap()))
 }
 
-/// Refuse an eager remap of an address-domain index while this stable-row-id
-/// table's fragment reuse index is not fully drained.
+/// Refuse an eager index remap while the table's fragment reuse index is not
+/// fully drained, regardless of whether the table uses stable row ids.
 ///
 /// A remappable index (e.g. BTree) is remapped by reading its persisted
 /// pages' stored addresses directly and translating them with this
@@ -3138,17 +3146,18 @@ async fn has_eager_remappable_index(dataset: &Dataset) -> Result<bool> {
 /// prior deferred compaction left addresses that only the FRI translates --
 /// remapping now would write those untranslated addresses into the rebuilt
 /// index and the manifest would then claim full coverage, silently dropping
-/// every row the FRI still had to translate. Draining it first, with
-/// `optimize_indices`, or compacting with `defer_index_remap` set instead,
-/// keeps the index's pages in step with its coverage.
+/// every row the FRI still had to translate. Explicitly remapping the indices
+/// and cleaning up the FRI first, or compacting with `defer_index_remap` set
+/// instead, keeps the index's pages in step with its coverage.
 async fn reject_eager_remap_over_undrained_fri(dataset: &Dataset) -> Result<()> {
     if let Some(fri) = dataset.frag_reuse_index().await?
         && !fri.is_empty()
     {
         return Err(Error::not_supported(
-            "Cannot eagerly compact: defer_index_remap was activated by an earlier
-            compaction. Please run optimize_indices first or continue compacting
-            with defer_index_remap activated.",
+            "Cannot eagerly compact while the fragment reuse index has pending remaps from \
+             an earlier compaction. Continue compacting with defer_index_remap=true, or \
+             explicitly remap the indices and clean up the fragment reuse index first. \
+             optimize_indices alone may leave pending remaps.",
         ));
     }
     Ok(())
@@ -4150,16 +4159,12 @@ pub async fn commit_compaction(
         && has_address_style
         && (!uses_stable_row_ids || has_eager_remappable_index(dataset).await?);
 
-    // On a non-stable-row-id table `needs_remapping` is never the kind of
-    // eager remap the FRI-drain gate and `records_stable_row_id_moves` care
-    // about; `uses_stable_row_ids` narrows it to that case.
-    let remapping_eagerly = uses_stable_row_ids && needs_remapping;
-    if remapping_eagerly {
+    if needs_remapping {
         reject_eager_remap_over_undrained_fri(dataset).await?;
     }
 
     let records_row_addrs = if uses_stable_row_ids {
-        records_stable_row_id_moves(dataset, &completed_tasks, options, remapping_eagerly).await?
+        records_stable_row_id_moves(dataset, &completed_tasks, options, needs_remapping).await?
     } else {
         options.defer_index_remap
     };
@@ -4642,6 +4647,7 @@ mod tests {
     mod concurrent_reindex;
     use self::remapping::RemappedIndex;
     use super::*;
+    use crate::dataset::UpdateBuilder;
     use crate::dataset::WriteDestination;
     use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
     use crate::dataset::optimize::remapping::{transpose_row_addrs, transpose_row_ids_from_digest};
@@ -8977,33 +8983,97 @@ mod tests {
     /// claim it fully covers fragments the FRI alone can still resolve --
     /// silently losing the rows the FRI has to translate. Eager compaction
     /// must refuse instead, until the FRI is drained.
+    #[rstest]
+    #[case::btree_physical(IndexType::BTree, false)]
+    #[case::btree_stable(IndexType::BTree, true)]
+    #[case::inverted_physical(IndexType::Inverted, false)]
     #[tokio::test]
-    async fn test_eager_remap_refuses_undrained_fri_over_address_domain_index() {
-        let mut dataset = stable_row_id_dataset("memory://", 5).await;
-        dataset
-            .create_index(
-                &["i"],
-                IndexType::BTree,
-                Some("i_idx".into()),
-                &ScalarIndexParams::default(),
-                false,
+    async fn test_eager_remap_refuses_undrained_fri_over_address_domain_index(
+        #[case] index_type: IndexType,
+        #[case] enable_stable_row_ids: bool,
+        #[values(false, true)] is_update: bool,
+        #[values(false, true)] is_optimized_before_compaction: bool,
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("id", Int32, [0, 1, 2, 3]),
+            ("value", Int32, [Some(0), Some(1), None, Some(3)]),
+            (
+                "doc",
+                Utf8,
+                [Some("needle"), Some("needle"), None, Some("needle")]
             )
-            .await
-            .unwrap();
-
-        // A deferred compaction merges every fragment, leaving the btree's
-        // pages stale and a non-empty FRI as the only thing resolving them.
-        compact_files(
-            &mut dataset,
-            CompactionOptions {
-                target_rows_per_fragment: 1_000,
-                defer_index_remap: true,
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids,
+                max_rows_per_file: 2,
                 ..Default::default()
-            },
-            None,
+            }),
         )
         .await
         .unwrap();
+        let column = if index_type == IndexType::BTree {
+            dataset
+                .create_index(
+                    &["value"],
+                    index_type,
+                    Some("test_idx".into()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            "value"
+        } else {
+            dataset
+                .create_index(
+                    &["doc"],
+                    index_type,
+                    Some("test_idx".into()),
+                    &InvertedIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            "doc"
+        };
+        let deferred_options = CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        };
+
+        // Persisted index addresses now require the FRI, even after optimize_indices.
+        compact_files(&mut dataset, deferred_options.clone(), None)
+            .await
+            .unwrap();
+        if is_optimized_before_compaction {
+            dataset.optimize_indices(&Default::default()).await.unwrap();
+        }
+        if is_update {
+            let result = UpdateBuilder::new(Arc::new(dataset))
+                .update_where("id = 0")
+                .unwrap()
+                .set(
+                    column,
+                    if index_type == IndexType::BTree {
+                        "value + 10"
+                    } else {
+                        "'needle updated'"
+                    },
+                )
+                .unwrap()
+                .build()
+                .unwrap()
+                .execute()
+                .await
+                .unwrap();
+            dataset = result.new_dataset.as_ref().clone();
+        } else {
+            dataset.delete("id = 0").await.unwrap();
+        }
         assert!(
             !dataset
                 .frag_reuse_index()
@@ -9013,17 +9083,104 @@ mod tests {
                 .is_empty()
         );
 
+        let assert_answers = async |dataset: &Dataset| {
+            let expected = if is_update { vec![0, 1, 3] } else { vec![1, 3] };
+            let filter = format!("{column} IS NOT NULL");
+            assert_eq!(
+                values_matching(dataset, "id", &filter, false).await,
+                expected
+            );
+            if index_type == IndexType::BTree {
+                assert_eq!(
+                    values_matching(dataset, "id", "value >= 0", true).await,
+                    expected
+                );
+                assert_eq!(
+                    values_matching(dataset, "id", "value IS NULL", true).await,
+                    vec![2]
+                );
+                assert_index_is_used(dataset, "value >= 0", "test_idx").await;
+            } else {
+                let mut scanner = dataset.scan();
+                scanner
+                    .full_text_search(FullTextSearchQuery::new("needle".to_string()))
+                    .unwrap()
+                    .project(&["id"])
+                    .unwrap();
+                assert!(
+                    scanner
+                        .explain_plan(false)
+                        .await
+                        .unwrap()
+                        .contains("MatchQuery")
+                );
+                let mut ids = scanner.try_into_batch().await.unwrap()["id"]
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .to_vec();
+                ids.sort_unstable();
+                assert_eq!(ids, expected);
+            }
+        };
+        assert_answers(&dataset).await;
+
+        let version = dataset.version().version;
         let error = compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
             .unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }), "{error}");
         assert!(error.to_string().contains("defer_index_remap"), "{error}");
-        assert!(error.to_string().contains("optimize_indices"), "{error}");
+        assert_eq!(dataset.version().version, version);
 
-        // Catch the btree up to the FRI's moves (a segment merge, not a
-        // rescan), then trim the now-caught-up version: this lets eager
-        // compaction proceed again.
-        remapping::remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+        let error = DefaultCompactionPlanner::new(CompactionOptions::default())
+            .unwrap()
+            .plan_groups(
+                &dataset,
+                vec![CompactionGroup {
+                    fragments: dataset.fragments().as_ref().clone(),
+                    output_clustering_id: None,
+                    output_metadata: HashMap::new(),
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(error.to_string().contains("defer_index_remap"), "{error}");
+
+        // Distributed callers can commit with options different from the plan's.
+        let plan = plan_compaction(&dataset, &deferred_options).await.unwrap();
+        let mut completed = Vec::new();
+        for task in plan.compaction_tasks() {
+            completed.push(task.execute(&dataset).await.unwrap());
+        }
+        assert!(!completed.is_empty());
+        let error = commit_compaction(
+            &mut dataset,
+            completed.clone(),
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &CompactionOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(error.to_string().contains("defer_index_remap"), "{error}");
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.version().version, version);
+        assert_answers(&dataset).await;
+
+        // Keeping the second compaction deferred must preserve every indexed row.
+        commit_compaction(
+            &mut dataset,
+            completed,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &deferred_options,
+        )
+        .await
+        .unwrap();
+        assert_answers(&dataset).await;
+
+        // Explicitly remap and trim the history to allow eager compaction again.
+        remapping::remap_column_index(&mut dataset, &[column], Some("test_idx".into()))
             .await
             .unwrap();
         cleanup_frag_reuse_index(&mut dataset).await.unwrap();
@@ -9037,6 +9194,7 @@ mod tests {
         compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
             .unwrap();
+        assert_answers(&dataset).await;
     }
 
     /// A table whose only index can never consume an eager remap (ZoneMap
