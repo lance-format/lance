@@ -22,7 +22,9 @@
 //! transparent).
 
 use arrow_buffer::ArrowNativeType;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result};
+use rayon::prelude::*;
 
 use std::str::FromStr;
 
@@ -164,7 +166,6 @@ pub trait BufferCompressor: std::fmt::Debug + Send + Sync {
 #[cfg(feature = "zstd")]
 mod zstd {
     use std::io::{Cursor, Write};
-    use std::sync::{Mutex, OnceLock};
 
     use super::*;
 
@@ -177,6 +178,26 @@ mod zstd {
         /// shared pool, so a per-thread context avoids both per-value context
         /// setup and cross-thread lock contention.
         static DECOMPRESSOR: RefCell<Option<Decompressor<'static>>> = const { RefCell::new(None) };
+        /// One compression context per thread, keyed by level, so pages compressed
+        /// on several threads do not serialize on a shared context.
+        static COMPRESSOR: RefCell<Option<(i32, Compressor<'static>)>> = const { RefCell::new(None) };
+    }
+
+    fn compress_frame_into(
+        level: i32,
+        input_buf: &[u8],
+        output_buf: &mut Vec<u8>,
+    ) -> std::io::Result<usize> {
+        COMPRESSOR.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().map(|(l, _)| *l) != Some(level) {
+                *slot = Some((level, Compressor::new(level)?));
+            }
+            slot.as_mut()
+                .expect("initialized above")
+                .1
+                .compress_to_buffer(input_buf, &mut append_cursor(output_buf))
+        })
     }
 
     /// Appends into `buf`'s spare capacity (reserved by the caller) without
@@ -219,7 +240,6 @@ mod zstd {
     /// contention.
     pub struct ZstdBufferCompressor {
         compression_level: i32,
-        compressor: OnceLock<std::result::Result<Mutex<Compressor<'static>>, String>>,
     }
 
     impl std::fmt::Debug for ZstdBufferCompressor {
@@ -232,21 +252,7 @@ mod zstd {
 
     impl ZstdBufferCompressor {
         pub fn new(compression_level: i32) -> Self {
-            Self {
-                compression_level,
-                compressor: OnceLock::new(),
-            }
-        }
-
-        fn get_compressor(&self) -> Result<&Mutex<Compressor<'static>>> {
-            self.compressor
-                .get_or_init(|| {
-                    Compressor::new(self.compression_level)
-                        .map(Mutex::new)
-                        .map_err(|e| e.to_string())
-                })
-                .as_ref()
-                .map_err(|e| Error::internal(format!("Failed to create zstd compressor: {}", e)))
+            Self { compression_level }
         }
 
         // https://datatracker.ietf.org/doc/html/rfc8878
@@ -327,10 +333,7 @@ mod zstd {
             output_buf.write_all(&(input_buf.len() as u64).to_le_bytes())?;
 
             output_buf.reserve(::zstd::zstd_safe::compress_bound(input_buf.len()));
-            self.get_compressor()?
-                .lock()
-                .unwrap()
-                .compress_to_buffer(input_buf, &mut append_cursor(output_buf))
+            compress_frame_into(self.compression_level, input_buf, output_buf)
                 .map_err(|e| Error::internal(format!("Zstd compression error: {}", e)))?;
             Ok(())
         }
@@ -718,17 +721,13 @@ impl CompressedBufferEncoder {
         offsets: &[T],
         compressed: &mut Vec<u8>,
     ) -> Result<LanceBuffer> {
-        let mut new_offsets: Vec<T> = Vec::with_capacity(offsets.len());
-        new_offsets.push(T::from_usize(0).unwrap());
-
-        for off in offsets.windows(2) {
-            let start = off[0].as_usize();
-            let end = off[1].as_usize();
-            self.compressor.compress(&data[start..end], compressed)?;
-            new_offsets.push(T::from_usize(compressed.len()).unwrap());
-        }
-
-        Ok(LanceBuffer::reinterpret_vec(new_offsets))
+        map_values(
+            data,
+            offsets,
+            compressed,
+            parallelism(offsets),
+            &|value, out| self.compressor.compress(value, out),
+        )
     }
 
     pub fn per_value_decompress<T: ArrowNativeType>(
@@ -737,22 +736,109 @@ impl CompressedBufferEncoder {
         offsets: &[T],
         decompressed: &mut Vec<u8>,
     ) -> Result<LanceBuffer> {
-        let mut new_offsets: Vec<T> = Vec::with_capacity(offsets.len());
-        new_offsets.push(T::from_usize(0).unwrap());
-
-        for off in offsets.windows(2) {
-            let start = off[0].as_usize();
-            let end = off[1].as_usize();
-            // Full-zip omits null payloads; LZ4 rejects empty input.
-            if start < end {
-                self.compressor
-                    .decompress(&data[start..end], decompressed)?;
+        map_values(data, offsets, decompressed, 1, &|value, out| {
+            if value.is_empty() {
+                Ok(())
+            } else {
+                self.compressor.decompress(value, out)
             }
-            new_offsets.push(T::from_usize(decompressed.len()).unwrap());
-        }
-
-        Ok(LanceBuffer::reinterpret_vec(new_offsets))
+        })
     }
+}
+
+/// Below this many input bytes a page's values are processed on the calling thread.
+const PARALLEL_MIN_BYTES: usize = 8 * 1024 * 1024;
+/// Each parallel chunk gets at least this many input bytes.
+const PARALLEL_MIN_CHUNK_BYTES: usize = 1024 * 1024;
+
+fn parallelism<T: ArrowNativeType>(offsets: &[T]) -> usize {
+    let total = match offsets {
+        [first, .., last] => last.as_usize() - first.as_usize(),
+        _ => 0,
+    };
+    if total < PARALLEL_MIN_BYTES {
+        return 1;
+    }
+    get_num_compute_intensive_cpus()
+        .min(total / PARALLEL_MIN_CHUNK_BYTES)
+        .max(1)
+}
+
+/// Appends the encoded form of one value to the output buffer.
+type ValueCodec<'a> = dyn Fn(&[u8], &mut Vec<u8>) -> Result<()> + Sync + 'a;
+
+/// Sized like the compute pool so `LANCE_CPU_THREADS` bounds per-value compression
+/// too; rayon's global pool would use every core.
+static CODEC_POOL: std::sync::LazyLock<rayon::ThreadPool> = std::sync::LazyLock::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(get_num_compute_intensive_cpus())
+        .thread_name(|i| format!("lance-codec-{i}"))
+        .build()
+        .expect("failed to build the per-value codec thread pool")
+});
+
+/// Applies `f` to every value delimited by `offsets`, appending the results to `output`
+/// in value order, and returns the output offsets. With `chunks > 1` the values are
+/// split into that many byte-balanced chunks processed on the rayon pool; the output
+/// is byte-identical to the sequential run because a per-value codec has no
+/// cross-value state.
+fn map_values<T: ArrowNativeType>(
+    data: &[u8],
+    offsets: &[T],
+    output: &mut Vec<u8>,
+    chunks: usize,
+    f: &ValueCodec<'_>,
+) -> Result<LanceBuffer> {
+    let mut new_offsets: Vec<T> = Vec::with_capacity(offsets.len());
+    new_offsets.push(T::from_usize(0).unwrap());
+    if offsets.len() < 2 {
+        return Ok(LanceBuffer::reinterpret_vec(new_offsets));
+    }
+    if chunks <= 1 {
+        for off in offsets.windows(2) {
+            f(&data[off[0].as_usize()..off[1].as_usize()], output)?;
+            new_offsets.push(T::from_usize(output.len()).unwrap());
+        }
+        return Ok(LanceBuffer::reinterpret_vec(new_offsets));
+    }
+    // Chunk boundaries are indices into `offsets`, balanced by input bytes.
+    let first = offsets[0].as_usize();
+    let total = offsets[offsets.len() - 1].as_usize() - first;
+    let target = (total / chunks).max(1);
+    let mut bounds = vec![0usize];
+    let mut next = first + target;
+    for (i, off) in offsets.iter().enumerate().take(offsets.len() - 1).skip(1) {
+        if off.as_usize() >= next {
+            bounds.push(i);
+            next = off.as_usize() + target;
+        }
+    }
+    bounds.push(offsets.len() - 1);
+    let parts: Vec<Result<(Vec<u8>, Vec<usize>)>> = CODEC_POOL.install(|| {
+        bounds
+            .par_windows(2)
+            .map(|w| {
+                let (lo, hi) = (w[0], w[1]);
+                let mut out = Vec::new();
+                let mut ends = Vec::with_capacity(hi - lo);
+                for off in offsets[lo..=hi].windows(2) {
+                    f(&data[off[0].as_usize()..off[1].as_usize()], &mut out)?;
+                    ends.push(out.len());
+                }
+                Ok((out, ends))
+            })
+            .collect()
+    });
+    for part in parts {
+        let (out, ends) = part?;
+        let base = output.len();
+        output.extend_from_slice(&out);
+        new_offsets.extend(
+            ends.into_iter()
+                .map(|end| T::from_usize(base + end).unwrap()),
+        );
+    }
+    Ok(LanceBuffer::reinterpret_vec(new_offsets))
 }
 
 impl PerValueCompressor for CompressedBufferEncoder {
@@ -883,6 +969,44 @@ mod tests {
     use std::str::FromStr;
 
     use crate::encodings::physical::block::zstd::ZstdBufferCompressor;
+
+    #[test]
+    fn test_per_value_parallel_matches_sequential() {
+        let encoder = CompressedBufferEncoder::default();
+        // 4096 values of ~4 KiB (16 MiB total) cross PARALLEL_MIN_BYTES.
+        let mut data = Vec::new();
+        let mut offsets = vec![0u32];
+        for i in 0..4096u32 {
+            let len = if i % 7 == 0 {
+                0
+            } else {
+                4000 + (i % 200) as usize
+            };
+            data.extend((0..len).map(|j| ((i as usize * 31 + j * 7) % 251) as u8));
+            offsets.push(data.len() as u32);
+        }
+        let mut seq = Vec::new();
+        let seq_offsets = map_values(&data, &offsets, &mut seq, 1, &|v, out| {
+            encoder.compressor.compress(v, out)
+        })
+        .unwrap();
+        let mut par = Vec::new();
+        let par_offsets = map_values(&data, &offsets, &mut par, 8, &|v, out| {
+            encoder.compressor.compress(v, out)
+        })
+        .unwrap();
+        assert_eq!(seq, par);
+        assert_eq!(seq_offsets, par_offsets);
+        let mut back = Vec::new();
+        let back_offsets = encoder
+            .per_value_decompress(&par, &par_offsets.borrow_to_typed_slice::<u32>(), &mut back)
+            .unwrap();
+        assert_eq!(back, data);
+        assert_eq!(
+            back_offsets.borrow_to_typed_slice::<u32>().as_ref(),
+            offsets.as_slice()
+        );
+    }
 
     #[test]
     fn test_compression_scheme_from_str() {
