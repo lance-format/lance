@@ -4297,6 +4297,7 @@ dependencies = [
  "io-uring",
  "lance-core",
  "lance-namespace",
+ "libc",
  "log",
  "metrics",
  "moka",

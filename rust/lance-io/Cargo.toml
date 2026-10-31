@@ -52,6 +52,7 @@ reqsign-google = { version = "3.0.3", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { workspace = true }
+libc.workspace = true
 
 [target.'cfg(target_family = "unix")'.dependencies]
 nix = { version = "0.31.3", default-features = false, features = ["fs"] }
