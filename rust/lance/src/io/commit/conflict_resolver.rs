@@ -1359,17 +1359,26 @@ impl<'a> TransactionRebase<'a> {
                     // the rewritten rows under their old fragments. On an untagged table
                     // the remap was deferred if the rewrite carries a reuse update
                     // (visible only in the process that committed it) or the latest
-                    // reuse index records it.
+                    // reuse index records it. On a stable-row-id table only the latest
+                    // reuse index counts: a cleanup there may have trimmed the record
+                    // since, leaving an index built before the rewrite nothing to
+                    // translate through.
                     // A frag_reuse_index cleanup is checked against the latest entry in
                     // `finish_create_index`. A tagged entry (an in-process rewrite on a
                     // tagged history) takes the durable-evidence path below instead.
-                    let deferred = frag_reuse_index
+                    let is_recorded = self
+                        .untagged_reuse
                         .as_ref()
-                        .is_some_and(|entry| !is_tagged(entry))
-                        || self
-                            .untagged_reuse
-                            .as_ref()
-                            .is_some_and(|reuse| reuse.records(groups));
+                        .is_some_and(|reuse| reuse.records(groups));
+                    let has_stable_row_ids = self
+                        .untagged_reuse
+                        .as_ref()
+                        .is_some_and(|reuse| reuse.manifest.uses_stable_row_ids());
+                    let deferred = is_recorded
+                        || (!has_stable_row_ids
+                            && frag_reuse_index
+                                .as_ref()
+                                .is_some_and(|entry| !is_tagged(entry)));
                     if deferred {
                         if let Some(reuse) = &self.untagged_reuse
                             && !reuse.withdraw_folded_overlays(groups, new_indices)
@@ -1406,8 +1415,8 @@ impl<'a> TransactionRebase<'a> {
                             .iter()
                             .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
                         {
-                            // this should not happen today since we don't support committing
-                            // a mixture of frag_reuse_index and other indices.
+                            // A frag_reuse_index replacement mixed with other indices is a
+                            // shape this resolver does not reason about, so refuse it.
                             if new_indices.len() != 1 || removed_indices.len() != 1 {
                                 return Err(self
                                     .incompatible_conflict_err(other_transaction, other_version));
@@ -1741,9 +1750,9 @@ impl<'a> TransactionRebase<'a> {
                         // cleanup trim); `finish_rewrite` works from the
                         // CURRENT manifest entry every attempt.
                         (Some(_), true) => {
-                            // An FRI replacement commits alone. A CreateIndex
-                            // mixing it with user indices is a shape this
-                            // resolver does not reason about (the user-index
+                            // A cleanup commits an FRI replacement alone. A
+                            // CreateIndex mixing it with user indices is a shape
+                            // this resolver does not reason about (the user-index
                             // straddle check below never runs for it), so
                             // refuse it instead of guessing.
                             if new_indices.len() != 1 || removed_indices.len() != 1 {
@@ -1811,8 +1820,8 @@ impl<'a> TransactionRebase<'a> {
                         }
                         // Rewrite with remapping and frag_reuse_index creation can commit without conflict
                         (Some(_), false) => {
-                            // this should not happen today since we don't support committing
-                            // a mixture of frag_reuse_index and other indices.
+                            // As above, a replacement mixed with other indices is
+                            // refused rather than reasoned about.
                             if new_indices.len() != 1 || removed_indices.len() != 1 {
                                 Err(self
                                     .incompatible_conflict_err(other_transaction, other_version))
