@@ -547,6 +547,10 @@ impl ScalarIndex for BloomFilterIndex {
         true
     }
 
+    fn can_remap(&self) -> bool {
+        false
+    }
+
     async fn remap(
         &self,
         _mapping: &RowAddrRemap,

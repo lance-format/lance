@@ -1070,7 +1070,7 @@ mod tests {
         assert!(!metadata.can_follow_stable_row_ids());
         assert!(
             metadata.supports_eager_remap(),
-            "BitmapIndex and LabelListIndex both support can_remap(), same as BTree"
+            "BitmapIndex and LabelListIndex both support remapping, same as BTree"
         );
     }
 

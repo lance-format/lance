@@ -1296,6 +1296,10 @@ impl ScalarIndex for BitmapIndex {
             .boxed())
     }
 
+    fn can_remap(&self) -> bool {
+        true
+    }
+
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,

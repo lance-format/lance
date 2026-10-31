@@ -1656,6 +1656,10 @@ impl ScalarIndex for FMIndexScalarIndex {
         true
     }
 
+    fn can_remap(&self) -> bool {
+        false
+    }
+
     async fn remap(&self, _: &RowAddrRemap, _: &dyn IndexStore) -> Result<CreatedIndex> {
         Err(Error::not_supported("Fm does not support remap"))
     }

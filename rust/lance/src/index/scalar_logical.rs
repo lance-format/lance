@@ -232,6 +232,10 @@ impl ScalarIndex for LogicalScalarIndex {
         self.segments[0].results_are_row_addresses()
     }
 
+    fn can_remap(&self) -> bool {
+        false
+    }
+
     async fn remap(
         &self,
         _mapping: &RowAddrRemap,

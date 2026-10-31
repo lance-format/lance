@@ -73,6 +73,9 @@ impl ScalarIndex for LegacyOnlyIndex {
     async fn search(&self, _: &dyn AnyQuery, _: &dyn MetricsCollector) -> Result<SearchResult> {
         unimplemented!()
     }
+    fn can_remap(&self) -> bool {
+        true
+    }
     async fn remap(&self, mapping: &RowAddrRemap, _: &dyn IndexStore) -> Result<CreatedIndex> {
         self.remaps
             .lock()

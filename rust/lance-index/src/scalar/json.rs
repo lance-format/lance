@@ -176,6 +176,11 @@ impl ScalarIndex for JsonIndex {
         self.target_index.results_are_row_addresses()
     }
 
+    #[allow(deprecated)]
+    fn can_remap(&self) -> bool {
+        self.target_index.can_remap()
+    }
+
     async fn remap(
         &self,
         mapping: &RowAddrRemap,
@@ -1134,14 +1139,44 @@ impl BasicTrainer for JsonIndexPlugin {
 #[async_trait]
 impl ScalarIndexPlugin for JsonIndexPlugin {
     fn can_remap(&self, details: &prost_types::Any) -> Result<bool> {
-        let details = crate::pb::JsonIndexDetails::decode(details.value.as_slice())?;
-        let target_details = details
-            .target_details
-            .as_ref()
-            .ok_or_else(|| Error::invalid_input("JSON index details are missing target_details"))?;
-        self.registry()?
-            .get_plugin_by_details(target_details)?
-            .can_remap(target_details)
+        let details = match crate::pb::JsonIndexDetails::decode(details.value.as_slice()) {
+            Ok(details) => details,
+            Err(error) => {
+                log::warn!(
+                    "Cannot determine whether a JSON index supports remapping because its \
+                     details cannot be decoded: {error}"
+                );
+                return Ok(false);
+            }
+        };
+        let Some(target_details) = details.target_details.as_ref() else {
+            log::warn!(
+                "Cannot determine whether a JSON index supports remapping because its details \
+                 are missing target_details"
+            );
+            return Ok(false);
+        };
+        let registry = self.registry()?;
+        let target_plugin = match registry.get_plugin_by_details(target_details) {
+            Ok(plugin) => plugin,
+            Err(error) => {
+                log::warn!(
+                    "Cannot determine whether a JSON index supports remapping because its \
+                     target plugin cannot be found: {error}"
+                );
+                return Ok(false);
+            }
+        };
+        match target_plugin.can_remap(target_details) {
+            Ok(can_remap) => Ok(can_remap),
+            Err(error) => {
+                log::warn!(
+                    "Cannot determine whether a JSON index supports remapping because its \
+                     target plugin cannot answer: {error}"
+                );
+                Ok(false)
+            }
+        }
     }
 
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
@@ -1443,17 +1478,15 @@ mod tests {
     }
 
     #[rstest]
-    #[case::missing_target(None, "missing target_details")]
+    #[case::missing_target(None)]
     #[case::unknown_target(
         Some(prost_types::Any {
             type_url: "type.googleapis.com/example.UnknownIndexDetails".to_string(),
             value: Vec::new(),
-        }),
-        "No scalar index plugin found"
+        })
     )]
-    fn test_json_can_remap_rejects_invalid_target(
+    fn test_json_can_remap_defaults_to_false_for_invalid_target(
         #[case] target_details: Option<prost_types::Any>,
-        #[case] message: &str,
     ) {
         let registry = IndexPluginRegistry::with_default_plugins();
         let plugin = registry.get_plugin_by_name("json").unwrap();
@@ -1464,9 +1497,19 @@ mod tests {
         })
         .unwrap();
 
-        let error = plugin.can_remap(&details).unwrap_err();
-        assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains(message), "{error}");
+        assert!(!plugin.can_remap(&details).unwrap());
+    }
+
+    #[test]
+    fn test_json_can_remap_defaults_to_false_for_malformed_details() {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let details = prost_types::Any {
+            type_url: String::new(),
+            value: b"not a json index".to_vec(),
+        };
+
+        assert!(!plugin.can_remap(&details).unwrap());
     }
 
     #[test]

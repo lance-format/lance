@@ -143,7 +143,12 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     ///
     /// This check must not read index files. It describes physical index segments,
     /// not query-time wrappers that combine multiple segments. Details must belong
-    /// to this plugin; malformed details needed to determine support return an error.
+    /// to this plugin.
+    ///
+    /// The default returns `true`, which keeps plugins written before this method
+    /// existed on the existing load-and-check path. Implementations should return
+    /// `Ok(false)` when they can determine the index cannot be remapped, or when
+    /// support cannot be determined safely; an error can prevent maintenance.
     ///
     /// ```
     /// # fn example(details: &prost_types::Any) -> lance_core::Result<bool> {
@@ -152,7 +157,9 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// plugin.can_remap(details)
     /// # }
     /// ```
-    fn can_remap(&self, details: &prost_types::Any) -> Result<bool>;
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(true)
+    }
 
     /// The version of the index plugin
     ///

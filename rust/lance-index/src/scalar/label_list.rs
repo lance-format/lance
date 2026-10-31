@@ -322,6 +322,10 @@ impl ScalarIndex for LabelListIndex {
         self.values_index.results_are_row_addresses()
     }
 
+    fn can_remap(&self) -> bool {
+        true
+    }
+
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,

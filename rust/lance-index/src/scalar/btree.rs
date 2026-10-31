@@ -3144,6 +3144,10 @@ impl ScalarIndex for BTreeIndex {
         self.results_are_row_addresses
     }
 
+    fn can_remap(&self) -> bool {
+        true
+    }
+
     async fn remap(
         &self,
         mapping: &RowAddrRemap,

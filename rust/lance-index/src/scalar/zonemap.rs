@@ -1072,6 +1072,10 @@ impl ScalarIndex for ZoneMapIndex {
         true
     }
 
+    fn can_remap(&self) -> bool {
+        false
+    }
+
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,

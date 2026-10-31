@@ -2125,6 +2125,13 @@ pub(crate) async fn remap_index(
             let scalar_index = dataset
                 .open_scalar_index(&field_path, index_id, &NoOpMetricsCollector)
                 .await?;
+            // Keep the deprecated instance-level check for external indexes
+            // written before ScalarIndexPlugin::can_remap existed. The plugin
+            // capability below covers built-ins and new implementations.
+            #[allow(deprecated)]
+            if !scalar_index.can_remap() {
+                return Ok(RemapResult::Drop);
+            }
             let details = fetch_index_details(dataset, &field_path, matched).await?;
             if !IndexDetails(details.clone())
                 .get_plugin()?

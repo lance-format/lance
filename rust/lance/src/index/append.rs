@@ -982,11 +982,19 @@ async fn merge_scalar_indices<'a>(
         None => split_segment_coverage(dataset.as_ref(), selected_old_indices.iter().copied()),
     };
 
-    let reference_details =
-        fetch_index_details(dataset.as_ref(), field_path, reference_idx).await?;
-    let is_remappable = IndexDetails(reference_details.clone())
-        .get_plugin()?
-        .can_remap(reference_details.as_ref())?;
+    // Keep honoring the deprecated instance-level check for external plugins
+    // that predate ScalarIndexPlugin::can_remap. Short-circuit so their `false`
+    // never reaches the metadata check or a remap attempt.
+    #[allow(deprecated)]
+    let is_remappable = if reference_index.can_remap() {
+        let reference_details =
+            fetch_index_details(dataset.as_ref(), field_path, reference_idx).await?;
+        IndexDetails(reference_details.clone())
+            .get_plugin()?
+            .can_remap(reference_details.as_ref())?
+    } else {
+        false
+    };
 
     // A remapping merge is stamped with the manifest it read (below): its sources were
     // translated through the fragment-reuse index, so the trim may retire the versions they
