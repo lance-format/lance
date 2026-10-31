@@ -81,6 +81,8 @@ lance_core::target_kernel! {
     }
 }
 
+// `CpuFeatures` detects host features only on x86_64, so a 32-bit x86 build
+// would never select an AVX2 candidate; it uses the scalar kernel instead.
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use std::arch::x86_64::*;
@@ -90,29 +92,27 @@ mod x86 {
     lance_core::target_kernel! {
         #[target_features("avx2")]
         #[candidate(pub(super) FLIP_SIGNS_AVX2: FlipSignsFn)]
-        /// Vectorized `flip_signs_scalar`: consume 8 f32 values per AVX2 lane.
-        /// The sign mask is expanded from one byte to 8 lane-wise sign-bit masks.
         fn flip_signs_avx2(values: &mut [f32], signs: &[u8]) {
+            // Vectorized variant of `flip_signs_scalar`: consume 8 f32 values per AVX2 lane.
+            // The sign mask is expanded from one byte to 8 lane-wise sign-bit masks.
+            let full_chunks = values.len() / 8;
             let bit_select = _mm256_setr_epi32(0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80);
             let sign_flip = _mm256_set1_epi32(0x80000000u32 as i32);
 
-            let (chunks, _) = values.as_chunks_mut::<8>();
-            let full_chunks = chunks.len();
-            for (chunk, &mask) in chunks.iter_mut().zip(signs) {
-                let mask_bits = _mm256_set1_epi32(mask as i32);
+            for (chunk_idx, &mask) in signs.iter().take(full_chunks).enumerate() {
+                let mask = mask as i32;
+                let mask_bits = _mm256_set1_epi32(mask);
                 let test = _mm256_and_si256(mask_bits, bit_select);
                 let cmp = _mm256_cmpeq_epi32(test, bit_select);
                 let xor_mask = _mm256_and_si256(cmp, sign_flip);
 
-                // SAFETY: `chunk` holds exactly 8 floats.
-                unsafe {
-                    let vec = _mm256_loadu_ps(chunk.as_ptr());
-                    let out = _mm256_xor_ps(vec, _mm256_castsi256_ps(xor_mask));
-                    _mm256_storeu_ps(chunk.as_mut_ptr(), out);
-                }
+                let ptr = unsafe { values.as_mut_ptr().add(chunk_idx * 8) };
+                let vec = unsafe { _mm256_loadu_ps(ptr) };
+                let out = _mm256_xor_ps(vec, _mm256_castsi256_ps(xor_mask));
+                unsafe { _mm256_storeu_ps(ptr, out) };
             }
 
-            if full_chunks * 8 < values.len() && full_chunks < signs.len() {
+            if full_chunks * 8 < values.len() {
                 flip_signs_scalar(&mut values[full_chunks * 8..], &signs[full_chunks..]);
             }
         }
