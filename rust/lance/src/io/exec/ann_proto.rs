@@ -677,12 +677,24 @@ mod tests {
     #[tokio::test]
     async fn test_sub_index_proto_roundtrip_scalar_index_query() {
         let (dataset, _dir) = make_indexed_dataset().await;
-        let scalar_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-            "result",
-            arrow_schema::DataType::Binary,
-            true,
-        )]));
-        let prefilter_plan = make_dummy_prefilter_plan(scalar_schema.clone());
+        let format = lance_select::result::IndexExprResultWireFormat::ThreeVariant;
+        let prefilter_plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+            Arc::new(super::super::prefilter_union::PrefilterUnionExec::new(
+                dataset.clone(),
+                make_dummy_prefilter_plan(format.schema().clone()),
+                None,
+                dataset
+                    .fragments()
+                    .iter()
+                    .map(|fragment| fragment.id as u32)
+                    .collect(),
+                dataset
+                    .fragments()
+                    .iter()
+                    .map(|fragment| fragment.id as u32)
+                    .collect(),
+                format,
+            ));
         let exec = build_sub_index_exec(
             &dataset,
             PreFilterSource::ScalarIndexQuery(prefilter_plan.clone()),
@@ -706,7 +718,7 @@ mod tests {
             proto,
             Some(dataset.clone()),
             input,
-            Some(make_dummy_prefilter_plan(scalar_schema)),
+            Some(prefilter_plan.clone()),
         )
         .await
         .unwrap();
@@ -714,6 +726,9 @@ mod tests {
             back.prefilter_source(),
             PreFilterSource::ScalarIndexQuery(_)
         ));
+        if let PreFilterSource::ScalarIndexQuery(child) = back.prefilter_source() {
+            assert!(Arc::ptr_eq(child, &prefilter_plan));
+        }
     }
 
     #[tokio::test]
