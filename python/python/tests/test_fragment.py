@@ -597,10 +597,33 @@ def test_fragment_pyarrow_expression_filter(tmp_path: Path, ignored_scalar_indic
         ignored_scalar_indices is None
     )
     assert scanner.to_table()["id"].to_pylist() == [1]
-    assert fragment.to_table(filter=expression)["id"].to_pylist() == [1]
+    assert fragment.to_table(
+        filter=expression, ignored_scalar_indices=ignored_scalar_indices
+    )["id"].to_pylist() == [1]
     assert fragment.to_table(filter=pc.field("s").isin(["C:\\temp"]))[
         "id"
     ].to_pylist() == [0]
+
+
+def test_fragment_to_table_preserves_positional_arguments(tmp_path: Path):
+    data = pa.table({"id": [0, 1, 2], "s": ["C:\\temp", "plain", "other"]})
+    dataset = write_dataset(data, tmp_path, max_rows_per_file=2)
+    dataset.create_scalar_index("s", "BTREE", name="s_btree")
+    fragment = dataset.get_fragments()[0]
+
+    table = fragment.to_table(
+        None,
+        pc.field("s") != "C:\\temp",
+        None,
+        None,
+        False,
+        False,
+        None,
+        None,
+        None,
+        1 << 20,
+    )
+    assert table["id"].to_pylist() == [1]
 
 
 @pytest.mark.parametrize("enable_stable_row_ids", [False, True])
