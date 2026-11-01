@@ -1648,7 +1648,7 @@ fn build_chunk_index(
         }
         let stride = repetition_index_depth as usize + 1;
         let (row_starts, has_trailer) = parse_nested_rep(rep_index_data, stride);
-        if row_starts.num_chunks() != num_chunks || has_trailer.len() != num_chunks {
+        if row_starts.num_chunks() != num_chunks || has_trailer.len() != num_chunks.div_ceil(8) {
             return Err(Error::corrupt_file_named(
                 "miniblock_metadata",
                 format!(
@@ -1668,17 +1668,12 @@ fn build_chunk_index(
                 last_chunk_values: value_counts.last_chunk_values,
             }
         };
-        RowMapping::Nested {
-            row_starts,
-            has_trailer,
-            item_counts,
-        }
+        RowMapping::nested(row_starts, has_trailer, item_counts)
     } else {
         if value_counts.uniform {
             RowMapping::UniformFlat {
                 values_per_chunk: value_counts.values_per_chunk,
                 last_chunk_values: value_counts.last_chunk_values,
-                num_chunks,
             }
         } else {
             let value_starts = PrefixSums::from_deltas(
@@ -1868,7 +1863,7 @@ mod tests {
     use bytes::Bytes;
     #[cfg(feature = "bitpacking")]
     use lance_bitpacking::BitPacking;
-    use lance_core::cache::{Context, DeepSizeOf};
+    use lance_core::cache::DeepSizeOf;
     use rstest::rstest;
 
     use crate::buffer::LanceBuffer;
@@ -2947,28 +2942,34 @@ mod tests {
     #[test]
     fn test_deep_size_per_variant_below_legacy() {
         // The previous representation cached 48 bytes per chunk (24 for ChunkMeta plus
-        // 24 for a rep-index block); every variant's heap must be well below that.
+        // 24 for a rep-index block), plus two inline Vec headers.
         const LEGACY_PER_CHUNK: usize = 48;
+        const LEGACY_FIXED_SIZE: usize = 2 * std::mem::size_of::<Vec<[u64; 3]>>();
         let num_chunks = 3;
-        let heap = |index: &MiniBlockChunkIndex| index.deep_size_of_children(&mut Context::new());
+        let legacy_size = LEGACY_FIXED_SIZE + LEGACY_PER_CHUNK * num_chunks;
+        let size = |index: &MiniBlockChunkIndex| index.deep_size_of();
 
         let (uniform_words, uniform_dbs) = words_from(&[(2, 8), (2, 8), (0, 8)]);
         let uniform = build_chunk_index(&uniform_words, 10, 0, uniform_dbs, None, 0).unwrap();
         assert_eq!(uniform.row_mapping_debug(), "uniform_flat");
-        assert!(heap(&uniform) < LEGACY_PER_CHUNK * num_chunks);
+        assert!(size(&uniform) < legacy_size);
 
         let (flat_words, flat_dbs) = words_from(&[(3, 8), (1, 8), (0, 8)]);
         let flat = build_chunk_index(&flat_words, 11, 0, flat_dbs, None, 0).unwrap();
         assert_eq!(flat.row_mapping_debug(), "flat");
-        assert!(heap(&flat) < LEGACY_PER_CHUNK * num_chunks);
+        assert!(size(&flat) < legacy_size);
         // Flat carries a value-starts array that UniformFlat derives arithmetically.
-        assert!(heap(&flat) > heap(&uniform));
+        assert!(size(&flat) > size(&uniform));
 
         let rep = rep_bytes_from(&[4, 0, 3, 0, 3, 0]);
         let (nested_words, nested_dbs) = words_from(&[(2, 8), (2, 8), (0, 8)]);
         let nested = build_chunk_index(&nested_words, 10, 0, nested_dbs, Some(&rep), 1).unwrap();
         assert_eq!(nested.row_mapping_debug(), "nested");
-        assert!(heap(&nested) < LEGACY_PER_CHUNK * num_chunks);
+        let nested_size = size(&nested);
+        assert!(
+            nested_size < legacy_size,
+            "nested index uses {nested_size} bytes, legacy uses {legacy_size}"
+        );
     }
 
     #[test]
