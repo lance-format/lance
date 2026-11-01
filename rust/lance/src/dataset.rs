@@ -166,8 +166,8 @@ pub use schema_evolution::{
 pub use take::TakeBuilder;
 use uuid::Uuid;
 pub use write::merge_insert::{
-    MergeInsertBuilder, MergeInsertJob, MergeInsertWriteMode, MergeStats, UncommittedMergeInsert,
-    WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
+    MergeInsertBuilder, MergeInsertJob, MergeInsertWriteMode, MergeStats, SourceDedupeBehavior,
+    UncommittedMergeInsert, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
 };
 
 use crate::dataset::index::LanceIndexStoreExt;
