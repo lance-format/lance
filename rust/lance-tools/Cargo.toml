@@ -18,11 +18,26 @@ path = "src/main.rs"
 [dependencies]
 chrono.workspace = true
 clap = { workspace = true, features = ["derive"] }
+futures.workspace = true
+lance.workspace = true
 lance-core.workspace = true
 lance-file.workspace = true
 lance-io.workspace = true
 lance-table.workspace = true
 object_store.workspace = true
 prost.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+arrow-array.workspace = true
+lance-datagen.workspace = true
+rstest.workspace = true
+tempfile.workspace = true
+
+[features]
+aws = ["lance/aws"]
+azure = ["lance/azure"]
+gcp = ["lance/gcp"]
+tos = ["lance/tos"]
