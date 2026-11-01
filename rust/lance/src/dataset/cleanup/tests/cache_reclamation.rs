@@ -24,8 +24,7 @@ async fn cleanup_evicts_stale_version_caches() {
     use crate::session::Session;
     use lance_index::optimize::OptimizeOptions;
 
-    let tmpdir = TempStrDir::default();
-    let dataset_path = format!("{}/my_db", tmpdir.as_str());
+    let dataset_path = "shared-memory://cleanup_cache_reclamation";
     // Large capacity so nothing is evicted by the normal capacity-based
     // policy during this test -- any shrinkage we observe must come from
     // cleanup's explicit invalidation, not incidental LRU eviction.
@@ -38,7 +37,7 @@ async fn cleanup_evicts_stale_version_caches() {
     // v1: create the dataset.
     Dataset::write(
         some_batch(),
-        &dataset_path,
+        dataset_path,
         Some(WriteParams {
             session: Some(session.clone()),
             mode: WriteMode::Create,
@@ -51,7 +50,7 @@ async fn cleanup_evicts_stale_version_caches() {
     // v2: build a vector index -- a real, separate commit whose
     // transaction carries non-empty index metadata, inserting a genuine
     // `IndexMetadataKey` entry into the index cache.
-    let mut dataset = DatasetBuilder::from_uri(&dataset_path)
+    let mut dataset = DatasetBuilder::from_uri(dataset_path)
         .with_session(session.clone())
         .load()
         .await
@@ -74,7 +73,7 @@ async fn cleanup_evicts_stale_version_caches() {
     for _ in 0..NUM_APPENDS_BEFORE_OPTIMIZE {
         Dataset::write(
             some_batch(),
-            &dataset_path,
+            dataset_path,
             Some(WriteParams {
                 session: Some(session.clone()),
                 mode: WriteMode::Append,
@@ -89,7 +88,7 @@ async fn cleanup_evicts_stale_version_caches() {
     // Another real commit with non-empty index metadata -- a second,
     // distinct `IndexMetadataKey` entry, at a version that will itself
     // become stale once more commits follow.
-    let mut dataset = DatasetBuilder::from_uri(&dataset_path)
+    let mut dataset = DatasetBuilder::from_uri(dataset_path)
         .with_session(session.clone())
         .load()
         .await
@@ -104,7 +103,7 @@ async fn cleanup_evicts_stale_version_caches() {
     for _ in 0..NUM_APPENDS_AFTER_OPTIMIZE {
         Dataset::write(
             some_batch(),
-            &dataset_path,
+            dataset_path,
             Some(WriteParams {
                 session: Some(session.clone()),
                 mode: WriteMode::Append,
@@ -115,22 +114,15 @@ async fn cleanup_evicts_stale_version_caches() {
         .unwrap();
     }
 
-    let metadata_before = session.metadata_cache_stats().await;
-    let index_before = session.index_cache_stats().await;
-    let expected_rows = {
-        let dataset = DatasetBuilder::from_uri(&dataset_path)
-            .with_session(session.clone())
-            .load()
-            .await
-            .unwrap();
-        dataset.count_rows(None).await.unwrap()
-    };
-
-    let dataset = DatasetBuilder::from_uri(&dataset_path)
+    let dataset = DatasetBuilder::from_uri(dataset_path)
         .with_session(session.clone())
         .load()
         .await
         .unwrap();
+    let expected_rows = dataset.count_rows(None).await.unwrap();
+
+    let metadata_before = session.metadata_cache_stats().await;
+    let index_before = session.index_cache_stats().await;
     cleanup_old_versions(
         &dataset,
         CleanupPolicy {
@@ -148,7 +140,7 @@ async fn cleanup_evicts_stale_version_caches() {
 
     // The surviving dataset must still be fully readable after the
     // invalidation: evicting stale versions must not touch live entries.
-    let dataset = DatasetBuilder::from_uri(&dataset_path)
+    let dataset = DatasetBuilder::from_uri(dataset_path)
         .with_session(session.clone())
         .load()
         .await
