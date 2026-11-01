@@ -31,6 +31,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
+    use object_store::ObjectStoreExt as _;
     use opendal::raw::oio;
     use opendal::raw::{
         OpCopy, OpCreateDir, OpList, OpPresign, OpRead, OpRename, OpStat, OpWrite, RpCreateDir,
@@ -206,6 +207,21 @@ mod tests {
     fn build_test_operator(service: RetryTestService, max_retries: usize) -> Operator {
         let operator = Operator::from_parts(OperationContext::default(), Arc::new(service));
         finish_opendal_operator(operator, max_retries)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_opendal_store_retries_temporary_stat() {
+        let service = RetryTestService::new(2, true);
+        let store = crate::object_store::opendal_store::OpendalStore::new(build_test_operator(
+            service.clone(),
+            3,
+        ));
+
+        store
+            .head(&object_store::path::Path::from("file"))
+            .await
+            .expect("head should succeed after retries");
+        assert_eq!(service.stat_attempts(), 3);
     }
 
     #[derive(Debug)]
