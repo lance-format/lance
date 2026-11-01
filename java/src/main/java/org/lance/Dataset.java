@@ -1204,8 +1204,9 @@ public class Dataset implements Closeable {
   /**
    * Creates a new index on the dataset.
    *
-   * <p>Concurrent {@link #createIndex} / {@link #mergeIndexMetadata} calls on the same Dataset
-   * handle are serialized.
+   * <p>Concurrent {@link #createIndex} / {@link #mergeIndexMetadata} calls that commit on the same
+   * Dataset handle are serialized. Uncommitted builds (with fragment ids, or a BTree build from
+   * preprocessed data) only read this handle's snapshot and may run concurrently.
    *
    * @param options options for building index
    * @return the metadata of the created index
@@ -1222,8 +1223,8 @@ public class Dataset implements Closeable {
    * callback must be thread-safe because Lance may invoke it concurrently from native runtime
    * threads. Callbacks may re-enter read-only methods on this Dataset. Conflicting write re-entry
    * from a callback is rejected; unrelated concurrent callers keep their normal wait behavior.
-   * Concurrent {@link #createIndex} / {@link #mergeIndexMetadata} calls on the same Dataset handle
-   * are serialized.
+   * Concurrent {@link #createIndex} / {@link #mergeIndexMetadata} calls that commit on the same
+   * Dataset handle are serialized; uncommitted builds may run concurrently.
    *
    * <pre>{@code
    * Index index = dataset.createIndex(options, new IndexBuildProgress() {
@@ -1249,7 +1250,15 @@ public class Dataset implements Closeable {
     }
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      acquireIndexBuildLock();
+      // Uncommitted builds only read this handle's snapshot and never publish a new version, so
+      // they skip the build lock. Mirrors skip_commit in the JNI layer.
+      boolean commits =
+          !options.getFragmentIds().isPresent()
+              && !(options.getIndexType() == IndexType.BTREE
+                  && options.getPreprocessedData().isPresent());
+      if (commits) {
+        acquireIndexBuildLock();
+      }
       try {
         if (progress == null) {
           return nativeCreateIndex(
@@ -1275,7 +1284,9 @@ public class Dataset implements Closeable {
             options.getPreprocessedData().map(ArrowArrayStream::memoryAddress),
             new ContextIndexBuildProgress(this, progress));
       } finally {
-        indexBuildLock.unlock();
+        if (commits) {
+          indexBuildLock.unlock();
+        }
       }
     }
   }
@@ -1345,7 +1356,7 @@ public class Dataset implements Closeable {
    *
    * <p>Callback re-entry semantics match {@link #createIndex(IndexOptions, IndexBuildProgress)}:
    * read-only Dataset methods are allowed, conflicting write re-entry is rejected, and concurrent
-   * create/merge builds on this handle are serialized.
+   * committing create/merge builds on this handle are serialized.
    *
    * @param indexUUID shared UUID used by the distributed index parts
    * @param indexType type of index metadata to merge
@@ -1988,6 +1999,8 @@ public class Dataset implements Closeable {
   // ===== BlobFile / Blob dataset entry points (JNI) =====
   private native List<BlobFile> nativeTakeBlobs(List<Long> rowIds, String column);
 
+  private native List<BlobFile> nativeTakeBlobsByAddresses(List<Long> rowAddresses, String column);
+
   private native List<BlobFile> nativeTakeBlobsByIndices(List<Long> rowIndices, String column);
 
   private static void checkReadBufferSize(long bufferSize) {
@@ -2022,7 +2035,10 @@ public class Dataset implements Closeable {
    * with Rust/Python.
    *
    * <p>Pass logical row IDs read from {@code _rowid}, not physical row addresses from {@code
-   * _rowaddr}.
+   * _rowaddr}. Use {@link #takeBlobsByAddresses(List, String)} for physical addresses.
+   *
+   * <p>Results preserve request order and duplicates. Valid empty blobs have size zero. Missing or
+   * deleted row IDs fail the entire call.
    *
    * <pre>{@code
    * long rowId = 42L; // Example value from the _rowid column.
@@ -2065,7 +2081,87 @@ public class Dataset implements Closeable {
   }
 
   /**
+   * Open {@link BlobFile} handles for physical row addresses on a blob column.
+   *
+   * <p>Pass addresses read from {@code _rowaddr} in this dataset snapshot. Each address encodes
+   * {@code (fragmentId << 32) | rowOffset}; the {@code long} carries the unsigned 64-bit bit
+   * pattern unchanged. Addresses can change after compaction. Use {@link #takeBlobs(List, String)}
+   * for logical {@code _rowid} values or {@link #takeBlobsByIndices(List, String)} for row offsets
+   * in dataset order.
+   *
+   * <p>Results preserve request order and duplicates. Null blobs produce null list elements; valid
+   * empty blobs produce handles with size zero. Missing or deleted addresses fail the entire call.
+   * Callers must close every non-null handle.
+   *
+   * <pre>{@code
+   * List<BlobFile> blobs = dataset.takeBlobsByAddresses(List.of(rowAddress), "images");
+   * for (BlobFile blob : blobs) {
+   *   if (blob != null) {
+   *     try (BlobFile file = blob) {
+   *       byte[] data = file.read();
+   *     }
+   *   }
+   * }
+   * }</pre>
+   *
+   * @param rowAddresses non-empty list of physical addresses from the {@code _rowaddr} column
+   * @param column blob column name
+   * @return one element per requested address, including duplicates and null blobs
+   * @throws IllegalArgumentException if the dataset is closed, the selector list is null, empty, or
+   *     contains null, or the column name is null or empty
+   */
+  public List<BlobFile> takeBlobsByAddresses(List<Long> rowAddresses, String column) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      Preconditions.checkArgument(
+          rowAddresses != null && !rowAddresses.isEmpty(), "rowAddresses cannot be null or empty");
+      for (int i = 0; i < rowAddresses.size(); i++) {
+        Preconditions.checkArgument(
+            rowAddresses.get(i) != null, "rowAddresses[%s] cannot be null", i);
+      }
+      Preconditions.checkArgument(
+          column != null && !column.isEmpty(), "column cannot be null or empty");
+      return nativeTakeBlobsByAddresses(rowAddresses, column);
+    }
+  }
+
+  /**
+   * Open {@link BlobFile} handles by physical address and set sequential read-ahead size.
+   *
+   * <p>Uses the selector and result semantics of {@link #takeBlobsByAddresses(List, String)}.
+   *
+   * <pre>{@code
+   * List<BlobFile> blobs = dataset.takeBlobsByAddresses(List.of(rowAddress), "images", 4096L);
+   * for (BlobFile blob : blobs) {
+   *   if (blob != null) {
+   *     try (BlobFile file = blob) {
+   *       byte[] data = file.read();
+   *     }
+   *   }
+   * }
+   * }</pre>
+   *
+   * @param rowAddresses non-empty list of physical addresses from the {@code _rowaddr} column
+   * @param column blob column name
+   * @param bufferSize sequential read-ahead size in bytes. {@code 0} disables read-ahead
+   * @return one element per requested address, including duplicates and null blobs
+   * @throws IllegalArgumentException if {@code bufferSize} is negative or selection is invalid
+   * @throws IOException if configuring read-ahead fails; all opened handles are closed on failure
+   */
+  public List<BlobFile> takeBlobsByAddresses(
+      List<Long> rowAddresses, String column, long bufferSize) throws IOException {
+    checkReadBufferSize(bufferSize);
+    List<BlobFile> blobs = takeBlobsByAddresses(rowAddresses, column);
+    setBlobReadBufferSize(blobs, bufferSize);
+    return blobs;
+  }
+
+  /**
    * Open {@link BlobFile} handles for given row indices on a blob column.
+   *
+   * <p>Indices are zero-based offsets among live rows in dataset order. Results preserve request
+   * order and duplicates. Valid empty blobs have size zero. Out-of-range indices fail the entire
+   * call.
    *
    * <pre>{@code
    * List<BlobFile> blobs = dataset.takeBlobsByIndices(List.of(0L), "images");
@@ -2622,23 +2718,33 @@ public class Dataset implements Closeable {
   }
 
   RemovalStats executeCleanup(
-      CleanupPolicy policy, Optional<Long> deleteConcurrency, Optional<Long> deleteRateLimit) {
+      CleanupPolicy policy,
+      Optional<Long> deleteConcurrency,
+      Optional<Long> deleteRateLimit,
+      Optional<String> retentionPolicyJson) {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeCleanupWithPolicy(policy, deleteConcurrency, deleteRateLimit);
+      return nativeCleanupWithPolicy(
+          policy, deleteConcurrency, deleteRateLimit, retentionPolicyJson);
     }
   }
 
   private native RemovalStats nativeCleanupWithPolicy(
-      CleanupPolicy policy, Optional<Long> deleteConcurrency, Optional<Long> deleteRateLimit);
+      CleanupPolicy policy,
+      Optional<Long> deleteConcurrency,
+      Optional<Long> deleteRateLimit,
+      Optional<String> retentionPolicyJson);
 
-  CleanupExplanation explainCleanup(CleanupPolicy policy, Optional<Long> maxCandidateFiles) {
+  CleanupExplanation explainCleanup(
+      CleanupPolicy policy,
+      Optional<Long> maxCandidateFiles,
+      Optional<String> retentionPolicyJson) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeExplainCleanupWithPolicy(policy, maxCandidateFiles);
+      return nativeExplainCleanupWithPolicy(policy, maxCandidateFiles, retentionPolicyJson);
     }
   }
 
   private native CleanupExplanation nativeExplainCleanupWithPolicy(
-      CleanupPolicy policy, Optional<Long> maxCandidateFiles);
+      CleanupPolicy policy, Optional<Long> maxCandidateFiles, Optional<String> retentionPolicyJson);
 }

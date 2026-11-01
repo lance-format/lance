@@ -211,6 +211,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let truth_s = truth_start.elapsed().as_secs_f64();
     let recall_at_k = recall_hits as f64 / (args.truth_queries * args.k) as f64;
 
+    let resident_bytes = graph.resident_bytes();
+    let drop_start = Instant::now();
+    drop(graph);
+    let drop_s = drop_start.elapsed().as_secs_f64();
+    println!(
+        "lifecycle impl=lance_hnsw rows={} capacity={} resident_bytes={} drop_s={:.6}",
+        args.rows, capacity, resident_bytes, drop_s
+    );
+
     println!(
         "result impl=lance_hnsw rows={} dim={} generate_s={:.6} arrow_s={:.6} insert_s={:.6} insert_passes={} insert_qps={:.3} insert_core_s={:.6} insert_core_qps={:.3} query_s={:.6} query_passes={} query_qps={:.3} truth_s={:.6} recall_at_{}={:.6} self_recall_at_{}={:.6}",
         args.rows,

@@ -40,6 +40,11 @@ impl LocalDirOperations for FileSystemDirOperations {
         .await
         .map_err(|error| Error::io(format!("recursive directory removal task failed: {error}")))?
     }
+
+    async fn canonicalize(&self, path: &Path) -> Result<Option<std::path::PathBuf>> {
+        let local_path = self.local_file_system.path_to_filesystem(path)?;
+        crate::object_store::canonicalize_local_io_result(tokio::fs::canonicalize(local_path).await)
+    }
 }
 
 #[cfg(windows)]
@@ -105,11 +110,13 @@ impl ObjectStoreProvider for FileStoreProvider {
         let block_size = params.block_size.unwrap_or(DEFAULT_LOCAL_BLOCK_SIZE);
         let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
         let download_retry_count = storage_options.download_retry_count();
+        let local_fsync = storage_options.local_fsync()?;
 
         #[cfg(windows)]
         let (inner, local_dir_operations) = match windows::extract_unc_path(&base_path)? {
             Some(unc_path) => {
-                let inner = LocalFileSystem::new_with_prefix(unc_path.root)?;
+                let inner =
+                    LocalFileSystem::new_with_prefix(unc_path.root)?.with_fsync(local_fsync);
                 let operations = FileSystemDirOperations {
                     local_file_system: inner.clone(),
                 };
@@ -118,21 +125,21 @@ impl ObjectStoreProvider for FileStoreProvider {
                     Some(Arc::new(operations) as Arc<dyn LocalDirOperations>),
                 )
             }
-            None => (LocalFileSystem::new(), None),
+            None => (LocalFileSystem::new().with_fsync(local_fsync), None),
         };
         #[cfg(not(windows))]
-        let inner = LocalFileSystem::new();
+        let inner = LocalFileSystem::new().with_fsync(local_fsync);
         #[cfg(not(windows))]
         let local_dir_operations = None;
 
         Ok(ObjectStore {
             inner: Arc::new(inner),
             local_dir_operations,
+            local_fsync,
             scheme: base_path.scheme().to_owned(),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: false,
-            supports_conditional_multipart_put: false,
             list_is_lexically_ordered: false,
             io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
             download_retry_count,
@@ -180,12 +187,59 @@ mod tests {
     use std::fs::{create_dir_all, write};
     use std::path::Path as StdPath;
 
-    use crate::object_store::uri_to_url;
+    use crate::object_store::{StorageOptionsAccessor, uri_to_url};
+    use rstest::rstest;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use tempfile::tempdir;
 
     use super::*;
+
+    #[rstest]
+    #[case::direct("file")]
+    #[case::object_store("file-object-store")]
+    #[tokio::test]
+    async fn test_local_fsync_storage_option(#[case] scheme: &str) {
+        let provider = FileStoreProvider;
+        let url = Url::parse(&format!("{scheme}:///")).unwrap();
+        let default_store = provider
+            .new_store(url.clone(), &ObjectStoreParams::default())
+            .await
+            .unwrap();
+        assert!(!default_store.local_fsync);
+
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([("local_fsync".to_owned(), "true".to_owned())]),
+            ))),
+            ..Default::default()
+        };
+        let store = provider.new_store(url, &params).await.unwrap();
+        assert!(store.local_fsync);
+
+        let directory = tempdir().unwrap();
+        let file_path = directory.path().join("data");
+        let object_path = Path::from_absolute_path(&file_path).unwrap();
+        store.put(&object_path, b"data").await.unwrap();
+        assert_eq!(std::fs::read(file_path).unwrap(), b"data");
+    }
+
+    #[tokio::test]
+    async fn test_invalid_local_fsync_storage_option() {
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([("local_fsync".to_owned(), "sometimes".to_owned())]),
+            ))),
+            ..Default::default()
+        };
+        let error = FileStoreProvider
+            .new_store(Url::parse("file:///").unwrap(), &params)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("local_fsync"), "{error}");
+        assert!(error.to_string().contains("sometimes"), "{error}");
+    }
 
     fn rooted_local_store(root: &StdPath) -> ObjectStore {
         let inner = LocalFileSystem::new_with_prefix(root).unwrap();
@@ -195,11 +249,11 @@ mod tests {
         ObjectStore {
             inner: Arc::new(inner),
             local_dir_operations: Some(local_dir_operations),
+            local_fsync: false,
             scheme: "file".to_owned(),
             block_size: DEFAULT_LOCAL_BLOCK_SIZE,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: false,
-            supports_conditional_multipart_put: false,
             list_is_lexically_ordered: false,
             io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
             download_retry_count: 0,
@@ -223,6 +277,53 @@ mod tests {
             .unwrap();
 
         assert!(!dataset.exists(), "recursive deletion must remove the tree");
+    }
+
+    #[tokio::test]
+    async fn test_rooted_canonicalize_uses_local_root() {
+        let sandbox = tempdir().unwrap();
+        let root = sandbox.path().join("share");
+        let dataset = root.join("dataset");
+        create_dir_all(&dataset).unwrap();
+        let store = rooted_local_store(&root);
+
+        let canonical = store
+            .canonicalize_local_path(&Path::from("dataset"))
+            .await
+            .unwrap()
+            .expect("rooted local paths should canonicalize");
+
+        assert_eq!(
+            canonical,
+            std::fs::canonicalize(&dataset).unwrap(),
+            "canonicalization must use the store's filesystem root"
+        );
+        assert!(!store.has_direct_local_paths());
+        #[cfg(unix)]
+        {
+            symlink(&dataset, root.join("alias")).unwrap();
+            assert_eq!(
+                store
+                    .canonicalize_local_path(&Path::from("alias"))
+                    .await
+                    .unwrap(),
+                Some(canonical)
+            );
+        }
+        assert!(
+            store
+                .canonicalize_local_path(&Path::from("missing"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ObjectStore::memory()
+                .canonicalize_local_path(&Path::from("dataset"))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[cfg(unix)]

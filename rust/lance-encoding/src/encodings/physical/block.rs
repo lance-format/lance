@@ -29,8 +29,8 @@ use std::str::FromStr;
 use crate::compression::{BlockCompressor, BlockDecompressor, require_block_payload};
 use crate::encodings::physical::binary::{BinaryBlockDecompressor, VariableEncoder};
 use crate::format::{
-    ProtobufUtils21,
-    pb21::{self, CompressiveEncoding},
+    EncodingUtils,
+    metadata::{self, CompressiveEncoding},
 };
 use crate::{
     buffer::LanceBuffer,
@@ -79,7 +79,7 @@ pub enum CompressionScheme {
     Lz4,
 }
 
-impl TryFrom<CompressionScheme> for pb21::CompressionScheme {
+impl TryFrom<CompressionScheme> for metadata::CompressionScheme {
     type Error = Error;
 
     fn try_from(scheme: CompressionScheme) -> Result<Self> {
@@ -94,13 +94,13 @@ impl TryFrom<CompressionScheme> for pb21::CompressionScheme {
     }
 }
 
-impl TryFrom<pb21::CompressionScheme> for CompressionScheme {
+impl TryFrom<metadata::CompressionScheme> for CompressionScheme {
     type Error = Error;
 
-    fn try_from(scheme: pb21::CompressionScheme) -> Result<Self> {
+    fn try_from(scheme: metadata::CompressionScheme) -> Result<Self> {
         match scheme {
-            pb21::CompressionScheme::CompressionAlgorithmLz4 => Ok(Self::Lz4),
-            pb21::CompressionScheme::CompressionAlgorithmZstd => Ok(Self::Zstd),
+            metadata::CompressionScheme::CompressionAlgorithmLz4 => Ok(Self::Lz4),
+            metadata::CompressionScheme::CompressionAlgorithmZstd => Ok(Self::Zstd),
             _ => Err(Error::invalid_input(format!(
                 "Unsupported compression scheme: {:?}",
                 scheme
@@ -295,14 +295,22 @@ mod zstd {
             let mut len_buf = [0u8; LENGTH_PREFIX_SIZE];
             len_buf.copy_from_slice(&input_buf[..LENGTH_PREFIX_SIZE]);
 
-            let uncompressed_len = u64::from_le_bytes(len_buf) as usize;
+            let uncompressed_len = usize::try_from(u64::from_le_bytes(len_buf)).map_err(|_| {
+                Error::invalid_input("Zstd declared output length does not fit usize")
+            })?;
 
             let start = output_buf.len();
-            output_buf.reserve(uncompressed_len);
+            // The prefix comes from the file, so a corrupt one must fail to reserve
+            // rather than panic or abort the process.
+            output_buf.try_reserve(uncompressed_len).map_err(|error| {
+                Error::invalid_input(format!(
+                    "Zstd could not reserve {uncompressed_len} output bytes: {error}"
+                ))
+            })?;
             let compressed_data = &input_buf[LENGTH_PREFIX_SIZE..];
             let written = decompress_frame_into(compressed_data, output_buf)?;
             if written != uncompressed_len {
-                // `reserve` may over-allocate, so a frame longer than its prefix can
+                // `try_reserve` may over-allocate, so a frame longer than its prefix can
                 // still fit; drop whatever it appended so an error leaves the
                 // buffer exactly as the caller passed it.
                 output_buf.truncate(start);
@@ -451,10 +459,28 @@ mod lz4 {
                 u32::from_le_bytes([input_buf[0], input_buf[1], input_buf[2], input_buf[3]])
                     as usize;
 
+            // A match length grows by at most 255 per input byte, so no LZ4 block
+            // decodes to more than 255 times its size, and the decoder refuses any
+            // size `compress_bound` rejects. A larger prefix is corrupt and must not
+            // make us allocate and zero-fill up to 4 GiB.
+            if uncompressed_size > input_buf.len().saturating_mul(255)
+                || ::lz4::block::compress_bound(uncompressed_size).is_err()
+            {
+                return Err(Error::invalid_input(format!(
+                    "LZ4 declares {uncompressed_size} output bytes for a {}-byte payload",
+                    input_buf.len()
+                )));
+            }
+
             // Remember the starting position
             let start_pos = output_buf.len();
 
-            // Resize to ensure we have the exact space needed
+            // Reserve fallibly, then size the buffer for the decoder
+            output_buf.try_reserve(uncompressed_size).map_err(|error| {
+                Error::invalid_input(format!(
+                    "LZ4 could not reserve {uncompressed_size} output bytes: {error}"
+                ))
+            })?;
             output_buf.resize(start_pos + uncompressed_size, 0);
 
             // Now decompress directly into the buffer slice
@@ -672,7 +698,7 @@ impl CompressedBufferEncoder {
         })
     }
 
-    pub fn from_scheme(scheme: pb21::CompressionScheme) -> Result<Self> {
+    pub fn from_scheme(scheme: metadata::CompressionScheme) -> Result<Self> {
         let scheme = CompressionScheme::try_from(scheme)?;
         let block_compression = CompressionConfig {
             scheme,
@@ -717,8 +743,11 @@ impl CompressedBufferEncoder {
         for off in offsets.windows(2) {
             let start = off[0].as_usize();
             let end = off[1].as_usize();
-            self.compressor
-                .decompress(&data[start..end], decompressed)?;
+            // Full-zip omits null payloads; LZ4 rejects empty input.
+            if start < end {
+                self.compressor
+                    .decompress(&data[start..end], decompressed)?;
+            }
             new_offsets.push(T::from_usize(decompressed.len()).unwrap());
         }
 
@@ -761,12 +790,9 @@ impl PerValueCompressor for CompressedBufferEncoder {
 
         // TODO: Support setting the level
         // TODO: Support underlying compression of data (e.g. defer to binary encoding for offset bitpacking)
-        let encoding = ProtobufUtils21::wrapped(
+        let encoding = EncodingUtils::wrapped(
             self.compressor.config(),
-            ProtobufUtils21::variable(
-                ProtobufUtils21::flat(data.bits_per_offset as u64, None),
-                None,
-            ),
+            EncodingUtils::variable(EncodingUtils::flat(data.bits_per_offset as u64, None), None),
         )?;
 
         Ok((compressed, encoding))
@@ -806,7 +832,7 @@ impl BlockCompressor for CompressedBufferEncoder {
         let (encoded, inner_encoding) = match data {
             DataBlock::FixedWidth(fixed_width) => (
                 fixed_width.data,
-                ProtobufUtils21::flat(fixed_width.bits_per_value, None),
+                EncodingUtils::flat(fixed_width.bits_per_value, None),
             ),
             DataBlock::VariableWidth(variable_width) => {
                 // Wrap VariableEncoder to handle the encoding
@@ -834,7 +860,7 @@ impl BlockCompressor for CompressedBufferEncoder {
         self.compressor.compress(&encoded, &mut compressed)?;
         Ok((
             Some(LanceBuffer::from(compressed)),
-            ProtobufUtils21::wrapped(self.block_compression, inner_encoding)?,
+            EncodingUtils::wrapped(self.block_compression, inner_encoding)?,
         ))
     }
 }
@@ -1019,6 +1045,19 @@ mod tests {
                     );
                     assert_eq!(output, b"keep", "declared {declared}, spare {spare}");
                 }
+            }
+        }
+
+        /// A length prefix too large to allocate is an error, not a panic or an abort.
+        #[test]
+        fn test_zstd_decompress_rejects_unallocatable_length_prefix() {
+            let compressor = ZstdBufferCompressor::new(0);
+            let mut bad = reference_frame(b"bounded", 3);
+            for declared in [u64::MAX, isize::MAX as u64] {
+                bad[..8].copy_from_slice(&declared.to_le_bytes());
+                let mut output = b"keep".to_vec();
+                assert!(compressor.decompress(&bad, &mut output).is_err());
+                assert_eq!(output, b"keep");
             }
         }
 
@@ -1307,6 +1346,59 @@ mod tests {
             assert!(output.is_empty());
         }
 
+        /// A length prefix beyond what the payload can decode to is rejected before
+        /// any output is allocated, while the most compressible input still decodes.
+        #[test]
+        fn test_lz4_decompress_bounds_length_prefix() {
+            let compressor = Lz4BufferCompressor::default();
+            let mut compressed = Vec::new();
+            compressor.compress(b"bounded", &mut compressed).unwrap();
+            compressed[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+            // A payload large enough that 255x its size exceeds any u32 is still bounded
+            // by the largest size LZ4 handles.
+            let mut large = vec![0u8; 17 << 20];
+            large[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+            for bad in [compressed, large] {
+                let mut output = Vec::new();
+                assert!(compressor.decompress(&bad, &mut output).is_err());
+                assert_eq!(output.capacity(), 0);
+            }
+
+            let zeros = vec![0u8; 16 << 20];
+            let mut compressed = Vec::new();
+            compressor.compress(&zeros, &mut compressed).unwrap();
+            let mut output = Vec::new();
+            compressor.decompress(&compressed, &mut output).unwrap();
+            assert!(output == zeros);
+        }
+
+        #[test]
+        fn test_lz4_per_value_decompress_skips_null_slots() {
+            let encoder = CompressedBufferEncoder::try_new(CompressionConfig {
+                scheme: CompressionScheme::Lz4,
+                level: None,
+            })
+            .unwrap();
+            let mut compressed = Vec::new();
+            let offsets = encoder
+                .per_value_compress::<u32>(b"abc", &[0, 3, 3], &mut compressed)
+                .unwrap();
+            let offsets = offsets.borrow_to_typed_slice::<u32>();
+            // Full-zip writes no payload for a null, so append an empty slot after the
+            // compressed "abc" and empty-string values.
+            let offsets = [offsets.as_ref(), &[compressed.len() as u32]].concat();
+
+            let mut decompressed = Vec::new();
+            let new_offsets = encoder
+                .per_value_decompress::<u32>(&compressed, &offsets, &mut decompressed)
+                .unwrap();
+            assert_eq!(decompressed, b"abc");
+            assert_eq!(
+                new_offsets.borrow_to_typed_slice::<u32>().as_ref(),
+                &[0, 3, 3, 3]
+            );
+        }
+
         #[rstest::rstest]
         #[test_log::test(tokio::test)]
         async fn test_lz4_compress_round_trip(
@@ -1338,10 +1430,15 @@ mod tests {
                 STRUCTURAL_ENCODING_FULLZIP.to_string(),
             );
             let field = field.with_metadata(field_meta);
+            let expected_encoding = if encoding == TestEncoding::StructuralSparse {
+                "lz4"
+            } else {
+                "zstd"
+            };
             let test_cases = TestCases::basic()
                 // Need to use large pages as small pages might be too small to compress
                 .with_page_sizes(vec![1024 * 1024])
-                .with_expected_encoding("zstd")
+                .with_expected_encoding(expected_encoding)
                 .with_encoding(encoding)
                 .with_slicing_modes([use_slicing]);
 

@@ -72,6 +72,25 @@ impl Bitmap {
         self.data[i / 8] &= !(1 << (i % 8));
     }
 
+    /// Clear the bits in `range`, whole bytes at a time where it spans them.
+    pub fn clear_range(&mut self, range: std::ops::Range<usize>) {
+        if range.is_empty() {
+            return;
+        }
+        let (first, last) = (range.start / 8, (range.end - 1) / 8);
+        // Bits at or above the range start within its first byte, and bits at
+        // or below the range end within its last byte.
+        let head = (0xFFu16 << (range.start % 8)) as u8;
+        let tail = (0xFFu16 >> (7 - (range.end - 1) % 8)) as u8;
+        if first == last {
+            self.data[first] &= !(head & tail);
+            return;
+        }
+        self.data[first] &= !head;
+        self.data[first + 1..last].fill(0);
+        self.data[last] &= !tail;
+    }
+
     pub fn get(&self, i: usize) -> bool {
         self.data[i / 8] & (1 << (i % 8)) != 0
     }

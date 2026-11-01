@@ -19,8 +19,11 @@ use arrow_array::{Array, BooleanArray, Float32Array, RecordBatch, UInt64Array, c
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::ScalarValue;
 use datafusion::common::stats::Precision;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::TaskContext;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::apply_expression_roots;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -234,7 +237,7 @@ impl MemTableBruteForceVectorExec {
         }
     }
 
-    /// Extract the flat per-element query vector. `arrow_batch_func` wants
+    /// Extract the flat per-element query vector. `DistanceType::batch` wants
     /// `(from: &dyn Array, to: &FixedSizeListArray)` where `from` is the raw
     /// primitive array of one vector (NOT an FSL), so unwrap an FSL with one
     /// row if that's how the caller built it.
@@ -366,7 +369,6 @@ impl MemTableBruteForceVectorExec {
         let query_flat = self.query_as_flat()?;
         let column_name = self.query.column.as_str();
         let distance_type = self.query.distance_type.unwrap_or(DEFAULT_DISTANCE_TYPE);
-        let batch_func = distance_type.arrow_batch_func();
 
         let passed = self.prefiltered_rows(max_readable_row)?;
         // When PK columns are configured, only the newest version of each PK is
@@ -424,12 +426,14 @@ impl MemTableBruteForceVectorExec {
                 ))
             })?;
 
-            let distances = batch_func(query_flat.as_ref(), column_fsl).map_err(|e| {
-                Error::invalid_input(format!(
-                    "brute-force distance computation failed for column '{}': {}",
-                    column_name, e
-                ))
-            })?;
+            let distances = distance_type
+                .batch(query_flat.as_ref(), column_fsl)
+                .map_err(|e| {
+                    Error::invalid_input(format!(
+                        "brute-force distance computation failed for column '{}': {}",
+                        column_name, e
+                    ))
+                })?;
 
             for row in rows {
                 if distances.is_null(row as usize) {
@@ -573,6 +577,13 @@ impl ExecutionPlan for MemTableBruteForceVectorExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        apply_expression_roots(&self.filter, f)
     }
 
     fn with_new_children(

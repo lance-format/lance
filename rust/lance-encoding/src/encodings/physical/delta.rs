@@ -8,7 +8,7 @@ use crate::{
     buffer::LanceBuffer,
     compression::{BlockCompressor, BlockDecompressor, validate_delta_child_encoding},
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
-    format::{ProtobufUtils21, pb21::CompressiveEncoding},
+    format::{EncodingUtils, metadata::CompressiveEncoding},
 };
 use lance_core::{Error, Result};
 
@@ -49,7 +49,7 @@ impl BlockCompressor for DeltaEncoder {
         validate_delta_child_encoding(&child_encoding, self.bits_per_value)?;
         Ok((
             payload,
-            ProtobufUtils21::delta(self.bits_per_value, self.base, child_encoding),
+            EncodingUtils::delta(self.bits_per_value, self.base, child_encoding),
         ))
     }
 }
@@ -254,7 +254,7 @@ mod tests {
         });
         let encoder = DeltaEncoder::new(64, 5, Box::new(ValueEncoder::default()));
         let (payload, encoding) = encoder.compress(input).unwrap();
-        let crate::format::pb21::compressive_encoding::Compression::Delta(delta) =
+        let crate::format::metadata::compressive_encoding::Compression::Delta(delta) =
             encoding.compression.as_ref().unwrap()
         else {
             panic!("expected Delta encoding");
@@ -335,8 +335,8 @@ mod tests {
 
     #[test]
     fn range_and_delta_return_errors_in_miniblock_positions() {
-        let range = ProtobufUtils21::range(32, 0, 1);
-        let delta = ProtobufUtils21::delta(32, 0, range.clone());
+        let range = EncodingUtils::range(32, 0, 1);
+        let delta = EncodingUtils::delta(32, 0, range.clone());
         let strategy = DefaultDecompressionStrategy::default();
 
         for encoding in [&range, &delta] {

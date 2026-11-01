@@ -151,7 +151,7 @@ impl CacheBackend for MokaCacheBackend {
             loader
                 .await
                 .map(|(entry, size_bytes)| MokaCacheEntry { entry, size_bytes })
-                .map_err(CloneableError)
+                .map_err(CloneableError::new)
         };
 
         let owned_key = *key;
@@ -160,7 +160,7 @@ impl CacheBackend for MokaCacheBackend {
                 let was_cached = !was_miss.load(Ordering::Relaxed);
                 Ok((record.entry, was_cached))
             }
-            Err(error) => Err(Arc::unwrap_or_clone(error).0),
+            Err(error) => Err(Arc::unwrap_or_clone(error).into_inner()),
         }
     }
 
