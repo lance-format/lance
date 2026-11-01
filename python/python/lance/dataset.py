@@ -8452,6 +8452,16 @@ class DatasetOptimizer:
             This is useful when the data distribution has changed significantly,
             and we want to retrain the index to improve the search quality.
             This rebuilds the index from the source data and may be expensive.
+        max_rows_per_task: optional, int, default None
+            Upper bound on the rows one build task covers. Setting this or
+            `max_rows_per_segment` splits the build of every index whose
+            segments can be merged into several tasks; a split vector build
+            never rebalances the partitions (set `retrain` to rebuild).
+        max_rows_per_segment: optional, int, default None
+            Upper bound on the rows one committed segment holds.
+
+        See :py:class:`lance.optimize.OptimizeIndices` to run the same
+        optimization as a plan whose tasks execute on several workers.
         """
         self._dataset._ds.optimize_indices(**kwargs)
 

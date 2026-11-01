@@ -84,6 +84,21 @@ from .optimize import (
     CompactionTask as CompactionTask,
 )
 from .optimize import (
+    IndexSegmentResult as IndexSegmentResult,
+)
+from .optimize import (
+    OptimizeIndexMerge as OptimizeIndexMerge,
+)
+from .optimize import (
+    OptimizeIndexTask as OptimizeIndexTask,
+)
+from .optimize import (
+    OptimizeIndices as OptimizeIndices,
+)
+from .optimize import (
+    OptimizeIndicesPlan as OptimizeIndicesPlan,
+)
+from .optimize import (
     RewriteResult as RewriteResult,
 )
 from .schema import LanceSchema as LanceSchema

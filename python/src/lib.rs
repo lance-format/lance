@@ -45,6 +45,10 @@ use dataset::io_stats::IoStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
+use dataset::optimize_indices::{
+    PyIndexSegmentResult, PyOptimizeIndexMerge, PyOptimizeIndexTask, PyOptimizeIndices,
+    PyOptimizeIndicesPlan,
+};
 use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery, PySearchFilter};
 use env_logger::{Builder, Env};
 use file::{
@@ -303,6 +307,11 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCompactionPlan>()?;
     m.add_class::<PyRewriteResult>()?;
     m.add_class::<PyCompactionMetrics>()?;
+    m.add_class::<PyOptimizeIndices>()?;
+    m.add_class::<PyOptimizeIndicesPlan>()?;
+    m.add_class::<PyOptimizeIndexTask>()?;
+    m.add_class::<PyOptimizeIndexMerge>()?;
+    m.add_class::<PyIndexSegmentResult>()?;
     m.add_class::<ScanStatistics>()?;
     m.add_class::<Session>()?;
     m.add_class::<object_store::PyObjectStoreProvider>()?;
