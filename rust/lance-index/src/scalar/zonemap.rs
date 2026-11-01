@@ -49,7 +49,7 @@ use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 
-use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, search_zones};
+use super::zoned::{ParallelZoneTrainer, ZoneBound, ZoneProcessor, search_zones};
 use std::collections::HashSet;
 
 /// `rows` without the positions of `fragments`.
@@ -1110,10 +1110,12 @@ impl ScalarIndex for ZoneMapIndex {
         let value_type = schema.field(0).data_type().clone();
 
         let options = self.builder_params();
-        let processor = ZoneMapProcessor::new(value_type.clone())?;
         // Positions are only worth collecting when the index keeps them.
-        let trainer = ZoneTrainer::new(processor, self.rows_per_zone)?
-            .with_null_tracking(self.null_rows.is_some());
+        let trainer = ParallelZoneTrainer::new(
+            move || ZoneMapProcessor::new(value_type.clone()),
+            self.rows_per_zone,
+        )?
+        .with_null_tracking(self.null_rows.is_some());
         let (new_zones, new_null_rows) = trainer.train(new_data).await?;
 
         // Additive: the stream is "the new data", with no claim about the
@@ -1602,9 +1604,12 @@ impl ZoneMapIndexBuilder {
     /// the value column followed by `_rowaddr`, matching the dataset scan order enforced
     /// by the scalar index registry.
     pub async fn train(&mut self, batches_source: SendableRecordBatchStream) -> Result<()> {
-        let processor = ZoneMapProcessor::new(self.items_type.clone())?;
-        let trainer = ZoneTrainer::new(processor, self.options.rows_per_zone)?
-            .with_null_tracking(self.options.store_null_bitmap);
+        let items_type = self.items_type.clone();
+        let trainer = ParallelZoneTrainer::new(
+            move || ZoneMapProcessor::new(items_type.clone()),
+            self.options.rows_per_zone,
+        )?
+        .with_null_tracking(self.options.store_null_bitmap);
         let (maps, null_rows) = trainer.train(batches_source).await?;
         self.maps = maps;
         self.set_null_rows(Some(null_rows));
@@ -2065,6 +2070,10 @@ impl BasicTrainer for ZoneMapIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for ZoneMapIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(false)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -3481,10 +3490,13 @@ pub async fn train_zonemap_scan(
     physical_rows: HashMap<u64, u64>,
     scan: SendableRecordBatchStream,
 ) -> Result<ScannedZones> {
-    let processor = ZoneMapProcessor::new(data_type.clone())?;
-    let trainer = ZoneTrainer::new(processor, rows_per_zone)?
-        .with_null_tracking(keep_positions)
-        .aligned_to(physical_rows);
+    let data_type = data_type.clone();
+    let trainer = ParallelZoneTrainer::new(
+        move || ZoneMapProcessor::new(data_type.clone()),
+        rows_per_zone,
+    )?
+    .with_null_tracking(keep_positions)
+    .aligned_to(physical_rows);
     let (zones, null_rows) = trainer.train(scan).await?;
     Ok(ScannedZones { zones, null_rows })
 }

@@ -31,7 +31,7 @@ use jni::{JNIEnv, objects::JObject};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::cleanup::{
     CleanupCandidateFile, CleanupExplanation, CleanupFileKind, CleanupPolicy,
-    CleanupReferencedBranch, RemovalStats,
+    CleanupReferencedBranch, RemovalStats, parse_cleanup_policy,
 };
 use lance::dataset::optimize::{CompactionOptions as RustCompactionOptions, compact_files};
 use lance::dataset::refs::{Ref, TagContents};
@@ -1220,85 +1220,83 @@ fn inner_create_index<'local>(
 
     let params = params_result?;
 
-    let index_metadata = match progress {
-        Some(progress) => {
-            // Progress callbacks may re-enter read-only methods on this Dataset. Clone the Dataset
-            // and release the native field guard before the long-running build so those callbacks
-            // do not deadlock on the field mutex.
-            let mut working_dataset = {
-                let dataset_guard = unsafe {
-                    env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
-                }?;
-                dataset_guard.inner.clone()
-            };
-            let initial_version = working_dataset.version().version;
-            let index_metadata = execute_create_index(
-                &mut working_dataset,
-                &columns_slice,
-                index_type,
-                params.as_ref(),
-                replace,
-                train,
-                name,
-                fragment_ids,
-                index_uuid,
-                batch_reader,
-                Some(progress),
+    let index_metadata = if progress.is_some() || skip_commit {
+        // Progress callbacks may re-enter read-only methods on this Dataset. Clone the Dataset
+        // and release the native field guard before the long-running build so those callbacks
+        // do not deadlock on the field mutex. Uncommitted builds never publish a new version, so
+        // they also build on a clone instead of serializing every build on this handle.
+        let mut working_dataset = {
+            let dataset_guard = unsafe {
+                env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
+            }?;
+            dataset_guard.inner.clone()
+        };
+        let initial_version = working_dataset.version().version;
+        let index_metadata = execute_create_index(
+            &mut working_dataset,
+            &columns_slice,
+            index_type,
+            params.as_ref(),
+            replace,
+            train,
+            name,
+            fragment_ids,
+            index_uuid,
+            batch_reader,
+            progress,
+            skip_commit,
+        )
+        .inspect_err(|_| {
+            // A committed build may fail while materializing its return metadata. The clone
+            // has already observed the durable commit, so publish it before propagating.
+            if should_publish_working_dataset_on_error(
                 skip_commit,
-            )
-            .inspect_err(|_| {
-                // A committed build may fail while materializing its return metadata. The clone
-                // has already observed the durable commit, so publish it before propagating.
-                if should_publish_working_dataset_on_error(
-                    skip_commit,
-                    initial_version,
-                    working_dataset.version().version,
-                ) {
-                    match unsafe {
-                        env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
-                    } {
-                        Ok(mut dataset_guard) => {
-                            dataset_guard.inner = working_dataset.clone();
-                        }
-                        Err(publish_error) => {
-                            log::warn!(
-                                "Failed to publish committed dataset version {} after create-index failure: {}",
-                                working_dataset.version().version,
-                                publish_error
-                            );
-                        }
+                initial_version,
+                working_dataset.version().version,
+            ) {
+                match unsafe {
+                    env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
+                } {
+                    Ok(mut dataset_guard) => {
+                        dataset_guard.inner = working_dataset.clone();
+                    }
+                    Err(publish_error) => {
+                        log::warn!(
+                            "Failed to publish committed dataset version {} after create-index failure: {}",
+                            working_dataset.version().version,
+                            publish_error
+                        );
                     }
                 }
-            })?;
-
-            if !skip_commit {
-                let mut dataset_guard = unsafe {
-                    env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
-                }?;
-                dataset_guard.inner = working_dataset;
             }
-            index_metadata
-        }
-        None => {
-            // Preserve the existing no-progress path, including its native-field locking behavior.
+        })?;
+
+        if !skip_commit {
             let mut dataset_guard = unsafe {
-                env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET)
+                env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
             }?;
-            execute_create_index(
-                &mut dataset_guard.inner,
-                &columns_slice,
-                index_type,
-                params.as_ref(),
-                replace,
-                train,
-                name,
-                fragment_ids,
-                index_uuid,
-                batch_reader,
-                None,
-                skip_commit,
-            )?
+            dataset_guard.inner = working_dataset;
         }
+        index_metadata
+    } else {
+        // Preserve the existing committed no-progress path, including its native-field locking
+        // behavior.
+        let mut dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        execute_create_index(
+            &mut dataset_guard.inner,
+            &columns_slice,
+            index_type,
+            params.as_ref(),
+            replace,
+            train,
+            name,
+            fragment_ids,
+            index_uuid,
+            batch_reader,
+            None,
+            skip_commit,
+        )?
     };
 
     (&index_metadata).into_java(env)
@@ -3640,6 +3638,7 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCleanupWithPolicy<'local>(
     jpolicy: JObject,
     jdelete_concurrency: JObject,
     jdelete_rate_limit: JObject,
+    jretention_policy: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -3648,7 +3647,8 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCleanupWithPolicy<'local>(
             jdataset,
             jpolicy,
             jdelete_concurrency,
-            jdelete_rate_limit
+            jdelete_rate_limit,
+            jretention_policy
         )
     )
 }
@@ -3659,8 +3659,12 @@ fn inner_cleanup_with_policy<'local>(
     jpolicy: JObject,
     jdelete_concurrency: JObject,
     jdelete_rate_limit: JObject,
+    jretention_policy: JObject,
 ) -> Result<JObject<'local>> {
     let policy = extract_cleanup_policy(env, &jpolicy)?;
+    let retention_policy: Option<String> = env.get_optional(&jretention_policy, |env, obj| {
+        Ok(env.get_string(&JString::from(obj))?.into())
+    })?;
     let delete_concurrency = env.get_optional(&jdelete_concurrency, |env, obj| {
         let value = env.call_method(obj, "longValue", "()J", &[])?.j()?;
         usize::try_from(value).map_err(|_| {
@@ -3682,6 +3686,9 @@ fn inner_cleanup_with_policy<'local>(
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
         let mut operation = dataset.inner.cleanup(policy);
+        if let Some(value) = retention_policy {
+            operation = operation.with_retention_policy(parse_cleanup_policy(&value)?)?;
+        }
         if let Some(concurrency) = delete_concurrency {
             operation = operation.with_delete_concurrency(concurrency)?;
         }
@@ -3700,10 +3707,17 @@ pub extern "system" fn Java_org_lance_Dataset_nativeExplainCleanupWithPolicy<'lo
     jdataset: JObject,
     jpolicy: JObject,
     jmax_candidate_files: JObject,
+    jretention_policy: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_explain_cleanup_with_policy(&mut env, jdataset, jpolicy, jmax_candidate_files)
+        inner_explain_cleanup_with_policy(
+            &mut env,
+            jdataset,
+            jpolicy,
+            jmax_candidate_files,
+            jretention_policy
+        )
     )
 }
 
@@ -3712,8 +3726,12 @@ fn inner_explain_cleanup_with_policy<'local>(
     jdataset: JObject,
     jpolicy: JObject,
     jmax_candidate_files: JObject,
+    jretention_policy: JObject,
 ) -> Result<JObject<'local>> {
     let policy = extract_cleanup_policy(env, &jpolicy)?;
+    let retention_policy: Option<String> = env.get_optional(&jretention_policy, |env, obj| {
+        Ok(env.get_string(&JString::from(obj))?.into())
+    })?;
     let max_candidate_files = env
         .get_optional(&jmax_candidate_files, |env, inner| {
             Ok(env.call_method(inner, "longValue", "()J", &[])?.j()?)
@@ -3732,6 +3750,9 @@ fn inner_explain_cleanup_with_policy<'local>(
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
         let mut operation = dataset.inner.cleanup(policy);
+        if let Some(value) = retention_policy {
+            operation = operation.with_retention_policy(parse_cleanup_policy(&value)?)?;
+        }
         if let Some(limit) = max_candidate_files {
             operation = operation.with_max_candidate_files(limit);
         }

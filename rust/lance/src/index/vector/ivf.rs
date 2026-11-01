@@ -10395,6 +10395,84 @@ mod tests {
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }
 
+    /// Count this process's descriptors for index files under `prefix`.
+    ///
+    /// Deleted files still match: their `/proc` link keeps the old path with a
+    /// ` (deleted)` suffix.
+    #[cfg(target_os = "linux")]
+    fn count_open_index_fds(prefix: &str) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .expect("read /proc/self/fd")
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .filter(|target| {
+                let target = target.to_string_lossy();
+                target.starts_with(prefix) && target.contains("_indices")
+            })
+            .count()
+    }
+
+    /// A cached legacy index must not keep a descriptor open for the file it
+    /// was loaded from. Creating indexes in a loop mints a new UUID each time;
+    /// before the fix the session index cache pinned one descriptor per UUID,
+    /// which is what let descriptor counts grow with every optimize/rewrite.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_legacy_index_cache_does_not_pin_file_descriptors() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let dim = DIM as i32;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
+            false,
+        )]));
+        let vectors = generate_random_array(512 * DIM);
+        let fsl = FixedSizeListArray::try_new_from_values(vectors, dim).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::with_ivf_pq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(4),
+            PQBuildParams::default(),
+        )
+        .version(IndexFileVersion::Legacy)
+        .clone();
+        let query = Float32Array::from_iter_values(repeat_n(0.0, DIM));
+
+        for round in 0..4 {
+            dataset
+                .create_index(
+                    &["vector"],
+                    IndexType::Vector,
+                    Some("my_idx".to_owned()),
+                    &params,
+                    true,
+                )
+                .await
+                .unwrap();
+
+            // Querying opens the index, which caches it for the session.
+            dataset
+                .scan()
+                .nearest("vector", &query, 10)
+                .unwrap()
+                .project(&["_rowid"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+
+            let open_fds = count_open_index_fds(test_dir.as_str());
+            assert_eq!(
+                open_fds, 0,
+                "round {round}: cached legacy index pinned {open_fds} descriptors"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_prewarm_ivf_legacy_multiple_deltas() {
         use lance_io::assert_io_eq;

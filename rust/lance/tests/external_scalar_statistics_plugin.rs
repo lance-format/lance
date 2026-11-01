@@ -135,6 +135,10 @@ impl BasicTrainer for ExampleIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for ExampleIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(false)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -215,9 +219,6 @@ impl ScalarIndex for ExampleIndex {
         _metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         Err(Error::not_supported("statistics do not answer predicates"))
-    }
-    fn can_remap(&self) -> bool {
-        false
     }
     async fn remap(
         &self,
@@ -573,7 +574,11 @@ async fn empty_coverage_survives_compaction(
         .open_scalar_index(columns[0], &before[0].uuid, &NoOpMetricsCollector)
         .await
         .unwrap();
-    assert!(!index.can_remap());
+    assert!(
+        !ExampleIndexPlugin
+            .can_remap(before[0].index_details.as_ref().unwrap())
+            .unwrap()
+    );
     assert_eq!(index.statistics().unwrap()["rows"], 4);
 }
 
