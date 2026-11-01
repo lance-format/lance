@@ -74,13 +74,19 @@ struct VersionHint {
     version: u64,
 }
 
-pub(super) fn validate_manifest_scan_batch_size(batch_size: usize) -> Result<()> {
-    if batch_size == 0 {
-        return Err(Error::invalid_input(format!(
-            "manifest_scan_batch_size={batch_size} is invalid; expected a value greater than 0"
-        )));
-    }
-    Ok(())
+/// Initial number of parallel HEAD requests used after checking the version hint.
+///
+/// Starting small avoids issuing many speculative requests when the hint is current.
+const INITIAL_MANIFEST_SCAN_BATCH_SIZE: usize = 2;
+
+/// Maximum number of parallel HEAD requests used while catching up a stale hint.
+///
+/// The cap bounds object-store concurrency while still reducing round trips when
+/// the hint is far behind.
+const MAX_MANIFEST_SCAN_BATCH_SIZE: usize = 64;
+
+fn next_manifest_scan_batch_size(current: usize) -> usize {
+    (current * 2).min(MAX_MANIFEST_SCAN_BATCH_SIZE)
 }
 
 /// Store for reading and writing shard manifests.
@@ -92,7 +98,6 @@ pub struct ShardManifestStore {
     object_store: Arc<ObjectStore>,
     shard_id: Uuid,
     manifest_dir: Path,
-    manifest_scan_batch_size: usize,
     max_position_age: Duration,
     min_prune_age: Duration,
     /// This store's position: the version it may build its next write on, and
@@ -116,32 +121,70 @@ struct Position {
 }
 
 impl ShardManifestStore {
-    /// Create a new manifest store for the given shard.
+    /// Create a manifest store using the internal adaptive scan policy.
+    ///
+    /// Manifest discovery starts with two parallel HEAD requests, doubles the
+    /// batch size after each successful scan, and caps concurrency at 64.
     ///
     /// # Arguments
     ///
     /// * `object_store` - Object store for reading/writing manifests
-    /// * `base_path` - Base path within the object store (from ObjectStore::from_uri)
+    /// * `base_path` - Base path within the object store
     /// * `dir_id` - The MemWAL's `dir_id` (empty for the legacy `_mem_wal`)
     /// * `shard_id` - Shard UUID
-    /// * `manifest_scan_batch_size` - Batch size for parallel HEAD requests when scanning versions
-    pub fn new(
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance::dataset::mem_wal::ShardManifestStore;
+    /// # use lance_io::object_store::ObjectStore;
+    /// # use object_store::path::Path;
+    /// # use uuid::Uuid;
+    /// # fn create_store(
+    /// #     object_store: Arc<ObjectStore>,
+    /// #     base_path: &Path,
+    /// #     dir_id: &str,
+    /// #     shard_id: Uuid,
+    /// # ) {
+    /// let manifest_store =
+    ///     ShardManifestStore::new_adaptive(object_store, base_path, dir_id, shard_id);
+    /// # let _ = manifest_store;
+    /// # }
+    /// ```
+    pub fn new_adaptive(
         object_store: Arc<ObjectStore>,
         base_path: &Path,
         dir_id: &str,
         shard_id: Uuid,
-        manifest_scan_batch_size: usize,
     ) -> Self {
         let manifest_dir = shard_manifest_path(base_path, dir_id, &shard_id);
         Self {
             object_store,
             shard_id,
             manifest_dir,
-            manifest_scan_batch_size,
             max_position_age: MAX_POSITION_AGE,
             min_prune_age: MIN_PRUNE_AGE,
             latest: RwLock::new(None),
         }
+    }
+
+    /// Create a manifest store using the internal adaptive scan policy.
+    ///
+    /// `manifest_scan_batch_size` is retained for source compatibility and is
+    /// ignored. Use [`Self::new_adaptive`] for new code.
+    #[deprecated(
+        since = "10.0.0",
+        note = "manifest scan concurrency is managed internally; use ShardManifestStore::new_adaptive"
+    )]
+    pub fn new(
+        object_store: Arc<ObjectStore>,
+        base_path: &Path,
+        dir_id: &str,
+        shard_id: Uuid,
+        _manifest_scan_batch_size: usize,
+    ) -> Self {
+        Self::new_adaptive(object_store, base_path, dir_id, shard_id)
     }
 
     #[cfg(test)]
@@ -397,15 +440,13 @@ impl ShardManifestStore {
     /// hint is missing or unreadable or its version was pruned, then scans
     /// forward with HEAD requests until a version is not found.
     async fn find_latest_version(&self) -> Result<u64> {
-        validate_manifest_scan_batch_size(self.manifest_scan_batch_size)?;
-
         let mut latest_found = match self.read_version_hint().await {
             Some(hint) if hint > 0 && self.version_exists(hint).await? => hint,
             _ => self.list_versions().await?.last().copied().unwrap_or(0),
         };
 
-        // Parallel scan forward with batches of HEAD requests
-        let batch_size = self.manifest_scan_batch_size;
+        // Parallel scan forward with exponentially growing batches of HEAD requests.
+        let mut batch_size = INITIAL_MANIFEST_SCAN_BATCH_SIZE;
         loop {
             let mut futures = FuturesUnordered::new();
             for offset in 0..batch_size {
@@ -424,6 +465,7 @@ impl ShardManifestStore {
             if !found_any {
                 break;
             }
+            batch_size = next_manifest_scan_batch_size(batch_size);
         }
 
         Ok(latest_found)
@@ -838,6 +880,7 @@ impl ShardManifestStore {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
@@ -1052,7 +1095,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_zero_manifest_scan_batch_size_rejects_stale_hint() {
+    async fn test_adaptive_scan_ignores_legacy_batch_size_and_recovers_stale_hint() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
         let manifest_store = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
@@ -1064,17 +1107,24 @@ mod tests {
                 .unwrap();
         }
         manifest_store.write_version_hint(1).await;
+        assert_eq!(manifest_store.read_version_hint().await, Some(1));
 
         let zero_batch_reader = ShardManifestStore::new(store, &base_path, shard_id, 0);
-        let error = zero_batch_reader
-            .read_latest()
-            .await
-            .expect_err("manifest_scan_batch_size=0 must not trust a stale version hint");
-        assert!(matches!(&error, Error::InvalidInput { .. }));
-        assert!(
-            error.to_string().contains("manifest_scan_batch_size=0"),
-            "the error must name manifest_scan_batch_size and its value, got: {error}"
-        );
+        let latest = zero_batch_reader.refresh_latest().await.unwrap().unwrap();
+        assert_eq!(latest.version, 3);
+    }
+
+    #[test]
+    fn test_manifest_scan_batch_size_growth_and_cap() {
+        let mut batch_size = INITIAL_MANIFEST_SCAN_BATCH_SIZE;
+        let mut batch_sizes = Vec::new();
+
+        for _ in 0..7 {
+            batch_sizes.push(batch_size);
+            batch_size = next_manifest_scan_batch_size(batch_size);
+        }
+
+        assert_eq!(batch_sizes, vec![2, 4, 8, 16, 32, 64, 64]);
     }
 
     #[tokio::test]

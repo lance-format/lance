@@ -1178,12 +1178,11 @@ impl WalAppender {
         shard_id: Uuid,
         shard_spec_id: u32,
     ) -> Result<Self> {
-        let manifest_store = Arc::new(ShardManifestStore::new(
+        let manifest_store = Arc::new(ShardManifestStore::new_adaptive(
             object_store.clone(),
             &base_path,
             dir_id,
             shard_id,
-            2,
         ));
         let (writer_epoch, manifest) = manifest_store.claim_epoch(shard_spec_id).await?;
         let position_hint = manifest
@@ -1518,12 +1517,11 @@ impl WalTailer {
         dir_id: &str,
         shard_id: Uuid,
     ) -> Self {
-        let manifest_store = Arc::new(ShardManifestStore::new(
+        let manifest_store = Arc::new(ShardManifestStore::new_adaptive(
             object_store.clone(),
             &base_path,
             dir_id,
             shard_id,
-            2,
         ));
         Self {
             object_store,
@@ -1939,6 +1937,7 @@ async fn scan_first_position(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::dataset::mem_wal::index::MemTableVisibility;
