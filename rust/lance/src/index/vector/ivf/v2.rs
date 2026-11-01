@@ -176,6 +176,37 @@ pub(crate) static STREAMING_SEARCH_BATCH_SIZE: LazyLock<usize> = LazyLock::new(|
     batch_size
 });
 
+/// Fewest (query, partition) probes a batch scoring task is given when a loaded
+/// chunk is split across CPU tasks. A probe costs from about a microsecond (a
+/// small flat partition) to far more (a high-dimensional PQ distance table), so
+/// this keeps the cheapest tasks above the cost of dispatching them.
+const MIN_PROBES_PER_SCORING_TASK: usize = 8;
+
+/// Split `0..probes_per_query.len()` into at most `max_tasks` contiguous query
+/// ranges with roughly equal numbers of probes, giving each range at least
+/// [`MIN_PROBES_PER_SCORING_TASK`] probes where the chunk has enough. Ranges
+/// without probes are omitted.
+fn balanced_query_ranges(probes_per_query: &[usize], max_tasks: usize) -> Vec<Range<usize>> {
+    let total: usize = probes_per_query.iter().sum();
+    let task_count = (total / MIN_PROBES_PER_SCORING_TASK).clamp(1, max_tasks.max(1));
+    let target = total.div_ceil(task_count);
+    let mut ranges = Vec::with_capacity(task_count);
+    let mut start = 0;
+    let mut probes = 0;
+    for (query_index, &count) in probes_per_query.iter().enumerate() {
+        probes += count;
+        if probes >= target && ranges.len() + 1 < task_count {
+            ranges.push(start..query_index + 1);
+            start = query_index + 1;
+            probes = 0;
+        }
+    }
+    if probes > 0 {
+        ranges.push(start..probes_per_query.len());
+    }
+    ranges
+}
+
 /// Prepared partition storage (bytes) handed to a single `spawn_cpu` dispatch on the
 /// global-top-k search path.
 ///
@@ -3572,51 +3603,87 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         // each mutates the same per-query heaps — so a step costs about
         // max(load, score) rather than their sum, and a scored chunk's storage is
         // dropped before the next is scored, keeping peak memory bounded.
+        let max_scoring_tasks = get_num_compute_intensive_cpus().max(1);
+        let mut probes_per_query = vec![0; query_count];
         let mut pending = loaded_chunks.next().await;
         while let Some(chunk) = pending {
-            let chunk = chunk.into_iter().collect::<Result<Vec<_>>>()?;
-            let index = self.clone();
-            let base_queries = base_queries.clone();
-            let raw_query_contexts = raw_query_contexts.clone();
-            let scratch_pool = self.scratch_pool.clone();
-            let search_metrics = metrics.clone();
-            let queued = Instant::now();
-            let score = spawn_cpu(move || -> Result<Vec<BinaryHeap<OrderedNode<u64>>>> {
-                search_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
-                scratch_pool.with_scratch(|scratch| -> Result<()> {
-                    for (part_id, part_entry, probing_queries, pre_filter) in &chunk {
-                        let partition_centroid = index.ivf.centroid(*part_id);
-                        for (query_index, dist_q_c) in probing_queries {
-                            let mut single_query = base_queries[*query_index].clone();
-                            single_query.dist_q_c = *dist_q_c;
-                            let prepared = PreparedPartitionSearch::<S, Q> {
-                                query: single_query,
-                                pre_filter: pre_filter.clone(),
-                                partition_id: *part_id,
-                                partition_centroid: partition_centroid.clone(),
-                                rq_search_cache: index.rq_search_cache.clone(),
-                                raw_query_context: raw_query_contexts[*query_index].clone(),
-                                part_entry: part_entry.clone(),
-                                _in_flight: index.prepared_partitions.track(),
-                                _marker: PhantomData,
-                            };
-                            Self::accumulate_prepared_partition_search(
-                                use_query_residual,
-                                use_residual_scratch,
-                                prepared,
-                                &mut heaps[*query_index],
-                                scratch,
-                                search_metrics.as_ref(),
-                            )?;
-                        }
-                    }
-                    Ok(())
-                })?;
-                Ok(heaps)
-            });
+            let chunk = Arc::new(chunk.into_iter().collect::<Result<Vec<_>>>()?);
+            // Score disjoint query ranges on separate CPU tasks. Each task owns
+            // its queries' heaps, and every query still visits the chunk's
+            // partitions in sorted order, so heap insertion order (and thus the
+            // tie-break above) matches scoring the chunk on a single task.
+            probes_per_query.fill(0);
+            for (_, _, probing_queries, _) in chunk.iter() {
+                for (query_index, _) in probing_queries {
+                    probes_per_query[*query_index] += 1;
+                }
+            }
+            let ranges = balanced_query_ranges(&probes_per_query, max_scoring_tasks);
+            let mut scoring = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                let range_heaps: Vec<_> = heaps[range.clone()]
+                    .iter_mut()
+                    .map(std::mem::take)
+                    .collect();
+                let chunk = chunk.clone();
+                let index = self.clone();
+                let base_queries = base_queries.clone();
+                let raw_query_contexts = raw_query_contexts.clone();
+                let scratch_pool = self.scratch_pool.clone();
+                let search_metrics = metrics.clone();
+                let queued = Instant::now();
+                scoring.push(spawn_cpu(
+                    move || -> Result<(Range<usize>, Vec<BinaryHeap<OrderedNode<u64>>>)> {
+                        search_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
+                        let mut range_heaps = range_heaps;
+                        scratch_pool.with_scratch(|scratch| -> Result<()> {
+                            for (part_id, part_entry, probing_queries, pre_filter) in chunk.iter() {
+                                // Each partition's probing queries are in ascending order.
+                                let start =
+                                    probing_queries.partition_point(|(q, _)| *q < range.start);
+                                let end = probing_queries.partition_point(|(q, _)| *q < range.end);
+                                if start == end {
+                                    continue;
+                                }
+                                let partition_centroid = index.ivf.centroid(*part_id);
+                                for (query_index, dist_q_c) in &probing_queries[start..end] {
+                                    let mut single_query = base_queries[*query_index].clone();
+                                    single_query.dist_q_c = *dist_q_c;
+                                    let prepared = PreparedPartitionSearch::<S, Q> {
+                                        query: single_query,
+                                        pre_filter: pre_filter.clone(),
+                                        partition_id: *part_id,
+                                        partition_centroid: partition_centroid.clone(),
+                                        rq_search_cache: index.rq_search_cache.clone(),
+                                        raw_query_context: raw_query_contexts[*query_index].clone(),
+                                        part_entry: part_entry.clone(),
+                                        _in_flight: index.prepared_partitions.track(),
+                                        _marker: PhantomData,
+                                    };
+                                    Self::accumulate_prepared_partition_search(
+                                        use_query_residual,
+                                        use_residual_scratch,
+                                        prepared,
+                                        &mut range_heaps[*query_index - range.start],
+                                        scratch,
+                                        search_metrics.as_ref(),
+                                    )?;
+                                }
+                            }
+                            Ok(())
+                        })?;
+                        Ok((range, range_heaps))
+                    },
+                ));
+            }
             // Load the next chunk while this one is scored on the CPU pool.
-            let (scored, next) = futures::join!(score, loaded_chunks.next());
-            heaps = scored?;
+            let (scored, next) =
+                futures::join!(futures::future::try_join_all(scoring), loaded_chunks.next());
+            for (range, range_heaps) in scored? {
+                for (heap, scored_heap) in heaps[range].iter_mut().zip(range_heaps) {
+                    *heap = scored_heap;
+                }
+            }
             pending = next;
         }
 
