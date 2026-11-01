@@ -2190,6 +2190,12 @@ pub(crate) async fn commit_transaction(
                             &current_transaction_file,
                         )
                         .await;
+                        if conditional_commit {
+                            return Err(Error::retryable_commit_conflict_source(
+                                target_version,
+                                Box::new(err),
+                            ));
+                        }
                         return Err(err);
                     }
                     CommitOutcome::Unknown => {
@@ -2204,14 +2210,21 @@ pub(crate) async fn commit_transaction(
     }
 
     cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
-    Err(crate::Error::commit_conflict_source(
-        target_version,
-        format!(
-            "Failed to commit the transaction after {} retries.",
-            commit_config.num_retries
-        )
-        .into(),
-    ))
+    let message = format!(
+        "Failed to commit the transaction after {} retries.",
+        commit_config.num_retries
+    );
+    if conditional_commit {
+        Err(Error::retryable_commit_conflict_source(
+            target_version,
+            message.into(),
+        ))
+    } else {
+        Err(Error::commit_conflict_source(
+            target_version,
+            message.into(),
+        ))
+    }
 }
 
 #[cfg(test)]
