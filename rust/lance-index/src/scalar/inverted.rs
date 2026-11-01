@@ -375,11 +375,9 @@ pub async fn prepare_bm25_query(
         term_ids = Some(Arc::new(prepared_term_ids));
         (scorer, true)
     } else {
-        // Cold asynchronous path: fetch every segment's statistics in one
-        // bounded fan-out instead of one awaited segment at a time, so the
-        // first query of a session pays the max of the per-segment storage
-        // round trips rather than their sum. `buffered` keeps segment order
-        // for the fold, though its checked adds are commutative.
+        // Read the segments' statistics together rather than one segment
+        // after another, so uncached term statistics cost about one storage
+        // round trip per window of segments instead of one per segment.
         let parallelism = get_num_compute_intensive_cpus()
             .clamp(1, MAX_CONCURRENT_SOURCE_LOADS)
             .min(indices.len());

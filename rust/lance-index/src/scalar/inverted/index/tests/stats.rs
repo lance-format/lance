@@ -5,6 +5,7 @@ use super::*;
 use lance_core::cache::{
     CacheBackend, CacheCodec, CacheEntry, InternalCacheKey, QuickCacheBackend,
 };
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 /// IO accounting for the IO-counting stats test below: tracks bytes
@@ -17,6 +18,8 @@ struct PostingMetadataCounter {
     posting_rows_read: std::sync::atomic::AtomicUsize,
     impact_rows_read: std::sync::atomic::AtomicUsize,
     read_range_calls: std::sync::atomic::AtomicUsize,
+    reads_in_flight: std::sync::atomic::AtomicUsize,
+    max_reads_in_flight: std::sync::atomic::AtomicUsize,
 }
 
 impl PostingMetadataCounter {
@@ -37,6 +40,10 @@ impl PostingMetadataCounter {
     }
     fn read_range_calls(&self) -> usize {
         self.read_range_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn max_reads_in_flight(&self) -> usize {
+        self.max_reads_in_flight
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
@@ -90,7 +97,22 @@ impl IndexReader for CountingPostingReader {
                 .impact_rows_read
                 .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         }
-        self.inner.read_range(range, projection).await
+        let in_flight = self
+            .counter
+            .reads_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        self.counter
+            .max_reads_in_flight
+            .fetch_max(in_flight, std::sync::atomic::Ordering::Relaxed);
+        // Let other reads start before this one completes, so reads issued
+        // together are observed together.
+        tokio::task::yield_now().await;
+        let result = self.inner.read_range(range, projection).await;
+        self.counter
+            .reads_in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        result
     }
     async fn num_batches(&self, batch_size: u64) -> u32 {
         self.inner.num_batches(batch_size).await
@@ -196,163 +218,6 @@ impl IndexStore for CountingStore {
     }
 }
 
-/// Concurrency probe for the cold scorer path in `prepare_bm25_query`:
-/// records how many posting-file reads are in flight at once across a whole
-/// multi-segment prepare, so a test can tell summed (sequential) per-segment
-/// latencies apart from overlapped (concurrent) ones.
-#[derive(Debug, Default)]
-struct SegmentStatConcurrencyProbe {
-    reads_in_flight: AtomicUsize,
-    max_reads_in_flight: AtomicUsize,
-}
-
-impl SegmentStatConcurrencyProbe {
-    fn read_started(&self) {
-        let in_flight = self.reads_in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        self.max_reads_in_flight
-            .fetch_max(in_flight, Ordering::Relaxed);
-    }
-
-    fn read_finished(&self) {
-        self.reads_in_flight.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    fn max_reads_in_flight(&self) -> usize {
-        self.max_reads_in_flight.load(Ordering::Relaxed)
-    }
-}
-
-struct ProbingReader {
-    inner: Arc<dyn IndexReader>,
-    probe: Arc<SegmentStatConcurrencyProbe>,
-}
-
-#[async_trait]
-impl IndexReader for ProbingReader {
-    async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch> {
-        self.inner.read_record_batch(n, batch_size).await
-    }
-    async fn read_global_buffer(&self, index: u32) -> Result<bytes::Bytes> {
-        self.inner.read_global_buffer(index).await
-    }
-    async fn read_range(
-        &self,
-        range: std::ops::Range<usize>,
-        projection: Option<&[&str]>,
-    ) -> Result<RecordBatch> {
-        self.probe.read_started();
-        // Yield before the underlying read so concurrently-scheduled segment
-        // fetches observe each other even when the local filesystem would
-        // otherwise complete each read within its first poll.
-        tokio::task::yield_now().await;
-        let result = self.inner.read_range(range, projection).await;
-        self.probe.read_finished();
-        result
-    }
-    async fn num_batches(&self, batch_size: u64) -> u32 {
-        self.inner.num_batches(batch_size).await
-    }
-    fn num_rows(&self) -> usize {
-        self.inner.num_rows()
-    }
-    fn schema(&self) -> &lance_core::datatypes::Schema {
-        self.inner.schema()
-    }
-}
-
-#[derive(Debug)]
-struct ProbingStore {
-    inner: Arc<dyn IndexStore>,
-    posting_file: String,
-    probe: Arc<SegmentStatConcurrencyProbe>,
-}
-
-impl DeepSizeOf for ProbingStore {
-    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.inner.deep_size_of_children(context)
-    }
-}
-
-#[async_trait]
-impl IndexStore for ProbingStore {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn clone_arc(&self) -> Arc<dyn IndexStore> {
-        Arc::new(Self {
-            inner: self.inner.clone(),
-            posting_file: self.posting_file.clone(),
-            probe: self.probe.clone(),
-        })
-    }
-    fn io_parallelism(&self) -> usize {
-        self.inner.io_parallelism()
-    }
-    fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
-        Arc::new(Self {
-            inner: self.inner.with_io_priority(io_priority),
-            posting_file: self.posting_file.clone(),
-            probe: self.probe.clone(),
-        })
-    }
-
-    fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
-        Arc::new(Self {
-            inner: self.inner.with_io_buffer_size(bytes),
-            posting_file: self.posting_file.clone(),
-            probe: self.probe.clone(),
-        })
-    }
-    async fn new_index_file(
-        &self,
-        name: &str,
-        schema: Arc<arrow_schema::Schema>,
-    ) -> Result<Box<dyn crate::scalar::IndexWriter>> {
-        self.inner.new_index_file(name, schema).await
-    }
-    async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
-        let reader = self.inner.open_index_file(name).await?;
-        if name == self.posting_file {
-            Ok(Arc::new(ProbingReader {
-                inner: reader,
-                probe: self.probe.clone(),
-            }))
-        } else {
-            Ok(reader)
-        }
-    }
-    async fn copy_index_file(
-        &self,
-        name: &str,
-        dest_store: &dyn IndexStore,
-    ) -> Result<crate::scalar::IndexFile> {
-        self.inner.copy_index_file(name, dest_store).await
-    }
-    async fn copy_index_file_to(
-        &self,
-        name: &str,
-        new_name: &str,
-        dest_store: &dyn IndexStore,
-    ) -> Result<crate::scalar::IndexFile> {
-        self.inner
-            .copy_index_file_to(name, new_name, dest_store)
-            .await
-    }
-    async fn rename_index_file(
-        &self,
-        name: &str,
-        new_name: &str,
-    ) -> Result<crate::scalar::IndexFile> {
-        self.inner.rename_index_file(name, new_name).await
-    }
-    async fn delete_index_file(&self, name: &str) -> Result<()> {
-        self.inner.delete_index_file(name).await
-    }
-    async fn list_files_with_sizes(&self) -> Result<Vec<crate::scalar::IndexFile>> {
-        self.inner.list_files_with_sizes().await
-    }
-}
-
 // Returns the `TempObjDir` guard so callers keep the backing store alive
 // for the index's lifetime: the deferred DocSet re-opens the docs file on
 // demand (it does not pin an open handle), so the files must still exist
@@ -360,6 +225,15 @@ impl IndexStore for ProbingStore {
 async fn load_counted_v2_index(
     num_tokens: usize,
     cache: LanceCache,
+) -> (Arc<InvertedIndex>, Arc<PostingMetadataCounter>, TempObjDir) {
+    load_counted_v2_index_with_counter(num_tokens, cache, Arc::default()).await
+}
+
+/// [`load_counted_v2_index`] with a counter shared across several segments.
+async fn load_counted_v2_index_with_counter(
+    num_tokens: usize,
+    cache: LanceCache,
+    counter: Arc<PostingMetadataCounter>,
 ) -> (Arc<InvertedIndex>, Arc<PostingMetadataCounter>, TempObjDir) {
     let tmpdir = TempObjDir::default();
     let inner_store = Arc::new(LanceIndexStore::new(
@@ -398,7 +272,6 @@ async fn load_counted_v2_index(
         .unwrap();
     writer.finish_with_metadata(metadata).await.unwrap();
 
-    let counter = Arc::new(PostingMetadataCounter::default());
     let counting_store: Arc<dyn IndexStore> = Arc::new(CountingStore {
         inner: inner_store,
         posting_file: posting_file_path(0),
@@ -410,59 +283,42 @@ async fn load_counted_v2_index(
     (index, counter, tmpdir)
 }
 
-/// One one-token v2 segment whose posting-file reads are routed through a
-/// shared [`SegmentStatConcurrencyProbe`], for the `prepare_bm25_query`
-/// fan-out test below. Passing the same probe to several segments makes it
-/// observable whether their statistics reads overlap. Mirrors
-/// [`load_counted_v2_index`] with a single token.
-async fn load_probed_v2_segment(
-    cache: LanceCache,
-    probe: Arc<SegmentStatConcurrencyProbe>,
-) -> (Arc<InvertedIndex>, TempObjDir) {
-    let tmpdir = TempObjDir::default();
-    let inner_store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
-        tmpdir.clone(),
-        Arc::new(LanceCache::no_cache()),
-    ));
+/// The cold scorer path of `prepare_bm25_query` reads every segment's
+/// statistics at once instead of one segment after another.
+#[tokio::test]
+async fn test_prepare_bm25_query_fetches_segment_stats_concurrently() {
+    let counter = Arc::new(PostingMetadataCounter::default());
+    let mut indices = Vec::new();
+    let mut tmpdirs = Vec::new();
+    for _ in 0..4 {
+        let (index, _, tmpdir) =
+            load_counted_v2_index_with_counter(1, LanceCache::no_cache(), counter.clone()).await;
+        indices.push(index);
+        tmpdirs.push(tmpdir);
+    }
 
-    let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
-    builder.tokens.get_or_add("t0");
-    let mut pl = PostingListBuilder::new(false);
-    pl.add(0, PositionRecorder::Count(1));
-    builder.posting_lists.push(pl);
-    builder.docs.append(0, 1);
-    builder.write(inner_store.as_ref()).await.unwrap();
+    let prepared = crate::scalar::inverted::prepare_bm25_query(
+        &indices,
+        Tokens::new(vec!["t0".to_owned()], DocType::Text),
+        &FtsSearchParams::new(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
 
-    let metadata = HashMap::from([
-        (
-            "partitions".to_owned(),
-            serde_json::to_string(&vec![0u64]).unwrap(),
-        ),
-        (
-            "params".to_owned(),
-            serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
-        ),
-        (
-            TOKEN_SET_FORMAT_KEY.to_owned(),
-            TokenSetFormat::default().to_string(),
-        ),
-    ]);
-    let mut writer = inner_store
-        .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
-        .await
-        .unwrap();
-    writer.finish_with_metadata(metadata).await.unwrap();
-
-    let probing_store: Arc<dyn IndexStore> = Arc::new(ProbingStore {
-        inner: inner_store,
-        posting_file: posting_file_path(0),
-        probe,
-    });
-    let index = InvertedIndex::load(probing_store, None, &cache)
-        .await
-        .unwrap();
-    (index, tmpdir)
+    let window = get_num_compute_intensive_cpus()
+        .clamp(1, 32)
+        .min(indices.len());
+    assert!(
+        counter.max_reads_in_flight() >= window.min(2),
+        "at most {} statistics reads were in flight at once",
+        counter.max_reads_in_flight()
+    );
+    let scorer = prepared.scorer();
+    assert_eq!(scorer.total_tokens, 4);
+    assert_eq!(scorer.num_docs, 4);
+    assert_eq!(scorer.token_docs["t0"], 4);
 }
 
 fn set_test_posting_group_size(index: &mut Arc<InvertedIndex>, group_size: u32) {
@@ -641,52 +497,6 @@ async fn test_bm25_stats_for_terms_reuses_posting_metadata_cache() {
         1,
         "repeated stats for the same token should reuse cached posting metadata",
     );
-}
-
-/// The cold asynchronous scorer path in `prepare_bm25_query` must fetch every
-/// segment's `bm25_stats_for_terms` concurrently: with one awaited segment at
-/// a time, the first query against a session pays the SUM of per-segment
-/// storage round trips instead of the max.
-///
-/// Four cold segments (fresh caches, no prewarm) share nothing, so the
-/// loaded-stats fast path cannot hit and the asynchronous fetch runs. Each
-/// segment's statistics read exactly one posting-file row for the one query
-/// term, so sequential awaits keep one read in flight at a time while a
-/// concurrent fan-out overlaps them.
-#[tokio::test]
-async fn test_prepare_bm25_query_fetches_segment_stats_concurrently() {
-    let probe = Arc::new(SegmentStatConcurrencyProbe::default());
-    let mut indices = Vec::with_capacity(4);
-    let mut tmpdirs = Vec::with_capacity(4);
-    for _ in 0..4 {
-        let (index, tmpdir) = load_probed_v2_segment(LanceCache::no_cache(), probe.clone()).await;
-        indices.push(index);
-        tmpdirs.push(tmpdir);
-    }
-
-    let prepared = crate::scalar::inverted::prepare_bm25_query(
-        &indices,
-        Tokens::new(vec!["t0".to_owned()], DocType::Text),
-        &FtsSearchParams::new(),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-
-    let max_in_flight = probe.max_reads_in_flight();
-    assert!(
-        max_in_flight >= 2,
-        "per-segment BM25 statistics should be fetched concurrently during prepare, \
-         but at most {max_in_flight} posting-file reads were in flight at once",
-    );
-
-    // The fan-out must not change the merged scorer: each segment contributes
-    // one document containing "t0" exactly once.
-    let scorer = prepared.scorer();
-    assert_eq!(scorer.total_tokens, 4);
-    assert_eq!(scorer.num_docs, 4);
-    assert_eq!(scorer.token_docs["t0"], 4);
 }
 
 /// Row-granularity statistics must not cost the posting file any extra IO
