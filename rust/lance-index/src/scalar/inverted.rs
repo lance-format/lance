@@ -316,8 +316,9 @@ fn merge_loaded_bm25_stats(
     ))))
 }
 
-/// Cap on concurrent per-segment loads, shared with the cross-column scorer.
-pub(crate) const MAX_CONCURRENT_SOURCE_LOADS: usize = 32;
+/// Cap on concurrent index loads within one FTS query, shared with the
+/// cross-column scorer.
+const MAX_CONCURRENT_SOURCE_LOADS: usize = 32;
 
 /// Expand and score one indexed query leaf exactly once across all segments.
 ///
@@ -379,8 +380,9 @@ pub async fn prepare_bm25_query(
         let parallelism = get_num_compute_intensive_cpus()
             .clamp(1, MAX_CONCURRENT_SOURCE_LOADS)
             .min(indices.len());
-        // Collected first: a lazily mapped iterator here leaves the stream's
-        // type higher-ranked over the borrow, which callers cannot prove Send.
+        // Collected first: holding a lazily mapped iterator across the await
+        // makes rustc check `Send` for the closure over every lifetime
+        // (rust-lang/rust#64552), which fails where callers box this future.
         let fetches = indices
             .iter()
             .map(|index| index.bm25_stats_for_terms(&terms, metrics))

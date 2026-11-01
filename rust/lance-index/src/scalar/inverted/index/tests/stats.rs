@@ -308,7 +308,7 @@ async fn test_prepare_bm25_query_fetches_segment_stats_concurrently() {
     .unwrap();
 
     let window = get_num_compute_intensive_cpus()
-        .clamp(1, 32)
+        .clamp(1, crate::scalar::inverted::MAX_CONCURRENT_SOURCE_LOADS)
         .min(indices.len());
     assert!(
         counter.max_reads_in_flight() >= window.min(2),
