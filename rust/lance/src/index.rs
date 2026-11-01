@@ -2313,6 +2313,9 @@ fn empty_fragment_bitmap_has_unknown_coverage(metadata: &IndexMetadata) -> bool 
         // Preserve best-effort behavior for legacy descriptions without details.
         return false;
     };
+    if segment_has_vector_details(metadata) {
+        return false;
+    }
     match scalar::SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(details) {
         Ok(plugin) => !plugin.supports_optimization(),
         // A description can still use a type URL whose plugin is unavailable.
@@ -9860,6 +9863,46 @@ mod tests {
         assert!(
             description.fragment_coverage().is_none(),
             "a missing plugin cannot make an empty bitmap authoritative coverage"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_describe_indices_empty_vector_bitmap_has_known_zero_coverage() {
+        let reader = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        let field_id = dataset.schema().field("id").unwrap().id;
+        let metadata = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "vector_idx".to_string(),
+            fields: vec![field_id],
+            covering_fields: vec![],
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(RoaringBitmap::new()),
+            index_details: Some(Arc::new(vector_index_details_default())),
+            index_version: IndexType::Vector.version(),
+            created_at: None,
+            base_id: None,
+            files: None,
+            clustering_id: None,
+            metadata: Default::default(),
+        };
+        let expected_bitmap_size =
+            u64::try_from(metadata.fragment_bitmap_serialized_size().unwrap()).unwrap();
+
+        let description = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
+            .await
+            .unwrap();
+        assert_eq!(
+            description.fragment_coverage(),
+            Some(&IndexFragmentCoverage {
+                covered_fragment_count: 0,
+                current_fragment_count: 1,
+                missing_fragment_count: 1,
+                stale_fragment_count: 0,
+                fragment_bitmap_size_bytes: expected_bitmap_size,
+            })
         );
     }
 
