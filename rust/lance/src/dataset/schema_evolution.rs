@@ -5771,6 +5771,8 @@ mod test {
             compact_files(
                 &mut dataset,
                 CompactionOptions {
+                    // Only the overlay count, not size, makes the fragment a candidate.
+                    target_rows_per_fragment: 3,
                     max_overlays_per_fragment: Some(0),
                     ..Default::default()
                 },
