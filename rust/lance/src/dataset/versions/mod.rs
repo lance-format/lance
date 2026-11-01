@@ -31,7 +31,6 @@ use lance_file::{
     versions as file_versions,
     writer::{FileWriter, FileWriterOptions},
 };
-use lance_index::scalar::seed::IndexSeedWriter;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer as ObjectWriter;
 use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
@@ -39,6 +38,7 @@ use lance_table::format::{DataFile, DataStorageFormat, Fragment, Manifest};
 use object_store::path::Path;
 
 use super::Dataset;
+use super::blob::BlobPayloadInventory;
 use super::fragment::{
     FileFragment, FragReadConfig, GenericFileReader, MetadataMode, V1FragmentReader,
     write::FragmentCreateBuilder,
@@ -49,7 +49,8 @@ use super::schema_evolution::optimize::{
     ChainedNewColumnTransformOptimizer, SqlToAllNullsOptimizer,
 };
 use super::statistics::FieldStatistics;
-use super::write::{self, GenericWriter, TargetBaseInfo, WriteParams, WriterOptions};
+use super::write::seeds::SeedCollector;
+use super::write::{self, GenericWriter, TargetBaseInfo, WriteMode, WriteParams, WriterOptions};
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, LanceScanConfig, LanceStream, TakeExec,
@@ -105,20 +106,6 @@ pub fn schema_compare_options(version: ConcreteFileVersion) -> SchemaCompareOpti
     }
 }
 
-async fn create_seed_writers(
-    version: ConcreteFileVersion,
-    dataset: Option<&Dataset>,
-    params: &WriteParams,
-) -> Result<Vec<Box<dyn IndexSeedWriter>>> {
-    match version {
-        ConcreteFileVersion::V1 => Ok(Vec::new()),
-        ConcreteFileVersion::V2_0
-        | ConcreteFileVersion::V2_1
-        | ConcreteFileVersion::V2_2
-        | ConcreteFileVersion::V2_3 => write::create_seed_writers_current(dataset, params).await,
-    }
-}
-
 fn create_current_file_writer(
     version: ConcreteFileVersion,
     object_writer: Box<dyn ObjectWriter>,
@@ -144,7 +131,19 @@ pub async fn write_fragments(
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
     file_row_counts: Option<Vec<usize>>,
+    preassigned_data_file_name: Option<Arc<String>>,
+    inherited_field_ids: bool,
+    created_blob_payloads: Option<BlobPayloadInventory>,
 ) -> Result<(Vec<Fragment>, Schema)> {
+    // A writer that spills row lineage into the fragment's own data file
+    // carries the hidden columns in its stream. They are not dataset fields:
+    // set them aside before the schema is checked against the dataset's and
+    // put them back on the schema that is written. This has to come before
+    // the blob promotion, which gives every negative field id a new one.
+    let (mut normalized_schema, lineage_fields) = split_row_lineage_fields(normalized_schema)?;
+    if dataset.is_none() {
+        write::assign_new_table_field_ids(&mut normalized_schema, inherited_field_ids)?;
+    }
     let normalized_schema = match version {
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
             write::promote_legacy_blob_schema(&normalized_schema)?
@@ -152,12 +151,14 @@ pub async fn write_fragments(
         _ => normalized_schema,
     };
     let version_name = format!("{version:?}");
-    let schema = write::prepare_write_schema(
+    let mut schema = write::prepare_write_schema(
         dataset,
         normalized_schema,
         &params,
         schema_compare_options(version),
+        inherited_field_ids,
     )?;
+    schema.fields.extend(lineage_fields);
     match version {
         ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => {
             write::validate_legacy_blob_write_schema(&schema, &version_name)?;
@@ -166,7 +167,9 @@ pub async fn write_fragments(
             write::validate_blob_v2_write_schema(&schema)?;
         }
     }
-    let seed_writers = create_seed_writers(version, dataset, &params).await?;
+    // Overwrite drops every index, so its seeds would have no consumer.
+    let consult_indices = !matches!(params.mode, WriteMode::Overwrite);
+    let seeds = SeedCollector::for_write(version, dataset, &schema, consult_indices).await?;
     let fragments = write_fragments_direct(
         version,
         dataset,
@@ -176,11 +179,72 @@ pub async fn write_fragments(
         data,
         params,
         target_bases_info,
-        seed_writers,
+        seeds,
         file_row_counts,
+        preassigned_data_file_name,
+        created_blob_payloads,
     )
     .await?;
     Ok((fragments, schema))
+}
+
+/// Take the hidden row lineage columns out of a write schema.
+///
+/// A hidden column is a top-level field that already carries the reserved id
+/// of its name, as the writers that spill lineage into a data file assign it.
+/// A user column that only shares the name has a non-negative id and stays a
+/// user column, to be checked against the dataset schema like any other.
+fn split_row_lineage_fields(schema: Schema) -> Result<(Schema, Vec<Field>)> {
+    let (lineage, user): (Vec<_>, Vec<_>) = schema
+        .fields
+        .into_iter()
+        .partition(|field| lance_core::row_lineage_field_id(&field.name) == Some(field.id));
+    // The readers decode these columns as non-nullable `UInt64`, whatever the
+    // written type, so any other type would only fail once read back.
+    if let Some(field) = lineage
+        .iter()
+        .find(|field| field.nullable || field.data_type() != DataType::UInt64)
+    {
+        return Err(Error::internal(format!(
+            "hidden row lineage column {} (field id {}) must be a non-nullable UInt64, got \
+             {} (nullable: {})",
+            field.name,
+            field.id,
+            field.data_type(),
+            field.nullable
+        )));
+    }
+    Ok((
+        Schema {
+            fields: user,
+            metadata: schema.metadata,
+        },
+        lineage,
+    ))
+}
+
+/// Zero row limits cannot be honored: a zero `max_rows_per_file` panics when
+/// a V2 stream is split into files, and on V1 a zero `max_rows_per_group`
+/// chunks the input into no batches, so nothing is written.
+pub fn validate_row_limits(version: ConcreteFileVersion, params: &WriteParams) -> Result<()> {
+    if params.max_rows_per_file == 0 {
+        return Err(Error::invalid_input(
+            "max_rows_per_file must be greater than zero",
+        ));
+    }
+    if params.max_rows_per_file > u32::MAX as usize {
+        return Err(Error::invalid_input(format!(
+            "max_rows_per_file cannot exceed the fragment row capacity of {} rows, got {}",
+            u32::MAX,
+            params.max_rows_per_file
+        )));
+    }
+    if matches!(version, ConcreteFileVersion::V1) && params.max_rows_per_group == 0 {
+        return Err(Error::invalid_input(
+            "max_rows_per_group must be greater than zero",
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -193,22 +257,29 @@ pub async fn write_fragments_direct(
     data: SendableRecordBatchStream,
     params: WriteParams,
     target_bases_info: Option<Vec<TargetBaseInfo>>,
-    seed_writers: Vec<Box<dyn IndexSeedWriter>>,
+    seeds: SeedCollector,
     file_row_counts: Option<Vec<usize>>,
+    preassigned_data_file_name: Option<Arc<String>>,
+    created_blob_payloads: Option<BlobPayloadInventory>,
 ) -> Result<Vec<Fragment>> {
+    validate_row_limits(version, &params)?;
     let buffered_reader = if let Some(file_row_counts) = file_row_counts.as_ref() {
-        if file_row_counts.contains(&0) {
-            return Err(Error::invalid_input(
-                "File row counts must be greater than zero",
-            ));
+        if let Some(rows) = file_row_counts.iter().find(|rows| **rows == 0) {
+            return Err(Error::invalid_input(format!(
+                "File row counts must be greater than zero, got {rows}"
+            )));
+        }
+        if let Some(rows) = file_row_counts
+            .iter()
+            .find(|rows| **rows > u32::MAX as usize)
+        {
+            return Err(Error::invalid_input(format!(
+                "File row counts cannot exceed the fragment row capacity of {} rows, got {rows}",
+                u32::MAX
+            )));
         }
         match version {
             ConcreteFileVersion::V1 => {
-                if params.max_rows_per_group == 0 {
-                    return Err(Error::invalid_input(
-                        "max_rows_per_group must be greater than zero when file row counts are specified",
-                    ));
-                }
                 let max_rows_per_group = params.max_rows_per_group;
                 let batch_row_counts =
                     file_row_counts
@@ -255,8 +326,10 @@ pub async fn write_fragments_direct(
         },
         external_base_resolver,
         target_bases_info,
-        seed_writers,
+        seeds,
         file_row_counts,
+        preassigned_data_file_name,
+        created_blob_payloads,
     )
     .await
 }
@@ -620,6 +693,7 @@ pub async fn open_writer(
             };
             if schema.fields_pre_order().any(Field::is_blob_v2) {
                 write::open_current_blob_v2_writer(
+                    version,
                     create_file_writer,
                     object_store,
                     schema,
@@ -654,16 +728,17 @@ pub async fn open_update_writer(
         }
         ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => None,
     };
+    let options = WriterOptions::update(
+        dataset.session.store_registry(),
+        external_base_resolver,
+        allow_external_blob_outside_bases,
+    );
     open_writer(
         version,
         &dataset.object_store,
         schema,
         &dataset.base,
-        WriterOptions::update(
-            dataset.session.store_registry(),
-            external_base_resolver,
-            allow_external_blob_outside_bases,
-        ),
+        options,
     )
     .await
 }
@@ -1084,5 +1159,67 @@ pub fn validate_row_stream_read(version: ConcreteFileVersion) -> Result<()> {
         | ConcreteFileVersion::V2_1
         | ConcreteFileVersion::V2_2
         | ConcreteFileVersion::V2_3 => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_ID_FIELD_ID};
+    use rstest::rstest;
+
+    fn lance_field(name: &str, data_type: DataType, nullable: bool, id: i32) -> Field {
+        let mut field = Field::try_from(&ArrowField::new(name, data_type, nullable)).unwrap();
+        field.id = id;
+        field
+    }
+
+    #[rstest]
+    #[case::uint64(DataType::UInt64, false, true)]
+    #[case::not_uint64(DataType::Int64, false, false)]
+    #[case::nullable(DataType::UInt64, true, false)]
+    fn split_row_lineage_fields_keys_on_reserved_ids(
+        #[case] data_type: DataType,
+        #[case] nullable: bool,
+        #[case] valid: bool,
+    ) {
+        let key = lance_field("i", DataType::Int32, false, 0);
+        // A user column that only shares a lineage column's name keeps its own
+        // id, so it stays with the fields checked against the dataset schema.
+        let named_like_lineage = lance_field(ROW_CREATED_AT_VERSION, DataType::UInt64, true, 1);
+        let hidden = lance_field(ROW_ID, data_type, nullable, ROW_ID_FIELD_ID);
+        let schema = Schema {
+            fields: vec![key.clone(), named_like_lineage.clone(), hidden.clone()],
+            metadata: HashMap::new(),
+        };
+
+        let result = split_row_lineage_fields(schema);
+        if !valid {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::Internal { .. }), "{error}");
+            assert!(error.to_string().contains("non-nullable UInt64"), "{error}");
+            return;
+        }
+        let (user, lineage) = result.unwrap();
+        assert_eq!(user.fields, vec![key, named_like_lineage]);
+        // Split out with its reserved id intact.
+        assert_eq!(lineage, vec![hidden]);
+    }
+
+    #[test]
+    fn rejects_file_limit_above_fragment_row_capacity() {
+        let params = WriteParams {
+            max_rows_per_file: u32::MAX as usize + 1,
+            ..Default::default()
+        };
+
+        let error = validate_row_limits(ConcreteFileVersion::V2_0, &params).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot exceed the fragment row capacity"),
+            "{error}"
+        );
     }
 }

@@ -5,8 +5,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering::Relaxed;
 
 use arrow_array::StringArray;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use lance_core::cache::LanceCache;
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tempfile::TempObjDir;
 use lance_io::object_store::ObjectStore;
 use lance_select::RowAddrTreeMap;
@@ -32,7 +33,7 @@ fn text_stream(rows: &[(Option<&str>, u64)], batch_rows: usize) -> SendableRecor
         Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
         Field::new(ROW_ID, DataType::UInt64, false),
     ]));
-    let batches: Vec<datafusion::error::Result<RecordBatch>> = rows
+    let batches: Vec<datafusion_common::Result<RecordBatch>> = rows
         .chunks(batch_rows.max(1))
         .map(|chunk| {
             let texts = StringArray::from(chunk.iter().map(|(text, _)| *text).collect::<Vec<_>>());
@@ -667,7 +668,6 @@ async fn test_remap_rewrites_and_drops_row_ids() {
     let (bases, _) = near_duplicate_corpus(4, 40);
     let rows = corpus_rows(&bases, &[]);
     let index = build_and_load(&store, default_builder(), &rows, 4, &LanceCache::no_cache()).await;
-    assert!(index.can_remap());
 
     // Row 1 is deleted, row 2 is absent from the mapping and keeps its id
     let mapping = RowAddrRemap::direct(HashMap::from([
@@ -677,6 +677,11 @@ async fn test_remap_rewrites_and_drops_row_ids() {
     ]));
     let (_dest_dir, dest_store) = test_store();
     let created = index.remap(&mapping, dest_store.as_ref()).await.unwrap();
+    assert!(
+        MinHashLshIndexPlugin
+            .can_remap(&created.index_details)
+            .unwrap()
+    );
     let remapped = load(&dest_store, &created.index_details, &LanceCache::no_cache()).await;
     assert_eq!(remapped.num_docs(), 3);
     assert_eq!(row_ids(&remapped, &bases[0], 1).await, vec![7]);

@@ -6,6 +6,16 @@ use super::*;
 
 const LANCE_FTS_REUSE_PREPARED_SCORER_ENV: &str = "LANCE_FTS_REUSE_PREPARED_SCORER";
 
+/// Segment BM25 statistics read without I/O, with the dictionary lookups they
+/// were derived from.
+#[derive(Debug, PartialEq)]
+pub(in crate::scalar::inverted) struct LoadedTermStats {
+    /// `(total_tokens, num_docs, per_term_doc_freq)`
+    pub(in crate::scalar::inverted) stats: (u64, usize, Vec<usize>),
+    /// Partition-major token ids: `token_ids[partition * terms.len() + term]`.
+    pub(in crate::scalar::inverted) token_ids: Box<[Option<u32>]>,
+}
+
 fn reuse_prepared_scorer_enabled_from_value(value: Option<&str>) -> bool {
     !value.is_some_and(|value| {
         let value = value.trim();
@@ -140,7 +150,7 @@ impl InvertedIndex {
     pub(in crate::scalar::inverted) fn bm25_stats_for_terms_if_loaded(
         &self,
         terms: &[String],
-    ) -> Result<Option<(u64, usize, Vec<usize>)>> {
+    ) -> Result<Option<LoadedTermStats>> {
         // Keep the legacy reader on its frozen asynchronous compatibility
         // path; this optimization targets current partitioned formats.
         if self.is_legacy() {
@@ -156,11 +166,28 @@ impl InvertedIndex {
         {
             return Ok(None);
         }
-        let mut token_docs = Vec::with_capacity(terms.len());
-        for term in terms {
-            let mut term_docs = 0_usize;
-            for partition in &self.partitions {
-                let Some(token_id) = partition.tokens.get(term) else {
+        let lookups = self
+            .partitions
+            .iter()
+            .flat_map(|partition| {
+                terms
+                    .iter()
+                    .map(|term| (partition.tokens.as_ref(), term.as_str()))
+            })
+            .collect::<Vec<_>>();
+        let token_ids = TokenSet::get_many(&lookups);
+        let mut token_docs = vec![0_usize; terms.len()];
+        for (partition, partition_token_ids) in self
+            .partitions
+            .iter()
+            .zip(token_ids.chunks(terms.len().max(1)))
+        {
+            for ((term, term_docs), &token_id) in terms
+                .iter()
+                .zip(token_docs.iter_mut())
+                .zip(partition_token_ids)
+            {
+                let Some(token_id) = token_id else {
                     continue;
                 };
                 let posting_len = partition
@@ -172,15 +199,17 @@ impl InvertedIndex {
                             partition.id()
                         ))
                     })?;
-                term_docs = term_docs.checked_add(posting_len).ok_or_else(|| {
+                *term_docs = term_docs.checked_add(posting_len).ok_or_else(|| {
                     Error::index(format!(
                         "FTS document frequency for term '{term}' overflows usize"
                     ))
                 })?;
             }
-            token_docs.push(term_docs);
         }
-        Ok(Some((total_tokens, num_docs, token_docs)))
+        Ok(Some(LoadedTermStats {
+            stats: (total_tokens, num_docs, token_docs),
+            token_ids: token_ids.into_boxed_slice(),
+        }))
     }
 
     /// Corpus statistics at row granularity: `(total_tokens, docCount,
@@ -205,6 +234,76 @@ impl InvertedIndex {
     /// statistics trigger, so both granularities report comparable
     /// `index_cache_hits`/`index_cache_misses`.
     pub async fn bm25_row_stats_for_terms(
+        &self,
+        terms: &[String],
+        stale_rows: Option<&RowAddrTreeMap>,
+        metrics: Option<&dyn MetricsCollector>,
+    ) -> Result<(u64, usize, Vec<usize>)> {
+        let base = self.bm25_row_stats_for_terms_unrestricted(terms, metrics);
+        let Some(stale_rows) = stale_rows.filter(|rows| !rows.is_empty()) else {
+            return base.await;
+        };
+        let (total_tokens, num_rows, mut row_freqs) = base.await?;
+        let (stale_tokens, stale_num_rows, stale_freqs) = self
+            .stale_row_stats_for_terms(terms, stale_rows, metrics)
+            .await?;
+        for (total, stale) in row_freqs.iter_mut().zip(stale_freqs) {
+            *total = total.saturating_sub(stale);
+        }
+        Ok((
+            total_tokens.saturating_sub(stale_tokens),
+            num_rows.saturating_sub(stale_num_rows),
+            row_freqs,
+        ))
+    }
+
+    /// What the rows an overlay made stale still contribute to this index's
+    /// statistics, for the caller to subtract.
+    ///
+    /// The index holds their pre-overlay values until it is optimized, and the flat
+    /// scan folds in their current ones. Counting both inflates `docCount` and
+    /// `docFreq`, which is enough to reorder results after an overlay that changed
+    /// no searchable value.
+    async fn stale_row_stats_for_terms(
+        &self,
+        terms: &[String],
+        stale_rows: &RowAddrTreeMap,
+        metrics: Option<&dyn MetricsCollector>,
+    ) -> Result<(u64, usize, Vec<usize>)> {
+        let io_parallelism = self.store.io_parallelism();
+        let futures = self
+            .partitions
+            .iter()
+            .map(|partition| {
+                let partition = partition.clone();
+                async move {
+                    partition
+                        .stale_row_stats_for_terms(terms, stale_rows, metrics)
+                        .await
+                }
+            })
+            .collect::<Vec<_>>();
+        let per_partition: Vec<(u64, usize, Vec<usize>)> = stream::iter(futures)
+            .buffer_unordered(io_parallelism)
+            .try_collect()
+            .await?;
+
+        let mut total_tokens = 0u64;
+        let mut num_rows = 0usize;
+        let mut row_freqs = vec![0usize; terms.len()];
+        // Partitions hold disjoint row sets, so a row lands in at most one of these.
+        for (partition_tokens, partition_rows, partition_freqs) in per_partition {
+            total_tokens += partition_tokens;
+            num_rows += partition_rows;
+            for (total, partition_freq) in row_freqs.iter_mut().zip(partition_freqs) {
+                *total += partition_freq;
+            }
+        }
+        Ok((total_tokens, num_rows, row_freqs))
+    }
+
+    /// [`Self::bm25_row_stats_for_terms`] with nothing subtracted.
+    async fn bm25_row_stats_for_terms_unrestricted(
         &self,
         terms: &[String],
         metrics: Option<&dyn MetricsCollector>,
@@ -315,7 +414,7 @@ impl InvertedIndex {
     /// Expand fuzzy query tokens against all partitions in this segment.
     ///
     /// `params.max_expansions` caps the whole query's expansion, not any
-    /// single partition's: source terms at the same query position and their
+    /// single partition's: source terms in the same query group and their
     /// per-partition candidates merge into one lexicographically ordered set,
     /// and the remaining budget takes a prefix of it. The selected terms are
     /// a pure function of the segment's vocabulary, so changing source-token
@@ -325,15 +424,17 @@ impl InvertedIndex {
         let initial_capacity = tokens.len().min(params.max_expansions);
         let mut expanded_tokens = Vec::with_capacity(initial_capacity);
         let mut expanded_positions = Vec::with_capacity(initial_capacity);
+        let mut expanded_groups = Vec::with_capacity(initial_capacity);
         let mut seen = HashSet::new();
-        let mut source_terms_by_position = BTreeMap::<u32, Vec<&str>>::new();
+        let mut source_terms_by_group = BTreeMap::<u32, (u32, Vec<&str>)>::new();
         for token_idx in 0..tokens.len() {
-            source_terms_by_position
-                .entry(tokens.position(token_idx))
-                .or_default()
+            source_terms_by_group
+                .entry(tokens.position_for_query(token_idx, params.phrase_slop.is_some()))
+                .or_insert_with(|| (tokens.position(token_idx), Vec::new()))
+                .1
                 .push(tokens.get_token(token_idx));
         }
-        for (position, source_terms) in source_terms_by_position {
+        for (group, (position, source_terms)) in source_terms_by_group {
             let remaining = params.max_expansions.saturating_sub(expanded_tokens.len());
             if remaining == 0 {
                 break;
@@ -359,9 +460,10 @@ impl InvertedIndex {
                 if expanded_tokens.len() >= params.max_expansions {
                     break;
                 }
-                if seen.insert((candidate.clone(), position)) {
+                if seen.insert((candidate.clone(), group)) {
                     expanded_tokens.push(candidate);
                     expanded_positions.push(position);
+                    expanded_groups.push(group);
                 }
             }
         }
@@ -369,7 +471,8 @@ impl InvertedIndex {
             expanded_tokens,
             expanded_positions,
             tokens.token_type().clone(),
-        ))
+        )
+        .with_term_groups(expanded_groups))
     }
 
     /// Search documents that match the query and return row ids sorted by BM25 score.
@@ -491,9 +594,12 @@ impl InvertedIndex {
                 // to keep at least one expansion; a position that expands to
                 // nothing anywhere in the segment can never be matched.
                 let surviving = (0..expanded.len())
-                    .map(|idx| expanded.position(idx))
+                    .map(|idx| expanded.position_for_query(idx, params.phrase_slop.is_some()))
                     .collect::<HashSet<_>>();
-                if (0..tokens.len()).any(|idx| !surviving.contains(&tokens.position(idx))) {
+                if (0..tokens.len()).any(|idx| {
+                    !surviving
+                        .contains(&tokens.position_for_query(idx, params.phrase_slop.is_some()))
+                }) {
                     return Ok(Vec::new());
                 }
             }
@@ -520,6 +626,7 @@ impl InvertedIndex {
             scorer,
             None,
             initial_score_floor,
+            None,
         )
         .await
     }
@@ -613,6 +720,9 @@ impl InvertedIndex {
         }
         let scorer = prepared.scorer();
         let reusable_scorer = prepared.reusable_scorer();
+        let term_ids = prepared
+            .term_ids()
+            .and_then(|term_ids| term_ids.for_segment(self, prepared.tokens().len()));
         self.bm25_search_final_documents(
             prepared.tokens().clone(),
             params,
@@ -622,6 +732,7 @@ impl InvertedIndex {
             scorer.as_ref(),
             reusable_scorer,
             initial_score_floor,
+            term_ids,
         )
         .await
     }
@@ -640,10 +751,12 @@ impl InvertedIndex {
         scorer: &MemBM25Scorer,
         prepared_scorer: Option<&Arc<MemBM25Scorer>>,
         initial_score_floor: Option<f32>,
+        term_ids: Option<SegmentTermIds<'_>>,
     ) -> Result<Vec<ScoredDoc>> {
         // The wand only consults `scorer.doc_weight`, which is metadata-free.
-        // The outer aggregation below consults `scorer.query_weight`; pairing
-        // final tokens with precomputed per-term IDFs avoids the v2 bulk
+        // Candidate rescoring also consults `query_weight`. The impact scorer
+        // is the final scorer or a clone of it, so either may rescore; pairing
+        // final tokens with its precomputed per-term IDFs avoids the v2 bulk
         // metadata pull and keeps scoring aligned with the rewrite.
         let impact_scorer = select_impact_scorer(
             scorer,
@@ -656,7 +769,7 @@ impl InvertedIndex {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let mask = prefilter.mask();
+        let mask = self.restrict_mask(prefilter.mask());
         if self.is_legacy() {
             let (row_ids, scores) = self
                 .bm25_search_legacy(
@@ -682,10 +795,10 @@ impl InvertedIndex {
                 operator,
                 mask,
                 metrics,
-                scorer,
                 impact_scorer,
                 limit,
                 initial_score_floor,
+                term_ids,
             })
             .await
         }
@@ -743,16 +856,6 @@ impl InvertedIndex {
                             if postings.is_empty() {
                                 return Result::Ok(None);
                             }
-                            let max_position = postings
-                                .iter()
-                                .map(|posting| posting.term_index() as usize)
-                                .max()
-                                .unwrap_or_default();
-                            let mut tokens_by_position = vec![String::new(); max_position + 1];
-                            for posting in &postings {
-                                tokens_by_position[posting.term_index() as usize] =
-                                    posting.token().to_owned();
-                            }
                             let docs = part.docs.legacy().cloned().ok_or_else(|| {
                                 Error::internal("legacy index contains modern partition documents")
                             })?;
@@ -769,7 +872,6 @@ impl InvertedIndex {
                                 postings,
                                 wand_scorer,
                                 threshold,
-                                tokens_by_position,
                                 grouped_expansions,
                             )))
                         }
@@ -787,16 +889,11 @@ impl InvertedIndex {
 
                     let results = spawn_cpu(move || {
                         let mut results = Vec::with_capacity(loaded.len());
-                        for (
-                            part,
-                            docs,
-                            postings,
-                            wand_scorer,
-                            threshold,
-                            tokens_by_position,
-                            grouped_expansions,
-                        ) in loaded
+                        for (part, docs, postings, wand_scorer, threshold, grouped_expansions) in
+                            loaded
                         {
+                            let idf_by_position =
+                                idf_by_position(&postings, impact_scorer.as_ref());
                             let candidates = part.bm25_search_legacy(
                                 docs.as_ref(),
                                 params.as_ref(),
@@ -808,7 +905,7 @@ impl InvertedIndex {
                                 threshold,
                             )?;
                             results.push(PartitionCandidates {
-                                tokens_by_position,
+                                idf_by_position,
                                 grouped_expansions,
                                 candidates,
                             });
@@ -822,13 +919,12 @@ impl InvertedIndex {
             .collect::<Vec<_>>();
 
         let mut ranked = BinaryHeap::new();
-        let mut idf_cache = HashMap::new();
         let mut parts = stream::iter(parts)
             .buffer_unordered(get_num_compute_intensive_cpus().min(32))
             .map_ok(|results| stream::iter(results.into_iter().map(Result::Ok)))
             .try_flatten();
         while let Some(partition) = parts.try_next().await? {
-            for (row_id, score) in rescore_partition_candidates(partition, scorer, &mut idf_cache) {
+            for (row_id, score) in rescore_partition_candidates(partition, scorer) {
                 push_scored_key(&mut ranked, limit, row_id, score);
             }
         }
@@ -942,10 +1038,10 @@ impl InvertedIndex {
             operator,
             mask,
             metrics,
-            scorer,
             impact_scorer,
             limit,
             initial_score_floor,
+            term_ids,
         } = request;
         if self.partitions.len() > u32::MAX as usize {
             return Err(Error::index(format!(
@@ -956,18 +1052,41 @@ impl InvertedIndex {
         let impact_shared_threshold = Arc::new(AtomicU32::new(
             initial_score_floor.unwrap_or(f32::NEG_INFINITY).to_bits(),
         ));
+        let shared_norm_addends = SharedNormAddends::default();
+        let search_guard = super::scheduling::MODERN_SEARCHES.enter();
+        let workers = get_num_compute_intensive_cpus().min(32);
         let io_parallelism = self.store.io_parallelism();
-        let parts = self
+        let is_phrase_query = params.phrase_slop.is_some();
+        // With dictionary lookups already resolved, drop partitions that
+        // cannot satisfy the leaf before building any per-partition state.
+        let searched_partitions = self
             .partitions
-            .chunks(fts_search_chunk())
+            .iter()
             .enumerate()
-            .map(|(chunk_ordinal, chunk)| {
-                let first_partition_ordinal = chunk_ordinal * fts_search_chunk();
+            .filter(|(partition_ordinal, _)| {
+                term_ids.is_none_or(|term_ids| {
+                    token_ids_may_match(
+                        tokens.as_ref(),
+                        term_ids.partition(*partition_ordinal),
+                        operator,
+                        is_phrase_query,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let chunk_size = search_guard.chunk_size(searched_partitions.len(), workers);
+        let buffered_chunks = super::scheduling::buffered_search_chunks(
+            searched_partitions.len(),
+            chunk_size,
+            workers,
+            io_parallelism,
+        );
+        let parts = searched_partitions
+            .chunks(chunk_size)
+            .map(|chunk| {
                 let chunk = chunk
                     .iter()
-                    .cloned()
-                    .enumerate()
-                    .map(|(offset, part)| (first_partition_ordinal + offset, part))
+                    .map(|&(partition_ordinal, part)| (partition_ordinal, Arc::clone(part)))
                     .collect::<Vec<_>>();
                 let tokens = tokens.clone();
                 let params = params.clone();
@@ -975,35 +1094,30 @@ impl InvertedIndex {
                 let metrics = metrics.clone();
                 let impact_scorer = impact_scorer.clone();
                 let impact_shared_threshold = impact_shared_threshold.clone();
+                let shared_norm_addends = shared_norm_addends.clone();
                 async move {
                     let loads = chunk.into_iter().map(|(partition_ordinal, part)| {
                         let tokens = tokens.clone();
                         let params = params.clone();
                         let mask = mask.clone();
                         let metrics = metrics.clone();
-                        let impact_scorer = impact_scorer.clone();
-                        let impact_shared_threshold = impact_shared_threshold.clone();
+                        let partition_term_ids =
+                            term_ids.map(|term_ids| term_ids.partition(partition_ordinal));
                         async move {
-                            let LoadedPostings {
-                                postings,
-                                grouped_expansions,
-                                impact_safe,
-                                exact_scoring_required,
-                                ..
-                            } = part
-                                .load_posting_lists(
+                            let Some(postings) = part
+                                .fetch_posting_lists(
                                     tokens.as_ref(),
                                     params.as_ref(),
                                     operator,
-                                    impact_scorer.as_ref(),
                                     metrics.as_ref(),
-                                    false,
+                                    PostingLoadOptions::cache_aware_exact(false),
+                                    partition_term_ids,
                                 )
-                                .await?;
-                            if postings.is_empty() {
+                                .await?
+                            else {
                                 return Result::Ok(None);
-                            }
-                            let documents = part.docs.modern().cloned().ok_or_else(|| {
+                            };
+                            let documents = part.docs.modern().ok_or_else(|| {
                                 Error::internal("modern index contains legacy partition documents")
                             })?;
                             let materialize_selected = operator == Operator::Or
@@ -1029,33 +1143,12 @@ impl InvertedIndex {
                                 Some(lengths) => lengths,
                                 None => documents.lengths().await?,
                             };
-                            let max_position = postings
-                                .iter()
-                                .map(|posting| posting.term_index() as usize)
-                                .max()
-                                .unwrap_or_default();
-                            let mut tokens_by_position = vec![String::new(); max_position + 1];
-                            for posting in &postings {
-                                tokens_by_position[posting.term_index() as usize] =
-                                    posting.token().to_owned();
-                            }
-                            let use_global_scorer = impact_safe || exact_scoring_required;
-                            let threshold = if use_global_scorer {
-                                impact_shared_threshold
-                            } else {
-                                Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()))
-                            };
-                            let wand_scorer = use_global_scorer.then(|| impact_scorer.clone());
                             Result::Ok(Some((
                                 partition_ordinal,
                                 part,
                                 lengths,
                                 visibility,
                                 postings,
-                                wand_scorer,
-                                threshold,
-                                tokens_by_position,
-                                grouped_expansions,
                             )))
                         }
                     });
@@ -1070,20 +1163,31 @@ impl InvertedIndex {
                         return Result::Ok(Vec::new());
                     }
 
+                    // Iterators are built here rather than during the load so
+                    // their decode buffers are allocated and freed by the same
+                    // thread that runs WAND.
                     let results = spawn_cpu(move || {
                         let mut results = Vec::with_capacity(loaded.len());
-                        for (
-                            partition_ordinal,
-                            part,
-                            lengths,
-                            visibility,
-                            postings,
-                            wand_scorer,
-                            threshold,
-                            tokens_by_position,
-                            grouped_expansions,
-                        ) in loaded
-                        {
+                        for (partition_ordinal, part, lengths, visibility, postings) in loaded {
+                            let LoadedPostings {
+                                postings,
+                                grouped_expansions,
+                                impact_safe,
+                                exact_scoring_required,
+                                ..
+                            } = postings.into_loaded(tokens.as_ref(), impact_scorer.as_ref())?;
+                            if postings.is_empty() {
+                                continue;
+                            }
+                            let use_global_scorer = impact_safe || exact_scoring_required;
+                            let threshold = if use_global_scorer {
+                                impact_shared_threshold.clone()
+                            } else {
+                                Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()))
+                            };
+                            let wand_scorer = use_global_scorer.then(|| impact_scorer.clone());
+                            let idf_by_position =
+                                idf_by_position(&postings, impact_scorer.as_ref());
                             let candidates = part.bm25_search_modern(
                                 lengths.as_ref(),
                                 &visibility,
@@ -1091,17 +1195,23 @@ impl InvertedIndex {
                                 operator,
                                 postings,
                                 wand_scorer,
+                                shared_norm_addends.clone(),
                                 metrics.as_ref(),
                                 threshold,
                             )?;
-                            results.push((
-                                partition_ordinal,
+                            // Rescore here too, so each candidate's frequency
+                            // list is freed by the thread that allocated it.
+                            let scored = rescore_partition_candidates(
                                 PartitionCandidates {
-                                    tokens_by_position,
+                                    idf_by_position,
                                     grouped_expansions,
                                     candidates,
                                 },
-                            ));
+                                impact_scorer.as_ref(),
+                            );
+                            if !scored.is_empty() {
+                                results.push((partition_ordinal, scored));
+                            }
                         }
                         Result::Ok(results)
                     })
@@ -1112,13 +1222,12 @@ impl InvertedIndex {
             .collect::<Vec<_>>();
 
         let mut ranked = BinaryHeap::new();
-        let mut idf_cache = HashMap::new();
         let mut parts = stream::iter(parts)
-            .buffer_unordered(get_num_compute_intensive_cpus().min(32))
+            .buffer_unordered(buffered_chunks)
             .map_ok(|results| stream::iter(results.into_iter().map(Result::Ok)))
             .try_flatten();
-        while let Some((partition_ordinal, partition)) = parts.try_next().await? {
-            for (doc_id, score) in rescore_partition_candidates(partition, scorer, &mut idf_cache) {
+        while let Some((partition_ordinal, scored)) = parts.try_next().await? {
+            for (doc_id, score) in scored {
                 push_scored_partition_doc(
                     &mut ranked,
                     limit,

@@ -212,14 +212,10 @@ pub trait FlatFloat: L2 + Dot {
 /// lance-linalg's batch kernels, one row at a time.
 fn batch_rows_kernel<T: L2 + Dot>(metric: DistanceType) -> RowsFn<T> {
     fn l2_rows<T: L2>(anchor: &[T], rows: &[T], out: &mut [f32]) {
-        for (out, l2) in out.iter_mut().zip(T::l2_batch(anchor, rows, anchor.len())) {
-            *out = l2;
-        }
+        T::l2_batch_into(anchor, rows, anchor.len(), out);
     }
     fn dot_rows<T: Dot>(anchor: &[T], rows: &[T], out: &mut [f32]) {
-        for (out, dot) in out.iter_mut().zip(T::dot_batch(anchor, rows, anchor.len())) {
-            *out = dot;
-        }
+        T::dot_batch_into(anchor, rows, anchor.len(), out);
     }
     if metric == DistanceType::Dot {
         dot_rows::<T>
@@ -361,11 +357,10 @@ mod f32_rows {
     fn portable<const L2: bool>(anchor: &[f32], rows: &[f32], out: &mut [f32]) {
         assert_eq!(rows.len(), anchor.len() * out.len());
         for (out, row) in out.iter_mut().zip(rows.chunks_exact(anchor.len())) {
-            let x = anchor.chunks_exact(LANES);
-            let y = row.chunks_exact(LANES);
-            let (x_tail, y_tail) = (x.remainder(), y.remainder());
+            let (x, x_tail) = anchor.as_chunks::<LANES>();
+            let (y, y_tail) = row.as_chunks::<LANES>();
             let mut sums = [0.0f32; LANES];
-            for (x, y) in x.zip(y) {
+            for (x, y) in x.iter().zip(y) {
                 for i in 0..LANES {
                     sums[i] += term::<L2>(x[i], y[i]);
                 }
@@ -395,11 +390,10 @@ mod f32_rows {
             let dim = anchor.len();
             assert_eq!(rows.len(), dim * out.len());
             let mut blocks = rows.chunks_exact(dim * BLOCK);
-            let mut outs = out.chunks_exact_mut(BLOCK);
-            for (rows, out) in (&mut blocks).zip(&mut outs) {
+            let (outs, out) = out.as_chunks_mut::<BLOCK>();
+            for (rows, out) in (&mut blocks).zip(outs) {
                 block(rows, out);
             }
-            let out = outs.into_remainder();
             if !out.is_empty() {
                 block(blocks.remainder(), out);
             }
@@ -723,20 +717,19 @@ mod tests {
 
     /// lance-linalg's `dot_scalar::<f32, f32, 16>`, which is private there.
     fn dot_reference(x: &[f32], y: &[f32]) -> f32 {
-        let x_chunks = y.chunks_exact(16);
-        let y_chunks = x.chunks_exact(16);
-        let sum = if x_chunks.remainder().is_empty() {
+        let (x_chunks, x_remainder) = y.as_chunks::<16>();
+        let (y_chunks, y_remainder) = x.as_chunks::<16>();
+        let sum = if x_remainder.is_empty() {
             0.0
         } else {
-            x_chunks
-                .remainder()
+            x_remainder
                 .iter()
-                .zip(y_chunks.remainder())
+                .zip(y_remainder)
                 .map(|(&x, &y)| x * y)
                 .sum::<f32>()
         };
         let mut sums = [0.0f32; 16];
-        for (x, y) in x_chunks.zip(y_chunks) {
+        for (x, y) in x_chunks.iter().zip(y_chunks) {
             for i in 0..16 {
                 sums[i] += x[i] * y[i];
             }

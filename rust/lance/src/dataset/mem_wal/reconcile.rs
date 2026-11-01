@@ -11,8 +11,8 @@
 //! the same name under a different id is a different column. Names are used only
 //! where no id exists, as in a batch a caller just handed in.
 //!
-//! A table with a MemWAL refuses type changes, so an id that disappears always
-//! means the column was dropped.
+//! A table with a MemWAL refuses type changes, so an id that disappears
+//! normally means the column was dropped.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,10 +23,11 @@ use arrow_array::{
     RecordBatchOptions, StructArray,
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
-use lance_core::datatypes::LANCE_FIELD_ID_KEY;
+use lance_core::datatypes::{BlobV2Layout, LANCE_FIELD_ID_KEY};
 use lance_core::{Error, Result};
 
 use super::TOMBSTONE;
+use crate::blob::{blob_v2_layout, logical_to_prepared_blob_field};
 
 /// The lance field id an Arrow field carries, if it carries one.
 ///
@@ -103,31 +104,12 @@ pub(super) fn without_field_id(field: &ArrowField) -> ArrowField {
 pub(super) fn without_field_ids(schema: &ArrowSchema) -> ArrowSchema {
     fn strip(field: &ArrowField) -> ArrowField {
         let field = without_field_id(field);
-        match field.data_type() {
-            DataType::Struct(children) => {
-                let children: Vec<ArrowField> = children.iter().map(|c| strip(c)).collect();
-                field.with_data_type(DataType::Struct(children.into()))
-            }
-            DataType::List(element) => field
-                .clone()
-                .with_data_type(DataType::List(Arc::new(strip(element)))),
-            DataType::LargeList(element) => field
-                .clone()
-                .with_data_type(DataType::LargeList(Arc::new(strip(element)))),
-            DataType::FixedSizeList(element, size) => {
-                let size = *size;
-                field
-                    .clone()
-                    .with_data_type(DataType::FixedSizeList(Arc::new(strip(element)), size))
-            }
-            DataType::Map(entries, sorted) => {
-                let sorted = *sorted;
-                field
-                    .clone()
-                    .with_data_type(DataType::Map(Arc::new(strip(entries)), sorted))
-            }
-            _ => field,
-        }
+        let Some(children) = children_of(field.data_type()) else {
+            return field;
+        };
+        let children: arrow_schema::Fields = children.iter().map(|c| Arc::new(strip(c))).collect();
+        let data_type = with_children(field.data_type(), children);
+        field.with_data_type(data_type)
     }
     let fields: Vec<ArrowField> = schema.fields().iter().map(|f| strip(f)).collect();
     ArrowSchema::new_with_metadata(fields, schema.metadata().clone())
@@ -248,32 +230,7 @@ fn resolve_field(
     top_level: bool,
 ) -> Result<Source> {
     let name = field.name();
-    let by_id = field_id_of(field).and_then(|id| {
-        source_fields
-            .iter()
-            .position(|f| field_id_of(f) == Some(id))
-    });
-    // Ids first. The name fallback is asymmetric on purpose: it fires for a
-    // target field carrying no id, and for one whose id no source field has --
-    // an id-bearing target against an unstamped source still matches by name.
-    let by_name = || {
-        source_fields
-            .iter()
-            .position(|f| f.name() == name)
-            .filter(|i| !claimed[*i])
-    };
-    let index = match field_id_of(field) {
-        // The target names an identity: only that identity answers for it,
-        // unless the source has none to be matched on.
-        Some(_) => by_id.or_else(|| {
-            source_fields
-                .iter()
-                .all(|f| field_id_of(f).is_none())
-                .then(by_name)
-                .flatten()
-        }),
-        None => by_name(),
-    };
+    let index = source_index(field, source_fields, claimed);
 
     let Some(index) = index else {
         if top_level && name == TOMBSTONE {
@@ -302,21 +259,104 @@ fn resolve_field(
     if source.data_type() == field.data_type() {
         return Ok(Source::Take(index));
     }
-    // The same column under a different scalar type. A table with a MemWAL
-    // refuses a cast, so this is a disagreement to surface rather than paper
-    // over; a struct differing only in its children is handled below.
-    if !matches!(
-        (source.data_type(), field.data_type()),
-        (DataType::Struct(_), DataType::Struct(_))
-    ) {
-        return Err(Error::invalid_input(format!(
-            "column `{name}` is stored as {} and the schema declares {}; a column's type \
-             cannot change on a table with a MemWAL",
-            source.data_type(),
-            field.data_type()
-        )));
+    // Same column, different type. A MemWAL table refuses type changes, so
+    // report it rather than convert.
+    Err(Error::invalid_input(format!(
+        "column `{name}` is stored as {} and the schema declares {}; a column's type \
+         cannot change on a table with a MemWAL",
+        source.data_type(),
+        field.data_type()
+    )))
+}
+
+/// The source field `field` resolves to.
+fn source_index(
+    field: &ArrowField,
+    source_fields: &arrow_schema::Fields,
+    claimed: &[bool],
+) -> Option<usize> {
+    let by_id = field_id_of(field).and_then(|id| {
+        source_fields
+            .iter()
+            .position(|f| field_id_of(f) == Some(id))
+    });
+    // Ids first. The name fallback is asymmetric on purpose: it fires for a
+    // target field carrying no id, and for one whose id no source field has --
+    // an id-bearing target against an unstamped source still matches by name.
+    let by_name = || {
+        source_fields
+            .iter()
+            .position(|f| f.name() == field.name())
+            .filter(|i| !claimed[*i])
+    };
+    match field_id_of(field) {
+        // The target names an identity: only that identity answers for it,
+        // unless the source has none to be matched on.
+        Some(_) => by_id.or_else(|| {
+            source_fields
+                .iter()
+                .all(|f| field_id_of(f).is_none())
+                .then(by_name)
+                .flatten()
+        }),
+        None => by_name(),
     }
-    unreachable!("a struct is resolved above and any other mismatch is rejected")
+}
+
+/// `target` with each blob v2 field the source holds writer-prepared, at any
+/// depth, typed prepared, so resolution keeps the reference it carries instead
+/// of rebuilding the declared logical layout. Fields pair up as resolution
+/// pairs them. A blob held as descriptors is an error: resolved as declared, it
+/// would come back empty.
+pub(super) fn with_prepared_blobs_held(
+    source: &arrow_schema::Fields,
+    target: &arrow_schema::Fields,
+) -> Result<arrow_schema::Fields> {
+    let claimed = claimed_by_id(source, target);
+    target
+        .iter()
+        .map(|field| {
+            let Some(held) = source_index(field, source, &claimed).map(|i| &source[i]) else {
+                return Ok(Arc::clone(field));
+            };
+            if blob_v2_layout(field).is_some() {
+                return match blob_v2_layout(held) {
+                    Some(BlobV2Layout::Prepared) => {
+                        Ok(Arc::new(logical_to_prepared_blob_field(field)?))
+                    }
+                    Some(BlobV2Layout::Descriptor) => Err(Error::invalid_input(format!(
+                        "blob column `{}` is held as descriptors, which carry no data to \
+                         reconcile; read it prepared or logical",
+                        held.name()
+                    ))),
+                    _ => Ok(Arc::clone(field)),
+                };
+            }
+            let (Some(held_children), Some(children)) = (
+                children_of(held.data_type()),
+                children_of(field.data_type()),
+            ) else {
+                return Ok(Arc::clone(field));
+            };
+            let children = with_prepared_blobs_held(&held_children, &children)?;
+            Ok(Arc::new(field.as_ref().clone().with_data_type(
+                with_children(field.data_type(), children),
+            )))
+        })
+        .collect()
+}
+
+/// `data_type` holding `children`, for a type [`children_of`] returns them for.
+fn with_children(data_type: &DataType, children: arrow_schema::Fields) -> DataType {
+    match data_type {
+        DataType::List(_) => DataType::List(Arc::clone(&children[0])),
+        DataType::LargeList(_) => DataType::LargeList(Arc::clone(&children[0])),
+        DataType::FixedSizeList(_, size) => {
+            DataType::FixedSizeList(Arc::clone(&children[0]), *size)
+        }
+        DataType::Map(_, sorted) => DataType::Map(Arc::clone(&children[0]), *sorted),
+        _ => DataType::Struct(children),
+    }
 }
 
 /// Whether this type carries its children inside its own type, so an array of
@@ -577,6 +617,13 @@ mod relabel_tests {
                     "Lance gives {data_type:?} children, so reconcile must recurse into it"
                 );
             }
+            if let Some(children) = children_of(&data_type) {
+                assert_eq!(
+                    with_children(&data_type, children),
+                    data_type,
+                    "rebuilding {data_type:?} from its own children gives it back"
+                );
+            }
         }
     }
 
@@ -659,7 +706,7 @@ mod relabel_tests {
             ArrowField::new(
                 "entries",
                 DataType::Struct(Fields::from(vec![
-                    stamped("key", DataType::Int64, 2),
+                    stamped("key", DataType::Int64, 2).with_nullable(false),
                     stamped(value, DataType::Int64, 3),
                 ])),
                 false,
@@ -669,7 +716,7 @@ mod relabel_tests {
         let values = Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef;
         let entries = StructArray::new(
             Fields::from(vec![
-                stamped("key", DataType::Int64, 2),
+                stamped("key", DataType::Int64, 2).with_nullable(false),
                 stamped("old", DataType::Int64, 3),
             ]),
             vec![keys, values],

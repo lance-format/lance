@@ -7,6 +7,7 @@
 //! update version for each row in a Lance dataset, enabling efficient
 //! cross-version diff operations.
 
+use std::collections::HashMap;
 use std::{ops::Range, sync::Arc};
 
 use lance_core::Error;
@@ -20,6 +21,25 @@ use serde::{Deserialize, Serialize};
 use crate::format::{Fragment, pb};
 use crate::rowids::segment::U64Segment;
 use crate::rowids::{RowIdSequence, read_row_ids};
+
+/// One fragment's row lineage sequences that live outside the manifest, read
+/// ahead of a commit by the caller.
+///
+/// Building a manifest is synchronous and has no object store, so it cannot
+/// read a sequence spilled to a data file column (`RowIdMeta::Column`,
+/// `RowDatasetVersionMeta::Column`). A caller that can do IO loads them first
+/// and hands them over in [`ManifestBuildConfig`](crate::format::ManifestBuildConfig).
+/// Only the spilled sequences need to be present; inline ones are decoded on
+/// the spot.
+#[derive(Debug, Clone, Default)]
+pub struct LoadedRowLineage {
+    pub row_ids: Option<Arc<RowIdSequence>>,
+    pub created_at: Option<Arc<RowDatasetVersionSequence>>,
+    pub last_updated_at: Option<Arc<RowDatasetVersionSequence>>,
+}
+
+/// [`LoadedRowLineage`] per fragment id.
+pub type SpilledRowLineage = HashMap<u64, LoadedRowLineage>;
 
 /// A run of identical versions over a contiguous span of row positions.
 ///
@@ -695,11 +715,15 @@ pub fn refresh_row_latest_update_meta_for_full_frag_rewrite_cols(
 /// `updated_offsets` are local row offsets (within the fragment) that have been updated.
 /// Existing version metadata is preserved and only the updated positions are set to `current_version`.
 /// If no existing metadata is present, positions default to `prev_version`.
+///
+/// A fragment whose existing versions are spilled has them read from
+/// `spilled`; the refreshed sequence is placed inline.
 pub fn refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
     fragment: &mut Fragment,
     updated_offsets: &[usize],
     current_version: u64,
     prev_version: u64,
+    spilled: &SpilledRowLineage,
 ) -> Result<()> {
     // Determine row count for fragment
     let row_count_u64: u64 = if let Some(pr) = fragment.physical_rows {
@@ -727,17 +751,26 @@ pub fn refresh_row_latest_update_meta_for_partial_frag_rewrite_cols(
         // Build base version vector from existing meta or previous dataset version
         let mut base_versions: Vec<u64> = Vec::with_capacity(row_count_u64 as usize);
         if let Some(meta) = fragment.last_updated_at_version_meta.as_ref() {
-            if matches!(meta, RowDatasetVersionMeta::Column) {
+            let base_seq = if matches!(meta, RowDatasetVersionMeta::Column) {
                 // The existing versions of the rows this update leaves alone
-                // live in a data file, which this commit-time path cannot read.
-                // Defaulting them would silently rewrite their lineage.
-                return Err(Error::not_supported(format!(
-                    "fragment {} stores its last-updated-at versions outside the manifest; \
-                     partially rewriting its columns is not supported yet",
-                    fragment.id
-                )));
-            }
-            if let Ok(base_seq) = meta.load_sequence() {
+                // live in a data file, which this path cannot read. Defaulting
+                // them would silently rewrite their lineage, so the caller has
+                // to have read them ahead of time.
+                let loaded = spilled
+                    .get(&fragment.id)
+                    .and_then(|lineage| lineage.last_updated_at.clone())
+                    .ok_or_else(|| {
+                        Error::not_supported(format!(
+                            "fragment {} stores its last-updated-at versions outside the \
+                             manifest and they were not loaded ahead of the commit",
+                            fragment.id
+                        ))
+                    })?;
+                Some(loaded.as_ref().clone())
+            } else {
+                meta.load_sequence().ok()
+            };
+            if let Some(base_seq) = base_seq {
                 base_versions.extend(base_seq.versions().take(row_count_u64 as usize));
                 base_versions.resize(row_count_u64 as usize, prev_version);
             } else {
@@ -901,6 +934,7 @@ mod tests {
             &[ROWS - 1],
             3,
             1,
+            &Default::default(),
         )
         .unwrap();
 

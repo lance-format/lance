@@ -38,6 +38,11 @@ pub struct i32x8(int32x4x2_t);
 #[derive(Clone, Copy)]
 pub struct i32x8(v8i32);
 
+#[allow(non_camel_case_types)]
+#[cfg(simd_fallback)]
+#[derive(Clone, Copy)]
+pub struct i32x8([i32; 8]);
+
 impl std::fmt::Debug for i32x8 {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut arr = [0; 8];
@@ -85,6 +90,10 @@ impl SIMD<i32, 8> for i32x8 {
         unsafe {
             Self(lasx_xvreplgr2vr_w(val))
         }
+        #[cfg(simd_fallback)]
+        {
+            Self([val; 8])
+        }
     }
 
     #[inline]
@@ -98,6 +107,10 @@ impl SIMD<i32, 8> for i32x8 {
             Self::splat(0)
         }
         #[cfg(target_arch = "loongarch64")]
+        {
+            Self::splat(0)
+        }
+        #[cfg(simd_fallback)]
         {
             Self::splat(0)
         }
@@ -117,13 +130,20 @@ impl SIMD<i32, 8> for i32x8 {
         {
             Self(transmute(lasx_xvld::<0>(transmute(ptr))))
         }
+        #[cfg(simd_fallback)]
+        {
+            unsafe { Self::load_unaligned(ptr) }
+        }
     }
 
     #[inline]
     unsafe fn load_unaligned(ptr: *const i32) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(_mm256_loadu_si256(ptr as *const __m256i))
+            // Treat the register as plain data so this load remains valid on
+            // pre-AVX hosts. LLVM still lowers this to an AVX move when AVX is
+            // enabled for the caller.
+            Self(ptr.cast::<__m256i>().read_unaligned())
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -132,6 +152,10 @@ impl SIMD<i32, 8> for i32x8 {
         #[cfg(target_arch = "loongarch64")]
         {
             Self(transmute(lasx_xvld::<0>(transmute(ptr))))
+        }
+        #[cfg(simd_fallback)]
+        {
+            unsafe { Self(std::ptr::read_unaligned(ptr as *const [i32; 8])) }
         }
     }
 
@@ -153,6 +177,10 @@ impl SIMD<i32, 8> for i32x8 {
         unsafe {
             lasx_xvst::<0>(transmute(self.0), transmute(ptr))
         }
+        #[cfg(simd_fallback)]
+        {
+            unsafe { std::ptr::write_unaligned(ptr as *mut [i32; 8], self.0) }
+        }
     }
 
     fn reduce_sum(&self) -> i32 {
@@ -168,6 +196,10 @@ impl SIMD<i32, 8> for i32x8 {
         #[cfg(target_arch = "loongarch64")]
         {
             self.as_array().iter().sum()
+        }
+        #[cfg(simd_fallback)]
+        {
+            self.0.iter().sum()
         }
     }
 
@@ -190,6 +222,10 @@ impl SIMD<i32, 8> for i32x8 {
         #[cfg(target_arch = "loongarch64")]
         unsafe {
             Self(lasx_xvmin_w(self.0, rhs.0))
+        }
+        #[cfg(simd_fallback)]
+        {
+            Self(std::array::from_fn(|i| self.0[i].min(rhs.0[i])))
         }
     }
 
@@ -224,6 +260,12 @@ impl SIMD<i32, 8> for i32x8 {
                 }
             }
         }
+        #[cfg(simd_fallback)]
+        {
+            if let Some(i) = self.0.iter().position(|&v| v == val) {
+                return Some(i as i32);
+            }
+        }
         None
     }
 }
@@ -248,6 +290,10 @@ impl Add for i32x8 {
         unsafe {
             Self(lasx_xvadd_w(self.0, rhs.0))
         }
+        #[cfg(simd_fallback)]
+        {
+            Self(std::array::from_fn(|i| self.0[i].wrapping_add(rhs.0[i])))
+        }
     }
 }
 
@@ -266,6 +312,12 @@ impl AddAssign for i32x8 {
         #[cfg(target_arch = "loongarch64")]
         unsafe {
             self.0 = lasx_xvadd_w(self.0, rhs.0);
+        }
+        #[cfg(simd_fallback)]
+        {
+            for i in 0..8 {
+                self.0[i] = self.0[i].wrapping_add(rhs.0[i]);
+            }
         }
     }
 }
@@ -290,6 +342,10 @@ impl Sub for i32x8 {
         unsafe {
             Self(lasx_xvsub_w(self.0, rhs.0))
         }
+        #[cfg(simd_fallback)]
+        {
+            Self(std::array::from_fn(|i| self.0[i].wrapping_sub(rhs.0[i])))
+        }
     }
 }
 
@@ -309,6 +365,12 @@ impl SubAssign for i32x8 {
         unsafe {
             self.0 = lasx_xvsub_w(self.0, rhs.0);
         }
+        #[cfg(simd_fallback)]
+        {
+            for i in 0..8 {
+                self.0[i] = self.0[i].wrapping_sub(rhs.0[i]);
+            }
+        }
     }
 }
 
@@ -318,11 +380,11 @@ impl Mul for i32x8 {
     /// Lane-wise product, keeping the low 32 bits of each result.
     ///
     /// `mul` wraps on overflow rather than panicking the way scalar `i32 * i32`
-    /// does in a debug build, and all three arms agree on that: `vpmulld`,
-    /// `vmulq_s32` and `lasx_xvmul_w` each discard the high half. This is a
-    /// statement about `mul` alone — `reduce_sum` sums in scalar `i32` on x86_64
-    /// and loongarch64 (so it panics on overflow in a debug build) but reduces
-    /// in-register on aarch64, where it wraps.
+    /// does in a debug build, and every arm agrees on that: `vpmulld`,
+    /// `vmulq_s32`, `lasx_xvmul_w` and `wrapping_mul` each discard the high
+    /// half. This is a statement about `mul` alone — `reduce_sum` sums in scalar
+    /// `i32` outside aarch64 (so it panics on overflow in a debug build) but
+    /// reduces in-register on aarch64, where it wraps.
     ///
     /// Picking a widening variant here is a silent wrong answer, not a compile
     /// error: `_mm256_mul_epi32` (`vpmuldq`) multiplies only the even 32-bit
@@ -345,6 +407,10 @@ impl Mul for i32x8 {
         unsafe {
             Self(lasx_xvmul_w(self.0, rhs.0))
         }
+        #[cfg(simd_fallback)]
+        {
+            Self(std::array::from_fn(|i| self.0[i].wrapping_mul(rhs.0[i])))
+        }
     }
 }
 
@@ -358,7 +424,23 @@ mod tests {
         assert!(std::panic::catch_unwind(|| i32x8::from(&[0; 7][..])).is_err());
     }
 
-    /// Lane-wise, low-32-bits multiplication is what all three arms promise, so
+    #[test]
+    fn test_slice_conversion_uses_cpu_baseline() {
+        let values = [1_i32, 2, 3, 4, 5, 6, 7, 8];
+        let from_slice = i32x8::from(&values[..]);
+        let from_array = i32x8::from(&values);
+
+        #[cfg(target_arch = "x86_64")]
+        if !std::is_x86_feature_detected!("avx") {
+            std::hint::black_box((from_slice, from_array));
+            return;
+        }
+
+        assert_eq!(from_slice.as_array(), values);
+        assert_eq!(from_array.as_array(), values);
+    }
+
+    /// Lane-wise, low-32-bits multiplication is what every arm promises, so
     /// this runs everywhere: only the x86 feature check is arch-gated, matching
     /// `f32.rs`'s and `f64.rs`'s test modules.
     ///

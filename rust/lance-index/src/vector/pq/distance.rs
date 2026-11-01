@@ -5,7 +5,9 @@ use core::panic;
 
 use super::utils::get_sub_vector_centroids;
 use lance_core::assume_eq;
-use lance_linalg::distance::{Dot, L2, dot_distance_batch, l2::L2Prepared, l2_distance_batch};
+use lance_linalg::distance::{
+    Dot, L2, dot_distance_batch_into, l2::L2Prepared, l2_distance_batch_into,
+};
 use lance_linalg::simd::dist_table::{
     sum_4bit_dist_table_f32_row, sum_4bit_dist_table_f32_rows, sum_4bit_dist_table_f32_transposed,
 };
@@ -34,21 +36,18 @@ pub fn build_distance_table_l2_impl<const NUM_BITS: u32, T: L2>(
     let dimension = query.len();
     let sub_vector_length = dimension / num_sub_vectors;
     let num_centroids = 2_usize.pow(NUM_BITS);
-    let mut result = Vec::with_capacity(num_sub_vectors * num_centroids);
+    let mut result = vec![0.0; num_sub_vectors * num_centroids];
     // Legacy writers allowed non-divisible dimensions and truncated the tail.
-    // Limit iteration to the sub-vectors that were persisted by those writers.
-    for (i, sub_vec) in query
+    // Zipping with `result`, which has one row per persisted sub-vector,
+    // stops before that tail.
+    for (i, (sub_vec, distances)) in query
         .chunks_exact(sub_vector_length)
-        .take(num_sub_vectors)
+        .zip(result.chunks_exact_mut(num_centroids))
         .enumerate()
     {
         let subvec_centroids =
             get_sub_vector_centroids::<NUM_BITS, _>(codebook, dimension, num_sub_vectors, i);
-        result.extend(l2_distance_batch(
-            sub_vec,
-            subvec_centroids,
-            sub_vector_length,
-        ));
+        l2_distance_batch_into(sub_vec, subvec_centroids, sub_vector_length, distances);
     }
     result
 }
@@ -98,21 +97,18 @@ pub fn build_distance_table_dot_impl<const NUM_BITS: u32, T: Dot>(
     let dimension = query.len();
     let sub_vector_length = dimension / num_sub_vectors;
     let num_centroids = 2_usize.pow(NUM_BITS);
-    let mut result = Vec::with_capacity(num_sub_vectors * num_centroids);
+    let mut result = vec![0.0; num_sub_vectors * num_centroids];
     // Legacy writers allowed non-divisible dimensions and truncated the tail.
-    // Limit iteration to the sub-vectors that were persisted by those writers.
-    for (i, sub_vec) in query
+    // Zipping with `result`, which has one row per persisted sub-vector,
+    // stops before that tail.
+    for (i, (sub_vec, distances)) in query
         .chunks_exact(sub_vector_length)
-        .take(num_sub_vectors)
+        .zip(result.chunks_exact_mut(num_centroids))
         .enumerate()
     {
         let subvec_centroids =
             get_sub_vector_centroids::<NUM_BITS, _>(codebook, dimension, num_sub_vectors, i);
-        result.extend(dot_distance_batch(
-            sub_vec,
-            subvec_centroids,
-            sub_vector_length,
-        ));
+        dot_distance_batch_into(sub_vec, subvec_centroids, sub_vector_length, distances);
     }
     result
 }
@@ -300,7 +296,13 @@ pub(super) fn quantize_4bit_distance_table(
     let mut max_sum = 0u32;
     for table in tables {
         let min = reduce_16(table, min_of);
-        let codes = table.map(|d| ((d - min) * scale + 0.5).floor().min(u8::MAX as f32) as u8);
+        // A loop rather than `table.map(..)`: with several codegen units the
+        // `array::map` instance can be left out of line, which cost up to 5%
+        // of a 1024-row partition scan.
+        let mut codes = [0u8; NUM_CENTROIDS];
+        for (code, &d) in codes.iter_mut().zip(table) {
+            *code = ((d - min) * scale + 0.5).floor().min(u8::MAX as f32) as u8;
+        }
         // The minimum entry quantizes to 0 with no error, so the largest error
         // is `>= 0` and the smallest `<= 0`. `code * step` and, short of a
         // 29-bit exponent gap, `d - min` are exact in `f64`.
@@ -371,7 +373,7 @@ fn max_of<T: PartialOrd>(a: T, b: T) -> T {
 pub(super) fn bounded_4bit_scores(distance_table: &[f32]) -> bool {
     const NUM_CENTROIDS: usize = 16;
     let mut magnitude_sum = 0.0f32;
-    for table in distance_table.chunks_exact(NUM_CENTROIDS) {
+    for table in distance_table.as_chunks::<NUM_CENTROIDS>().0 {
         let mut max_magnitude = 0.0f32;
         for &d in table {
             if !d.is_finite() {

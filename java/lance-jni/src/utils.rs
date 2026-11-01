@@ -294,6 +294,14 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
         let key = Arc::new(Float32Array::from(key_array));
 
         let k = env.get_int_as_usize_from_method(&java_obj, "getK")?;
+        let lower_bound =
+            env.get_optional_from_method(&java_obj, "getLowerBound", |env, value| {
+                env.get_f32_from_method(&value, "floatValue")
+            })?;
+        let upper_bound =
+            env.get_optional_from_method(&java_obj, "getUpperBound", |env, value| {
+                env.get_f32_from_method(&value, "floatValue")
+            })?;
         let minimum_nprobes = env.get_int_as_usize_from_method(&java_obj, "getMinimumNprobes")?;
         let maximum_nprobes = env.get_optional_usize_from_method(&java_obj, "getMaximumNprobes")?;
 
@@ -316,14 +324,18 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
         let approx_mode_str = env.get_string_from_method(&java_obj, "getApproxModeString")?;
         let approx_mode = parse_approx_mode(&approx_mode_str)?;
 
-        Ok(Query {
+        let search_effort = env
+            .call_method(&java_obj, "getSearchEffort", "()D", &[])?
+            .d()?;
+        let query = Query {
             column,
             key,
             k,
-            lower_bound: None,
-            upper_bound: None,
+            lower_bound,
+            upper_bound,
             minimum_nprobes,
             maximum_nprobes,
+            search_effort,
             ef,
             refine_factor,
             metric_type: distance_type,
@@ -331,7 +343,9 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             dist_q_c: 0.0,
             query_parallelism,
             approx_mode,
-        })
+        };
+        query.validate_search_effort()?;
+        Ok(query)
     })?;
 
     Ok(query)

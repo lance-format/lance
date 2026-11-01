@@ -28,6 +28,20 @@ A manifest describes a single version of the dataset.
 It contains the complete schema definition including nested fields, the list of data fragments comprising this version, 
 a monotonically increasing version number, and an optional reference to the index section that describes a list of index metadata.
 
+`max_allocated_field_id` is optional. If a manifest sets it, the dataset uses non-reusable field IDs from
+that version onward. See [Field IDs](schema.md#field-ids).
+
+The field is a high-water mark. It starts at the largest field ID that the activation manifest
+references. It then records the largest ID assigned after activation. When a manifest sets it:
+
+- Every field ID of 0 or greater in the manifest schema, a `DataFile.fields` mapping, or an overlay
+  mapping must be less than or equal to `max_allocated_field_id`.
+- A writer must not lower `max_allocated_field_id` from the value in the previous manifest.
+- A writer must not assign a previously allocated field ID to another field.
+- A writer that adds fields must assign IDs greater than the previous `max_allocated_field_id` and
+  set the new high-water mark to at least the largest ID it assigned. The writer must fail if an
+  assigned ID does not fit in an `int32`.
+
 <details>
 <summary>Manifest protobuf message</summary>
 
@@ -36,6 +50,11 @@ a monotonically increasing version number, and an optional reference to the inde
 ```
 
 </details>
+
+The manifest also has a `config` map for table-level configuration. Keys prefixed with
+`lance.` are reserved for the Lance library; conforming readers and writers are expected
+to recognize and honor them. See the [Table Config Specification](table_config.md) for
+the full list of known `lance.` configuration keys and their meanings.
 
 ## Schema & Fields
 
@@ -130,6 +149,19 @@ fragment's row lineage sequences when they are not stored in the manifest; see
 fragment's `files`, next to user columns or in a file holding nothing else, and at
 most one file of a fragment may carry each of these ids.
 
+### Fragment Metadata
+
+Like `Manifest.table_metadata`, `DataFragment.metadata` is a `map<string, string>`
+for arbitrary metadata associated with the fragment. It may be empty. Use namespaced
+keys and small values. Any metadata stored here must remain valid regardless of
+operations on the same fragment, including column replacement, overlays, and deletions.
+
+- Changes to the same fragment preserve all entries, including unknown ones.
+- New fragments do not automatically inherit metadata from their inputs.
+
+A nonempty map requires `FLAG_OBJECT_METADATA` (`1 << 17`) in
+`writer_feature_flags`. Readers may ignore it.
+
 ## Data Files
 
 Data files store column data for a fragment using the Lance file format.
@@ -156,6 +188,22 @@ or independently of column indices due to variable encoding widths (for Lance fi
     levels. Only leaf fields and packed structs have column indices.
 
     See the [5.0.0 migration guide](../../guide/migration.md#500) for a detailed example.
+
+### File Metadata Size Hints
+
+`DataFile.file_metadata_size_bytes` and `IndexFile.file_metadata_size_bytes`
+record the size in bytes of a file's metadata suffix, or 0 if unknown. For a
+Lance file of format version 2.0 or later, this is the file size minus the
+position of global buffer 0, which holds the file's `FileDescriptor`. That
+position is stored in the first entry of the global buffer offset table, which
+the footer locates; see the [file layout](../file/index.md#detailed-overview).
+It is always 0 for legacy (0.1) files and for index files in other formats.
+Writers record either this exact value or 0.
+
+The hint is advisory: it lets a reader fetch the last
+`file_metadata_size_bytes` bytes of the file before decoding the footer. The
+footer stays authoritative. Readers must ignore a value larger than the file
+and read any metadata the footer references outside the hinted range.
 
 ## Deletion Files
 
@@ -203,6 +251,18 @@ versioning, index integration, compaction, and a worked example — see the
 
 
 ## Related Specifications
+
+### Blob v2
+
+Logical blob inputs, physical descriptors, payload objects, and snapshot ownership.
+
+See [Blob v2 Specification](blob.md)
+
+### Table Config
+
+Standard `lance.`-prefixed table configuration keys and their meanings.
+
+See [Table Config Specification](table_config.md)
 
 ### Storage Layout
 

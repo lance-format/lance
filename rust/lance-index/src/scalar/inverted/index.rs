@@ -35,9 +35,9 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::metrics::Time;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_execution::SendableRecordBatchStream;
+use datafusion_physical_plan::metrics::Time;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use fst::{Automaton, IntoStreamer, Streamer};
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use itertools::{Either, Itertools};
@@ -51,7 +51,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
-use lance_select::{RowAddrMask, RowAddrTreeMap};
+use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use std::sync::LazyLock;
 use tokio::{
@@ -68,20 +68,21 @@ use super::encoding::{MAX_POSTING_BLOCK_SIZE, PositionBlockBuilder};
 use super::impact::{IMPACT_LEVEL1_BLOCKS, ImpactSkipData, ImpactSkipDataBuilder};
 use super::iter::PostingListIterator;
 use super::tokenizer::{LEGACY_BLOCK_SIZE, validate_block_size};
-use super::{DocumentGranularity, InvertedIndexBuilder, InvertedIndexParams, wand::*};
 use super::{
-    builder::{
-        BLOCK_SIZE, ScoredDoc, doc_file_path,
-        inverted_list_schema_for_version_with_block_size_and_impacts, posting_file_path,
-        token_file_path,
-    },
-    iter::PlainPostingListIterator,
-    query::*,
-    scorer::{B, IndexBM25Scorer, K1, Scorer, idf},
+    DocumentGranularity, FlatFieldStats, InvertedIndexBuilder, InvertedIndexParams, wand::*,
 };
 use super::{
     builder::{InnerBuilder, PositionRecorder},
     iter::CompressedPostingListIterator,
+};
+use super::{
+    builder::{
+        ScoredDoc, doc_file_path, inverted_list_schema_for_version_with_block_size_and_impacts,
+        posting_file_path, token_file_path,
+    },
+    iter::PlainPostingListIterator,
+    query::*,
+    scorer::{B, IndexBM25Scorer, K1, Scorer, idf},
 };
 use crate::pbold;
 use crate::progress::IndexBuildProgress;
@@ -104,12 +105,14 @@ mod flat_search;
 mod format;
 mod inverted_index;
 mod partition;
+mod position_blocks;
 mod posting_batch_builder;
 mod posting_builder;
 mod posting_list;
 mod posting_prewarm;
 mod posting_reader;
 mod prewarm;
+mod scheduling;
 mod search;
 mod search_candidates;
 mod token_set;
@@ -120,6 +123,7 @@ pub use flat_search::*;
 pub use format::*;
 pub use inverted_index::*;
 pub use partition::*;
+use position_blocks::EncodedPositionBlocks;
 pub(super) use posting_batch_builder::*;
 pub use posting_builder::*;
 pub use posting_list::*;

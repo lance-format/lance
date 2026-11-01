@@ -426,13 +426,23 @@ pub fn transform_vectors(
         num_bits as usize,
     )
     .infer_error()?;
+    let (_, value_type) =
+        lance::index::vector::utils::get_vector_type(dataset.ds.schema(), column).infer_error()?;
+    lance_index::vector::pq::validate_codebook_value_type(&codebook.value_type(), &value_type)
+        .infer_error()?;
     let distance_type = DistanceType::try_from(distance_type).unwrap();
+    // The IVF transform normalizes the vectors for Cosine, so the codes are
+    // computed with L2, as every other PQ build does.
+    let pq_distance_type = match distance_type {
+        DistanceType::Cosine => DistanceType::L2,
+        other => other,
+    };
     let pq = ProductQuantizer::new(
         num_subvectors as usize,
         num_bits,
         dimension,
         codebook,
-        distance_type,
+        pq_distance_type,
     );
     rt().block_on(
         Some(py),
@@ -549,6 +559,8 @@ async fn do_load_shuffled_vectors(
         created_at: Some(Utc::now()),
         base_id: None,
         files: Some(files),
+        clustering_id: None,
+        metadata: Default::default(),
     };
     ds.commit_existing_index_segments(index_name, column, vec![metadata])
         .await
@@ -596,6 +608,10 @@ pub fn load_shuffled_vectors(
         num_bits as usize,
     )
     .infer_error()?;
+    let (_, value_type) =
+        lance::index::vector::utils::get_vector_type(dataset.ds.schema(), column).infer_error()?;
+    lance_index::vector::pq::validate_codebook_value_type(&codebook.value_type(), &value_type)
+        .infer_error()?;
 
     let distance_type = DistanceType::try_from(distance_type).unwrap();
     let pq_model = ProductQuantizer::new(
