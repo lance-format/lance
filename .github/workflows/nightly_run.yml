@@ -63,10 +63,8 @@ jobs:
     permissions:
       contents: read
     env:
-      # build.rs compiles dist_table.c with whatever CC provides and only warns
-      # on failure, so CC decides whether kernel_support = "avx512_dist_table" is
-      # set, and with it whether an AVX-512 host runs the C kernel or the Rust
-      # arm. rust.yml's linux-build sets clang for the same reason.
+      # Matches rust.yml's linux-build, so build.rs compiles the remaining C
+      # kernels (f16, bf16, AMX-FP16) with the same compiler as CI.
       #
       # Default features, unlike linux-build's --features "${ALL_FEATURES}":
       # turning on fp16kernels would route the f16 and bf16 dispatch into C that
