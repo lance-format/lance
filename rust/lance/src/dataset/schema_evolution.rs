@@ -18,6 +18,7 @@ use crate::index::load_all_indices;
 use crate::{Error, Result, io::exec::Planner};
 use arrow::compute::CastOptions;
 use arrow::compute::can_cast_types;
+use arrow_array::cast::AsArray;
 use arrow_array::{Array, RecordBatch, RecordBatchReader};
 use arrow_cast::cast_with_options;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -49,13 +50,70 @@ async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &
     // Deleted rows count too: their values stay in the data files, and readers of a
     // fragment's physical rows (the updater behind `add_columns`, an
     // `include_deleted_rows` scan) reject a null in a non-nullable field.
+    let mut null_in_deleted_row = false;
+    scan_with_deleted_rows(dataset, path, |column, row_ids| {
+        // A deleted row reads with a null row id.
+        for row in (0..column.len()).filter(|row| column.is_null(*row)) {
+            if row_ids.is_valid(row) {
+                return Err(Error::invalid_input(format!(
+                    "Column \"{}\" contains NULL values and cannot be made non-nullable",
+                    path
+                )));
+            }
+            null_in_deleted_row = true;
+        }
+        Ok(())
+    })
+    .await?;
+    if !null_in_deleted_row {
+        return Ok(());
+    }
+
+    // A nested column also reads as null where its parent is null, which those
+    // readers accept, so check the parent's validity.
+    let schema = dataset.schema();
+    let ancestry = schema
+        .field_ancestry_by_id(field.id)
+        .ok_or_else(|| Error::internal(format!("No ancestry for field \"{}\"", path)))?;
+    if let [.., parent, _] = ancestry.as_slice() {
+        let mut unmasked_null = false;
+        scan_with_deleted_rows(dataset, &schema.field_path(parent.id)?, |column, _| {
+            unmasked_null |= match column.as_struct_opt() {
+                Some(parent) => {
+                    let child = parent.column_by_name(&field.name).ok_or_else(|| {
+                        Error::internal(format!("Validation scan for {} lost the column", path))
+                    })?;
+                    (0..parent.len()).any(|row| parent.is_valid(row) && child.is_null(row))
+                }
+                None => true,
+            };
+            Ok(())
+        })
+        .await?;
+        if !unmasked_null {
+            return Ok(());
+        }
+    }
+    Err(Error::invalid_input(format!(
+        "Column \"{}\" cannot be made non-nullable: deleted rows still store NULL values \
+         for it. Compact the dataset with materialize_deletions_threshold=0 to remove them \
+         first",
+        path
+    )))
+}
+
+/// Scan `path`, deleted rows included, and hand each batch's column and row ids to `f`.
+async fn scan_with_deleted_rows(
+    dataset: &Dataset,
+    path: &str,
+    mut f: impl FnMut(&dyn Array, &dyn Array) -> Result<()>,
+) -> Result<()> {
     let mut scanner = dataset.scan();
     scanner
         .project(&[path])?
         .with_row_id()
         .include_deleted_rows();
     let mut stream = scanner.try_into_stream().await?;
-    let mut null_in_deleted_row = false;
     while let Some(batch) = stream.try_next().await? {
         // `path` can be a nested path (e.g. "b.c") which will not be found by
         // `RecordBatch::column_by_name`. We project exactly one column, plus the row id.
@@ -66,29 +124,8 @@ async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &
                 batch.num_columns()
             )));
         }
-        let col = batch.column(0);
-        if col.null_count() == 0 {
-            continue;
-        }
-        // A deleted row reads with a null row id.
-        let row_ids = batch.column(1);
-        if (0..batch.num_rows()).any(|row| col.is_null(row) && row_ids.is_valid(row)) {
-            return Err(Error::invalid_input(format!(
-                "Column \"{}\" contains NULL values and cannot be made non-nullable",
-                path
-            )));
-        }
-        null_in_deleted_row = true;
+        f(batch.column(0), batch.column(1))?;
     }
-    if null_in_deleted_row {
-        return Err(Error::invalid_input(format!(
-            "Column \"{}\" cannot be made non-nullable: deleted rows still store NULL values \
-             for it. Compact the dataset with materialize_deletions_threshold=0 to remove them \
-             first",
-            path
-        )));
-    }
-
     Ok(())
 }
 
@@ -5451,10 +5488,13 @@ mod test {
     /// `add_columns` reads them back, so the column can be made non-nullable only after
     /// compaction has removed them.
     #[rstest]
+    #[case::v2_0(LanceFileVersion::V2_0, false)]
+    #[case::stable(LanceFileVersion::Stable, false)]
+    #[case::stable_row_ids(LanceFileVersion::Stable, true)]
     #[tokio::test]
     async fn test_set_not_null_fails_with_nulls_in_deleted_rows(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::Stable)]
-        data_storage_version: LanceFileVersion,
+        #[case] data_storage_version: LanceFileVersion,
+        #[case] enable_stable_row_ids: bool,
     ) -> Result<()> {
         use crate::dataset::optimize::{CompactionOptions, compact_files};
 
@@ -5469,7 +5509,7 @@ mod test {
                 Some(1),
                 None,
                 Some(3),
-                Some(4),
+                None,
             ]))],
         )?;
         let test_dir = TempStrDir::default();
@@ -5477,7 +5517,9 @@ mod test {
             RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
             &test_dir,
             Some(WriteParams {
+                max_rows_per_file: 2,
                 data_storage_version: Some(data_storage_version),
+                enable_stable_row_ids,
                 ..Default::default()
             }),
         )
@@ -5513,9 +5555,74 @@ mod test {
         let batch = dataset.scan().try_into_batch().await?;
         assert_eq!(
             batch["b"].as_ref(),
-            &Int32Array::from(vec![2, 6, 8]) as &dyn Array
+            &Int32Array::from(vec![2, 6]) as &dyn Array
         );
         dataset.validate().await?;
+
+        Ok(())
+    }
+
+    /// In a deleted row, a NULL child under a valid struct stops the child from
+    /// becoming non-nullable; a NULL struct does not, since it masks the child.
+    #[rstest]
+    #[case::null_child(false, false)]
+    #[case::null_parent(true, true)]
+    #[tokio::test]
+    async fn test_set_not_null_nested_with_nulls_in_deleted_rows(
+        #[case] parent_null: bool,
+        #[case] succeeds: bool,
+    ) -> Result<()> {
+        use arrow_array::StructArray;
+        use arrow_buffer::NullBuffer;
+
+        let c = ArrowField::new("c", DataType::Int32, true);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("b", DataType::Struct(vec![c.clone()].into()), true),
+        ]));
+        let b = StructArray::new(
+            vec![c].into(),
+            vec![Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]))],
+            parent_null.then(|| NullBuffer::from(vec![true, false, true])),
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![0, 1, 2])), Arc::new(b)],
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            &test_dir,
+            None,
+        )
+        .await?;
+        dataset.delete("id = 1").await?;
+
+        let result = dataset
+            .alter_columns(&[ColumnAlteration::new("b.c".into()).set_nullable(false)])
+            .await;
+        if !succeeds {
+            let err = result.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("deleted rows still store NULL values"),
+                "{err}"
+            );
+            return Ok(());
+        }
+        result?;
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("d".into(), "b.c + 1".into())]),
+                None,
+                None,
+            )
+            .await?;
+        let batch = dataset.scan().try_into_batch().await?;
+        assert_eq!(
+            batch["d"].as_ref(),
+            &Int32Array::from(vec![2, 4]) as &dyn Array
+        );
 
         Ok(())
     }
