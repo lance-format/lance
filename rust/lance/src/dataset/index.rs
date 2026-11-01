@@ -17,7 +17,7 @@ use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::index::DatasetIndexExt;
 use crate::index::remap_index;
-use crate::index::scalar::infer_scalar_index_details;
+use crate::index::scalar::{IndexDetails, infer_scalar_index_details};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
@@ -63,12 +63,43 @@ impl IndexRemapperOptions for DatasetIndexRemapperOptions {
         let Some(indices) = load_indices_for_remapping(dataset).await? else {
             return Ok(None);
         };
+        if !needs_index_remap(dataset, &indices) {
+            return Ok(None);
+        }
 
         Ok(Some(Box::new(DatasetIndexRemapper {
             dataset: Arc::new(dataset.clone()),
             indices,
         })))
     }
+}
+
+/// Whether any non-system index may need remapping, using metadata only.
+/// Check the whole table to avoid duplicating task coverage logic here.
+/// Unsupported indices retain their stored bitmap, as on the Drop path;
+/// retired fragments are excluded from their effective coverage.
+fn needs_index_remap(dataset: &Dataset, indices: &[IndexMetadata]) -> bool {
+    for index in indices.iter().filter(|index| !is_system_index(index)) {
+        // Preserve remap_index's handling of multi-field or invalid declarations.
+        let [field_id] = index.fields.as_slice() else {
+            return true;
+        };
+        if !index.covering_fields.is_empty() || dataset.schema().field_by_id(*field_id).is_none() {
+            return true;
+        }
+        // Legacy details require file inspection. Vectors and failed plugin
+        // lookups also retain the existing path and its error handling.
+        let Some(details) = &index.index_details else {
+            return true;
+        };
+        let capability = IndexDetails(details.clone())
+            .get_plugin()
+            .and_then(|plugin| plugin.can_remap(details.as_ref()));
+        if !matches!(capability, Ok(false)) {
+            return true;
+        }
+    }
+    false
 }
 
 struct DatasetIndexRemapper {
@@ -403,6 +434,7 @@ mod tests {
     use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails};
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
     use lance_linalg::distance::MetricType;
+    use rstest::rstest;
     use std::collections::HashMap;
     use uuid::Uuid;
 
@@ -731,23 +763,17 @@ mod tests {
         let _ = index_uuid;
     }
 
-    /// The same migration path must reject -- cleanly, not with a panic -- a
-    /// malformed `covering_fields` longer than `fields`.
-    ///
-    /// Note this is a genuinely synthetic scenario, not one a real commit can
-    /// produce: `crate::index::remap_index`'s own `keyed > 1` guard (a sibling
-    /// fix in this same phase) already rejects every organically-committable
-    /// composite index *before* this migration path ever runs, since it is
-    /// only reached from that function's `RemapResult::Keep` arm. And
-    /// `validate_covering_fields` rejects a fully-consumed `covering_fields`
-    /// (`keyed == 0` with non-empty `fields`) at `Operation::CreateIndex`
-    /// commit time, and `TryFrom<pb::IndexMetadata>` rejects it again when a
-    /// manifest is decoded. The only way left to reach this branch's rejection
-    /// is metadata that passed through neither, which is how this test reaches
-    /// it: seeding the index cache directly rather than committing through a
-    /// `Transaction`.
+    // Seed the cache directly: normal commits and manifest decoding already
+    // reject malformed covering fields. Even an unremappable index must reach
+    // the existing validation instead of being silently skipped.
+    #[rstest]
+    #[case::legacy_btree(BuiltinIndexType::BTree, false)]
+    #[case::zonemap(BuiltinIndexType::ZoneMap, true)]
     #[tokio::test]
-    async fn test_remapper_migration_path_rejects_malformed_covering_fields() {
+    async fn test_remapper_rejects_malformed_covering_fields(
+        #[case] index_type: BuiltinIndexType,
+        #[case] has_details: bool,
+    ) {
         let reader = lance_datagen::gen_batch()
             .col("a", array::step::<arrow_array::types::Int32Type>())
             .into_reader_rows(RowCount::from(20), BatchCount::from(1));
@@ -755,35 +781,25 @@ mod tests {
         dataset
             .create_index(
                 &["a"],
-                IndexType::BTree,
+                IndexType::Scalar,
                 None,
-                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                &ScalarIndexParams::for_builtin(index_type),
                 false,
             )
             .await
             .unwrap();
 
-        let index_uuid = dataset.load_indices().await.unwrap()[0].uuid;
         let mut indices = dataset.load_indices().await.unwrap().as_ref().clone();
-        for idx in &mut indices {
-            if idx.uuid == index_uuid {
-                // Force the legacy migration path, and malform `covering_fields`
-                // to be longer than `fields` -- more carried fields than fields
-                // at all. No normal commit can produce this.
-                idx.index_details = None;
-                // A real `index_details: None` entry predates every version bump
-                // too, so `index_version` must go back to 0 along with it --
-                // otherwise `unsupported_index_version` hides it as a too-new
-                // version of an unrecognized type before this path is even reached.
-                idx.index_version = 0;
-                idx.covering_fields = idx
-                    .fields
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(999))
-                    .collect();
-            }
+        assert_eq!(indices.len(), 1);
+        let index = &mut indices[0];
+        if !has_details {
+            // Missing details predate versioned indices; preserve that
+            // legacy case alongside the current ZoneMap case.
+            index.index_details = None;
+            index.index_version = 0;
         }
+        index.covering_fields = index.fields.clone();
+        index.covering_fields.push(999);
         let metadata_key = crate::session::index_caches::IndexMetadataKey {
             version: dataset.version().version,
             store_identity: &dataset.object_store.store_prefix,

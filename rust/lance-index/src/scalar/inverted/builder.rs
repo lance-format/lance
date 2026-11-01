@@ -24,6 +24,7 @@ use lance_bitpacking::{BitPacker, BitPacker4x};
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::{IO_CORE_RESERVATION, get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID, Result};
@@ -306,7 +307,11 @@ impl InvertedIndexBuilder {
             .await?;
         let mut files = self.update_index(new_data, dest_store).await?;
 
-        if let Some(OldIndexDataFilter::Fragments { to_remove, .. }) = old_data_filter {
+        if let Some(
+            OldIndexDataFilter::Fragments { to_remove, .. }
+            | OldIndexDataFilter::RowAddresses { to_remove, .. },
+        ) = old_data_filter
+        {
             self.deleted_fragments.extend(to_remove);
         }
 
@@ -1109,6 +1114,14 @@ impl InnerBuilder {
                     to_keep.contains((*row_id >> 32) as u32)
                 }
                 OldIndexDataFilter::RowIds(valid_row_ids) => valid_row_ids.contains(*row_id),
+                OldIndexDataFilter::RowAddresses {
+                    to_keep,
+                    deleted_rows,
+                    ..
+                } => {
+                    to_keep.contains(RowAddress::from(*row_id).fragment_id())
+                        && !deleted_rows.contains(*row_id)
+                }
             };
             if !keep {
                 mapping.insert(*row_id, None);

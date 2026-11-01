@@ -54,6 +54,7 @@ mod branches;
 mod e2e_table_version_tracking;
 mod namespaces;
 mod register_declare;
+mod rename;
 mod storage;
 mod table_versions;
 mod tables;

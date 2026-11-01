@@ -570,6 +570,9 @@ pub async fn build_pq_model_in_fragments(
     fragment_ids: Option<&[u32]>,
 ) -> Result<ProductQuantizer> {
     if let Some(codebook) = &params.codebook {
+        let (_, value_type) =
+            crate::index::vector::utils::get_vector_type(dataset.schema(), column)?;
+        lance_index::vector::pq::validate_codebook_value_type(codebook.data_type(), &value_type)?;
         lance_index::vector::pq::validate_supplied_codebook(
             codebook.len(),
             dim,

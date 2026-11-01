@@ -50,6 +50,7 @@ use lance_io::{
 use object_store::path::Path;
 use tokio::io::AsyncWriteExt;
 
+use crate::dataset::BLOBS_DIR;
 use crate::{Error, Result};
 
 /// Construct the Arrow field for a blob v2 column.
@@ -1066,7 +1067,7 @@ impl ManagedBlobLocation {
     pub(crate) fn new(base_id: Option<u32>) -> Self {
         Self {
             base_id,
-            relative_path: Path::from("_blobs").join(format!("{}.blob", uuid::Uuid::new_v4())),
+            relative_path: Path::from(BLOBS_DIR).join(format!("{}.blob", uuid::Uuid::new_v4())),
         }
     }
 

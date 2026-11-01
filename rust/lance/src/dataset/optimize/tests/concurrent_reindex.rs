@@ -389,10 +389,14 @@ async fn test_index_retries_past_an_eager_compaction() {
     let dir = TempStrDir::default();
     let uri = dir.as_str();
     let mut table = indexed_table(uri, 4).await;
-    // A deferred compaction first, so the table has a fragment reuse index.
+    // Drain an earlier deferred compaction before switching to eager remapping.
     compact_files(&mut table, deferred_compaction(2), None)
         .await
         .unwrap();
+    remapping::remap_column_index(&mut table, &["id"], Some("id_idx".into()))
+        .await
+        .unwrap();
+    cleanup_frag_reuse_index(&mut table).await.unwrap();
     let mut builder = open_in_new_session(uri).await;
     let eager = CompactionOptions {
         defer_index_remap: false,

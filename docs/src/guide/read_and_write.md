@@ -521,7 +521,7 @@ dataset = lance.dataset("./my_dataset.lance")
 dataset.cleanup_old_versions()
 ```
 
-By default, versions older than 7 days are removed. You can override this with
+By default, versions older than two weeks are removed. You can override this with
 the `older_than` parameter (a `timedelta`):
 
 ```python
@@ -529,6 +529,93 @@ from datetime import timedelta
 
 dataset.cleanup_old_versions(older_than=timedelta(days=1))
 ```
+
+For multiple retention windows, pass a `CleanupPolicy` containing ordered `CleanupRule` entries. This example keeps
+full recent history, hourly samples between two and seven days, daily samples
+between seven and thirty days, and expires everything older than thirty days:
+
+```python
+from lance import CleanupPolicy, KeepOne, RemoveAll
+
+dataset.cleanup_old_versions(
+    policy=CleanupPolicy(rules=[
+        KeepOne(per_interval=timedelta(hours=1), older_than=timedelta(days=2)),
+        KeepOne(per_interval=timedelta(days=1), older_than=timedelta(days=7)),
+        RemoveAll(older_than=timedelta(days=30)),
+    ])
+)
+```
+
+`KeepOne` and `RemoveAll` implement `CleanupRule`. A `CleanupPolicy` contains
+the ordered rules; `CleanupPolicy()` defaults to a single
+`RemoveAll(older_than=timedelta(days=14))`, matching existing cleanup behavior.
+Ages must strictly increase. Each version uses the oldest matching `KeepOne`
+rule, with separate buckets for each band. `RemoveAll` is optional and must be
+last; without it, sampled history has no expiration limit. Empty policies,
+duplicate thresholds and unsupported rules are rejected. Comparisons are strictly
+older-than: a version exactly at a threshold stays in the younger band.
+
+`KeepOne.older_than` must be at least two days. Sampling ages are relative to the
+hinted commit timestamp, falling back to this dataset's commit when no hint
+exists. The hinted version and every later version are protected from thinning,
+even with backwards clocks or `LANCE_USE_VERSION_HINT=0` in the cleaner.
+`RemoveAll.older_than` is a wall-clock expiration age and expires sampled versions
+too. Each sampling interval aligns to the UTC Unix epoch and selects the newest
+eligible commit timestamp, breaking ties by version number.
+
+Tags, current versions and branch dependencies remain protected. `versions` and
+`retain_versions` limit which versions either operation can remove. Cleanup also
+preserves the data, indices and blobs needed by retained snapshots. The same
+`policy` is accepted by `explain_cleanup_old_versions` for a read-only preview.
+
+Retention rules work with both values of `delete_unverified`. By default, cleanup
+preserves recent files that no manifest references. With `delete_unverified=True`,
+it can remove those files immediately; files needed by retained snapshots remain
+protected in either mode.
+
+The existing top-level `older_than` keeps its wall-clock expiration meaning.
+Existing cleanup calls and defaults continue to work. The single-window shorthand
+`older_than=timedelta(days=7), keep_one=KeepOne(timedelta(days=1), timedelta(days=2))`
+is also supported. Do not combine `policy` with `older_than` or `keep_one`.
+
+Rust uses `cleanup::retention::CleanupPolicy::new(Vec<CleanupRule>)` through
+`.with_retention_policy(...)`; the legacy `cleanup::CleanupPolicy` remains
+available for version and file-cleanup filters. Java accepts
+`dataset.cleanup(new CleanupPolicy(rules))`, using
+`CleanupRule.keepOne(perInterval, olderThan)` and
+`CleanupRule.removeAll(olderThan)`. Existing native policy filters still apply.
+
+For automatic cleanup, use the same rules with duration strings:
+
+```python
+import json
+
+dataset.update_config({
+    "lance.auto_cleanup.interval": None,
+    "lance.auto_cleanup.older_than": None,
+    "lance.auto_cleanup.policy_interval": "100",
+    "lance.auto_cleanup.policy": json.dumps({"rules": [
+        {"type": "keep_one", "per_interval": "1h", "older_than": "2days"},
+        {"type": "keep_one", "per_interval": "1day", "older_than": "7days"},
+        {"type": "remove_all", "older_than": "30days"},
+    ]}),
+})
+```
+
+The policy interval is a version count. Older clients ignore this activation key
+and leave automatic retention cleanup disabled. The legacy interval must be
+removed atomically when activating either policy form; unsafe combinations are
+rejected before publication. Do not combine this policy with
+`lance.auto_cleanup.older_than` or the
+single-window `lance.auto_cleanup.keep_one.*` settings.
+
+Thinning also supports local filesystems and S3 Express. The hint-relative
+two-day minimum provides a retention buffer for delayed hint writes; it does not
+make hint updates monotonic. On stores using hints, unreadable or malformed hints
+fail cleanup instead of using the wall clock. If explicit expiration has removed
+an older hinted manifest, cleanup falls back to the dataset snapshot, as latest
+version discovery does when a hint target is missing. A missing current manifest
+still fails cleanup.
 
 !!! note
 
