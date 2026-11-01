@@ -52,6 +52,9 @@ async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &
     // `include_deleted_rows` scan) reject a null in a non-nullable field.
     let mut null_in_deleted_row = false;
     scan_with_deleted_rows(dataset, path, |column, row_ids| {
+        if column.null_count() == 0 {
+            return Ok(());
+        }
         // A deleted row reads with a null row id.
         for row in (0..column.len()).filter(|row| column.is_null(*row)) {
             if row_ids.is_valid(row) {
@@ -69,8 +72,8 @@ async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &
         return Ok(());
     }
 
-    // A nested column also reads as null where its parent is null, which those
-    // readers accept, so check the parent's validity.
+    // A NULL child under a NULL struct is masked, which those readers accept, so
+    // check the parent's validity.
     let schema = dataset.schema();
     let ancestry = schema
         .field_ancestry_by_id(field.id)
@@ -5609,6 +5612,7 @@ mod test {
                     .contains("deleted rows still store NULL values"),
                 "{err}"
             );
+            assert!(dataset.schema().field("b.c").unwrap().nullable);
             return Ok(());
         }
         result?;
