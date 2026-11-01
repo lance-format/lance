@@ -61,9 +61,11 @@ use super::transaction::Transaction;
 use super::utils::SchemaAdapter;
 use super::versions;
 use super::{DATA_DIR, DataFilePart, DataFileTarget};
+use dictionary_budget::DictionaryValueBudget;
 
 mod commit;
 pub mod delete;
+pub(crate) mod dictionary_budget;
 mod insert;
 pub mod merge_insert;
 mod retry;
@@ -943,6 +945,7 @@ pub(super) async fn do_write_fragments_impl<OpenWriter, OpenWriterFuture>(
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
     created_blob_payloads: Option<BlobPayloadInventory>,
+    mut dictionary_budget: Option<DictionaryValueBudget>,
 ) -> Result<Vec<Fragment>>
 where
     OpenWriter: Fn(Arc<ObjectStore>, Schema, Path, WriterOptions) -> OpenWriterFuture + Send + Sync,
@@ -1001,113 +1004,138 @@ where
             let mut pending_batches = VecDeque::from(batch_chunk?);
 
             while !pending_batches.is_empty() {
-                let rows_to_take = if has_file_row_counts {
+                let mut rows_to_take = if has_file_row_counts {
                     rows_remaining_in_planned_file.ok_or_else(|| {
                         Error::internal(
                             "Writer received rows after all planned file boundaries were consumed",
                         )
                     })?
+                } else if dictionary_budget.is_some() {
+                    // The input is cut at multiples of `max_rows_per_file` from its start,
+                    // which a file finished early for its dictionaries no longer lines up
+                    // with, so take no more than the file has room for.
+                    params
+                        .max_rows_per_file
+                        .checked_sub(num_rows_in_current_file)
+                        .ok_or_else(|| {
+                            Error::internal(format!(
+                                "Writer holds {num_rows_in_current_file} rows in a file limited to {} rows",
+                                params.max_rows_per_file
+                            ))
+                        })?
                 } else {
                     usize::MAX
                 };
-                let batch_chunk = take_batch_rows(&mut pending_batches, rows_to_take);
-                if batch_chunk.is_empty() {
-                    continue;
+                let mut reached_dictionary_limit = false;
+                if let Some(budget) = dictionary_budget.as_mut() {
+                    let admission = budget.admit(&pending_batches, rows_to_take)?;
+                    rows_to_take = admission.rows;
+                    reached_dictionary_limit = admission.is_full;
                 }
-                // Seed observers must see the values the data file stores, so
-                // convert before handing the batches to both. The data file
-                // writer then finds nothing left to convert.
-                let batch_chunk = batch_chunk
-                    .into_iter()
-                    .map(|batch| SchemaAdapter::new(batch.schema()).to_physical_batch(batch))
-                    .collect::<Result<Vec<_>>>()?;
-
-                if writer.is_none() {
-                    let (new_writer, new_fragment) = writer_generator.new_writer().await?;
-                    params.progress.begin(&new_fragment).await?;
-                    writer = Some(new_writer);
-                    fragments.push(new_fragment);
-                }
-
-                let active_writer = writer.as_mut().ok_or_else(|| {
-                    Error::internal("Writer was not initialized before writing a batch")
-                })?;
-                let batch_chunk_rows =
-                    batch_chunk.iter().map(RecordBatch::num_rows).sum::<usize>();
-                let reaches_row_limit = if has_file_row_counts {
-                    rows_remaining_in_planned_file == Some(batch_chunk_rows)
-                } else {
-                    num_rows_in_current_file + batch_chunk_rows >= params.max_rows_per_file
-                };
-                let input_memory = batch_chunk
-                    .iter()
-                    .map(RecordBatch::get_array_memory_size)
-                    .sum::<usize>();
-                let data_cache_bytes = params
-                    .file_writer_options
-                    .as_ref()
-                    .and_then(|options| options.data_cache_bytes)
-                    .unwrap_or(8 * 1024 * 1024);
-                let flush_last =
-                    reaches_row_limit && input_memory > data_cache_bytes as usize;
-                if flush_last {
-                    let (last, prefix) = batch_chunk
-                        .split_last()
-                        .ok_or_else(|| Error::internal("empty writer batch chunk"))?;
-                    if !prefix.is_empty() {
-                        active_writer.write(prefix).await?;
+                let mut reached_planned_file_boundary = false;
+                let mut current_file_bytes = 0;
+                // Nothing is admitted when the next batch would overflow a dictionary of
+                // the current file; finish the file without writing.
+                if rows_to_take > 0 {
+                    let batch_chunk = take_batch_rows(&mut pending_batches, rows_to_take);
+                    if batch_chunk.is_empty() {
+                        continue;
                     }
-                    active_writer.prepare_for_flush();
-                    active_writer.write(std::slice::from_ref(last)).await?;
-                } else {
-                    active_writer.write(&batch_chunk).await?;
-                }
-                for batch in &batch_chunk {
-                    seeds.observe(batch)?;
-                }
-                num_rows_in_current_file += batch_chunk_rows;
-                // The writer owns the values it needs (either borrowed for an
-                // immediate page or detached into the queue).  Do not keep the
-                // input's parent buffers alive through the file finish below.
-                drop(batch_chunk);
+                    // Seed observers must see the values the data file stores, so
+                    // convert before handing the batches to both. The data file
+                    // writer then finds nothing left to convert.
+                    let batch_chunk = batch_chunk
+                        .into_iter()
+                        .map(|batch| SchemaAdapter::new(batch.schema()).to_physical_batch(batch))
+                        .collect::<Result<Vec<_>>>()?;
 
-                let reached_planned_file_boundary = if has_file_row_counts {
-                    let rows_remaining =
-                        rows_remaining_in_planned_file.as_mut().ok_or_else(|| {
-                            Error::internal(
-                                "Writer received rows without an active planned file boundary",
-                            )
-                        })?;
-                    *rows_remaining = rows_remaining.checked_sub(batch_chunk_rows).ok_or_else(|| {
-                        Error::internal(format!(
-                            "Writer chunk of {batch_chunk_rows} rows crossed a planned file boundary with {rows_remaining} rows remaining"
-                        ))
+                    if writer.is_none() {
+                        let (new_writer, new_fragment) = writer_generator.new_writer().await?;
+                        params.progress.begin(&new_fragment).await?;
+                        writer = Some(new_writer);
+                        fragments.push(new_fragment);
+                    }
+
+                    let active_writer = writer.as_mut().ok_or_else(|| {
+                        Error::internal("Writer was not initialized before writing a batch")
                     })?;
-                    let total_remaining = planned_rows_remaining.as_mut().ok_or_else(|| {
-                        Error::internal("Writer lost the planned row count total")
-                    })?;
-                    *total_remaining =
-                        total_remaining.checked_sub(batch_chunk_rows).ok_or_else(|| {
+                    let batch_chunk_rows =
+                        batch_chunk.iter().map(RecordBatch::num_rows).sum::<usize>();
+                    let reaches_row_limit = if has_file_row_counts {
+                        rows_remaining_in_planned_file == Some(batch_chunk_rows)
+                    } else {
+                        num_rows_in_current_file + batch_chunk_rows >= params.max_rows_per_file
+                    };
+                    let input_memory = batch_chunk
+                        .iter()
+                        .map(RecordBatch::get_array_memory_size)
+                        .sum::<usize>();
+                    let data_cache_bytes = params
+                        .file_writer_options
+                        .as_ref()
+                        .and_then(|options| options.data_cache_bytes)
+                        .unwrap_or(8 * 1024 * 1024);
+                    let flush_last =
+                        reaches_row_limit && input_memory > data_cache_bytes as usize;
+                    if flush_last {
+                        let (last, prefix) = batch_chunk
+                            .split_last()
+                            .ok_or_else(|| Error::internal("empty writer batch chunk"))?;
+                        if !prefix.is_empty() {
+                            active_writer.write(prefix).await?;
+                        }
+                        active_writer.prepare_for_flush();
+                        active_writer.write(std::slice::from_ref(last)).await?;
+                    } else {
+                        active_writer.write(&batch_chunk).await?;
+                    }
+                    for batch in &batch_chunk {
+                        seeds.observe(batch)?;
+                    }
+                    num_rows_in_current_file += batch_chunk_rows;
+                    // The writer owns the values it needs (either borrowed for an
+                    // immediate page or detached into the queue).  Do not keep the
+                    // input's parent buffers alive through the file finish below.
+                    drop(batch_chunk);
+
+                    reached_planned_file_boundary = if has_file_row_counts {
+                        let rows_remaining =
+                            rows_remaining_in_planned_file.as_mut().ok_or_else(|| {
+                                Error::internal(
+                                    "Writer received rows without an active planned file boundary",
+                                )
+                            })?;
+                        *rows_remaining = rows_remaining.checked_sub(batch_chunk_rows).ok_or_else(|| {
                             Error::internal(format!(
-                                "Writer consumed {batch_chunk_rows} rows after the planned row count total was exhausted"
+                                "Writer chunk of {batch_chunk_rows} rows crossed a planned file boundary with {rows_remaining} rows remaining"
                             ))
                         })?;
-                    *rows_remaining == 0
-                } else {
-                    false
-                };
+                        let total_remaining = planned_rows_remaining.as_mut().ok_or_else(|| {
+                            Error::internal("Writer lost the planned row count total")
+                        })?;
+                        *total_remaining =
+                            total_remaining.checked_sub(batch_chunk_rows).ok_or_else(|| {
+                                Error::internal(format!(
+                                    "Writer consumed {batch_chunk_rows} rows after the planned row count total was exhausted"
+                                ))
+                            })?;
+                        *rows_remaining == 0
+                    } else {
+                        false
+                    };
 
-                let current_file_bytes = writer
-                    .as_mut()
-                    .ok_or_else(|| Error::internal("Writer disappeared after writing a batch"))?
-                    .tell()
-                    .await?;
-                if let Some(cb) = &params.write_progress {
-                    cb.call(WriteStats {
-                        bytes_written: bytes_completed + current_file_bytes,
-                        rows_written: rows_completed + num_rows_in_current_file as u64,
-                        files_written,
-                    });
+                    current_file_bytes = writer
+                        .as_mut()
+                        .ok_or_else(|| Error::internal("Writer disappeared after writing a batch"))?
+                        .tell()
+                        .await?;
+                    if let Some(cb) = &params.write_progress {
+                        cb.call(WriteStats {
+                            bytes_written: bytes_completed + current_file_bytes,
+                            rows_written: rows_completed + num_rows_in_current_file as u64,
+                            files_written,
+                        });
+                    }
                 }
 
                 let reached_row_limit = if has_file_row_counts {
@@ -1117,14 +1145,14 @@ where
                 };
                 let reached_byte_limit = current_file_bytes >= params.max_bytes_per_file as u64;
 
-                if reached_row_limit || reached_byte_limit {
+                if reached_row_limit || reached_byte_limit || reached_dictionary_limit {
                     if has_file_row_counts {
                         if reached_planned_file_boundary {
                             rows_remaining_in_planned_file = file_row_counts
                                 .as_mut()
                                 .and_then(VecDeque::pop_front);
                         } else {
-                            // A byte-driven close is an extra physical boundary. Rebalance all
+                            // A byte- or dictionary-driven close is an extra physical boundary. Rebalance all
                             // unwritten rows under the original maximum instead of preserving a
                             // tiny abandoned remainder or rolling it into an oversized tail.
                             let total_remaining = planned_rows_remaining.ok_or_else(|| {
@@ -1171,6 +1199,9 @@ where
                         });
                     }
                     num_rows_in_current_file = 0;
+                    if let Some(budget) = dictionary_budget.as_mut() {
+                        budget.reset();
+                    }
                 }
             }
         }
@@ -1810,6 +1841,7 @@ pub(crate) async fn write_fragments_internal_with_file_row_counts(
         file_row_counts,
         None,
         false,
+        false,
         None,
     )
     .await
@@ -1828,6 +1860,7 @@ pub(crate) async fn write_fragments_internal_impl(
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
     inherited_field_ids: bool,
+    disable_dictionary_split: bool,
     created_blob_payloads: Option<BlobPayloadInventory>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let mut params = params;
@@ -1849,6 +1882,7 @@ pub(crate) async fn write_fragments_internal_impl(
         file_row_counts,
         preassigned_data_file_name,
         inherited_field_ids,
+        disable_dictionary_split,
         created_blob_payloads,
     )
     .await
@@ -5034,6 +5068,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await;
 
@@ -5099,6 +5134,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await;
 
@@ -5204,6 +5240,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await
     }
@@ -5544,6 +5581,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await;
 
