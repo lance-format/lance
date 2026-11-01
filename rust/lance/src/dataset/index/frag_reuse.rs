@@ -12,6 +12,7 @@ use crate::index::frag_reuse::{
     decode_frag_reuse_ledger_from_content, load_frag_reuse_index_details,
     load_raw_frag_reuse_content,
 };
+use crate::index::frag_reuse_with_stable_row_ids::history::trimmable_versions;
 use lance_core::{Error, Result};
 use lance_index::frag_reuse::{
     CompactFragReuseIndex, FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails, FragReuseVersion,
@@ -100,10 +101,20 @@ impl Dataset {
 /// Typically run after [`compact_files`] with deferred remap and per-index
 /// [`remap_column_index`] have caught the indexes up.
 ///
+/// On a table with stable row ids, cleanup removes only the oldest versions, up
+/// to the first one an index of the manifest still needs, and keeps every later
+/// version as it is, so an address a kept version maps still translates through
+/// every later recorded move. It keeps the entry when it removes every version.
+/// Nothing keeps a version for readers other than indices: once no index needs
+/// it, it is removed even if an application still translates addresses through
+/// it.
+///
 /// # Errors
 ///
 /// Returns [`Error::RetryableCommitConflict`] if the fragment reuse index changed
-/// after `dataset`'s version; reload the latest version and run it again.
+/// after `dataset`'s version or, on a table with stable row ids, if an index
+/// committed since then still needs a version it removes; reload the latest
+/// version and run it again.
 ///
 /// # Example
 ///
@@ -130,6 +141,10 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
     else {
         return Ok(());
     };
+
+    if dataset.manifest.uses_stable_row_ids() && frag_reuse_index_meta.index_version == 0 {
+        return cleanup_stable_row_id_history(dataset, frag_reuse_index_meta, &indices).await;
+    }
 
     // Hard fork by index_version: tagged histories trim per transition in
     // fresh code below, while the v0 path stays exactly as it was.
@@ -196,10 +211,48 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
     Ok(())
 }
 
+/// The stable-row-id cleanup: removes the versions [`trimmable_versions`] counts
+/// from the front of the history and keeps the rest, the entry included, as is.
+/// The commit validates the trim against the manifest it publishes.
+async fn cleanup_stable_row_id_history(
+    dataset: &mut Dataset,
+    frag_reuse_index_meta: &IndexMetadata,
+    indices: &[IndexMetadata],
+) -> Result<()> {
+    let details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta).await?;
+    let trimmed = trimmable_versions(&details.versions, indices);
+    if trimmed == 0 {
+        return Ok(());
+    }
+    let retained = FragReuseIndexDetails {
+        versions: details.versions[trimmed..].to_vec(),
+    };
+    let fragment_bitmap = retained.new_frag_bitmap();
+    let new_index_meta = build_frag_reuse_index_metadata(
+        dataset,
+        Some(frag_reuse_index_meta),
+        retained,
+        fragment_bitmap,
+    )
+    .await?;
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: vec![new_index_meta],
+            removed_indices: vec![frag_reuse_index_meta.clone()],
+        },
+        None,
+    );
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await?;
+    Ok(())
+}
+
 /// Every fragment the reuse chain touches (old + new) across all versions. An
 /// index disjoint from this set holds no row address the FRI remaps, so trimming
 /// can never strand it (fragment ids are never reused).
-fn reuse_chain_frag_bitmap(versions: &[FragReuseVersion]) -> RoaringBitmap {
+pub(crate) fn reuse_chain_frag_bitmap(versions: &[FragReuseVersion]) -> RoaringBitmap {
     let mut bitmap = RoaringBitmap::new();
     for version in versions {
         bitmap.extend(version.old_frag_ids().iter().map(|&id| id as u32));
@@ -208,7 +261,7 @@ fn reuse_chain_frag_bitmap(versions: &[FragReuseVersion]) -> RoaringBitmap {
     bitmap
 }
 
-fn is_index_remap_caught_up(
+pub(crate) fn is_index_remap_caught_up(
     frag_reuse_version: &FragReuseVersion,
     index_meta: &IndexMetadata,
     chain_frag_bitmap: &RoaringBitmap,
@@ -325,12 +378,12 @@ pub(crate) enum TaggedTrimOutcome {
     NothingToTrim,
     /// Replace the current entry with the filtered history.
     Replace {
-        new_entry: IndexMetadata,
-        current_entry: IndexMetadata,
+        new_entry: Box<IndexMetadata>,
+        current_entry: Box<IndexMetadata>,
     },
     /// Everything trimmed away: delete the entry outright. The manifest
     /// feature flags stay set (they are sticky).
-    Delete { current_entry: IndexMetadata },
+    Delete { current_entry: Box<IndexMetadata> },
 }
 
 /// Segments of a logical index whose whole contribution is already served
@@ -513,12 +566,12 @@ async fn cleanup_tagged_frag_reuse_index(dataset: &mut Dataset) -> lance_core::R
             new_entry,
             current_entry,
         } => Operation::CreateIndex {
-            new_indices: vec![new_entry],
-            removed_indices: vec![current_entry],
+            new_indices: vec![*new_entry],
+            removed_indices: vec![*current_entry],
         },
         TaggedTrimOutcome::Delete { current_entry } => Operation::CreateIndex {
             new_indices: vec![],
-            removed_indices: vec![current_entry],
+            removed_indices: vec![*current_entry],
         },
     };
 
@@ -854,7 +907,7 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
     }
     if retained.iter().all(|kept| !*kept) {
         return Ok(TaggedTrimOutcome::Delete {
-            current_entry: entry,
+            current_entry: Box::new(entry),
         });
     }
 
@@ -885,8 +938,8 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
     decode_frag_reuse_ledger_from_content(entry.index_version, &new_content).await?;
     let new_entry = build_tagged_frag_reuse_entry(dataset, new_content, fragment_bitmap).await?;
     Ok(TaggedTrimOutcome::Replace {
-        new_entry,
-        current_entry: entry,
+        new_entry: Box::new(new_entry),
+        current_entry: Box::new(entry),
     })
 }
 
@@ -938,6 +991,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -2290,6 +2345,8 @@ mod tests {
                 created_at: None,
                 base_id: None,
                 files: None,
+                clustering_id: None,
+                metadata: Default::default(),
             };
             dataset
                 .apply_commit(

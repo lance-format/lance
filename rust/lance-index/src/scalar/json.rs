@@ -65,6 +65,30 @@ impl JsonIndex {
     }
 }
 
+/// The pre-migration, row-id-domain version for `builtin`'s on-disk format, if it has
+/// one (BTree, Bitmap, and LabelList are the only builtins with a second, address-domain
+/// format -- see `BTREE_ROW_ID_DOMAIN_VERSION`, `BITMAP_ROW_ID_DOMAIN_VERSION`, and
+/// `LABEL_LIST_ROW_ID_DOMAIN_VERSION`).
+fn legacy_row_id_domain_version(builtin_name: &str) -> Option<u32> {
+    [
+        (
+            BuiltinIndexType::BTree,
+            crate::scalar::btree::BTREE_ROW_ID_DOMAIN_VERSION,
+        ),
+        (
+            BuiltinIndexType::Bitmap,
+            crate::scalar::bitmap::BITMAP_ROW_ID_DOMAIN_VERSION,
+        ),
+        (
+            BuiltinIndexType::LabelList,
+            crate::scalar::label_list::LABEL_LIST_ROW_ID_DOMAIN_VERSION,
+        ),
+    ]
+    .into_iter()
+    .find(|(builtin, _)| builtin_name.eq_ignore_ascii_case(builtin.as_str()))
+    .map(|(_, version)| version)
+}
+
 impl DeepSizeOf for JsonIndex {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         self.target_index.deep_size_of_children(context) + self.path.deep_size_of_children(context)
@@ -107,10 +131,10 @@ impl JsonIndex {
             path: self.path.clone(),
             target_details: Some(target_created.index_details),
             target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_index_version: Some(target_created.index_version),
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
-            // TODO: We should store the target index version in the details
             index_version: JSON_INDEX_VERSION,
             files: target_created.files,
         })
@@ -152,6 +176,7 @@ impl ScalarIndex for JsonIndex {
         self.target_index.results_are_row_addresses()
     }
 
+    #[allow(deprecated)]
     fn can_remap(&self) -> bool {
         self.target_index.can_remap()
     }
@@ -207,10 +232,10 @@ impl ScalarIndex for JsonIndex {
             path: self.path.clone(),
             target_details: Some(target_created.index_details),
             target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_index_version: Some(target_created.index_version),
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&json_details)?,
-            // TODO: We should store the target index version in the details
             index_version: JSON_INDEX_VERSION,
             files: target_created.files,
         })
@@ -1076,7 +1101,7 @@ impl BasicTrainer for JsonIndexPlugin {
             &Field::new("", target_type, true),
         )?;
 
-        let target_index = target_trainer
+        let mut target_index = target_trainer
             .train_index(
                 converted_stream,
                 index_store,
@@ -1086,10 +1111,22 @@ impl BasicTrainer for JsonIndexPlugin {
             )
             .await?;
 
+        // BTree, Bitmap, and LabelList's `BasicTrainer::train_index` always reports the
+        // current (address-domain) version: that generic path has no dataset awareness
+        // to tell whether a row id and a row address coincide, unlike `build_scalar_index`
+        // in the `lance` crate, which downgrades to the row-id-domain version itself for
+        // exactly that reason. A JSON-wrapped target is never built on a stable-row-id
+        // dataset (`build_scalar_index`'s guard refuses one), so a row id and a row
+        // address always coincide here, and the row-id-domain version is always correct.
+        if let Some(floor_version) = legacy_row_id_domain_version(target_plugin.name()) {
+            target_index.index_version = floor_version;
+        }
+
         let index_details = crate::pb::JsonIndexDetails {
             path,
             target_details: Some(target_index.index_details),
             target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_index_version: Some(target_index.index_version),
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&index_details)?,
@@ -1101,6 +1138,47 @@ impl BasicTrainer for JsonIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for JsonIndexPlugin {
+    fn can_remap(&self, details: &prost_types::Any) -> Result<bool> {
+        let details = match crate::pb::JsonIndexDetails::decode(details.value.as_slice()) {
+            Ok(details) => details,
+            Err(error) => {
+                log::warn!(
+                    "Cannot determine whether a JSON index supports remapping because its \
+                     details cannot be decoded: {error}"
+                );
+                return Ok(false);
+            }
+        };
+        let Some(target_details) = details.target_details.as_ref() else {
+            log::warn!(
+                "Cannot determine whether a JSON index supports remapping because its details \
+                 are missing target_details"
+            );
+            return Ok(false);
+        };
+        let registry = self.registry()?;
+        let target_plugin = match registry.get_plugin_by_details(target_details) {
+            Ok(plugin) => plugin,
+            Err(error) => {
+                log::warn!(
+                    "Cannot determine whether a JSON index supports remapping because its \
+                     target plugin cannot be found: {error}"
+                );
+                return Ok(false);
+            }
+        };
+        match target_plugin.can_remap(target_details) {
+            Ok(can_remap) => Ok(can_remap),
+            Err(error) => {
+                log::warn!(
+                    "Cannot determine whether a JSON index supports remapping because its \
+                     target plugin cannot answer: {error}"
+                );
+                Ok(false)
+            }
+        }
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -1160,48 +1238,23 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         let json_details = crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())?;
         let target_details = json_details.target_details.as_ref().expect_ok()?;
         let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
-        // `_index_version` is this *wrapper's* version (`JSON_INDEX_VERSION`,
-        // currently always 0 -- see the `// TODO` in `remap`/`update` below), not
-        // the target's; `JsonIndexDetails` does not yet record the target's own
-        // version, so it has to be inferred here instead.
+
+        // `_index_version` is this *wrapper's* version (`JSON_INDEX_VERSION`), not the
+        // target's. The target's own persisted version lives in `target_index_version`;
         //
-        // BTree, Bitmap, and LabelList are the one case where that matters. Unlike
-        // their non-wrapped builds (`build_scalar_index`/`build_bitmap_index_segment`
-        // in the `lance` crate), training through this wrapper has no dataset
-        // awareness to downgrade the version when a row id and a row address
-        // coincide -- their own `TrainingRequest`s always ask for addresses, so a
-        // JSON-wrapped instance's postings are always address-valued. That is only
-        // safe to persist as the pre-migration, row-id-domain floor version, never
-        // the current (address-domain) max: on a dataset without stable row ids the
-        // two values coincide, and `build_scalar_index`'s guard in the `lance` crate
-        // refuses to build one of these three as a JSON target at all once stable
-        // row ids are enabled (where they would not). Passing the current max here
-        // would misread a stable-row-id instance as address-domain and silently
-        // translate its row ids as if they were addresses. Every other target type
-        // never gained a second, incompatible on-disk format, so its current max
-        // version remains the accurate stand-in.
-        let legacy_row_id_domain_version = [
-            (
-                BuiltinIndexType::BTree,
-                crate::scalar::btree::BTREE_ROW_ID_DOMAIN_VERSION,
-            ),
-            (
-                BuiltinIndexType::Bitmap,
-                crate::scalar::bitmap::BITMAP_ROW_ID_DOMAIN_VERSION,
-            ),
-            (
-                BuiltinIndexType::LabelList,
-                crate::scalar::label_list::LABEL_LIST_ROW_ID_DOMAIN_VERSION,
-            ),
-        ]
-        .into_iter()
-        .find(|(builtin, _)| target_plugin.name().eq_ignore_ascii_case(builtin.as_str()))
-        .map(|(_, version)| version);
+        // If `target_index_version` is missing then we have to guess.  Our best guess
+        // is that this is an old index written before `target_index_version` was added.
+        // These indexes were the old versions that stored row ids and not row addresses.
+        let target_index_version = json_details.target_index_version.unwrap_or_else(|| {
+            // Minhash, ngram, and rtree have no row-id-domain version of their own.
+            legacy_row_id_domain_version(target_plugin.name()).unwrap_or(0)
+        });
+
         let target_index = target_plugin
             .load_index(
                 index_store,
                 target_details,
-                legacy_row_id_domain_version.unwrap_or_else(|| target_plugin.version()),
+                target_index_version,
                 frag_reuse_index,
                 cache,
             )
@@ -1399,6 +1452,66 @@ mod tests {
         assert_eq!(json_wrapped_target_type(r#"{"path":"x"}"#), None);
     }
 
+    #[rstest]
+    #[case::btree(
+        prost_types::Any::from_msg(&crate::pbold::BTreeIndexDetails::default()).unwrap(),
+        true
+    )]
+    #[case::zonemap(
+        prost_types::Any::from_msg(&crate::pbold::ZoneMapIndexDetails::default()).unwrap(),
+        false
+    )]
+    fn test_json_can_remap_delegates_to_target(
+        #[case] target_details: prost_types::Any,
+        #[case] expected: bool,
+    ) {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let details = prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
+            path: "$.value".to_string(),
+            target_details: Some(target_details),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(plugin.can_remap(&details).unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::missing_target(None)]
+    #[case::unknown_target(
+        Some(prost_types::Any {
+            type_url: "type.googleapis.com/example.UnknownIndexDetails".to_string(),
+            value: Vec::new(),
+        })
+    )]
+    fn test_json_can_remap_defaults_to_false_for_invalid_target(
+        #[case] target_details: Option<prost_types::Any>,
+    ) {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let details = prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
+            path: "$.value".to_string(),
+            target_details,
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(!plugin.can_remap(&details).unwrap());
+    }
+
+    #[test]
+    fn test_json_can_remap_defaults_to_false_for_malformed_details() {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let plugin = registry.get_plugin_by_name("json").unwrap();
+        let details = prost_types::Any {
+            type_url: String::new(),
+            value: b"not a json index".to_vec(),
+        };
+
+        assert!(!plugin.can_remap(&details).unwrap());
+    }
+
     #[test]
     fn test_json_query_parser_forwards_target_details() {
         let registry = IndexPluginRegistry::with_default_plugins();
@@ -1413,6 +1526,7 @@ mod tests {
             path: "$.value".to_string(),
             target_details: Some(target_details),
             target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_index_version: None,
         })
         .unwrap();
 
@@ -1446,6 +1560,7 @@ mod tests {
             path: "$.value".to_string(),
             target_details: Some(target_details),
             target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
+            target_index_version: None,
         })
         .unwrap();
 

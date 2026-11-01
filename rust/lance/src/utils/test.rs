@@ -257,6 +257,8 @@ impl TestDatasetGenerator {
             physical_rows: Some(batch.num_rows()),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 }
@@ -1071,7 +1073,11 @@ pub async fn compact_into_two(dataset: &mut Dataset, fragment_ids: &[u64]) -> Ve
         ..Default::default()
     };
     let task = CompactionTask {
-        task: TaskData { fragments },
+        task: TaskData {
+            fragments,
+            output_clustering_id: None,
+            output_metadata: Default::default(),
+        },
         read_version: dataset.manifest.version,
         options: options.clone(),
     };

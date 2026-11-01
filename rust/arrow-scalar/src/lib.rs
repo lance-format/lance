@@ -67,7 +67,7 @@ impl ArrowScalar {
 
         let data = array.to_data();
         let mut mutable = MutableArrayData::new(vec![&data], true, 1);
-        mutable.extend(0, offset, offset + 1);
+        mutable.try_extend(0, offset, offset + 1)?;
         let single = make_array(mutable.freeze());
         Self::try_from_array(single)
     }

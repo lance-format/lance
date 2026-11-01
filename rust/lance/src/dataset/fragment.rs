@@ -318,19 +318,55 @@ impl GenericFileReader for V1Reader {
         projection: Arc<Schema>,
         _take_priority: Option<u32>,
     ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
-        let indices_vec = indices.to_vec();
+        // Keep stored row groups separate: combining otherwise readable groups
+        // can exceed Arrow's offset limits before the caller can split them.
+        let mut groups = Vec::new();
+        let mut indices = indices.to_vec();
+        indices.sort_unstable();
+        let mut remaining = indices.as_slice();
+        let mut batch_end = 0_u64;
+        for batch_id in 0..self.reader.num_batches() {
+            let batch_start = batch_end;
+            batch_end += self.reader.num_rows_in_batch(batch_id as i32) as u64;
+            let count = remaining.partition_point(|&index| u64::from(index) < batch_end);
+            if count > 0 {
+                let offsets = remaining[..count]
+                    .iter()
+                    .map(|&index| (u64::from(index) - batch_start) as u32)
+                    .collect::<Vec<_>>();
+                groups.push((Some(batch_id as i32), offsets));
+                remaining = &remaining[count..];
+            }
+            if remaining.is_empty() {
+                break;
+            }
+        }
+        // Preserve the file reader's validation of out-of-bounds indices and
+        // its empty-selection result.
+        if !remaining.is_empty() || groups.is_empty() {
+            groups.push((None, remaining.to_vec()));
+        }
         let reader = self.reader.clone();
-        let num_rows = indices.len() as u32;
         async move {
             // In the new path the row id is added by the fragment and not the file
-            let task_fut =
-                async move { reader.take(&indices_vec, projection.as_ref()).await }.boxed();
-            let task = std::future::ready(ReadBatchTask {
-                task: task_fut,
-                num_rows,
-            })
-            .boxed();
-            Ok(futures::stream::once(task).boxed())
+            Ok(stream::iter(groups)
+                .map(move |(batch_id, indices)| {
+                    let reader = reader.clone();
+                    let projection = projection.clone();
+                    let num_rows = indices.len() as u32;
+                    let task = async move {
+                        if let Some(batch_id) = batch_id {
+                            reader
+                                .read_batch(batch_id, indices.as_slice(), projection.as_ref())
+                                .await
+                        } else {
+                            reader.take(&indices, projection.as_ref()).await
+                        }
+                    }
+                    .boxed();
+                    ReadBatchTask { task, num_rows }
+                })
+                .boxed())
         }
         .boxed()
     }
@@ -359,15 +395,17 @@ mod v2_adapter {
     use lance_core::datatypes::{
         BLOB_DESC_LANCE_FIELD, BLOB_V2_DESC_FIELDS, BlobKind, Field as LanceField,
     };
-    use lance_encoding::decoder::FilterExpression;
+    use lance_encoding::decoder::{ColumnInfo, FilterExpression, PageEncoding};
+    use lance_encoding::format::metadata::{PageLayout, page_layout::Layout};
 
     use super::*;
 
-    /// Request the original descriptor layout from an older file. Adaptation belongs at
-    /// the dataset boundary so the released file readers retain their original behavior.
-    pub(super) fn legacy_blob_read_schema(schema: &Schema) -> Schema {
-        fn adapt(field: &mut LanceField) {
-            if field.is_blob_v2() {
+    /// Request the legacy descriptor layout for the blobs a file stores that way.
+    /// Adaptation belongs at the dataset boundary so the released file readers
+    /// retain their original behavior.
+    pub(super) fn legacy_blob_read_schema(schema: &Schema, legacy_blobs: &HashSet<i32>) -> Schema {
+        fn adapt(field: &mut LanceField, legacy_blobs: &HashSet<i32>) {
+            if field.is_blob_v2() && legacy_blobs.contains(&field.id) {
                 field.metadata.remove(lance_arrow::ARROW_EXT_NAME_KEY);
                 field
                     .metadata
@@ -376,22 +414,33 @@ mod v2_adapter {
                 field.children = BLOB_DESC_LANCE_FIELD.children.clone();
             } else {
                 for child in &mut field.children {
-                    adapt(child);
+                    adapt(child, legacy_blobs);
                 }
             }
         }
         let mut schema = schema.clone();
         for field in &mut schema.fields {
-            adapt(field);
+            adapt(field, legacy_blobs);
         }
         schema
     }
 
     /// A legacy payload is an Inline Blob v2 extent in the same data file. Normalize
     /// before batches from different file versions are concatenated or materialized.
-    fn normalize_legacy_blob_batch(batch: RecordBatch, schema: &Schema) -> Result<RecordBatch> {
-        fn adapt(array: &ArrayRef, field: &LanceField) -> Result<ArrayRef> {
+    fn normalize_legacy_blob_batch(
+        batch: RecordBatch,
+        schema: &Schema,
+        legacy_blobs: &HashSet<i32>,
+    ) -> Result<RecordBatch> {
+        fn adapt(
+            array: &ArrayRef,
+            field: &LanceField,
+            legacy_blobs: &HashSet<i32>,
+        ) -> Result<ArrayRef> {
             if field.is_blob_v2() {
+                if !legacy_blobs.contains(&field.id) {
+                    return Ok(array.clone());
+                }
                 let descriptors = array.as_struct();
                 let positions = descriptors.column(0).as_primitive::<UInt64Type>();
                 let sizes = descriptors.column(1).as_primitive::<UInt64Type>();
@@ -428,7 +477,7 @@ mod v2_adapter {
                         .columns()
                         .iter()
                         .zip(&field.children)
-                        .map(|(array, field)| adapt(array, field))
+                        .map(|(array, field)| adapt(array, field, legacy_blobs))
                         .collect::<Result<Vec<_>>>()?;
                     let fields = field
                         .children
@@ -441,21 +490,22 @@ mod v2_adapter {
                         values.nulls().cloned(),
                     )?))
                 }
-                DataType::List(_) => adapt_list::<i32>(array, field),
-                DataType::LargeList(_) => adapt_list::<i64>(array, field),
+                DataType::List(_) => adapt_list::<i32>(array, field, legacy_blobs),
+                DataType::LargeList(_) => adapt_list::<i64>(array, field, legacy_blobs),
                 _ => Ok(array.clone()),
             }
         }
         fn adapt_list<O: OffsetSizeTrait>(
             array: &ArrayRef,
             field: &LanceField,
+            legacy_blobs: &HashSet<i32>,
         ) -> Result<ArrayRef> {
             let list = array.as_list::<O>();
             let child = &field.children[0];
             Ok(Arc::new(GenericListArray::<O>::try_new(
                 Arc::new(ArrowField::from(child)),
                 list.offsets().clone(),
-                adapt(list.values(), child)?,
+                adapt(list.values(), child, legacy_blobs)?,
                 list.nulls().cloned(),
             )?))
         }
@@ -463,7 +513,7 @@ mod v2_adapter {
             .columns()
             .iter()
             .zip(&schema.fields)
-            .map(|(array, field)| adapt(array, field))
+            .map(|(array, field)| adapt(array, field, legacy_blobs))
             .collect::<Result<Vec<_>>>()?;
         Ok(RecordBatch::try_new(
             Arc::new(ArrowSchema::from(schema)),
@@ -471,11 +521,46 @@ mod v2_adapter {
         )?)
     }
 
+    /// Find the projected blob fields whose column a 2.2 data file stores in the
+    /// legacy layout.
+    ///
+    /// The single-fragment writers skip the Blob v2 promotion, so a 2.2 file can keep
+    /// a legacy blob column after the table has promoted it. Only the legacy encoder
+    /// writes blob page layouts, and the decoder dispatches on the same signal.
+    pub(super) fn legacy_blob_fields(
+        projection: &Schema,
+        field_id_to_column_idx: &BTreeMap<u32, u32>,
+        column_infos: &[Arc<ColumnInfo>],
+    ) -> HashSet<i32> {
+        projection
+            .fields_pre_order()
+            .filter(|field| {
+                field.is_blob_v2()
+                    && field_id_to_column_idx
+                        .get(&(field.id as u32))
+                        .and_then(|column_index| column_infos.get(*column_index as usize))
+                        .is_some_and(|column| {
+                            column.page_infos.iter().any(|page| {
+                                matches!(
+                                    page.encoding,
+                                    PageEncoding::Structural(PageLayout {
+                                        layout: Some(Layout::BlobLayout(_))
+                                    })
+                                )
+                            })
+                        })
+            })
+            .map(|field| field.id)
+            .collect()
+    }
+
     #[derive(Debug, Clone)]
     pub struct Reader {
         reader: Arc<ProjectedFileReader>,
         projection: Arc<Schema>,
         field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
+        /// The blob fields this file stores in the legacy layout.
+        legacy_blobs: Arc<HashSet<i32>>,
         default_priority: u32,
         file_scheduler: FileScheduler,
     }
@@ -485,6 +570,7 @@ mod v2_adapter {
             reader: Arc<ProjectedFileReader>,
             projection: Arc<Schema>,
             field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
+            legacy_blobs: Arc<HashSet<i32>>,
             default_priority: u32,
             file_scheduler: FileScheduler,
         ) -> Self {
@@ -492,6 +578,7 @@ mod v2_adapter {
                 reader,
                 projection,
                 field_id_to_column_idx,
+                legacy_blobs,
                 default_priority,
                 file_scheduler,
             }
@@ -503,14 +590,11 @@ mod v2_adapter {
             batch_size: u32,
             output_schema: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
-            let has_legacy_blobs = matches!(
-                reader.version(),
-                ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1
-            ) && output_schema
+            let has_legacy_blobs = output_schema
                 .fields_pre_order()
-                .any(|field| field.is_blob_v2());
+                .any(|field| field.is_blob_v2() && self.legacy_blobs.contains(&field.id));
             let physical_schema = if has_legacy_blobs {
-                legacy_blob_read_schema(&output_schema)
+                legacy_blob_read_schema(&output_schema, &self.legacy_blobs)
             } else {
                 output_schema.as_ref().clone()
             };
@@ -519,6 +603,7 @@ mod v2_adapter {
                 &physical_schema,
                 self.field_id_to_column_idx.as_ref(),
             )?;
+            let legacy_blobs = self.legacy_blobs.clone();
             Ok(reader
                 .read_tasks(
                     params,
@@ -529,11 +614,12 @@ mod v2_adapter {
                 .await?
                 .map(move |task| {
                     let output_schema = output_schema.clone();
+                    let legacy_blobs = legacy_blobs.clone();
                     ReadBatchTask {
                         task: async move {
                             let batch = task.task.await?;
                             if has_legacy_blobs {
-                                normalize_legacy_blob_batch(batch, &output_schema)
+                                normalize_legacy_blob_batch(batch, &output_schema, &legacy_blobs)
                             } else {
                                 Ok(batch)
                             }
@@ -1577,14 +1663,34 @@ impl FileFragment {
                 }),
         ));
         let file_version = data_file.file_version()?;
-        let physical_schema = if matches!(
-            file_version,
-            ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1
-        ) {
-            v2_adapter::legacy_blob_read_schema(&schema_per_file)
+        // Blob projections always open the reader with the full footer. A 2.2 file reads
+        // it first, to see which of its blob columns keep the legacy layout.
+        let blob_file_metadata = if file_version == ConcreteFileVersion::V2_2
+            && schema_per_file
+                .fields_pre_order()
+                .any(|field| field.is_blob_v2())
+        {
+            Some(self.get_file_metadata(&file_scheduler).await?)
         } else {
-            schema_per_file.as_ref().clone()
+            None
         };
+        let legacy_blobs = match file_version {
+            ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => schema_per_file
+                .fields_pre_order()
+                .filter(|field| field.is_blob_v2())
+                .map(|field| field.id)
+                .collect(),
+            _ => blob_file_metadata
+                .as_ref()
+                .map_or_else(HashSet::new, |file_metadata| {
+                    v2_adapter::legacy_blob_fields(
+                        &schema_per_file,
+                        &field_id_to_column_idx,
+                        &file_metadata.column_infos,
+                    )
+                }),
+        };
+        let physical_schema = v2_adapter::legacy_blob_read_schema(&schema_per_file, &legacy_blobs);
         let reader_projection = file_versions::reader_projection_from_field_ids(
             file_version,
             &physical_schema,
@@ -1638,7 +1744,10 @@ impl FileFragment {
                 ))
             },
             || async {
-                let file_metadata = self.get_file_metadata(&file_scheduler).await?;
+                let file_metadata = match blob_file_metadata {
+                    Some(file_metadata) => file_metadata,
+                    None => self.get_file_metadata(&file_scheduler).await?,
+                };
                 ProjectedFileReader::try_open_with_file_metadata(
                     encodings_io.clone(),
                     path.clone(),
@@ -1656,6 +1765,7 @@ impl FileFragment {
             Arc::new(reader),
             schema_per_file,
             field_id_to_column_idx,
+            Arc::new(legacy_blobs),
             reader_priority,
             file_scheduler,
         ))))
@@ -3302,6 +3412,7 @@ impl FileFragment {
             self.dataset.version_id(),
             &deletion_vector,
             self.dataset.object_store.as_ref(),
+            self.dataset.inline_deletions_max_bytes()?,
         )
         .await?;
 
@@ -6550,6 +6661,7 @@ mod tests {
             updated_fragments: vec![u1.fragment],
             new_fragments: vec![],
             fields_modified: u1.fields_modified,
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
@@ -6631,6 +6743,7 @@ mod tests {
             updated_fragments: vec![u2.fragment],
             new_fragments: vec![],
             fields_modified: u2.fields_modified,
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
@@ -7640,6 +7753,7 @@ mod tests {
             dataset.version().version,
             &deletion_vector,
             &dataset.object_store,
+            0,
         )
         .await
         .unwrap()
@@ -7680,6 +7794,7 @@ mod tests {
             dataset.version().version,
             &deletion_vector,
             &dataset.object_store,
+            0,
         )
         .await
         .unwrap()
@@ -7846,6 +7961,7 @@ mod tests {
             dataset.version().version,
             &deletion_vector,
             dataset.object_store.as_ref(),
+            0,
         )
         .await
         .unwrap();

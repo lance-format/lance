@@ -294,6 +294,19 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
             ),
         }
     }
+
+    fn decompressed_size(
+        &self,
+        data: &[u8],
+        offsets_bytes: &[u8],
+        bits_per_offset: u8,
+    ) -> Option<u64> {
+        let fsst_compressed_size =
+            self.inner_decompressor
+                .decompressed_size(data, offsets_bytes, bits_per_offset)?;
+        // The vendored FSST decoder expands each compressed value by at most 8x.
+        fsst_compressed_size.checked_mul(8)
+    }
 }
 
 #[derive(Debug)]
@@ -317,6 +330,17 @@ impl FsstMiniBlockDecompressor {
 impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
     fn num_buffers(&self) -> usize {
         self.inner_decompressor.num_buffers()
+    }
+
+    fn decoded_bytes_from_chunk(
+        &self,
+        chunk_buffers: &[LanceBuffer],
+        offset_in_chunk: u64,
+        num_rows: u64,
+    ) -> Option<u64> {
+        self.inner_decompressor
+            .decoded_bytes_from_chunk(chunk_buffers, offset_in_chunk, num_rows)?
+            .checked_mul(8)
     }
 
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {

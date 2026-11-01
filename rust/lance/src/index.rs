@@ -92,6 +92,7 @@ pub mod optimize;
 pub mod prefilter;
 pub mod scalar;
 pub(crate) mod scalar_logical;
+pub(crate) mod segment_coverage;
 pub mod vector;
 
 use self::frag_reuse_with_stable_row_ids::{
@@ -683,14 +684,18 @@ async fn build_provenance(
 /// must each match the version their entries describe
 /// ([`indexed_data_differs`]). A changed input, or a manifest the comparison
 /// needs that was cleaned up, leaves out every fragment its group produced.
-async fn fresh_fragments(
+pub(crate) async fn fresh_fragments(
     dataset: &Dataset,
     frag_reuse_index: &CompactFragReuseIndex,
     segments: &[IndexMetadata],
 ) -> Result<RoaringBitmap> {
     let mut indexed = HashSet::new();
     for segment in segments {
-        indexed.extend(indexed_field_ids(dataset, &segment.fields)?);
+        indexed.extend(indexed_field_ids(
+            dataset,
+            &segment.fields,
+            &segment.covering_fields,
+        )?);
     }
     let mut history = History::new(dataset).await?;
     // Each followed fragment's version, or `None` once it cannot be shown fresh.
@@ -787,9 +792,9 @@ async fn fresh_fragments(
 /// segment's carried columns can go stale independently of its keyed column, so
 /// checking only the keyed subtree would leave a fragment covered after a carried
 /// column was rewritten, and the segment would answer with the obsolete value.
-fn indexed_field_ids(dataset: &Dataset, fields: &[i32]) -> Result<HashSet<i32>> {
+fn indexed_field_ids(dataset: &Dataset, fields: &[i32], carried: &[i32]) -> Result<HashSet<i32>> {
     let mut indexed_field_ids = HashSet::new();
-    for field_id in fields {
+    for field_id in fields.iter().chain(carried) {
         let field = dataset.schema().field_by_id(*field_id).ok_or_else(|| {
             Error::invalid_input(format!(
                 "CreateIndex: field id {field_id} does not exist in the current schema"
@@ -804,7 +809,7 @@ fn indexed_field_ids(dataset: &Dataset, fields: &[i32]) -> Result<HashSet<i32>> 
 /// since it was built. `historically_missing_exempt` names fragments compaction
 /// created after the segments were built, whose absence from a segment's
 /// history is expected rather than stale.
-async fn prune_stale_segment_coverage(
+pub(crate) async fn prune_stale_segment_coverage(
     dataset: &Dataset,
     segments: &mut [IndexSegment],
     prune_historically_missing: bool,
@@ -865,7 +870,8 @@ async fn prune_stale_segment_coverage(
             .iter_mut()
             .filter(|segment| segment.dataset_version() == version)
         {
-            let indexed_field_ids = indexed_field_ids(dataset, segment.fields())?;
+            let indexed_field_ids =
+                indexed_field_ids(dataset, segment.fields(), segment.covering_fields())?;
             let stale_fragments = segment
                 .fragment_bitmap()
                 .iter()
@@ -1120,6 +1126,8 @@ pub(crate) async fn build_index_metadata_from_segments(
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
         .validate_covering_fields()?;
         if segment.fields() != expected_fields.as_slice()
@@ -1157,6 +1165,8 @@ pub(crate) async fn build_index_metadata_from_segments(
         .await?;
 
     let new_indices = futures::stream::iter(segments.into_iter().map(|segment| async move {
+        let clustering_id = segment.clustering_id();
+        let metadata = segment.metadata().clone();
         let (
             uuid,
             fragment_bitmap,
@@ -1180,6 +1190,8 @@ pub(crate) async fn build_index_metadata_from_segments(
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: None,
+                clustering_id,
+                metadata: metadata.clone(),
             };
             crate::index::scalar::inverted::finalize_segment_files_if_needed(dataset, &metadata)
                 .await?;
@@ -1201,6 +1213,8 @@ pub(crate) async fn build_index_metadata_from_segments(
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(files),
+            clustering_id,
+            metadata,
         })
     }))
     .buffered(dataset.object_store.io_parallelism())
@@ -2016,10 +2030,13 @@ async fn remap_deletes_all_indexed_rows(
     Ok(true)
 }
 
+/// Restrict rows to `owned_fragments` only for sources of a staging merge,
+/// before translating their addresses. Independent and deferred remaps pass None.
 pub(crate) async fn remap_index(
     dataset: &Dataset,
     index_id: &Uuid,
     row_id_map: &RowAddrTranslator,
+    owned_fragments: Option<&RoaringBitmap>,
 ) -> Result<RemapResult> {
     // A remap is maintenance: a segment the tagged reader excludes from the
     // listing is still reachable here (its caller decided whether to touch
@@ -2039,7 +2056,7 @@ pub(crate) async fn remap_index(
     // values in the first place, and each index type's `remap` rewrites only the
     // schema that type knows about, so the remapped segment would still declare
     // payload its storage no longer holds. Withdraw it instead, exactly as an
-    // index whose type reports `can_remap() == false` is withdrawn below: an
+    // index whose plugin reports `can_remap(details) == false` is withdrawn below: an
     // absent index costs a fallback scan, whereas a surviving false declaration
     // is answered from data that is not there. Erroring here would instead block
     // compaction of the whole table.
@@ -2108,7 +2125,18 @@ pub(crate) async fn remap_index(
             let scalar_index = dataset
                 .open_scalar_index(&field_path, index_id, &NoOpMetricsCollector)
                 .await?;
+            // Keep the deprecated instance-level check for external indexes
+            // written before ScalarIndexPlugin::can_remap existed. The plugin
+            // capability below covers built-ins and new implementations.
+            #[allow(deprecated)]
             if !scalar_index.can_remap() {
+                return Ok(RemapResult::Drop);
+            }
+            let details = fetch_index_details(dataset, &field_path, matched).await?;
+            if !IndexDetails(details.clone())
+                .get_plugin()?
+                .can_remap(details.as_ref())?
+            {
                 return Ok(RemapResult::Drop);
             }
 
@@ -2131,6 +2159,7 @@ pub(crate) async fn remap_index(
                             &TrainingCriteria::new(TrainingOrdering::None),
                             None,
                             true, // Legacy reindexing should always train
+                            None,
                             None,
                         )
                         .await?;
@@ -2163,6 +2192,7 @@ pub(crate) async fn remap_index(
                 &new_id,
                 matched,
                 row_id_map,
+                owned_fragments,
             )
             .await?;
 
@@ -3941,9 +3971,8 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
     if let Some(frag_reuse_index_meta) =
         indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
     {
-        let fri_key = FragReuseIndexKey {
-            uuid: &frag_reuse_index_meta.uuid,
-        };
+        let identity = frag_reuse::v0_cache_identity(dataset, frag_reuse_index_meta);
+        let fri_key = FragReuseIndexKey { uuid: &identity };
         let frag_reuse_index = dataset
             .index_cache
             .get_or_insert_with_key(fri_key, || async move {
@@ -4091,7 +4120,7 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
     async fn initialize_indices(&mut self, source_dataset: &Dataset) -> Result<()>;
 }
 
-/// The FRI UUID that belongs in the vector cache keys before any remapping
+/// The FRI identity that belongs in the vector cache keys before any remapping
 /// is resolved: only a v0 history, whose remapper is applied while the index
 /// is decoded, identifies cached content (see [`frag_reuse::fri_cache_id`]).
 async fn v0_frag_reuse_cache_id(dataset: &Dataset) -> Option<Uuid> {
@@ -4100,7 +4129,22 @@ async fn v0_frag_reuse_cache_id(dataset: &Dataset) -> Option<Uuid> {
         .ok()?
         .iter()
         .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME && idx.index_version == 0)
-        .map(|idx| idx.uuid)
+        .map(|idx| frag_reuse::v0_cache_identity(dataset, idx))
+}
+
+/// The FRI part of a cache key for content read alongside the dataset's
+/// history: [`frag_reuse::v0_cache_identity`] for `index_version = 0`, or the
+/// entry UUID for tagged history, which every change to that history replaces.
+pub(crate) async fn frag_reuse_cache_scope(dataset: &Dataset) -> Option<Uuid> {
+    load_all_indices(dataset)
+        .await
+        .ok()?
+        .iter()
+        .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+        .map(|idx| match idx.index_version {
+            0 => frag_reuse::v0_cache_identity(dataset, idx),
+            _ => idx.uuid,
+        })
 }
 
 impl Dataset {
@@ -4349,6 +4393,18 @@ impl Dataset {
         let tailing_bytes = read_last_block(reader.as_ref()).await?;
         let (major_version, minor_version) = read_version(&tailing_bytes)?;
 
+        // Legacy vector indexes are cached whole and can outlive the files they
+        // were opened from: cleanup unlinks old index files while the cache still
+        // holds an entry for them. Anything stored in the cached index must
+        // therefore reopen the file per read instead of pinning a descriptor.
+        let lazy_reader = vector::open_cache_reader(
+            object_store.clone(),
+            &index_file,
+            INDEX_FILE_NAME,
+            &file_sizes,
+        )
+        .await?;
+
         // Namespace the index cache by the UUID of the index. v2+ partition
         // entries are store-free and remain reusable across object-store
         // generations alongside their serializable state.
@@ -4378,7 +4434,7 @@ impl Dataset {
                             dataset,
                             uuid,
                             vector_index,
-                            reader,
+                            lazy_reader,
                             frag_reuse_index,
                         )
                         .await?;
@@ -4393,7 +4449,7 @@ impl Dataset {
             (0, 2) => {
                 info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
                 let reader = V1FileReader::try_new_self_described_from_reader(
-                    reader.clone(),
+                    lazy_reader,
                     Some(&self.metadata_cache.file_metadata_cache(&index_file)),
                 )
                 .await?;
@@ -4810,9 +4866,8 @@ impl DatasetIndexInternalExt for Dataset {
                 };
             }
             let frag_reuse_uuid = frag_reuse_index_meta.uuid;
-            let frag_reuse_key = FragReuseIndexKey {
-                uuid: &frag_reuse_uuid,
-            };
+            let identity = frag_reuse::v0_cache_identity(self, &frag_reuse_index_meta);
+            let frag_reuse_key = FragReuseIndexKey { uuid: &identity };
 
             let index = self
                 .index_cache
@@ -4844,7 +4899,7 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(None);
         };
 
-        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
+        let frag_reuse_uuid = frag_reuse_cache_scope(self).await;
         let cache_key = MemWalCacheKey::new(&mem_wal_meta.uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_with_key(&cache_key).await {
             log::debug!("Found MemWAL index in cache uuid: {}", mem_wal_meta.uuid);
@@ -5213,6 +5268,7 @@ mod tests {
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
+    use crate::index::vector::details::target_partition_size_from_details;
     use crate::session::Session;
     use crate::utils::test::{
         DatagenExt, FragmentCount, FragmentRowCount, compact_into_two, copy_test_data_to_tmp,
@@ -5303,6 +5359,8 @@ mod tests {
                 size_bytes: payload.len() as u64,
                 file_metadata_size_bytes: None,
             }]),
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -5881,6 +5939,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         // The shape every merge_segments impl builds: keyed field only, carried
@@ -6822,16 +6882,47 @@ mod tests {
         assert_eq!(stats["num_indexed_rows"], 512);
     }
 
+    #[rstest]
+    #[case::missing_details("v0.18.2/index_no_details.lance", None)]
+    #[case::v036(
+        "0.36.0/btree_in_index_pkg.lance",
+        Some("/lance.index.pb.BTreeIndexDetails")
+    )]
     #[tokio::test]
-    async fn test_v036_scalar_details_are_still_known() {
-        let test_dir = copy_test_data_to_tmp("0.36.0/btree_in_index_pkg.lance").unwrap();
+    async fn test_historical_scalar_indices_support_remapping(
+        #[case] fixture: &str,
+        #[case] type_url: Option<&str>,
+    ) {
+        let test_dir = copy_test_data_to_tmp(fixture).unwrap();
         let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
         let indices = dataset.load_indices().await.unwrap();
-        let details = indices[0].index_details.clone().unwrap();
+        assert!(!indices.is_empty());
 
-        assert_eq!(details.type_url, "/lance.index.pb.BTreeIndexDetails");
-        assert_eq!(IndexDetails(details).get_plugin().unwrap().name(), "BTree");
-        assert!(index_type_is_known(&indices[0]));
+        for index in indices.iter() {
+            assert_eq!(
+                index
+                    .index_details
+                    .as_ref()
+                    .map(|details| details.type_url.as_str()),
+                type_url
+            );
+            if let Some(details) = &index.index_details {
+                assert_eq!(
+                    IndexDetails(details.clone()).get_plugin().unwrap().name(),
+                    "BTree"
+                );
+            }
+            assert!(index_type_is_known(index));
+            let result = remap_index(
+                &dataset,
+                &index.uuid,
+                &RowAddrTranslator::sync(RowAddrRemap::empty()),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(result, RemapResult::Remapped(_)), "{result:?}");
+        }
     }
 
     #[tokio::test]
@@ -7682,6 +7773,84 @@ mod tests {
 
         // 300 / 256 = 1, not the 1000 requested.
         assert_eq!(trained_partitions(&dataset).await, vec![1]);
+
+        // The target recorded is the 300 vectors the one partition holds, not
+        // 300 / 1000, which would have optimize split it apart.
+        let details = dataset.load_indices().await.unwrap()[0]
+            .index_details
+            .clone()
+            .unwrap();
+        assert_eq!(target_partition_size_from_details(&details), Some(300));
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(trained_partitions(&dataset).await, vec![1]);
+    }
+
+    /// An index built from a partition count, or from centroids that fix one,
+    /// records the vectors per partition it was built at and keeps its
+    /// partitions through an optimize with nothing new to index. With no target
+    /// partition size recorded, optimize joined every partition under a quarter
+    /// of the index type's default, and 500 vectors a partition is under that
+    /// for every IVF type. Null rows are not indexed, so they do not count: a
+    /// target taken from 50,000 rows would join partitions under 625.
+    #[rstest]
+    #[case::num_partitions(VectorIndexParams::ivf_flat(20, DistanceType::L2))]
+    #[case::centroids(ivf_flat_from_centroids(20))]
+    #[tokio::test]
+    async fn test_optimize_keeps_trained_partitions(
+        #[case] params: VectorIndexParams,
+        #[values(0, 40_000)] null_rows: usize,
+    ) {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset =
+            partly_null_vector_dataset(test_dir.path(), 10_000 + null_rows, 10_000).await;
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        assert_eq!(trained_partitions(&dataset).await, vec![20]);
+        let details = dataset.load_indices().await.unwrap()[0]
+            .index_details
+            .clone()
+            .unwrap();
+        assert_eq!(target_partition_size_from_details(&details), Some(500));
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(trained_partitions(&dataset).await, vec![20]);
+    }
+
+    /// IVF_FLAT params carrying `partitions` precomputed centroids and no
+    /// partition count. The centroids are trained on a fresh sample of the
+    /// distribution `vector_reader` draws from, so the partitions they cut are
+    /// balanced; random centroids could leave one under the join threshold.
+    fn ivf_flat_from_centroids(partitions: usize) -> VectorIndexParams {
+        let dimension = 16;
+        let sample = generate_random_array(partitions * 256 * dimension as usize);
+        let centroids = train_kmeans::<Float32Type>(
+            &sample,
+            KMeansParams::new(None, 10, 1, DistanceType::L2),
+            dimension as usize,
+            partitions,
+            256,
+        )
+        .unwrap()
+        .centroids
+        .as_primitive::<Float32Type>()
+        .clone();
+        let centroids =
+            Arc::new(FixedSizeListArray::try_new_from_values(centroids, dimension).unwrap());
+        VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            IvfBuildParams {
+                centroids: Some(centroids),
+                ..Default::default()
+            },
+        )
     }
 
     /// Partition counts for a trained logical vector index, one per segment.
@@ -7946,7 +8115,8 @@ mod tests {
             .unwrap()
     }
 
-    /// A dataset of `rows` rows where only the first `non_null` hold a vector.
+    /// A dataset of `rows` rows where only the first `non_null` hold a vector,
+    /// each random.
     async fn partly_null_vector_dataset(
         dir: &std::path::Path,
         rows: usize,
@@ -7966,11 +8136,13 @@ mod tests {
             arrow_array::builder::Float32Builder::new(),
             dimensions,
         );
+        let values = generate_random_array(non_null * dimensions as usize);
         for row in 0..rows {
             if row < non_null {
-                for value in 0..dimensions {
-                    builder.values().append_value(value as f32);
-                }
+                let start = row * dimensions as usize;
+                builder
+                    .values()
+                    .append_slice(&values.values()[start..start + dimensions as usize]);
                 builder.append(true);
             } else {
                 for _ in 0..dimensions {
@@ -8790,6 +8962,7 @@ mod tests {
             &dataset,
             &index_uuid,
             &RowAddrTranslator::sync(remap_to_empty.clone()),
+            None,
         )
         .await
         .unwrap();
@@ -8827,6 +9000,7 @@ mod tests {
             &dataset,
             &index_meta.uuid,
             &RowAddrTranslator::sync(remap.clone()),
+            None,
         )
         .await
         .unwrap();
@@ -8902,6 +9076,7 @@ mod tests {
             &dataset,
             &index_uuid,
             &RowAddrTranslator::sync(RowAddrRemap::empty()),
+            None,
         )
         .await
         .unwrap_err();
@@ -8979,6 +9154,7 @@ mod tests {
             &dataset,
             &index_uuid,
             &RowAddrTranslator::sync(RowAddrRemap::empty()),
+            None,
         )
         .await
         .expect_err("malformed covering metadata must not be silently accepted");
@@ -9480,6 +9656,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
@@ -9521,6 +9699,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
@@ -9835,24 +10015,21 @@ mod tests {
 
         // Verify index is NOT being used in queries after delete (empty bitmap)
         if column_name == "text" {
-            // Inverted indexes will still appear to be used in FTS queries.
-            // TODO: once metrics are working on FTS queries, we can check the
-            // analyze plan output instead for index usage.
-            let _plan_after_delete = dataset
-                .scan()
-                .project(&[column_name])
+            // The retained index has no live fragments, so an empty snapshot
+            // needs no index scan to return an empty FTS result.
+            let mut scan = dataset.scan();
+            scan.project(&[column_name])
                 .unwrap()
                 .full_text_search(FullTextSearchQuery::new("test".to_string()))
-                .unwrap()
-                .explain_plan(false)
-                .await
                 .unwrap();
+            let plan_after_delete = scan.explain_plan(false).await.unwrap();
             assert_index_usage(
-                &_plan_after_delete,
+                &plan_after_delete,
                 column_name,
-                true,
+                false,
                 "after delete (empty bitmap)",
             );
+            assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 0);
         } else {
             // Use equality filter for btree/bitmap indices
             let _plan_after_delete = dataset
@@ -12482,6 +12659,8 @@ mod tests {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: seg0.files.clone(),
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let err = dataset
@@ -15367,6 +15546,8 @@ mod tests {
                     .filter(|fragment| covered.contains(fragment.id as u32))
                     .cloned()
                     .collect(),
+                output_clustering_id: None,
+                output_metadata: Default::default(),
             }],
             read_version: dataset.version().version,
             options: CompactionOptions::default(),
@@ -15405,10 +15586,9 @@ mod tests {
     /// bitmap into the current space through the fragment-reuse index and leaves
     /// a `None` one alone, so the reconstruction has to make that move itself.
     ///
-    /// Without it, a deferred compaction is enough to defeat both guards: the
-    /// coverage still names the fragments the rows moved out of, which no later
-    /// rewrite can intersect, so the planner stops holding anything back and the
-    /// commit boundary waves the rewrite through.
+    /// Without it, coverage still names the fragments the rows moved out of:
+    /// deferred planning loses the boundary between indexed and unindexed rows,
+    /// and the unreadable-index commit guard cannot detect a covered rewrite.
     #[tokio::test]
     async fn test_reconstructed_coverage_follows_a_deferred_compaction() {
         use crate::dataset::index::DatasetIndexRemapperOptions;
@@ -15483,6 +15663,8 @@ mod tests {
         let plan = CompactionPlan {
             tasks: vec![TaskData {
                 fragments: dataset.fragments().as_ref().clone(),
+                output_clustering_id: None,
+                output_metadata: Default::default(),
             }],
             read_version: dataset.version().version,
             options: CompactionOptions::default(),
@@ -15519,10 +15701,29 @@ mod tests {
         .unwrap();
         assert_eq!(dataset.get_fragments().len(), 3);
 
-        // The planner half: the appended pair coalesces, fragment 2 is held back.
-        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+        // Eager planning refuses pending FRI moves before considering coverage.
+        let version = dataset.version().version;
+        let err = compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        assert!(err.to_string().contains("pending remaps"), "{err}");
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.version().version, version);
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        // Deferred planning still honors the reconstructed boundary: the
+        // appended pair coalesces and the indexed fragment 2 is left alone.
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(metrics.fragments_removed, 2);
         assert_eq!(metrics.fragments_added, 1);
         assert!(

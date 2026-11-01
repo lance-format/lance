@@ -4,6 +4,7 @@
 import base64
 import contextlib
 import importlib
+import json
 import os
 import pickle
 import platform
@@ -720,6 +721,11 @@ def test_tag(tmp_path: Path):
 
     assert len(ds.tags.list()) == 0
 
+    with pytest.raises(
+        ValueError, match="Ref not found error: tag tag1 does not exist"
+    ):
+        ds.tags.get("tag1")
+
     with pytest.raises(ValueError):
         ds.tags.create("tag1", 3)
 
@@ -728,7 +734,11 @@ def test_tag(tmp_path: Path):
 
     ds.tags.create("tag1", 1)
     ds.tags.replace_metadata("tag1", {"description": "first tag"})
-    tag1_meta = ds.tags.list()["tag1"]
+    tag1_meta = ds.tags.get("tag1")
+    assert tag1_meta == ds.tags.list()["tag1"]
+    assert tag1_meta["version"] == 1
+    assert tag1_meta["branch"] is None
+    assert tag1_meta["manifest_size"] > 0
     assert tag1_meta["created_at"] is not None
     assert isinstance(tag1_meta["created_at"], datetime)
     assert tag1_meta["updated_at"] is not None
@@ -746,6 +756,7 @@ def test_tag(tmp_path: Path):
     ds.tags.create("tag2", 1)
 
     assert len(ds.tags.list()) == 2
+    assert ds.tags.get("tag1")["metadata"] == {}
 
     with pytest.raises(OSError):
         ds.checkout_version("tag3")
@@ -769,7 +780,7 @@ def test_tag(tmp_path: Path):
     ):
         ds.tags.update("tag3", 1)
 
-    tag1_meta = ds.tags.list()["tag1"]
+    tag1_meta = ds.tags.get("tag1")
     tag1_created_at = tag1_meta["created_at"]
     tag1_updated_at = tag1_meta["updated_at"]
     assert tag1_created_at is not None
@@ -777,17 +788,19 @@ def test_tag(tmp_path: Path):
     ds.tags.replace_metadata("tag1", {"description": "updated tag"})
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 1
-    replaced_tag1_meta = ds.tags.list()["tag1"]
+    replaced_tag1_meta = ds.tags.get("tag1")
     assert replaced_tag1_meta["metadata"] == {"description": "updated tag"}
     assert replaced_tag1_meta["updated_at"] == tag1_updated_at
 
     ds.tags.replace_metadata("tag1", {"owner": "ml-team"})
-    replaced_again_tag1_meta = ds.tags.list()["tag1"]
+    replaced_again_tag1_meta = ds.tags.get("tag1")
     assert replaced_again_tag1_meta["metadata"] == {"owner": "ml-team"}
     assert replaced_again_tag1_meta["updated_at"] == tag1_updated_at
 
     ds.tags.update("tag1", 2)
-    updated_tag1_meta = ds.tags.list()["tag1"]
+    updated_tag1_meta = ds.tags.get("tag1")
+    assert updated_tag1_meta["version"] == 2
+    assert updated_tag1_meta["branch"] is None
     assert updated_tag1_meta["created_at"] == tag1_created_at
     assert updated_tag1_meta["updated_at"] is not None
     assert updated_tag1_meta["updated_at"] >= tag1_updated_at
@@ -810,7 +823,9 @@ def test_tag(tmp_path: Path):
 
     ds.create_branch("branch", "tag1")
     ds.tags.create("tag3", ("branch", None))
-    target_tag = ds.tags.list().get("tag3")
+    target_tag = ds.tags.get("tag3")
+    assert target_tag == ds.tags.list()["tag3"]
+    assert ds.checkout_version(("branch", 1)).tags.get("tag3") == target_tag
     assert ds.tags.get_version("tag3") == 1
     assert len(ds.tags.list()) == 3
     assert target_tag is not None
@@ -818,7 +833,7 @@ def test_tag(tmp_path: Path):
     assert target_tag["branch"] == "branch"
 
     ds.tags.update("tag3", (None, 2))
-    target_tag = ds.tags.list()["tag3"]
+    target_tag = ds.tags.get("tag3")
     assert ds.tags.get_version("tag3") == 2
     assert target_tag is not None
     assert target_tag["version"] == 2
@@ -826,7 +841,7 @@ def test_tag(tmp_path: Path):
 
     ds.create_branch("branch2", 2)
     ds.tags.update("tag3", ("branch2", 2))
-    target_tag = ds.tags.list()["tag3"]
+    target_tag = ds.tags.get("tag3")
     assert ds.tags.get_version("tag3") == 2
     assert target_tag is not None
     assert target_tag["version"] == 2
@@ -834,6 +849,19 @@ def test_tag(tmp_path: Path):
 
     ds.tags.delete("tag3")
     assert len(ds.tags.list()) == 2
+
+    with pytest.raises(
+        ValueError, match="Ref not found error: tag tag3 does not exist"
+    ):
+        ds.tags.get("tag3")
+
+
+@pytest.mark.parametrize("tag", ["", "invalid/tag", ".invalid"])
+def test_tag_get_invalid_name(tmp_path: Path, tag: str):
+    ds = lance.write_dataset(pa.table({"a": [1]}), tmp_path)
+
+    with pytest.raises(ValueError, match="Ref is invalid"):
+        ds.tags.get(tag)
 
 
 def test_tag_order(tmp_path: Path):
@@ -1047,7 +1075,13 @@ def test_take_system_columns_values(tmp_path: Path, column_name: str):
     table = pa.table({"a": range(100), "b": range(100, 200)})
     base_dir = tmp_path / "test_take_system_columns_values"
     # Use max_rows_per_file to create multiple fragments
-    lance.write_dataset(table, base_dir, max_rows_per_file=25)
+    lance.write_dataset(
+        table,
+        base_dir,
+        max_rows_per_file=25,
+        enable_stable_row_ids=column_name
+        in ("_row_created_at_version", "_row_last_updated_at_version"),
+    )
     dataset = lance.dataset(base_dir)
 
     indices = [0, 5, 10, 50, 99]
@@ -1087,7 +1121,7 @@ def test_take_system_columns_column_ordering(tmp_path: Path):
     """Test that column ordering is preserved when using system columns."""
     table = pa.table({"a": range(50), "b": range(50, 100)})
     base_dir = tmp_path / "test_take_column_ordering"
-    lance.write_dataset(table, base_dir)
+    lance.write_dataset(table, base_dir, enable_stable_row_ids=True)
     dataset = lance.dataset(base_dir)
 
     indices = [0, 1, 2]
@@ -1521,15 +1555,49 @@ def test_polar_scan(tmp_path: Path):
     # kind of filter
     check_pushdown_filt((pl.col("a") + 3) < 100, "(a + 3) < 100")
 
-    # I can't seem to get struct["x"] to work in Lance but maybe there is
-    # a way.  For now, let's compare it directly to the pyarrow compute version
+    # Compare with the PyArrow expression filter, which reaches the scanner as a
+    # nested Substrait field reference.
+    polars_df = pl.scan_pyarrow_dataset(dataset).filter(
+        pl.col("struct").struct.field("x") < 10
+    )
+    df = dataset.to_table(filter=pc.field("struct", "x") < 10).to_pandas()
+    assert len(df) == 10
+    tm.assert_frame_equal(polars_df.collect().to_pandas(), df)
 
-    # Doesn't yet work today :( due to upstream issue (datafusion's substrait parser
-    # doesn't yet handle nested refs)
-    # if pa.cpp_version_info.major >= 14:
-    #     polars_df = pl.scan_pyarrow_dataset(dataset).filter(pl.col("struct.x") < 10)
-    #     df = dataset.to_table(filter=pc.field("struct", "x") < 10).to_pandas()
-    #     tm.assert_frame_equal(polars_df.collect().to_pandas(), df)
+
+def test_filter_on_struct_field_expression(tmp_path: Path):
+    rows = [{"x": i, "inner": {"y": i % 3}} for i in range(10)]
+    table = pa.table(
+        {
+            "id": pa.array(range(12), pa.int64()),
+            "meta": pa.array(
+                rows + [{"x": None, "inner": None}, None],
+                pa.struct(
+                    [("x", pa.int64()), ("inner", pa.struct([("y", pa.int64())]))]
+                ),
+            ),
+        }
+    )
+    ds = lance.write_dataset(table, tmp_path, max_rows_per_file=4)
+    by_x = pc.field("meta", "x") >= 6
+    by_y = pc.field("meta", "inner", "y") == 0
+
+    assert ds.to_table(filter=by_x)["id"].to_pylist() == [6, 7, 8, 9]
+    assert ds.to_table(filter=by_y)["id"].to_pylist() == [0, 3, 6, 9]
+    assert ds.count_rows(filter=by_x) == 4
+    assert ds.get_fragments()[1].to_table(filter=by_x)["id"].to_pylist() == [6, 7]
+
+    # The filter decodes to the same expression as `meta.x >= 6`, so it can use
+    # an index on the struct field.
+    ds.create_scalar_index("meta.x", "BTREE")
+    assert "ScalarIndexQuery" in ds.scanner(filter=by_x).explain_plan()
+    assert ds.to_table(filter=by_x)["id"].to_pylist() == [6, 7, 8, 9]
+    is_null = pc.field("meta", "x").is_null()
+    assert ds.to_table(filter=is_null)["id"].to_pylist() == [10, 11]
+
+    ds.update({"id": "id + 100"}, where=by_y)
+    ds.delete(by_x)
+    assert sorted(ds.to_table()["id"].to_pylist()) == [1, 2, 4, 5, 10, 11, 100, 103]
 
 
 def test_count_fragments(tmp_path: Path):
@@ -1696,6 +1764,21 @@ def test_pickle_fragment(tmp_path: Path):
     assert fragment.to_table() == unpickled.to_table()
 
 
+def test_scheduler_error_mode_storage_option(tmp_path: Path):
+    table = pa.table({"a": range(10)})
+    uri = tmp_path / "scheduler_error_mode"
+    lance.write_dataset(table, uri)
+
+    dataset = lance.dataset(uri, storage_options={"scheduler_error_mode": "fail_fast"})
+    assert dataset.to_table() == table
+
+    with pytest.raises(
+        ValueError,
+        match="Invalid scheduler_error_mode value 'invalid'",
+    ):
+        lance.dataset(uri, storage_options={"scheduler_error_mode": "invalid"})
+
+
 def test_cleanup_old_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -1858,6 +1941,225 @@ def test_cleanup_with_retain_versions(tmp_path: Path):
     assert stats.deletion_files_removed == 0
     assert len(ds.versions()) == 3
     assert ds.count_rows() == len(ds.to_table())
+
+
+@pytest.mark.parametrize(
+    "invalid_rules,message",
+    [
+        ({}, "requires a cleanup policy"),
+        (
+            {"lance.auto_cleanup.keep_one.older_than": "2days"},
+            "requires a cleanup policy",
+        ),
+        (
+            {"lance.auto_cleanup.keep_one.per_intervl": "1day"},
+            "Unknown retention configuration key",
+        ),
+    ],
+)
+def test_cleanup_retention_rejects_incomplete_activation(
+    tmp_path: Path, invalid_rules, message
+):
+    ds = lance.write_dataset(pa.table({"value": [1, 2]}), tmp_path)
+    with pytest.raises(OSError, match=message):
+        ds.update_config({"lance.auto_cleanup.policy_interval": "1", **invalid_rules})
+    assert lance.dataset(tmp_path).version == 1
+
+
+@pytest.mark.parametrize("shorthand", [False, True])
+def test_cleanup_retention_activation_is_atomic(tmp_path: Path, shorthand):
+    table = pa.table({"value": [1, 2, 3, 4]})
+    ds = lance.write_dataset(table, tmp_path, max_rows_per_file=2)
+    for _ in range(2):
+        ds = lance.write_dataset(table, tmp_path, mode="overwrite", max_rows_per_file=2)
+    ds.update_config(
+        {"lance.auto_cleanup.interval": "1", "lance.auto_cleanup.older_than": "7days"}
+    )
+    before = ds.version
+    config = {"lance.auto_cleanup.policy_interval": "1"}
+    if shorthand:
+        config["lance.auto_cleanup.keep_one.per_interval"] = "1day"
+    else:
+        config["lance.auto_cleanup.policy"] = json.dumps(
+            {
+                "rules": [
+                    {"type": "keep_one", "per_interval": "1day", "older_than": "2days"},
+                    {"type": "remove_all", "older_than": "30days"},
+                ]
+            }
+        )
+    with pytest.raises(OSError, match="remove lance.auto_cleanup.interval"):
+        ds.update_config(config)
+    assert lance.dataset(tmp_path).version == before
+    assert [version["version"] for version in ds.versions()] == list(
+        range(1, before + 1)
+    )
+    config["lance.auto_cleanup.interval"] = None
+    config["lance.auto_cleanup.older_than"] = None
+    applied = ds.update_config(config)
+    assert "lance.auto_cleanup.interval" not in applied
+    assert applied["lance.auto_cleanup.policy_interval"] == "1"
+    assert [version["version"] for version in ds.versions()] == list(
+        range(1, before + 2)
+    )
+    for version in range(1, 4):
+        assert lance.dataset(tmp_path, version=version).to_table() == table
+
+
+@pytest.mark.parametrize("delete_unverified", [False, True])
+def test_cleanup_retention_policy(tmp_path: Path, delete_unverified):
+    options = {"delete_unverified": delete_unverified}
+    assert list(lance.CleanupPolicy().rules) == [lance.RemoveAll(timedelta(days=14))]
+    assert isinstance(lance.KeepOne(timedelta(hours=1)), lance.CleanupRule)
+    assert isinstance(lance.RemoveAll(timedelta(days=30)), lance.CleanupRule)
+    table = pa.table({"a": [1, 2, 3, 4]})
+    ds = lance.write_dataset(table, tmp_path, max_rows_per_file=2)
+    for _ in range(3):
+        ds = lance.write_dataset(table, tmp_path, mode="overwrite", max_rows_per_file=2)
+    policy = lance.CleanupPolicy(
+        rules=[
+            lance.KeepOne(
+                per_interval=timedelta(hours=1), older_than=timedelta(days=2)
+            ),
+            lance.KeepOne(per_interval=timedelta(days=1), older_than=timedelta(days=7)),
+            lance.RemoveAll(older_than=timedelta(days=30)),
+        ]
+    )
+    assert (
+        ds.explain_cleanup_old_versions(policy=policy, **options).stats.old_versions
+        == 0
+    )
+    assert ds.cleanup_old_versions(policy=policy, **options).old_versions == 0
+    assert len(ds.versions()) == 4
+    large_interval = lance.CleanupPolicy(
+        [lance.KeepOne(timedelta(days=365 * 10_000, microseconds=1))]
+    )
+    assert (
+        ds.explain_cleanup_old_versions(
+            policy=large_interval, **options
+        ).stats.old_versions
+        == 0
+    )
+    assert ds.cleanup_old_versions(policy=large_interval, **options).old_versions == 0
+    orphan = tmp_path / "data" / "uncommitted.lance"
+    orphan.write_bytes(b"uncommitted")
+    expiration = lance.CleanupPolicy([lance.RemoveAll(older_than=timedelta(0))])
+    explanation = ds.explain_cleanup_old_versions(policy=expiration, **options)
+    assert len(ds.versions()) == 4
+    assert explanation.stats.old_versions == 3
+    assert orphan.exists()
+    stats = ds.cleanup_old_versions(policy=expiration, **options)
+    assert stats.old_versions == explanation.stats.old_versions
+    assert (
+        stats.data_files_removed
+        == explanation.stats.data_files_removed
+        == 6 + int(delete_unverified)
+    )
+    assert orphan.exists() == (not delete_unverified)
+    assert [version["version"] for version in ds.versions()] == [4]
+    assert ds.to_table() == table
+    assert ds.cleanup_old_versions(policy=expiration, **options).old_versions == 0
+
+
+@pytest.mark.parametrize(
+    "policy,message",
+    [
+        ([], "must not be empty"),
+        ([lance.KeepOne(timedelta(hours=1), timedelta(days=1))], "at least 2 days"),
+        ([lance.KeepOne(timedelta(0))], "keep_one.per_interval"),
+        (
+            [lance.KeepOne(timedelta(hours=1)), lance.KeepOne(timedelta(days=1))],
+            "strictly increasing",
+        ),
+        (
+            [lance.RemoveAll(timedelta(days=30)), lance.KeepOne(timedelta(hours=1))],
+            "final retention rule",
+        ),
+    ],
+)
+def test_cleanup_rejects_invalid_retention_policy(tmp_path: Path, policy, message):
+    policy = lance.CleanupPolicy(rules=policy)
+    ds = lance.write_dataset(pa.table({"a": [1, 2]}), tmp_path)
+    with pytest.raises(OSError, match=message):
+        ds.explain_cleanup_old_versions(policy=policy)
+    with pytest.raises(OSError, match=message):
+        ds.cleanup_old_versions(policy=policy)
+    assert len(ds.versions()) == 1
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    [{"older_than": timedelta(days=7)}, {"keep_one": lance.KeepOne(timedelta(days=1))}],
+)
+def test_cleanup_rejects_conflicting_retention_policy(tmp_path: Path, conflict):
+    ds = lance.write_dataset(pa.table({"a": [1, 2]}), tmp_path)
+    policy = lance.CleanupPolicy([lance.RemoveAll(timedelta(days=30))])
+    with pytest.raises(ValueError, match="policy cannot be combined"):
+        ds.explain_cleanup_old_versions(policy=policy, **conflict)
+    with pytest.raises(ValueError, match="policy cannot be combined"):
+        ds.cleanup_old_versions(policy=policy, **conflict)
+
+
+@pytest.mark.parametrize("period", [timedelta(0), timedelta(microseconds=-1)])
+def test_cleanup_rejects_invalid_keep_one(tmp_path: Path, period):
+    ds = lance.write_dataset(pa.table({"a": [1, 2]}), tmp_path)
+    with pytest.raises(OSError, match="keep_one"):
+        ds.cleanup_old_versions(keep_one=lance.KeepOne(period))
+    with pytest.raises(OSError, match="keep_one"):
+        ds.explain_cleanup_old_versions(keep_one=lance.KeepOne(period))
+    assert len(ds.versions()) == 1
+
+
+def test_cleanup_keeps_one_per_period(tmp_path: Path):
+    uri = tmp_path
+    table = pa.table({"a": [1, 2, 3, 4]})
+    ds = lance.write_dataset(table, uri, max_rows_per_file=2)
+    for _ in range(3):
+        ds = lance.write_dataset(table, uri, mode="overwrite", max_rows_per_file=2)
+    assert (
+        ds.cleanup_old_versions(keep_one=lance.KeepOne(timedelta(days=1))).old_versions
+        == 0
+    )
+    period = timedelta(days=365 * 10_000)
+    explanation = ds.explain_cleanup_old_versions(
+        older_than=timedelta(days=7), keep_one=lance.KeepOne(period, timedelta(days=2))
+    )
+    assert explanation.stats.old_versions == 0
+    assert len(ds.versions()) == 4
+    stats = ds.cleanup_old_versions(
+        older_than=timedelta(days=7), keep_one=lance.KeepOne(period, timedelta(days=2))
+    )
+    assert stats.old_versions == explanation.stats.old_versions
+    assert stats.data_files_removed == explanation.stats.data_files_removed == 0
+    assert stats.bytes_removed == explanation.stats.bytes_removed
+    assert [v["version"] for v in ds.versions()] == [1, 2, 3, 4]
+    assert lance.dataset(uri, version=3).to_table() == table
+    assert ds.to_table() == table
+
+    expiration = dict(
+        older_than=timedelta(0), keep_one=lance.KeepOne(timedelta(days=1))
+    )
+    explanation = ds.explain_cleanup_old_versions(**expiration)
+    assert explanation.stats.old_versions == 3
+    assert ds.cleanup_old_versions(**expiration).old_versions == 3
+    assert [v["version"] for v in ds.versions()] == [4]
+    assert ds.to_table() == table
+
+
+@pytest.mark.parametrize(
+    "age", [timedelta(0), timedelta(days=1), timedelta(days=2, microseconds=-1)]
+)
+def test_cleanup_thinning_requires_two_days(tmp_path: Path, age):
+    ds = lance.write_dataset(pa.table({"a": [1, 2]}), tmp_path)
+    with pytest.raises(OSError, match="older_than must be at least 2 days"):
+        ds.cleanup_old_versions(
+            older_than=timedelta(days=7), keep_one=lance.KeepOne(timedelta(days=1), age)
+        )
+    with pytest.raises(OSError, match="older_than must be at least 2 days"):
+        ds.explain_cleanup_old_versions(
+            older_than=timedelta(days=7), keep_one=lance.KeepOne(timedelta(days=1), age)
+        )
+    assert len(ds.versions()) == 1
 
 
 def test_cleanup_specific_versions(tmp_path: Path):
@@ -2035,6 +2337,34 @@ def test_enable_disable_auto_cleanup(tmp_path):
     assert len(ds.versions()) == 7
 
 
+@pytest.mark.parametrize("shorthand", [False, True])
+def test_disable_retention_auto_cleanup(tmp_path: Path, shorthand: bool):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    ds = lance.write_dataset(table, tmp_path, mode="create")
+    config = {"lance.auto_cleanup.policy_interval": "1"}
+    if shorthand:
+        config["lance.auto_cleanup.keep_one.per_interval"] = "1day"
+        config["lance.auto_cleanup.keep_one.older_than"] = "2days"
+    else:
+        config["lance.auto_cleanup.policy"] = json.dumps(
+            {"rules": [{"type": "remove_all", "older_than": "0s"}]}
+        )
+    ds.update_config(config)
+    ds = lance.dataset(tmp_path)
+
+    ds.optimize.disable_auto_cleanup()
+    ds = lance.dataset(tmp_path)
+    assert not any(key.startswith("lance.auto_cleanup.") for key in ds.config())
+    before = [version["version"] for version in ds.versions()]
+
+    for _ in range(4):
+        lance.write_dataset(table, tmp_path, mode="append")
+
+    assert [
+        version["version"] for version in lance.dataset(tmp_path).versions()
+    ] == list(range(before[0], before[-1] + 5))
+
+
 def test_cleanup_with_rate_limit(tmp_path):
     """Test that cleanup_old_versions works with delete_rate_limit parameter."""
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
@@ -2106,6 +2436,80 @@ def test_strict_overwrite(tmp_path: Path):
         )
     # CommitConflict means commit-step retries were exhausted; it is safe to retry.
     assert exc_info.value.retryable is True
+
+
+def test_fragment_object_metadata_round_trips_through_append(tmp_path: Path):
+    """A fragment's generic metadata map crosses Python -> Rust -> Python intact."""
+    import dataclasses
+
+    table = pa.Table.from_pydict({"a": range(10)})
+    base_dir = tmp_path / "fragment_metadata"
+    dataset = lance.write_dataset(table, base_dir)
+
+    metadata = {
+        "org.example.cluster.bucket": "3",
+        "org.example.unknown": "  opaque value: 東京  ",
+        "org.example.empty": "",
+    }
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    assert fragment.clustering_id is None
+    assert fragment.metadata == {}
+    stamped = dataclasses.replace(fragment, metadata=metadata)
+
+    dataset = lance.LanceDataset.commit(
+        dataset, lance.LanceOperation.Append([stamped]), read_version=dataset.version
+    )
+    committed = [f.metadata for f in dataset.get_fragments()]
+    assert committed[0].metadata == {}
+    assert committed[1].metadata == metadata
+    assert committed[1].clustering_id is None
+
+    # Operations on the same fragment keep the map.
+    dataset.delete("a = 3")
+    kept = dataset.get_fragments()[1].metadata
+    assert kept.metadata == metadata
+    assert kept.deletion_file is not None
+
+
+def test_nonzero_clustering_reference_reaches_rust_validation(tmp_path: Path):
+    """A nonzero clustering_id crosses Python -> Rust on fragments and indices.
+
+    No definition can exist in a table created from Python yet, so the manifest
+    validation error is the evidence that the reference arrived in Rust.
+    """
+    import dataclasses
+
+    from lance.dataset import Index
+
+    table = pa.Table.from_pydict({"a": range(10)})
+    base_dir = tmp_path / "clustering_reference"
+    dataset = lance.write_dataset(table, base_dir)
+
+    fragment = dataclasses.replace(
+        lance.fragment.LanceFragment.create(base_dir, table), clustering_id=7
+    )
+    with pytest.raises(OSError, match="references clustering definition 7"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.Append([fragment]),
+            read_version=dataset.version,
+        )
+
+    index = Index(
+        uuid="00000000-0000-0000-0000-000000000001",
+        name="a_idx",
+        fields=[0],
+        dataset_version=dataset.version,
+        fragment_ids=set(f.fragment_id for f in dataset.get_fragments()),
+        index_version=0,
+        clustering_id=9,
+    )
+    with pytest.raises(OSError, match="references clustering definition 9"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.CreateIndex(new_indices=[index], removed_indices=[]),
+            read_version=dataset.version,
+        )
 
 
 def test_commit_timeout(tmp_path: Path):
@@ -5432,6 +5836,46 @@ def test_default_scan_options(tmp_path: Path):
     assert dataset.schema.names == ["a", "b", "_rowaddr"]
 
 
+def test_inline_deletions(tmp_path: Path):
+    import json
+
+    ds = lance.write_dataset(pa.table({"a": range(40)}), tmp_path, max_rows_per_file=10)
+    ds.delete("a in (3, 17, 18, 39)")
+    deletion_files = [f.metadata.deletion_file for f in ds.get_fragments()]
+    assert sum(f is not None for f in deletion_files) == 3
+    assert all(f is None or f.inline is None for f in deletion_files)
+
+    with pytest.raises(OSError, match="lance.deletions.inline_max_bytes"):
+        ds.optimize.inline_deletions()
+    ds.update_config({"lance.deletions.inline_max_bytes": "4096"})
+    assert ds.optimize.inline_deletions() == 3
+    assert ds.optimize.inline_deletions() == 0
+
+    reopened = lance.dataset(tmp_path)
+    assert reopened.count_rows() == 36
+    assert sorted(reopened.to_table()["a"].to_pylist()) == [
+        v for v in range(40) if v not in (3, 17, 18, 39)
+    ]
+    for fragment in reopened.get_fragments():
+        deletion_file = fragment.metadata.deletion_file
+        if deletion_file is not None:
+            assert deletion_file.inline is not None
+            assert deletion_file.file_type == "bitmap"
+            assert deletion_file.path(fragment.fragment_id) is None
+            assert fragment.deletion_file() is None
+            assert "_deletions/" not in repr(fragment)
+            # Round-tripping the metadata through JSON keeps the vector.
+            round_trip = lance.fragment.FragmentMetadata.from_json(
+                json.dumps(fragment.metadata.to_json())
+            )
+            assert round_trip.deletion_file.inline == deletion_file.inline
+
+    # Later deletes stay inline as well.
+    reopened.delete("a = 0")
+    assert reopened.get_fragments()[0].metadata.deletion_file.inline is not None
+    assert reopened.count_rows() == 35
+
+
 def test_scan_with_row_ids(tmp_path: Path):
     """Test expose physical row ids in the scanner."""
     data = pa.table({"a": range(1000)})
@@ -5642,13 +6086,44 @@ def test_count_index_rows(tmp_path: Path):
     assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
 
 
-def test_dataset_progress(tmp_path: Path):
-    data = pa.table({"a": range(10)})
+@pytest.mark.parametrize(
+    "num_rows",
+    [
+        pytest.param(10, id="exact_multiple"),
+        pytest.param(7, id="last_file_under_limit"),
+    ],
+)
+def test_dataset_progress(tmp_path: Path, num_rows: int):
+    data = pa.table({"a": range(num_rows)})
     progress = ProgressForTest()
     ds = lance.write_dataset(data, tmp_path, max_rows_per_file=5, progress=progress)
     assert len(ds.get_fragments()) == 2
     assert progress.begin_called == 2
     assert progress.complete_called == 2
+
+
+@pytest.mark.parametrize("failing_hook", ["begin", "complete"])
+def test_dataset_progress_failing_hook(tmp_path: Path, failing_hook: str):
+    class FailsOnSecondFile(ProgressForTest):
+        def begin(self, fragment, **kwargs):
+            super().begin(fragment, **kwargs)
+            if failing_hook == "begin" and self.begin_called == 2:
+                raise RuntimeError("injected failure")
+
+        def complete(self, fragment):
+            super().complete(fragment)
+            if failing_hook == "complete" and self.complete_called == 2:
+                raise RuntimeError("injected failure")
+
+    with pytest.raises(OSError, match=f"Failed to call {failing_hook}"):
+        lance.write_dataset(
+            pa.table({"a": range(7)}),
+            tmp_path,
+            max_rows_per_file=5,
+            progress=FailsOnSecondFile(),
+        )
+
+    assert list(tmp_path.glob("data/*")) == []
 
 
 def test_tensor_type(tmp_path: Path):
@@ -7012,6 +7487,63 @@ def test_dataset_sql(tmp_path: Path):
     assert pa.Table.from_batches(complex_result) == expected_complex
 
 
+@pytest.mark.parametrize("as_reader", [False, True], ids=["table", "reader"])
+def test_dataset_sql_register_arrow(tmp_path: Path, as_reader: bool):
+    table = pa.table({"id": [1, 2, 3, 4, 5], "value": ["a", "b", "c", "d", "e"]})
+    ds = lance.write_dataset(table, tmp_path / "test")
+
+    # A subset of ids to join against, including one id (99) not in the dataset.
+    # Exercise both accepted input forms: a pyarrow Table and a RecordBatchReader.
+    ids = pa.table({"id": [4, 2, 99]})
+    data = ids.to_reader() if as_reader else ids
+
+    result = (
+        ds.sql("SELECT id FROM t WHERE id IN (SELECT id FROM ids) ORDER BY id")
+        .table_name("t")
+        .register_arrow("ids", data)
+        .build()
+        .to_batch_records()
+    )
+
+    # Only the intersection, in ascending order.
+    expected = pa.table({"id": [2, 4]})
+    assert pa.Table.from_batches(result) == expected
+
+
+@pytest.mark.parametrize("name", ["t", "T", '"t"'], ids=["exact", "case", "quoted"])
+def test_dataset_sql_register_arrow_table_name_collision(tmp_path: Path, name: str):
+    table = pa.table({"id": [1, 2, 3]})
+    ds = lance.write_dataset(table, tmp_path / "test")
+
+    # A registered name that resolves to the query's own table name would hide the
+    # dataset. The check lives in the Rust builder, which runs when the query is
+    # executed rather than when build() returns, so build() itself succeeds.
+    builder = (
+        ds.sql("SELECT id FROM t")
+        .table_name("t")
+        .register_arrow(name, pa.table({"id": [4]}))
+    )
+    query = builder.build()
+
+    # to_batch_records surfaces Lance errors as ValueError, to_stream_reader as OSError.
+    with pytest.raises(ValueError, match="resolves to"):
+        query.to_batch_records()
+    with pytest.raises(OSError, match="resolves to"):
+        builder.build().to_stream_reader()
+
+
+def test_dataset_sql_register_arrow_empty(tmp_path: Path):
+    table = pa.table({"id": [1, 2, 3]})
+    ds = lance.write_dataset(table, tmp_path / "test")
+
+    # An empty relation has no batches to derive a schema from, so registration
+    # raises (translated to ValueError by the PyO3 binding).
+    schema = pa.schema([("id", pa.int64())])
+    empty = pa.RecordBatchReader.from_batches(schema, [])
+    with pytest.raises(ValueError):
+        ds.sql("SELECT id FROM ids").table_name("t").register_arrow("ids", empty)
+
+
 def test_dataset_sql_batch_size_rows(tmp_path: Path):
     table = pa.table({"id": range(50)})
     ds = lance.write_dataset(table, tmp_path / "test_sql_batch_size_rows")
@@ -7123,21 +7655,11 @@ def test_transaction_audit_fields(tmp_path):
         pa.table({"id": [3, 4]}), tmp_path / "base", mode="append"
     )
 
-    empty = lance.LanceOperation.UpdateMemWalState()
-    tagged = lance.Transaction(
-        read_version=dataset.version, operation=empty, tag="audit-window"
-    )
-    dataset = lance.LanceDataset.commit(dataset, tagged)
-    read_back = dataset.read_transaction(dataset.version)
-    assert read_back.tag == "audit-window"
-    assert isinstance(read_back.operation, lance.LanceOperation.UpdateMemWalState)
-    assert list(read_back.operation.compacted_sstables) == []
-
     shard_id = str(uuid.uuid4())
     recorded = lance.LanceOperation.UpdateMemWalState(
         compacted_sstables=[CompactedSsTable(shard_id, 3)]
     )
-    with pytest.raises(OSError, match="__lance_mem_wal"):
+    with pytest.raises(OSError, match="Stale MemWAL"):
         lance.LanceDataset.commit(
             dataset,
             lance.Transaction(read_version=dataset.version, operation=recorded),
@@ -7146,11 +7668,24 @@ def test_transaction_audit_fields(tmp_path):
     update = lance.LanceOperation.Update(
         compacted_sstables=[CompactedSsTable(shard_id, 1)]
     )
-    with pytest.raises(OSError, match="__lance_mem_wal"):
+    with pytest.raises(OSError, match="mem_wal_dir_id"):
         lance.LanceDataset.commit(
             dataset,
             lance.Transaction(read_version=dataset.version, operation=update),
         )
+
+    dataset.initialize_mem_wal(unsharded=True)
+    dir_id = dataset.mem_wal_index_details()["dir_id"]
+    empty = lance.LanceOperation.UpdateMemWalState(dir_id=dir_id)
+    tagged = lance.Transaction(
+        read_version=dataset.version, operation=empty, tag="audit-window"
+    )
+    dataset = lance.LanceDataset.commit(dataset, tagged)
+    read_back = dataset.read_transaction(dataset.version)
+    assert read_back.tag == "audit-window"
+    assert isinstance(read_back.operation, lance.LanceOperation.UpdateMemWalState)
+    assert list(read_back.operation.compacted_sstables) == []
+    assert read_back.operation.dir_id == dir_id
 
     dataset.optimize.compact_files()
     rewrite = dataset.read_transaction(dataset.version)

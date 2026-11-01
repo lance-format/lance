@@ -14,8 +14,8 @@ table = pa.Table.from_pylist([{"name": "Alice", "age": 20},
 ds = lance.write_dataset(table, "./alice_and_bob.lance")
 ```
 
-If the dataset is too large to fully load into memory, you can stream data using `lance.write_dataset`
-also supports `Iterator` of `pyarrow.RecordBatch` es.
+If the dataset is too large to fully load into memory, `lance.write_dataset`
+also supports streaming an `Iterator` of `pyarrow.RecordBatch`es.
 You will need to provide a `pyarrow.Schema` for the dataset in this case.
 
 ```python
@@ -39,66 +39,6 @@ print(ds.count_rows())  # Output: 2
 
 `lance.write_dataset` supports writing `pyarrow.Table`, `pandas.DataFrame`,
 `pyarrow.dataset.Dataset`, and `Iterator[pyarrow.RecordBatch]`.
-
-## Choosing a data file version
-
-`data_storage_version` selects the format of newly written data files. For an
-existing V2 dataset, an operation can select `"2.0"`, `"2.1"`, `"2.2"`, or `"2.3"`
-without rewriting the other files. The dataset's `data_storage_version` property
-is the default for writes that omit a target, not a summary of its existing
-files. Create and overwrite establish this default; append, update, merge-insert,
-and compaction do not change it. V1 and V2 cannot be mixed.
-
-```python
-import lance
-import pyarrow as pa
-
-data = pa.table({"id": [1, 2], "value": [10, 20]})
-ds = lance.write_dataset(data, "./versions.lance", data_storage_version="2.1")
-ds.update({"value": "value + 1"}, data_storage_version="2.2")
-assert ds.data_storage_version == "2.1"
-
-ds.merge_insert("id").when_not_matched_insert_all().data_storage_version("2.2").execute(
-    pa.table({"id": [3], "value": [30]})
-)
-ds.optimize.compact_files(data_storage_version="2.2")
-```
-
-The `"stable"` and `"next"` selectors resolve according to the engine release.
-Use exact versions when the output identity must be independent of that release.
-V2.3 is currently unstable: files written by one unstable revision may not be
-readable by a later revision. Use it only for experimentation.
-Compaction plans fix the target before distributing tasks, including when the
-target comes from the dataset default. The target survives Python pickle and
-Java serialization; workers do not reinterpret it using their own release defaults.
-
-Java update, merge-insert, and compaction options use
-`withDataStorageVersion(DataStorageVersion.V2_2)`. The shared `DataStorageVersion`
-enum also provides `STABLE` and `NEXT` selectors.
-
-Compaction can convert selected fragments to another supported V2 version.
-Binary copy requires every selected file to match the output version, as well
-as the usual eligibility checks. In particular, overlays need reencoding to
-preserve updated values. `try_binary_copy` falls back to reencoding when inputs
-are ineligible; `force_binary_copy` rejects them. A version mismatch error includes
-the target version, actual version, and file path. A persistent compaction target
-can be set through `lance.compaction.data_storage_version` in the table config;
-an explicit operation target takes precedence.
-
-### Upgrading clients before mixed-version writes
-
-Before writing files that differ from the dataset default, upgrade every reader
-and writer to a mixed-version-aware release. Drain, restart, or fence writers
-that opened the dataset using an older release. The commit automatically sets
-the paired mixed-version reader/writer feature flags when needed; there is no
-separate activation API. These flags remain set even if compaction later makes
-the files homogeneous again.
-
-Older clients that do not recognize the flags reject the resulting snapshots.
-The flags cannot retroactively fence an older writer that already read a prior
-manifest. Historical homogeneous datasets remain readable by clients that
-support their file versions; see [table versioning](../format/table/versioning.md)
-for the feature flag contract.
 
 ## Adding Rows
 
@@ -347,8 +287,9 @@ ds = lance.dataset("./imagenet.lance")
 
 !!! note
 
-    Lance supports local file system, AWS `s3` and Google Cloud Storage(`gs`) as storage backends
-    at the moment. Read more in [Object Store Configuration](object_store.md).
+    Lance supports local file systems as well as cloud object stores including AWS S3 (`s3://`),
+    Google Cloud Storage (`gs://`), Azure Blob Storage (`az://`), and S3-compatible stores.
+    Read more in [Object Store Configuration](object_store.md).
 
 The most straightforward approach for reading a Lance dataset is to utilize the `lance.LanceDataset.to_table`
 method in order to load the entire dataset into memory.
@@ -547,7 +488,7 @@ dataset = lance.dataset("./my_dataset.lance")
 dataset.cleanup_old_versions()
 ```
 
-By default, versions older than 7 days are removed. You can override this with
+By default, versions older than two weeks are removed. You can override this with
 the `older_than` parameter (a `timedelta`):
 
 ```python
@@ -555,6 +496,93 @@ from datetime import timedelta
 
 dataset.cleanup_old_versions(older_than=timedelta(days=1))
 ```
+
+For multiple retention windows, pass a `CleanupPolicy` containing ordered `CleanupRule` entries. This example keeps
+full recent history, hourly samples between two and seven days, daily samples
+between seven and thirty days, and expires everything older than thirty days:
+
+```python
+from lance import CleanupPolicy, KeepOne, RemoveAll
+
+dataset.cleanup_old_versions(
+    policy=CleanupPolicy(rules=[
+        KeepOne(per_interval=timedelta(hours=1), older_than=timedelta(days=2)),
+        KeepOne(per_interval=timedelta(days=1), older_than=timedelta(days=7)),
+        RemoveAll(older_than=timedelta(days=30)),
+    ])
+)
+```
+
+`KeepOne` and `RemoveAll` implement `CleanupRule`. A `CleanupPolicy` contains
+the ordered rules; `CleanupPolicy()` defaults to a single
+`RemoveAll(older_than=timedelta(days=14))`, matching existing cleanup behavior.
+Ages must strictly increase. Each version uses the oldest matching `KeepOne`
+rule, with separate buckets for each band. `RemoveAll` is optional and must be
+last; without it, sampled history has no expiration limit. Empty policies,
+duplicate thresholds and unsupported rules are rejected. Comparisons are strictly
+older-than: a version exactly at a threshold stays in the younger band.
+
+`KeepOne.older_than` must be at least two days. Sampling ages are relative to the
+hinted commit timestamp, falling back to this dataset's commit when no hint
+exists. The hinted version and every later version are protected from thinning,
+even with backwards clocks or `LANCE_USE_VERSION_HINT=0` in the cleaner.
+`RemoveAll.older_than` is a wall-clock expiration age and expires sampled versions
+too. Each sampling interval aligns to the UTC Unix epoch and selects the newest
+eligible commit timestamp, breaking ties by version number.
+
+Tags, current versions and branch dependencies remain protected. `versions` and
+`retain_versions` limit which versions either operation can remove. Cleanup also
+preserves the data, indices and blobs needed by retained snapshots. The same
+`policy` is accepted by `explain_cleanup_old_versions` for a read-only preview.
+
+Retention rules work with both values of `delete_unverified`. By default, cleanup
+preserves recent files that no manifest references. With `delete_unverified=True`,
+it can remove those files immediately; files needed by retained snapshots remain
+protected in either mode.
+
+The existing top-level `older_than` keeps its wall-clock expiration meaning.
+Existing cleanup calls and defaults continue to work. The single-window shorthand
+`older_than=timedelta(days=7), keep_one=KeepOne(timedelta(days=1), timedelta(days=2))`
+is also supported. Do not combine `policy` with `older_than` or `keep_one`.
+
+Rust uses `cleanup::retention::CleanupPolicy::new(Vec<CleanupRule>)` through
+`.with_retention_policy(...)`; the legacy `cleanup::CleanupPolicy` remains
+available for version and file-cleanup filters. Java accepts
+`dataset.cleanup(new CleanupPolicy(rules))`, using
+`CleanupRule.keepOne(perInterval, olderThan)` and
+`CleanupRule.removeAll(olderThan)`. Existing native policy filters still apply.
+
+For automatic cleanup, use the same rules with duration strings:
+
+```python
+import json
+
+dataset.update_config({
+    "lance.auto_cleanup.interval": None,
+    "lance.auto_cleanup.older_than": None,
+    "lance.auto_cleanup.policy_interval": "100",
+    "lance.auto_cleanup.policy": json.dumps({"rules": [
+        {"type": "keep_one", "per_interval": "1h", "older_than": "2days"},
+        {"type": "keep_one", "per_interval": "1day", "older_than": "7days"},
+        {"type": "remove_all", "older_than": "30days"},
+    ]}),
+})
+```
+
+The policy interval is a version count. Older clients ignore this activation key
+and leave automatic retention cleanup disabled. The legacy interval must be
+removed atomically when activating either policy form; unsafe combinations are
+rejected before publication. Do not combine this policy with
+`lance.auto_cleanup.older_than` or the
+single-window `lance.auto_cleanup.keep_one.*` settings.
+
+Thinning also supports local filesystems and S3 Express. The hint-relative
+two-day minimum provides a retention buffer for delayed hint writes; it does not
+make hint updates monotonic. On stores using hints, unreadable or malformed hints
+fail cleanup instead of using the wall clock. If explicit expiration has removed
+an older hinted manifest, cleanup falls back to the dataset snapshot, as latest
+version discovery does when a hint target is missing. A missing current manifest
+still fails cleanup.
 
 !!! note
 
@@ -676,3 +704,63 @@ It is common to run cleanup as a periodic background task on a dedicated server
 (for example, via a cron job or scheduled workflow). This keeps cleanup off the
 write path entirely, avoiding any impact to write latency, but requires setting
 up and maintaining additional infrastructure.
+
+## Choosing a data file version
+
+`data_storage_version` selects the format of newly written data files. For an
+existing V2 dataset, an operation can select `"2.0"`, `"2.1"`, `"2.2"`, or `"2.3"`
+without rewriting the other files. The dataset's `data_storage_version` property
+is the default for writes that omit a target, not a summary of its existing
+files. Create and overwrite establish this default; append, update, merge-insert,
+and compaction do not change it. V1 and V2 cannot be mixed.
+
+```python
+import lance
+import pyarrow as pa
+
+data = pa.table({"id": [1, 2], "value": [10, 20]})
+ds = lance.write_dataset(data, "./versions.lance", data_storage_version="2.1")
+ds.update({"value": "value + 1"}, data_storage_version="2.2")
+assert ds.data_storage_version == "2.1"
+
+ds.merge_insert("id").when_not_matched_insert_all().data_storage_version("2.2").execute(
+    pa.table({"id": [3], "value": [30]})
+)
+ds.optimize.compact_files(data_storage_version="2.2")
+```
+
+The `"stable"` and `"next"` selectors resolve according to the engine release.
+Use exact versions when the output identity must be independent of that release.
+V2.3 is currently unstable: files written by one unstable revision may not be
+readable by a later revision. Use it only for experimentation.
+Compaction plans fix the target before distributing tasks, including when the
+target comes from the dataset default. The target survives Python pickle and
+Java serialization; workers do not reinterpret it using their own release defaults.
+
+Java update, merge-insert, and compaction options use
+`withDataStorageVersion(DataStorageVersion.V2_2)`. The shared `DataStorageVersion`
+enum also provides `STABLE` and `NEXT` selectors.
+
+Compaction can convert selected fragments to another supported V2 version.
+Binary copy requires every selected file to match the output version, as well
+as the usual eligibility checks. In particular, overlays need reencoding to
+preserve updated values. `try_binary_copy` falls back to reencoding when inputs
+are ineligible; `force_binary_copy` rejects them. A version mismatch error includes
+the target version, actual version, and file path. A persistent compaction target
+can be set through `lance.compaction.data_storage_version` in the table config;
+an explicit operation target takes precedence.
+
+### Upgrading clients before mixed-version writes
+
+Before writing files that differ from the dataset default, upgrade every reader
+and writer to a mixed-version-aware release. Drain, restart, or fence writers
+that opened the dataset using an older release. The commit automatically sets
+the paired mixed-version reader/writer feature flags when needed; there is no
+separate activation API. These flags remain set even if compaction later makes
+the files homogeneous again.
+
+Older clients that do not recognize the flags reject the resulting snapshots.
+The flags cannot retroactively fence an older writer that already read a prior
+manifest. Historical homogeneous datasets remain readable by clients that
+support their file versions; see [table versioning](../format/table/versioning.md)
+for the feature flag contract.

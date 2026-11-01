@@ -25,6 +25,23 @@ from .compat_decorator import (
 from .util import safe_data_storage_version
 
 
+def _assert_row_address_writes_fenced(dataset, data, compat_version):
+    version = dataset.version
+    original = dataset.to_table()
+    with pytest.raises(OSError, match="cannot be written by this version"):
+        dataset.insert(data)
+    # The affected 12.x/13.x updates retain unsupported index metadata and can
+    # corrupt its coverage (#10351). The legacy 0.39 update path drops it instead
+    # and predates writer capability checks on that path.
+    if Version(compat_version) >= Version("12.0.0"):
+        with pytest.raises(OSError, match="cannot be written by this version"):
+            dataset.update({"idx": "idx + 1000"}, where="idx < 20")
+
+    reopened = lance.dataset(dataset.uri)
+    assert reopened.version == version
+    assert reopened.to_table().equals(original)
+
+
 @compat_test(min_version="0.30.0")
 class BTreeIndex(UpgradeDowngradeTest):
     """Test BTREE scalar index compatibility (introduced in 0.20.0).
@@ -120,7 +137,8 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
       keeps both old and new rows queryable.
     - Readers released before 14.0.0b16 must ignore the updated index and
       answer correctly via a full scan. Readers from 14.0.0b16 onward must
-      use it. Both must still be able to write to the dataset afterwards.
+      use it. The writer capability must reject inserts and unsafe updates
+      from released writers without changing the dataset.
     """
 
     def __init__(self, path: Path):
@@ -173,9 +191,7 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
         self._assert_queryable(expect_index_used=self._supports_row_address_index())
 
     def check_write(self):
-        """Insert a row and update the index, then verify old and new rows
-        both stay correct -- whether or not this build can even see the
-        index."""
+        """Fence old writers; verify current writes and index maintenance."""
         ds = lance.dataset(self.path)
         data = pa.table(
             {
@@ -183,30 +199,24 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
                 "btree": pa.array([1000]),
             }
         )
+        if self._running_in_old_venv:
+            _assert_row_address_writes_fenced(ds, data, self.compat_version)
+            return
         ds.insert(data)
-        # For a build that cannot see this index at all, there is nothing
-        # registered to update, so this is a safe no-op rather than an
-        # error. For the current build updating a legacy row-id-domain
-        # segment, this must rebuild (not merge) the index -- see the class
-        # docstring.
+        # Rebuild legacy row-id-domain segments rather than merging domains.
         ds.optimize.optimize_indices()
         ds.optimize.compact_files()
 
         ds = lance.dataset(self.path)
         table = ds.to_table(filter="btree == 7")
         assert table.num_rows == 1
-        # `check_write` runs more than once across the upgrade/downgrade
-        # round trip, each time inserting another `btree == 1000` row, so
-        # this can't assert an exact count the way the `== 7` row (written
-        # once, in `create`) can.
         table = ds.to_table(filter="btree == 1000")
-        assert table.num_rows >= 1
+        assert table.num_rows == 1
 
         # Preserve the post-compaction result checks above, then restore
         # physical-address coverage before testing the next reader's format
-        # support. Older readers cannot rebuild this index format.
-        if self._supports_row_address_index():
-            ds.optimize.optimize_indices()
+        # support.
+        ds.optimize.optimize_indices()
 
 
 @pytest.fixture
@@ -263,13 +273,9 @@ def test_btree_row_address_reader_capability(
         case.check_read()
 
 
-@pytest.mark.parametrize("running_in_old_venv", [False, True])
-def test_btree_row_address_maintenance_restores_coverage(
-    btree_row_address_compat_case, running_in_old_venv
-):
+def test_btree_row_address_maintenance_restores_coverage(btree_row_address_compat_case):
     case = btree_row_address_compat_case
     case.compat_version = "14.0.0b16"
-    case._running_in_old_venv = running_in_old_venv
     case.check_write()
     case.check_read()
     assert lance.dataset(case.path).count_rows("btree == 1000") == 1
@@ -440,15 +446,20 @@ class BitmapRowAddressDomainIndex(UpgradeDowngradeTest):
       correctly by the current build.
     - Updating it (inserting rows, then optimizing) with the current build
       keeps both old and new rows queryable.
-    - Once the current build has touched the index this way, an older build
-      must no longer use it -- its format version has moved past what that
-      build supports -- but it must still answer every query correctly via
-      a full scan, and must not error out when writing to the dataset
-      afterwards.
+    - Readers released before 15.0.0b2 must ignore the updated index and
+      answer correctly via a full scan. Readers from 15.0.0b2 onward must
+      use it. The writer capability must reject inserts and unsafe updates
+      from released writers without changing the dataset.
     """
 
     def __init__(self, path: Path):
         self.path = path
+
+    def _supports_row_address_index(self) -> bool:
+        # 15.0.0b2 is the first release containing the row-address format.
+        return not self._running_in_old_venv or Version(self.compat_version) >= Version(
+            "15.0.0b2"
+        )
 
     def create(self):
         """Create a stable-row-id dataset with a BITMAP index."""
@@ -485,15 +496,11 @@ class BitmapRowAddressDomainIndex(UpgradeDowngradeTest):
             )
 
     def check_read(self):
-        """An old-format index must be used by the current build; a
-        too-new one must be safely ignored (but answers must stay correct)
-        by an older build."""
-        self._assert_queryable(expect_index_used=not self._running_in_old_venv)
+        """Use supported index formats and safely ignore too-new ones."""
+        self._assert_queryable(expect_index_used=self._supports_row_address_index())
 
     def check_write(self):
-        """Insert a row and update the index, then verify old and new rows
-        both stay correct -- whether or not this build can even see the
-        index."""
+        """Fence old writers; verify current writes and index maintenance."""
         ds = lance.dataset(self.path)
         data = pa.table(
             {
@@ -501,24 +508,19 @@ class BitmapRowAddressDomainIndex(UpgradeDowngradeTest):
                 "bitmap": pa.array([1000]),
             }
         )
+        if self._running_in_old_venv:
+            _assert_row_address_writes_fenced(ds, data, self.compat_version)
+            return
         ds.insert(data)
-        # For a build that cannot see this index at all, there is nothing
-        # registered to update, so this is a safe no-op rather than an
-        # error. For the current build updating a legacy row-id-domain
-        # segment, this must rebuild (not merge) the index -- see the class
-        # docstring.
+        # Rebuild legacy row-id-domain segments rather than merging domains.
         ds.optimize.optimize_indices()
         ds.optimize.compact_files()
 
         ds = lance.dataset(self.path)
         table = ds.to_table(filter="bitmap == 7")
         assert table.num_rows == 1
-        # `check_write` runs more than once across the upgrade/downgrade
-        # round trip, each time inserting another `bitmap == 1000` row, so
-        # this can't assert an exact count the way the `== 7` row (written
-        # once, in `create`) can.
         table = ds.to_table(filter="bitmap == 1000")
-        assert table.num_rows >= 1
+        assert table.num_rows == 1
 
 
 @compat_test(min_version="0.22.0")
@@ -629,15 +631,20 @@ class LabelListRowAddressDomainIndex(UpgradeDowngradeTest):
       correctly by the current build.
     - Updating it (inserting rows, then optimizing) with the current build
       keeps both old and new rows queryable.
-    - Once the current build has touched the index this way, an older build
-      must no longer use it -- its format version has moved past what that
-      build supports -- but it must still answer every query correctly via
-      a full scan, and must not error out when writing to the dataset
-      afterwards.
+    - Readers released before 15.0.0b2 must ignore the updated index and
+      answer correctly via a full scan. Readers from 15.0.0b2 onward must
+      use it. The writer capability must reject inserts and unsafe updates
+      from released writers without changing the dataset.
     """
 
     def __init__(self, path: Path):
         self.path = path
+
+    def _supports_row_address_index(self) -> bool:
+        # 15.0.0b2 is the first release containing the row-address format.
+        return not self._running_in_old_venv or Version(self.compat_version) >= Version(
+            "15.0.0b2"
+        )
 
     def create(self):
         """Create a stable-row-id dataset with a LABEL_LIST index."""
@@ -676,15 +683,11 @@ class LabelListRowAddressDomainIndex(UpgradeDowngradeTest):
             )
 
     def check_read(self):
-        """An old-format index must be used by the current build; a
-        too-new one must be safely ignored (but answers must stay correct)
-        by an older build."""
-        self._assert_queryable(expect_index_used=not self._running_in_old_venv)
+        """Use supported index formats and safely ignore too-new ones."""
+        self._assert_queryable(expect_index_used=self._supports_row_address_index())
 
     def check_write(self):
-        """Insert a row and update the index, then verify old and new rows
-        both stay correct -- whether or not this build can even see the
-        index."""
+        """Fence old writers; verify current writes and index maintenance."""
         ds = lance.dataset(self.path)
         data = pa.table(
             {
@@ -692,24 +695,19 @@ class LabelListRowAddressDomainIndex(UpgradeDowngradeTest):
                 "label_list": pa.array([["label1000"]]),
             }
         )
+        if self._running_in_old_venv:
+            _assert_row_address_writes_fenced(ds, data, self.compat_version)
+            return
         ds.insert(data)
-        # For a build that cannot see this index at all, there is nothing
-        # registered to update, so this is a safe no-op rather than an
-        # error. For the current build updating a legacy row-id-domain
-        # segment, this must rebuild (not merge) the index -- see the class
-        # docstring.
+        # Rebuild legacy row-id-domain segments rather than merging domains.
         ds.optimize.optimize_indices()
         ds.optimize.compact_files()
 
         ds = lance.dataset(self.path)
         table = ds.to_table(filter="array_has_any(label_list, ['label7'])")
         assert table.num_rows == 1
-        # `check_write` runs more than once across the upgrade/downgrade
-        # round trip, each time inserting another row, so this can't assert
-        # an exact count the way the `label7` row (written once, in
-        # `create`) can.
         table = ds.to_table(filter="array_has_any(label_list, ['label1000'])")
-        assert table.num_rows >= 1
+        assert table.num_rows == 1
 
 
 @compat_test(min_version="0.22.0")

@@ -226,6 +226,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 inserted_rows,
                 updated_fragment_offsets,
                 updated_fragment_offset_bitmaps,
+                mem_wal_dir_id,
             })) => Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: updated_fragments
@@ -241,6 +242,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .into_iter()
                     .map(|m| CompactedSsTable::try_from(m).unwrap())
                     .collect(),
+                mem_wal_dir_id,
                 fields_for_preserving_frag_bitmap,
                 update_mode: match update_mode {
                     0 => Some(UpdateMode::RewriteRows),
@@ -384,12 +386,16 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .collect::<Result<Vec<_>>>()?,
             },
             Some(pb::transaction::Operation::UpdateMemWalState(
-                pb::transaction::UpdateMemWalState { compacted_sstables },
+                pb::transaction::UpdateMemWalState {
+                    compacted_sstables,
+                    dir_id,
+                },
             )) => Operation::UpdateMemWalState {
                 compacted_sstables: compacted_sstables
                     .into_iter()
                     .map(CompactedSsTable::try_from)
                     .collect::<Result<_>>()?,
+                dir_id,
             },
             Some(pb::transaction::Operation::UpdateBases(pb::transaction::UpdateBases {
                 new_bases,
@@ -600,6 +606,7 @@ impl TryFrom<&Transaction> for pb::Transaction {
                 new_fragments,
                 fields_modified,
                 compacted_sstables,
+                mem_wal_dir_id,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 inserted_rows_filter,
@@ -616,6 +623,7 @@ impl TryFrom<&Transaction> for pb::Transaction {
                     .iter()
                     .map(pb::CompactedSsTable::from)
                     .collect(),
+                mem_wal_dir_id: mem_wal_dir_id.clone(),
                 fields_for_preserving_frag_bitmap: fields_for_preserving_frag_bitmap.clone(),
                 update_mode: update_mode
                     .as_ref()
@@ -694,12 +702,16 @@ impl TryFrom<&Transaction> for pb::Transaction {
                         .collect(),
                 })
             }
-            Operation::UpdateMemWalState { compacted_sstables } => {
+            Operation::UpdateMemWalState {
+                compacted_sstables,
+                dir_id,
+            } => {
                 pb::transaction::Operation::UpdateMemWalState(pb::transaction::UpdateMemWalState {
                     compacted_sstables: compacted_sstables
                         .iter()
                         .map(pb::CompactedSsTable::from)
                         .collect::<Vec<_>>(),
+                    dir_id: dir_id.clone(),
                 })
             }
             Operation::UpdateBases { new_bases } => {
