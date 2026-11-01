@@ -59,6 +59,14 @@ pub enum CacheTier {
     Absent,
 }
 
+/// A cache read that can finish without allocating or polling a future.
+pub enum ImmediateCacheRead {
+    /// The complete result of a read, including a definitive cache miss.
+    Ready(Option<CacheEntry>),
+    /// The caller must use [`CacheBackend::get`] to finish the read.
+    Deferred,
+}
+
 /// Low-level pluggable cache backend.
 ///
 /// Implementations store entries keyed by [`InternalCacheKey`] and return
@@ -67,6 +75,30 @@ pub enum CacheTier {
 /// backend authors only need to implement storage and eviction.
 #[async_trait]
 pub trait CacheBackend: Send + Sync + std::fmt::Debug {
+    /// Complete a read synchronously when the backend supports it.
+    ///
+    /// A ready result must have the same access/priority accounting as
+    /// [`get`](Self::get). Return `Deferred` if reading a lower tier or any
+    /// asynchronous work may be necessary; `Ready(None)` is a final miss.
+    /// The default preserves the asynchronous path for existing backends.
+    ///
+    /// ```
+    /// # use lance_core::cache::{CacheBackend, CacheEntry, ImmediateCacheRead, InternalCacheKey};
+    /// # async fn read(backend: &dyn CacheBackend, key: &InternalCacheKey) -> Option<CacheEntry> {
+    /// match backend.get_immediate(key, None) {
+    ///     ImmediateCacheRead::Ready(value) => value,
+    ///     ImmediateCacheRead::Deferred => backend.get(key, None).await,
+    /// }
+    /// # }
+    /// ```
+    fn get_immediate(
+        &self,
+        _key: &InternalCacheKey,
+        _codec: Option<CacheCodec>,
+    ) -> ImmediateCacheRead {
+        ImmediateCacheRead::Deferred
+    }
+
     /// Look up RAM only, without reading or promoting a persistent entry.
     /// Backends without a resident lookup return a miss safely.
     async fn get_resident(&self, _key: &InternalCacheKey) -> Option<CacheEntry> {
