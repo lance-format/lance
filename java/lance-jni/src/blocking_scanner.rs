@@ -498,6 +498,16 @@ pub(crate) fn build_scanner_with_options<'a>(
                 .map_err(|err| Error::input_error(err.to_string()))?;
         }
 
+        let lower_bound =
+            env.get_optional_from_method(&java_obj, "getLowerBound", |env, value| {
+                env.get_f32_from_method(&value, "floatValue")
+            })?;
+        let upper_bound =
+            env.get_optional_from_method(&java_obj, "getUpperBound", |env, value| {
+                env.get_f32_from_method(&value, "floatValue")
+            })?;
+        scanner.distance_range(lower_bound, upper_bound);
+
         let minimum_nprobes = env.get_int_as_usize_from_method(&java_obj, "getMinimumNprobes")?;
         scanner.minimum_nprobes(minimum_nprobes);
 
@@ -505,6 +515,11 @@ pub(crate) fn build_scanner_with_options<'a>(
         if let Some(maximum_nprobes) = maximum_nprobes {
             scanner.maximum_nprobes(maximum_nprobes);
         }
+
+        let search_effort = env
+            .call_method(&java_obj, "getSearchEffort", "()D", &[])?
+            .d()?;
+        scanner.search_effort(search_effort)?;
 
         if let Some(ef) = env.get_optional_usize_from_method(&java_obj, "getEf")? {
             scanner.ef(ef);
@@ -514,6 +529,12 @@ pub(crate) fn build_scanner_with_options<'a>(
             env.get_optional_u32_from_method(&java_obj, "getRefineFactor")?
         {
             scanner.refine(refine_factor);
+        }
+
+        if let Some(factor) =
+            env.get_optional_u32_from_method(&java_obj, "getQuantizedRefineFactor")?
+        {
+            scanner.quantized_refine(factor);
         }
 
         if let Some(distance_type_str) =

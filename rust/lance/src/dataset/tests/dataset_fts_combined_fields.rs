@@ -242,6 +242,231 @@ fn assert_matches_brute_force(actual: &[(i32, f32)], expected: &[Option<f32>], c
     }
 }
 
+#[rstest]
+#[tokio::test]
+async fn test_fts_9058_global_corpus(
+    #[values(false, true)] stable_row_ids: bool,
+    #[values(false, true)] combined: bool,
+    #[values(false, true)] index_body: bool,
+    #[values("all", "prefilter", "indexed", "unindexed", "mixed", "empty")] scope: &str,
+    #[values(None, Some(1))] limit: Option<i64>,
+) {
+    let titles = [
+        "alpha",
+        "beta",
+        "alpha",
+        "alpha alpha",
+        "",
+        "",
+        "alpha",
+        "alpha",
+    ];
+    let bodies = ["", "", "alpha", "", "beta", "", "alpha gamma", "alpha"];
+    let batch = record_batch!(
+        ("id", Int32, (0..8).collect::<Vec<_>>()),
+        (
+            "title",
+            Utf8,
+            [
+                Some("alpha"),
+                Some("beta"),
+                Some("alpha"),
+                Some("alpha alpha"),
+                None,
+                Some(""),
+                Some("alpha"),
+                Some("alpha")
+            ]
+        ),
+        (
+            "body",
+            Utf8,
+            [
+                None,
+                None,
+                Some("alpha"),
+                Some(""),
+                Some("beta"),
+                None,
+                Some("alpha gamma"),
+                Some("alpha")
+            ]
+        )
+    )
+    .unwrap();
+    let uri = TempStrDir::default();
+    let mut dataset = write_fts_dataset(
+        &uri,
+        batch.slice(0, 2),
+        Some(WriteParams {
+            enable_stable_row_ids: stable_row_ids,
+            ..Default::default()
+        }),
+    )
+    .await;
+    create_inverted_indices(&mut dataset, &["title"], &combined_fields_test_params()).await;
+    dataset = append_fts_dataset(&uri, batch.slice(2, 6), Some(3)).await;
+    // Different per-column coverage must fold each residual row exactly once.
+    if index_body {
+        create_inverted_indices(&mut dataset, &["body"], &combined_fields_test_params()).await;
+    }
+    let query = if combined {
+        combined_query_with_boosts("alpha beta", Operator::Or, Some(vec![1.0, 2.0]))
+    } else {
+        MatchQuery::new("alpha beta".to_owned())
+            .with_column(Some("title".to_owned()))
+            .with_fuzziness(Some(0))
+            .into()
+    };
+    let columns = if combined {
+        vec![(1.0, titles.to_vec()), (2.0, bodies.to_vec())]
+    } else {
+        vec![(1.0, titles.to_vec())]
+    };
+    let mut expected = brute_force_bm25f(&columns, "alpha beta", false);
+    for (id, score) in expected.iter_mut().enumerate() {
+        let selected = match scope {
+            "empty" => false,
+            "prefilter" | "indexed" => id < 2,
+            "unindexed" => (2..5).contains(&id),
+            "mixed" => id < 5,
+            _ => true,
+        };
+        if !selected {
+            *score = None;
+        }
+    }
+    for optimized in [false, true] {
+        if optimized {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(query.clone()).limit(limit))
+            .unwrap();
+        if scope == "prefilter" || scope == "empty" {
+            scanner
+                .prefilter(true)
+                .filter(if scope == "empty" { "id < 0" } else { "id < 2" })
+                .unwrap();
+        } else if scope != "all" {
+            let fragments = dataset.get_fragments();
+            let selected = match scope {
+                "indexed" => vec![fragments[0].clone().into()],
+                "unindexed" => vec![fragments[1].clone().into()],
+                "mixed" => fragments[..2].iter().cloned().map(Into::into).collect(),
+                _ => unreachable!(),
+            };
+            scanner.with_fragments(selected);
+        }
+        let result = scanner.try_into_batch().await.unwrap();
+        let ids = result["id"].as_primitive::<Int32Type>();
+        let scores = result["_score"].as_primitive::<Float32Type>();
+        let actual: Vec<_> = ids
+            .values()
+            .iter()
+            .copied()
+            .zip(scores.values().iter().copied())
+            .collect();
+        let context = format!(
+            "combined={combined}, index_body={index_body}, scope={scope}, optimized={optimized}"
+        );
+        if scope == "empty" {
+            assert!(actual.is_empty(), "{context}: {actual:?}");
+        } else if let Some(limit) = limit {
+            assert_topk_matches_brute_force(&actual, &expected, limit as usize, &context);
+        } else {
+            assert_matches_brute_force(&actual, &expected, &context);
+        }
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_fts_9058_code_analyzer_corpus(
+    #[values(false, true)] stable_row_ids: bool,
+    #[values(false, true)] prefilter: bool,
+) {
+    let uri = TempStrDir::default();
+    let batch = combined_fields_batch(
+        (0..6).collect(),
+        vec![
+            "getUser",
+            "setUser name",
+            "user",
+            "user user",
+            "loadUser cache",
+            "other thing here",
+        ],
+        vec![""; 6],
+    );
+    let mut dataset = write_fts_dataset(
+        &uri,
+        batch.slice(0, 3),
+        Some(WriteParams {
+            enable_stable_row_ids: stable_row_ids,
+            ..Default::default()
+        }),
+    )
+    .await;
+    let params = InvertedIndexParams::default()
+        .analyzer("code")
+        .unwrap()
+        .split_identifiers(true);
+    create_inverted_indices(&mut dataset, &["title"], &params).await;
+    dataset = append_fts_dataset(&uri, batch.slice(3, 3), None).await;
+    let mut before: Option<Vec<(i32, f32)>> = None;
+    for optimized in [false, true] {
+        if optimized {
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(
+                MatchQuery::new("user".to_owned())
+                    .with_column(Some("title".to_owned()))
+                    .into(),
+            ))
+            .unwrap();
+        if prefilter {
+            scanner.prefilter(true).filter("id % 2 = 1").unwrap();
+        }
+        let result = scanner.try_into_batch().await.unwrap();
+        let ids = result["id"].as_primitive::<Int32Type>();
+        let scores = result["_score"].as_primitive::<Float32Type>();
+        let mut actual: Vec<_> = ids
+            .values()
+            .iter()
+            .copied()
+            .zip(scores.values().iter().copied())
+            .collect();
+        actual.sort_by_key(|(id, _)| *id);
+        assert!(!actual.is_empty());
+        if let Some(before) = &before {
+            assert_eq!(actual.len(), before.len());
+            for ((id, score), (old_id, old_score)) in actual.iter().zip(before) {
+                assert_eq!(id, old_id, "optimization changed matches");
+                assert!(
+                    (score - old_score).abs() < 1e-5,
+                    "optimization changed id={id} score: {old_score} -> {score}"
+                );
+            }
+        } else {
+            before = Some(actual);
+        }
+    }
+}
+
 /// Assert `actual` is a valid exact top-`k` of `expected`: the right hit count, the exact
 /// ranking's scores, each returned doc carrying its own score, no duplicate or
 /// below-cutoff id. Identity is membership rather than an exact id set because ties at

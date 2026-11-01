@@ -8,6 +8,7 @@ Tests that Lance files can be read and written across different versions,
 covering various data types and file format versions.
 """
 
+import json
 from pathlib import Path
 
 import lance
@@ -20,6 +21,117 @@ from .compat_decorator import (
     compat_test,
 )
 from .util import build_basic_types, build_large, safe_data_storage_version
+
+
+class RetentionCleanupCompatibility:
+    def __init__(self, path: Path):
+        self.path = path
+
+    def create_released(self):
+        for value in [1, 2, 3]:
+            lance.write_dataset(
+                pa.table({"value": [value] * 4}),
+                self.path,
+                mode="create" if value == 1 else "overwrite",
+                max_rows_per_file=2,
+                data_storage_version="2.0",
+            )
+        assert [v["version"] for v in lance.dataset(self.path).versions()] == [1, 2, 3]
+
+    def append_released(self):
+        assert [v["version"] for v in lance.dataset(self.path).versions()] == [
+            1,
+            2,
+            3,
+            4,
+        ]
+        before_files = len(list((self.path / "data").glob("*.lance")))
+        dataset = lance.write_dataset(
+            pa.table({"value": [99]}), self.path, mode="append"
+        )
+        assert [v["version"] for v in dataset.versions()] == [1, 2, 3, 4, 5]
+        assert len(list((self.path / "data").glob("*.lance"))) == before_files + 1
+        for version in range(1, 4):
+            assert lance.dataset(self.path, version=version).to_table() == pa.table(
+                {"value": [version] * 4}
+            )
+        assert dataset.to_table()["value"].to_pylist() == [3, 3, 3, 3, 99]
+
+    def enable_legacy_interval(self):
+        dataset = lance.dataset(self.path)
+        dataset.update_config(
+            {
+                "lance.auto_cleanup.interval": "1",
+                "lance.auto_cleanup.older_than": "30days",
+            }
+        )
+
+
+@pytest.mark.compat
+@pytest.mark.parametrize("shorthand", [False, True])
+def test_retention_auto_cleanup_remains_safe_for_released_writers(
+    venv_factory, tmp_path, shorthand
+):
+    case = RetentionCleanupCompatibility(tmp_path / "retention.lance")
+    released = venv_factory.get_venv("13.0.0")
+    released.execute_method(case, "create_released")
+    dataset = lance.dataset(case.path)
+    config = {"lance.auto_cleanup.policy_interval": "1"}
+    if shorthand:
+        config["lance.auto_cleanup.keep_one.per_interval"] = "1day"
+        config["lance.auto_cleanup.keep_one.older_than"] = "2days"
+    else:
+        config["lance.auto_cleanup.policy"] = json.dumps(
+            {
+                "rules": [
+                    {"type": "keep_one", "per_interval": "1h", "older_than": "2days"},
+                    {"type": "keep_one", "per_interval": "1day", "older_than": "7days"},
+                    {"type": "remove_all", "older_than": "30days"},
+                ]
+            }
+        )
+    applied = dataset.update_config(config)
+    assert "lance.auto_cleanup.interval" not in applied
+    released.execute_method(case, "append_released")
+    dataset = lance.write_dataset(pa.table({"value": [100]}), case.path, mode="append")
+    assert [v["version"] for v in dataset.versions()] == [1, 2, 3, 4, 5, 6]
+    assert dataset.to_table()["value"].to_pylist() == [3, 3, 3, 3, 99, 100]
+
+
+@pytest.mark.compat
+def test_released_legacy_interval_does_not_block_upgraded_writes(
+    venv_factory, tmp_path
+):
+    case = RetentionCleanupCompatibility(tmp_path / "retention.lance")
+    released = venv_factory.get_venv("13.0.0")
+    released.execute_method(case, "create_released")
+    dataset = lance.dataset(case.path)
+    dataset.update_config(
+        {
+            "lance.auto_cleanup.policy_interval": "1",
+            "lance.auto_cleanup.policy": json.dumps(
+                {
+                    "rules": [
+                        {
+                            "type": "keep_one",
+                            "per_interval": "1h",
+                            "older_than": "2days",
+                        },
+                        {
+                            "type": "keep_one",
+                            "per_interval": "1day",
+                            "older_than": "7days",
+                        },
+                        {"type": "remove_all", "older_than": "30days"},
+                    ]
+                }
+            ),
+        }
+    )
+    released.execute_method(case, "enable_legacy_interval")
+    dataset = lance.write_dataset(pa.table({"value": [100]}), case.path, mode="append")
+    assert [v["version"] for v in dataset.versions()] == [1, 2, 3, 4, 5, 6]
+    assert dataset.to_table()["value"].to_pylist() == [3, 3, 3, 3, 100]
 
 
 class ManagedBlobCompatibility:
@@ -71,6 +183,28 @@ class ManagedBlobCompatibility:
         # this must not be mistaken for permission to run old maintenance clients.
         assert lance.dataset(self.path, version=1).count_rows() == 4
 
+    def write_config(self):
+        dataset = lance.dataset(self.path)
+        dataset.update_config({"test": "released-writer"})
+
+
+@pytest.mark.compat
+@pytest.mark.parametrize("version", ["11.0.0", "13.0.0"])
+def test_default_blob_writes_and_compaction_remain_compatible(
+    venv_factory, tmp_path, version
+):
+    case = ManagedBlobCompatibility(tmp_path / "blobs.lance")
+    case.create()
+    released = venv_factory.get_venv(version)
+    released.execute_method(case, "check_unflagged")
+    dataset = lance.dataset(case.path)
+    dataset.optimize.compact_files(
+        target_rows_per_fragment=100, data_storage_version="2.2"
+    )
+    released.execute_method(case, "check_unflagged")
+    released.execute_method(case, "write_config")
+    assert lance.dataset(case.path).count_rows() == 4
+
 
 @pytest.mark.compat
 @pytest.mark.parametrize("version", ["11.0.0", "13.0.0"])
@@ -81,6 +215,8 @@ def test_managed_blob_activation_and_restore_fence(venv_factory, tmp_path, versi
     dataset = lance.dataset(case.path)
     dataset.update_config({"test": "metadata-only"})
     released.execute_method(case, "check_unflagged")
+    dataset.update_schema_metadata({"lance.blob.managed": "true"})
+    released.execute_method(case, "check_fenced")
     dataset.optimize.compact_files(
         target_rows_per_fragment=100, data_storage_version="2.2"
     )

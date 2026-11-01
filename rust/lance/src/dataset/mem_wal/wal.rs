@@ -129,6 +129,7 @@ impl WalFlushFailure {
 /// blocked on it would hang until some unrelated write happened to move a cursor
 /// again. With nothing cached there is nothing to leave stale — `notify` is a
 /// bare wake-up and every waiter recomputes from the cursors themselves.
+#[derive(Debug)]
 pub struct WriterCursors {
     durable: AtomicUsize,
     /// Bumped whenever a cursor advances or the writer poisons. Carries no
@@ -207,6 +208,21 @@ impl WriterCursors {
             return Err(failure.into_error());
         }
         Ok(())
+    }
+
+    /// Interrupt admission waits, including those inside custom backpressure
+    /// controllers, when the writer can no longer make progress.
+    pub(crate) async fn wait_for_failure(&self) -> Error {
+        let mut receiver = self.notify_rx.clone();
+        loop {
+            receiver.borrow_and_update();
+            if let Err(error) = self.check_poisoned() {
+                return error;
+            }
+            if receiver.changed().await.is_err() {
+                return Error::io("Writer cursor channel closed");
+            }
+        }
     }
 
     pub(crate) fn mark_terminal_failure(&self, error: &Error) {
@@ -870,6 +886,16 @@ impl WalFlusher {
             return Ok(empty_flush_result());
         }
 
+        // Blob descriptors are inserted before their shared packed sidecar is
+        // finalized so several puts can use one object. Finish that object before
+        // any of those descriptors enter the WAL: after the append succeeds,
+        // replay is allowed to expose every descriptor in this range.
+        batch_store.finish_blob_pack().await.map_err(|error| {
+            Error::writer_poisoned(format!(
+                "failed to finalize Blob v2 pack before WAL append: {error}"
+            ))
+        })?;
+
         // Every position in the range must exist. `get` returns `None` only for a
         // position past `committed_len`, so a hole means we were asked to append a
         // batch the store never committed. Silently skipping it while still
@@ -1148,12 +1174,14 @@ impl WalAppender {
     pub async fn open(
         object_store: Arc<ObjectStore>,
         base_path: Path,
+        dir_id: &str,
         shard_id: Uuid,
         shard_spec_id: u32,
     ) -> Result<Self> {
         let manifest_store = Arc::new(ShardManifestStore::new(
             object_store.clone(),
             &base_path,
+            dir_id,
             shard_id,
             2,
         ));
@@ -1165,6 +1193,7 @@ impl WalAppender {
         Ok(Self::with_claimed_epoch(
             object_store,
             base_path,
+            dir_id,
             shard_id,
             manifest_store,
             writer_epoch,
@@ -1184,9 +1213,11 @@ impl WalAppender {
     /// reading 0 until the first append has discovered the true tip. The
     /// authoritative position counter is still discovered lazily on the
     /// first append.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_claimed_epoch(
         object_store: Arc<ObjectStore>,
         base_path: Path,
+        dir_id: &str,
         shard_id: Uuid,
         manifest_store: Arc<ShardManifestStore>,
         writer_epoch: u64,
@@ -1195,7 +1226,7 @@ impl WalAppender {
     ) -> Self {
         Self {
             object_store,
-            wal_dir: shard_wal_path(&base_path, &shard_id),
+            wal_dir: shard_wal_path(&base_path, dir_id, &shard_id),
             manifest_store,
             shard_id,
             writer_epoch,
@@ -1402,9 +1433,15 @@ impl WalAppender {
         }
     }
 
+    /// Find the next free WAL position: probe forward from the manifest's
+    /// hint, falling back to a full listing.
     async fn discover_next_position(&self) -> Result<u64> {
         if let Ok(Some(manifest)) = self.manifest_store.latest().await {
-            let hint = manifest.wal_entry_position_last_seen;
+            // `last_seen` can lag `replay_after`, below which entries may be
+            // GC'd; probing from such a hole would fence below the real tip.
+            let hint = manifest
+                .wal_entry_position_last_seen
+                .max(manifest.replay_after_wal_entry_position);
             if let Some(tip) = probe_forward_from(
                 self.object_store.as_ref(),
                 &self.wal_dir,
@@ -1418,6 +1455,39 @@ impl WalAppender {
         }
         scan_next_position(self.object_store.as_ref(), &self.wal_dir, self.shard_id).await
     }
+}
+
+/// Fence the writer holding `shard_id` below `writer_epoch` without opening a
+/// writer: writes a sentinel at the WAL tip (past it if a live append wins), so
+/// that writer's next PUT-IF-NOT-EXISTS fails. Returns the sentinel's position.
+///
+/// The caller must already have raised the manifest epoch to `writer_epoch`.
+pub async fn fence_shard(
+    object_store: Arc<ObjectStore>,
+    base_path: &Path,
+    dir_id: &str,
+    shard_id: Uuid,
+    writer_epoch: u64,
+) -> Result<u64> {
+    let manifest_store = Arc::new(ShardManifestStore::new(
+        object_store.clone(),
+        base_path,
+        dir_id,
+        shard_id,
+        2,
+    ));
+    WalAppender::with_claimed_epoch(
+        object_store,
+        base_path.clone(),
+        dir_id,
+        shard_id,
+        manifest_store,
+        writer_epoch,
+        0,
+        WalRetryConfig::default(),
+    )
+    .write_fence_sentinel()
+    .await
 }
 
 /// Ordered reader for MemWAL entries from a single shard.
@@ -1442,16 +1512,22 @@ pub struct WalTailer {
 
 impl WalTailer {
     /// Create a WAL tailer for a shard.
-    pub fn new(object_store: Arc<ObjectStore>, base_path: Path, shard_id: Uuid) -> Self {
+    pub fn new(
+        object_store: Arc<ObjectStore>,
+        base_path: Path,
+        dir_id: &str,
+        shard_id: Uuid,
+    ) -> Self {
         let manifest_store = Arc::new(ShardManifestStore::new(
             object_store.clone(),
             &base_path,
+            dir_id,
             shard_id,
             2,
         ));
         Self {
             object_store,
-            wal_dir: shard_wal_path(&base_path, &shard_id),
+            wal_dir: shard_wal_path(&base_path, dir_id, &shard_id),
             manifest_store,
             shard_id,
             highest_read: Arc::new(AtomicU64::new(0)),
@@ -1908,12 +1984,14 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             base_path,
+            "",
             shard_id,
             2,
         ));
         let appender = Arc::new(WalAppender::with_claimed_epoch(
             store,
             base_path.clone(),
+            "",
             shard_id,
             manifest_store,
             writer_epoch,
@@ -1964,8 +2042,8 @@ mod tests {
     #[tokio::test]
     async fn test_track_batch_watcher_blocks_until_flush() {
         let (store, base_path, _temp_dir) = create_local_store().await;
-        let region_id = Uuid::new_v4();
-        let flusher = build_test_flusher(store, &base_path, region_id, 1);
+        let shard_id = Uuid::new_v4();
+        let flusher = build_test_flusher(store, &base_path, shard_id, 1);
 
         let schema = create_test_schema();
         let batch_store = Arc::new(BatchStore::with_capacity(10));
@@ -2278,7 +2356,7 @@ mod tests {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
 
-        let appender = WalAppender::open(store.clone(), base_path.clone(), shard_id, 0)
+        let appender = WalAppender::open(store.clone(), base_path.clone(), "", shard_id, 0)
             .await
             .unwrap();
         assert_eq!(appender.shard_id(), shard_id);
@@ -2297,7 +2375,7 @@ mod tests {
         let second = appender.append(vec![batch_b.clone()]).await.unwrap();
         assert_eq!(second.entry_position, FIRST_WAL_ENTRY_POSITION + 1);
 
-        let tailer = WalTailer::new(store, base_path, shard_id);
+        let tailer = WalTailer::new(store, base_path, "", shard_id);
         assert_eq!(tailer.first_position().await.unwrap(), first.entry_position);
         assert_eq!(
             tailer.next_position().await.unwrap(),
@@ -2329,7 +2407,7 @@ mod tests {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
 
-        let first = WalAppender::open(store.clone(), base_path.clone(), shard_id, 0)
+        let first = WalAppender::open(store.clone(), base_path.clone(), "", shard_id, 0)
             .await
             .unwrap();
         assert_eq!(first.writer_epoch(), 1);
@@ -2338,7 +2416,7 @@ mod tests {
         let batch = create_test_batch(&schema, 1);
         first.append(vec![batch.clone()]).await.unwrap();
 
-        let second = WalAppender::open(store, base_path, shard_id, 0)
+        let second = WalAppender::open(store, base_path, "", shard_id, 0)
             .await
             .unwrap();
         assert_eq!(second.writer_epoch(), 2);
@@ -2364,7 +2442,7 @@ mod tests {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
 
-        let first = WalAppender::open(store.clone(), base_path.clone(), shard_id, 0)
+        let first = WalAppender::open(store.clone(), base_path.clone(), "", shard_id, 0)
             .await
             .unwrap();
         let schema = create_test_schema();
@@ -2373,7 +2451,7 @@ mod tests {
 
         // Successor claims epoch 2 and drops a sentinel at the tip (position 2)
         // — but writes no data of its own.
-        let second = WalAppender::open(store.clone(), base_path.clone(), shard_id, 0)
+        let second = WalAppender::open(store.clone(), base_path.clone(), "", shard_id, 0)
             .await
             .unwrap();
         assert_eq!(second.writer_epoch(), 2);
@@ -2389,7 +2467,7 @@ mod tests {
 
         // The sentinel is data-less: a tailer reads it back as zero batches so
         // replay skips it.
-        let tailer = WalTailer::new(store.clone(), base_path.clone(), shard_id);
+        let tailer = WalTailer::new(store.clone(), base_path.clone(), "", shard_id);
         let entry = tailer.read_entry(sentinel_pos).await.unwrap().unwrap();
         assert_eq!(entry.writer_epoch, 2);
         assert!(entry.batches.is_empty(), "sentinel must carry no batches");
@@ -2397,6 +2475,106 @@ mod tests {
         // Successor's own writes land after the sentinel (position 3).
         let res = second.append(vec![batch]).await.unwrap();
         assert_eq!(res.entry_position, 3);
+    }
+
+    #[tokio::test]
+    async fn test_fence_shard_fences_a_live_writer_without_opening_one() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let live = WalAppender::open(store.clone(), base_path.clone(), "", shard_id, 0)
+            .await
+            .unwrap();
+        let batch = create_test_batch(&create_test_schema(), 1);
+        live.append(vec![batch.clone()]).await.unwrap();
+        live.append(vec![batch.clone()]).await.unwrap();
+
+        // A seal raises the epoch; fence_shard then drops the sentinel.
+        let sealer = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2);
+        let (epoch, _) = sealer.claim_epoch(0).await.unwrap();
+        let position = fence_shard(store, &base_path, "", shard_id, epoch)
+            .await
+            .unwrap();
+        assert_eq!(position, 3, "the sentinel lands at the tip");
+
+        let err = live.append(vec![batch]).await.unwrap_err();
+        assert_eq!(err.fence_reason(), Some(FenceReason::PeerClaimedEpoch));
+    }
+
+    /// `last_seen` lags `replay_after` and a partly failed GC pass left a hole
+    /// below `replay_after`. Probing from `last_seen` would stop in the hole and
+    /// put the sentinel where it fences no one.
+    #[tokio::test]
+    async fn test_fence_shard_probes_from_replay_after_past_a_gc_hole() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let live = WalAppender::open(store.clone(), base_path.clone(), "", shard_id, 0)
+            .await
+            .unwrap();
+        let batch = create_test_batch(&create_test_schema(), 1);
+        for _ in 0..4 {
+            live.append(vec![batch.clone()]).await.unwrap();
+        }
+        let wal_dir = shard_wal_path(&base_path, "", &shard_id);
+        store
+            .delete(&wal_dir.clone().join(wal_entry_filename(2)))
+            .await
+            .unwrap();
+
+        let sealer = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2);
+        let (epoch, _) = sealer.claim_epoch(0).await.unwrap();
+        sealer
+            .commit_update(epoch, |current| lance_index::mem_wal::ShardManifest {
+                version: current.next_version(),
+                wal_entry_position_last_seen: 1,
+                replay_after_wal_entry_position: 3,
+                ..current.clone()
+            })
+            .await
+            .unwrap();
+
+        let position = fence_shard(store, &base_path, "", shard_id, epoch)
+            .await
+            .unwrap();
+        assert_eq!(
+            position, 5,
+            "the sentinel lands past the live writer's last append"
+        );
+        let err = live.append(vec![batch]).await.unwrap_err();
+        assert_eq!(err.fence_reason(), Some(FenceReason::PeerClaimedEpoch));
+    }
+
+    /// A live append that takes the tip first pushes the sentinel one past it,
+    /// and the writer is fenced on its next append.
+    #[tokio::test]
+    async fn test_fence_shard_retries_past_a_live_append_that_wins_the_tip() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let live = WalAppender::open(store.clone(), base_path.clone(), "", shard_id, 0)
+            .await
+            .unwrap();
+        let batch = create_test_batch(&create_test_schema(), 1);
+        live.append(vec![batch.clone()]).await.unwrap();
+
+        let sealer = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2);
+        let (epoch, _) = sealer.claim_epoch(0).await.unwrap();
+        let fencer = WalAppender::with_claimed_epoch(
+            store.clone(),
+            base_path.clone(),
+            "",
+            shard_id,
+            Arc::new(sealer),
+            epoch,
+            0,
+            WalRetryConfig::default(),
+        );
+        // The fencer has found the tip at 2; the live writer's in-flight append
+        // lands there before the sentinel's PUT.
+        *fencer.next_entry_position.lock().await = Some(2);
+        live.append(vec![batch.clone()]).await.unwrap();
+
+        assert_eq!(fencer.write_fence_sentinel().await.unwrap(), 3);
+        let err = live.append(vec![batch]).await.unwrap_err();
+        assert_eq!(err.fence_reason(), Some(FenceReason::PeerClaimedEpoch));
     }
 
     // Regression: a fenced WAL flush never advances the durability watermark.
@@ -2413,7 +2591,7 @@ mod tests {
         // Predecessor claims epoch 1 and writes one entry (position 1), seeding
         // its cached next position at 2. The flusher shares this appender.
         let first = Arc::new(
-            WalAppender::open(store.clone(), base_path.clone(), shard_id, 0)
+            WalAppender::open(store.clone(), base_path.clone(), "", shard_id, 0)
                 .await
                 .unwrap(),
         );
@@ -2426,7 +2604,7 @@ mod tests {
 
         // Successor claims epoch 2 and drops a sentinel at the predecessor's
         // next slot (position 2) — a rolling-restart pod replacement.
-        let second = WalAppender::open(store.clone(), base_path.clone(), shard_id, 0)
+        let second = WalAppender::open(store.clone(), base_path.clone(), "", shard_id, 0)
             .await
             .unwrap();
         assert_eq!(second.writer_epoch(), 2);
@@ -2461,7 +2639,7 @@ mod tests {
     async fn test_wal_appender_rejects_invalid_input() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let appender = WalAppender::open(store, base_path, shard_id, 0)
+        let appender = WalAppender::open(store, base_path, "", shard_id, 0)
             .await
             .unwrap();
         let err = appender.append(vec![]).await.unwrap_err();
@@ -2477,7 +2655,7 @@ mod tests {
     async fn test_wal_tailer_hints_from_memory_without_writing() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let appender = WalAppender::open(store.clone(), base_path.clone(), shard_id, 0)
+        let appender = WalAppender::open(store.clone(), base_path.clone(), "", shard_id, 0)
             .await
             .unwrap();
 
@@ -2489,7 +2667,7 @@ mod tests {
                 .unwrap();
         }
 
-        let manifest_store = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let manifest_store = ShardManifestStore::new(store.clone(), &base_path, "", shard_id, 2);
         let before = manifest_store
             .refresh_latest()
             .await
@@ -2497,7 +2675,7 @@ mod tests {
             .unwrap()
             .version;
 
-        let tailer = WalTailer::new(store, base_path, shard_id);
+        let tailer = WalTailer::new(store, base_path, "", shard_id);
         let entry = tailer.read_entry(1).await.unwrap().unwrap();
         assert_eq!(entry.entry_position, 1);
 
@@ -2525,7 +2703,9 @@ mod tests {
         let (store, base, controls) = failing_memory_store().await;
         let shard_id = Uuid::new_v4();
         controls.fail_wal_puts(2); // 2 failures, under the default budget of 3
-        let appender = WalAppender::open(store, base, shard_id, 0).await.unwrap();
+        let appender = WalAppender::open(store, base, "", shard_id, 0)
+            .await
+            .unwrap();
 
         let schema = create_test_schema();
         let res = appender
@@ -2543,11 +2723,18 @@ mod tests {
         let (store, base, controls) = failing_memory_store().await;
         let shard_id = Uuid::new_v4();
         controls.fail_wal_puts(usize::MAX);
-        let manifest_store = Arc::new(ShardManifestStore::new(store.clone(), &base, shard_id, 2));
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base,
+            "",
+            shard_id,
+            2,
+        ));
         let (epoch, _) = manifest_store.claim_epoch(0).await.unwrap();
         let appender = WalAppender::with_claimed_epoch(
             store,
             base,
+            "",
             shard_id,
             manifest_store,
             epoch,
@@ -2575,7 +2762,7 @@ mod tests {
         let shard_id = Uuid::new_v4();
         controls.set_lost_ack(true);
         controls.fail_wal_puts(1);
-        let appender = WalAppender::open(store.clone(), base.clone(), shard_id, 0)
+        let appender = WalAppender::open(store.clone(), base.clone(), "", shard_id, 0)
             .await
             .unwrap();
 
@@ -2587,7 +2774,7 @@ mod tests {
         assert_eq!(err.fence_reason(), Some(FenceReason::PersistenceFailure));
 
         // The entry landed exactly once; the next slot stays empty.
-        let tailer = WalTailer::new(store, base, shard_id);
+        let tailer = WalTailer::new(store, base, "", shard_id);
         assert!(
             tailer
                 .read_entry(FIRST_WAL_ENTRY_POSITION)
@@ -2621,11 +2808,18 @@ mod tests {
         let (store, base, controls) = failing_memory_store().await;
         let shard_id = Uuid::new_v4();
         controls.fail_wal_puts(usize::MAX);
-        let manifest_store = Arc::new(ShardManifestStore::new(store.clone(), &base, shard_id, 2));
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base,
+            "",
+            shard_id,
+            2,
+        ));
         let (epoch, _) = manifest_store.claim_epoch(0).await.unwrap();
         let appender = Arc::new(WalAppender::with_claimed_epoch(
             store,
             base,
+            "",
             shard_id,
             manifest_store,
             epoch,
@@ -2762,7 +2956,7 @@ mod tests {
         batch_store.append(create_test_batch(&schema, 1)).unwrap();
 
         // An HNSW index on `id`, which is an Int32 and not a vector, so every
-        // insert of this batch fails deterministically. `validate_index_configs`
+        // insert of this batch fails deterministically. `validate_index_specs`
         // rejects this at shard open — that is what makes poison-and-replay
         // terminating — so the store has to be built by hand to reach it at all.
         let mut idx = IndexStore::new();
@@ -2804,11 +2998,18 @@ mod tests {
         let (store, base, controls) = failing_memory_store().await;
         let shard_id = Uuid::new_v4();
         controls.fail_wal_puts(usize::MAX);
-        let manifest_store = Arc::new(ShardManifestStore::new(store.clone(), &base, shard_id, 2));
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base,
+            "",
+            shard_id,
+            2,
+        ));
         let (epoch, _) = manifest_store.claim_epoch(0).await.unwrap();
         let appender = Arc::new(WalAppender::with_claimed_epoch(
             store,
             base,
+            "",
             shard_id,
             manifest_store,
             epoch,

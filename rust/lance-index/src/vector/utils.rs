@@ -167,7 +167,7 @@ impl SimpleIndex {
             dist_q_c: 0.0,
             use_acorn: false,
         };
-        let res = match &self.store {
+        let (res, _) = match &self.store {
             SimpleStore::Float(store) => self.index.search_basic(query, 1, &params, None, store)?,
             SimpleStore::Binary(store) => {
                 let query = if query.data_type() == &DataType::UInt8 {
@@ -182,23 +182,42 @@ impl SimpleIndex {
     }
 }
 
+/// Cap on how many cache lines one `do_prefetch` call touches.
+///
+/// Distance kernels read a vector sequentially, so once its head is resident
+/// the hardware stream prefetcher covers the tail; issuing one prefetch
+/// instruction per line of a large vector (48 for a 768-dim f32 vector) costs
+/// more in issue overhead and cache pollution than the misses it hides. Eight
+/// lines is one full 128-dim f32 vector, so smaller vectors are prefetched
+/// exactly as before, while at 768 dims the cap turns a within-noise effect
+/// into a 20-28% search speedup on the `search_hnsw_prefetch` bench
+/// (issue #8275).
+#[cfg(target_arch = "x86_64")]
+const PREFETCH_MAX_CACHE_LINES: usize = 8;
+
 #[inline]
 pub(crate) fn do_prefetch<T>(ptrs: Range<*const T>) {
     // TODO use rust intrinsics instead of x86 intrinsics
-    // TODO finish this
+    #[cfg(target_arch = "x86_64")]
     unsafe {
-        let (ptr, end_ptr) = (ptrs.start as *const i8, ptrs.end as *const i8);
-        let mut current_ptr = ptr;
-        while current_ptr < end_ptr {
-            const CACHE_LINE_SIZE: usize = 64;
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            {
-                use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-                _mm_prefetch(current_ptr, _MM_HINT_T0);
-            }
-            current_ptr = current_ptr.add(CACHE_LINE_SIZE);
+        use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        const CACHE_LINE_SIZE: usize = 64;
+        // Cap the byte length before any pointer arithmetic: `ptr::add` must
+        // stay within the allocation even for intermediate values, and a
+        // short vector at the end of its backing buffer has fewer bytes left
+        // than the cap.
+        let start = ptrs.start as *const i8;
+        let len = (ptrs.end as usize)
+            .saturating_sub(ptrs.start as usize)
+            .min(PREFETCH_MAX_CACHE_LINES * CACHE_LINE_SIZE);
+        let mut offset = 0;
+        while offset < len {
+            _mm_prefetch(start.add(offset), _MM_HINT_T0);
+            offset += CACHE_LINE_SIZE;
         }
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = ptrs;
 }
 
 impl From<pb::tensor::DataType> for DataType {
@@ -346,6 +365,19 @@ pub fn is_finite(fsl: &FixedSizeListArray) -> BooleanArray {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A vector shorter than the prefetch cap whose slice ends exactly at its
+    /// allocation must not make `do_prefetch` form an out-of-allocation
+    /// pointer, and neither may a range that is not a multiple of the cache
+    /// line (UB under Miri; caught in review of #8882).
+    #[test]
+    fn test_do_prefetch_stays_in_short_allocations() {
+        let one_line: Vec<f32> = vec![0.0; 16]; // 64 bytes, far below the cap
+        do_prefetch(one_line.as_ptr_range());
+
+        let odd_length: Vec<f32> = vec![0.0; 24]; // 96 bytes, not line-aligned
+        do_prefetch(odd_length.as_ptr_range());
+    }
 
     use arrow_array::{Float16Array, Float32Array, Float64Array, UInt8Array};
     use half::f16;

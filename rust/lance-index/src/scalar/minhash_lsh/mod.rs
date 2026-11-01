@@ -69,7 +69,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use bytes::Bytes;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion_execution::SendableRecordBatchStream;
 use futures::stream::FuturesOrdered;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache, WeakLanceCache};
@@ -842,6 +842,10 @@ impl BasicTrainer for MinHashLshIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for MinHashLshIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(true)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }

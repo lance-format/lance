@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::num::NonZero;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use lance_core::Error;
 use lance_core::deepsize::DeepSizeOf;
 use lance_file::version::ConcreteFileVersion;
@@ -28,7 +29,7 @@ use lance_core::error::Result;
 /// Lance Data File
 ///
 /// A data file is one piece of file storing data.
-#[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataFile {
     /// Relative path of the data file to dataset root.
     pub path: String,
@@ -56,21 +57,38 @@ pub struct DataFile {
     /// The size of the file in bytes, if known.
     pub file_size_bytes: CachedFileSize,
 
+    /// The metadata suffix size in bytes, if known.
+    ///
+    /// The suffix starts at global buffer 0, which holds the `FileDescriptor`,
+    /// and ends at EOF. Readers treat this as an advisory hint and use the file
+    /// footer as authoritative. `None` preserves the footer-directed open path
+    /// used for older manifests.
+    pub file_metadata_size_bytes: Option<NonZero<u64>>,
+
     /// The base path of the datafile, when the datafile is outside the dataset.
     pub base_id: Option<u32>,
+}
+
+impl DeepSizeOf for DataFile {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.path.deep_size_of_children(context)
+            + self.fields.deep_size_of_children(context)
+            + self.column_indices.deep_size_of_children(context)
+    }
 }
 
 // Custom Serialize: convert Arc<[i32]> to slice for transparent JSON output
 impl Serialize for DataFile {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("DataFile", 7)?;
+        let mut s = serializer.serialize_struct("DataFile", 8)?;
         s.serialize_field("path", &self.path)?;
         s.serialize_field("fields", self.fields.as_ref())?;
         s.serialize_field("column_indices", self.column_indices.as_ref())?;
         s.serialize_field("file_major_version", &self.file_major_version)?;
         s.serialize_field("file_minor_version", &self.file_minor_version)?;
         s.serialize_field("file_size_bytes", &self.file_size_bytes)?;
+        s.serialize_field("file_metadata_size_bytes", &self.file_metadata_size_bytes)?;
         s.serialize_field("base_id", &self.base_id)?;
         s.end()
     }
@@ -90,6 +108,7 @@ impl<'de> Deserialize<'de> for DataFile {
             #[serde(default)]
             file_minor_version: u32,
             file_size_bytes: CachedFileSize,
+            file_metadata_size_bytes: Option<NonZero<u64>>,
             base_id: Option<u32>,
         }
 
@@ -101,6 +120,7 @@ impl<'de> Deserialize<'de> for DataFile {
             file_major_version: helper.file_major_version,
             file_minor_version: helper.file_minor_version,
             file_size_bytes: helper.file_size_bytes,
+            file_metadata_size_bytes: helper.file_metadata_size_bytes,
             base_id: helper.base_id,
         })
     }
@@ -124,6 +144,7 @@ impl DataFile {
             file_major_version,
             file_minor_version,
             file_size_bytes: file_size_bytes.into(),
+            file_metadata_size_bytes: None,
             base_id,
         }
     }
@@ -138,6 +159,7 @@ impl DataFile {
             file_major_version,
             file_minor_version,
             file_size_bytes: Default::default(),
+            file_metadata_size_bytes: None,
             base_id: None,
         }
     }
@@ -289,6 +311,7 @@ impl From<&DataFile> for pb::DataFile {
             file_minor_version: df.file_minor_version,
             file_size_bytes: df.file_size_bytes.get().map_or(0, |v| v.get()),
             base_id: df.base_id,
+            file_metadata_size_bytes: df.file_metadata_size_bytes.map_or(0, NonZero::get),
         }
     }
 }
@@ -305,6 +328,7 @@ impl TryFrom<pb::DataFile> for DataFile {
             file_minor_version: proto.file_minor_version,
             file_size_bytes: CachedFileSize::new(proto.file_size_bytes),
             base_id: proto.base_id,
+            file_metadata_size_bytes: NonZero::new(proto.file_metadata_size_bytes),
         })
     }
 }
@@ -418,6 +442,7 @@ impl DataFileFieldInterner {
             file_minor_version: proto.file_minor_version,
             file_size_bytes: CachedFileSize::new(proto.file_size_bytes),
             base_id: proto.base_id,
+            file_metadata_size_bytes: NonZero::new(proto.file_metadata_size_bytes),
         })
     }
 
@@ -457,6 +482,8 @@ impl DataFileFieldInterner {
             physical_rows,
             last_updated_at_version_meta,
             created_at_version_meta,
+            clustering_id: p.clustering_id,
+            metadata: p.metadata,
         })
     }
 }
@@ -486,6 +513,43 @@ pub struct DeletionFile {
     /// Number of deleted rows in this file. If None, this is unknown.
     pub num_deleted_rows: Option<usize>,
     pub base_id: Option<u32>,
+    /// The serialized Roaring bitmap of deleted row offsets, when the deletion
+    /// vector is stored in the manifest rather than in a file. `Bytes`, so the
+    /// many clones of a fragment share it instead of copying it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "inline_deletion_bytes"
+    )]
+    pub inline: Option<Bytes>,
+}
+
+/// `Option<Bytes>` as serde sees a byte sequence, without the `serde` feature of `bytes`.
+mod inline_deletion_bytes {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<Bytes>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match value {
+            Some(bytes) => serializer.serialize_some(&bytes[..]),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Option<Bytes>, D::Error> {
+        Option::<Vec<u8>>::deserialize(deserializer).map(|bytes| bytes.map(Bytes::from))
+    }
+}
+
+impl DeletionFile {
+    /// Whether the deletion vector lives in the manifest, so no file exists for it.
+    pub fn is_inline(&self) -> bool {
+        self.inline.is_some()
+    }
 }
 
 impl TryFrom<pb::DeletionFile> for DeletionFile {
@@ -512,6 +576,7 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
             file_type,
             num_deleted_rows,
             base_id: value.base_id,
+            inline: value.inline,
         })
     }
 }
@@ -554,6 +619,19 @@ pub struct Fragment {
     /// Created at version metadata
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at_version_meta: Option<RowDatasetVersionMeta>,
+
+    /// The clustering definition this fragment was organized under when it
+    /// was created, by `Manifest::clustering` id. Operations on the same
+    /// fragment keep it; a fragment written from this one does not inherit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clustering_id: Option<u32>,
+
+    /// Arbitrary metadata attached to this fragment, like
+    /// `Manifest::table_metadata`. Operations on the same fragment preserve
+    /// every entry, including keys this build does not understand; new
+    /// fragments carry only what their writer sets.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, String>,
 }
 
 impl Fragment {
@@ -567,6 +645,8 @@ impl Fragment {
             physical_rows: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: HashMap::new(),
         }
     }
 
@@ -605,6 +685,8 @@ impl Fragment {
             physical_rows: _,
             last_updated_at_version_meta: _,
             created_at_version_meta: _,
+            clustering_id: _,
+            metadata: _,
         } = self;
         files
             .iter()
@@ -626,6 +708,8 @@ impl Fragment {
             physical_rows: _,
             last_updated_at_version_meta: _,
             created_at_version_meta: _,
+            clustering_id: _,
+            metadata: _,
         } = self;
         files
             .iter_mut()
@@ -745,6 +829,8 @@ impl Fragment {
             row_id_meta: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: HashMap::new(),
         }
     }
 
@@ -864,6 +950,8 @@ impl TryFrom<pb::DataFragment> for Fragment {
                 .created_at_version_sequence
                 .map(RowDatasetVersionMeta::try_from)
                 .transpose()?,
+            clustering_id: p.clustering_id,
+            metadata: p.metadata,
         })
     }
 }
@@ -881,6 +969,7 @@ impl From<&Fragment> for pb::DataFragment {
                 file_type: file_type.into(),
                 num_deleted_rows: f.num_deleted_rows.unwrap_or_default() as u64,
                 base_id: f.base_id,
+                inline: f.inline.clone(),
             }
         });
 
@@ -902,6 +991,8 @@ impl From<&Fragment> for pb::DataFragment {
             deletion_file,
             row_id_sequence,
             physical_rows: f.physical_rows.unwrap_or_default() as u64,
+            clustering_id: f.clustering_id,
+            metadata: f.metadata.clone(),
             last_updated_at_version_sequence,
             created_at_version_sequence,
         }
@@ -918,6 +1009,7 @@ mod tests {
     use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
     use object_store::path::Path;
     use roaring::RoaringBitmap;
+    use rstest::rstest;
     use serde_json::{Value, json};
 
     #[test]
@@ -1048,12 +1140,14 @@ mod tests {
         let mut fragment = Fragment::new(123);
         let schema = ArrowSchema::new(vec![ArrowField::new("x", DataType::Float16, true)]);
         fragment.add_file_legacy("foobar.lance", &Schema::try_from(&schema).unwrap());
+        fragment.files[0].file_metadata_size_bytes = NonZero::new(1_024);
         fragment.deletion_file = Some(DeletionFile {
             read_version: 123,
             id: 456,
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
             base_id: None,
+            inline: None,
         });
 
         let proto = pb::DataFragment::from(&fragment);
@@ -1197,22 +1291,50 @@ mod tests {
         assert_eq!(current_file.schema(&schema), schema);
     }
 
-    #[test]
-    fn test_to_json() {
+    #[rstest]
+    #[case::present(1_024, NonZero::new(1_024))]
+    #[case::absent(0, None)]
+    fn test_intern_fragment_file_metadata_size_bytes(
+        #[case] encoded: u64,
+        #[case] expected: Option<NonZero<u64>>,
+    ) {
+        let proto = pb::DataFragment {
+            files: vec![pb::DataFile {
+                path: "data.lance".to_string(),
+                fields: vec![0],
+                file_metadata_size_bytes: encoded,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let interned = DataFileFieldInterner::default()
+            .intern_fragment(proto.clone())
+            .unwrap();
+        assert_eq!(interned.files[0].file_metadata_size_bytes, expected);
+        assert_eq!(interned, Fragment::try_from(proto).unwrap());
+    }
+
+    #[rstest]
+    #[case::present(NonZero::new(1_024))]
+    #[case::absent(None)]
+    fn test_to_json(#[case] file_metadata_size_bytes: Option<NonZero<u64>>) {
         let mut fragment = Fragment::new(123);
         let schema = ArrowSchema::new(vec![ArrowField::new("x", DataType::Float16, true)]);
         fragment.add_file_legacy("foobar.lance", &Schema::try_from(&schema).unwrap());
+        fragment.files[0].file_metadata_size_bytes = file_metadata_size_bytes;
         fragment.deletion_file = Some(DeletionFile {
             read_version: 123,
             id: 456,
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
             base_id: None,
+            inline: None,
         });
 
         let json = serde_json::to_string(&fragment).unwrap();
 
-        let value: Value = serde_json::from_str(&json).unwrap();
+        let mut value: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(
             value,
             json!({
@@ -1220,7 +1342,8 @@ mod tests {
                 "files":[
                     {"path": "foobar.lance", "fields": [0], "column_indices": [], 
                      "file_major_version": MAJOR_VERSION, "file_minor_version": MINOR_VERSION,
-                     "file_size_bytes": null, "base_id": null }
+                     "file_size_bytes": null, "file_metadata_size_bytes": file_metadata_size_bytes,
+                     "base_id": null }
                 ],
                 "deletion_file": {"read_version": 123, "id": 456, "file_type": "array",
                                   "num_deleted_rows": 10, "base_id": null},
@@ -1229,6 +1352,14 @@ mod tests {
 
         let frag2 = Fragment::from_json(&json).unwrap();
         assert_eq!(fragment, frag2);
+
+        // JSON written before the hint existed has no key for it.
+        value["files"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("file_metadata_size_bytes");
+        let frag3: Fragment = serde_json::from_value(value).unwrap();
+        assert_eq!(frag3.files[0].file_metadata_size_bytes, None);
     }
 
     #[test]
@@ -1241,6 +1372,7 @@ mod tests {
             file_major_version: MAJOR_VERSION as u32,
             file_minor_version: MINOR_VERSION as u32,
             file_size_bytes: Default::default(),
+            file_metadata_size_bytes: None,
             base_id: None,
         };
 

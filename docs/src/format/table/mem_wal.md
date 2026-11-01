@@ -130,6 +130,7 @@ For example, position 5 is encoded as:
 
 An SSTable is the immutable result of flushing a MemTable.
 It is stored as a Lance dataset under its shard directory.
+Its table columns carry the base table's field ids as of the MemTable's schema, not ids numbered afresh, since readers and the compactor match them to the base table's columns by field id.
 
 !!! note
     Unlike a classic LSM sorted string table, a MemWAL SSTable is not sorted by key; random access is instead served by its BTree primary-key sidecar. It is called an SSTable because it is an immutable, persisted, indexed run.
@@ -152,7 +153,8 @@ Alongside `generation` and `path`, a shard manifest entry may record what the
 SSTable holds, as the writer's MemTable accounted for it at flush:
 
 - `in_memory_bytes`: payload size of the rows, summed over the MemTable's
-  buffers as the window each one holds.
+  buffers as the window each one holds, plus the payload of the blob values
+  the generation keeps in packed and dedicated sidecar files.
 - `physical_rows`: rows held, counting the older duplicates of a primary key
   that the generation's deletion vector masks. A scan applying the deletion
   vector yields fewer.

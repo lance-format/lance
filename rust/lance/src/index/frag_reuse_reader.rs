@@ -543,7 +543,7 @@ pub mod tests {
         }
         let batch = dataset
             .scan()
-            .with_row_id()
+            .with_row_address()
             .project_with_transform(&[("value", "i")])
             .unwrap()
             .try_into_batch()
@@ -764,6 +764,8 @@ pub mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         indices.push(fri.clone());
         let manifest = Arc::make_mut(&mut dataset.manifest);
@@ -1982,6 +1984,8 @@ pub mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         // Installed by writing the manifest directly: the commit chokepoint
         // (correctly) refuses a hand-built tagged entry, and no writer of this
