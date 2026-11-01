@@ -201,26 +201,33 @@ impl PostingListReader {
                 })?
             }
         });
-        let packed = prepared
-            .map(|result| async move { self.build_packed_groups(result?, with_position).await })
+        let published = prepared
+            .map(|result| async move {
+                let chunk = self.build_packed_groups(result?, with_position).await?;
+                // Keep publication inside the buffered future: a spill waiting for
+                // backpressure must not stop polling other chunks' reads and builds.
+                for (token_id, positions) in chunk.positions {
+                    self.index_cache
+                        .insert_with_key(&PositionKey { token_id }, Arc::new(positions))
+                        .await;
+                }
+                let mut ends = Vec::with_capacity(chunk.groups.len());
+                for (start, end, group) in chunk.groups {
+                    self.index_cache
+                        .insert_with_key(
+                            &posting_list_group_cache_key(start, end, self.has_impacts),
+                            Arc::new(group),
+                        )
+                        .await;
+                    ends.push(end);
+                }
+                Result::Ok(ends)
+            })
             .buffered(concurrency);
-        futures::pin_mut!(packed);
+        futures::pin_mut!(published);
         let mut ends = Vec::new();
-        while let Some(chunk) = packed.try_next().await? {
-            for (token_id, positions) in chunk.positions {
-                self.index_cache
-                    .insert_with_key(&PositionKey { token_id }, Arc::new(positions))
-                    .await;
-            }
-            for (start, end, group) in chunk.groups {
-                self.index_cache
-                    .insert_with_key(
-                        &posting_list_group_cache_key(start, end, self.has_impacts),
-                        Arc::new(group),
-                    )
-                    .await;
-                ends.push(end);
-            }
+        while let Some(chunk_ends) = published.try_next().await? {
+            ends.extend(chunk_ends);
         }
         if !ends.is_empty() {
             let bounds = Arc::new(PostingGroupBoundaries { ends });

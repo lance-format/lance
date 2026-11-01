@@ -14,6 +14,8 @@ use lance_core::cache::{
 #[derive(Debug, Default)]
 struct SerializedPostingCache {
     entries: Mutex<HashMap<InternalCacheKey, (bytes::Bytes, usize)>>,
+    write_barrier: Option<Arc<tokio::sync::Barrier>>,
+    position_writes: std::sync::atomic::AtomicUsize,
 }
 
 #[async_trait]
@@ -29,6 +31,14 @@ impl CacheBackend for SerializedPostingCache {
         size: usize,
         codec: Option<CacheCodec>,
     ) {
+        if let Some(barrier) = &self.write_barrier
+            && entry.is::<Positions>()
+            && self.position_writes.fetch_add(1, Ordering::Relaxed) < 2
+        {
+            // The first chunk must not stop the buffered stream from driving
+            // another chunk's publication while its own insertion is pending.
+            barrier.wait().await;
+        }
         if let Some(codec) = codec {
             let mut bytes = Vec::new();
             codec.serialize(&entry, &mut bytes).unwrap();
@@ -65,16 +75,18 @@ impl CacheBackend for SerializedPostingCache {
 }
 
 #[rstest::rstest]
-#[case::postings(false, 1, 2, 256)]
-#[case::positions(true, 3, 2, 256)]
-#[case::whole_chunk(true, 12, 1, 256)]
-#[case::oversized(true, 2, 2, 1)]
+#[case::postings(false, 1, 2, 256, false)]
+#[case::positions(true, 3, 2, 256, false)]
+#[case::whole_chunk(true, 12, 1, 256, false)]
+#[case::oversized(true, 2, 2, 1, false)]
+#[case::concurrent_publication(true, 1, 2, 1, true)]
 #[tokio::test]
 async fn test_byte_prewarm_reopens_serialized_groups(
     #[case] with_position: bool,
     #[case] chunk_rows: usize,
     #[case] concurrency: usize,
     #[case] budget: usize,
+    #[case] concurrent_publication: bool,
 ) {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
@@ -103,7 +115,10 @@ async fn test_byte_prewarm_reopens_serialized_groups(
     }
     builder.write(store.as_ref()).await.unwrap();
     let file = store.open_index_file(&posting_file_path(0)).await.unwrap();
-    let backend = Arc::new(SerializedPostingCache::default());
+    let backend = Arc::new(SerializedPostingCache {
+        write_barrier: concurrent_publication.then(|| Arc::new(tokio::sync::Barrier::new(2))),
+        ..Default::default()
+    });
     let cache = LanceCache::with_backend(backend.clone());
     let mut reader = PostingListReader::try_new(file.clone(), &cache)
         .await
@@ -118,10 +133,13 @@ async fn test_byte_prewarm_reopens_serialized_groups(
         .await
         .unwrap();
     reader.grouping = PostingGrouping::byte_bounded(budget);
-    reader
-        .prewarm_posting_lists_chunked(with_position, Some(chunk_rows), concurrency)
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        reader.prewarm_posting_lists_chunked(with_position, Some(chunk_rows), concurrency),
+    )
+    .await
+    .expect("prewarm must drive independent chunk publications concurrently")
+    .unwrap();
     let ranges: Vec<_> = (0..12)
         .map(|token| reader.group_range_for_token(token).unwrap())
         .collect();
