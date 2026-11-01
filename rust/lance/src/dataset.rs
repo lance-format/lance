@@ -308,7 +308,7 @@ pub struct Version {
     ///
     /// On wide tables (many columns and/or fragments) the manifest is rewritten
     /// in full on every commit; exposing its size per version makes metadata
-    /// growth observable via `list_versions`.
+    /// growth observable via [`Dataset::versions`].
     #[serde(default)]
     pub manifest_size: Option<u64>,
 }
