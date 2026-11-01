@@ -233,6 +233,69 @@ pub async fn open_sstable(
     Ok(dataset)
 }
 
+/// Test-only [`DatasetCache`] that runs a callback just before its `n`th open
+/// (1-based), then opens through an [`SsTableCache`]. A planner opens the
+/// SSTable PK indexes for its block lists after reading the in-memory memtables
+/// and before building their scan arms, so a test can land a write between the
+/// two by picking the open that loads the PK index.
+#[cfg(test)]
+pub struct RunOnOpen {
+    inner: SsTableCache,
+    run_on: usize,
+    opens: std::sync::atomic::AtomicUsize,
+    callback: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+#[cfg(test)]
+impl RunOnOpen {
+    pub fn new(run_on: usize, callback: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            inner: SsTableCache::new(16),
+            run_on,
+            opens: std::sync::atomic::AtomicUsize::new(0),
+            callback: std::sync::Mutex::new(Some(Box::new(callback))),
+        }
+    }
+
+    /// Whether the callback has run.
+    pub fn has_run(&self) -> bool {
+        self.callback.lock().unwrap().is_none()
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for RunOnOpen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunOnOpen")
+            .field("run_on", &self.run_on)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl DatasetCache for RunOnOpen {
+    async fn get_or_open(
+        &self,
+        path: &str,
+        session: Option<Arc<Session>>,
+        store_params: Option<ObjectStoreParams>,
+    ) -> Result<Arc<Dataset>> {
+        let open = self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if open == self.run_on {
+            let callback = self.callback.lock().unwrap().take();
+            if let Some(callback) = callback {
+                callback();
+            }
+        }
+        self.inner.get_or_open(path, session, store_params).await
+    }
+
+    async fn retain_paths(&self, live_paths: &HashSet<String>) {
+        self.inner.retain_paths(live_paths)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

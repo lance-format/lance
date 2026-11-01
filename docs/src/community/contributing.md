@@ -38,7 +38,7 @@ for what the vote requires and how it is counted.
 
 We encourage contributors to continuously improve integrations with AI tools, including:
 
-- Enhancing coding agent guidelines such as `AGENTS.md` and `CLAUDE.md`
+- Enhancing coding agent guidelines such as `AGENTS.md`
 - Providing feedback to AI code reviewers
 - Developing and improving AI-driven GitHub actions
 

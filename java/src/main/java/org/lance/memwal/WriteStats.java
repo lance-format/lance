@@ -25,6 +25,7 @@ public class WriteStats {
   private final long memtableFlushCount;
   private final long memtableFlushRows;
   private final long memtableFlushTimeMs;
+  private final long memtableFlushFailures;
 
   public WriteStats(
       long putCount,
@@ -34,7 +35,8 @@ public class WriteStats {
       long walFlushTimeMs,
       long memtableFlushCount,
       long memtableFlushRows,
-      long memtableFlushTimeMs) {
+      long memtableFlushTimeMs,
+      long memtableFlushFailures) {
     this.putCount = putCount;
     this.putTimeMs = putTimeMs;
     this.walFlushCount = walFlushCount;
@@ -43,6 +45,7 @@ public class WriteStats {
     this.memtableFlushCount = memtableFlushCount;
     this.memtableFlushRows = memtableFlushRows;
     this.memtableFlushTimeMs = memtableFlushTimeMs;
+    this.memtableFlushFailures = memtableFlushFailures;
   }
 
   /** Number of {@link ShardWriter#put} calls. */
@@ -85,6 +88,11 @@ public class WriteStats {
     return memtableFlushTimeMs;
   }
 
+  /** Number of failed MemTable flush attempts, each retry counted separately. */
+  public long memtableFlushFailures() {
+    return memtableFlushFailures;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -96,6 +104,7 @@ public class WriteStats {
         .add("memtableFlushCount", memtableFlushCount)
         .add("memtableFlushRows", memtableFlushRows)
         .add("memtableFlushTimeMs", memtableFlushTimeMs)
+        .add("memtableFlushFailures", memtableFlushFailures)
         .toString();
   }
 }

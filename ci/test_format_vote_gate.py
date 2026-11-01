@@ -28,7 +28,7 @@ def review(login, state, commit_id=HEAD):
 
 
 def test_counts_distinct_pmc_approvals_on_head_commit():
-    approvals, stale, vetoes = tally_reviews(
+    approvals, head_approvals, vetoes = tally_reviews(
         [
             review("alice", "APPROVED"),
             review("bob", "APPROVED"),
@@ -39,7 +39,7 @@ def test_counts_distinct_pmc_approvals_on_head_commit():
         is_pmc,
     )
     assert sorted(approvals) == ["alice", "bob", "carol"]
-    assert stale == []
+    assert sorted(head_approvals) == ["alice", "bob", "carol"]
     assert vetoes == []
 
 
@@ -55,15 +55,28 @@ def test_only_latest_review_per_member_counts():
     assert vetoes == ["alice"]
 
 
-def test_approvals_on_earlier_commit_are_stale():
-    approvals, stale, _ = tally_reviews(
+def test_approvals_on_earlier_commits_still_count():
+    # A push doesn't send earlier voters back to re-vote; only the head-commit
+    # approval is tracked separately, because the gate requires one of those.
+    approvals, head_approvals, _ = tally_reviews(
         [review("alice", "APPROVED", "old_sha"), review("bob", "APPROVED")],
         HEAD,
         "author",
         is_pmc,
     )
-    assert approvals == ["bob"]
-    assert stale == ["alice"]
+    assert sorted(approvals) == ["alice", "bob"]
+    assert head_approvals == ["bob"]
+
+
+def test_no_head_approval_when_every_vote_predates_the_push():
+    approvals, head_approvals, _ = tally_reviews(
+        [review("alice", "APPROVED", "old_sha"), review("bob", "APPROVED", "older")],
+        HEAD,
+        "author",
+        is_pmc,
+    )
+    assert sorted(approvals) == ["alice", "bob"]
+    assert head_approvals == []
 
 
 def test_ignores_author_non_pmc_and_dismissed():
@@ -83,16 +96,26 @@ def test_ignores_author_non_pmc_and_dismissed():
 
 
 @pytest.mark.parametrize(
-    ("veto_count", "approval_count", "period_elapsed", "expected"),
+    ("veto_count", "approvals", "head_approvals", "period_elapsed", "expected"),
     [
-        (1, 5, True, "veto"),  # veto wins even with enough approvals + elapsed
-        (0, 2, True, "insufficient"),
-        (0, 3, False, "waiting_period"),
-        (0, 3, True, "pass"),
+        # A veto wins even with enough approvals, one on head, and time elapsed.
+        (1, 5, 1, True, "veto"),
+        (0, 2, 1, True, "insufficient"),
+        # Enough votes carried over, but nobody has approved the latest commit.
+        (0, 3, 0, True, "unconfirmed"),
+        (0, 3, 1, False, "waiting_period"),
+        (0, 3, 1, True, "pass"),
+        # The head-commit approval counts toward the three; it is not a fourth.
+        (0, 3, 3, True, "pass"),
     ],
 )
-def test_decide_verdict_priority(veto_count, approval_count, period_elapsed, expected):
-    assert decide_verdict(veto_count, approval_count, period_elapsed, 3) == expected
+def test_decide_verdict_priority(
+    veto_count, approvals, head_approvals, period_elapsed, expected
+):
+    assert (
+        decide_verdict(veto_count, approvals, head_approvals, period_elapsed, 3)
+        == expected
+    )
 
 
 def utc(text):
