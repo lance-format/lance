@@ -7,14 +7,25 @@
 //! It handles chunking data streams into fixed-size zones while respecting fragment
 //! boundaries and computing zone bounds that remain valid after row deletions.
 
-use arrow_array::{ArrayRef, UInt64Array};
-use datafusion::execution::SendableRecordBatchStream;
-use futures::TryStreamExt;
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::Arc;
+
+use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
+use datafusion_execution::SendableRecordBatchStream;
+use futures::{TryStreamExt, stream};
 use lance_core::error::Error;
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{ROW_ADDR, Result};
-use lance_datafusion::chunker::chunk_concat_stream;
 use lance_select::RowAddrTreeMap;
+
+/// Minimum number of scanned rows to dispatch to the CPU pool at once.
+///
+/// This is a floor, not a target: zones are never divided, so a single zone
+/// larger than this is dispatched as-is. Cheap zones are grouped to amortize
+/// dispatch overhead.
+const MIN_ROWS_PER_SPLIT: usize = 8192;
 
 //
 // Example: Suppose we have two fragments, each with 4 rows.
@@ -62,6 +73,15 @@ pub trait ZoneProcessor {
 pub struct ZoneTrainer<P> {
     processor: P,
     zone_capacity: u64,
+    /// Whether to record the address of every null row. Off for indexes that
+    /// keep only per-zone counts, so the scan does not build a bitmap it will
+    /// discard.
+    track_null_rows: bool,
+    /// Physical-offset alignment: when set, zone `k` of a fragment is exactly
+    /// the offsets `[k * capacity, (k + 1) * capacity)`, and the map gives the
+    /// fragment's physical row count so the last zone's length is known even
+    /// when its trailing rows are deleted or outside the scanned selection.
+    aligned: Option<HashMap<u64, u64>>,
 }
 
 impl<P> ZoneTrainer<P>
@@ -70,15 +90,31 @@ where
 {
     /// Create a new trainer that buffers at most `zone_capacity` rows per zone.
     pub fn new(processor: P, zone_capacity: u64) -> Result<Self> {
-        if zone_capacity == 0 {
-            return Err(Error::invalid_input(
-                "zone capacity must be greater than zero",
-            ));
-        }
+        validate_zone_capacity(zone_capacity)?;
         Ok(Self {
             processor,
             zone_capacity,
+            track_null_rows: true,
+            aligned: None,
         })
+    }
+
+    /// Cut zones at fixed physical offsets instead of counting rows:
+    /// zone `k` of a fragment spans `[k * capacity, min((k + 1) * capacity, P))`
+    /// where `P` is that fragment's entry in `physical_rows`. A fragment
+    /// missing from the map falls back to the span up to its last scanned
+    /// row for its final zone. Rows of a zone with no scanned rows produce
+    /// no zone. Fragments must still arrive grouped and in offset order.
+    pub fn aligned_to(mut self, physical_rows: HashMap<u64, u64>) -> Self {
+        self.aligned = Some(physical_rows);
+        self
+    }
+
+    /// Enable or disable per-row null address tracking. When disabled the
+    /// bitmap returned by [`Self::train`] is empty.
+    pub fn with_null_tracking(mut self, track: bool) -> Self {
+        self.track_null_rows = track;
+        self
     }
 
     /// Consume the `_rowaddr`-annotated stream, split it into zones, and let the
@@ -96,152 +132,486 @@ where
         let zone_size = usize::try_from(self.zone_capacity).map_err(|_| {
             Error::invalid_input("zone capacity does not fit into usize on this platform")
         })?;
-
-        let mut batches = chunk_concat_stream(stream, zone_size);
+        let mut assembler =
+            ZoneSplitAssembler::new(stream, zone_size, self.zone_capacity, self.aligned);
         let mut zones = Vec::new();
         let mut null_rows = RowAddrTreeMap::new();
-        let mut current_fragment_id: Option<u64> = None;
-        let mut current_zone_len: usize = 0;
-        let mut zone_start_offset: Option<u64> = None;
-        let mut zone_end_offset: Option<u64> = None;
 
         self.processor.reset()?;
-
-        while let Some(batch) = batches.try_next().await? {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-
-            let values = batch.column(0);
-            let row_addr_col = batch
-                .column_by_name(ROW_ADDR)
-                .unwrap()
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap();
-
-            let mut batch_offset = 0usize;
-            while batch_offset < batch.num_rows() {
-                let row_addr = row_addr_col.value(batch_offset);
-                let fragment_id = row_addr >> 32;
-
-                // Zones cannot span fragments; flush current zone (if non-empty) at boundary
-                match current_fragment_id {
-                    Some(current) if current != fragment_id => {
-                        if current_zone_len > 0 {
-                            Self::flush_zone(
-                                &mut self.processor,
-                                &mut zones,
-                                current,
-                                &mut current_zone_len,
-                                &mut zone_start_offset,
-                                &mut zone_end_offset,
-                            )?;
-                        }
-                        current_fragment_id = Some(fragment_id);
-                    }
-                    None => {
-                        current_fragment_id = Some(fragment_id);
-                    }
-                    _ => {}
-                }
-
-                // Count consecutive rows in the same fragment
-                let run_len = (batch_offset..batch.num_rows())
-                    .take_while(|&idx| (row_addr_col.value(idx) >> 32) == fragment_id)
-                    .count();
-                let capacity = zone_size - current_zone_len;
-                let take = run_len.min(capacity);
-
-                self.processor
-                    .process_chunk(&values.slice(batch_offset, take))?;
-
-                // Record exact row addresses for null values in this chunk.
-                let chunk = values.slice(batch_offset, take);
-                if chunk.null_count() > 0 {
-                    for i in 0..take {
-                        if values.is_null(batch_offset + i) {
-                            null_rows.insert(row_addr_col.value(batch_offset + i));
-                        }
-                    }
-                }
-
-                // Track the first and last row offsets to handle non-contiguous offsets
-                // after deletions. Zone length (offset span) is computed as (last - first + 1),
-                // not the actual row count.
-                let first_offset =
-                    RowAddress::new_from_u64(row_addr_col.value(batch_offset)).row_offset() as u64;
-                let last_offset =
-                    RowAddress::new_from_u64(row_addr_col.value(batch_offset + take - 1))
-                        .row_offset() as u64;
-
-                if zone_start_offset.is_none() {
-                    zone_start_offset = Some(first_offset);
-                }
-                zone_end_offset = Some(last_offset);
-
-                current_zone_len += take;
-                batch_offset += take;
-
-                if current_zone_len == zone_size {
-                    Self::flush_zone(
-                        &mut self.processor,
-                        &mut zones,
-                        fragment_id,
-                        &mut current_zone_len,
-                        &mut zone_start_offset,
-                        &mut zone_end_offset,
-                    )?;
-                }
-            }
-        }
-
-        if current_zone_len > 0 {
-            if let Some(fragment_id) = current_fragment_id {
-                Self::flush_zone(
-                    &mut self.processor,
-                    &mut zones,
-                    fragment_id,
-                    &mut current_zone_len,
-                    &mut zone_start_offset,
-                    &mut zone_end_offset,
-                )?;
-            } else {
-                self.processor.reset()?;
-            }
+        while let Some(zone) = assembler.next_zone().await? {
+            zones.push(process_zone(
+                &mut self.processor,
+                zone,
+                self.track_null_rows,
+                &mut null_rows,
+            )?);
+            self.processor.reset()?;
         }
 
         Ok((zones, null_rows))
     }
+}
 
-    /// Flushes a non-empty zone and resets the processor state.
-    fn flush_zone(
-        processor: &mut P,
-        zones: &mut Vec<P::ZoneStatistics>,
-        fragment_id: u64,
-        current_zone_len: &mut usize,
-        zone_start_offset: &mut Option<u64>,
-        zone_end_offset: &mut Option<u64>,
-    ) -> Result<()> {
-        let start = zone_start_offset.unwrap_or(0);
-        let inferred_end =
-            zone_end_offset.unwrap_or_else(|| start + (*current_zone_len as u64).saturating_sub(1));
+/// Parallel trainer that creates independent processors from a factory.
+///
+/// Use this entry when zone statistics can be computed independently. The
+/// factory and statistics cross the CPU-pool boundary; the processor itself is
+/// constructed and consumed on the worker thread.
+///
+/// ```rust,no_run
+/// use std::sync::Arc;
+///
+/// use arrow_array::{ArrayRef, Int32Array, RecordBatch, UInt64Array};
+/// use arrow_schema::{DataType, Field, Schema};
+/// use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+/// use futures::stream;
+/// use lance_core::{Result, ROW_ADDR};
+/// use lance_index::scalar::zoned::{ParallelZoneTrainer, ZoneBound, ZoneProcessor};
+///
+/// #[derive(Default)]
+/// struct Sum(i32);
+///
+/// impl ZoneProcessor for Sum {
+///     type ZoneStatistics = i32;
+///
+///     fn process_chunk(&mut self, values: &ArrayRef) -> Result<()> {
+///         let values = values.as_any().downcast_ref::<Int32Array>().unwrap();
+///         self.0 += values.values().iter().copied().sum::<i32>();
+///         Ok(())
+///     }
+///
+///     fn finish_zone(&mut self, _bound: ZoneBound) -> Result<Self::ZoneStatistics> {
+///         Ok(std::mem::take(&mut self.0))
+///     }
+///
+///     fn reset(&mut self) -> Result<()> {
+///         self.0 = 0;
+///         Ok(())
+///     }
+/// }
+///
+/// async fn train() -> Result<()> {
+///     let schema = Arc::new(Schema::new(vec![
+///         Field::new("value", DataType::Int32, false),
+///         Field::new(ROW_ADDR, DataType::UInt64, false),
+///     ]));
+///     let batch = RecordBatch::try_new(
+///         schema.clone(),
+///         vec![
+///             Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+///             Arc::new(UInt64Array::from(vec![0, 1, 2])) as ArrayRef,
+///         ],
+///     )?;
+///     let stream = Box::pin(RecordBatchStreamAdapter::new(
+///         schema,
+///         stream::once(async { Ok(batch) }),
+///     ));
+///
+///     let trainer = ParallelZoneTrainer::new(|| Ok(Sum::default()), 2)?;
+///     let (statistics, _) = trainer.train(stream).await?;
+///     assert_eq!(statistics, vec![3, 3]);
+///     Ok(())
+/// }
+/// ```
+pub struct ParallelZoneTrainer<P> {
+    processor_factory: Arc<dyn Fn() -> Result<P> + Send + Sync>,
+    zone_capacity: u64,
+    track_null_rows: bool,
+    aligned: Option<HashMap<u64, u64>>,
+}
+
+impl<P> fmt::Debug for ParallelZoneTrainer<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ParallelZoneTrainer")
+            .field("zone_capacity", &self.zone_capacity)
+            .field("track_null_rows", &self.track_null_rows)
+            .field("aligned", &self.aligned)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<P> ParallelZoneTrainer<P>
+where
+    P: ZoneProcessor + 'static,
+    P::ZoneStatistics: Send + 'static,
+{
+    /// Create a parallel trainer from a pure-CPU processor factory.
+    ///
+    /// The factory is invoked once during construction and once per zone. It
+    /// must not perform I/O or wait.
+    pub fn new(
+        processor_factory: impl Fn() -> Result<P> + Send + Sync + 'static,
+        zone_capacity: u64,
+    ) -> Result<Self> {
+        validate_zone_capacity(zone_capacity)?;
+        processor_factory()?;
+        Ok(Self {
+            processor_factory: Arc::new(processor_factory),
+            zone_capacity,
+            track_null_rows: true,
+            aligned: None,
+        })
+    }
+
+    /// Cut zones at fixed physical offsets instead of counting rows.
+    ///
+    /// See [`ZoneTrainer::aligned_to`] for the alignment contract.
+    pub fn aligned_to(mut self, physical_rows: HashMap<u64, u64>) -> Self {
+        self.aligned = Some(physical_rows);
+        self
+    }
+
+    /// Enable or disable per-row null address tracking.
+    pub fn with_null_tracking(mut self, track: bool) -> Self {
+        self.track_null_rows = track;
+        self
+    }
+
+    /// Consume the stream and compute zone statistics on the CPU pool.
+    pub async fn train(
+        self,
+        stream: SendableRecordBatchStream,
+    ) -> Result<(Vec<P::ZoneStatistics>, RowAddrTreeMap)> {
+        let zone_size = usize::try_from(self.zone_capacity).map_err(|_| {
+            Error::invalid_input("zone capacity does not fit into usize on this platform")
+        })?;
+        let splits = stream::try_unfold(
+            ZoneSplitAssembler::new(stream, zone_size, self.zone_capacity, self.aligned),
+            |mut assembler| async move {
+                Ok(assembler
+                    .next_split()
+                    .await?
+                    .map(|split| (split, assembler)))
+            },
+        );
+
+        let processor_factory = self.processor_factory;
+        let track_null_rows = self.track_null_rows;
+        let split_tasks = splits.map_ok(move |split| {
+            let processor_factory = processor_factory.clone();
+            spawn_cpu(move || {
+                process_zone_split(processor_factory.as_ref(), split, track_null_rows)
+            })
+        });
+        let results = split_tasks.try_buffered(get_num_compute_intensive_cpus());
+        futures::pin_mut!(results);
+
+        let mut zones = Vec::new();
+        let mut null_rows = RowAddrTreeMap::new();
+        while let Some((mut split_zones, split_null_rows)) = results.try_next().await? {
+            zones.append(&mut split_zones);
+            null_rows |= &split_null_rows;
+        }
+        Ok((zones, null_rows))
+    }
+}
+
+type ZoneSplit = Vec<Zone>;
+
+#[derive(Debug)]
+struct Zone {
+    batches: Vec<RecordBatch>,
+    bound: ZoneBound,
+    scanned_rows: usize,
+}
+
+/// Serial accumulator shared by the sequential and parallel trainers.
+///
+/// This is the only implementation of fragment/aligned boundary handling and
+/// zone-bound computation.
+struct ZoneSplitAssembler {
+    stream: SendableRecordBatchStream,
+    zone_size: usize,
+    capacity: u64,
+    aligned: Option<HashMap<u64, u64>>,
+    input_batch: Option<RecordBatch>,
+    input_offset: usize,
+    current_batches: Vec<RecordBatch>,
+    current_rows: usize,
+    current_fragment: Option<u64>,
+    current_zone_index: Option<u64>,
+    current_start_offset: Option<u64>,
+    current_end_offset: Option<u64>,
+    current_split: ZoneSplit,
+    current_split_rows: usize,
+}
+
+impl ZoneSplitAssembler {
+    fn new(
+        stream: SendableRecordBatchStream,
+        zone_size: usize,
+        capacity: u64,
+        aligned: Option<HashMap<u64, u64>>,
+    ) -> Self {
+        Self {
+            stream,
+            zone_size,
+            capacity,
+            aligned,
+            input_batch: None,
+            input_offset: 0,
+            current_batches: Vec::new(),
+            current_rows: 0,
+            current_fragment: None,
+            current_zone_index: None,
+            current_start_offset: None,
+            current_end_offset: None,
+            current_split: Vec::new(),
+            current_split_rows: 0,
+        }
+    }
+
+    async fn next_zone(&mut self) -> Result<Option<Zone>> {
+        loop {
+            if self.input_batch.is_none() {
+                let Some(batch) = self.stream.try_next().await? else {
+                    if self.current_batches.is_empty() {
+                        return Ok(None);
+                    }
+                    return self.take_zone().map(Some);
+                };
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                row_addr_column(&batch)?;
+                self.input_batch = Some(batch);
+                self.input_offset = 0;
+            }
+
+            let input_rows = self
+                .input_batch
+                .as_ref()
+                .map(RecordBatch::num_rows)
+                .ok_or_else(|| Error::internal("zone split assembler lost its input batch"))?;
+            if self.input_offset == input_rows {
+                self.input_batch = None;
+                self.input_offset = 0;
+                continue;
+            }
+
+            let has_alignment = self.aligned.is_some();
+            let capacity = self.capacity;
+            let batch = self
+                .input_batch
+                .as_ref()
+                .ok_or_else(|| Error::internal("zone split assembler lost its input batch"))?;
+            let row_addrs = row_addr_column(batch)?.values();
+            let row_addr = row_addrs[self.input_offset];
+            let fragment_id = row_addr >> 32;
+            let zone_index = RowAddress::new_from_u64(row_addr).row_offset() as u64 / capacity;
+
+            let at_boundary = self.current_rows > 0
+                && (self.current_fragment != Some(fragment_id)
+                    || (has_alignment && self.current_zone_index != Some(zone_index)));
+            if at_boundary {
+                return self.take_zone().map(Some);
+            }
+
+            self.current_fragment = Some(fragment_id);
+            self.current_zone_index = Some(zone_index);
+
+            let remaining_rows = batch.num_rows() - self.input_offset;
+            let room = self
+                .zone_size
+                .checked_sub(self.current_rows)
+                .filter(|room| *room > 0)
+                .ok_or_else(|| Error::internal("zone split assembler has a full current zone"))?;
+            let limit = self.input_offset + remaining_rows.min(room);
+            let run_len = row_addrs[self.input_offset..limit]
+                .iter()
+                .take_while(|addr| {
+                    (**addr >> 32) == fragment_id
+                        && (!has_alignment
+                            || RowAddress::new_from_u64(**addr).row_offset() as u64 / capacity
+                                == zone_index)
+                })
+                .count();
+            let end = self.input_offset + run_len;
+            let first_offset =
+                RowAddress::new_from_u64(row_addrs[self.input_offset]).row_offset() as u64;
+            let last_offset = RowAddress::new_from_u64(row_addrs[end - 1]).row_offset() as u64;
+            self.current_batches
+                .push(batch.slice(self.input_offset, run_len));
+            self.current_rows += run_len;
+            self.input_offset = end;
+            if self.current_start_offset.is_none() {
+                self.current_start_offset = Some(first_offset);
+            }
+            self.current_end_offset = Some(last_offset);
+
+            if self.current_rows == self.zone_size {
+                return self.take_zone().map(Some);
+            }
+        }
+    }
+
+    async fn next_split(&mut self) -> Result<Option<ZoneSplit>> {
+        while self.current_split_rows < MIN_ROWS_PER_SPLIT {
+            let Some(zone) = self.next_zone().await? else {
+                break;
+            };
+            self.current_split_rows = self
+                .current_split_rows
+                .checked_add(zone.scanned_rows)
+                .ok_or_else(|| {
+                    Error::invalid_input("zone split row count exceeds usize on this platform")
+                })?;
+            self.current_split.push(zone);
+        }
+
+        if self.current_split.is_empty() {
+            Ok(None)
+        } else {
+            self.current_split_rows = 0;
+            Ok(Some(std::mem::take(&mut self.current_split)))
+        }
+    }
+
+    fn take_zone(&mut self) -> Result<Zone> {
+        let fragment_id = self
+            .current_fragment
+            .ok_or_else(|| Error::internal("zone split assembler lost its fragment"))?;
+        let start = self.current_start_offset.ok_or_else(|| {
+            Error::internal("zone split assembler lost its first observed offset")
+        })?;
+        let inferred_end = self
+            .current_end_offset
+            .ok_or_else(|| Error::internal("zone split assembler lost its last observed offset"))?;
         if inferred_end < start {
             return Err(Error::invalid_input("zone row offsets are out of order"));
         }
-        let bound = ZoneBound {
-            fragment_id,
-            start,
-            length: (inferred_end - start + 1) as usize,
+
+        let bound = match &self.aligned {
+            Some(physical_rows) => {
+                let zone_index = self.current_zone_index.ok_or_else(|| {
+                    Error::internal("zone split assembler lost its aligned zone index")
+                })?;
+                let zone_start = zone_index.checked_mul(self.capacity).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "fragment {fragment_id}: zone {zone_index} of {} rows overflows",
+                        self.capacity
+                    ))
+                })?;
+                let end = match physical_rows.get(&fragment_id) {
+                    Some(rows) => {
+                        // The supplied row count is authoritative for the
+                        // zone's length, so every observed offset must lie
+                        // inside it (and inside this zone); otherwise the
+                        // zone would summarize rows it does not cover.
+                        if start < zone_start || inferred_end >= *rows {
+                            return Err(Error::invalid_input(format!(
+                                "fragment {fragment_id}: zone {zone_index} (rows {zone_start}..) \
+                                 saw offsets {start}..={inferred_end}, outside its physical row \
+                                 count {rows}"
+                            )));
+                        }
+                        zone_start
+                            .checked_add(self.capacity)
+                            .map_or(*rows, |zone_end| zone_end.min(*rows))
+                    }
+                    None => inferred_end + 1,
+                };
+                let length = end
+                    .checked_sub(zone_start)
+                    .filter(|length| *length > 0)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "fragment {fragment_id}: zone {zone_index} ends at {end} before its \
+                             start {zone_start}"
+                        ))
+                    })?;
+                ZoneBound {
+                    fragment_id,
+                    start: zone_start,
+                    length: length as usize,
+                }
+            }
+            None => ZoneBound {
+                fragment_id,
+                start,
+                length: (inferred_end - start + 1) as usize,
+            },
         };
-        let stats = processor.finish_zone(bound)?;
-        zones.push(stats);
-        *current_zone_len = 0;
-        *zone_start_offset = None;
-        *zone_end_offset = None;
-        processor.reset()?;
+
+        let scanned_rows = self.current_rows;
+        self.current_rows = 0;
+        self.current_fragment = None;
+        self.current_zone_index = None;
+        self.current_start_offset = None;
+        self.current_end_offset = None;
+        Ok(Zone {
+            batches: std::mem::take(&mut self.current_batches),
+            bound,
+            scanned_rows,
+        })
+    }
+}
+
+fn validate_zone_capacity(zone_capacity: u64) -> Result<()> {
+    if zone_capacity == 0 {
+        Err(Error::invalid_input(
+            "zone capacity must be greater than zero",
+        ))
+    } else {
         Ok(())
     }
+}
+
+fn row_addr_column(batch: &RecordBatch) -> Result<&UInt64Array> {
+    batch
+        .column_by_name(ROW_ADDR)
+        .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "zone training batches must include a UInt64 `{ROW_ADDR}` column"
+            ))
+        })
+}
+
+fn process_zone<P: ZoneProcessor>(
+    processor: &mut P,
+    zone: Zone,
+    track_null_rows: bool,
+    null_rows: &mut RowAddrTreeMap,
+) -> Result<P::ZoneStatistics> {
+    for batch in &zone.batches {
+        let values = batch.column(0);
+        processor.process_chunk(values)?;
+
+        if track_null_rows
+            && values.null_count() > 0
+            && let Some(nulls) = values.nulls()
+        {
+            let row_addrs = row_addr_column(batch)?;
+            null_rows.extend(
+                nulls
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, is_valid)| !is_valid)
+                    .map(|(i, _)| row_addrs.value(i)),
+            );
+        }
+    }
+    processor.finish_zone(zone.bound)
+}
+
+fn process_zone_split<P: ZoneProcessor>(
+    processor_factory: &dyn Fn() -> Result<P>,
+    split: ZoneSplit,
+    track_null_rows: bool,
+) -> Result<(Vec<P::ZoneStatistics>, RowAddrTreeMap)> {
+    let mut statistics = Vec::with_capacity(split.len());
+    let mut null_rows = RowAddrTreeMap::new();
+    for zone in split {
+        let mut processor = processor_factory()?;
+        statistics.push(process_zone(
+            &mut processor,
+            zone,
+            track_null_rows,
+            &mut null_rows,
+        )?);
+    }
+    Ok((statistics, null_rows))
 }
 
 /// Shared search helper that loops over zones, records metrics, and
@@ -294,13 +664,29 @@ where
     Ok((combined, null_rows))
 }
 
+/// Parallel counterpart to [`rebuild_zones`].
+pub async fn rebuild_zones_parallel<P>(
+    existing: &[P::ZoneStatistics],
+    trainer: ParallelZoneTrainer<P>,
+    stream: SendableRecordBatchStream,
+) -> Result<(Vec<P::ZoneStatistics>, RowAddrTreeMap)>
+where
+    P: ZoneProcessor + 'static,
+    P::ZoneStatistics: Clone + Send + 'static,
+{
+    let mut combined = existing.to_vec();
+    let (mut new_zones, null_rows) = trainer.train(stream).await?;
+    combined.append(&mut new_zones);
+    Ok((combined, null_rows))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{metrics::LocalMetricsCollector, scalar::SearchResult};
     use arrow_array::{ArrayRef, Int32Array, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
     use lance_core::ROW_ADDR;
     use std::sync::Arc;
@@ -357,6 +743,61 @@ mod tests {
             Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         RecordBatch::try_new(schema, vec![val_array, addr_array]).unwrap()
+    }
+
+    fn nullable_batch(values: Vec<Option<i32>>, row_addrs: Vec<u64>) -> RecordBatch {
+        let val_array = Arc::new(Int32Array::from(values));
+        let addr_array = Arc::new(UInt64Array::from(row_addrs));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int32, true),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        RecordBatch::try_new(schema, vec![val_array, addr_array]).unwrap()
+    }
+
+    fn stream_from_batches(batches: Vec<RecordBatch>) -> SendableRecordBatchStream {
+        let schema = batches[0].schema();
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(batches.into_iter().map(Ok)),
+        ))
+    }
+
+    fn reference_zones(rows: &[(u64, Option<i32>)], capacity: usize) -> (Vec<MockStats>, Vec<u64>) {
+        fn flush(current: &mut Vec<(u64, Option<i32>)>, zones: &mut Vec<MockStats>) {
+            if current.is_empty() {
+                return;
+            }
+            let (first, last) = (current[0].0, current[current.len() - 1].0);
+            let (start, end) = (first & 0xFFFF_FFFF, last & 0xFFFF_FFFF);
+            zones.push(MockStats {
+                sum: current.iter().map(|(_, value)| value.unwrap_or(0)).sum(),
+                bound: ZoneBound {
+                    fragment_id: first >> 32,
+                    start,
+                    length: (end - start + 1) as usize,
+                },
+            });
+            current.clear();
+        }
+
+        let mut zones = Vec::new();
+        let mut nulls = Vec::new();
+        let mut current: Vec<(u64, Option<i32>)> = Vec::new();
+        for &(addr, value) in rows {
+            if !current.is_empty() && current[current.len() - 1].0 >> 32 != addr >> 32 {
+                flush(&mut current, &mut zones);
+            }
+            if value.is_none() {
+                nulls.push(addr);
+            }
+            current.push((addr, value));
+            if current.len() == capacity {
+                flush(&mut current, &mut zones);
+            }
+        }
+        flush(&mut current, &mut zones);
+        (zones, nulls)
     }
 
     #[tokio::test]
@@ -434,6 +875,51 @@ mod tests {
             format!("{}", err).contains("zone row offsets are out of order"),
             "unexpected error: {err:?}"
         );
+    }
+
+    /// Aligned zones take their length from the supplied physical row count,
+    /// so every observed offset must lie inside it; a count below an observed
+    /// offset would hide a row the zone already summarized.
+    #[tokio::test]
+    async fn aligned_zone_rejects_offsets_outside_physical_rows() {
+        async fn train(offsets: Vec<u64>, physical_rows: u64) -> Result<Vec<MockStats>> {
+            let batch = batch(vec![1; offsets.len()], vec![0; offsets.len()], offsets);
+            let stream = Box::pin(RecordBatchStreamAdapter::new(
+                batch.schema(),
+                stream::once(async { Ok(batch) }),
+            ));
+            let trainer = ZoneTrainer::new(MockProcessor::new(), 10)
+                .unwrap()
+                .aligned_to(HashMap::from([(0, physical_rows)]));
+            trainer.train(stream).await.map(|(zones, _)| zones)
+        }
+
+        // The last zone ends at the physical row count even when its
+        // trailing rows are deleted.
+        let zones = train(vec![0, 1, 2, 3], 8).await.unwrap();
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].bound.start, 0);
+        assert_eq!(zones[0].bound.length, 8);
+
+        for (offsets, physical_rows) in [
+            // The count lies inside the zone but below an observed offset.
+            (vec![0, 1, 2, 7], 5),
+            // The count equals the zone's start.
+            (vec![10, 11, 12], 10),
+            // The count lies below the zone's start.
+            (vec![10, 11, 12], 5),
+        ] {
+            let message = train(offsets.clone(), physical_rows)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains("fragment 0")
+                    && message.contains(&format!("physical row count {physical_rows}"))
+                    && message.contains(&format!("..={}", offsets.last().unwrap())),
+                "{offsets:?} in {physical_rows} rows: {message}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -524,6 +1010,65 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("zone capacity must be greater than zero")
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_trainer_accepts_borrowed_non_send_processors() {
+        #[derive(Debug)]
+        struct BorrowedStats {
+            sum: i32,
+            _not_send: std::rc::Rc<()>,
+        }
+
+        #[derive(Debug)]
+        struct BorrowedProcessor<'a> {
+            sum: i32,
+            marker: &'a std::cell::Cell<()>,
+        }
+
+        impl ZoneProcessor for BorrowedProcessor<'_> {
+            type ZoneStatistics = BorrowedStats;
+
+            fn process_chunk(&mut self, values: &ArrayRef) -> Result<()> {
+                let values = values.as_any().downcast_ref::<Int32Array>().unwrap();
+                self.sum += values.iter().map(|value| value.unwrap_or(0)).sum::<i32>();
+                self.marker.set(());
+                Ok(())
+            }
+
+            fn finish_zone(&mut self, _bound: ZoneBound) -> Result<Self::ZoneStatistics> {
+                Ok(BorrowedStats {
+                    sum: std::mem::take(&mut self.sum),
+                    _not_send: std::rc::Rc::new(()),
+                })
+            }
+
+            fn reset(&mut self) -> Result<()> {
+                self.sum = 0;
+                Ok(())
+            }
+        }
+
+        let marker = std::cell::Cell::new(());
+        let trainer = ZoneTrainer::new(
+            BorrowedProcessor {
+                sum: 0,
+                marker: &marker,
+            },
+            2,
+        )
+        .unwrap();
+        assert!(format!("{trainer:?}").contains("ZoneTrainer"));
+
+        let input = batch(vec![1, 2, 3], vec![0, 0, 0], vec![0, 1, 2]);
+        let (stats, _) = trainer
+            .train(stream_from_batches(vec![input]))
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.iter().map(|stats| stats.sum).collect::<Vec<_>>(),
+            vec![3, 3]
         );
     }
 
@@ -859,5 +1404,169 @@ mod tests {
         assert_eq!(rebuilt[2].bound.fragment_id, 2);
         assert_eq!(rebuilt[1].sum, 10);
         assert_eq!(rebuilt[2].sum, 12);
+    }
+
+    #[tokio::test]
+    async fn parallel_assembler_batches_tiny_zones_incrementally() {
+        let num_rows = MIN_ROWS_PER_SPLIT * 2 + 17;
+        let input = batch(
+            vec![1; num_rows],
+            vec![0; num_rows],
+            (0..num_rows as u64).collect(),
+        );
+        let mut assembler = ZoneSplitAssembler::new(stream_from_batches(vec![input]), 1, 1, None);
+
+        let first_split = assembler.next_split().await.unwrap().unwrap();
+        assert_eq!(first_split.len(), MIN_ROWS_PER_SPLIT);
+        for zone in &first_split {
+            assert_eq!(zone.scanned_rows, 1);
+        }
+        assert_eq!(assembler.input_offset, MIN_ROWS_PER_SPLIT);
+
+        let second_split = assembler.next_split().await.unwrap().unwrap();
+        assert_eq!(second_split.len(), MIN_ROWS_PER_SPLIT);
+
+        let trailing_split = assembler.next_split().await.unwrap().unwrap();
+        assert_eq!(trailing_split.len(), 17);
+        assert!(assembler.next_split().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn parallel_trainer_preserves_order_across_splits() {
+        let num_rows = MIN_ROWS_PER_SPLIT * 2 + 17;
+        let values: Vec<i32> = (0..num_rows).map(|value| value as i32).collect();
+        let input = batch(
+            values.clone(),
+            vec![0; num_rows],
+            (0..num_rows as u64).collect(),
+        );
+        let trainer = ParallelZoneTrainer::new(|| Ok(MockProcessor::new()), 1).unwrap();
+        let (stats, _) = trainer
+            .train(stream_from_batches(vec![input]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stats.iter().map(|stats| stats.sum).collect::<Vec<_>>(),
+            values
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_trainer_matches_reference_on_random_streams() {
+        use rand::rngs::SmallRng;
+        use rand::{Rng, SeedableRng};
+
+        for trial in 0..4u64 {
+            let mut rng = SmallRng::seed_from_u64(trial);
+            let mut rows: Vec<(u64, Option<i32>)> = Vec::new();
+            for fragment_id in [0u64, 3, 4, 11, 100] {
+                let num_rows = rng.random_range(0..60);
+                let mut offset = rng.random_range(0..4);
+                for _ in 0..num_rows {
+                    let value = (!rng.random_bool(0.25)).then(|| rng.random_range(-100..100));
+                    rows.push(((fragment_id << 32) | offset, value));
+                    offset += rng.random_range(1..5);
+                }
+            }
+
+            let batch_size = [1, 3, 7, 100][(trial % 4) as usize];
+            let batches: Vec<RecordBatch> = rows
+                .chunks(batch_size)
+                .map(|chunk| {
+                    nullable_batch(
+                        chunk.iter().map(|(_, value)| *value).collect(),
+                        chunk.iter().map(|(addr, _)| *addr).collect(),
+                    )
+                })
+                .collect();
+            if batches.is_empty() {
+                continue;
+            }
+
+            for capacity in [1u64, 3, 8, 8192] {
+                let (expected_zones, expected_nulls) = reference_zones(&rows, capacity as usize);
+                let trainer =
+                    ParallelZoneTrainer::new(|| Ok(MockProcessor::new()), capacity).unwrap();
+                let (zones, null_rows) = trainer
+                    .train(stream_from_batches(batches.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(zones, expected_zones, "trial={trial} capacity={capacity}");
+                assert_eq!(
+                    null_rows,
+                    RowAddrTreeMap::from_iter(expected_nulls),
+                    "trial={trial} capacity={capacity}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_trainer_honors_alignment_and_null_tracking() {
+        let input = batch(vec![1; 6], vec![0; 6], vec![0, 1, 2, 3, 8, 9]);
+        let trainer = ParallelZoneTrainer::new(|| Ok(MockProcessor::new()), 4)
+            .unwrap()
+            .aligned_to(HashMap::from([(0, 10)]));
+        let (zones, _) = trainer
+            .train(stream_from_batches(vec![input]))
+            .await
+            .unwrap();
+        assert_eq!(zones.len(), 2);
+        assert_eq!(
+            zones[0].bound,
+            ZoneBound {
+                fragment_id: 0,
+                start: 0,
+                length: 4,
+            }
+        );
+        assert_eq!(
+            zones[1].bound,
+            ZoneBound {
+                fragment_id: 0,
+                start: 8,
+                length: 2,
+            }
+        );
+
+        let input = nullable_batch(vec![Some(1), None, Some(3), None], vec![7, 9, 11, 15]);
+        let trainer = ParallelZoneTrainer::new(|| Ok(MockProcessor::new()), 4).unwrap();
+        let (_, null_rows) = trainer
+            .train(stream_from_batches(vec![input.clone()]))
+            .await
+            .unwrap();
+        assert_eq!(null_rows, RowAddrTreeMap::from_iter([9, 15]));
+
+        let trainer = ParallelZoneTrainer::new(|| Ok(MockProcessor::new()), 4)
+            .unwrap()
+            .with_null_tracking(false);
+        let (_, null_rows) = trainer
+            .train(stream_from_batches(vec![input]))
+            .await
+            .unwrap();
+        assert_eq!(null_rows, RowAddrTreeMap::new());
+    }
+
+    #[tokio::test]
+    async fn parallel_rebuild_zones_appends_new_stats() {
+        let existing = vec![MockStats {
+            sum: 50,
+            bound: ZoneBound {
+                fragment_id: 0,
+                start: 0,
+                length: 2,
+            },
+        }];
+        let input = batch(vec![3, 4], vec![1, 1], vec![0, 1]);
+        let trainer = ParallelZoneTrainer::new(|| Ok(MockProcessor::new()), 2).unwrap();
+        let (rebuilt, _) =
+            rebuild_zones_parallel(&existing, trainer, stream_from_batches(vec![input]))
+                .await
+                .unwrap();
+        assert_eq!(
+            rebuilt.iter().map(|stats| stats.sum).collect::<Vec<_>>(),
+            vec![50, 7]
+        );
     }
 }

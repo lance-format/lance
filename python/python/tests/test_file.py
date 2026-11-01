@@ -40,6 +40,26 @@ def test_write_no_schema(tmp_path):
     assert reader.read_all().to_table() == pa.table({"a": [1, 2, 3]})
 
 
+def test_write_arrow_json_no_schema(tmp_path):
+    path = tmp_path / "foo.lance"
+    json_type = pa.json_()
+    json_values = pa.ExtensionArray.from_storage(
+        json_type, pa.array(['{"a":1}', '{"b":2}'], pa.string())
+    )
+    table = pa.table({"json": json_values})
+
+    with LanceFileWriter(str(path), version="2.1") as writer:
+        writer.write_batch(table)
+
+    reader = LanceFileReader(str(path))
+    result = reader.read_all().to_table()
+    assert result.num_rows == table.num_rows
+    assert result.schema.field("json").type == pa.large_binary()
+    assert (
+        result.schema.field("json").metadata[b"ARROW:extension:name"] == b"lance.json"
+    )
+
+
 def test_no_schema_no_data(tmp_path):
     path = tmp_path / "foo.lance"
     with pytest.raises(

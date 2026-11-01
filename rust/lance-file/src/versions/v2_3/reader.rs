@@ -4,7 +4,12 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use lance_core::{Error, Result, datatypes::Schema};
-use lance_encoding::{decoder::ColumnInfo, format::pb21};
+use lance_encoding::{
+    compression::{DecompressionStrategy, DefaultDecompressionStrategy},
+    decoder::ColumnInfo,
+    encodings::physical::binary::BinaryMiniBlockDecompressor,
+    format::{metadata, pb23},
+};
 
 use crate::{
     format::pbfile,
@@ -23,115 +28,186 @@ fn required<'a, T>(value: Option<&'a T>, label: &str) -> Result<&'a T> {
     })
 }
 
-fn validate_compressive_encoding(encoding: &pb21::CompressiveEncoding) -> Result<()> {
-    use pb21::compressive_encoding::Compression;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EncodingPosition {
+    OptionalPayloadBlock,
+    BufferBackedBlock,
+    MiniBlock,
+    PerValue,
+}
+
+impl EncodingPosition {
+    fn child(self) -> Self {
+        match self {
+            Self::OptionalPayloadBlock => Self::OptionalPayloadBlock,
+            Self::BufferBackedBlock => Self::BufferBackedBlock,
+            Self::MiniBlock => Self::MiniBlock,
+            Self::PerValue => Self::PerValue,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::OptionalPayloadBlock => "optional-payload block",
+            Self::BufferBackedBlock => "buffer-backed block",
+            Self::MiniBlock => "mini-block",
+            Self::PerValue => "per-value",
+        }
+    }
+}
+
+fn validate_compressive_encoding(
+    encoding: &metadata::CompressiveEncoding,
+    position: EncodingPosition,
+) -> Result<()> {
+    use metadata::compressive_encoding::Compression;
 
     match encoding.compression.as_ref() {
         Some(Compression::Flat(_))
         | Some(Compression::InlineBitpacking(_))
         | Some(Compression::Constant(_)) => Ok(()),
-        Some(Compression::Variable(variable)) => validate_compressive_encoding(required(
-            variable.offsets.as_deref(),
-            "variable offsets",
-        )?),
-        Some(Compression::OutOfLineBitpacking(bitpacking)) => {
-            validate_compressive_encoding(required(
+        Some(Compression::Variable(variable)) if position == EncodingPosition::MiniBlock => {
+            // Variable mini-blocks own the optional offset payload and typed codec grammar.
+            BinaryMiniBlockDecompressor::from_variable(variable).map(|_| ())
+        }
+        Some(Compression::Variable(variable)) => validate_compressive_encoding(
+            required(variable.offsets.as_deref(), "variable offsets")?,
+            position.child(),
+        ),
+        Some(Compression::OutOfLineBitpacking(bitpacking)) => validate_compressive_encoding(
+            required(
                 bitpacking.values.as_deref(),
                 "out-of-line bitpacking values",
-            )?)
-        }
-        Some(Compression::Fsst(fsst)) => {
-            validate_compressive_encoding(required(fsst.values.as_deref(), "FSST values")?)
-        }
+            )?,
+            position.child(),
+        ),
+        Some(Compression::Fsst(fsst)) => validate_compressive_encoding(
+            required(fsst.values.as_deref(), "FSST values")?,
+            position.child(),
+        ),
         Some(Compression::Dictionary(dictionary)) => {
-            validate_compressive_encoding(required(
-                dictionary.indices.as_deref(),
-                "dictionary indices",
-            )?)?;
-            validate_compressive_encoding(required(
-                dictionary.items.as_deref(),
-                "dictionary items",
-            )?)
+            validate_compressive_encoding(
+                required(dictionary.indices.as_deref(), "dictionary indices")?,
+                position.child(),
+            )?;
+            validate_compressive_encoding(
+                required(dictionary.items.as_deref(), "dictionary items")?,
+                position.child(),
+            )
         }
         Some(Compression::Rle(rle)) => {
-            validate_compressive_encoding(required(rle.values.as_deref(), "RLE values")?)?;
-            validate_compressive_encoding(required(rle.run_lengths.as_deref(), "RLE run lengths")?)
+            validate_compressive_encoding(
+                required(rle.values.as_deref(), "RLE values")?,
+                position.child(),
+            )?;
+            validate_compressive_encoding(
+                required(rle.run_lengths.as_deref(), "RLE run lengths")?,
+                position.child(),
+            )
         }
-        Some(Compression::ByteStreamSplit(split)) => validate_compressive_encoding(required(
-            split.values.as_deref(),
-            "byte-stream-split values",
-        )?),
-        Some(Compression::General(general)) => validate_compressive_encoding(required(
-            general.values.as_deref(),
-            "general-compression values",
-        )?),
-        Some(Compression::FixedSizeList(list)) => validate_compressive_encoding(required(
-            list.values.as_deref(),
-            "fixed-size-list values",
-        )?),
-        Some(Compression::PackedStruct(packed)) => validate_compressive_encoding(required(
-            packed.values.as_deref(),
-            "packed-struct values",
-        )?),
-        Some(Compression::VariablePackedStruct(packed)) => {
-            for field in &packed.fields {
-                validate_compressive_encoding(required(
-                    field.value.as_ref(),
-                    "variable packed-struct field",
-                )?)?;
+        Some(Compression::ByteStreamSplit(split)) => validate_compressive_encoding(
+            required(split.values.as_deref(), "byte-stream-split values")?,
+            position.child(),
+        ),
+        Some(Compression::Alp(alp)) => {
+            if !matches!(alp.bits_per_value, 32 | 64) {
+                return Err(Error::invalid_input_source(
+                    "Lance v2.3 ALP requires 32 or 64-bit values".into(),
+                ));
             }
             Ok(())
         }
+        Some(Compression::AxisDelta(_)) => {
+            if position != EncodingPosition::PerValue {
+                return Err(Error::invalid_input(format!(
+                    "Tensor transform is not supported in {} positions",
+                    position.name()
+                )));
+            }
+            DefaultDecompressionStrategy::default()
+                .create_fixed_per_value_decompressor(encoding)
+                .map(|_| ())
+        }
+        Some(Compression::General(general)) => validate_compressive_encoding(
+            required(general.values.as_deref(), "general-compression values")?,
+            position.child(),
+        ),
+        Some(Compression::FixedSizeList(list)) => validate_compressive_encoding(
+            required(list.values.as_deref(), "fixed-size-list values")?,
+            position.child(),
+        ),
+        Some(Compression::PackedStruct(packed)) => validate_compressive_encoding(
+            required(packed.values.as_deref(), "packed-struct values")?,
+            position.child(),
+        ),
+        Some(Compression::VariablePackedStruct(packed)) => {
+            for field in &packed.fields {
+                validate_compressive_encoding(
+                    required(field.value.as_ref(), "variable packed-struct field")?,
+                    position.child(),
+                )?;
+            }
+            Ok(())
+        }
+        Some(Compression::Range(_)) if position == EncodingPosition::OptionalPayloadBlock => Ok(()),
+        Some(Compression::Delta(delta)) if position == EncodingPosition::OptionalPayloadBlock => {
+            validate_compressive_encoding(
+                required(delta.deltas.as_deref(), "delta values")?,
+                EncodingPosition::OptionalPayloadBlock,
+            )
+        }
+        Some(Compression::Range(_) | Compression::Delta(_)) => Err(Error::invalid_input_source(
+            format!(
+                "Range and delta compression are not supported in {} positions",
+                position.name()
+            )
+            .into(),
+        )),
         None => Err(Error::invalid_input_source(
             "Lance v2.3 compressive encoding is missing its compression variant".into(),
         )),
     }
 }
 
-fn validate_sparse_positions(positions: Option<&pb21::SparsePositionSet>) -> Result<()> {
-    use pb21::sparse_position_set::Positions;
-
-    if let Some(Positions::Explicit(encoding)) =
-        positions.and_then(|positions| positions.positions.as_ref())
-    {
-        validate_compressive_encoding(encoding)?;
-    }
-    Ok(())
+fn validate_sparse_sequence(
+    positions: Option<&metadata::CompressiveEncoding>,
+    count: u64,
+) -> Result<()> {
+    lance_encoding::compression::validate_fixed_width_block_sequence(
+        required(positions, "sparse structural sequence")?,
+        64,
+        count,
+    )
 }
 
-fn validate_sparse_validity(validity: Option<&pb21::SparseValiditySet>) -> Result<()> {
-    if let Some(validity) = validity {
-        validate_sparse_positions(validity.positions.as_ref())?;
+fn validate_sparse_validity(validity: Option<&pb23::SparseValiditySet>) -> Result<()> {
+    let validity = required(validity, "sparse validity")?;
+    match pb23::sparse_validity_set::Meaning::try_from(validity.meaning) {
+        Ok(
+            pb23::sparse_validity_set::Meaning::SparseValidityNullPositions
+            | pb23::sparse_validity_set::Meaning::SparseValidityValidPositions,
+        ) => {}
+        _ => {
+            return Err(Error::invalid_input(
+                "Planar sparse validity has an invalid meaning",
+            ));
+        }
     }
-    Ok(())
+    validate_sparse_sequence(validity.positions.as_ref(), validity.num_positions)
 }
 
-fn validate_sparse_layout(layout: &pb21::SparseLayout) -> Result<()> {
-    use pb21::{sparse_count_set::Counts, sparse_structural_layer::Layer};
+fn validate_sparse_structure(layout: &pb23::SparseStructure) -> Result<()> {
+    use pb23::sparse_structural_layer::Layer;
 
-    if !layout.has_large_chunk {
-        return Err(Error::invalid_input_source(
-            "Lance v2.3 sparse pages require the u32 chunk grammar".into(),
-        ));
-    }
-    validate_compressive_encoding(required(
-        layout.value_compression.as_ref(),
-        "sparse values",
-    )?)?;
-    for layer in &layout.structural_layers {
+    for layer in &layout.layers {
         match layer.layer.as_ref() {
-            Some(Layer::Validity(validity)) => {
-                validate_sparse_validity(validity.validity.as_ref())?
-            }
+            Some(Layer::Validity(validity)) => validate_sparse_validity(Some(validity))?,
             Some(Layer::List(list)) => {
-                validate_sparse_positions(list.non_empty_positions.as_ref())?;
-                if let Some(Counts::Explicit(encoding)) = list
-                    .counts
-                    .as_ref()
-                    .and_then(|counts| counts.counts.as_ref())
-                {
-                    validate_compressive_encoding(encoding)?;
-                }
+                validate_sparse_sequence(
+                    list.non_empty_positions.as_ref(),
+                    list.num_non_empty_positions,
+                )?;
+                validate_sparse_sequence(list.counts.as_ref(), list.num_non_empty_positions)?;
                 validate_sparse_validity(list.validity.as_ref())?;
             }
             Some(Layer::FixedSizeList(list)) => validate_sparse_validity(list.validity.as_ref())?,
@@ -145,8 +221,8 @@ fn validate_sparse_layout(layout: &pb21::SparseLayout) -> Result<()> {
     Ok(())
 }
 
-fn validate_page_layout(layout: &pb21::PageLayout) -> Result<()> {
-    use pb21::page_layout::Layout;
+fn validate_page_layout(layout: &metadata::PageLayout) -> Result<()> {
+    use metadata::page_layout::Layout;
 
     match layout.layout.as_ref() {
         Some(Layout::MiniBlockLayout(miniblock)) => {
@@ -156,45 +232,77 @@ fn validate_page_layout(layout: &pb21::PageLayout) -> Result<()> {
                 ));
             }
             if let Some(rep) = miniblock.rep_compression.as_ref() {
-                validate_compressive_encoding(rep)?;
+                validate_compressive_encoding(rep, EncodingPosition::BufferBackedBlock)?;
             }
             if let Some(def) = miniblock.def_compression.as_ref() {
-                validate_compressive_encoding(def)?;
+                validate_compressive_encoding(def, EncodingPosition::BufferBackedBlock)?;
             }
-            validate_compressive_encoding(required(
-                miniblock.value_compression.as_ref(),
-                "miniblock values",
-            )?)?;
+            validate_compressive_encoding(
+                required(miniblock.value_compression.as_ref(), "miniblock values")?,
+                EncodingPosition::MiniBlock,
+            )?;
             if let Some(dictionary) = miniblock.dictionary.as_ref() {
-                validate_compressive_encoding(dictionary)?;
+                validate_compressive_encoding(dictionary, EncodingPosition::BufferBackedBlock)?;
             }
             Ok(())
         }
-        Some(Layout::FullZipLayout(fullzip)) => validate_compressive_encoding(required(
-            fullzip.value_compression.as_ref(),
-            "full-zip values",
-        )?),
+        Some(Layout::FullZipLayout(fullzip)) => validate_compressive_encoding(
+            required(fullzip.value_compression.as_ref(), "full-zip values")?,
+            EncodingPosition::PerValue,
+        ),
         Some(Layout::ConstantLayout(constant)) => {
             if let Some(rep) = constant.rep_compression.as_ref() {
-                validate_compressive_encoding(rep)?;
+                validate_compressive_encoding(rep, EncodingPosition::BufferBackedBlock)?;
             }
             if let Some(def) = constant.def_compression.as_ref() {
-                validate_compressive_encoding(def)?;
+                validate_compressive_encoding(def, EncodingPosition::BufferBackedBlock)?;
             }
             Ok(())
         }
-        Some(Layout::SparseLayout(sparse)) => validate_sparse_layout(sparse),
-        Some(Layout::BlobLayout(blob)) => {
-            let inner = blob.inner_layout.as_deref().ok_or_else(|| {
-                Error::invalid_input_source(
-                    "Lance v2.3 blob page layout is missing its inner layout".into(),
-                )
-            })?;
-            validate_page_layout(inner)
-        }
+        Some(Layout::BlobLayout(_)) => Err(Error::invalid_input(
+            "Blob v1 pages are not part of the Lance 2.3 grammar",
+        )),
         None => Err(Error::invalid_input_source(
             "Lance v2.3 page is missing its page layout".into(),
         )),
+    }
+}
+
+fn validate_planar_layout(layout: &pb23::PlanarLayout) -> Result<()> {
+    if let Some(structure) = layout.sparse() {
+        validate_sparse_structure(structure)?;
+        use pb23::value_plane::Codec;
+        match layout.values.as_ref().and_then(|v| v.codec.as_ref()) {
+            Some(Codec::Chunked(v)) => {
+                validate_compressive_encoding(
+                    required(v.compression.as_ref(), "chunked values")?,
+                    EncodingPosition::MiniBlock,
+                )?;
+                if let Some(dictionary) = &v.dictionary {
+                    validate_compressive_encoding(dictionary, EncodingPosition::BufferBackedBlock)?;
+                }
+                Ok(())
+            }
+            Some(Codec::Zipped(v)) => validate_compressive_encoding(
+                required(v.compression.as_ref(), "zipped values")?,
+                EncodingPosition::PerValue,
+            ),
+            Some(Codec::Indexed(v)) => {
+                validate_compressive_encoding(
+                    required(v.indices.as_ref(), "dictionary indices")?,
+                    EncodingPosition::OptionalPayloadBlock,
+                )?;
+                let items = required(v.items.as_ref(), "dictionary items")?;
+                validate_compressive_encoding(
+                    required(items.compression.as_ref(), "dictionary item values")?,
+                    EncodingPosition::PerValue,
+                )
+            }
+            Some(Codec::Constant(_)) | Some(Codec::None(_)) => Ok(()),
+            None => Err(Error::invalid_input("Planar page is missing values")),
+        }
+    } else {
+        validate_page_layout(&layout.dense_execution_layout()?)
     }
 }
 
@@ -207,9 +315,18 @@ pub fn decode_column(
         .iter()
         .enumerate()
         .map(|(page_index, page)| {
-            let page_layout = structural::decode_page_layout(column_index, page_index, page)?;
-            validate_page_layout(&page_layout)?;
-            structural::build_page_info(column_index, page_index, page, page_layout)
+            let layout: pb23::PlanarLayout = structural::fetch_encoding(
+                page.encoding
+                    .as_ref()
+                    .ok_or_else(|| Error::invalid_input("Planar page is missing its encoding"))?,
+            )?;
+            validate_planar_layout(&layout)?;
+            structural::build_page_info(
+                column_index,
+                page_index,
+                page,
+                lance_encoding::decoder::PageEncoding::Planar(layout),
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     structural::build_column_info(column_index, metadata, page_infos)
@@ -300,9 +417,9 @@ pub fn finish_metadata_index(index: FileMetadataIndex) -> Result<FileMetadataInd
 #[cfg(test)]
 mod grammar_tests {
     use super::*;
-    use pb21::{
-        CompressiveEncoding, Dictionary, Flat, FullZipLayout, PageLayout, Rle,
-        compressive_encoding::Compression, page_layout::Layout,
+    use metadata::{
+        CompressiveEncoding, Dictionary, FixedSizeList, Flat, FullZipLayout, MiniBlockLayout,
+        PageLayout, Rle, compressive_encoding::Compression, page_layout::Layout,
     };
 
     fn flat(bits_per_value: u64) -> CompressiveEncoding {
@@ -311,6 +428,41 @@ mod grammar_tests {
                 bits_per_value,
                 data: None,
             })),
+        }
+    }
+
+    #[rstest::rstest]
+    fn axis_delta_requires_per_value_position(
+        #[values(
+            EncodingPosition::OptionalPayloadBlock,
+            EncodingPosition::BufferBackedBlock,
+            EncodingPosition::MiniBlock,
+            EncodingPosition::PerValue
+        )]
+        position: EncodingPosition,
+    ) {
+        let encoding = CompressiveEncoding {
+            compression: Some(Compression::AxisDelta(Box::new(metadata::AxisDelta {
+                values: Some(Box::new(lance_encoding::format::EncodingUtils::fsl(
+                    64,
+                    false,
+                    flat(16),
+                ))),
+                axis_length: 8,
+                inner_stride: 1,
+            }))),
+        };
+        let result = validate_compressive_encoding(&encoding, position);
+        if position == EncodingPosition::PerValue {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains("Tensor transform is not supported")
+            );
         }
     }
 
@@ -337,5 +489,107 @@ mod grammar_tests {
         };
 
         validate_page_layout(&layout).unwrap();
+    }
+
+    #[test]
+    fn accepts_range_and_delta() {
+        let range = CompressiveEncoding {
+            compression: Some(Compression::Range(metadata::Range {
+                uncompressed_bits_per_value: 32,
+                start: 0,
+                step: 1,
+            })),
+        };
+        let delta = CompressiveEncoding {
+            compression: Some(Compression::Delta(Box::new(metadata::Delta {
+                uncompressed_bits_per_value: 32,
+                base: 0,
+                deltas: Some(Box::new(range.clone())),
+            }))),
+        };
+
+        validate_compressive_encoding(&range, EncodingPosition::OptionalPayloadBlock).unwrap();
+        validate_compressive_encoding(&delta, EncodingPosition::OptionalPayloadBlock).unwrap();
+    }
+
+    #[test]
+    fn rejects_metadata_only_codecs_in_buffer_backed_block_positions() {
+        let range = CompressiveEncoding {
+            compression: Some(Compression::Range(metadata::Range {
+                uncompressed_bits_per_value: 32,
+                start: 0,
+                step: 1,
+            })),
+        };
+        let delta = CompressiveEncoding {
+            compression: Some(Compression::Delta(Box::new(metadata::Delta {
+                uncompressed_bits_per_value: 32,
+                base: 0,
+                deltas: Some(Box::new(range.clone())),
+            }))),
+        };
+        let wrapped_range = CompressiveEncoding {
+            compression: Some(Compression::FixedSizeList(Box::new(FixedSizeList {
+                items_per_value: 1,
+                values: Some(Box::new(range.clone())),
+                has_validity: false,
+            }))),
+        };
+
+        for encoding in [range, delta, wrapped_range] {
+            let layout = PageLayout {
+                layout: Some(Layout::MiniBlockLayout(MiniBlockLayout {
+                    rep_compression: Some(encoding),
+                    value_compression: Some(flat(32)),
+                    has_large_chunk: true,
+                    ..Default::default()
+                })),
+            };
+
+            let error = validate_page_layout(&layout).unwrap_err();
+            assert!(matches!(&error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("buffer-backed block positions"));
+        }
+    }
+
+    #[test]
+    fn rejects_range_and_delta_outside_block_positions() {
+        let range = CompressiveEncoding {
+            compression: Some(Compression::Range(metadata::Range {
+                uncompressed_bits_per_value: 32,
+                start: 0,
+                step: 1,
+            })),
+        };
+        let delta = CompressiveEncoding {
+            compression: Some(Compression::Delta(Box::new(metadata::Delta {
+                uncompressed_bits_per_value: 32,
+                base: 0,
+                deltas: Some(Box::new(range.clone())),
+            }))),
+        };
+
+        for encoding in [range, delta] {
+            let miniblock = PageLayout {
+                layout: Some(Layout::MiniBlockLayout(MiniBlockLayout {
+                    value_compression: Some(encoding.clone()),
+                    has_large_chunk: true,
+                    ..Default::default()
+                })),
+            };
+            let miniblock_error = validate_page_layout(&miniblock).unwrap_err();
+            assert!(matches!(&miniblock_error, Error::InvalidInput { .. }));
+            assert!(miniblock_error.to_string().contains("mini-block positions"));
+
+            let fullzip = PageLayout {
+                layout: Some(Layout::FullZipLayout(FullZipLayout {
+                    value_compression: Some(encoding),
+                    ..Default::default()
+                })),
+            };
+            let fullzip_error = validate_page_layout(&fullzip).unwrap_err();
+            assert!(matches!(&fullzip_error, Error::InvalidInput { .. }));
+            assert!(fullzip_error.to_string().contains("per-value positions"));
+        }
     }
 }

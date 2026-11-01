@@ -18,10 +18,10 @@ use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    metrics::MetricsCollector,
+    metrics::{IndexTimer, IndexTiming, MetricsCollector},
     prefilter::PreFilter,
     vector::{
-        ApproxMode, DIST_COL, Query,
+        ApproxMode, DIST_COL, PartitionSearchCandidate, PartitionSearchResult, Query,
         graph::{OrderedFloat, OrderedNode},
         quantizer::{Quantization, QuantizationType, Quantizer, QuantizerMetadata},
         storage::{
@@ -34,20 +34,20 @@ use crate::{
 use super::storage::{FLAT_COLUMN, FlatBinStorage, FlatFloatStorage};
 
 #[inline(always)]
-fn push_candidate_local(
-    res: &mut BinaryHeap<OrderedNode<u64>>,
+fn push_candidate_local<T: Eq>(
+    res: &mut BinaryHeap<OrderedNode<T>>,
     k: usize,
-    row_id: u64,
+    candidate: T,
     dist: OrderedFloat,
 ) {
     if k == 0 {
         return;
     }
     if res.len() < k {
-        res.push(OrderedNode::new(row_id, dist));
+        res.push(OrderedNode::new(candidate, dist));
     } else if res.peek().is_some_and(|node| node.dist > dist) {
         res.pop();
-        res.push(OrderedNode::new(row_id, dist));
+        res.push(OrderedNode::new(candidate, dist));
     }
 }
 
@@ -65,6 +65,16 @@ static ANN_SEARCH_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ])
     .into()
 });
+
+/// A partition goes through the screened top-k scan only when it has more
+/// than this many rows per result. Screening computes a quantized sum for every
+/// row and then rescores its candidates exactly, in SIMD chunks of 16; with few
+/// rows per result most rows end up rescored, so the quantization and sums
+/// cost more than the scoring they skip. With 4-bit PQ at m=96 it lost to the
+/// bulk scan at 2.5 rows per result on x86 (won on Graviton3), and won on both
+/// at 5. Those ratios were measured when this routing was added, before later
+/// changes to candidate selection and the kernels, and have not been re-tuned.
+const MIN_ROWS_PER_RESULT_FOR_TOPK_SCAN: usize = 4;
 
 /// Marker schema for the flat index, which stores no data of its own.
 static FLAT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -88,6 +98,110 @@ impl From<&Query> for FlatQueryParams {
             approx_mode: q.approx_mode,
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_candidates_with_scratch(
+    query: ArrayRef,
+    candidate_limit: usize,
+    params: &FlatQueryParams,
+    storage: &impl VectorStore,
+    prefilter: Arc<dyn PreFilter>,
+    metrics: &dyn MetricsCollector,
+    residual: Option<QueryResidual<'_>>,
+    scratch: &mut QueryScratch,
+) -> Result<BinaryHeap<OrderedNode<(u32, u64)>>> {
+    if storage.len() > u32::MAX as usize {
+        return Err(Error::index(format!(
+            "flat partition contains {} rows, exceeding the u32 local-offset limit",
+            storage.len()
+        )));
+    }
+
+    let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
+    let row_ids = storage.row_ids();
+    let dist_calc = storage.dist_calculator_with_scratch(
+        query,
+        params.dist_q_c,
+        residual,
+        &mut scratch.query_f32,
+        DistanceCalculatorOptions {
+            approx_mode: params.approx_mode,
+        },
+    );
+    let mut candidates = BinaryHeap::with_capacity(candidate_limit);
+    metrics.record_comparisons(storage.len());
+
+    if prefilter.is_empty() {
+        dist_calc.distance_all_with_scratch(
+            candidate_limit,
+            &mut scratch.distances,
+            &mut scratch.u16,
+            &mut scratch.u8,
+            &mut scratch.u32,
+        );
+        let distances = scratch.distances.iter().copied();
+        if is_range_query {
+            let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
+            let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
+            for (offset, (&row_id, distance)) in row_ids.zip(distances).enumerate() {
+                let distance = distance.into();
+                if distance < lower_bound || distance >= upper_bound {
+                    continue;
+                }
+                push_candidate_local(
+                    &mut candidates,
+                    candidate_limit,
+                    (offset as u32, row_id),
+                    distance,
+                );
+            }
+        } else {
+            for (offset, (&row_id, distance)) in row_ids.zip(distances).enumerate() {
+                push_candidate_local(
+                    &mut candidates,
+                    candidate_limit,
+                    (offset as u32, row_id),
+                    distance.into(),
+                );
+            }
+        }
+    } else {
+        let row_addr_mask = prefilter.mask();
+        if is_range_query {
+            let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
+            let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
+            for (offset, &row_id) in row_ids.enumerate() {
+                if !row_addr_mask.selected(row_id) {
+                    continue;
+                }
+                let distance = dist_calc.distance(offset as u32).into();
+                if distance < lower_bound || distance >= upper_bound {
+                    continue;
+                }
+                push_candidate_local(
+                    &mut candidates,
+                    candidate_limit,
+                    (offset as u32, row_id),
+                    distance,
+                );
+            }
+        } else {
+            for (offset, &row_id) in row_ids.enumerate() {
+                if !row_addr_mask.selected(row_id) {
+                    continue;
+                }
+                push_candidate_local(
+                    &mut candidates,
+                    candidate_limit,
+                    (offset as u32, row_id),
+                    dist_calc.distance(offset as u32).into(),
+                );
+            }
+        }
+    }
+
+    Ok(candidates)
 }
 
 impl IvfSubIndex for FlatIndex {
@@ -141,6 +255,7 @@ impl IvfSubIndex for FlatIndex {
     ) -> Result<RecordBatch> {
         let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
         let row_ids = storage.row_ids();
+        let query_timer = IndexTimer::new(metrics, IndexTiming::QueryPrepare);
         let dist_calc = storage.dist_calculator_with_scratch(
             query,
             params.dist_q_c,
@@ -150,10 +265,30 @@ impl IvfSubIndex for FlatIndex {
                 approx_mode: params.approx_mode,
             },
         );
+        drop(query_timer);
         let mut res = BinaryHeap::with_capacity(k);
         metrics.record_comparisons(storage.len());
+        // Filtering, distance evaluation and heap updates are fused in fast-scan paths.
+        let distance_timer = IndexTimer::new(metrics, IndexTiming::DistanceTopK);
 
         match prefilter.is_empty() {
+            // The calculator certifies that its top-k scan keeps every row the
+            // push below would, so it can skip scoring most rows.
+            true if storage.len() > k.saturating_mul(MIN_ROWS_PER_RESULT_FOR_TOPK_SCAN)
+                && dist_calc.has_exact_topk_scan() =>
+            {
+                dist_calc.accumulate_topk_with_scratch(
+                    k,
+                    params.lower_bound,
+                    params.upper_bound,
+                    |id| storage.row_id(id),
+                    &mut res,
+                    &mut scratch.distances,
+                    &mut scratch.u16,
+                    &mut scratch.u8,
+                    &mut scratch.u32,
+                );
+            }
             true => {
                 dist_calc.distance_all_with_scratch(
                     k,
@@ -211,15 +346,63 @@ impl IvfSubIndex for FlatIndex {
             }
         };
 
+        drop(distance_timer);
+        let _result_timer = IndexTimer::new(metrics, IndexTiming::ResultMaterialize);
         // we don't need to sort the results by distances here
         // because there's a SortExec node in the query plan which sorts the results from all partitions
-        let (row_ids, dists): (Vec<_>, Vec<_>) = res.into_iter().map(|r| (r.id, r.dist.0)).unzip();
+        let (row_ids, dists): (Vec<_>, Vec<_>) = res
+            .into_iter()
+            .map(|candidate| (candidate.id, candidate.dist.0))
+            .unzip();
         let (row_ids, dists) = (UInt64Array::from(row_ids), Float32Array::from(dists));
 
         Ok(RecordBatch::try_new(
             ANN_SEARCH_SCHEMA.clone(),
             vec![Arc::new(dists), Arc::new(row_ids)],
         )?)
+    }
+
+    fn search_with_candidates_with_scratch(
+        &self,
+        query: ArrayRef,
+        candidate_limit: usize,
+        params: Self::QueryParams,
+        storage: &impl VectorStore,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+        partition_id: u32,
+        residual: Option<QueryResidual<'_>>,
+        scratch: &mut QueryScratch,
+    ) -> Result<PartitionSearchResult> {
+        let results = search_candidates_with_scratch(
+            query,
+            candidate_limit,
+            &params,
+            storage,
+            prefilter,
+            metrics,
+            residual,
+            scratch,
+        )?;
+        let mut candidates = Vec::with_capacity(results.len());
+        let mut row_ids = Vec::with_capacity(results.len());
+        let mut distances = Vec::with_capacity(results.len());
+        for result in results {
+            candidates.push(PartitionSearchCandidate {
+                partition_id,
+                offset_in_partition: result.id.0,
+            });
+            row_ids.push(result.id.1);
+            distances.push(result.dist.0);
+        }
+        let batch = RecordBatch::try_new(
+            ANN_SEARCH_SCHEMA.clone(),
+            vec![
+                Arc::new(Float32Array::from(distances)),
+                Arc::new(UInt64Array::from(row_ids)),
+            ],
+        )?;
+        Ok(PartitionSearchResult { batch, candidates })
     }
 
     fn supports_global_topk_heap() -> bool {
@@ -263,6 +446,7 @@ impl IvfSubIndex for FlatIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<()> {
         let row_ids = storage.row_ids();
+        let query_timer = IndexTimer::new(metrics, IndexTiming::QueryPrepare);
         let dist_calc = storage.dist_calculator_with_scratch(
             query,
             params.dist_q_c,
@@ -272,7 +456,10 @@ impl IvfSubIndex for FlatIndex {
                 approx_mode: params.approx_mode,
             },
         );
+        drop(query_timer);
         metrics.record_comparisons(storage.len());
+        // Filtering, distance evaluation and heap updates are fused in fast-scan paths.
+        let distance_timer = IndexTimer::new(metrics, IndexTiming::DistanceTopK);
 
         match prefilter.is_empty() {
             true => {
@@ -304,6 +491,7 @@ impl IvfSubIndex for FlatIndex {
                 );
             }
         };
+        drop(distance_timer);
         Ok(())
     }
 
@@ -672,5 +860,33 @@ mod tests {
             search_results.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             vec![0, 3]
         );
+    }
+
+    #[test]
+    fn test_flat_candidate_search_preserves_partition_offsets() {
+        let index = FlatIndex::default();
+        let storage = test_storage();
+        let mut scratch = QueryScratch::new();
+        let result = index
+            .search_with_candidates_with_scratch(
+                query(),
+                3,
+                FlatQueryParams::default(),
+                &storage,
+                Arc::new(NoFilter),
+                &NoOpMetricsCollector,
+                7,
+                None,
+                &mut scratch,
+            )
+            .unwrap();
+
+        assert_eq!(result.batch.num_rows(), result.candidates.len());
+        let row_ids =
+            result.batch[lance_core::ROW_ID].as_primitive::<arrow_array::types::UInt64Type>();
+        for (&row_id, candidate) in row_ids.values().iter().zip(&result.candidates) {
+            assert_eq!(candidate.partition_id, 7);
+            assert_eq!(row_id, candidate.offset_in_partition as u64);
+        }
     }
 }

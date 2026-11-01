@@ -13,6 +13,8 @@
  */
 package org.lance.update;
 
+import org.lance.DataStorageVersion;
+
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 
@@ -47,6 +49,7 @@ public class UpdateParams {
 
   private final Map<String, String> updates;
   private Optional<String> whereClause = Optional.empty();
+  private Optional<DataStorageVersion> dataStorageVersion = Optional.empty();
   private int conflictRetries = DEFAULT_CONFLICT_RETRIES;
   private long retryTimeoutMs = DEFAULT_RETRY_TIMEOUT_MS;
 
@@ -105,6 +108,17 @@ public class UpdateParams {
     return this;
   }
 
+  /**
+   * Set the exact data storage version for files written by this operation.
+   *
+   * <p>If omitted, the dataset's default write version is used without changing it. Release
+   * selectors are resolved by the engine. V1/V2 cross-family targets are rejected.
+   */
+  public UpdateParams withDataStorageVersion(DataStorageVersion version) {
+    this.dataStorageVersion = Optional.of(Preconditions.checkNotNull(version));
+    return this;
+  }
+
   /** Returns an unmodifiable view of the update expressions. */
   public Map<String, String> updates() {
     return Collections.unmodifiableMap(updates);
@@ -122,6 +136,11 @@ public class UpdateParams {
     return retryTimeoutMs;
   }
 
+  /** Returns the version selector as its string value for the native layer. */
+  public Optional<String> getDataStorageVersion() {
+    return dataStorageVersion.map(DataStorageVersion::toRustString);
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -129,6 +148,7 @@ public class UpdateParams {
         .add("whereClause", whereClause.orElse(null))
         .add("conflictRetries", conflictRetries)
         .add("retryTimeoutMs", retryTimeoutMs)
+        .add("dataStorageVersion", dataStorageVersion.orElse(null))
         .toString();
   }
 }

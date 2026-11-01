@@ -86,6 +86,12 @@ fn parse_compaction_options(
                 opts.excluded_fragment_ids =
                     value.extract::<Option<Vec<u32>>>()?.unwrap_or_default();
             }
+            "data_storage_version" => {
+                let version: Option<String> = value.extract()?;
+                if let Some(version) = version {
+                    opts.data_storage_version = Some(version.parse().infer_error()?);
+                }
+            }
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Invalid compaction option: {}",
@@ -432,6 +438,15 @@ impl PyRewriteResult {
     }
 
     /// Load a result from a JSON representation.
+    ///
+    /// Parameters
+    /// ----------
+    /// json : str
+    ///     The JSON representation of the result.
+    ///
+    /// Returns
+    /// -------
+    /// RewriteResult
     #[staticmethod]
     pub fn from_json(json: String) -> PyResult<Self> {
         let result = serde_json::from_str(&json).map_err(|err| {

@@ -14,11 +14,27 @@ use crate::metrics::MetricsCollector;
 use crate::vector::graph::OrderedNode;
 use crate::vector::storage::{QueryResidual, QueryScratch, VectorStore};
 use crate::vector::{flat, hnsw};
-use crate::{prefilter::PreFilter, vector::Query};
+use crate::{
+    prefilter::PreFilter,
+    vector::{PartitionSearchResult, Query},
+};
 /// A sub index for IVF index
 pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     type QueryParams: Send + Sync + for<'a> From<&'a Query>;
     type BuildParams: Clone + Send + Sync;
+
+    /// Serialize per-partition metadata for a partition the build left empty.
+    ///
+    /// Most sub-indexes store no per-partition rows and return `None`, which
+    /// the writer stores as an empty string. Sub-indexes that still parse
+    /// per-partition metadata for empty partitions (an empty `HNSW` graph must
+    /// round-trip through `read_sub_index_batch`) return the serialized
+    /// metadata here, carrying the segment's build parameters so an empty
+    /// partition cannot misrepresent the parameters readers derive from the
+    /// segment's metadata.
+    fn empty_partition_metadata(_build_params: Option<&Self::BuildParams>) -> Option<String> {
+        None
+    }
 
     /// Load the sub index from a record batch with a single row
     fn load(data: RecordBatch) -> Result<Self>
@@ -71,6 +87,27 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
         _scratch: &mut QueryScratch,
     ) -> Result<RecordBatch> {
         self.search(query, k, params, storage, prefilter, metrics)
+    }
+
+    /// Search the sub-index while preserving each result's partition-local
+    /// storage offset. Implementations that cannot expose stable offsets return
+    /// [`Error::NotSupported`].
+    #[allow(clippy::too_many_arguments)]
+    fn search_with_candidates_with_scratch(
+        &self,
+        _query: ArrayRef,
+        _candidate_limit: usize,
+        _params: Self::QueryParams,
+        _storage: &impl VectorStore,
+        _prefilter: Arc<dyn PreFilter>,
+        _metrics: &dyn MetricsCollector,
+        _partition_id: u32,
+        _residual: Option<QueryResidual<'_>>,
+        _scratch: &mut QueryScratch,
+    ) -> Result<PartitionSearchResult> {
+        Err(Error::not_supported(
+            "partition-local candidate identities are not supported for this sub-index",
+        ))
     }
 
     /// Return true if this sub-index can accumulate candidates into a caller-owned heap.
