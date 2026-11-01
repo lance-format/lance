@@ -7694,6 +7694,7 @@ class ScannerBuilder:
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
         search_effort: Optional[float] = None,
+        quantized_refine_factor: Optional[int] = None,
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
 
@@ -7741,6 +7742,16 @@ class ScannerBuilder:
             setting. ``fast`` favors lower latency and may reduce recall,
             ``normal`` uses the default balance, and ``accurate`` favors higher
             recall and may increase latency.
+        quantized_refine_factor: int, optional
+            For an IVF_RQ flat index, overfetch this many one-bit candidates per
+            requested result and rerank them with the index's most accurate stored
+            RQ representation. Unlike ``refine_factor``, indexed candidates do not
+            read their original vectors. Unindexed fragments and stale overlay rows
+            still use flat fallback and may read original vectors. The two stages can
+            be combined; exact refinement remains the final stage and reads original
+            vectors for its candidates. With ``distance_range``, selected partitions
+            use Accurate RQ search directly so the range applies before top-k
+            truncation.
         """
         self._nearest = _build_vector_search_query(
             column,
@@ -7752,6 +7763,7 @@ class ScannerBuilder:
             minimum_nprobes=minimum_nprobes,
             maximum_nprobes=maximum_nprobes,
             refine_factor=refine_factor,
+            quantized_refine_factor=quantized_refine_factor,
             use_index=use_index,
             ef=ef,
             query_parallelism=query_parallelism,
@@ -9138,6 +9150,7 @@ def _build_vector_search_query(
     minimum_nprobes: Optional[int] = None,
     maximum_nprobes: Optional[int] = None,
     refine_factor: Optional[int] = None,
+    quantized_refine_factor: Optional[int] = None,
     use_index: bool = True,
     ef: Optional[int] = None,
     query_parallelism: Optional[int] = None,
@@ -9174,6 +9187,13 @@ def _build_vector_search_query(
         both initial and later probing without disabling Auto probing.
     refine_factor: int, optional
         The refine factor for the search.
+    quantized_refine_factor: int, optional
+        For an IVF_RQ flat index, overfetch this many one-bit candidates per
+        requested result and rerank them using the most accurate stored RQ data.
+        Indexed candidates do not read their original vectors. Unindexed fragments
+        and stale overlay rows still use flat fallback and may read original vectors.
+        With ``distance_range``, selected partitions use Accurate RQ search directly
+        so the range applies before top-k truncation.
     use_index: bool, default True
         Whether to use the index for the search.
     ef: int, optional
@@ -9256,6 +9276,10 @@ def _build_vector_search_query(
         raise ValueError("minimum_nprobes must be <= maximum_nprobes")
     if refine_factor is not None and int(refine_factor) < 1:
         raise ValueError(f"Refine factor must be 1 or more got {refine_factor}")
+    if quantized_refine_factor is not None and int(quantized_refine_factor) < 1:
+        raise ValueError(
+            f"Quantized refine factor must be 1 or more got {quantized_refine_factor}"
+        )
     if ef is not None and int(ef) <= 0:
         # `ef` should be >= `k`, but `k` could be None so we can't check it here
         # the rust code will check it
@@ -9287,6 +9311,7 @@ def _build_vector_search_query(
         "minimum_nprobes": minimum_nprobes,
         "maximum_nprobes": maximum_nprobes,
         "refine_factor": refine_factor,
+        "quantized_refine_factor": quantized_refine_factor,
         "use_index": use_index,
         "ef": ef,
         "query_parallelism": query_parallelism,
