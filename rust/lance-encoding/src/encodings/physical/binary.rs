@@ -811,6 +811,9 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
 
         let data = &chunk_buffers[0];
         let bytes_per_offset = usize::from(bits_per_offset / 8);
+        if !data.len().is_multiple_of(bytes_per_offset) {
+            return None;
+        }
         let start = usize::try_from(offset_in_chunk).ok()?;
         let end = start.checked_add(usize::try_from(num_rows).ok()?)?;
         let needed = end.checked_add(1)?.checked_mul(bytes_per_offset)?;
@@ -2186,6 +2189,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
         assert!(err.to_string().contains("multiple"), "{err}");
+        assert_eq!(
+            decompressor.decoded_bytes_from_chunk(&[LanceBuffer::from(vec![0u8; 10])], 0, 1),
+            None
+        );
 
         // 64-bit offsets take the same validation path.
         fn chunk_u64(offsets: &[u64], values: &[u8]) -> LanceBuffer {
