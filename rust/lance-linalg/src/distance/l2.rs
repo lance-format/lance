@@ -31,9 +31,8 @@ pub trait L2: Num {
     ///
     /// # Panics
     ///
-    /// `x` and `y` must have the same length. An implementation is required to
-    /// reject a mismatch rather than read past the shorter slice; the five in
-    /// this crate do it by panicking.
+    /// The implementations in this crate panic if `x` and `y` have different
+    /// lengths. A downstream implementation may define different behavior.
     fn l2(x: &[Self], y: &[Self]) -> f32;
 
     /// Writes the L2 distance from `x` to each `dimension`-sized vector in
@@ -47,7 +46,8 @@ pub trait L2: Num {
     ///
     /// # Panics
     ///
-    /// Panics if `x.len() != dimension`, if `batch.len()` is not a multiple of
+    /// The default implementation panics if `dimension == 0`, if
+    /// `x.len() != dimension`, if `batch.len()` is not a multiple of
     /// `dimension`, or if `output.len() != batch.len() / dimension`.
     fn l2_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
         assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
@@ -61,7 +61,8 @@ pub trait L2: Num {
 ///
 /// # Panics
 ///
-/// Panics under the conditions [`L2::l2`] documents.
+/// The implementations in this crate panic if `from` and `to` have different
+/// lengths. A downstream [`L2`] implementation may define different behavior.
 #[inline]
 pub fn l2<T: L2>(from: &[T], to: &[T]) -> f32 {
     T::l2(from, to)
@@ -984,6 +985,13 @@ impl L2Prepared {
     }
 
     /// Compute L2 distances from `query` to every target.
+    ///
+    /// `query` must have length `dimension`.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the conditions [`Self::distances_into`] documents, with the
+    /// same debug/release behavior.
     pub fn distances(&self, query: &[f32]) -> Vec<f32> {
         let mut result = vec![0.0f32; self.num_targets];
         self.distances_into(query, &mut result);
@@ -992,8 +1000,14 @@ impl L2Prepared {
 
     /// Return the index of the nearest target to `query`, using `buf` as scratch space.
     ///
-    /// `buf` must have length `num_targets`. NaN distances are ignored; on ties the
-    /// lowest index wins. Returns `None` if there are no targets or no distance is finite.
+    /// `query` must have length `dimension`, and `buf` must have length
+    /// `num_targets`. NaN distances are ignored; on ties the lowest index wins.
+    /// Returns `None` if there are no targets or no distance is finite.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the conditions [`Self::distances_into`] documents, with the
+    /// same debug/release behavior.
     pub fn nearest_into(&self, query: &[f32], buf: &mut [f32]) -> Option<u32> {
         self.distances_into(query, buf);
         let distances: &[f32] = buf;
@@ -1007,6 +1021,13 @@ impl L2Prepared {
     }
 
     /// Return the index of the nearest target to `query`.
+    ///
+    /// `query` must have length `dimension`.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the conditions [`Self::distances_into`] documents, with the
+    /// same debug/release behavior.
     pub fn nearest(&self, query: &[f32]) -> Option<u32> {
         self.nearest_into(query, &mut vec![0.0f32; self.num_targets])
     }
@@ -1042,8 +1063,9 @@ pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
 ///
 /// # Panics
 ///
-/// Panics if `from.len() != dimension`, if `to.len()` is not a multiple of
-/// `dimension`, or if `output.len() != to.len() / dimension`.
+/// The implementations in this crate panic if `dimension == 0`, if
+/// `from.len() != dimension`, if `to.len()` is not a multiple of `dimension`,
+/// or if `output.len() != to.len() / dimension`.
 ///
 /// ```
 /// # use lance_linalg::distance::l2_distance_batch_into;
