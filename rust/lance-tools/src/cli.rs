@@ -20,6 +20,8 @@ pub struct LanceToolsArgs {
 pub enum LanceToolsCommand {
     /// Commands for interacting with Lance files.
     File(LanceFileArgs),
+    /// Commands for interacting with Lance tables.
+    Table(LanceTableArgs),
     /// Commands for inspecting and recovering Lance datasets.
     Dataset(LanceDatasetArgs),
 }
@@ -135,9 +137,28 @@ pub enum LanceFileCommand {
     Meta(LanceFileMetaArgs),
 }
 
+#[derive(Parser, Debug)]
+pub struct LanceTableArgs {
+    #[command(subcommand)]
+    command: LanceTableCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LanceTableCommand {
+    /// Display Lance table manifest contents.
+    Manifest(LanceTableManifestArgs),
+}
+
 #[derive(Args, Debug)]
 pub struct LanceFileMetaArgs {
     // The Lance file to examine.
+    #[arg(short = 's', long, value_name = "source")]
+    pub(crate) source: String,
+}
+
+#[derive(Args, Debug)]
+pub struct LanceTableManifestArgs {
+    /// The Lance manifest file to examine.
     #[arg(short = 's', long, value_name = "source")]
     pub(crate) source: String,
 }
@@ -159,6 +180,11 @@ impl LanceToolsArgs {
                     crate::dataset::locate_data_file(writer, args).await
                 }
                 LanceDatasetCommand::Restore(args) => crate::dataset::restore(writer, args).await,
+            },
+            LanceToolsCommand::Table(args) => match &args.command {
+                LanceTableCommand::Manifest(args) => {
+                    crate::manifest::show_table_manifest(writer, args).await
+                }
             },
         }
     }

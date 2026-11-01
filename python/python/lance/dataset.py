@@ -6322,6 +6322,52 @@ class SqlQueryBuilder:
         self._builder = self._builder.blob_handling(blob_handling)
         return self
 
+    def register_arrow(
+        self, name: str, data: Union[pa.Table, pa.RecordBatchReader]
+    ) -> "SqlQueryBuilder":
+        """
+        Register an in-memory Arrow relation that the query can join.
+
+        The relation is exposed under ``name`` and can be referenced like any
+        other table in the SQL (for example joined or used in a subquery). It
+        must be non-empty, since the schema is derived from the provided data.
+        The input is fully materialized in memory when this method is called,
+        so ``data`` must be bounded to available memory.
+
+        ``name`` is parsed as a SQL identifier, so an unquoted name is lowercased
+        (``IDs`` registers the table ``ids``) while a quoted one keeps its case
+        (``"IDs"``). If two names resolve to the same table, the later
+        registration wins. A name that resolves to the query's own
+        :meth:`table_name` would hide the dataset and is rejected.
+
+        Registered names are validated when the query is executed, not when
+        :meth:`build` returns, so a rejected name raises from
+        :meth:`SqlQuery.to_batch_records` (as ``ValueError``) or
+        :meth:`SqlQuery.to_stream_reader` (as ``OSError``).
+
+        Parameters
+        ----------
+        name: str
+            The name the relation is registered under in the query.
+        data: pyarrow.Table or pyarrow.RecordBatchReader
+            The in-memory relation to register. Must be non-empty.
+
+        Examples
+        --------
+        Register an in-memory relation and semi-join it in the query::
+
+            ids = pa.table({"id": [1, 2, 3]})
+            batches = (
+                dataset.sql("SELECT * FROM d WHERE id IN (SELECT id FROM ids)")
+                .table_name("d")
+                .register_arrow("ids", ids)
+                .build()
+                .to_batch_records()
+            )
+        """
+        self._builder = self._builder.register_arrow(name, data)
+        return self
+
     def batch_size(self, batch_size: int) -> "SqlQueryBuilder":
         """
         Set the maximum number of rows produced by each query batch.
