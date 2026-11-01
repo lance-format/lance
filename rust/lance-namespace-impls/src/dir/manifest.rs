@@ -684,25 +684,23 @@ impl ManifestStreamMutation for DeleteObjectMutation {
     }
 }
 
-/// Replace one object's identity in a single manifest rewrite: the source row is
-/// dropped and the destination row is written in the same commit, so a rename is
-/// never observable as two live names for one location.
+/// Replace one object's identity in a single manifest rewrite.
+///
+/// The destination row copies every non-identity field from the source row observed by
+/// the rewrite, so a concurrent metadata or location update is not replaced with a
+/// stale snapshot taken before the commit.
 struct RenameObjectMutation {
     source_object_id: String,
-    destination: ManifestEntry,
-    /// View dependencies carried over from the source row, which is the only place
-    /// they are known.
-    base_objects: Option<Vec<String>>,
-    source_found: bool,
+    destination_object_id: String,
+    source_row: Option<ManifestRowValue>,
 }
 
 impl RenameObjectMutation {
-    fn new(source_object_id: String, destination: ManifestEntry) -> Self {
+    fn new(source_object_id: String, destination_object_id: String) -> Self {
         Self {
             source_object_id,
-            destination,
-            base_objects: None,
-            source_found: false,
+            destination_object_id,
+            source_row: None,
         }
     }
 }
@@ -717,12 +715,11 @@ impl ManifestStreamMutation for RenameObjectMutation {
         index_data: &mut ManifestIndexAccumulator,
     ) -> Result<()> {
         if row.object_id == self.source_object_id {
-            self.source_found = true;
-            self.base_objects = row.base_objects;
+            self.source_row = Some(row);
             return Ok(());
         }
 
-        if row.object_id == self.destination.object_id {
+        if row.object_id == self.destination_object_id {
             return Err(NamespaceError::ConcurrentModification {
                 message: format!(
                     "Object '{}' was concurrently created by another operation",
@@ -749,12 +746,18 @@ impl ManifestStreamMutation for RenameObjectMutation {
         output: &mut ManifestBatchBuilder,
         index_data: &mut ManifestIndexAccumulator,
     ) -> Result<()> {
-        if !self.source_found {
+        let source_row =
+            self.source_row
+                .take()
+                .ok_or_else(|| NamespaceError::ConcurrentModification {
+                    message: format!(
+                        "Object '{}' was concurrently removed by another operation",
+                        self.source_object_id
+                    ),
+                })?;
+        if source_row.object_type != ObjectType::Table {
             return Err(NamespaceError::ConcurrentModification {
-                message: format!(
-                    "Object '{}' was concurrently removed by another operation",
-                    self.source_object_id
-                ),
+                message: format!("Object '{}' is no longer a table", self.source_object_id),
             }
             .into());
         }
@@ -762,11 +765,11 @@ impl ManifestStreamMutation for RenameObjectMutation {
         output.append(
             index_data,
             ManifestOutputRow {
-                object_id: &self.destination.object_id,
-                object_type: self.destination.object_type,
-                location: self.destination.location.as_deref(),
-                metadata: self.destination.metadata.as_deref(),
-                base_objects: self.base_objects.as_deref(),
+                object_id: &self.destination_object_id,
+                object_type: source_row.object_type,
+                location: source_row.location.as_deref(),
+                metadata: source_row.metadata.as_deref(),
+                base_objects: source_row.base_objects.as_deref(),
             },
         )
     }
@@ -778,7 +781,7 @@ impl ManifestStreamMutation for RenameObjectMutation {
     fn conflict_resolution(&self) -> ConflictResolution<Self::Output> {
         // The new name must still be free after losing a commit race; re-applying against
         // the latest manifest is otherwise safe.
-        ConflictResolution::FailIfExists(vec![self.destination.object_id.clone()])
+        ConflictResolution::FailIfExists(vec![self.destination_object_id.clone()])
     }
 }
 
@@ -1060,38 +1063,6 @@ fn convert_lance_commit_error(e: &LanceError, operation: &str, object_id: Option
             })
         }
     }
-}
-
-/// Recursively copy every object under `source_dir` to the corresponding path under
-/// `destination_dir`, preserving the relative layout of each file.
-pub(crate) async fn copy_dir_all(
-    object_store: &ObjectStore,
-    source_dir: &Path,
-    destination_dir: &Path,
-) -> Result<()> {
-    let mut entries = object_store.list(Some(source_dir.clone()));
-    while let Some(meta) = entries.try_next().await? {
-        let source_file = meta.location;
-        let Some(relative_parts) = source_file.prefix_match(source_dir) else {
-            continue;
-        };
-        let mut destination_file = destination_dir.clone();
-        for part in relative_parts {
-            destination_file = destination_file.join(part);
-        }
-        object_store
-            .copy(&source_file, &destination_file)
-            .await
-            .map_err(|e| {
-                lance_core::Error::from(NamespaceError::Internal {
-                    message: format!(
-                        "Failed to copy {} to {}: {:?}",
-                        source_file, destination_file, e
-                    ),
-                })
-            })?;
-    }
-    Ok(())
 }
 
 impl ManifestNamespace {
@@ -2828,83 +2799,12 @@ impl ManifestNamespace {
     async fn rename_in_manifest(
         &self,
         source_object_id: &str,
-        destination: ManifestEntry,
+        destination_object_id: String,
     ) -> Result<()> {
         self.rewrite_manifest("Failed to rename in manifest", || {
-            RenameObjectMutation::new(source_object_id.to_string(), destination.clone())
+            RenameObjectMutation::new(source_object_id.to_string(), destination_object_id.clone())
         })
         .await
-    }
-
-    /// Drop a directory staged for an operation that then failed. The directory is
-    /// unreferenced by any commit, so a failed cleanup only wastes storage.
-    async fn discard_staged_directory(&self, staged_dir: &Path) {
-        if let Err(err) = self.object_store.remove_dir_all(staged_dir.clone()).await {
-            log::warn!(
-                "Failed to remove staged directory '{}' after an aborted operation: {:?}",
-                staged_dir,
-                err
-            );
-        }
-    }
-
-    /// Undo a committed rename whose data copy failed, returning the error to report.
-    ///
-    /// The destination name is owned by this caller at this point, so removing its
-    /// directory cannot destroy another writer's data. If either step of the rollback
-    /// fails the returned error says so, because the catalog is then left naming a
-    /// destination that holds no data.
-    async fn roll_back_rename(
-        &self,
-        destination_object_id: &str,
-        source_object_id: &str,
-        source_info: &TableInfo,
-        destination_dir: &Path,
-        copy_err: LanceError,
-    ) -> LanceError {
-        let mut rollback_failure = None;
-        if let Err(err) = self
-            .object_store
-            .remove_dir_all(destination_dir.clone())
-            .await
-        {
-            rollback_failure = Some(format!("removing '{}' failed: {:?}", destination_dir, err));
-        }
-
-        let source_entry = match Self::serialize_metadata(
-            source_info.metadata.as_ref(),
-            "table",
-            source_object_id,
-        ) {
-            Ok(metadata) => ManifestEntry {
-                object_id: source_object_id.to_string(),
-                object_type: ObjectType::Table,
-                location: Some(source_info.location.clone()),
-                metadata,
-            },
-            Err(err) => return err,
-        };
-        if let Err(err) = self
-            .rename_in_manifest(destination_object_id, source_entry)
-            .await
-        {
-            rollback_failure = Some(match rollback_failure {
-                Some(previous) => format!("{}; restoring the catalog failed: {:?}", previous, err),
-                None => format!("restoring the catalog failed: {:?}", err),
-            });
-        }
-
-        match rollback_failure {
-            None => copy_err,
-            Some(failure) => NamespaceError::Internal {
-                message: format!(
-                    "Failed to copy table data while renaming '{}' to '{}' ({:?}), and the \
-                     rollback did not complete: {}. The namespace needs manual repair.",
-                    source_object_id, destination_object_id, copy_err, failure
-                ),
-            }
-            .into(),
-        }
     }
 
     /// Register a table in the manifest without creating the physical table (internal helper for migration)
@@ -3798,15 +3698,17 @@ impl LanceNamespace for ManifestNamespace {
         let (source_namespace, _) = Self::split_object_id(table_id);
         let source_object_id = Self::str_object_id(table_id);
 
-        let source_info = self
+        let source_exists = self
             .query_manifest_for_table(&source_object_id)
             .boxed()
             .await?
-            .ok_or_else(|| {
-                lance_core::Error::from(NamespaceError::TableNotFound {
-                    message: Self::format_table_id(table_id),
-                })
-            })?;
+            .is_some();
+        if !source_exists {
+            return Err(NamespaceError::TableNotFound {
+                message: Self::format_table_id(table_id),
+            }
+            .into());
+        }
 
         // Default to the source namespace when no destination namespace is provided.
         let destination_namespace = match request.new_namespace_id.as_ref() {
@@ -3832,123 +3734,15 @@ impl LanceNamespace for ManifestNamespace {
             .into());
         }
 
-        // Refuse an unwritable manifest before copying anything, so a rejected rename
-        // leaves no orphaned copy behind.
+        // Refuse an unwritable manifest before changing any catalog state.
         self.ensure_manifest_writable().boxed().await?;
 
-        // Root tables in directory-listing mode are resolved by directory name, so their
-        // directory *is* the published table: it appears to readers as soon as it is
-        // written, before any catalog commit can vet it. Every other destination gets a
-        // generated directory name that no reader can find until the catalog points at it.
-        let destination_is_dir_listed =
-            destination_namespace.is_empty() && self.dir_listing_enabled;
-        // Choose the destination directory the same way create_table does so the
-        // physical layout stays consistent with how tables are otherwise created.
-        let destination_dir_name = if destination_is_dir_listed {
-            // Copying into a prefix that still holds objects would interleave two datasets
-            // under one name, so the name is only usable while the prefix is empty.
-            let dir_name = format!("{}.lance", request.new_table_name);
-            let dir_path = self.base_path.clone().join(dir_name.as_str());
-            if self
-                .object_store
-                .list(Some(dir_path))
-                .try_next()
-                .boxed()
-                .await?
-                .is_some()
-            {
-                return Err(NamespaceError::TableAlreadyExists {
-                    message: format!(
-                        "{}: directory '{}' is not empty, remove it before renaming into it",
-                        request.new_table_name, dir_name
-                    ),
-                }
-                .into());
-            }
-            dir_name
-        } else {
-            Self::generate_dir_name(&destination_object_id)
-        };
-
-        let source_dir = self.base_path.clone().join(source_info.location.as_str());
-        let destination_dir = self.base_path.clone().join(destination_dir_name.as_str());
-        // Retiring the old name and publishing the new one is a single manifest commit:
-        // two commits would expose both names at once, and a failure between them would
-        // leave the extra alias behind for good.
-        let metadata = Self::serialize_metadata(
-            source_info.metadata.as_ref(),
-            "table",
-            &destination_object_id,
-        )?;
-        let destination_entry = ManifestEntry {
-            object_id: destination_object_id.clone(),
-            object_type: ObjectType::Table,
-            location: Some(destination_dir_name),
-            metadata,
-        };
-
-        if destination_is_dir_listed {
-            // The commit goes first, because the copy is what publishes this destination
-            // and a rejected commit must not leave a readable table behind. Claiming the
-            // name also locks out concurrent renames and creates, so the copy below owns
-            // the directory and can be rolled back without destroying another writer's
-            // data. Until the copy lands the source directory is still listed, so the
-            // table keeps its old name rather than disappearing.
-            self.rename_in_manifest(&source_object_id, destination_entry)
-                .boxed()
-                .await?;
-
-            if let Err(copy_err) = copy_dir_all(&self.object_store, &source_dir, &destination_dir)
-                .boxed()
-                .await
-            {
-                return Err(self
-                    .roll_back_rename(
-                        &destination_object_id,
-                        &source_object_id,
-                        &source_info,
-                        &destination_dir,
-                        copy_err,
-                    )
-                    .boxed()
-                    .await);
-            }
-        } else {
-            // The copy goes first, into a directory no reader can name yet, so a rejected
-            // commit leaves nothing but unreferenced files behind.
-            if let Err(copy_err) = copy_dir_all(&self.object_store, &source_dir, &destination_dir)
-                .boxed()
-                .await
-            {
-                self.discard_staged_directory(&destination_dir)
-                    .boxed()
-                    .await;
-                return Err(copy_err);
-            }
-
-            if let Err(commit_err) = self
-                .rename_in_manifest(&source_object_id, destination_entry)
-                .boxed()
-                .await
-            {
-                self.discard_staged_directory(&destination_dir)
-                    .boxed()
-                    .await;
-                return Err(commit_err);
-            }
-        }
-
-        // The rename is committed; the source directory is now unreferenced garbage.
-        // Failing to delete it wastes storage but does not undo the rename, so it is
-        // logged rather than reported as a failed rename.
-        if let Err(err) = self.object_store.remove_dir_all(source_dir).boxed().await {
-            log::warn!(
-                "Renamed table '{}' but failed to remove its old directory '{}': {:?}",
-                source_object_id,
-                source_info.location,
-                err
-            );
-        }
+        // Moving the row is the whole rename. The source location remains the table's
+        // storage, so aliases of the same path stay valid and readers already holding
+        // that URI keep working.
+        self.rename_in_manifest(&source_object_id, destination_object_id)
+            .boxed()
+            .await?;
 
         Ok(RenameTableResponse::new())
     }
@@ -5574,6 +5368,105 @@ mod tests {
         let mut tables = reader.list_tables(list_request).await.unwrap().tables;
         tables.sort();
         assert_eq!(tables, vec!["t1", "t2", "t3", "t4"]);
+    }
+
+    #[tokio::test]
+    async fn test_rename_mutation_uses_latest_source_row() {
+        let temp_dir = TempStdDir::default();
+        let manifest_ns = create_manifest_namespace(temp_dir.to_str().unwrap(), false).await;
+
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: "source".to_string(),
+                    object_type: ObjectType::Table,
+                    location: Some("initial.lance".to_string()),
+                    metadata: Some(r#"{"version":"initial"}"#.to_string()),
+                }],
+                Some(vec!["initial_base".to_string()]),
+            )
+            .await
+            .unwrap();
+        let initial = manifest_ns
+            .query_manifest_for_table("source")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial.location, "initial.lance");
+
+        manifest_ns
+            .upsert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: "source".to_string(),
+                    object_type: ObjectType::Table,
+                    location: Some("latest.lance".to_string()),
+                    metadata: Some(r#"{"version":"latest"}"#.to_string()),
+                }],
+                Some(vec!["latest_base".to_string()]),
+            )
+            .await
+            .unwrap();
+
+        manifest_ns
+            .rename_in_manifest("source", "destination".to_string())
+            .await
+            .unwrap();
+
+        let renamed = manifest_ns
+            .query_manifest_for_table("destination")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(renamed.location, "latest.lance");
+        assert_eq!(
+            renamed.metadata,
+            Some(HashMap::from([(
+                "version".to_string(),
+                "latest".to_string()
+            )]))
+        );
+        assert_eq!(
+            manifest_base_objects(&manifest_ns).await["destination"],
+            Some(vec!["latest_base".to_string()])
+        );
+        assert!(
+            manifest_ns
+                .query_manifest_for_table("source")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_mutation_rejects_source_replaced_by_namespace() {
+        let temp_dir = TempStdDir::default();
+        let manifest_ns = create_manifest_namespace(temp_dir.to_str().unwrap(), false).await;
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: "source".to_string(),
+                    object_type: ObjectType::Namespace,
+                    location: None,
+                    metadata: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+
+        let error = manifest_ns
+            .rename_in_manifest("source", "destination".to_string())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("is no longer a table"));
+        assert!(
+            manifest_ns
+                .query_manifest_for_table("destination")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
