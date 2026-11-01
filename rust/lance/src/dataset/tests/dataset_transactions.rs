@@ -8,17 +8,23 @@ use std::vec;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, UpdateMode, UpdatedFragmentOffsets};
 use crate::dataset::{
-    ColumnAlteration, ManifestWriteConfig, NewColumnTransform, TRANSACTIONS_DIR, UpdateBuilder,
-    write_manifest_file,
+    ColumnAlteration, ManifestWriteConfig, NewColumnTransform, ReadParams, TRANSACTIONS_DIR,
+    UpdateBuilder, write_manifest_file,
 };
 use crate::io::ObjectStoreParams;
 use crate::session::Session;
 use crate::{Dataset, Result};
 use lance_file::version::LanceFileVersion;
 use lance_table::feature_flags::{FLAG_COVERED_INDEX_METADATA, FLAG_ROW_ADDR_INDICES};
-use lance_table::format::IndexMetadata;
-use lance_table::io::commit::ManifestNamingScheme;
+use lance_table::format::{IndexMetadata, Manifest, Transaction as ManifestTransaction};
+use lance_table::io::commit::{
+    CommitError, CommitHandler, ConditionalPutCommitHandler, ManifestLocation,
+    ManifestNamingScheme, ManifestWriter,
+};
+use object_store::path::Path;
 use roaring::RoaringBitmap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
@@ -1423,6 +1429,232 @@ async fn test_spilled_restore_and_deep_clone_read_own_transaction() {
     assert!(cloned.manifest.transaction_section.is_none());
     assert_ne!(cloned.manifest.transaction_file, source_tx_file);
     assert_eq!(cloned.read_transaction().await.unwrap().unwrap(), clone_tx);
+}
+
+async fn restore_fence_dataset() -> (TempStrDir, Dataset) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let first = record_batch!(("id", Int32, [1])).unwrap();
+    let second = record_batch!(("id", Int32, [2])).unwrap();
+    let dir = TempStrDir::default();
+    Dataset::write(
+        RecordBatchIterator::new([Ok(first)], schema.clone()),
+        &dir,
+        None,
+    )
+    .await
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(second)], schema),
+        &dir,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.version().version, 2);
+    (dir, dataset)
+}
+
+#[tokio::test]
+async fn test_restore_from_requires_the_expected_latest_version() {
+    let (dir, _) = restore_fence_dataset().await;
+    let mut target = reopen(&dir).await.checkout_version(1).await.unwrap();
+
+    target.restore_from(2).await.unwrap();
+
+    assert_eq!(target.version().version, 3);
+    let restored = reopen(&dir).await;
+    assert_eq!(restored.version().version, 3);
+    assert_eq!(restored.count_rows(None).await.unwrap(), 1);
+    let batch = restored.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch["id"].as_primitive::<Int32Type>().values(), &[1]);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConcurrentCommit {
+    UpdateConfig,
+    Merge,
+}
+
+#[rstest::rstest]
+#[case::update_config(ConcurrentCommit::UpdateConfig)]
+#[case::merge(ConcurrentCommit::Merge)]
+#[tokio::test]
+async fn test_restore_from_rejects_a_concurrent_commit(#[case] commit: ConcurrentCommit) {
+    let (dir, _) = restore_fence_dataset().await;
+    let mut target = reopen(&dir).await.checkout_version(1).await.unwrap();
+    let mut writer = reopen(&dir).await;
+    match commit {
+        ConcurrentCommit::UpdateConfig => {
+            writer
+                .update_schema_metadata([("restore_fence", "advanced")])
+                .await
+                .unwrap();
+        }
+        ConcurrentCommit::Merge => {
+            writer
+                .add_columns(
+                    NewColumnTransform::SqlExpressions(vec![(
+                        "added".to_string(),
+                        "id + 10".to_string(),
+                    )]),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    let error = target.restore_from(2).await.unwrap_err();
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { version: 2, .. }),
+        "restore must return a retryable conflict: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("latest version advanced"),
+        "{error}"
+    );
+
+    let latest = reopen(&dir).await;
+    assert_eq!(latest.version().version, 3);
+    assert_eq!(latest.count_rows(None).await.unwrap(), 2);
+    match commit {
+        ConcurrentCommit::UpdateConfig => {
+            assert_eq!(
+                latest
+                    .schema()
+                    .metadata
+                    .get("restore_fence")
+                    .map(String::as_str),
+                Some("advanced")
+            );
+        }
+        ConcurrentCommit::Merge => {
+            assert!(latest.schema().field("added").is_some());
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GateNextCommitHandler {
+    inner: Arc<dyn CommitHandler>,
+    gate_next: AtomicBool,
+    entered: Notify,
+    release: Notify,
+}
+
+impl GateNextCommitHandler {
+    fn arm(&self) {
+        self.gate_next.store(true, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl CommitHandler for GateNextCommitHandler {
+    fn is_version_not_found_definitive(&self) -> bool {
+        self.inner.is_version_not_found_definitive()
+    }
+
+    fn propagate_commit_error_after_success(&self) -> bool {
+        self.inner.propagate_commit_error_after_success()
+    }
+
+    async fn commit(
+        &self,
+        manifest: &mut Manifest,
+        indices: Option<Vec<IndexMetadata>>,
+        base_path: &Path,
+        object_store: &lance_io::object_store::ObjectStore,
+        manifest_writer: ManifestWriter,
+        naming_scheme: ManifestNamingScheme,
+        transaction: Option<ManifestTransaction>,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        if self.gate_next.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.inner
+            .commit(
+                manifest,
+                indices,
+                base_path,
+                object_store,
+                manifest_writer,
+                naming_scheme,
+                transaction,
+            )
+            .await
+    }
+}
+
+/// Once the restore has checked its predecessor, a commit that wins the next
+/// version must make the restore conflict instead of rebasing to a later
+/// version.
+#[tokio::test]
+async fn test_restore_from_does_not_rebase_after_predecessor_validation() {
+    let (dir, _) = restore_fence_dataset().await;
+    let handler = Arc::new(GateNextCommitHandler {
+        inner: Arc::new(ConditionalPutCommitHandler),
+        gate_next: AtomicBool::new(false),
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    handler.arm();
+
+    let restore_handler: Arc<dyn CommitHandler> = handler.clone();
+    let mut target = DatasetBuilder::from_uri(&dir)
+        .with_read_params(ReadParams {
+            commit_handler: Some(restore_handler),
+            ..Default::default()
+        })
+        .load()
+        .await
+        .unwrap()
+        .checkout_version(1)
+        .await
+        .unwrap();
+
+    let restore = tokio::spawn(async move { target.restore_from(2).await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        handler.entered.notified(),
+    )
+    .await
+    .expect("restore must reach publication");
+
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    Dataset::write(
+        RecordBatchIterator::new([Ok(record_batch!(("id", Int32, [3])).unwrap())], schema),
+        &dir,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    handler.release.notify_one();
+    let error = restore.await.unwrap().unwrap_err();
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { version: 3, .. }),
+        "restore must not rebase after validation: {error:?}"
+    );
+
+    let latest = reopen(&dir).await;
+    assert_eq!(latest.version().version, 3);
+    assert_eq!(latest.count_rows(None).await.unwrap(), 3);
 }
 
 /// Partial RewriteColumns refresh in `build_manifest`: only matched physical

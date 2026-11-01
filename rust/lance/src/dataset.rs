@@ -1590,6 +1590,53 @@ impl Dataset {
         Ok(())
     }
 
+    /// Restore the currently checked out version if `expected_latest_version`
+    /// is still the dataset's latest version.
+    ///
+    /// Unlike [`Self::restore`], this method never rebases across commits that
+    /// landed after the caller inspected the table. If the latest version
+    /// changed, or another writer publishes while this restore is being built,
+    /// the commit fails with a retryable conflict and the caller must reload
+    /// and validate the new snapshot before trying again.
+    ///
+    /// The restore is published through this dataset's installed commit
+    /// handler, including namespace-managed version registration.
+    ///
+    /// # Arguments
+    ///
+    /// * `expected_latest_version` - The latest version the caller observed
+    ///   and validated before deciding to restore.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let expected_latest_version = dataset.latest_version_id().await?;
+    /// let mut restore_target = dataset.checkout_version(3).await?;
+    /// restore_target
+    ///     .restore_from(expected_latest_version)
+    ///     .await?;
+    /// # Ok(())
+    /// }
+    /// ```
+    pub async fn restore_from(&mut self, expected_latest_version: u64) -> Result<()> {
+        let transaction = Transaction::new(
+            expected_latest_version,
+            Operation::Restore {
+                version: self.manifest.version,
+            },
+            None,
+        );
+        self.apply_commit_with_expected_latest_version(
+            transaction,
+            &Default::default(),
+            &Default::default(),
+            Some(expected_latest_version),
+        )
+        .await
+    }
+
     /// Removes old versions of the dataset from disk
     ///
     /// This function will remove all versions of the dataset that are older than the provided
@@ -1806,6 +1853,22 @@ impl Dataset {
         write_config: &ManifestWriteConfig,
         commit_config: &CommitConfig,
     ) -> Result<()> {
+        self.apply_commit_with_expected_latest_version(
+            transaction,
+            write_config,
+            commit_config,
+            None,
+        )
+        .await
+    }
+
+    async fn apply_commit_with_expected_latest_version(
+        &mut self,
+        transaction: Transaction,
+        write_config: &ManifestWriteConfig,
+        commit_config: &CommitConfig,
+        expected_latest_version: Option<u64>,
+    ) -> Result<()> {
         // Keep the retry and rebase state machine out of every caller's future.
         let (manifest, manifest_location) = Box::pin(commit_transaction(
             self,
@@ -1817,6 +1880,7 @@ impl Dataset {
             default_commit_retry_timeout(),
             self.manifest_location.naming_scheme,
             None,
+            expected_latest_version,
         ))
         .await?;
 
