@@ -4,7 +4,6 @@ from pathlib import Path
 
 import yaml
 
-
 ROOT = Path(__file__).parent.parent
 LABELER_CONFIG = ROOT / ".github" / "labeler-area.yml"
 EXECUTION_PROTO_PATHS = {
