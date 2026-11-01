@@ -538,6 +538,7 @@ impl MemTableFlusher {
                 dataset.version().version,
                 &dv,
                 dataset.object_store.as_ref(),
+                dataset.inline_deletions_max_bytes()?,
             )
             .await?;
             let fragments = Arc::make_mut(&mut manifest.fragments);

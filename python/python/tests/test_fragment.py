@@ -6,6 +6,7 @@ import multiprocessing
 import pickle
 import uuid
 from pathlib import Path
+from unittest import mock
 
 import lance
 import pandas as pd
@@ -24,6 +25,7 @@ from lance.debug import format_fragment
 from lance.file import LanceFileReader, LanceFileWriter
 from lance.fragment import RowIdMeta, RowIdSequence, write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
+from pyarrow.fs import FileInfo, FileType
 
 
 def test_write_fragment(tmp_path: Path):
@@ -320,6 +322,53 @@ def test_dataset_progress(tmp_path: Path):
     with open(progress_uri / "fragment_1.json") as f:
         metadata = json.load(f)
     assert metadata["id"] == 1
+
+
+def test_file_system_progress_clears_marker_of_last_file(tmp_path: Path):
+    progress_uri = tmp_path / "progress"
+    dataset = write_dataset(
+        pa.table({"a": range(7)}),
+        tmp_path / "dataset",
+        max_rows_per_file=5,
+        progress=FileSystemFragmentWriteProgress(progress_uri),
+    )
+
+    assert len(dataset.get_fragments()) == 2
+    assert list(progress_uri.glob("*.in_progress")) == []
+    assert (progress_uri / "fragment_0.json").exists()
+
+
+def test_file_system_progress_shared_directory(tmp_path: Path):
+    fragment = FragmentMetadata(id=0, files=[], physical_rows=0)
+    marker = tmp_path / "fragment_0.in_progress"
+    first = FileSystemFragmentWriteProgress(tmp_path)
+    second = FileSystemFragmentWriteProgress(tmp_path)
+
+    first.begin(fragment)
+    second.begin(fragment)
+    assert marker.exists()
+    first.complete(fragment)
+    assert not marker.exists()
+    # The marker is already gone: the second writer must not fail for that.
+    second.complete(fragment)
+
+
+def test_file_system_progress_tolerates_only_a_missing_marker(tmp_path: Path):
+    fragment = FragmentMetadata(id=0, files=[], physical_rows=0)
+    progress = FileSystemFragmentWriteProgress(tmp_path)
+    progress.begin(fragment)
+
+    # Another writer can recreate the marker right after this delete failed, so
+    # the error alone decides: looking at the marker afterwards would be a race.
+    progress._fs = mock.Mock(
+        delete_file=mock.Mock(side_effect=FileNotFoundError("gone")),
+        get_file_info=mock.Mock(return_value=FileInfo("marker", FileType.File)),
+    )
+    progress.complete(fragment)
+
+    progress._fs = mock.Mock(delete_file=mock.Mock(side_effect=PermissionError("no")))
+    with pytest.raises(PermissionError, match="no"):
+        progress.complete(fragment)
 
 
 def test_fragment_meta():
