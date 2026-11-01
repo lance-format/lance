@@ -12,8 +12,8 @@
 //! the `IndexInformationProvider::fragment_bitmap` lookup) is general
 //! enough to be reused.
 //!
-//! Two rewritten shapes are emitted depending on whether the scalar index
-//! backing the filter covers every fragment targeted by the scan.
+//! Two rewritten shapes are emitted depending on index coverage and whether
+//! the scan is limited to indexed fragments.
 //!
 //! **Full coverage** (index ⊇ targeted fragments, or no filter at all):
 //!
@@ -22,8 +22,8 @@
 //!   └── CountFromMaskExec { prefilter_input = index_input }
 //! ```
 //!
-//! **Partial coverage** (index misses some targeted fragments — typically
-//! appended fragments):
+//! **Partial coverage without fast search** (index misses some targeted
+//! fragments — typically appended fragments):
 //!
 //! ```text
 //! AggregateExec(Final, aggs=[count(...)], group_by=[])
@@ -33,12 +33,14 @@
 //!               └── FilteredReadExec(fragments = unindexed, full_filter = …)
 //! ```
 //!
+//! For partially covered filters, fast searches omit the scan branch and
+//! restrict [`CountFromMaskExec`] to targeted fragments covered by the index.
+//!
 //! [`CountFromMaskExec`] emits partial-state, so the outer
 //! `AggregateExec(Final)` performs the final combine in either shape.
 //!
-//! If the prefilter's index coverage is unknown (any leaf is missing
-//! `fragment_bitmap`, e.g. constructed outside scanner planning), the rule
-//! refuses to fire and leaves the existing scan path in place.
+//! If the prefilter is not a [`ScalarIndexExec`] or any index leaf lacks a
+//! `fragment_bitmap`, the rule leaves the existing read plan in place.
 
 use std::sync::Arc;
 
@@ -65,8 +67,8 @@ use super::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use super::scalar_index::ScalarIndexExec;
 
 /// Physical optimizer rule that rewrites a `COUNT(*)`-style aggregate into
-/// [`CountFromMaskExec`], optionally splitting into a parallel scan branch
-/// when the index has partial coverage of the dataset.
+/// [`CountFromMaskExec`], adding a scan branch when the index has partial
+/// coverage of the targeted fragments and fast search is disabled.
 ///
 /// Only fires when the shape is verifiably safe; everything outside that
 /// envelope (GROUP BY, residual filters, scan ranges, etc.) is left alone
@@ -229,12 +231,11 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     let index_coverage = match &prefilter_input {
         None => None,
         Some(input) => {
-            let scalar_exec = input.downcast_ref::<ScalarIndexExec>().ok_or_else(|| {
-                datafusion::error::DataFusionError::Internal(
-                    "count_pushdown: FilteredReadExec.index_input is not a ScalarIndexExec"
-                        .to_string(),
-                )
-            })?;
+            // Only ScalarIndexExec exposes the expression and fragment coverage
+            // this rule requires to prove that counting from the mask is safe.
+            let Some(scalar_exec) = input.downcast_ref::<ScalarIndexExec>() else {
+                return Ok(None);
+            };
             if scalar_exec.expr().needs_recheck() {
                 return Ok(None);
             }
@@ -253,8 +254,9 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
     //    targeted fragment. Always safe.
     // 2. Prefilter + index covers every targeted fragment: single pushdown
     //    branch, prefilter feeds in directly.
-    // 3. Prefilter + index covers a strict subset of the target: split into
-    //    pushdown over indexed fragments + parallel scan over unindexed fragments.
+    // 3. Prefilter + index covers a strict subset of the target: pushdown over
+    //    indexed fragments, plus a scan over unindexed fragments unless fast
+    //    search excludes them.
     let (partial_stream, partial_state_schema): (Arc<dyn ExecutionPlan>, _) = match index_coverage {
         None => {
             // No prefilter at all (verified above): nothing to restrict.
@@ -280,13 +282,12 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
             (Arc::new(exec), schema)
         }
         Some(coverage) => {
-            // Split plan: CountFromMaskExec for the targeted indexed fragments,
-            // a normal scan + AggregateExec(Partial) for the targeted remainder.
+            // Restrict the pushdown to targeted indexed fragments. Add a scan
+            // for the remainder below unless fast search excludes them.
             let covered = &target_fragments & &coverage;
             if covered.is_empty() {
                 return Ok(None);
             }
-            let uncovered = &target_fragments - &coverage;
             let pushdown_exec = CountFromMaskExec::try_new_restricted(
                 dataset,
                 aggr_exprs.clone(),
@@ -295,11 +296,17 @@ fn try_rewrite(agg: &AggregateExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> 
             )?;
             let partial_state_schema = pushdown_exec.schema();
             let pushdown_branch: Arc<dyn ExecutionPlan> = Arc::new(pushdown_exec);
-            let scan_branch =
-                build_scan_branch(filtered_read, options, &uncovered, aggr_exprs.clone())?;
-            let union: Arc<dyn ExecutionPlan> =
-                UnionExec::try_new(vec![pushdown_branch, scan_branch])?;
-            (union, partial_state_schema)
+            // A fast search skips the fragments the index does not cover.
+            if options.only_indexed_fragments {
+                (pushdown_branch, partial_state_schema)
+            } else {
+                let uncovered = &target_fragments - &coverage;
+                let scan_branch =
+                    build_scan_branch(filtered_read, options, &uncovered, aggr_exprs.clone())?;
+                let union: Arc<dyn ExecutionPlan> =
+                    UnionExec::try_new(vec![pushdown_branch, scan_branch])?;
+                (union, partial_state_schema)
+            }
         }
     };
 
@@ -468,10 +475,13 @@ mod tests {
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion::physical_plan::{ExecutionPlan, displayable};
     use futures::TryStreamExt;
+    use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::gen_batch;
     use lance_index::IndexType;
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+    use lance_select::{RowAddrMask, RowAddrTreeMap};
+    use rstest::rstest;
 
     use super::*;
     use crate::Dataset;
@@ -655,31 +665,10 @@ mod tests {
 
     #[tokio::test]
     async fn rule_emits_split_plan_for_partial_index_coverage() {
-        // Build index over 4 fragments, then append a 5th — the index now
-        // covers a strict subset of the dataset. The rule must split into a
-        // pushdown branch over the indexed fragments and a scan branch over
-        // the rest, then sum the partials.
+        // Appending a fifth fragment leaves it unindexed: normal counts must
+        // scan it, while fast searches must exclude it.
         use crate::dataset::WriteParams;
-        let tmp = TempStrDir::default();
-        let mut dataset = gen_batch()
-            .col("ordered", lance_datagen::array::step::<UInt64Type>())
-            .into_dataset(
-                tmp.as_str(),
-                FragmentCount::from(4),
-                FragmentRowCount::from(10),
-            )
-            .await
-            .unwrap();
-        dataset
-            .create_index(
-                &["ordered"],
-                IndexType::BTree,
-                None,
-                &ScalarIndexParams::default(),
-                true,
-            )
-            .await
-            .unwrap();
+        let fixture = make_fixture().await;
         let extra = gen_batch()
             .col("ordered", lance_datagen::array::step::<UInt64Type>())
             .into_reader_rows(
@@ -688,7 +677,7 @@ mod tests {
             );
         let dataset = Dataset::write(
             extra,
-            tmp.as_str(),
+            fixture.dataset.uri(),
             Some(WriteParams {
                 mode: crate::dataset::WriteMode::Append,
                 max_rows_per_file: 10,
@@ -749,6 +738,80 @@ mod tests {
         assert!(
             plan_contains_union(&plan),
             "expected a scan branch for the unindexed requested fragment: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+
+        let mut fast_search_scanner = dataset.scan();
+        fast_search_scanner
+            .fast_search()
+            .filter("ordered < 15")
+            .unwrap();
+        let (plan, count) = run_count(&mut fast_search_scanner).await;
+        assert_eq!(count, 15);
+        assert!(
+            plan_contains_pushdown(&plan),
+            "expected pushdown for a fast search: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+        assert!(
+            !plan_contains_union(&plan),
+            "a fast search must not add a scan branch for unindexed fragments: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+    }
+
+    #[rstest]
+    #[case::address_row_ids(false)]
+    #[case::stable_row_ids(true)]
+    #[tokio::test]
+    async fn rule_skips_a_row_id_selection(#[case] stable_row_ids: bool) {
+        // A row-id prefilter and a `_rowid IN` filter both become a
+        // OneShotExec index input, so count pushdown must leave the read in place.
+        use crate::dataset::WriteParams;
+        let dataset = gen_batch()
+            .col("ordered", lance_datagen::array::step::<UInt64Type>())
+            .into_ram_dataset_with_params(
+                FragmentCount::from(2),
+                FragmentRowCount::from(3),
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    enable_stable_row_ids: stable_row_ids,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        // Both selections are keyed in `_rowid` space: the row's position under
+        // stable row ids, its address otherwise.
+        let row_ids = [(0, 0), (0, 1), (1, 2)].map(|(fragment_id, row_offset)| {
+            if stable_row_ids {
+                u64::from(fragment_id * 3 + row_offset)
+            } else {
+                u64::from(RowAddress::new_from_parts(fragment_id, row_offset))
+            }
+        });
+        let mut scanner = dataset.scan();
+        scanner.with_row_id_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            row_ids,
+        )));
+        let (plan, count) = run_count(&mut scanner).await;
+        assert_eq!(count, 3);
+        assert!(
+            !plan_contains_pushdown(&plan),
+            "rule must not fire on a row-id prefilter, got plan: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+
+        let row_id_list = row_ids.map(|row_id| row_id.to_string()).join(", ");
+        let mut row_id_scanner = dataset.scan();
+        row_id_scanner
+            .filter(&format!("_rowid IN ({row_id_list})"))
+            .unwrap();
+        let (plan, count) = run_count(&mut row_id_scanner).await;
+        assert_eq!(count, 3);
+        assert!(
+            !plan_contains_pushdown(&plan),
+            "rule must not fire on a row-id selection, got plan: {}",
             displayable(plan.as_ref()).indent(true)
         );
     }

@@ -18,7 +18,9 @@ import com.google.common.base.MoreObjects;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -41,6 +43,8 @@ public class Index {
   private final Long sizeBytes;
   private final List<IndexFile> files;
   private final IndexType indexType;
+  private final Long clusteringId;
+  private final Map<String, String> metadata;
 
   private Index(
       UUID uuid,
@@ -55,7 +59,14 @@ public class Index {
       Integer baseId,
       Long sizeBytes,
       List<IndexFile> files,
-      IndexType indexType) {
+      IndexType indexType,
+      Long clusteringId,
+      Map<String, String> metadata) {
+    this.clusteringId = clusteringId;
+    this.metadata =
+        metadata == null
+            ? Collections.emptyMap()
+            : Collections.unmodifiableMap(new HashMap<>(metadata));
     this.uuid = uuid;
     this.fields = fields;
     this.coveringFields = coveringFields;
@@ -185,6 +196,28 @@ public class Index {
     return indexType;
   }
 
+  /**
+   * The clustering definition this segment was built under, by its id in the manifest. Changes to
+   * the same segment keep it; a segment built from this one does not inherit it. The value is
+   * within the unsigned 32-bit range.
+   *
+   * @return the clustering definition id, or empty when the segment has none
+   */
+  public Optional<Long> clusteringId() {
+    return Optional.ofNullable(clusteringId);
+  }
+
+  /**
+   * Generic metadata attached to this segment, like the dataset's table metadata. Changes to the
+   * same segment preserve every entry, including keys this library does not understand; new
+   * segments carry only what their creator sets.
+   *
+   * @return the metadata, never null; empty when there is none
+   */
+  public Map<String, String> metadata() {
+    return metadata;
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) return true;
@@ -202,7 +235,9 @@ public class Index {
         && Objects.equals(baseId, index.baseId)
         && Objects.equals(sizeBytes, index.sizeBytes)
         && Objects.equals(files, index.files)
-        && indexType == index.indexType;
+        && indexType == index.indexType
+        && Objects.equals(clusteringId, index.clusteringId)
+        && Objects.equals(metadata, index.metadata);
   }
 
   @Override
@@ -220,7 +255,9 @@ public class Index {
             sizeBytes,
             files,
             fragments,
-            indexType);
+            indexType,
+            clusteringId,
+            metadata);
     result = 31 * result + Arrays.hashCode(indexDetails);
     return result;
   }
@@ -239,6 +276,8 @@ public class Index {
         .add("baseId", baseId)
         .add("sizeBytes", sizeBytes)
         .add("files", files)
+        .add("clusteringId", clusteringId)
+        .add("metadata", metadata)
         .toString();
   }
 
@@ -266,6 +305,8 @@ public class Index {
     private Long sizeBytes;
     private List<IndexFile> files;
     private IndexType indexType;
+    private Long clusteringId;
+    private Map<String, String> metadata = Collections.emptyMap();
 
     private Builder() {}
 
@@ -334,6 +375,21 @@ public class Index {
       return this;
     }
 
+    /**
+     * The clustering definition id this segment was built under, or null for none. Must be within
+     * the unsigned 32-bit range.
+     */
+    public Builder clusteringId(Long clusteringId) {
+      this.clusteringId = clusteringId;
+      return this;
+    }
+
+    /** Generic metadata attached to this segment; null is treated as empty. */
+    public Builder metadata(Map<String, String> metadata) {
+      this.metadata = metadata;
+      return this;
+    }
+
     public Index build() {
       return new Index(
           uuid,
@@ -348,7 +404,9 @@ public class Index {
           baseId,
           sizeBytes,
           files,
-          indexType);
+          indexType,
+          clusteringId,
+          metadata);
     }
   }
 }

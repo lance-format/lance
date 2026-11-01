@@ -414,7 +414,7 @@ impl InvertedIndex {
     /// Expand fuzzy query tokens against all partitions in this segment.
     ///
     /// `params.max_expansions` caps the whole query's expansion, not any
-    /// single partition's: source terms at the same query position and their
+    /// single partition's: source terms in the same query group and their
     /// per-partition candidates merge into one lexicographically ordered set,
     /// and the remaining budget takes a prefix of it. The selected terms are
     /// a pure function of the segment's vocabulary, so changing source-token
@@ -424,15 +424,17 @@ impl InvertedIndex {
         let initial_capacity = tokens.len().min(params.max_expansions);
         let mut expanded_tokens = Vec::with_capacity(initial_capacity);
         let mut expanded_positions = Vec::with_capacity(initial_capacity);
+        let mut expanded_groups = Vec::with_capacity(initial_capacity);
         let mut seen = HashSet::new();
-        let mut source_terms_by_position = BTreeMap::<u32, Vec<&str>>::new();
+        let mut source_terms_by_group = BTreeMap::<u32, (u32, Vec<&str>)>::new();
         for token_idx in 0..tokens.len() {
-            source_terms_by_position
-                .entry(tokens.position(token_idx))
-                .or_default()
+            source_terms_by_group
+                .entry(tokens.position_for_query(token_idx, params.phrase_slop.is_some()))
+                .or_insert_with(|| (tokens.position(token_idx), Vec::new()))
+                .1
                 .push(tokens.get_token(token_idx));
         }
-        for (position, source_terms) in source_terms_by_position {
+        for (group, (position, source_terms)) in source_terms_by_group {
             let remaining = params.max_expansions.saturating_sub(expanded_tokens.len());
             if remaining == 0 {
                 break;
@@ -458,9 +460,10 @@ impl InvertedIndex {
                 if expanded_tokens.len() >= params.max_expansions {
                     break;
                 }
-                if seen.insert((candidate.clone(), position)) {
+                if seen.insert((candidate.clone(), group)) {
                     expanded_tokens.push(candidate);
                     expanded_positions.push(position);
+                    expanded_groups.push(group);
                 }
             }
         }
@@ -468,7 +471,8 @@ impl InvertedIndex {
             expanded_tokens,
             expanded_positions,
             tokens.token_type().clone(),
-        ))
+        )
+        .with_term_groups(expanded_groups))
     }
 
     /// Search documents that match the query and return row ids sorted by BM25 score.
@@ -590,9 +594,12 @@ impl InvertedIndex {
                 // to keep at least one expansion; a position that expands to
                 // nothing anywhere in the segment can never be matched.
                 let surviving = (0..expanded.len())
-                    .map(|idx| expanded.position(idx))
+                    .map(|idx| expanded.position_for_query(idx, params.phrase_slop.is_some()))
                     .collect::<HashSet<_>>();
-                if (0..tokens.len()).any(|idx| !surviving.contains(&tokens.position(idx))) {
+                if (0..tokens.len()).any(|idx| {
+                    !surviving
+                        .contains(&tokens.position_for_query(idx, params.phrase_slop.is_some()))
+                }) {
                     return Ok(Vec::new());
                 }
             }
@@ -762,7 +769,7 @@ impl InvertedIndex {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let mask = prefilter.mask();
+        let mask = self.restrict_mask(prefilter.mask());
         if self.is_legacy() {
             let (row_ids, scores) = self
                 .bm25_search_legacy(
@@ -1046,6 +1053,8 @@ impl InvertedIndex {
             initial_score_floor.unwrap_or(f32::NEG_INFINITY).to_bits(),
         ));
         let shared_norm_addends = SharedNormAddends::default();
+        let search_guard = super::scheduling::MODERN_SEARCHES.enter();
+        let workers = get_num_compute_intensive_cpus().min(32);
         let io_parallelism = self.store.io_parallelism();
         let is_phrase_query = params.phrase_slop.is_some();
         // With dictionary lookups already resolved, drop partitions that
@@ -1065,8 +1074,15 @@ impl InvertedIndex {
                 })
             })
             .collect::<Vec<_>>();
+        let chunk_size = search_guard.chunk_size(searched_partitions.len(), workers);
+        let buffered_chunks = super::scheduling::buffered_search_chunks(
+            searched_partitions.len(),
+            chunk_size,
+            workers,
+            io_parallelism,
+        );
         let parts = searched_partitions
-            .chunks(fts_search_chunk())
+            .chunks(chunk_size)
             .map(|chunk| {
                 let chunk = chunk
                     .iter()
@@ -1094,7 +1110,7 @@ impl InvertedIndex {
                                     params.as_ref(),
                                     operator,
                                     metrics.as_ref(),
-                                    PostingLoadOptions::read_ahead(false),
+                                    PostingLoadOptions::cache_aware_exact(false),
                                     partition_term_ids,
                                 )
                                 .await?
@@ -1207,7 +1223,7 @@ impl InvertedIndex {
 
         let mut ranked = BinaryHeap::new();
         let mut parts = stream::iter(parts)
-            .buffer_unordered(get_num_compute_intensive_cpus().min(32))
+            .buffer_unordered(buffered_chunks)
             .map_ok(|results| stream::iter(results.into_iter().map(Result::Ok)))
             .try_flatten();
         while let Some((partition_ordinal, scored)) = parts.try_next().await? {

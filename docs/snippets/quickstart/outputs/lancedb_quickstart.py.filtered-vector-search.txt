@@ -1,0 +1,2 @@
+   id              name  _distance
+0   5  wool winter coat     1.2344

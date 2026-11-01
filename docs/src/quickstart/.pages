@@ -1,5 +1,8 @@
 nav:
-  - Getting Started with Lance: index.md
-  - Versioning: versioning.md
-  - Vector Search: vector-search.md
-  - Full-Text Search: full-text-search.md
+  - LanceDB: index.md
+  - Apache Spark: spark.md
+  - PyLance:
+    - Getting Started: pylance.md
+    - Versioning: versioning.md
+    - Vector Search: vector-search.md
+    - Full-Text Search: full-text-search.md

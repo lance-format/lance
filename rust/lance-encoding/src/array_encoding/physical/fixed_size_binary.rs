@@ -353,14 +353,35 @@ mod tests {
 
         // Budget for page 1 plus two rows of page 2.
         let limit = root.max_rows_to_drain(6, 50).unwrap();
-        assert_eq!(limit, DrainLimit { rows: 5, bytes: 50 });
+        assert_eq!(
+            limit,
+            DrainLimit {
+                rows: 5,
+                bytes: 50,
+                dictionary_rows: None,
+            }
+        );
 
         // Budget for exactly one page: the batch stops at the page boundary.
         let limit = root.max_rows_to_drain(6, 30).unwrap();
-        assert_eq!(limit, DrainLimit { rows: 3, bytes: 30 });
+        assert_eq!(
+            limit,
+            DrainLimit {
+                rows: 3,
+                bytes: 30,
+                dictionary_rows: None,
+            }
+        );
 
         // Both pages fit a large enough budget.
         let limit = root.max_rows_to_drain(6, 60).unwrap();
-        assert_eq!(limit, DrainLimit { rows: 6, bytes: 60 });
+        assert_eq!(
+            limit,
+            DrainLimit {
+                rows: 6,
+                bytes: 60,
+                dictionary_rows: None,
+            }
+        );
     }
 }

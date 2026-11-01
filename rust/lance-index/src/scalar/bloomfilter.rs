@@ -31,7 +31,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion_execution::SendableRecordBatchStream;
 use std::sync::Arc;
 
 use crate::scalar::{
@@ -46,7 +46,9 @@ use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 
-use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
+use super::zoned::{
+    ParallelZoneTrainer, ZoneBound, ZoneProcessor, rebuild_zones_parallel, search_zones,
+};
 
 const BLOOMFILTER_FILENAME: &str = "bloomfilter.lance";
 const BLOOMFILTER_ITEM_META_KEY: &str = "bloomfilter_item";
@@ -585,11 +587,12 @@ impl ScalarIndex for BloomFilterIndex {
         };
 
         let factory_params = params.clone();
-        let trainer = ZoneTrainer::new(
+        let trainer = ParallelZoneTrainer::new(
             move || BloomFilterProcessor::new(factory_params.clone()),
             params.number_of_items,
         )?;
-        let (updated_blocks, new_null_rows) = rebuild_zones(&self.zones, trainer, new_data).await?;
+        let (updated_blocks, new_null_rows) =
+            rebuild_zones_parallel(&self.zones, trainer, new_data).await?;
 
         // Merge existing and new null rows.  If the existing index had no null bitmap
         // (legacy format — null positions unknown), preserve that None: updating cannot
@@ -844,12 +847,12 @@ impl BloomFilterIndexBuilder {
         })
     }
 
-    /// Train the builder using the shared ZoneTrainer. The input stream is expected to
+    /// Train the builder using the shared parallel zone trainer. The input stream is expected to
     /// contain the value column followed by `_rowaddr`, matching the order emitted by
     /// the scalar index training pipeline.
     pub async fn train(&mut self, batches_source: SendableRecordBatchStream) -> Result<()> {
         let params = self.params.clone();
-        let trainer = ZoneTrainer::new(
+        let trainer = ParallelZoneTrainer::new(
             move || BloomFilterProcessor::new(params.clone()),
             self.params.number_of_items,
         )?;
@@ -1479,6 +1482,10 @@ impl BasicTrainer for BloomFilterIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BloomFilterIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(false)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -1583,9 +1590,9 @@ mod tests {
     use crate::scalar::bloomfilter::BloomFilterIndexPlugin;
     use arrow_array::{RecordBatch, UInt64Array, record_batch};
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::execution::SendableRecordBatchStream;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
+    use datafusion_execution::SendableRecordBatchStream;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{StreamExt, stream};
     use lance_core::{Error, ROW_ADDR, cache::LanceCache, utils::tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;

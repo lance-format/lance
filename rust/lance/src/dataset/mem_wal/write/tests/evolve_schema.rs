@@ -82,7 +82,7 @@ mod replay {
         base_path: &Path,
         shard_id: Uuid,
     ) -> Vec<u64> {
-        ShardManifestStore::new(store.clone(), base_path, shard_id, 10)
+        ShardManifestStore::new(store.clone(), base_path, "", shard_id, 10)
             .latest()
             .await
             .unwrap()
@@ -341,16 +341,15 @@ mod evolve {
             columns: resolved.columns,
             plugin: Arc::new(FtsMemIndexPlugin),
             params: resolved.params,
-            index_details: meta.index_details,
         }]
     }
 
     #[tokio::test]
-    async fn test_evolve_schema_seals_under_the_old_schema_and_writes_under_the_new() {
+    async fn test_evolve_schema_freezes_under_the_old_schema_and_writes_under_the_new() {
         use crate::dataset::ColumnAlteration;
 
         let (mut dataset, writer, shard_id, schema) =
-            evolving_writer("evolve-seal", Some(&["text_fts"])).await;
+            evolving_writer("evolve-freeze", Some(&["text_fts"])).await;
         writer
             .put(vec![rows_under(&schema, &[(100, "before")])])
             .await
@@ -366,14 +365,14 @@ mod evolve {
             .await
             .expect_err("a batch shaped to a schema the writer has not been evolved to");
 
-        let sealed_generation = writer.active_memtable_ref().await.unwrap().generation;
+        let frozen_generation = writer.active_memtable_ref().await.unwrap().generation;
         writer
             .evolve_schema(writer_schema_of(&dataset), fts_config_of(&dataset).await)
             .await
             .unwrap();
         let memtables = writer.in_memory_memtable_refs().await.unwrap();
-        assert_eq!(memtables.active.generation, sealed_generation + 1);
-        assert_eq!(memtables.frozen.len(), 1, "the old memtable is sealed");
+        assert_eq!(memtables.active.generation, frozen_generation + 1);
+        assert_eq!(memtables.frozen.len(), 1, "the old memtable is frozen");
         assert!(
             memtables.frozen[0]
                 .schema
@@ -391,27 +390,28 @@ mod evolve {
             .await
             .expect_err("a batch shaped to the schema the writer has moved off");
 
-        // Same schema again: nothing is sealed.
+        // Same schema again: nothing is frozen.
         writer
             .evolve_schema(writer_schema_of(&dataset), fts_config_of(&dataset).await)
             .await
             .unwrap();
         let memtables = writer.in_memory_memtable_refs().await.unwrap();
-        assert_eq!(memtables.active.generation, sealed_generation + 1);
+        assert_eq!(memtables.active.generation, frozen_generation + 1);
         assert_eq!(memtables.frozen.len(), 1);
 
-        // The sealed memtable flushes under its old schema and index.
+        // The frozen memtable flushes under its old schema and index.
         writer.wait_for_flush_drain().await.unwrap();
         let manifest = writer.manifest().await.unwrap().unwrap();
         let sstable = manifest
             .sstables
             .iter()
-            .find(|s| s.generation == sealed_generation)
-            .expect("the sealed generation is in the manifest");
-        let generation = Dataset::open(&format!(
-            "{}/_mem_wal/{shard_id}/{}",
-            dataset.uri().trim_end_matches('/'),
-            sstable.path
+            .find(|s| s.generation == frozen_generation)
+            .expect("the frozen generation is in the manifest");
+        let generation = Dataset::open(&crate::dataset::mem_wal::util::sstable_uri(
+            dataset.uri(),
+            &writer.config().dir_id,
+            &shard_id,
+            &sstable.path,
         ))
         .await
         .unwrap();
@@ -450,7 +450,7 @@ mod evolve {
             .await
             .unwrap();
         let generation = writer.active_memtable_ref().await.unwrap().generation;
-        writer.force_seal_active().await.unwrap();
+        writer.force_freeze_active().await.unwrap();
         writer.wait_for_flush_drain().await.unwrap();
 
         let manifest = writer.manifest().await.unwrap().unwrap();
@@ -458,11 +458,12 @@ mod evolve {
             .sstables
             .iter()
             .find(|s| s.generation == generation)
-            .expect("the sealed generation is flushed");
-        let flushed = Dataset::open(&format!(
-            "{}/_mem_wal/{shard_id}/{}",
-            dataset.uri().trim_end_matches('/'),
-            sstable.path
+            .expect("the frozen generation is flushed");
+        let flushed = Dataset::open(&crate::dataset::mem_wal::util::sstable_uri(
+            dataset.uri(),
+            &writer.config().dir_id,
+            &shard_id,
+            &sstable.path,
         ))
         .await
         .unwrap();
@@ -517,6 +518,7 @@ mod evolve {
                 vec!["id".to_string()],
             )
             .with_identity_schema(writer_schema_of(&dataset))
+            .with_mem_wal_dir_id(writer.config().dir_id.clone())
         };
         let rows = |batch: RecordBatch| -> Vec<(i64, String)> {
             let ids = batch["id"].as_primitive::<Int64Type>();
@@ -628,7 +630,7 @@ mod evolve {
         let memtables = writer.in_memory_memtable_refs().await.unwrap();
         assert_eq!(
             memtables.active.generation, generation,
-            "nothing was sealed"
+            "nothing was frozen"
         );
         assert!(memtables.frozen.is_empty());
         assert!(memtables.active.schema.column_with_name("body").is_some());

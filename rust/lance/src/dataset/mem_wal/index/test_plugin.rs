@@ -16,9 +16,10 @@ use lance_index::scalar::registry::TrainingCriteria;
 
 use super::fts::FtsQueryExpr;
 use super::{
-    FlushContext, FlushOutcome, FtsMemQuery, MemIndex, MemIndexBuildContext, MemIndexPlugin,
-    MemIndexSpec, MemMatches, MemQuery, MemSearchResult, PositionSet, PrimaryKeyIndex, RankedMatch,
-    ResolveContext, ResolvedIndex, RowPosition, SearchContext, VectorMemQuery,
+    FlushContext, FlushOutcome, FtsMemQuery, MemIndex, MemIndexBuildContext, MemIndexParams,
+    MemIndexPlugin, MemIndexSpec, MemMatches, MemQuery, MemSearchResult, PositionSet,
+    PrimaryKeyIndex, RankedMatch, ResolveContext, ResolvedIndex, RowPosition, SearchContext,
+    VectorMemQuery,
 };
 
 /// How a wrapped index departs from the one it wraps.
@@ -111,9 +112,9 @@ impl MemIndexPlugin for Wrapped {
     fn query_parser(
         &self,
         index_name: String,
-        index_details: Option<&prost_types::Any>,
+        params: &dyn MemIndexParams,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        self.inner.query_parser(index_name, index_details)
+        self.inner.query_parser(index_name, params)
     }
     async fn resolve(&self, ctx: &ResolveContext<'_>) -> Result<ResolvedIndex> {
         self.inner.resolve(ctx).await
