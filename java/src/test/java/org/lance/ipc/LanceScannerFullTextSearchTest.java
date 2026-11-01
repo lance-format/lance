@@ -35,6 +35,9 @@ import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -42,7 +45,9 @@ import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.stream.Stream;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -55,6 +60,35 @@ class LanceScannerFullTextSearchTest {
         "memory://fts_java_match",
         FullTextQuery.match("hello", "doc", DocumentGranularity.ROW),
         2L);
+  }
+
+  @ParameterizedTest
+  @MethodSource("globalStatisticsQueries")
+  void testGetFtsGlobalStatistics(FullTextQuery query, long expectedTotal) throws Exception {
+    runFtsQuery("memory://", query, expectedTotal, true);
+  }
+
+  static Stream<Arguments> globalStatisticsQueries() {
+    return Stream.of(
+        Arguments.of(FullTextQuery.match("hello", "doc", DocumentGranularity.ROW), 2L),
+        Arguments.of(FullTextQuery.phrase("hello world", "doc", 0), 1L),
+        Arguments.of(
+            FullTextQuery.boost(
+                FullTextQuery.match("hello", "doc"), FullTextQuery.match("world", "doc"), 0.3f),
+            2L));
+  }
+
+  @Test
+  void testFtsGlobalStatisticsTransport() {
+    byte[] original = {1, 2, 3};
+    FtsGlobalStatistics statistics = FtsGlobalStatistics.fromBytes(original);
+    original[0] = 9;
+    assertArrayEquals(new byte[] {1, 2, 3}, statistics.toBytes());
+    byte[] exported = statistics.toBytes();
+    exported[1] = 9;
+    assertArrayEquals(new byte[] {1, 2, 3}, statistics.toBytes());
+    assertThrows(NullPointerException.class, () -> FtsGlobalStatistics.fromBytes(null));
+    assertThrows(IllegalArgumentException.class, () -> FtsGlobalStatistics.fromBytes(new byte[0]));
   }
 
   @Test
@@ -181,6 +215,12 @@ class LanceScannerFullTextSearchTest {
   }
 
   private void runFtsQuery(String uri, FullTextQuery query, long expectedTotal) throws Exception {
+    runFtsQuery(uri, query, expectedTotal, false);
+  }
+
+  private void runFtsQuery(
+      String uri, FullTextQuery query, long expectedTotal, boolean verifyGlobalStatistics)
+      throws Exception {
     ScalarIndexParams indexParams =
         ScalarIndexParams.create(
             "inverted",
@@ -190,7 +230,8 @@ class LanceScannerFullTextSearchTest {
         query,
         expectedTotal,
         Arrays.asList("hello world", "hello lance", "other text"),
-        indexParams);
+        indexParams,
+        verifyGlobalStatistics);
   }
 
   private void runFtsQuery(
@@ -199,6 +240,17 @@ class LanceScannerFullTextSearchTest {
       long expectedTotal,
       List<String> documents,
       ScalarIndexParams scalarParams)
+      throws Exception {
+    runFtsQuery(uri, query, expectedTotal, documents, scalarParams, false);
+  }
+
+  private void runFtsQuery(
+      String uri,
+      FullTextQuery query,
+      long expectedTotal,
+      List<String> documents,
+      ScalarIndexParams scalarParams,
+      boolean verifyGlobalStatistics)
       throws Exception {
 
     Schema schema =
@@ -253,6 +305,24 @@ class LanceScannerFullTextSearchTest {
                         Collections.singletonList("title"), IndexType.INVERTED, indexParams)
                     .withIndexName("title_idx")
                     .build());
+
+            if (verifyGlobalStatistics) {
+              FtsGlobalStatistics statistics = dataset.getFtsGlobalStatistics(query);
+              byte[] encoded = statistics.toBytes();
+              assertTrue(encoded.length > 0);
+              assertArrayEquals(encoded, FtsGlobalStatistics.fromBytes(encoded).toBytes());
+              assertArrayEquals(encoded, dataset.getFtsGlobalStatistics(query).toBytes());
+              RuntimeException error =
+                  assertThrows(
+                      RuntimeException.class,
+                      () ->
+                          dataset.getFtsGlobalStatistics(
+                              FullTextQuery.multiMatch("hello", Arrays.asList("doc", "title"))));
+              assertTrue(
+                  error.getMessage().contains("requires exactly one indexed column"),
+                  error.getMessage());
+              assertThrows(NullPointerException.class, () -> dataset.getFtsGlobalStatistics(null));
+            }
 
             ScanOptions scanOptions = new ScanOptions.Builder().fullTextQuery(query).build();
 

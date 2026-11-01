@@ -779,14 +779,16 @@ async fn test_grouped_posting_lists_read_one_group_per_neighborhood() {
     // K adjacent cold tokens shares a single group cache entry: one
     // read_range bounded by the group size, independent of the partition's
     // total token count.
-    let runtime_group_size = runtime_posting_group_tokens().max(1);
+    let runtime_group_size = TEST_GROUP_TOKENS.max(1);
     let queried_token_count = runtime_group_size.min(4);
     let queried_tokens = (0..queried_token_count as u32).collect::<Vec<_>>();
     let num_tokens = runtime_group_size
         .saturating_mul(2)
         .max(queried_token_count + 1)
         .min(1024);
-    let (index, counter, _tmpdir) = load_counted_v2_index(num_tokens, LanceCache::no_cache()).await;
+    let (mut index, counter, _tmpdir) =
+        load_counted_v2_index(num_tokens, LanceCache::no_cache()).await;
+    set_test_posting_group_size(&mut index, runtime_group_size as u32);
     let inverted_list = index.partitions[0].inverted_list.clone();
     assert!(
         !inverted_list.is_legacy_layout(),
@@ -1347,7 +1349,8 @@ async fn load_v2_index_with_grouped_postings(
 /// avoiding the per-member enum/array object graph of a materialized group.
 #[tokio::test]
 async fn test_packed_group_deep_size_is_smaller_than_materialized_graph() {
-    let (index, _cache) = load_v2_index_with_grouped_postings(512, 1).await;
+    let (mut index, _cache) = load_v2_index_with_grouped_postings(512, 1).await;
+    set_test_posting_group_size(&mut index, 128);
     let inverted_list = index.partitions[0].inverted_list.clone();
     assert!(!inverted_list.is_legacy_layout(), "expected v2 layout");
     assert!(

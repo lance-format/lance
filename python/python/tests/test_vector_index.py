@@ -21,7 +21,7 @@ import pyarrow.compute as pc
 import pytest
 from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
 from lance import LanceDataset, LanceFragment
-from lance.dataset import VectorIndexReader, VectorSearchQuery
+from lance.dataset import ScannerBuilder, VectorIndexReader, VectorSearchQuery
 from lance.indices import IndexFileVersion, IndicesBuilder
 from lance.query import MatchQuery, PhraseQuery
 from lance.util import (  # noqa: E402
@@ -1732,6 +1732,17 @@ def test_create_ivf_rq_multi_bit_searches_l2_and_cosine():
         )
         assert result.num_rows == 10
 
+    quantized_refined = ds.to_table(
+        nearest={
+            "column": "vector",
+            "q": mat[0],
+            "k": 10,
+            "quantized_refine_factor": 4,
+        },
+        columns=["id"],
+    )
+    assert quantized_refined.num_rows == 10
+
     cosine_ds = lance.write_dataset(tbl, "memory://")
     cosine_ds = _assert_recall_at_least(cosine_ds, mat[1], metric="cosine")
     cosine_stats = cosine_ds.stats.index_stats("vector_idx")
@@ -3334,6 +3345,56 @@ def test_vector_index_invalid_approx_mode(indexed_dataset):
         )
 
 
+def test_vector_index_invalid_quantized_refine_factor(indexed_dataset):
+    with pytest.raises(ValueError, match="Quantized refine factor"):
+        indexed_dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128),
+                "k": 10,
+                "quantized_refine_factor": 0,
+            }
+        )
+
+
+def test_nearest_preserves_existing_positional_arguments(dataset):
+    query = np.random.default_rng(42).standard_normal(128).astype(np.float32)
+    expected = dataset.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": query,
+            "k": 10,
+            "use_index": False,
+            "query_parallelism": 1,
+            "approx_mode": "fast",
+        },
+    )
+    actual = (
+        ScannerBuilder(dataset)
+        .columns(["id"])
+        .nearest(
+            "vector",
+            query,
+            10,
+            None,
+            None,
+            None,
+            None,
+            None,
+            False,
+            None,
+            1,
+            "fast",
+            None,
+            None,
+        )
+        .to_scanner()
+        .to_table()
+    )
+    assert actual == expected
+
+
 def test_knn_deleted_rows(tmp_path):
     data = create_table()
     ds = lance.write_dataset(data, tmp_path)
@@ -3519,6 +3580,42 @@ def test_prewarm_index(tmp_path):
         assert rs["vector"][0].as_py() == q
 
     run(dataset, q=np.array(q), assert_func=func)
+
+
+def test_vector_search_filter_uses_the_index_metric(tmp_path):
+    # With no metric given, a VectorSearchQuery filter used to search with L2
+    # and skip a cosine index. Rows 0-3 point the query's way but are far away;
+    # rows 4-7 are near it in L2 and point elsewhere, so the two metrics pick
+    # disjoint top 4s.
+    vectors = [[10.0, 1.0]] * 4 + [[0.0, 1.0]] * 4
+    ds = lance.write_dataset(
+        pa.table(
+            {
+                "id": pa.array(range(8), pa.int64()),
+                "vector": pa.array(vectors, pa.list_(pa.float32(), 2)),
+                "text": ["match"] * 8,
+            }
+        ),
+        tmp_path / "ds",
+    )
+    ds = ds.create_index(
+        "vector",
+        "IVF_FLAT",
+        metric="cosine",
+        num_partitions=1,
+        ivf_centroids=np.array([[1.0, 0.0]], dtype=np.float32),
+    )
+    ds.create_scalar_index("text", "INVERTED")
+    q = np.array([1.0, 0.0], dtype=np.float32)
+
+    scanner = ds.scanner(
+        columns=["id"],
+        filter=VectorSearchQuery("vector", q, k=4),
+        full_text_query=MatchQuery("match", column="text"),
+        prefilter=True,
+    )
+    assert "ANNSubIndex" in scanner.explain_plan()
+    assert sorted(scanner.to_table()["id"].to_pylist()) == [0, 1, 2, 3]
 
 
 def test_scanner_rejects_unknown_index_segments(tmp_path):
@@ -4270,6 +4367,83 @@ def test_distributed_ivf_pq_order_invariance(tmp_path: Path):
         assert np.allclose(a, b, atol=1e-6)
 
 
+@pytest.mark.parametrize("prefilter", [True, False])
+@pytest.mark.parametrize(
+    "index_metric,metric,use_index,expected_ids",
+    [
+        (None, None, True, [0, 1]),
+        ("cosine", None, True, [2, 3]),
+        ("dot", None, True, [4, 5]),
+        ("cosine", "cosine", True, [2, 3]),
+        ("cosine", "l2", True, [0, 1]),
+        ("cosine", None, False, [0, 1]),
+        ("cosine", "cosine", False, [2, 3]),
+    ],
+)
+def test_vector_search_filter_metric(
+    tmp_path, prefilter, index_metric, metric, use_index, expected_ids
+):
+    # Each metric has a disjoint top two, so an L2 fallback cannot pass by chance.
+    vectors = [[1, 0.1], [1, 0.2], [3, 0], [4, 0.01], [10, 4], [9, 5], None]
+    table = pa.table(
+        {
+            "id": range(len(vectors)),
+            "vector": pa.array(vectors, type=pa.list_(pa.float32(), 2)),
+            "text": ["match"] * len(vectors),
+        }
+    )
+    ds = lance.write_dataset(table, tmp_path, max_rows_per_file=2)
+    if index_metric is not None:
+        ds.create_index(
+            "vector",
+            "IVF_FLAT",
+            metric=index_metric,
+            num_partitions=1,
+            ivf_centroids=np.array([[1, 0]], dtype=np.float32),
+        )
+    ds.create_scalar_index("text", "INVERTED")
+
+    scanner = ds.scanner(
+        columns=["id"],
+        filter=VectorSearchQuery(
+            "vector", [1, 0], k=2, metric=metric, use_index=use_index
+        ),
+        full_text_query=MatchQuery("match", column="text"),
+        prefilter=prefilter,
+    )
+    uses_ann = (
+        prefilter
+        and use_index
+        and index_metric is not None
+        and metric in (None, index_metric)
+    )
+    assert ("ANNIvf" in scanner.explain_plan()) == uses_ann
+    assert sorted(scanner.to_table()["id"].to_pylist()) == expected_ids
+
+
+@pytest.mark.parametrize("prefilter", [True, False])
+def test_fts_filter_binary_default_metric(tmp_path, prefilter):
+    ds = lance.write_dataset(
+        pa.table(
+            {
+                "id": [0, 1, 2],
+                "vector": pa.array([[128, 0], [3, 0], None], pa.list_(pa.uint8(), 2)),
+                "text": ["match"] * 3,
+            }
+        ),
+        tmp_path,
+        max_rows_per_file=1,
+    )
+    ds.create_scalar_index("text", "INVERTED")
+    result = ds.to_table(
+        columns=["id"],
+        nearest={"column": "vector", "q": np.array([0, 0], dtype=np.uint8), "k": 1},
+        filter=MatchQuery("match", column="text"),
+        prefilter=prefilter,
+    )
+    assert result["id"].to_pylist() == [0]
+
+
 def test_fts_filter_vector_search(tmp_path):
     # Create dataset with vector and text columns
     ids = list(range(1, 301))
@@ -4344,9 +4518,15 @@ def test_fts_filter_vector_search(tmp_path):
     assert [300, 255, 252, 249, 246] == ids_result
 
     # Case 3: search with prefilter=false, search_filter=match("text")
+    # Refine approximate IVF-PQ scores so the strict distance order is deterministic.
     scanner = dataset.scanner(
         filter=MatchQuery("text", "text"),
-        nearest={"column": "vector", "q": query_vector, "k": 5},
+        nearest={
+            "column": "vector",
+            "q": query_vector,
+            "k": 5,
+            "refine_factor": 1,
+        },
         prefilter=False,
     )
 

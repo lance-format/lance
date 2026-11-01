@@ -497,6 +497,7 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
 
 pub struct PrimitiveFieldEncoder {
     accumulation_queue: AccumulationQueue,
+    flush_next: bool,
     array_encoding_strategy: Arc<dyn ArrayEncodingStrategy>,
     column_index: u32,
     field: Field,
@@ -516,6 +517,7 @@ impl PrimitiveFieldEncoder {
                 column_index,
                 options.keep_original_array,
             ),
+            flush_next: false,
             column_index,
             max_page_bytes: options.max_page_bytes,
             array_encoding_strategy,
@@ -607,11 +609,23 @@ impl FieldEncoder for PrimitiveFieldEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        if let Some(arrays) = self.accumulation_queue.insert(array, row_number, num_rows) {
-            Ok(self.do_flush(arrays.0)?)
+        let pages = if self.flush_next {
+            self.flush_next = false;
+            self.accumulation_queue
+                .insert_for_page_boundary(array, row_number, num_rows)
         } else {
-            Ok(vec![])
+            self.accumulation_queue
+                .insert_with_pages(array, row_number, num_rows)
+        };
+        let mut tasks = Vec::new();
+        for page in pages {
+            tasks.extend(self.do_flush(page.arrays)?);
         }
+        Ok(tasks)
+    }
+
+    fn prepare_for_flush(&mut self) {
+        self.flush_next = true;
     }
 
     // If there is any data left in the buffer then create an encode task from it

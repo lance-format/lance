@@ -82,7 +82,8 @@ use lance_index::scalar::inverted::query::{
 };
 use lance_index::scalar::inverted::{
     CombinedFieldsBM25Scorer, DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity,
-    INVERTED_INDEX_VERSION_V2, INVERTED_INDEX_VERSION_V3, SCORE_COL, SCORE_FIELD, fts_schema,
+    INVERTED_INDEX_VERSION_V2, INVERTED_INDEX_VERSION_V3, PreparedFtsQueryLeaf, SCORE_COL,
+    SCORE_FIELD, fts_schema, prepare_fts_global_statistics,
 };
 use lance_index::scalar::minhash_lsh::{MinHashLshIndexParams, MinHashQuery};
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
@@ -123,7 +124,7 @@ use crate::io::exec::fts::{
     BoostQueryExec, CombinedFieldsQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec,
     FlatCombinedFieldsExec, FlatMatchFilterExec, FlatMatchQueryExec, FlatStatsCoverage,
     FlatStatsScope, FtsDocumentExec, HybridCompoundQueryExec, MatchQueryExec, PhraseQueryExec,
-    SharedFtsScorer, SharedFtsScorerExec,
+    SharedFtsScorer, SharedFtsScorerExec, open_fts_segments_without_coverage,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -243,13 +244,13 @@ fn collect_fts_columns_in_order(query: &FtsQuery) -> Vec<String> {
 }
 
 /// The multiple of the exact distance a vector index ranks by. Lance indexes
-/// cosine on SQ and PQ as L2 over normalized vectors, twice `1 - cos`; FLAT
-/// and RQ rank it, and every other metric, on its own scale.
+/// cosine on SQ, PQ, and RQ as L2 over normalized vectors, twice `1 - cos`;
+/// FLAT ranks it, and every other metric, on its own scale.
 fn index_distance_scale(metric: MetricType, segments: &[IndexMetadata]) -> f32 {
     let quantized_as_l2 = segments.iter().any(|segment| {
         segment.index_details.as_ref().is_some_and(|details| {
             let index_type = crate::index::vector::details::derive_vector_index_type(details);
-            index_type.ends_with("PQ") || index_type.ends_with("SQ")
+            index_type.ends_with("PQ") || index_type.ends_with("SQ") || index_type.ends_with("RQ")
         })
     });
     if metric == MetricType::Cosine && quantized_as_l2 {
@@ -792,7 +793,7 @@ impl FilterPlan {
                     plan = scanner.flat_fts_filter(plan, fts_query).await?;
                 }
                 Some(QueryFilter::Vector(vector_query)) => {
-                    plan = scanner.flat_knn(plan, vector_query)?;
+                    plan = scanner.flat_knn(plan, vector_query).await?;
                 }
                 None => {}
             }
@@ -1213,6 +1214,8 @@ pub struct Scanner {
 
     nearest: Option<Query>,
     probe_params: ProbeParams,
+    /// Candidate overfetch factor for RQ Fast-to-Accurate refinement.
+    quantized_refine_factor: Option<u32>,
     nearest_query_count: usize,
     /// True when the query shape represents a batch of single-vector queries
     /// (list-like query on a fixed-size vector column, or multiple concatenated vectors).
@@ -1224,6 +1227,9 @@ pub struct Scanner {
     /// scalar indices do not work well (though we should also improve our planning
     /// to handle this better in the future as well)
     use_scalar_index: bool,
+
+    /// Scalar indices that must not participate in expression-filter planning.
+    ignored_scalar_index_names: HashSet<String>,
 
     /// Whether to use statistics to optimize the scan (default: true)
     ///
@@ -1708,6 +1714,7 @@ impl Scanner {
             ordering: None,
             nearest: None,
             probe_params: ProbeParams::default(),
+            quantized_refine_factor: None,
             nearest_query_count: 1,
             is_batch_nearest: false,
             use_stats: true,
@@ -1717,6 +1724,7 @@ impl Scanner {
             index_segments: None,
             fast_search: false,
             use_scalar_index: true,
+            ignored_scalar_index_names: HashSet::new(),
             include_deleted_rows: false,
             scan_stats_callback: None,
             strict_batch_size: false,
@@ -2159,6 +2167,213 @@ impl Scanner {
         Ok(self)
     }
 
+    /// Return opaque protobuf-encoded global BM25 statistics for this scanner's
+    /// full-text query.
+    ///
+    /// Statistics are aggregated across every committed physical segment of
+    /// the selected logical FTS index. The payload is bound to the current
+    /// dataset version, exact segment UUIDs, indexed column, document
+    /// granularity, and the prepared Match term groups or Phrase token
+    /// positions, including fuzzy expansions. It does not include documents in
+    /// unindexed fragments. Scanner filters, fragment or segment selection,
+    /// limits, and offsets do not restrict the corpus.
+    ///
+    /// The query must resolve to exactly one indexed column. The returned bytes
+    /// are an opaque transport handle intended for Lance bindings and
+    /// distributed query planning. The caller must attach them only to the same
+    /// query used to produce them; V1 consumers cannot independently verify the
+    /// source query identity.
+    ///
+    /// ```no_run
+    /// # use lance::{Dataset, Result};
+    /// # use lance_index::scalar::FullTextSearchQuery;
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let mut scanner = dataset.scan();
+    /// scanner.full_text_search(
+    ///     FullTextSearchQuery::new("hello".to_string()).with_column("text".to_string())?,
+    /// )?;
+    /// let statistics = scanner.fts_global_statistics().await?;
+    /// assert!(!statistics.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn fts_global_statistics(&self) -> Result<Vec<u8>> {
+        let query = self.full_text_query.as_ref().ok_or_else(|| {
+            Error::invalid_input("fts_global_statistics requires a full-text query")
+        })?;
+        let query = self.resolve_full_text_search_query(query).await?;
+        validate_fts_query_contract(&query.query)?;
+
+        let document_granularity = self.fts_document_granularity(&query.query)?;
+        let columns = query
+            .columns()
+            .into_iter()
+            .map(|column| {
+                resolve_fts_field(self.dataset.schema(), &column, document_granularity)
+                    .map(|field| field.canonical_path)
+            })
+            .collect::<Result<HashSet<_>>>()?;
+        if columns.len() != 1 {
+            return Err(Error::not_supported(format!(
+                "fts_global_statistics requires exactly one indexed column, got {}",
+                columns.len()
+            )));
+        }
+        let column = columns.into_iter().next().ok_or_else(|| {
+            Error::invalid_input("fts_global_statistics query does not reference a column")
+        })?;
+        let segments = load_segments(&self.dataset, &column, document_granularity)
+            .await?
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "No Inverted index found for column {column} and document granularity {document_granularity:?}"
+                ))
+            })?;
+        load_segment_details(&self.dataset, &column, &segments).await?;
+        let indices = open_fts_segments_without_coverage(
+            &self.dataset,
+            &column,
+            &segments,
+            &NoOpMetricsCollector,
+        )
+        .await?;
+        let params = query.params();
+        let prepared = prepare_fts_global_statistics(&indices, &query.query, &params, None).await?;
+        let scorer = prepared.scorer();
+
+        let num_docs = u64::try_from(scorer.num_docs).map_err(|_| {
+            Error::internal(format!(
+                "FTS document count {} exceeds u64::MAX",
+                scorer.num_docs
+            ))
+        })?;
+        let total_tokens = scorer.total_tokens;
+        let mut term_statistics = scorer
+            .token_docs
+            .iter()
+            .map(|(term, document_frequency)| (term.clone(), *document_frequency))
+            .collect::<Vec<_>>();
+        term_statistics.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut term_indices = HashMap::with_capacity(term_statistics.len());
+        let mut terms = Vec::with_capacity(term_statistics.len());
+        let mut corpus_terms = Vec::with_capacity(term_statistics.len());
+        for (term_index, (term, document_frequency)) in term_statistics.iter().enumerate() {
+            let term_index = u32::try_from(term_index).map_err(|_| {
+                Error::internal(format!(
+                    "FTS global term count {} exceeds u32::MAX",
+                    term_statistics.len()
+                ))
+            })?;
+            term_indices.insert(term.as_str(), term_index);
+            terms.push(term.clone());
+            corpus_terms.push(crate::pb::FtsCorpusTermStatisticsProto {
+                term_index: Some(term_index),
+                document_frequency: Some(u64::try_from(*document_frequency).map_err(|_| {
+                    Error::internal(format!(
+                        "FTS document frequency for term '{term}' exceeds u64::MAX"
+                    ))
+                })?),
+            });
+        }
+        let query_leaves = prepared
+            .query_leaves()
+            .iter()
+            .enumerate()
+            .map(|(leaf_ordinal, prepared_leaf)| {
+                let is_phrase_query = matches!(prepared_leaf, PreparedFtsQueryLeaf::Phrase(_));
+                let (kind, prepared_leaf) = match prepared_leaf {
+                    PreparedFtsQueryLeaf::Match(query) => (crate::pb::FtsQueryLeafKind::Match, query),
+                    PreparedFtsQueryLeaf::Phrase(query) => (crate::pb::FtsQueryLeafKind::Phrase, query),
+                };
+                let leaf_ordinal = u32::try_from(leaf_ordinal).map_err(|_| {
+                    Error::internal(format!(
+                        "FTS prepared query leaf count {} exceeds u32::MAX",
+                        prepared.query_leaves().len()
+                    ))
+                })?;
+                let prepared_tokens = prepared_leaf.tokens();
+                let mut tokens = Vec::with_capacity(prepared_tokens.len());
+                for token_index in 0..prepared_tokens.len() {
+                    let term = prepared_tokens.get_token(token_index);
+                    let term_index = term_indices.get(term).copied().ok_or_else(|| {
+                        Error::internal(format!(
+                            "FTS prepared leaf {leaf_ordinal} references missing global term '{term}'"
+                        ))
+                    })?;
+                    let query_position = if is_phrase_query {
+                        prepared_tokens.position(token_index)
+                    } else {
+                        prepared_tokens.term_group(token_index)
+                    };
+                    tokens.push((query_position, term_index));
+                }
+                tokens.sort_unstable();
+                tokens.dedup();
+                let tokens = tokens
+                    .into_iter()
+                    .map(
+                        |(query_position, term_index)| crate::pb::FtsPreparedTokenProto {
+                            term_index: Some(term_index),
+                            query_position: Some(query_position),
+                        },
+                    )
+                    .collect();
+                Ok(crate::pb::FtsPreparedQueryLeafProto {
+                    leaf_ordinal: Some(leaf_ordinal),
+                    kind: kind as i32,
+                    corpus_indices: vec![0],
+                    tokens,
+                    has_all_query_positions: Some(prepared_leaf.has_all_query_positions()),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let index_name = segments
+            .first()
+            .ok_or_else(|| Error::internal("FTS index has no committed segments"))?
+            .name
+            .clone();
+        if let Some(segment) = segments.iter().find(|segment| segment.name != index_name) {
+            return Err(Error::internal(format!(
+                "FTS segment {} belongs to logical index '{}', expected '{}'",
+                segment.uuid, segment.name, index_name
+            )));
+        }
+        let document_granularity = match document_granularity {
+            DocumentGranularity::Row => crate::pb::FtsDocumentGranularity::Row,
+            DocumentGranularity::ListElement => crate::pb::FtsDocumentGranularity::ListElement,
+        };
+        let mut segment_uuids = segments
+            .iter()
+            .map(|segment| segment.uuid.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        segment_uuids.sort_unstable();
+        if let Some(duplicate) = segment_uuids.windows(2).find(|uuids| uuids[0] == uuids[1]) {
+            return Err(Error::internal(format!(
+                "FTS logical index '{index_name}' contains duplicate segment UUID {}",
+                Uuid::from_slice(&duplicate[0]).map_err(|error| Error::internal(format!(
+                    "FTS segment UUID must contain 16 bytes: {error}"
+                )))?
+            )));
+        }
+        Ok(crate::pb::FtsGlobalStatisticsProto {
+            schema_version: crate::pb::FtsGlobalStatisticsSchemaVersion::V1 as i32,
+            dataset_version: self.dataset.version_id(),
+            terms,
+            corpora: vec![crate::pb::FtsCorpusStatisticsProto {
+                index_name,
+                column,
+                document_granularity: document_granularity as i32,
+                count_unit: crate::pb::FtsCorpusCountUnit::Document as i32,
+                segment_uuids,
+                num_docs: Some(num_docs),
+                total_tokens: Some(total_tokens),
+                terms: corpus_terms,
+            }],
+            query_leaves,
+        }
+        .encode_to_vec())
+    }
+
     /// Set a filter using a Substrait ExtendedExpression message
     ///
     /// The message must contain exactly one expression and that expression
@@ -2328,6 +2543,45 @@ impl Scanner {
     /// This option allows users to disable scalar indices for a query.
     pub fn use_scalar_index(&mut self, use_scalar_index: bool) -> &mut Self {
         self.use_scalar_index = use_scalar_index;
+        self
+    }
+
+    /// Ignore named scalar indices from expression-filter planning.
+    ///
+    /// Other scalar indices remain eligible, and the original filter is still
+    /// evaluated for rows selected by the remaining scan plan. Names that do
+    /// not identify an available scalar index have no effect. This option is
+    /// ignored when scalar indices are disabled with [`Self::use_scalar_index`].
+    ///
+    /// Inverted index names are also honored for expression filters such as
+    /// `contains_tokens`, which fall back to evaluating the function without that
+    /// index. This does not control vector index segments or the index selected
+    /// by an explicit full-text search query.
+    ///
+    /// With [`Self::fast_search`], only a filter plan that still uses an index
+    /// skips unindexed fragments. If ignoring indices removes every index query,
+    /// the scan falls back to evaluating the filter over all selected fragments,
+    /// potentially returning more matching rows. Explicit fragment and row
+    /// selections still apply; use them to preserve a caller-defined scan scope.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn scan_without_one_index(dataset: &Dataset) -> Result<()> {
+    /// let mut scanner = dataset.scan();
+    /// scanner
+    ///     .filter("id = 42")?
+    ///     .with_ignored_scalar_indices(["id_zonemap"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_ignored_scalar_indices<I, S>(&mut self, index_names: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.ignored_scalar_index_names = index_names.into_iter().map(Into::into).collect();
         self
     }
 
@@ -2509,6 +2763,7 @@ impl Scanner {
             dist_q_c: 0.0,
             approx_mode: Default::default(),
         });
+        self.quantized_refine_factor = None;
         self.nearest_query_count = query_count;
         self.is_batch_nearest = is_batch_nearest;
         Ok(self)
@@ -2655,6 +2910,13 @@ impl Scanner {
     /// This is a weak consistency search: newly appended or updated rows may be absent.
     /// SQL [`Self::prefilter`] placement is unchanged. See [`Self::with_index_segments`]
     /// for the default mixed-search behavior.
+    ///
+    /// This is essentially a weak consistency search, only on the indexed data.
+    /// For scalar expression filters, this applies only when the filter plan
+    /// uses an index. If no index query remains, including after
+    /// [`Self::with_ignored_scalar_indices`], the scan falls back to all selected
+    /// fragments while retaining the original filter and explicit row selections.
+    ///
     /// Row IDs are used internally but are only returned when explicitly requested.
     pub fn fast_search(&mut self) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
@@ -2680,13 +2942,41 @@ impl Scanner {
         self
     }
 
+    /// Re-rank an over-fetched IVF_RQ candidate set with its multi-bit index data.
+    ///
+    /// Unlike [`Self::refine`], indexed candidates are re-ranked without reading
+    /// their original vectors. It first discovers `factor * k` candidates with
+    /// one-bit RQ scores and then re-ranks them with the index's most accurate
+    /// stored RQ representation. Unindexed fragments and stale overlay rows still
+    /// use flat fallback and may read original vectors. If exact refinement is also
+    /// configured, the quantized stage emits enough candidates for that exact stage.
+    /// When a distance range is set, the selected partitions use Accurate RQ search
+    /// directly so the range applies before top-k truncation.
+    ///
+    /// ```
+    /// # use arrow_array::Float32Array;
+    /// # use lance::{Dataset, Result};
+    /// # async fn search(dataset: &Dataset) -> Result<()> {
+    /// let query = Float32Array::from(vec![0.0_f32; 128]);
+    /// let mut scanner = dataset.scan();
+    /// scanner.nearest("vector", &query, 10)?;
+    /// scanner.quantized_refine(4);
+    /// let results = scanner.try_into_batch().await?;
+    /// # let _ = results;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn quantized_refine(&mut self, factor: u32) -> &mut Self {
+        self.quantized_refine_factor = Some(factor);
+        self
+    }
+
     /// Change the distance [MetricType], i.e, L2 or Cosine distance.
     ///
     /// When unset, the search ranks by the metric of the vector index it chooses for the
-    /// column, also where it falls back to flat KNN over fragments that index does not
-    /// cover. A search that chooses no index, such as one with [`Self::use_index`] false
-    /// or a full-text filter under [`Self::prefilter`], uses the column type's default:
-    /// Hamming for uint8 vectors and L2 otherwise.
+    /// column, including when it falls back to flat KNN for filtered rows or fragments
+    /// that index does not cover. A search with [`Self::use_index`] false uses the column
+    /// type's default: Hamming for uint8 vectors and L2 otherwise.
     pub fn distance_metric(&mut self, metric_type: MetricType) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.metric_type = Some(metric_type)
@@ -3584,10 +3874,17 @@ impl Scanner {
             let index_info = match self.scalar_index_selection.as_ref() {
                 Some(selection) => {
                     self.dataset
-                        .scalar_index_info_for_segments(selection.segments.as_ref())
+                        .scalar_index_info_for_segments_ignoring(
+                            selection.segments.as_ref(),
+                            &self.ignored_scalar_index_names,
+                        )
                         .await?
                 }
-                None => self.dataset.scalar_index_info().await?,
+                None => {
+                    self.dataset
+                        .scalar_index_info_ignoring(&self.ignored_scalar_index_names)
+                        .await?
+                }
             };
             let filter_plan = create_filter_plan(expr.clone(), &index_info, use_scalar_index)?;
 
@@ -4957,7 +5254,7 @@ impl Scanner {
                         .union_column(&query.column, OnMissing::Error)?;
                     let plan = self.take(fts_plan, projection)?;
 
-                    self.flat_knn(plan, query)?
+                    self.flat_knn(plan, query).await?
                 }
                 None => {
                     self.vector_search(&filter_plan.expr_filter_plan, query)
@@ -5437,7 +5734,8 @@ impl Scanner {
         query: &FullTextSearchQuery,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut params = query.params();
-        if params.limit.is_none() {
+        // A column sort must select the page before relevance can truncate its candidates.
+        if params.limit.is_none() && self.ordering.is_none() {
             let search_limit = match (self.limit, self.offset) {
                 (Some(limit), Some(offset)) => Some((limit + offset) as usize),
                 (Some(limit), None) => Some(limit as usize),
@@ -5462,7 +5760,7 @@ impl Scanner {
         // retain their existing scoring and approximation contracts.
         if let FtsQuery::Match(match_query) = query
             && let Some(plan) = self
-                .plan_restricted_match_query(match_query, &params, filter_plan, &prefilter_source)
+                .plan_corpus_match_query(match_query, &params, filter_plan, &prefilter_source)
                 .await?
         {
             return Ok(plan);
@@ -6119,9 +6417,9 @@ impl Scanner {
     }
 
     /// Use global append-only corpus statistics independently of the selected candidates.
-    /// This entry is called only for a root scalar-text Match with a user prefilter or
-    /// explicit fragment selection. Other query shapes retain their existing planner.
-    async fn plan_restricted_match_query(
+    /// Exact root scalar-text matches share this corpus with and without candidate
+    /// restrictions. Other query shapes retain their existing planner.
+    async fn plan_corpus_match_query(
         &self,
         query: &MatchQuery,
         params: &FtsSearchParams,
@@ -6131,13 +6429,8 @@ impl Scanner {
         let is_primary_fts = self.full_text_query.is_some()
             && self.nearest.is_none()
             && self.filter.query_filter.is_none();
-        let has_postfilter = !self.prefilter && self.filter.expr_filter.is_some();
-        let has_restriction =
-            self.fragments.is_some() || (self.prefilter && !filter_plan.is_empty());
         if !is_primary_fts
             || self.fast_search
-            || has_postfilter
-            || !has_restriction
             || params.wand_factor != 1.0
             || params.phrase_slop.is_some()
             || query.fuzziness != Some(0)
@@ -6603,6 +6896,14 @@ impl Scanner {
             ))));
         }
 
+        // Candidate fragments do not define the corpus: even an index-only
+        // selection needs statistics from unindexed rows outside that selection.
+        let corpus_fragments = if self.fast_search {
+            target_fragments
+        } else {
+            self.dataset.fragments()
+        };
+
         // Kept per column; see `FlatStatsCoverage`.
         let mut per_column_coverage = Vec::with_capacity(query.column_names().len());
         let mut uncovered = RoaringBitmap::new();
@@ -6631,7 +6932,7 @@ impl Scanner {
                         .collect()
                 }
                 // No index on this column at all, so no fragment is covered for it.
-                None => target_fragments
+                None => corpus_fragments
                     .iter()
                     .map(|fragment| fragment.id as u32)
                     .collect(),
@@ -6645,7 +6946,7 @@ impl Scanner {
             // reaches `docFreq_f`.
             let mut column_stale_rows = RowAddrTreeMap::new();
             match self
-                .fts_overlay_plan(column, DocumentGranularity::Row, target_fragments)
+                .fts_overlay_plan(column, DocumentGranularity::Row, corpus_fragments)
                 .await?
             {
                 FtsOverlayPlan::Unchanged(_) => {}
@@ -6658,7 +6959,7 @@ impl Scanner {
                 // A legacy segment reports no fragment coverage, so no target fragment
                 // can be proven free of stale entries and no row can be named as one.
                 FtsOverlayPlan::FullScan => {
-                    uncovered.extend(target_fragments.iter().map(|fragment| fragment.id as u32));
+                    uncovered.extend(corpus_fragments.iter().map(|fragment| fragment.id as u32));
                     needs_whole_corpus = true;
                 }
             }
@@ -6685,7 +6986,7 @@ impl Scanner {
         stale_addresses.retain(|fragment_id, _| !uncovered.contains(*fragment_id));
         let overlay_block = self.stale_rows_block_mask(&stale_addresses).await?;
 
-        let uncovered_fragments: Vec<Fragment> = target_fragments
+        let uncovered_fragments: Vec<Fragment> = corpus_fragments
             .iter()
             .filter(|fragment| uncovered.contains(fragment.id as u32))
             .cloned()
@@ -6757,7 +7058,7 @@ impl Scanner {
         // index and the corpus has to be re-measured from every target fragment. That
         // is a full scan, so it stays confined to that case.
         let (flat_fragments, stats_scope) = if needs_whole_corpus {
-            (target_fragments.to_vec(), FlatStatsScope::WholeCorpus)
+            (corpus_fragments.to_vec(), FlatStatsScope::WholeCorpus)
         } else {
             (
                 uncovered_fragments,
@@ -6785,7 +7086,7 @@ impl Scanner {
             .await?;
         // Only a plan with both children needs the two to agree on a corpus, and a
         // whole-corpus scan leaves no fragment for an indexed child.
-        let is_mixed = !needs_whole_corpus && flat_fragments.len() != target_fragments.len();
+        let is_mixed = !needs_whole_corpus && !covered.is_empty();
         let shared_scorer = is_mixed.then(|| Arc::new(SharedFtsScorer::new()));
         let flat_plan = self
             .plan_flat_combined_fields_query(
@@ -6804,20 +7105,26 @@ impl Scanner {
         let scored_plan = if !is_mixed {
             flat_plan
         } else {
-            let union =
-                UnionExec::try_new(vec![index_exec(Some(covered), shared_scorer), flat_plan])?;
+            let union = UnionExec::try_new(vec![
+                index_exec(Some(covered), shared_scorer.clone()),
+                flat_plan,
+            ])?;
             Arc::new(RepartitionExec::try_new(
                 union,
                 Partitioning::RoundRobinBatch(1),
             )?)
         };
-        Ok(Arc::new(
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
             SortExec::new(
                 Self::fts_score_sort_exprs(scored_plan.schema().as_ref())?.into(),
                 scored_plan,
             )
             .with_fetch(params.limit),
-        ))
+        );
+        Ok(match shared_scorer {
+            Some(shared_scorer) => Arc::new(SharedFtsScorerExec::new_combined(plan, shared_scorer)),
+            None => plan,
+        })
     }
 
     /// Plan the flat (unindexed) side of a `combined_fields` query: one scan over
@@ -6906,6 +7213,12 @@ impl Scanner {
         q: &Query,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut q = q.clone();
+
+        if matches!(self.quantized_refine_factor, Some(0)) {
+            return Err(Error::invalid_input(
+                "Quantized refine factor cannot be zero".to_string(),
+            ));
+        }
 
         // Sanity check
         let (vector_type, element_type) = get_vector_type(self.dataset.schema(), &q.column)?;
@@ -7145,6 +7458,21 @@ impl Scanner {
             // Build a prefilter block mask for stale rows (empty = no-op fast path).
             let overlay_block = self.stale_rows_block_mask(&stale_rows).await?;
 
+            let ann_query = if self.quantized_refine_factor.is_some() {
+                let exact_factor = q.refine_factor.unwrap_or(1) as usize;
+                let mut ann_query = q.clone();
+                ann_query.k = q.k.checked_mul(exact_factor).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "quantized refinement result count overflows: k={} exact_refine_factor={exact_factor}",
+                        q.k
+                    ))
+                })?;
+                ann_query.refine_factor = None;
+                ann_query
+            } else {
+                q.clone()
+            };
+
             let ann_node = match vector_type {
                 DataType::FixedSizeList(_, _) => {
                     // Refine applies the distance range to exact distances, but
@@ -7157,10 +7485,10 @@ impl Scanner {
                             Query {
                                 lower_bound: q.lower_bound.map(|lower| lower * scale),
                                 upper_bound: q.upper_bound.map(|upper| upper * scale),
-                                ..q.clone()
+                                ..ann_query
                             }
                         }
-                        None => q.clone(),
+                        None => ann_query,
                     };
                     self.ann(
                         &ann_query,
@@ -7171,6 +7499,11 @@ impl Scanner {
                     .await?
                 }
                 DataType::List(_) => {
+                    if self.quantized_refine_factor.is_some() {
+                        return Err(Error::not_supported(
+                            "quantized refinement is not supported for multivector columns",
+                        ));
+                    }
                     self.multivec_ann(&q, &index_segments, filter_plan, overlay_block.clone())
                         .await?
                 }
@@ -7184,7 +7517,7 @@ impl Scanner {
                     .union_column(&q.column, OnMissing::Error)
                     .unwrap();
                 let knn_node_with_vector = self.take(ann_node, vector_projection)?;
-                self.flat_knn(knn_node_with_vector, &q)?
+                self.flat_knn(knn_node_with_vector, &q).await?
             } else {
                 ann_node
             }; // vector, _distance, _rowid
@@ -7204,6 +7537,11 @@ impl Scanner {
 
             Ok(knn_node)
         } else {
+            if self.quantized_refine_factor.is_some() {
+                return Err(Error::not_supported(
+                    "quantized refinement requires an IVF_RQ vector index",
+                ));
+            }
             if self.fast_search {
                 return Ok(Arc::new(EmptyExec::new(knn_empty_result_schema(
                     self.is_batch_nearest,
@@ -7253,7 +7591,7 @@ impl Scanner {
             if let Some(mask) = self.external_row_mask.clone() {
                 plan = Arc::new(RowAddrMaskFilterExec::new(plan, mask));
             }
-            Ok(self.flat_knn(plan, &q)?)
+            self.flat_knn(plan, &q).await
         }
     }
 
@@ -7262,7 +7600,7 @@ impl Scanner {
     /// search per query vector.
     ///
     /// Requires all of:
-    /// - no refine step (the batch path does not yet rerank);
+    /// - no exact or quantized refine step (the batch path does not yet rerank);
     /// - fixed nprobes (`minimum_nprobes == maximum_nprobes`) — see below;
     /// - every segment an IVF index with a flat-style sub-index (i.e. not HNSW);
     /// - every target fragment covered by the *selected* `index_segments` (or
@@ -7287,12 +7625,13 @@ impl Scanner {
         index_segments: &[IndexMetadata],
         q: &Query,
     ) -> Result<bool> {
-        // Any refine factor sends the query onto a reranking path that the
-        // shared batch scan does not implement: the single-query path reranks
-        // with the original vectors even when the factor is 1, and rejects a
-        // factor of 0 outright (`Refine factor cannot be zero`). The batch path
-        // does neither, so fall back to the per-query loop for every `Some(_)`.
-        if q.refine_factor.is_some() {
+        // Any exact or quantized refine factor sends the query onto a reranking
+        // path that the shared batch scan does not implement. Exact refinement
+        // reranks with the original vectors even when the factor is 1, while
+        // quantized refinement overfetches and reranks with Accurate RQ scores.
+        // The batch path does neither, so fall back to the per-query loop for
+        // every configured refinement.
+        if q.refine_factor.is_some() || self.quantized_refine_factor.is_some() {
             return Ok(false);
         }
         // Only fixed nprobes is provably equivalent to single-query search; see
@@ -7525,9 +7864,26 @@ impl Scanner {
 
         let q = q.clone();
         debug_assert!(q.metric_type.is_some());
+        let keep_quantized_distances =
+            self.quantized_refine_factor.is_some() && q.refine_factor.is_none();
+
+        // Retained RQ scores use the index's native distance scale. Convert the
+        // flat arms' bounds before filtering, then their scores before merging;
+        // fetching indexed vectors just to recompute distances defeats quantized refinement.
+        let flat_distance_scale = if keep_quantized_distances {
+            q.metric_type
+                .map_or(1.0, |metric| index_distance_scale(metric, indexed_segments))
+        } else {
+            1.0
+        };
+        let flat_query = Query {
+            lower_bound: q.lower_bound.map(|bound| bound / flat_distance_scale),
+            upper_bound: q.upper_bound.map(|bound| bound / flat_distance_scale),
+            ..q.clone()
+        };
 
         // Ensure the vector column is present for distance computation.
-        if knn_node.schema().column_with_name(&q.column).is_none() {
+        if !keep_quantized_distances && knn_node.schema().column_with_name(&q.column).is_none() {
             let vector_projection = self
                 .dataset
                 .empty_projection()
@@ -7573,7 +7929,7 @@ impl Scanner {
                 Some(mask) => Arc::new(RowAddrMaskFilterExec::new(scan_node, mask)) as _,
                 None => scan_node,
             };
-            let topk_fallback = self.flat_knn(scan_node, &q)?;
+            let topk_fallback = self.flat_knn(scan_node, &flat_query).await?;
             let topk_fallback: Arc<dyn ExecutionPlan> =
                 Arc::new(project(topk_fallback, knn_node.schema().as_ref())?);
             flat_inputs.push(topk_fallback);
@@ -7598,20 +7954,73 @@ impl Scanner {
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 stale_node = Arc::new(LanceFilterExec::try_new(expr.clone(), stale_node)?);
             }
-            let topk_stale = self.flat_knn(stale_node, &q)?;
+            let topk_stale = self.flat_knn(stale_node, &flat_query).await?;
             let topk_stale: Arc<dyn ExecutionPlan> =
                 Arc::new(project(topk_stale, knn_node.schema().as_ref())?);
             flat_inputs.push(topk_stale);
         }
 
+        if flat_distance_scale != 1.0 {
+            for input in &mut flat_inputs {
+                let exprs: Vec<_> = input
+                    .schema()
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, field)| {
+                        let column =
+                            Arc::new(Column::new(field.name(), index)) as Arc<dyn PhysicalExpr>;
+                        let expr = if field.name() == DIST_COL {
+                            Arc::new(expressions::BinaryExpr::new(
+                                column,
+                                datafusion::logical_expr::Operator::Multiply,
+                                Arc::new(Literal::new(ScalarValue::Float32(Some(
+                                    flat_distance_scale,
+                                )))),
+                            )) as Arc<dyn PhysicalExpr>
+                        } else {
+                            column
+                        };
+                        (expr, field.name().clone())
+                    })
+                    .collect();
+                *input = Arc::new(ProjectionExec::try_new(exprs, input.clone())?);
+            }
+        }
+
         // Union: flat paths first (matching original order), then ANN results.
         flat_inputs.push(knn_node);
         let unioned = UnionExec::try_new(flat_inputs)?;
-        let unioned = RepartitionExec::try_new(
+        let unioned: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
             unioned,
             datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
-        )?;
-        self.flat_knn(Arc::new(unioned), &q)
+        )?);
+        if keep_quantized_distances {
+            let sort = SortExec::new(
+                [
+                    PhysicalSortExpr {
+                        expr: expressions::col(DIST_COL, unioned.schema().as_ref())?,
+                        options: SortOptions {
+                            descending: false,
+                            nulls_first: false,
+                        },
+                    },
+                    PhysicalSortExpr {
+                        expr: expressions::col(ROW_ID, unioned.schema().as_ref())?,
+                        options: SortOptions {
+                            descending: false,
+                            nulls_first: false,
+                        },
+                    },
+                ]
+                .into(),
+                unioned,
+            )
+            .with_fetch(Some(q.k));
+            Self::flat_knn_not_null_filter(Arc::new(sort))
+        } else {
+            self.flat_knn(unioned, &q).await
+        }
     }
 
     #[async_recursion]
@@ -8350,15 +8759,40 @@ impl Scanner {
     }
 
     /// Add a knn search node to the input plan
-    fn flat_knn(&self, input: Arc<dyn ExecutionPlan>, q: &Query) -> Result<Arc<dyn ExecutionPlan>> {
-        // Resolve metric_type if not set (use default for the column's element type)
-        let metric_type = match q.metric_type {
-            Some(m) => m,
-            None => {
-                let (_, element_type) = get_vector_type(self.dataset.schema(), &q.column)?;
-                default_distance_type_for(&element_type)
+    async fn flat_knn(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        q: &Query,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let (_, element_type) = get_vector_type(self.dataset.schema(), &q.column)?;
+        let mut metric_type = q.metric_type;
+        // Ranking FTS hits still needs the index's metric, even though the rows
+        // are scored directly instead of being retrieved through ANN.
+        if metric_type.is_none() && q.use_index {
+            let column_id = self.dataset.schema().field_id(&q.column)?;
+            let indices = self.dataset.load_indices().await?;
+            if let Some(index) = indices.iter().find(|index| {
+                index.fields.first() == Some(&column_id) && crate::index::index_type_is_known(index)
+            }) {
+                let index_metric = if let Some(metric) =
+                    crate::index::vector::details::metric_type_from_index_metadata(index)
+                {
+                    metric
+                } else {
+                    self.dataset
+                        .open_vector_index(&q.column, &index.uuid, &NoOpMetricsCollector)
+                        .await?
+                        .metric_type()
+                };
+                // Match the flat fallback in vector_search for untrained indices
+                // whose recorded metric is incompatible with the column type.
+                if validate_distance_type_for(index_metric, &element_type).is_ok() {
+                    metric_type = Some(index_metric);
+                }
             }
-        };
+        }
+        let metric_type = metric_type.unwrap_or_else(|| default_distance_type_for(&element_type));
+        validate_distance_type_for(metric_type, &element_type)?;
         let input = if self.is_batch_nearest {
             Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
         } else {
@@ -8588,6 +9022,7 @@ impl Scanner {
             prefilter_source,
             overlay_block,
             self.external_row_mask.clone(),
+            self.quantized_refine_factor,
         )?;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
@@ -8648,6 +9083,7 @@ impl Scanner {
                 prefilter_source.clone(),
                 overlay_block.clone(),
                 self.external_row_mask.clone(),
+                None,
             )?;
             let sort_expr = PhysicalSortExpr {
                 expr: expressions::col(DIST_COL, ann_node.schema().as_ref())?,
@@ -9056,6 +9492,7 @@ pub mod test_dataset {
         IndexType,
         scalar::{ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
         vector::{
+            bq::{RQBuildParams, RQRotationType},
             hnsw::builder::HnswBuildParams,
             ivf::IvfBuildParams,
             kmeans::{KMeansParams, train_kmeans},
@@ -9201,6 +9638,24 @@ pub mod test_dataset {
                 IvfBuildParams::new(2),
                 HnswBuildParams::default(),
                 SQBuildParams::default(),
+            );
+            self.dataset
+                .create_index(
+                    &["vec"],
+                    IndexType::Vector,
+                    Some("idx".to_string()),
+                    &params,
+                    true,
+                )
+                .await?;
+            Ok(())
+        }
+
+        pub async fn make_rq_vector_index(&mut self, num_bits: u8) -> Result<()> {
+            let params = VectorIndexParams::with_ivf_rq_params(
+                MetricType::L2,
+                IvfBuildParams::new(2),
+                RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast),
             );
             self.dataset
                 .create_index(
@@ -9374,7 +9829,7 @@ pub mod test_dataset {
 #[cfg(test)]
 mod test {
 
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
     use std::vec;
@@ -9408,6 +9863,8 @@ mod test {
         BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, PhraseQuery,
     };
     use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
+    use lance_index::vector::bq::builder::RabitQuantizer;
+    use lance_index::vector::bq::{RQBuildParams, RQRotationType};
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
@@ -10506,6 +10963,16 @@ mod test {
             ])))
             .limit(Some(10))
         };
+
+        let mut statistics_scan = dataset.scan();
+        statistics_scan.full_text_search(cross_column()).unwrap();
+        let error = statistics_scan.fts_global_statistics().await.unwrap_err();
+        assert!(matches!(&error, Error::NotSupported { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("requires exactly one indexed column")
+        );
 
         let mut scan = dataset.scan();
         scan.full_text_search(cross_column()).unwrap();
@@ -13078,6 +13545,27 @@ mod test {
         assert_eq!(query.search_effort, effort);
     }
 
+    #[tokio::test]
+    async fn test_batch_knn_quantized_refinement_uses_rerank_path() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds.make_rq_vector_index(4).await.unwrap();
+        let (queries, _) = batch_knn_two_queries();
+
+        let mut scan = test_ds.dataset.scan();
+        scan.nearest("vec", &queries, 10).unwrap();
+        scan.nprobes(2);
+        scan.quantized_refine(40);
+
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            !plan.contains("ANNIvfBatch"),
+            "quantized refinement must not use the shared-scan batch node, got:\n{plan}"
+        );
+        assert!(plan.contains("quantized_refine_factor=40"), "{plan}");
+    }
+
     /// Without pinned nprobes the shared-scan fast path is not equivalent to
     /// single-query search (the single-query path applies an adaptive
     /// `early_pruning` floor and late-search expansion that the batch path does
@@ -13240,6 +13728,7 @@ mod test {
                 updated_fragments: vec![updated.fragment],
                 new_fragments: vec![],
                 fields_modified: updated.fields_modified,
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(UpdateMode::RewriteColumns),
@@ -17391,6 +17880,82 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         );
     }
 
+    #[rstest]
+    #[case::known_names(false)]
+    #[case::unknown_name(true)]
+    #[tokio::test]
+    async fn test_ignored_scalar_indices(#[case] include_unknown_name: bool) {
+        use lance_index::scalar::BuiltinIndexType;
+
+        let data = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .col("b", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+        dataset
+            .create_index(
+                &["a"],
+                IndexType::Scalar,
+                Some("a_zonemap".to_string()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                false,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["b"],
+                IndexType::BTree,
+                Some("b_btree".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let mut default_scan = dataset.scan();
+        default_scan.filter("a < 50 AND b < 50").unwrap();
+        let default_plan = default_scan.explain_plan(true).await.unwrap();
+        assert!(
+            default_plan.contains("@a_zonemap(ZoneMap)"),
+            "{default_plan}"
+        );
+        assert!(default_plan.contains("@b_btree(BTree)"), "{default_plan}");
+
+        let mut ignore_a = dataset.scan();
+        ignore_a
+            .filter("a < 50 AND b < 50")
+            .unwrap()
+            .with_ignored_scalar_indices(if include_unknown_name {
+                vec!["a_zonemap", "missing_index"]
+            } else {
+                vec!["a_zonemap"]
+            });
+        let ignore_a_plan = ignore_a.explain_plan(true).await.unwrap();
+        assert!(
+            !ignore_a_plan.contains("@a_zonemap(ZoneMap)"),
+            "{ignore_a_plan}"
+        );
+        assert!(ignore_a_plan.contains("@b_btree(BTree)"), "{ignore_a_plan}");
+
+        let result = ignore_a.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), 50);
+
+        let mut ignore_both = dataset.scan();
+        ignore_both
+            .filter("a < 50 AND b < 50")
+            .unwrap()
+            .with_ignored_scalar_indices(["a_zonemap", "b_btree"]);
+        let ignore_both_plan = ignore_both.explain_plan(true).await.unwrap();
+        assert!(
+            !ignore_both_plan.contains("ScalarIndexQuery"),
+            "{ignore_both_plan}"
+        );
+        let result = ignore_both.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), 50);
+    }
+
     #[tokio::test]
     async fn test_like_prefix_correctness_with_btree_index() {
         // Create dataset with deterministic string data for exact result verification
@@ -20228,29 +20793,30 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         .await?;
 
         log::info!("Test case: Full text search with unindexed rows");
-        // The flat-FTS path now reads through `FilteredReadExec`, matching the
-        // brute-force KNN path. With no prefilter the scan still produces no
-        // pushdown, but the operator differs by storage version: legacy emits
-        // a `LanceScan`, v2 emits a `LanceRead` with empty filters.
+        // MatchCorpus initializes shared BM25 statistics before either child scores
+        // candidates. The flat input reads through FilteredReadExec: legacy emits
+        // a LanceScan, v2 emits a LanceRead with empty filters.
         let expected = if data_storage_version == LanceFileVersion::Legacy {
             r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
+      MatchCorpus
+        SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+          CoalescePartitionsExec
+            UnionExec
+              MatchQuery: column=s, query=[hello]
+              FlatMatchQuery: column=s, query=hello
+                LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None"#
+        } else {
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
+    MatchCorpus
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
         CoalescePartitionsExec
           UnionExec
             MatchQuery: column=s, query=[hello]
             FlatMatchQuery: column=s, query=hello
-              LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None"#
-        } else {
-            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], source=stream(_rowid)
-    SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-      CoalescePartitionsExec
-        UnionExec
-          MatchQuery: column=s, query=[hello]
-          FlatMatchQuery: column=s, query=hello
-            LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--"#
+              LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--"#
         };
         dataset.append_new_data().await?;
         assert_plan_equals(
@@ -20688,6 +21254,55 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             project_first_scanner.try_into_batch().await.unwrap(),
             fast_batch
         );
+    }
+
+    #[rstest]
+    #[case::no_ignored_indices(vec![], false, 5)]
+    #[case::remaining_index(vec!["a_btree"], false, 5)]
+    #[case::all_ignored(vec!["a_btree", "b_btree"], false, 15)]
+    #[case::explicit_rows(vec!["a_btree", "b_btree"], true, 2)]
+    #[case::unknown_name(vec!["missing_index"], false, 5)]
+    #[tokio::test]
+    async fn test_fast_search_ignored_scalar_indices(
+        #[case] ignored_names: Vec<&str>,
+        #[case] restrict_rows: bool,
+        #[case] expected_rows: usize,
+    ) {
+        let (_tmp_dir, schema, mut dataset) =
+            make_scalar_filter_test_dataset(LanceFileVersion::Stable).await;
+        for column in ["a", "b"] {
+            dataset
+                .create_index(
+                    &[column],
+                    IndexType::BTree,
+                    Some(format!("{column}_btree")),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        append_scalar_filter_test_data(&mut dataset, schema, 100, 110).await;
+
+        let mut scanner = dataset.scan();
+        scanner
+            .filter("a >= 95 AND b >= 95")
+            .unwrap()
+            .with_ignored_scalar_indices(ignored_names)
+            .fast_search();
+        if restrict_rows {
+            // The caller's selection must survive fallback, and its rows must
+            // still be refined by the original expression (which excludes 90).
+            scanner.with_row_id_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+                90u64, 97, 99,
+            ])));
+        }
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), expected_rows);
+        if restrict_rows {
+            let values = batch["a"].as_primitive::<Int32Type>();
+            assert_eq!(values.values().as_ref(), &[97, 99]);
+        }
     }
 
     fn make_scalar_filter_test_batch(schema: SchemaRef, start: i32, end: i32) -> RecordBatch {
@@ -21160,6 +21775,457 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             scanner.nearest_mut().unwrap().approx_mode,
             ApproxMode::Accurate
         );
+
+        assert_eq!(scanner.quantized_refine_factor, None);
+        scanner.quantized_refine(4);
+        assert_eq!(scanner.quantized_refine_factor, Some(4));
+
+        scanner.nearest("vec", &query_vector, 5).unwrap();
+        assert_eq!(scanner.quantized_refine_factor, None);
+
+        scanner.quantized_refine(0);
+        let error = scanner.explain_plan(false).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("cannot be zero"));
+    }
+
+    #[rstest]
+    #[case::rq4(4)]
+    #[case::rq8(8)]
+    #[tokio::test]
+    async fn test_ivf_rq_quantized_refinement(#[case] num_bits: u8) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_rq_vector_index(num_bits).await.unwrap();
+        let query_vector = Float32Array::from_iter_values((0..32).map(|value| value as f32));
+
+        let mut accurate = test_ds.dataset.scan();
+        accurate
+            .nearest("vec", &query_vector, 10)
+            .unwrap()
+            .nprobes(2)
+            .approx_mode(ApproxMode::Accurate)
+            .with_row_id()
+            .project(&["i"])
+            .unwrap();
+        let accurate_results = accurate.try_into_batch().await.unwrap();
+
+        // The fixture has 400 rows across multiple fragments. This factor makes
+        // the Fast candidate pass exhaustive, so selected-candidate scoring
+        // must produce the same top-k set as native Accurate RQ search. Ties in
+        // approximate scores may appear in a different order.
+        let mut quantized = test_ds.dataset.scan();
+        quantized
+            .nearest("vec", &query_vector, 10)
+            .unwrap()
+            .nprobes(2)
+            .quantized_refine(40)
+            .with_row_id()
+            .project(&["i"])
+            .unwrap();
+        let plan = quantized.explain_plan(false).await.unwrap();
+        assert!(plan.contains("quantized_refine_factor=40"), "{plan}");
+        assert!(!plan.contains("KNNVectorDistance"), "{plan}");
+        let quantized_results = quantized.try_into_batch().await.unwrap();
+        let quantized_ids = BTreeSet::from_iter(batch_row_ids(&quantized_results));
+        let accurate_ids = BTreeSet::from_iter(batch_row_ids(&accurate_results));
+        assert_eq!(quantized_ids, accurate_ids);
+        assert!(
+            quantized_results[DIST_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .all(|distance| distance.is_finite())
+        );
+
+        // Exact refinement remains a separate final stage and still reads the
+        // original vectors only when the caller explicitly asks for it.
+        let mut exact = test_ds.dataset.scan();
+        exact
+            .nearest("vec", &query_vector, 10)
+            .unwrap()
+            .use_index(false)
+            .with_row_id()
+            .project(&["i"])
+            .unwrap();
+        let exact_results = exact.try_into_batch().await.unwrap();
+
+        let mut quantized_then_exact = test_ds.dataset.scan();
+        quantized_then_exact
+            .nearest("vec", &query_vector, 10)
+            .unwrap()
+            .nprobes(2)
+            .quantized_refine(40)
+            .refine(2)
+            .with_row_id()
+            .project(&["i"])
+            .unwrap();
+        let plan = quantized_then_exact.explain_plan(false).await.unwrap();
+        assert!(plan.contains("quantized_refine_factor=40"), "{plan}");
+        assert!(plan.contains("KNNVectorDistance"), "{plan}");
+        let quantized_then_exact_results = quantized_then_exact.try_into_batch().await.unwrap();
+        assert_eq!(quantized_then_exact_results, exact_results);
+    }
+
+    #[rstest]
+    #[case::rq4(4)]
+    #[case::rq8(8)]
+    #[tokio::test]
+    async fn test_quantized_refinement_merges_unindexed_distance_scales(
+        #[case] num_bits: u8,
+        #[values(DistanceType::Cosine, DistanceType::L2, DistanceType::Dot)] metric: DistanceType,
+        #[values(false, true)] exact_refine: bool,
+        #[values(None, Some((0.15, 0.25)), Some((0.28, 0.32)))] range: Option<(f32, f32)>,
+    ) {
+        const DIM: usize = 32;
+        let make_batch = |rows: usize, first: f32, nearest_boost: f32| {
+            let mut values = Vec::with_capacity(rows * DIM);
+            for row in 0..rows {
+                // Separate the nearest ten so recall measures the merge rather
+                // than approximation noise among nearly tied RQ4 scores.
+                let boost = if row < 10 { nearest_boost } else { 0.0 };
+                let x = first + boost + row as f32 * 0.0001;
+                let tail: Vec<f32> = (1..DIM)
+                    .map(|dim| ((row * 37 + dim * 19) as f32).sin())
+                    .collect();
+                let norm = tail.iter().map(|value| value * value).sum::<f32>().sqrt();
+                values.push(x);
+                values.extend(tail.iter().map(|value| value / norm * (1.0 - x * x).sqrt()));
+            }
+            RecordBatch::try_from_iter([(
+                "vec",
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM as i32)
+                        .unwrap(),
+                ) as ArrayRef,
+            )])
+            .unwrap()
+        };
+        let indexed = make_batch(128, 0.8, 0.04);
+        let centroids = indexed["vec"].as_fixed_size_list().slice(0, 4);
+        let tmp = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(indexed.clone())], indexed.schema()),
+            &tmp,
+            Some(WriteParams {
+                max_rows_per_file: 32,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut rq_params = RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast);
+        let mut rotation = RabitQuantizer::new::<Float32Type>(num_bits, DIM as i32)
+            .metadata_ref()
+            .clone();
+        // Reuse a fixed rotation so recall assertions are deterministic.
+        for (index, signs) in rotation
+            .fast_rotation_signs
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            *signs = (index * 37 + 19) as u8;
+        }
+        rq_params.rotation = Some(rotation);
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::with_ivf_rq_params(
+                    metric,
+                    IvfBuildParams::try_with_centroids(4, Arc::new(centroids)).unwrap(),
+                    rq_params,
+                ),
+                true,
+            )
+            .await
+            .unwrap();
+        let appended = make_batch(16, 0.7, 0.0);
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 5);
+
+        let mut query = vec![0.0; DIM];
+        query[0] = 1.0;
+        let query = Float32Array::from(query);
+        let scale = if metric == DistanceType::Cosine && !exact_refine {
+            2.0
+        } else {
+            1.0
+        };
+        // Fixture ranges are expressed as 1 - cos. L2 on unit vectors is twice
+        // that, as are native RQ cosine scores without exact refinement.
+        let metric_scale = if metric == DistanceType::L2 { 2.0 } else { 1.0 };
+        let mut exact = dataset.scan();
+        exact
+            .nearest("vec", &query, 10)
+            .unwrap()
+            .distance_metric(metric)
+            .use_index(false)
+            .with_row_id()
+            .project::<&str>(&[])
+            .unwrap();
+        if let Some((lower, upper)) = range {
+            exact.distance_range(Some(lower * metric_scale), Some(upper * metric_scale));
+        }
+        let expected = exact.try_into_batch().await.unwrap();
+        let expected_ids = BTreeSet::from_iter(batch_row_ids(&expected));
+
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("vec", &query, 10)
+            .unwrap()
+            .distance_metric(metric)
+            .nprobes(4)
+            .quantized_refine(64)
+            .with_row_id()
+            .project::<&str>(&[])
+            .unwrap();
+        if exact_refine {
+            scanner.refine(2);
+        }
+        if let Some((lower, upper)) = range {
+            scanner.distance_range(
+                Some(lower * metric_scale * scale),
+                Some(upper * metric_scale * scale),
+            );
+        }
+        let plan = scanner.explain_plan(false).await.unwrap();
+        if !exact_refine {
+            // Only the unindexed scan computes vector distances. Indexed rows
+            // retain their RQ scores without taking their original vectors.
+            assert_eq!(plan.matches("KNNVectorDistance").count(), 1, "{plan}");
+            assert!(!plan.contains("Take:"), "{plan}");
+        }
+        let results = scanner.try_into_batch().await.unwrap();
+        assert_eq!(results.num_rows(), 10);
+        let ids = batch_row_ids(&results);
+        let recall = ids.iter().filter(|id| expected_ids.contains(id)).count();
+        assert!(
+            recall >= 5,
+            "recall={recall}/10, metric={metric:?}, ids={ids:?}"
+        );
+        for (row, distance) in results[DIST_COL]
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .enumerate()
+        {
+            if let Some((lower, upper)) = range {
+                assert!(
+                    (lower * metric_scale * scale..upper * metric_scale * scale).contains(distance)
+                );
+            }
+            if RowAddress::from(ids[row]).fragment_id() == 4 {
+                let offset = RowAddress::from(ids[row]).row_offset();
+                let expected_distance =
+                    (1.0 - (0.7 + offset as f32 * 0.0001)) * metric_scale * scale;
+                assert!((distance - expected_distance).abs() < 1e-5);
+            } else {
+                assert!(
+                    range != Some((0.28, 0.32)),
+                    "indexed row passed appended-only bounds"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_quantized_refinement_scores_selective_prefilter_shortcut_rows() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_rq_vector_index(4).await.unwrap();
+        let query_vector = Float32Array::from_iter_values((0..32).map(|value| value as f32));
+
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .nearest("vec", &query_vector, 10)
+            .unwrap()
+            .minimum_nprobes(1)
+            .maximum_nprobes(2)
+            .prefilter(true)
+            .filter("i = 0 OR i = 399")
+            .unwrap()
+            .quantized_refine(2)
+            .distance_range(None, Some(f32::MAX));
+        let results = scanner.try_into_batch().await.unwrap();
+
+        assert_eq!(results.num_rows(), 2);
+        assert!(
+            results[DIST_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .all(|distance| distance.is_finite())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_quantized_refinement_rejects_non_rq_index() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        let query_vector = Float32Array::from(vec![0.0; 32]);
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .nearest("vec", &query_vector, 5)
+            .unwrap()
+            .quantized_refine(2);
+        let error = scanner.try_into_batch().await.unwrap_err();
+        assert!(error.to_string().contains("requires an IVF_RQ flat index"));
+    }
+
+    #[tokio::test]
+    async fn test_quantized_refinement_applies_range_before_candidate_truncation() {
+        const DIM: usize = 32;
+        const ROWS: usize = 64;
+        let mut state = 0x1234_5678_u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / (u32::MAX >> 8) as f32) * 2.0 - 1.0
+        };
+        let mut values = Vec::with_capacity(ROWS * DIM);
+        for _ in 0..ROWS {
+            let start = values.len();
+            values.extend((0..DIM).map(|_| next()));
+            let norm = values[start..]
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                .sqrt();
+            values[start..].iter_mut().for_each(|value| *value /= norm);
+        }
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM as i32)
+                .unwrap();
+        let batch = RecordBatch::try_from_iter([("vec", Arc::new(vectors) as ArrayRef)]).unwrap();
+        let tmp = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            &tmp,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut rq_params = RQBuildParams::with_rotation_type(4, RQRotationType::Fast);
+        let mut rotation = RabitQuantizer::new::<Float32Type>(4, DIM as i32)
+            .metadata_ref()
+            .clone();
+        for (index, signs) in rotation
+            .fast_rotation_signs
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            *signs = (index * 37 + 19) as u8;
+        }
+        rq_params.rotation = Some(rotation);
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::with_ivf_rq_params(
+                    DistanceType::L2,
+                    IvfBuildParams::new(1),
+                    rq_params,
+                ),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let mut query_state = 0x9e37_79b9_u32;
+        let mut query = Vec::with_capacity(DIM);
+        for _ in 0..DIM {
+            query_state = query_state
+                .wrapping_mul(1_664_525)
+                .wrapping_add(1_013_904_223);
+            query.push(((query_state >> 8) as f32 / (u32::MAX >> 8) as f32) * 2.0 - 1.0);
+        }
+        let norm = query.iter().map(|value| value * value).sum::<f32>().sqrt();
+        query.iter_mut().for_each(|value| *value /= norm);
+        let query = Float32Array::from(query);
+
+        let mut fast = dataset.scan();
+        fast.nearest("vec", &query, 2)
+            .unwrap()
+            .nprobes(1)
+            .approx_mode(ApproxMode::Fast)
+            .fast_search()
+            .with_row_id()
+            .project::<&str>(&[])
+            .unwrap();
+        let fast = fast.try_into_batch().await.unwrap();
+        let fast_ids = batch_row_ids(&fast);
+
+        let mut accurate = dataset.scan();
+        accurate
+            .nearest("vec", &query, 2)
+            .unwrap()
+            .nprobes(1)
+            .approx_mode(ApproxMode::Accurate)
+            .fast_search()
+            .with_row_id()
+            .project::<&str>(&[])
+            .unwrap();
+        let accurate = accurate.try_into_batch().await.unwrap();
+        let accurate_ids = batch_row_ids(&accurate);
+        let accurate_distances = accurate[DIST_COL]
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+
+        assert_eq!(fast_ids, vec![accurate_ids[1], accurate_ids[0]]);
+        assert!(accurate_distances[0] < accurate_distances[1]);
+
+        // The Fast winner is the farther Accurate candidate. With factor=1, a
+        // post-truncation upper bound would discard it without ever scoring the
+        // in-range candidate that the Fast pass ranked second.
+        let upper_bound = (accurate_distances[0] + accurate_distances[1]) / 2.0;
+        let mut accurate_range = dataset.scan();
+        accurate_range
+            .nearest("vec", &query, 1)
+            .unwrap()
+            .nprobes(1)
+            .approx_mode(ApproxMode::Accurate)
+            .distance_range(None, Some(upper_bound))
+            .fast_search()
+            .with_row_id()
+            .project::<&str>(&[])
+            .unwrap();
+        let accurate_range = accurate_range.try_into_batch().await.unwrap();
+
+        let mut quantized = dataset.scan();
+        quantized
+            .nearest("vec", &query, 1)
+            .unwrap()
+            .nprobes(1)
+            .quantized_refine(1)
+            .distance_range(None, Some(upper_bound))
+            .fast_search()
+            .with_row_id()
+            .project::<&str>(&[])
+            .unwrap();
+        let quantized = quantized.try_into_batch().await.unwrap();
+
+        assert_eq!(batch_row_ids(&quantized), batch_row_ids(&accurate_range));
+        assert_eq!(quantized.num_rows(), 1);
+        assert!(quantized[DIST_COL].as_primitive::<Float32Type>().value(0) < upper_bound);
     }
 
     #[tokio::test]
@@ -21234,6 +22300,88 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         scanner
             .full_text_search(FullTextSearchQuery::new("4".into()))
             .unwrap();
+        limit_offset_equivalency_test(&scanner).await;
+    }
+
+    #[rstest]
+    #[case::flat(false, false)]
+    #[case::indexed(true, false)]
+    #[case::mixed(true, true)]
+    #[tokio::test]
+    async fn test_fts_ordered_limit_offset(
+        #[case] has_index: bool,
+        #[case] has_append: bool,
+        #[values(None, Some(4))] candidate_limit: Option<i64>,
+    ) {
+        // Longer documents rank lower, opposite to the requested id ordering.
+        let texts: Vec<String> = (0..6)
+            .map(|i| format!("needle {}", "filler ".repeat(20 * i)))
+            .collect();
+        let batch = arrow_array::record_batch!(
+            ("id", Int32, (0..6).collect::<Vec<i32>>()),
+            ("text", Utf8, texts)
+        )
+        .unwrap();
+        let initial_rows = if has_append { 4 } else { 6 };
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.slice(0, initial_rows))], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        if has_index {
+            dataset
+                .create_index(
+                    &["text"],
+                    IndexType::Inverted,
+                    None,
+                    &InvertedIndexParams::default(),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        if has_append {
+            dataset
+                .append(
+                    RecordBatchIterator::new(vec![Ok(batch.slice(4, 2))], batch.schema()),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["id", SCORE_COL])
+            .unwrap()
+            .full_text_search(
+                FullTextSearchQuery::new("needle".into())
+                    .with_column("text".into())
+                    .unwrap()
+                    .limit(candidate_limit),
+            )
+            .unwrap()
+            .order_by(Some(vec![ColumnOrdering::desc_nulls_last("id".into())]))
+            .unwrap();
+        let full = scanner.try_into_batch().await.unwrap();
+        let candidate_count = candidate_limit.unwrap_or(6) as i32;
+        assert_eq!(
+            full["id"].as_primitive::<Int32Type>().values().as_ref(),
+            (0..candidate_count).rev().collect::<Vec<_>>()
+        );
+        assert!(
+            full[SCORE_COL]
+                .as_primitive::<Float32Type>()
+                .values()
+                .windows(2)
+                .all(|scores| scores[0] < scores[1])
+        );
         limit_offset_equivalency_test(&scanner).await;
     }
 
@@ -24068,5 +25216,393 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                 .as_primitive::<Int32Type>();
             assert_eq!(i_array.values(), &[expected_i]);
         }
+    }
+
+    #[tokio::test]
+    async fn test_fts_global_statistics_preserve_prepared_query() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let error = test_ds
+            .dataset
+            .scan()
+            .fts_global_statistics()
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("requires a full-text query"));
+        let mut unindexed_scanner = test_ds.dataset.scan();
+        unindexed_scanner
+            .full_text_search(
+                FullTextSearchQuery::new("s-5".into())
+                    .with_column("s".into())
+                    .unwrap(),
+            )
+            .unwrap();
+        let error = unindexed_scanner.fts_global_statistics().await.unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("No Inverted index found for column s")
+        );
+        test_ds.make_segmented_fts_index().await.unwrap();
+        let mut combined_scanner = test_ds.dataset.scan();
+        combined_scanner
+            .full_text_search(FullTextSearchQuery::new_query(
+                CombinedFieldsQuery::try_new("s".into(), vec!["s".into()])
+                    .unwrap()
+                    .into(),
+            ))
+            .unwrap();
+        let error = combined_scanner.fts_global_statistics().await.unwrap_err();
+        assert!(matches!(&error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("combined_fields"));
+        test_ds.append_new_data().await.unwrap();
+
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .full_text_search(
+                FullTextSearchQuery::new("s-5".into())
+                    .with_column("S".into())
+                    .unwrap(),
+            )
+            .unwrap();
+        let encoded = scanner.fts_global_statistics().await.unwrap();
+        let statistics = crate::pb::FtsGlobalStatisticsProto::decode(encoded.as_slice()).unwrap();
+
+        assert_eq!(
+            statistics.schema_version,
+            crate::pb::FtsGlobalStatisticsSchemaVersion::V1 as i32
+        );
+        assert_eq!(statistics.dataset_version, test_ds.dataset.version_id());
+        assert_eq!(statistics.corpora.len(), 1);
+        let corpus = &statistics.corpora[0];
+        assert_eq!(corpus.index_name, "s_idx");
+        assert_eq!(corpus.column, "s");
+        assert_eq!(
+            corpus.document_granularity,
+            crate::pb::FtsDocumentGranularity::Row as i32
+        );
+        assert_eq!(
+            corpus.count_unit,
+            crate::pb::FtsCorpusCountUnit::Document as i32
+        );
+        assert_eq!(corpus.segment_uuids.len(), 2);
+        assert!(corpus.segment_uuids.iter().all(|uuid| uuid.len() == 16));
+        assert!(
+            corpus
+                .segment_uuids
+                .windows(2)
+                .all(|uuids| uuids[0] < uuids[1])
+        );
+        assert_eq!(corpus.num_docs, Some(400));
+        assert!(corpus.total_tokens.unwrap() > 0);
+        let term_document_frequencies = corpus
+            .terms
+            .iter()
+            .map(|term| {
+                (
+                    statistics.terms[term.term_index.unwrap() as usize].as_str(),
+                    term.document_frequency,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(term_document_frequencies.get("s"), Some(&Some(400)));
+        assert_eq!(term_document_frequencies.get("5"), Some(&Some(1)));
+        assert!(statistics.terms.windows(2).all(|terms| terms[0] < terms[1]));
+        assert_eq!(corpus.terms.len(), statistics.terms.len());
+        assert!(
+            corpus
+                .terms
+                .windows(2)
+                .all(|terms| terms[0].term_index < terms[1].term_index)
+        );
+        assert_eq!(statistics.query_leaves.len(), 1);
+        let leaf = &statistics.query_leaves[0];
+        assert_eq!(leaf.leaf_ordinal, Some(0));
+        assert_eq!(leaf.kind, crate::pb::FtsQueryLeafKind::Match as i32);
+        assert_eq!(leaf.corpus_indices, [0]);
+        assert_eq!(leaf.has_all_query_positions, Some(true));
+        let leaf_tokens = leaf
+            .tokens
+            .iter()
+            .map(|token| {
+                (
+                    statistics.terms[token.term_index.unwrap() as usize].as_str(),
+                    token.query_position.unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(leaf_tokens, [("s", 0), ("5", 1)]);
+        assert_eq!(
+            scanner.fts_global_statistics().await.unwrap(),
+            encoded,
+            "opaque statistics serialization must be deterministic"
+        );
+        scanner.with_fragments(vec![test_ds.dataset.fragments()[0].clone()]);
+        scanner.filter("i < 1").unwrap();
+        scanner.limit(Some(1), Some(1)).unwrap();
+        assert_eq!(scanner.fts_global_statistics().await.unwrap(), encoded);
+    }
+
+    #[rstest]
+    #[case::complete(50, true)]
+    #[case::capped(1, false)]
+    #[tokio::test]
+    async fn test_fts_global_statistics_compound_leaves(
+        #[case] max_expansions: usize,
+        #[case] has_all_query_positions: bool,
+    ) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_segmented_fts_index().await.unwrap();
+
+        let query: FtsQuery = BooleanQuery::new([
+            (
+                Occur::Should,
+                MatchQuery::new("s-5".to_string())
+                    .with_column(Some("s".to_string()))
+                    .into(),
+            ),
+            (
+                Occur::Should,
+                PhraseQuery::new("s-5".to_string())
+                    .with_column(Some("S".to_string()))
+                    .into(),
+            ),
+            (
+                Occur::Must,
+                MatchQuery::new("s-205".to_string())
+                    .with_column(Some("s".to_string()))
+                    .with_fuzziness(Some(1))
+                    .with_max_expansions(max_expansions)
+                    .into(),
+            ),
+        ])
+        .into();
+        let mut compound_scanner = test_ds.dataset.scan();
+        compound_scanner
+            .full_text_search(FullTextSearchQuery::new_query(query))
+            .unwrap();
+        let compound_statistics = crate::pb::FtsGlobalStatisticsProto::decode(
+            compound_scanner
+                .fts_global_statistics()
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(compound_statistics.corpora.len(), 1);
+        assert_eq!(compound_statistics.corpora[0].column, "s");
+        assert_eq!(compound_statistics.query_leaves.len(), 3);
+        assert_eq!(
+            compound_statistics
+                .query_leaves
+                .iter()
+                .map(|leaf| leaf.leaf_ordinal)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1), Some(2)]
+        );
+        assert_eq!(
+            compound_statistics
+                .query_leaves
+                .iter()
+                .map(|leaf| leaf.kind)
+                .collect::<Vec<_>>(),
+            [
+                crate::pb::FtsQueryLeafKind::Match as i32,
+                crate::pb::FtsQueryLeafKind::Phrase as i32,
+                crate::pb::FtsQueryLeafKind::Match as i32
+            ]
+        );
+        assert!(
+            compound_statistics
+                .query_leaves
+                .iter()
+                .all(|leaf| leaf.corpus_indices == [0])
+        );
+        let match_leaf = &compound_statistics.query_leaves[0];
+        let phrase_leaf = &compound_statistics.query_leaves[1];
+        assert_eq!(phrase_leaf.tokens, match_leaf.tokens);
+        assert_eq!(phrase_leaf.has_all_query_positions, Some(true));
+        assert_eq!(
+            compound_statistics.query_leaves[0]
+                .tokens
+                .iter()
+                .map(|token| token.query_position.unwrap())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 1])
+        );
+        let fuzzy_leaf = &compound_statistics.query_leaves[2];
+        assert_eq!(
+            fuzzy_leaf.has_all_query_positions,
+            Some(has_all_query_positions)
+        );
+        if !has_all_query_positions {
+            assert_eq!(fuzzy_leaf.tokens.len(), 1);
+            assert_eq!(fuzzy_leaf.tokens[0].query_position, Some(0));
+            return;
+        }
+        assert!(fuzzy_leaf.tokens.len() > 2);
+        assert_eq!(
+            fuzzy_leaf
+                .tokens
+                .iter()
+                .map(|token| token.query_position.unwrap())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([0, 1])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fts_global_statistics_preserves_ngram_fuzzy_and_phrase_positions() {
+        let batch =
+            arrow_array::record_batch!(("text", Utf8, ["abcd", "xbcd", "axcd", "abxd"])).unwrap();
+        let schema = batch.schema();
+        let reader = RecordBatchIterator::new([Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        let params = InvertedIndexParams::default()
+            .base_tokenizer("ngram".into())
+            .ngram_min_length(2)
+            .ngram_max_length(2)
+            .with_position(true);
+        dataset
+            .create_index(&["text"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+
+        let match_query: FtsQuery = BooleanQuery::new([
+            (
+                Occur::Must,
+                MatchQuery::new("abcd".into())
+                    .with_column(Some("text".into()))
+                    .into(),
+            ),
+            (
+                Occur::Must,
+                MatchQuery::new("ab bc".into())
+                    .with_column(Some("text".into()))
+                    .with_fuzziness(Some(1))
+                    .with_max_expansions(50)
+                    .into(),
+            ),
+        ])
+        .into();
+        let mut match_scanner = dataset.scan();
+        match_scanner
+            .full_text_search(FullTextSearchQuery::new_query(match_query))
+            .unwrap();
+        let match_statistics = crate::pb::FtsGlobalStatisticsProto::decode(
+            match_scanner
+                .fts_global_statistics()
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(match_statistics.query_leaves.len(), 2);
+        let match_leaf = &match_statistics.query_leaves[0];
+        assert_eq!(match_leaf.kind, crate::pb::FtsQueryLeafKind::Match as i32);
+
+        let mut tokens_by_term = BTreeMap::new();
+        let mut terms_by_group = BTreeMap::<u32, BTreeSet<&str>>::new();
+        for token in &match_leaf.tokens {
+            let term = match_statistics.terms[token.term_index.unwrap() as usize].as_str();
+            let position = token.query_position.unwrap();
+            tokens_by_term.insert(term, position);
+            terms_by_group.entry(position).or_default().insert(term);
+        }
+        assert_eq!(tokens_by_term.get("ab"), Some(&0));
+        assert_eq!(tokens_by_term.get("bc"), Some(&1));
+        assert_eq!(tokens_by_term.get("cd"), Some(&2));
+        assert_eq!(
+            terms_by_group.keys().copied().collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        let fuzzy_leaf = &match_statistics.query_leaves[1];
+        let mut fuzzy_terms_by_group = BTreeMap::<u32, BTreeSet<&str>>::new();
+        for token in &fuzzy_leaf.tokens {
+            let term = match_statistics.terms[token.term_index.unwrap() as usize].as_str();
+            fuzzy_terms_by_group
+                .entry(token.query_position.unwrap())
+                .or_default()
+                .insert(term);
+        }
+        assert_eq!(
+            fuzzy_terms_by_group.keys().copied().collect::<Vec<_>>(),
+            [0, 1],
+            "fuzzy Match tokens must retain their source term groups: {fuzzy_terms_by_group:?}"
+        );
+        assert!(
+            fuzzy_terms_by_group.values().any(|terms| terms.len() > 1),
+            "fuzzy alternatives must retain their source term group: {fuzzy_terms_by_group:?}"
+        );
+
+        let phrase_query = PhraseQuery::new("abcd".into()).with_column(Some("text".into()));
+        let mut phrase_scanner = dataset.scan();
+        phrase_scanner
+            .full_text_search(FullTextSearchQuery::new_query(phrase_query.into()))
+            .unwrap();
+        let phrase_statistics = crate::pb::FtsGlobalStatisticsProto::decode(
+            phrase_scanner
+                .fts_global_statistics()
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        let phrase_leaf = &phrase_statistics.query_leaves[0];
+        assert_eq!(phrase_leaf.kind, crate::pb::FtsQueryLeafKind::Phrase as i32);
+        assert_eq!(
+            phrase_leaf
+                .tokens
+                .iter()
+                .map(|token| token.query_position.unwrap())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([0]),
+            "Phrase must use the ngram tokenizer's raw zero offsets, not Match term groups"
+        );
+    }
+
+    #[rstest]
+    #[case::all_null(vec![None, None])]
+    #[case::empty_strings(vec![Some(""), Some("")])]
+    #[tokio::test]
+    async fn test_fts_global_statistics_empty_corpus(#[case] texts: Vec<Option<&str>>) {
+        let batch = arrow_array::record_batch!(("text", Utf8, texts)).unwrap();
+        let schema = batch.schema();
+        let reader = RecordBatchIterator::new([Ok(batch)], schema);
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        let mut scanner = dataset.scan();
+        scanner
+            .full_text_search(
+                FullTextSearchQuery::new("missing".into())
+                    .with_column("text".into())
+                    .unwrap(),
+            )
+            .unwrap();
+        let encoded = scanner.fts_global_statistics().await.unwrap();
+        let statistics = crate::pb::FtsGlobalStatisticsProto::decode(encoded.as_slice()).unwrap();
+        // The default English tokenizer stems "missing" to "miss".
+        assert_eq!(statistics.terms, ["miss"]);
+        assert_eq!(statistics.corpora.len(), 1);
+        let corpus = &statistics.corpora[0];
+        assert_eq!(corpus.num_docs, Some(0));
+        assert_eq!(corpus.total_tokens, Some(0));
+        assert_eq!(corpus.terms.len(), 1);
+        assert_eq!(corpus.terms[0].term_index, Some(0));
+        assert_eq!(corpus.terms[0].document_frequency, Some(0));
     }
 }

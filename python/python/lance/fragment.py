@@ -602,6 +602,7 @@ class LanceFragment(pa.dataset.Fragment):
         ] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[List[str]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         include_deleted_rows: Optional[bool] = None,
@@ -637,6 +638,7 @@ class LanceFragment(pa.dataset.Fragment):
             blob_handling=blob_handling,
             order_by=order_by,
             use_scalar_index=use_scalar_index,
+            ignored_scalar_indices=ignored_scalar_indices,
             io_buffer_size=io_buffer_size,
             late_materialization=late_materialization,
             include_deleted_rows=include_deleted_rows,
@@ -671,6 +673,7 @@ class LanceFragment(pa.dataset.Fragment):
             "_fast_search": False,
             "_full_text_query": None,
             "_use_scalar_index": use_scalar_index,
+            "_ignored_scalar_indices": ignored_scalar_indices,
             "_include_deleted_rows": include_deleted_rows,
             "_scan_stats_callback": None,
             "_strict_batch_size": (
@@ -727,6 +730,7 @@ class LanceFragment(pa.dataset.Fragment):
         ] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[List[str]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         include_deleted_rows: Optional[bool] = None,
@@ -745,6 +749,7 @@ class LanceFragment(pa.dataset.Fragment):
             blob_handling=blob_handling,
             order_by=order_by,
             use_scalar_index=use_scalar_index,
+            ignored_scalar_indices=ignored_scalar_indices,
             io_buffer_size=io_buffer_size,
             late_materialization=late_materialization,
             include_deleted_rows=include_deleted_rows,
@@ -770,6 +775,7 @@ class LanceFragment(pa.dataset.Fragment):
         include_deleted_rows: Optional[bool] = None,
         batch_size_bytes: Optional[int] = None,
         strict_batch_size: Optional[bool] = None,
+        ignored_scalar_indices: Optional[List[str]] = None,
     ) -> pa.Table:
         return self.scanner(
             columns=columns,
@@ -781,6 +787,7 @@ class LanceFragment(pa.dataset.Fragment):
             blob_handling=blob_handling,
             order_by=order_by,
             use_scalar_index=use_scalar_index,
+            ignored_scalar_indices=ignored_scalar_indices,
             io_buffer_size=io_buffer_size,
             late_materialization=late_materialization,
             include_deleted_rows=include_deleted_rows,
@@ -845,6 +852,9 @@ class LanceFragment(pa.dataset.Fragment):
         is the right side. Rows existing in the dataset but not on the left will
         be filled with null values, unless Lance doesn't support null values for
         some types, in which case an error will be raised.
+        The right-side join column must contain unique keys; null counts as a
+        key, so at most one null value is allowed. Duplicate right-side keys
+        raise an error.
 
         Parameters
         ----------

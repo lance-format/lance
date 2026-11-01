@@ -1079,6 +1079,14 @@ fn old_filter_keeps(filter: &super::OldIndexDataFilter, row_id: u64) -> bool {
             to_keep.contains((row_id >> 32) as u32)
         }
         super::OldIndexDataFilter::RowIds(valid) => valid.contains(row_id),
+        super::OldIndexDataFilter::RowAddresses {
+            to_keep,
+            deleted_rows,
+            ..
+        } => {
+            to_keep.contains(RowAddress::from(row_id).fragment_id())
+                && !deleted_rows.contains(row_id)
+        }
     }
 }
 
@@ -1923,6 +1931,10 @@ impl BasicTrainer for NGramIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for NGramIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(true)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }

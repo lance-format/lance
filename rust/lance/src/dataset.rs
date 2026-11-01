@@ -72,6 +72,7 @@ pub mod builder;
 pub mod cleanup;
 mod data_file;
 mod data_file_part;
+pub mod deletions;
 pub mod delta;
 pub mod files;
 pub mod fragment;
@@ -165,8 +166,8 @@ pub use schema_evolution::{
 pub use take::TakeBuilder;
 use uuid::Uuid;
 pub use write::merge_insert::{
-    MergeInsertBuilder, MergeInsertJob, MergeInsertWriteMode, MergeStats, UncommittedMergeInsert,
-    WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
+    MergeInsertBuilder, MergeInsertJob, MergeInsertWriteMode, MergeStats, SourceDedupeBehavior,
+    UncommittedMergeInsert, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
 };
 
 use crate::dataset::index::LanceIndexStoreExt;
@@ -181,6 +182,8 @@ pub use write::{
 pub(crate) const INDICES_DIR: &str = "_indices";
 pub(crate) const DATA_DIR: &str = "data";
 pub(crate) const TRANSACTIONS_DIR: &str = "_transactions";
+pub(crate) const BLOBS_DIR: &str = "_blobs";
+pub(crate) const FRAG_REUSE_DIR: &str = "_fri";
 const DEFAULT_MAX_STREAM_COPY_PARALLELISM: usize = 4;
 
 // Full samples already have their final ordering and need no randomness.
@@ -300,6 +303,14 @@ pub struct Version {
 
     /// Key-value pairs of metadata.
     pub metadata: BTreeMap<String, String>,
+
+    /// Size of the manifest file for this version, in bytes, if known.
+    ///
+    /// On wide tables (many columns and/or fragments) the manifest is rewritten
+    /// in full on every commit; exposing its size per version makes metadata
+    /// growth observable via [`Dataset::versions`].
+    #[serde(default)]
+    pub manifest_size: Option<u64>,
 }
 
 /// A lightweight reference to an attached dataset version, which could be used to uniquely identify a version.
@@ -317,6 +328,7 @@ impl From<&Manifest> for Version {
             version: m.version,
             timestamp: m.timestamp(),
             metadata: m.summary().into(),
+            manifest_size: None,
         }
     }
 }
@@ -608,30 +620,39 @@ impl Dataset {
         self.checkout_by_ref(None, Some(branch)).await
     }
 
+    /// Create a branch from an existing version with a shallow clone.
+    ///
     /// This is a two-phase operation:
+    /// - Atomically reserve the name by creating the branch metadata (`BranchContents`).
     /// - Create the branch dataset by shallow cloning.
-    /// - Create the branch metadata (a.k.a. `BranchContents`).
     ///
     /// These two phases are not atomic. We consider `BranchContents` as the source of truth
     /// for the branch.
     ///
-    /// The cleanup procedure should:
-    /// - Clean up zombie branch datasets that have no related `BranchContents`.
-    /// - Delete broken `BranchContents` entries that have no related branch dataset.
+    /// A concurrent creator that cannot reserve the name returns a conflict without
+    /// writing to the branch dataset.
     ///
-    /// If `create_branch` stops at phase 1, it may leave a zombie branch dataset,
-    /// which can be cleaned up later. Such a zombie dataset may cause a branch creation
-    /// failure if we use the same name to `create_branch`. In that case, you need to call
-    /// `force_delete_branch` to interactively clean up the zombie dataset.
+    /// If cloning fails or is interrupted, the name remains reserved, since the clone
+    /// commit may have succeeded even if its result is unknown. Use
+    /// [`Self::force_delete_branch`] to clean up the incomplete branch before retrying.
     ///
     /// `"main"` is reserved for the default branch and cannot be used as a new branch name.
+    /// A segment after the first cannot be a reserved dataset directory.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &mut Dataset) -> Result<()> {
+    /// let experiment = dataset.create_branch("experiment", ("main", None), None).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn create_branch(
         &mut self,
         branch: &str,
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
-        refs::check_valid_branch(branch)?;
+        refs::check_new_branch(branch)?;
 
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
         let branch_location = self.branch_location().find_branch(Some(branch))?;
@@ -647,6 +668,11 @@ impl Dataset {
         };
         let transaction = Transaction::new(version_number, clone_op, None);
 
+        // Claim the name before the clone can write into another creator's branch.
+        self.branches()
+            .create(branch, version_number, source_branch.as_deref())
+            .await?;
+
         let builder = CommitBuilder::new(WriteDestination::Uri(branch_location.uri.as_str()))
             // Fall back to the dataset's own store params
             .with_store_params(
@@ -655,15 +681,13 @@ impl Dataset {
             .with_object_store(Arc::new(self.object_store.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
-        let dataset = builder.execute(transaction).await?;
-
-        // Create BranchContents after shallow_clone
-        self.branches()
-            .create(branch, version_number, source_branch.as_deref())
-            .await?;
-        Ok(dataset)
+        builder.execute(transaction).await
     }
 
+    /// Deletes a branch and removes its directory when safe.
+    ///
+    /// Legacy branches like `outer/data` may share a directory with another
+    /// branch. Their files are retained, so checkout by name may still work.
     pub async fn delete_branch(&mut self, branch: &str) -> Result<()> {
         self.branches().delete(branch, false).await
     }
@@ -1575,6 +1599,53 @@ impl Dataset {
         Ok(())
     }
 
+    /// Restore the currently checked out version if `expected_latest_version`
+    /// is still the dataset's latest version.
+    ///
+    /// Unlike [`Self::restore`], this method never rebases across commits that
+    /// landed after the caller inspected the table. If the latest version
+    /// changed, or another writer publishes while this restore is being built,
+    /// the commit fails with a retryable conflict and the caller must reload
+    /// and validate the new snapshot before trying again.
+    ///
+    /// The restore is published through this dataset's installed commit
+    /// handler, including namespace-managed version registration.
+    ///
+    /// # Arguments
+    ///
+    /// * `expected_latest_version` - The latest version the caller observed
+    ///   and validated before deciding to restore.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let expected_latest_version = dataset.latest_version_id().await?;
+    /// let mut restore_target = dataset.checkout_version(3).await?;
+    /// restore_target
+    ///     .restore_from(expected_latest_version)
+    ///     .await?;
+    /// # Ok(())
+    /// }
+    /// ```
+    pub async fn restore_from(&mut self, expected_latest_version: u64) -> Result<()> {
+        let transaction = Transaction::new(
+            expected_latest_version,
+            Operation::Restore {
+                version: self.manifest.version,
+            },
+            None,
+        );
+        self.apply_commit_with_expected_latest_version(
+            transaction,
+            &Default::default(),
+            &Default::default(),
+            Some(expected_latest_version),
+        )
+        .await
+    }
+
     /// Removes old versions of the dataset from disk
     ///
     /// This function will remove all versions of the dataset that are older than the provided
@@ -1582,6 +1653,8 @@ impl Dataset {
     ///
     /// Once a version is removed it can no longer be checked out or restored.  Any data unique
     /// to that version will be lost.
+    ///
+    /// Returns an invalid-input error when this dataset is checked out at a detached version.
     ///
     /// # Arguments
     ///
@@ -1623,6 +1696,8 @@ impl Dataset {
     /// Once a version is removed it can no longer be checked out or restored.  Any data unique
     /// to that version will be lost.
     ///
+    /// Returns an invalid-input error when this dataset is checked out at a detached version.
+    ///
     /// # Arguments
     ///
     /// * `policy` - `CleanupPolicy` determines the behaviour of cleanup.
@@ -1642,6 +1717,8 @@ impl Dataset {
     ///
     /// The returned operation can be explained without deleting files, or
     /// executed to re-evaluate the current dataset state and remove files.
+    /// Both return an invalid-input error when this dataset is checked out at a
+    /// detached version.
     pub fn cleanup(&self, policy: CleanupPolicy) -> CleanupOperation<'_> {
         CleanupOperation::new(self, policy)
     }
@@ -1785,7 +1862,24 @@ impl Dataset {
         write_config: &ManifestWriteConfig,
         commit_config: &CommitConfig,
     ) -> Result<()> {
-        let (manifest, manifest_location) = commit_transaction(
+        self.apply_commit_with_expected_latest_version(
+            transaction,
+            write_config,
+            commit_config,
+            None,
+        )
+        .await
+    }
+
+    async fn apply_commit_with_expected_latest_version(
+        &mut self,
+        transaction: Transaction,
+        write_config: &ManifestWriteConfig,
+        commit_config: &CommitConfig,
+        expected_latest_version: Option<u64>,
+    ) -> Result<()> {
+        // Keep the retry and rebase state machine out of every caller's future.
+        let (manifest, manifest_location) = Box::pin(commit_transaction(
             self,
             self.object_store.as_ref(),
             self.commit_handler.as_ref(),
@@ -1795,7 +1889,8 @@ impl Dataset {
             default_commit_retry_timeout(),
             self.manifest_location.naming_scheme,
             None,
-        )
+            expected_latest_version,
+        ))
         .await?;
 
         self.set_manifest(Arc::new(manifest), manifest_location);
@@ -2744,6 +2839,23 @@ impl Dataset {
         self.object_store(index.base_id).await
     }
 
+    /// This table as a reader of `manifest`, another manifest of it, sees its
+    /// files: through that manifest's base paths, with base stores opened
+    /// afresh when those differ, since `base_object_stores` caches by id alone.
+    pub(crate) fn with_manifest_view(&self, manifest: Arc<Manifest>) -> Self {
+        let base_object_stores = if manifest.base_paths == self.manifest.base_paths {
+            self.base_object_stores.clone()
+        } else {
+            Default::default()
+        };
+        Self {
+            fragment_bitmap: Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect()),
+            manifest,
+            base_object_stores,
+            ..self.clone()
+        }
+    }
+
     pub(crate) fn dataset_dir_for_deletion(&self, deletion_file: &DeletionFile) -> Result<Path> {
         match deletion_file.base_id.as_ref() {
             Some(base_id) => {
@@ -2807,7 +2919,13 @@ impl Dataset {
     /// This constructs a full [Version], including summary metadata derived
     /// from the loaded manifest fragments.
     pub fn version(&self) -> Version {
-        Version::from(self.manifest.as_ref())
+        let mut version = Version::from(self.manifest.as_ref());
+        // `Version::from` only sees the manifest itself, not where it was read
+        // from. This dataset already knows the on-disk size, so report it here
+        // too; otherwise `get_version()` would disagree with `versions()`,
+        // which takes the size from the manifest location.
+        version.manifest_size = self.manifest_location().size;
+        version
     }
 
     /// Get the number of entries currently in the index cache.
@@ -2831,8 +2949,13 @@ impl Dataset {
             .commit_handler
             .list_manifest_locations(&self.base, &self.object_store, false)
             .try_filter_map(|location| async move {
-                match read_manifest(&self.object_store, &location.path, location.size).await {
-                    Ok(manifest) => Ok(Some(Version::from(&manifest))),
+                let manifest_size = location.size;
+                match read_manifest(&self.object_store, &location.path, manifest_size).await {
+                    Ok(manifest) => {
+                        let mut version = Version::from(&manifest);
+                        version.manifest_size = manifest_size;
+                        Ok(Some(version))
+                    }
                     Err(e) => Err(e),
                 }
             })
@@ -3803,7 +3926,11 @@ impl Dataset {
                     }
                 }
             }
-            if let Some(deletion_file) = &fragment.deletion_file {
+            if let Some(deletion_file) = fragment
+                .deletion_file
+                .as_ref()
+                .filter(|file| !file.is_inline())
+            {
                 let base_root = if let Some(base_id) = deletion_file.base_id {
                     let base_path =
                         self.manifest.base_paths.get(&base_id).ok_or_else(|| {
@@ -4134,7 +4261,9 @@ impl Dataset {
     ///
     /// Returns: a new version of dataset.
     ///
-    /// It performs a left-join on the two datasets.
+    /// It performs a left-join on the two datasets. The right-side join column must
+    /// contain unique keys, including at most one null. Duplicate right-side keys
+    /// return an input error before the dataset is modified.
     pub async fn merge(
         &mut self,
         stream: impl RecordBatchReader + Send + 'static,
@@ -4609,6 +4738,11 @@ pub(crate) async fn write_manifest_file(
         // this write with their index section but without a build, and a clone
         // starts from a masked writer word.
         apply_index_object_metadata_flag(manifest, indices.as_deref().unwrap_or_default());
+    }
+    // Restore and clone bypass build_manifest and may copy an older snapshot
+    // that predates the writer fence.
+    if let Some(indices) = &indices {
+        lance_table::feature_flags::apply_row_addr_index_feature_flag(manifest, indices);
     }
     // After the flag reset, so it judges the flags being published. Here rather
     // than in `build_manifest`, which restore and clone bypass.

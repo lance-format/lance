@@ -246,12 +246,11 @@ print(results.to_pandas())
 For production workloads with large datasets, create a vector index for much faster search:
 
 ```python
-# Create an IVF-PQ index for fast approximate nearest neighbor search
+# Create an IVF_RQ index for fast approximate nearest neighbor search
 ds.create_index(
     "vector",
-    index_type="IVF_PQ",
+    index_type="IVF_RQ",
     num_partitions=256,  # Number of IVF partitions
-    num_sub_vectors=16,  # Number of PQ sub-vectors
 )
 
 # Search with the index (automatically used)
@@ -411,10 +410,10 @@ This maps to Lance's `FixedSizeList(Float32, 384)` type, which is optimized for:
 4. **Create indices for large datasets**: For datasets with more than ~10,000 vectors, create an ANN index for fast search:
 
     ```python
-    # IVF_PQ is recommended for most use cases
-    ds.create_index("vector", index_type="IVF_PQ", num_partitions=256, num_sub_vectors=16)
+    # IVF_RQ is recommended for most use cases
+    ds.create_index("vector", index_type="IVF_RQ", num_partitions=256)
     
-    # IVF_HNSW_SQ offers better recall at the cost of more memory
+    # IVF_HNSW_SQ offers graph-based search with different latency and recall tradeoffs
     ds.create_index("vector", index_type="IVF_HNSW_SQ", num_partitions=256)
     ```
 

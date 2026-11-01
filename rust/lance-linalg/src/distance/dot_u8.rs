@@ -54,6 +54,10 @@ lance_core::target_kernel! {
     ///
     /// The result is the low 32 bits of the exact dot product. Use
     /// [`dot_u8_u64`] when the full result is required.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `a` and `b` have different lengths.
     #[inline]
     pub fn dot_u8_scalar(a: &[u8], b: &[u8]) -> u32 {
         assert_equal_lengths(a.len(), b.len());
@@ -165,6 +169,10 @@ mod x86 {
 ///
 /// The result is the low 32 bits of the exact dot product. Use
 /// [`dot_u8_u64`] when the full result is required.
+///
+/// # Panics
+///
+/// Panics if `a` and `b` have different lengths.
 #[inline]
 pub fn dot_u8(a: &[u8], b: &[u8]) -> u32 {
     assert_equal_lengths(a.len(), b.len());
@@ -175,6 +183,10 @@ pub fn dot_u8(a: &[u8], b: &[u8]) -> u32 {
 ///
 /// This retains the runtime-selected SIMD kernel and widens its result between
 /// chunks that are guaranteed to fit in a u32.
+///
+/// # Panics
+///
+/// Panics if `a` and `b` have different lengths.
 ///
 /// # Example
 ///

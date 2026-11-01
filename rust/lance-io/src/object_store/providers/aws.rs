@@ -44,6 +44,8 @@ mod conditional_copy;
 
 use conditional_copy::ConditionalS3Store;
 
+use super::opendal::finish_opendal_operator;
+
 #[derive(Default, Debug)]
 pub struct AwsStoreProvider;
 
@@ -216,6 +218,7 @@ impl AwsStoreProvider {
 
         let operator = Operator::from_iter::<S3>(config_map)
             .map_err(|e| Error::invalid_input(format!("Failed to create S3 operator: {:?}", e)))?;
+        let operator = finish_opendal_operator(operator, storage_options.client_max_retries());
 
         Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
     }
@@ -299,6 +302,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
             list_is_lexically_ordered: !is_s3_express,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
+            scheduler_error_mode: Default::default(),
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,

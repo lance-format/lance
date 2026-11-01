@@ -33,6 +33,7 @@ import java.util.Arrays;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 public class JNITest {
@@ -60,6 +61,7 @@ public class JNITest {
     assertEquals(Optional.empty(), defaultQuery.getUpperBound());
     assertEquals(0.5, defaultQuery.getSearchEffort());
     assertEquals(Optional.empty(), defaultQuery.getSearchEffortOption());
+    assertFalse(defaultQuery.getQuantizedRefineFactor().isPresent());
 
     Query nprobesQuery =
         new Query.Builder()
@@ -80,6 +82,7 @@ public class JNITest {
             .setNprobes(20)
             .setEf(30)
             .setRefineFactor(40)
+            .setQuantizedRefineFactor(4)
             .setDistanceType(DistanceType.L2)
             .setUseIndex(true)
             .setQueryParallelism(-1)
@@ -88,6 +91,16 @@ public class JNITest {
     assertEquals(Optional.of(1.5f), query.getLowerBound());
     assertEquals(Optional.of(2.5f), query.getUpperBound());
     JniTestHelper.parseQuery(Optional.of(query));
+    assertEquals(Optional.of(4), query.getQuantizedRefineFactor());
+
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            new Query.Builder()
+                .setColumn("column")
+                .setKey(new float[] {1.0f})
+                .setQuantizedRefineFactor(0)
+                .build());
   }
 
   @ParameterizedTest

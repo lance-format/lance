@@ -162,6 +162,12 @@ impl InvertedIndex {
         self
     }
 
+    /// The rows this segment may answer for, when the opener restricted it
+    /// (see [`Self::with_allowed_rows`]).
+    pub fn allowed_rows(&self) -> Option<&Arc<RowAddrMask>> {
+        self.allowed_rows.as_ref()
+    }
+
     /// The mask this segment searches with: `mask` restricted to its allowed rows.
     pub(crate) fn restrict_mask(&self, mask: Arc<RowAddrMask>) -> Arc<RowAddrMask> {
         match &self.allowed_rows {
@@ -866,6 +872,27 @@ impl InvertedIndex {
         state.satisfies(with_position) && self.has_resident_document_projections()
     }
 
+    /// Prewarm postings and, optionally, positions into the index cache.
+    ///
+    /// Modern posting groups default to a 32 KiB logical row-buffer budget.
+    /// `LANCE_FTS_POSTING_GROUP_MAX_BYTES` overrides that budget; an oversized
+    /// posting remains a singleton. Positions and cache serialization overhead
+    /// are excluded. Group boundaries are cached alongside postings, so source
+    /// index files do not change and existing indices need no rebuild.
+    ///
+    /// `LANCE_FTS_POSTING_GROUP_MAX_TOKENS` explicitly selects the previous
+    /// token-count policy instead. Both settings require positive integers and
+    /// are mutually exclusive. Set them before the first index is opened.
+    /// Without cached byte boundaries, cold queries keep their existing read
+    /// policy. Legacy per-document position layouts keep token-count grouping.
+    ///
+    /// ```
+    /// # use lance_index::{FtsPrewarmOptions, scalar::inverted::InvertedIndex};
+    /// # async fn example(index: &InvertedIndex) -> lance_core::Result<()> {
+    /// index.prewarm_with_options(&FtsPrewarmOptions::default()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn prewarm_with_options(&self, options: &FtsPrewarmOptions) -> Result<()> {
         self.prewarm_with_options_result(options).await.map(|_| ())
     }
