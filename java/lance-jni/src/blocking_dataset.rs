@@ -1212,7 +1212,8 @@ fn inner_create_index<'local>(
         | IndexType::IvfRq
         | IndexType::IvfHnswSq
         | IndexType::IvfHnswPq
-        | IndexType::IvfHnswFlat => {
+        | IndexType::IvfHnswFlat
+        | IndexType::IvfHnswRq => {
             // For vector indices, use the existing parameter handling
             get_vector_index_params(env, params_jobj)
         }

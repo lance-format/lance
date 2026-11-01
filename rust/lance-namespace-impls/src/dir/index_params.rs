@@ -68,6 +68,7 @@ impl DirectoryNamespace {
             "IVF_HNSW_FLAT" => Ok(IndexType::IvfHnswFlat),
             "IVF_HNSW_SQ" => Ok(IndexType::IvfHnswSq),
             "IVF_HNSW_PQ" => Ok(IndexType::IvfHnswPq),
+            "IVF_HNSW_RQ" => Ok(IndexType::IvfHnswRq),
             other => Err(NamespaceError::InvalidInput {
                 message: format!("Unsupported index_type '{}'", other),
             }
@@ -180,12 +181,12 @@ impl DirectoryNamespace {
                     SQBuildParams::default(),
                 ),
             },
-            IndexType::IvfRq => {
+            IndexType::IvfRq | IndexType::IvfHnswRq => {
                 let rq_params = if let Some(requested_num_bits) = request.num_bits {
                     let invalid_num_bits = || NamespaceError::InvalidInput {
                         message: format!(
-                            "IVF_RQ num_bits must be in {}..={}, got {}",
-                            RABIT_MIN_NUM_BITS, RABIT_MAX_NUM_BITS, requested_num_bits
+                            "{} num_bits must be in {}..={}, got {}",
+                            index_type, RABIT_MIN_NUM_BITS, RABIT_MAX_NUM_BITS, requested_num_bits
                         ),
                     };
                     let num_bits =
@@ -195,14 +196,22 @@ impl DirectoryNamespace {
                 } else {
                     RQBuildParams::default()
                 };
-                DirectoryIndexParams::Vector {
-                    index_type,
-                    params: VectorIndexParams::with_ivf_rq_params(
-                        Self::parse_metric_type(request.distance_type.as_deref())?,
+                let metric_type = Self::parse_metric_type(request.distance_type.as_deref())?;
+                let params = if index_type == IndexType::IvfRq {
+                    VectorIndexParams::with_ivf_rq_params(
+                        metric_type,
                         IvfBuildParams::default(),
                         rq_params,
-                    ),
-                }
+                    )
+                } else {
+                    VectorIndexParams::with_ivf_hnsw_rq_params(
+                        metric_type,
+                        IvfBuildParams::default(),
+                        HnswBuildParams::default(),
+                        rq_params,
+                    )
+                };
+                DirectoryIndexParams::Vector { index_type, params }
             }
             IndexType::IvfHnswFlat => DirectoryIndexParams::Vector {
                 index_type,

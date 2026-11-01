@@ -71,6 +71,9 @@ use lance_index::prefilter::NoFilter;
 use lance_index::scalar::RowAddrTranslator;
 use lance_index::vector::DISTANCE_TYPE_KEY;
 use lance_index::vector::bq::builder::RabitQuantizer;
+use lance_index::vector::bq::storage::{
+    RABIT_METADATA_KEY, RabitQuantizationMetadata, RabitQuantizationStorage,
+};
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatMetadata, FlatQuantizer};
 use lance_index::vector::flat::storage::{FLAT_COLUMN, FlatBinStorage, FlatFloatStorage};
 use lance_index::vector::hnsw::HnswMetadata;
@@ -81,8 +84,8 @@ use lance_index::vector::kmeans::{KMeans, KMeansParams};
 use lance_index::vector::pq::storage::{
     PQ_METADATA_KEY, ProductQuantizationMetadata, ProductQuantizationStorage, transpose,
 };
-use lance_index::vector::quantizer::QuantizationType;
-use lance_index::vector::storage::STORAGE_METADATA_KEY;
+use lance_index::vector::quantizer::{QuantizationType, QuantizerMetadata as _};
+use lance_index::vector::storage::{STORAGE_METADATA_KEY, VectorStore};
 use lance_index::vector::v3::shuffler::create_owned_ivf_shuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use lance_index::{
@@ -1061,6 +1064,27 @@ pub(crate) async fn optimize_vector_indices_v2(
         // IVF_HNSW_PQ
         (SubIndexType::Hnsw, QuantizationType::Product) => {
             IvfIndexBuilder::<HNSW, ProductQuantizer>::new_incremental(
+                dataset.clone(),
+                vector_column.to_owned(),
+                index_dir,
+                distance_type,
+                shuffler,
+                derive_hnsw_params(reference_index.as_ref()),
+                frag_reuse_index,
+                options.clone(),
+            )?
+            .with_ivf(ivf_model.clone())
+            .with_quantizer(quantizer.try_into()?)
+            .with_existing_index_sources(existing_indices.clone())
+            .with_progress(options.progress.clone())
+            .with_target_partition_size(target_partition_size)
+            .shuffle_data_input(unindexed)
+            .build()
+            .await?
+        }
+        // IVF_HNSW_RQ
+        (SubIndexType::Hnsw, QuantizationType::Rabit) => {
+            IvfIndexBuilder::<HNSW, RabitQuantizer>::new_incremental(
                 dataset.clone(),
                 vector_column.to_owned(),
                 index_dir,
@@ -3290,6 +3314,11 @@ async fn write_hnsw_root_index_from_auxiliary(
     };
     let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
     let mut partition_index_metadata = Vec::with_capacity(aux_ivf.num_partitions());
+    // Read once: a dense rotation is a large global buffer.
+    let rq_metadata = match index_metadata.index_type.as_str() {
+        "IVF_HNSW_RQ" => Some(read_rq_storage_metadata(aux_reader).await?),
+        _ => None,
+    };
 
     progress
         .stage_start(
@@ -3317,6 +3346,7 @@ async fn write_hnsw_root_index_from_auxiliary(
             aux_reader,
             distance_type,
             hnsw_params,
+            rq_metadata.as_ref().zip(aux_ivf.centroid(partition_id)),
         )
         .await?;
         let index_batch = hnsw.to_batch()?;
@@ -3364,6 +3394,7 @@ async fn build_hnsw_from_storage_batch(
     aux_reader: &V2Reader,
     distance_type: DistanceType,
     hnsw_params: &HnswBuildParams,
+    rq: Option<(&RabitQuantizationMetadata, ArrayRef)>,
 ) -> Result<HNSW> {
     match index_type {
         "IVF_HNSW_FLAT" => {
@@ -3398,6 +3429,14 @@ async fn build_hnsw_from_storage_batch(
                 read_storage_metadata::<ScalarQuantizationMetadata>(aux_reader, SQ_METADATA_KEY)?;
             let storage =
                 ScalarQuantizationStorage::try_from_batch(batch, &metadata, distance_type, None)?;
+            HNSW::index_vectors(&storage, hnsw_params.clone())
+        }
+        "IVF_HNSW_RQ" => {
+            let (metadata, centroid) = rq
+                .ok_or_else(|| Error::index("IVF_HNSW_RQ graph rebuild needs the IVF centroids"))?;
+            let storage =
+                RabitQuantizationStorage::try_from_batch(batch, metadata, distance_type, None)?
+                    .with_centroid(centroid.as_ref())?;
             HNSW::index_vectors(&storage, hnsw_params.clone())
         }
         other => Err(Error::index(format!(
@@ -3437,6 +3476,21 @@ async fn read_pq_storage_metadata(reader: &V2Reader) -> Result<ProductQuantizati
         let codebook_tensor: lance_index::pb::Tensor = Message::decode(tensor_bytes)?;
         metadata.codebook = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
     }
+    Ok(metadata)
+}
+
+/// The RQ metadata of an `IVF_HNSW_RQ` auxiliary file, set up for a graph
+/// rebuild.
+async fn read_rq_storage_metadata(reader: &V2Reader) -> Result<RabitQuantizationMetadata> {
+    let mut metadata =
+        read_storage_metadata::<RabitQuantizationMetadata>(reader, RABIT_METADATA_KEY)?;
+    // A dense rotation lives in a global buffer, not in the JSON.
+    if metadata.rotate_mat.is_none()
+        && let Some(position) = metadata.buffer_index()
+    {
+        metadata.parse_buffer(reader.read_global_buffer(position).await?)?;
+    }
+    metadata.graph_sub_index = true;
     Ok(metadata)
 }
 

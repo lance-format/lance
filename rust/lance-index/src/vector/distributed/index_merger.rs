@@ -973,6 +973,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     "IVF_HNSW_FLAT" => SupportedIvfIndexType::IvfHnswFlat,
                     "IVF_HNSW_PQ" => SupportedIvfIndexType::IvfHnswPq,
                     "IVF_HNSW_SQ" => SupportedIvfIndexType::IvfHnswSq,
+                    "IVF_HNSW_RQ" => SupportedIvfIndexType::IvfHnswRq,
                     other => {
                         return Err(Error::index(format!(
                             "Unsupported index type in shard index.idx: {}",
@@ -1102,7 +1103,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     v2w_opt = Some(w);
                 }
             }
-            SupportedIvfIndexType::IvfRq => {
+            SupportedIvfIndexType::IvfRq | SupportedIvfIndexType::IvfHnswRq => {
                 let rq_json = if let Some(rq_json) = reader
                     .metadata()
                     .file_schema
@@ -1603,7 +1604,7 @@ async fn merge_partial_vector_auxiliary_files_inner(
                     .await?;
             }
         }
-        SupportedIvfIndexType::IvfRq => {
+        SupportedIvfIndexType::IvfRq | SupportedIvfIndexType::IvfHnswRq => {
             let partition_window_size = *PARTITION_WINDOW_SIZE;
             let prefetch_window_count = *PARTITION_PREFETCH_WINDOW_COUNT;
             let mut shard_merge_reader = ShardMergeReader::new(
@@ -2754,6 +2755,7 @@ mod tests {
             num_bits: 1,
             packed: false,
             query_estimator: RabitQueryEstimator::RawQuery,
+            graph_sub_index: false,
         };
 
         write_rq_partial_aux(
@@ -2886,6 +2888,7 @@ mod tests {
             num_bits: 1,
             packed: true,
             query_estimator: RabitQueryEstimator::RawQuery,
+            graph_sub_index: false,
         };
 
         write_rq_partial_aux(
@@ -2948,6 +2951,7 @@ mod tests {
             num_bits: 4,
             packed: false,
             query_estimator: RabitQueryEstimator::RawQuery,
+            graph_sub_index: false,
         };
 
         write_rq_partial_aux(

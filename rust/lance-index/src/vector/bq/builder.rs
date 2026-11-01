@@ -57,7 +57,7 @@ impl QuantizerBuildParams for RabitBuildParams {
 
 #[derive(Debug, Clone, DeepSizeOf)]
 pub struct RabitQuantizer {
-    metadata: RabitQuantizationMetadata,
+    pub(crate) metadata: RabitQuantizationMetadata,
 }
 
 pub(crate) struct RabitQuantizedBatch {
@@ -584,6 +584,7 @@ impl RabitQuantizer {
                     num_bits,
                     packed: false,
                     query_estimator: RabitQueryEstimator::RawQuery,
+                    graph_sub_index: false,
                 }
             }
             RQRotationType::Fast => RabitQuantizationMetadata {
@@ -595,6 +596,7 @@ impl RabitQuantizer {
                 num_bits,
                 packed: false,
                 query_estimator: RabitQueryEstimator::RawQuery,
+                graph_sub_index: false,
             },
         };
         Self { metadata }
@@ -1636,7 +1638,7 @@ mod tests {
                 .any(|field| field.name() == RABIT_BLOCKED_EX_CODE_COLUMN)
         );
 
-        let q = RabitQuantizer::new_with_rotation::<Float32Type>(3, 128, RQRotationType::Fast);
+        let mut q = RabitQuantizer::new_with_rotation::<Float32Type>(3, 128, RQRotationType::Fast);
         let fields = q.extra_fields();
         for expected in [
             ERROR_FACTORS_FIELD.name().as_str(),
@@ -1649,6 +1651,9 @@ mod tests {
                 "missing {expected}"
             );
         }
+        // IVF_HNSW_RQ stores exactly the IVF_RQ columns.
+        q.metadata.graph_sub_index = true;
+        assert_eq!(q.extra_fields(), fields);
     }
 
     #[test]

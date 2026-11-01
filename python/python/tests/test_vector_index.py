@@ -211,6 +211,7 @@ def test_large_k_auto_probe_initial_budget(tmp_path, monkeypatch, metric, k, seg
         ("IVF_HNSW_FLAT", {}, np.float32, None),
         ("IVF_HNSW_PQ", {"num_sub_vectors": 16, "num_bits": 4}, np.float32, None),
         ("IVF_HNSW_SQ", {}, np.float32, None),
+        ("IVF_HNSW_RQ", {"num_bits": 5}, np.float32, None),
         ("IVF_FLAT", {}, np.float16, None),
         ("IVF_FLAT", {}, np.float64, None),
         ("IVF_FLAT", {}, np.float32, 2),
@@ -1303,6 +1304,10 @@ def test_index_type(tmp_path):
         (
             "IVF_HNSW_FLAT",
             {"max_level": 2, "m": 4, "ef_construction": 16},
+        ),
+        (
+            "IVF_HNSW_RQ",
+            {"num_bits": 5, "max_level": 2, "m": 4, "ef_construction": 16},
         ),
     ]
     rng = np.random.default_rng(42)

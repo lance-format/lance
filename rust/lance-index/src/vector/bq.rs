@@ -31,6 +31,7 @@ pub(crate) mod resident;
 pub mod rotation;
 pub mod scan_stats;
 pub mod storage;
+pub(crate) mod sym;
 pub mod transform;
 
 pub const RABIT_MIN_NUM_BITS: u8 = 1;
