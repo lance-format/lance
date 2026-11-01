@@ -844,7 +844,8 @@ impl InvertedIndexParams {
     /// Set whether to store the position of the term in the document.
     /// This can significantly increase the size of the index.
     /// If false, only store the frequency of the term in the document.
-    /// This doesn't work with `ngram` tokenizer.
+    /// This is not supported with the `ngram` tokenizer; requesting both is
+    /// rejected with an error.
     /// Default to `false`.
     pub fn with_position(mut self, with_position: bool) -> Self {
         self.with_position = with_position;
@@ -1129,6 +1130,14 @@ impl InvertedIndexParams {
 
     fn validate(&self) -> Result<()> {
         validate_block_size(self.block_size)?;
+        // The ngram tokenizer emits every token at position 0, so a position
+        // stream built from it carries no information. Reject the combination
+        // instead of silently storing useless (and large) position data.
+        if self.with_position && self.base_tokenizer == "ngram" {
+            return Err(Error::invalid_input(
+                "with_position is not supported with base_tokenizer='ngram'".to_string(),
+            ));
+        }
         if self.base_tokenizer != "code"
             && (self.split_identifiers
                 || self.split_on_numerics
@@ -1548,6 +1557,20 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("code_config requires base_tokenizer='code'")
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_with_position_for_ngram_tokenizer() {
+        let err = InvertedIndexParams::default()
+            .base_tokenizer("ngram".to_string())
+            .with_position(true)
+            .build()
+            .unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string()
+                .contains("with_position is not supported with base_tokenizer='ngram'")
         );
     }
 
