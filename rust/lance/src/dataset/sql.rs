@@ -6,8 +6,7 @@ use crate::datafusion::LanceTableProvider;
 use crate::dataset::scanner::validate_batch_size;
 use crate::dataset::utils::SchemaAdapter;
 use arrow_array::RecordBatch;
-use datafusion::common::DataFusionError;
-use datafusion::common::TableReference;
+use datafusion::common::{DataFusionError, ResolvedTableReference, TableReference};
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::execution::SendableRecordBatchStream;
@@ -306,8 +305,13 @@ impl SqlQueryBuilder {
             .statement_to_plan(statement)
             .await
             .map_err(planning_error)?;
-        let plan = if safe_to_inject_system_columns(&plan, &columns)
-            && project_system_columns(&mut projected, &columns)
+        let plan = if safe_to_inject_system_columns(
+            &plan,
+            &columns,
+            &dataset_table,
+            &catalog_options.default_catalog,
+            &catalog_options.default_schema,
+        ) && project_system_columns(&mut projected, &columns)
         {
             // Fall back to the original plan when the rewritten statement
             // fails to plan (e.g. another expression aliased to a system
@@ -334,9 +338,22 @@ impl SqlQueryBuilder {
 /// 2. Name lineage: no intermediate projection redefines an enabled system
 ///    column name (e.g. `SELECT (_rowid + 1) AS _rowid` in a subquery), so
 ///    the injected identifiers can only bind to the real scan columns.
-fn safe_to_inject_system_columns(plan: &LogicalPlan, columns: &[(bool, &str)]) -> bool {
+/// 3. Table identity: the scan targets the query's resolved dataset table, not
+///    an additional table whose ordinary columns may use system-like names.
+fn safe_to_inject_system_columns(
+    plan: &LogicalPlan,
+    columns: &[(bool, &str)],
+    dataset_table: &ResolvedTableReference,
+    default_catalog: &str,
+    default_schema: &str,
+) -> bool {
     match plan {
-        LogicalPlan::TableScan(_) => true,
+        LogicalPlan::TableScan(scan) => {
+            scan.table_name
+                .clone()
+                .resolve(default_catalog, default_schema)
+                == *dataset_table
+        }
         LogicalPlan::Projection(projection) => {
             let shadows_system_column = projection
                 .schema
@@ -355,15 +372,27 @@ fn safe_to_inject_system_columns(plan: &LogicalPlan, columns: &[(bool, &str)]) -
                     }
                     !matches!(expr, LogicalExpr::Column(column) if &column.name == field.name())
                 });
-            !shadows_system_column && safe_to_inject_system_columns(&projection.input, columns)
+            !shadows_system_column
+                && safe_to_inject_system_columns(
+                    &projection.input,
+                    columns,
+                    dataset_table,
+                    default_catalog,
+                    default_schema,
+                )
         }
         LogicalPlan::Filter(_)
         | LogicalPlan::Sort(_)
         | LogicalPlan::Limit(_)
-        | LogicalPlan::SubqueryAlias(_) => plan
-            .inputs()
-            .iter()
-            .all(|input| safe_to_inject_system_columns(input, columns)),
+        | LogicalPlan::SubqueryAlias(_) => plan.inputs().iter().all(|input| {
+            safe_to_inject_system_columns(
+                input,
+                columns,
+                dataset_table,
+                default_catalog,
+                default_schema,
+            )
+        }),
         _ => false,
     }
 }
@@ -518,11 +547,11 @@ mod tests {
     use all_asserts::assert_true;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field};
     use datafusion::common::DataFusionError;
-    use datafusion::datasource::MemTable;
+    use datafusion::datasource::{MemTable, TableProvider};
     use lance_arrow::json::ARROW_JSON_EXT_NAME;
     use lance_arrow::{ARROW_EXT_NAME_KEY, SchemaExt};
     use lance_core::datatypes::BlobHandling;
@@ -1360,6 +1389,81 @@ mod tests {
         assert!(
             message.contains(name) && message.contains("table name 't'"),
             "message should name the registered table and the query table: {message}"
+        );
+    }
+
+    /// System-column injection must only target the registered dataset provider.
+    /// A query whose top-level scan is an extra provider's ordinary `_rowid` /
+    /// `_rowaddr` columns must not gain them as dataset system identifiers.
+    #[tokio::test]
+    async fn test_sql_register_arrow_extra_only_not_injected_as_system_columns() {
+        let ds = ids_dataset("memory://test_sql_register_arrow_extra_system_columns").await;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![7, 8])),
+                Arc::new(UInt64Array::from(vec![70, 80])),
+                Arc::new(UInt64Array::from(vec![700, 800])),
+            ],
+        )
+        .unwrap();
+        let extra: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap());
+
+        // The top-level scan comes from the extra provider, so requesting a
+        // dataset row id/address must not append the extra provider's ordinary
+        // system-like columns.
+        let results = ds
+            .sql("SELECT id FROM extra ORDER BY id")
+            .table_name("t")
+            .register_table("extra", Arc::clone(&extra))
+            .with_row_id(true)
+            .with_row_addr(true)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let names: Vec<String> = results[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        pretty_assertions::assert_eq!(names, vec!["id".to_string()]);
+        pretty_assertions::assert_eq!(collect_ids(&results), vec![7, 8]);
+
+        // Ordinary extra-table columns with system-like names remain directly
+        // selectable.
+        let results = ds
+            .sql("SELECT _rowid, _rowaddr FROM extra ORDER BY _rowid")
+            .table_name("t")
+            .register_table("extra", extra)
+            .with_row_id(true)
+            .with_row_addr(true)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let batch = &results[0];
+        pretty_assertions::assert_eq!(
+            batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec(),
+            vec![70, 80]
+        );
+        pretty_assertions::assert_eq!(
+            batch[ROW_ADDR]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .to_vec(),
+            vec![700, 800]
         );
     }
 
