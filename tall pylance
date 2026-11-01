@@ -1,0 +1,173 @@
+[1mdiff --git a/benchmarks/full_report/report.ipynb b/benchmarks/full_report/report.ipynb[m
+[1mindex 11a4924c..70eb810a 100644[m
+[1m--- a/benchmarks/full_report/report.ipynb[m
+[1m+++ b/benchmarks/full_report/report.ipynb[m
+[36m@@ -8,11 +8,12 @@[m
+    "outputs": [],[m
+    "source": [[m
+     "import sys\n",[m
+[32m+[m[32m    "\n",[m
+     "sys.dont_write_bytecode = True\n",[m
+     "\n",[m
+     "import os\n",[m
+     "\n",[m
+[31m-    "module_path = os.path.abspath(os.path.join('.'))\n",[m
+[32m+[m[32m    "module_path = os.path.abspath(os.path.join(\".\"))\n",[m
+     "if module_path not in sys.path:\n",[m
+     "    sys.path.append(module_path)"[m
+    ][m
+[36m@@ -61,58 +62,91 @@[m
+     "    gt_in_sample = knn(in_sample, data, metric, 10)\n",[m
+     "\n",[m
+     "    print(\"generated gt\")\n",[m
+[31m-    "    \n",[m
+[32m+[m[32m    "\n",[m
+     "    with tempfile.TemporaryDirectory() as d:\n",[m
+     "        write_lance(d, data)\n",[m
+     "        ds = lance.dataset(d)\n",[m
+     "\n",[m
+[31m-    "        for q, target in zip(tqdm(in_sample, desc=\"checking brute force\"), gt_in_sample):\n",[m
+[31m-    "            res = ds.to_table(nearest={\n",[m
+[31m-    "                \"column\": \"vec\",\n",[m
+[31m-    "                \"q\": q,\n",[m
+[31m-    "                \"k\": 10,\n",[m
+[31m-    "                \"metric\": metric,\n",[m
+[31m-    "            }, columns=[\"id\"])\n",[m
+[32m+[m[32m    "        for q, target in zip(\n",[m
+[32m+[m[32m    "            tqdm(in_sample, desc=\"checking brute force\"), gt_in_sample\n",[m
+[32m+[m[32m    "        ):\n",[m
+[32m+[m[32m    "            res = ds.to_table(\n",[m
+[32m+[m[32m    "                nearest={\n",[m
+[32m+[m[32m    "                    \"column\": \"vec\",\n",[m
+[32m+[m[32m    "                    \"q\": q,\n",[m
+[32m+[m[32m    "                    \"k\": 10,\n",[m
+[32m+[m[32m    "                    \"metric\": metric,\n",[m
+[32m+[m[32m    "                },\n",[m
+[32m+[m[32m    "                columns=[\"id\"],\n",[m
+[32m+[m[32m    "            )\n",[m
+     "            assert len(np.intersect1d(res[\"id\"].to_numpy(), target)) == 10\n",[m
+[31m-    "    \n",[m
+[31m-    "        ds = ds.create_index(\"vec\", \"IVF_PQ\", metric=metric, num_partitions=num_partitions, num_sub_vectors=num_sub_vectors)\n",[m
+[31m-    "    \n",[m
+[32m+[m[32m    "\n",[m
+[32m+[m[32m    "        ds = ds.create_index(\n",[m
+[32m+[m[32m    "            \"vec\",\n",[m
+[32m+[m[32m    "            \"IVF_PQ\",\n",[m
+[32m+[m[32m    "            metric=metric,\n",[m
+[32m+[m[32m    "            num_partitions=num_partitions,\n",[m
+[32m+[m[32m    "            num_sub_vectors=num_sub_vectors,\n",[m
+[32m+[m[32m    "        )\n",[m
+[32m+[m[32m    "\n",[m
+     "        recall_data = []\n",[m
+     "        for nprobes in nprobes_list:\n",[m
+     "            for refine_factor in refine_factor_list:\n",[m
+     "                hits = 0\n",[m
+     "                # check that brute force impl is correct\n",[m
+[31m-    "                for q, target in zip(tqdm(query, desc=f\"out of sample, nprobes={nprobes}, refine={refine_factor}\"), gt):\n",[m
+[31m-    "                    res = ds.to_table(nearest={\n",[m
+[31m-    "                        \"column\": \"vec\",\n",[m
+[31m-    "                        \"q\": q,\n",[m
+[31m-    "                        \"k\": 10,\n",[m
+[31m-    "                        \"nprobes\": nprobes,\n",[m
+[31m-    "                        \"refine_factor\": refine_factor,\n",[m
+[31m-    "                    }, columns=[\"id\"])[\"id\"].to_numpy()\n",[m
+[32m+[m[32m    "                for q, target in zip(\n",[m
+[32m+[m[32m    "                    tqdm(\n",[m
+[32m+[m[32m    "                        query,\n",[m
+[32m+[m[32m    "                        desc=f\"out of sample, nprobes={nprobes}, refine={refine_factor}\",\n",[m
+[32m+[m[32m    "                    ),\n",[m
+[32m+[m[32m    "                    gt,\n",[m
+[32m+[m[32m    "                ):\n",[m
+[32m+[m[32m    "                    res = ds.to_table(\n",[m
+[32m+[m[32m    "                        nearest={\n",[m
+[32m+[m[32m    "                            \"column\": \"vec\",\n",[m
+[32m+[m[32m    "                            \"q\": q,\n",[m
+[32m+[m[32m    "                            \"k\": 10,\n",[m
+[32m+[m[32m    "                            \"nprobes\": nprobes,\n",[m
+[32m+[m[32m    "                            \"refine_factor\": refine_factor,\n",[m
+[32m+[m[32m    "                        },\n",[m
+[32m+[m[32m    "                        columns=[\"id\"],\n",[m
+[32m+[m[32m    "                    )[\"id\"].to_numpy()\n",[m
+     "                    hits += len(np.intersect1d(res, target))\n",[m
+[31m-    "                recall_data.append([\n",[m
+[31m-    "                    \"out_of_sample\",\n",[m
+[31m-    "                    nprobes,\n",[m
+[31m-    "                    refine_factor,\n",[m
+[31m-    "                    hits / 10 / len(gt),\n",[m
+[31m-    "                ])\n",[m
+[32m+[m[32m    "                recall_data.append(\n",[m
+[32m+[m[32m    "                    [\n",[m
+[32m+[m[32m    "                        \"out_of_sample\",\n",[m
+[32m+[m[32m    "                        nprobes,\n",[m
+[32m+[m[32m    "                        refine_factor,\n",[m
+[32m+[m[32m    "                        hits / 10 / len(gt),\n",[m
+[32m+[m[32m    "                    ]\n",[m
+[32m+[m[32m    "                )\n",[m
+     "                # check that brute force impl is correct\n",[m
+[31m-    "                for q, target in zip(tqdm(in_sample, desc=f\"in sample nprobes={nprobes}, refine={refine_factor}\"), gt_in_sample):\n",[m
+[31m-    "                    res = ds.to_table(nearest={\n",[m
+[31m-    "                        \"column\": \"vec\",\n",[m
+[31m-    "                        \"q\": q,\n",[m
+[31m-    "                        \"k\": 10,\n",[m
+[31m-    "                        \"nprobes\": nprobes,\n",[m
+[31m-    "                        \"refine_factor\": refine_factor,\n",[m
+[31m-    "                    }, columns=[\"id\"])[\"id\"].to_numpy()\n",[m
+[32m+[m[32m    "                for q, target in zip(\n",[m
+[32m+[m[32m    "                    tqdm(\n",[m
+[32m+[m[32m    "                        in_sample,\n",[m
+[32m+[m[32m    "                        desc=f\"in sample nprobes={nprobes}, refine={refine_factor}\",\n",[m
+[32m+[m[32m    "                    ),\n",[m
+[32m+[m[32m    "                    gt_in_sample,\n",[m
+[32m+[m[32m    "                ):\n",[m
+[32m+[m[32m    "                    res = ds.to_table(\n",[m
+[32m+[m[32m    "                        nearest={\n",[m
+[32m+[m[32m    "                            \"column\": \"vec\",\n",[m
+[32m+[m[32m    "                            \"q\": q,\n",[m
+[32m+[m[32m    "                            \"k\": 10,\n",[m
+[32m+[m[32m    "                            \"nprobes\": nprobes,\n",[m
+[32m+[m[32m    "                            \"refine_factor\": refine_factor,\n",[m
+[32m+[m[32m    "                        },\n",[m
+[32m+[m[32m    "                        columns=[\"id\"],\n",[m
+[32m+[m[32m    "                    )[\"id\"].to_numpy()\n",[m
+     "                    hits += len(np.intersect1d(res, target))\n",[m
+[31m-    "                recall_data.append([\n",[m
+[31m-    "                    \"in_sample\",\n",[m
+[31m-    "                    nprobes,\n",[m
+[31m-    "                    refine_factor,\n",[m
+[31m-    "                    hits / 10 / len(gt_in_sample),\n",[m
+[31m-    "                ])\n",[m
+[32m+[m[32m    "                recall_data.append(\n",[m
+[32m+[m[32m    "                    [\n",[m
+[32m+[m[32m    "                        \"in_sample\",\n",[m
+[32m+[m[32m    "                        nprobes,\n",[m
+[32m+[m[32m    "                        refine_factor,\n",[m
+[32m+[m[32m    "                        hits / 10 / len(gt_in_sample),\n",[m
+[32m+[m[32m    "                    ]\n",[m
+[32m+[m[32m    "                )\n",[m
+     "    return recall_data"[m
+    ][m
+   },[m
+[36m@@ -124,15 +158,19 @@[m
+    "outputs": [],[m
+    "source": [[m
+     "def make_plot(recall_data):\n",[m
+[31m-    "    df = pd.DataFrame(recall_data, columns=[\"case\", \"nprobes\", \"refine_factor\", \"recall\"])\n",[m
+[31m-    "    \n",[m
+[32m+[m[32m    "    df = pd.DataFrame(\n",[m
+[32m+[m[32m    "        recall_data, columns=[\"case\", \"nprobes\", \"refine_factor\", \"recall\"]\n",[m
+[32m+[m[32m    "    )\n",[m
+[32m+[m[32m    "\n",[m
+     "    num_cases = len(df[\"case\"].unique())\n",[m
+     "    (fig, axs) = plt.subplots(1, 2, figsize=(16, 8))\n",[m
+[31m-    "    \n",[m
+[32m+[m[32m    "\n",[m
+     "    for case, ax in zip(df[\"case\"].unique(), axs):\n",[m
+     "        current_case = df[df[\"case\"] == case]\n",[m
+     "        sns.heatmap(\n",[m
+[31m-    "            current_case.drop(columns=[\"case\"]).set_index([\"nprobes\", \"refine_factor\"])[\"recall\"].unstack(),\n",[m
+[32m+[m[32m    "            current_case.drop(columns=[\"case\"])\n",[m
+[32m+[m[32m    "            .set_index([\"nprobes\", \"refine_factor\"])[\"recall\"]\n",[m
+[32m+[m[32m    "            .unstack(),\n",[m
+     "            annot=True,\n",[m
+     "            ax=ax,\n",[m
+     "        ).set(title=f\"Recall -- {case}\")"[m
