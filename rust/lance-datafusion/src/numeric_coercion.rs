@@ -404,16 +404,11 @@ fn widened_column<'a>(expr: &'a Expr, schema: &DFSchema) -> Option<WidenedColumn
         Expr::TryCast(cast) => (cast.expr.as_ref(), cast.field.data_type()),
         _ => return None,
     };
-    if !is_field_reference(column) {
-        return None;
-    }
     let column_type = column.get_type(schema).ok()?;
-    let is_widening = match (&column_type, float_type) {
-        (column_type, DataType::Float32 | DataType::Float64) if column_type.is_integer() => true,
-        (DataType::Float32, DataType::Float64) => true,
-        _ => false,
-    };
-    is_widening.then(|| WidenedColumn {
+    let is_widening = (column_type.is_integer()
+        && matches!(float_type, DataType::Float32 | DataType::Float64))
+        || (column_type == DataType::Float32 && *float_type == DataType::Float64);
+    (is_widening && is_field_reference(column)).then(|| WidenedColumn {
         column,
         column_type,
         float_type: float_type.clone(),
@@ -434,191 +429,107 @@ fn widened_literal(expr: &Expr, float_type: &DataType) -> Option<Option<f64>> {
     }
 }
 
-/// The integers `start..end` matching a comparison, or all others when
-/// `negated`.
-struct Interval {
-    start: i128,
-    end: i128,
-    negated: bool,
-}
-
-/// The first integer in `start..end` for which `holds` is true, or `end`.
-/// `holds` has to be false up to some point and true from there on.
-fn partition_point(mut start: i128, mut end: i128, holds: impl Fn(i128) -> bool) -> i128 {
-    while start < end {
-        let mid = start + (end - start) / 2;
-        if holds(mid) {
-            end = mid;
-        } else {
-            start = mid + 1;
-        }
-    }
-    start
-}
-
-/// The integers whose conversion to `float_type` compares with `value` like
-/// `op`.
+/// `column op value` for an integer column compared after rounding it to
+/// `float_type`.
 ///
-/// Rounding an integer to a float is monotonic, so the integers that compare
-/// above (or not below) `value` are a suffix of the domain and each comparison
-/// selects one interval. Comparisons against NaN are false, which places NaN
-/// above every integer, as float filters do regardless of its sign bit.
-fn integer_interval(
-    op: Operator,
-    value: f64,
-    float_type: &DataType,
-    (min, end): (i128, i128),
-) -> Option<Interval> {
+/// Rounding is monotonic, so the integers that round above `value` (or not
+/// below it) are a suffix of the domain, found by binary search, and each
+/// comparison selects one interval. Comparisons against NaN are false, which
+/// places NaN above every integer, as float filters do regardless of its sign.
+fn unwrap_integer(widened: &WidenedColumn, op: Operator, value: f64) -> Option<Expr> {
+    let WidenedColumn {
+        column,
+        column_type,
+        float_type,
+    } = widened;
+    let bits = column_type.primitive_width()? as u32 * 8;
+    let (min, end) = if column_type.is_signed_integer() {
+        (-(1_i128 << (bits - 1)), 1_i128 << (bits - 1))
+    } else {
+        (0, 1_i128 << bits)
+    };
     let round = |integer: i128| match float_type {
         DataType::Float32 => f64::from(integer as f32),
         _ => integer as f64,
     };
-    let first_not_below = || partition_point(min, end, |integer| round(integer) >= value);
-    let first_above = || partition_point(min, end, |integer| round(integer) > value);
-    let interval = |start, end| Interval {
-        start,
-        end,
-        negated: false,
-    };
-    Some(match op {
-        Operator::Gt => interval(first_above(), end),
-        Operator::GtEq => interval(first_not_below(), end),
-        Operator::Lt => interval(min, first_not_below()),
-        Operator::LtEq => interval(min, first_above()),
-        Operator::Eq | Operator::NotEq => Interval {
-            start: first_not_below(),
-            end: first_above(),
-            negated: op == Operator::NotEq,
-        },
-        _ => return None,
-    })
-}
-
-fn integer_domain(data_type: &DataType) -> Option<(i128, i128)> {
-    let bits = data_type.primitive_width()? as u32 * 8;
-    Some(if data_type.is_signed_integer() {
-        (-(1_i128 << (bits - 1)), 1_i128 << (bits - 1))
-    } else {
-        (0, 1_i128 << bits)
-    })
-}
-
-fn integer_literal(value: i128, data_type: &DataType) -> Option<Expr> {
-    let value = match i64::try_from(value) {
-        Ok(value) => ScalarValue::Int64(Some(value)),
-        Err(_) => ScalarValue::UInt64(Some(u64::try_from(value).ok()?)),
-    };
-    Some(lit(value.cast_to(data_type).ok()?))
-}
-
-fn interval_expr(column: &Expr, data_type: &DataType, interval: Interval) -> Option<Expr> {
-    let (min, domain_end) = integer_domain(data_type)?;
-    let Interval {
-        start,
-        end,
-        negated,
-    } = interval;
-    let compare = |op, value| -> Option<Expr> {
-        Some(Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(column.clone()),
-            op,
-            Box::new(integer_literal(value, data_type)?),
-        )))
-    };
-    let constant = |value| comparison_expr(column, data_type, Comparison::Constant(value));
-    let matches = if start >= end {
-        constant(false)?
-    } else {
-        match (start == min, end == domain_end) {
-            (true, true) => constant(true)?,
-            (true, false) => compare(Operator::Lt, end)?,
-            (false, true) => compare(Operator::GtEq, start)?,
-            (false, false) if end == start + 1 => compare(Operator::Eq, start)?,
-            (false, false) => compare(Operator::GtEq, start)?.and(compare(Operator::Lt, end)?),
+    let first = |above: bool| {
+        let (mut start, mut stop) = (min, end);
+        while start < stop {
+            let mid = start + (stop - start) / 2;
+            if round(mid) > value || (!above && round(mid) == value) {
+                stop = mid;
+            } else {
+                start = mid + 1;
+            }
         }
+        start
     };
-    Some(if negated { !matches } else { matches })
-}
-
-/// `value` as a `Float32` when that is exact, or else the largest `Float32`
-/// below it.
-fn float32_at_or_below(value: f64) -> (f32, bool) {
-    let nearest = value as f32;
-    match f64::from(nearest).partial_cmp(&value) {
-        Some(std::cmp::Ordering::Equal) => (nearest, true),
-        Some(std::cmp::Ordering::Less) => (nearest, false),
-        _ => (nearest.next_down(), false),
+    let (start, stop) = match op {
+        Operator::Gt => (first(true), end),
+        Operator::GtEq => (first(false), end),
+        Operator::Lt => (min, first(false)),
+        Operator::LtEq => (min, first(true)),
+        Operator::Eq => (first(false), first(true)),
+        _ => return None,
+    };
+    let compare = |op, value: i128| {
+        let value = match i64::try_from(value) {
+            Ok(value) => ScalarValue::Int64(Some(value)),
+            Err(_) => ScalarValue::UInt64(Some(u64::try_from(value).ok()?)),
+        };
+        let value = value.cast_to(column_type).ok()?;
+        comparison_expr(column, column_type, Comparison::Literal(op, value))
+    };
+    let constant = |value| comparison_expr(column, column_type, Comparison::Constant(value));
+    match (start == min, stop == end) {
+        _ if start >= stop => constant(false),
+        (true, true) => constant(true),
+        (true, false) => compare(Operator::Lt, stop),
+        (false, true) => compare(Operator::GtEq, start),
+        _ if stop == start + 1 => compare(Operator::Eq, start),
+        _ => Some(compare(Operator::GtEq, start)?.and(compare(Operator::Lt, stop)?)),
     }
 }
 
 /// `column op value` for a column that the comparison reads widened to a
 /// float, without the cast.
 fn unwrap_comparison(widened: &WidenedColumn, op: Operator, value: Option<f64>) -> Option<Expr> {
-    let WidenedColumn {
-        column,
-        column_type,
-        float_type,
-    } = widened;
+    let (column, column_type) = (widened.column, &widened.column_type);
+    if op == Operator::NotEq {
+        return Some(!unwrap_comparison(widened, Operator::Eq, value)?);
+    }
     let Some(value) = value else {
         let null = ScalarValue::try_new_null(column_type).ok()?;
         return comparison_expr(column, column_type, Comparison::Literal(op, null));
     };
     if column_type.is_integer() {
-        let interval = integer_interval(op, value, float_type, integer_domain(column_type)?)?;
-        return interval_expr(column, column_type, interval);
+        return unwrap_integer(widened, op, value);
     }
     // A float comparison against NaN also orders NaN payloads, which a Float32
     // bound would not keep.
     if value.is_nan() {
         return None;
     }
-    let (below, is_exact) = float32_at_or_below(value);
-    let comparison = if is_exact {
-        Comparison::Literal(op, ScalarValue::Float32(Some(below)))
+    let nearest = value as f32;
+    let comparison = if f64::from(nearest) == value {
+        Comparison::Literal(op, ScalarValue::Float32(Some(nearest)))
     } else {
-        // Between `below` and the next Float32 there is no Float32, so `value`
-        // can be replaced by `below` once `<` and `>=` include it.
+        // There is no Float32 between `below` and `value`, so `value` can be
+        // replaced by `below` once `<` and `>=` include it.
+        let below = if f64::from(nearest) < value {
+            nearest
+        } else {
+            nearest.next_down()
+        };
         let below = ScalarValue::Float32(Some(below));
         match op {
             Operator::Gt | Operator::GtEq => Comparison::Literal(Operator::Gt, below),
             Operator::Lt | Operator::LtEq => Comparison::Literal(Operator::LtEq, below),
             Operator::Eq => Comparison::Constant(false),
-            Operator::NotEq => Comparison::Constant(true),
             _ => return None,
         }
     };
     comparison_expr(column, column_type, comparison)
-}
-
-/// The `IN` list values of a widened column, or `None` when a value matches
-/// more than one column value or cannot be unwrapped.
-fn unwrap_in_list(widened: &WidenedColumn, values: &[Option<f64>]) -> Option<Vec<Expr>> {
-    let mut list = Vec::with_capacity(values.len());
-    for value in values {
-        let Some(value) = *value else {
-            list.push(lit(ScalarValue::try_new_null(&widened.column_type).ok()?));
-            continue;
-        };
-        if widened.column_type.is_integer() {
-            let domain = integer_domain(&widened.column_type)?;
-            let interval = integer_interval(Operator::Eq, value, &widened.float_type, domain)?;
-            match interval.end - interval.start {
-                // No integer rounds to this value.
-                ..=0 => {}
-                1 => list.push(integer_literal(interval.start, &widened.column_type)?),
-                _ => return None,
-            }
-        } else {
-            if value.is_nan() {
-                return None;
-            }
-            // An inexact value matches no Float32 and is dropped.
-            if let (value, true) = float32_at_or_below(value) {
-                list.push(lit(ScalarValue::Float32(Some(value))));
-            }
-        }
-    }
-    Some(list)
 }
 
 fn unwrap_node(expr: &Expr, schema: &DFSchema) -> Option<Expr> {
@@ -663,30 +574,26 @@ fn unwrap_node(expr: &Expr, schema: &DFSchema) -> Option<Expr> {
             list,
             negated,
         }) => {
+            // An `OR` of the values' equalities, which the simplifier gathers
+            // back into a list where they compare the column with one value.
             let widened = widened_column(expr, schema)?;
-            let values = list
+            let never = comparison_expr(
+                widened.column,
+                &widened.column_type,
+                Comparison::Constant(false),
+            )?;
+            let matches = list
                 .iter()
-                .map(|item| widened_literal(item, &widened.float_type))
-                .collect::<Option<Vec<_>>>()?;
-            let Some(values) = unwrap_in_list(&widened, &values) else {
-                // A value that several integers round to needs a range. The
-                // simplifier turns a short list into this same `OR` chain anyway,
-                // and leaving the list alone would only unwrap it there, on the
-                // next pass.
-                let matches = values
-                    .into_iter()
-                    .map(|value| unwrap_comparison(&widened, Operator::Eq, value))
-                    .reduce(|left, right| Some(left?.or(right?)))??;
-                return Some(if *negated { !matches } else { matches });
-            };
-            if values.is_empty() {
-                return comparison_expr(
-                    widened.column,
-                    &widened.column_type,
-                    Comparison::Constant(*negated),
-                );
-            }
-            Some(widened.column.clone().in_list(values, *negated))
+                .map(|item| {
+                    let value = widened_literal(item, &widened.float_type)?;
+                    unwrap_comparison(&widened, Operator::Eq, value)
+                })
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .filter(|matches| *matches != never)
+                .reduce(Expr::or)
+                .unwrap_or(never);
+            Some(if *negated { !matches } else { matches })
         }
         _ => None,
     }
@@ -1271,6 +1178,10 @@ mod tests {
         col("i")
             .gt_eq(lit(9007199254740992_i64))
             .and(col("i").lt(lit(9007199254740994_i64)))
+    )]
+    #[case::in_list(
+        "CAST(i AS double) IN (1.0, 2.5, 3.0, 4.0, 5.0)",
+        col("i").in_list(vec![lit(1_i64), lit(3_i64), lit(4_i64), lit(5_i64)], false)
     )]
     #[case::never("CAST(u AS double) < -1.0", col("u").lt(lit(0_u8)))]
     #[case::always("CAST(u AS float) <= CAST(255.0 AS float)", col("u").gt_eq(lit(0_u8)))]
