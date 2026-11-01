@@ -6785,6 +6785,10 @@ impl CacheBackend for SingleScalarContainerCacheBackend {
         self.inner.get_or_insert(key, loader, codec).await
     }
 
+    async fn invalidate(&self, key: &InternalCacheKey) {
+        self.inner.invalidate(key).await;
+    }
+
     async fn clear(&self) {
         self.inner.clear().await;
     }

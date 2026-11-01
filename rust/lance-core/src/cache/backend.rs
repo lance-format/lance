@@ -20,13 +20,17 @@
 //! Prefix invalidation and key inventory are intentionally not part of this
 //! interface: one-way digests cannot support either operation without
 //! retaining the logical strings that fixed-size keys are designed to remove.
-//! Existing callers should migrate removed symbols as follows:
+//! Callers that know which logical entries have become stale rebuild the exact
+//! [`CacheKey`](crate::cache::CacheKey)s and remove them one by one through
+//! [`invalidate`](CacheBackend::invalidate). Existing callers should migrate
+//! removed symbols as follows:
 //! - replace `with_backend_and_prefix(backend, prefix)` with
 //!   [`LanceCache::with_backend`](super::LanceCache::with_backend) followed by
 //!   [`LanceCache::with_key_prefix`](super::LanceCache::with_key_prefix);
-//! - replace `invalidate_prefix` with [`LanceCache::clear`](super::LanceCache::clear)
-//!   when clearing the shared backend is acceptable, or rotate a versioned
-//!   namespace to leave older entries to age out;
+//! - replace `invalidate_prefix` with per-key
+//!   [`LanceCache::invalidate_key`](super::LanceCache::invalidate_key) calls
+//!   for known keys, or with [`LanceCache::clear`](super::LanceCache::clear)
+//!   when clearing the shared backend is acceptable;
 //! - remove uses of `prefix`, `keys`, and session key-inventory methods; opaque
 //!   keys have no readable or enumerable equivalent.
 
@@ -169,6 +173,35 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     fn max_entry_bytes(&self) -> Option<u64> {
         self.capacity_bytes().map(|bytes| bytes as u64)
     }
+
+    /// Remove a single entry by its exact physical key.
+    ///
+    /// This is the only invalidation operation on this trait. Cache keys are
+    /// one-way digests, so backends cannot match by logical prefix; callers
+    /// that know which logical entries have become stale (for example, cleanup
+    /// after it deletes a version's files) rebuild the exact
+    /// [`CacheKey`](crate::cache::CacheKey)s and invalidate them one by one.
+    ///
+    /// The default is a best-effort no-op so external implementations keep
+    /// compiling without it: stale entries in such a backend age out through
+    /// its capacity-based eviction instead of being removed eagerly. Backends
+    /// that can remove a single entry should override it; the built-in moka
+    /// and quick backends do.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_core::cache::{InternalCacheKey, MokaCacheBackend, CacheBackend};
+    /// # async fn example() {
+    /// let backend = MokaCacheBackend::with_capacity(1024);
+    /// let key = InternalCacheKey::from_bytes([7; 16]);
+    /// backend.insert(&key, Arc::new(42_i32), 4, None).await;
+    /// backend.invalidate(&key).await;
+    /// assert!(backend.get(&key, None).await.is_none());
+    /// # }
+    /// ```
+    async fn invalidate(&self, _key: &InternalCacheKey) {}
 
     /// Remove all entries.
     async fn clear(&self);

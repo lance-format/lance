@@ -36,8 +36,10 @@
 //! (which should only be done if the caller can guarantee there are no updates
 //! happening at the same time)
 
+mod cache_reclamation;
 pub mod retention;
 
+use cache_reclamation::ExpiredManifest;
 use retention::{CleanupPolicy as RetentionPolicy, MIN_THINNING_AGE, validate_retention_policy};
 pub use retention::{CleanupRule, parse_cleanup_policy};
 
@@ -449,15 +451,6 @@ struct ManagedScanKey {
     fields: Vec<arrow_schema::Field>,
     field_ids: Vec<i32>,
     retained: bool,
-}
-
-/// A manifest that has aged out and is queued for deletion.
-#[derive(Clone, Debug)]
-struct ExpiredManifest {
-    version: u64,
-    /// Size from the manifest listing. `None` means it must be fetched before it can
-    /// be counted in `RemovalStats::bytes_removed`.
-    size_bytes: Option<u64>,
 }
 
 /// Information about the dataset that we learn by inspecting all of the manifests
@@ -969,10 +962,13 @@ impl<'a> CleanupTask<'a> {
             ));
         }
 
+        let stale_versions = cache_reclamation::stale_versions(&inspection);
+
         final_result.merge(
             self.delete_unreferenced_files(inspection).await?,
             candidate_file_limit,
         );
+        self.invalidate_stale_version_caches(&stale_versions).await;
         Ok(final_result)
     }
 
@@ -1162,6 +1158,7 @@ impl<'a> CleanupTask<'a> {
                 ExpiredManifest {
                     version: location.version,
                     size_bytes: location.size,
+                    e_tag: location.e_tag.clone(),
                 },
             );
             if let Some(identity) = location.identity {
@@ -1266,6 +1263,7 @@ impl<'a> CleanupTask<'a> {
                     // Carried from the listing so the delete phase need not HEAD
                     // every manifest just to report bytes removed.
                     size_bytes: location.size,
+                    e_tag: location.e_tag.clone(),
                 },
             );
             if let Some(identity) = location.identity.clone() {
@@ -3052,6 +3050,8 @@ mod tests {
     mod concurrency;
 
     mod auto_cleanup;
+
+    mod cache_reclamation;
 
     #[rstest]
     #[case::zero(0)]
