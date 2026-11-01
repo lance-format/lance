@@ -2855,6 +2855,31 @@ impl SharedFtsScorerExec {
                         })
                             as Arc<dyn ExecutionPlan>));
                     }
+                    if let Some(node) = plan.downcast_ref::<PhraseQueryExec>()
+                        && node
+                            .shared_scorer
+                            .as_ref()
+                            .is_some_and(|shared| Arc::ptr_eq(shared, template))
+                    {
+                        consumers += 1;
+                        return Ok(Transformed::yes(Arc::new(PhraseQueryExec {
+                            dataset: node.dataset.clone(),
+                            query: node.query.clone(),
+                            tokenized_query: node.tokenized_query.clone(),
+                            params: node.params.clone(),
+                            prefilter_source: node.prefilter_source.clone(),
+                            base_scorer: node.base_scorer.clone(),
+                            shared_scorer: Some(scorer.clone()),
+                            segment_selection: node.segment_selection.clone(),
+                            overlay_block: node.overlay_block.clone(),
+                            document_granularity: node.document_granularity,
+                            schema: node.schema.clone(),
+                            external_mask: node.external_mask.clone(),
+                            properties: node.properties.clone(),
+                            metrics: node.metrics.clone(),
+                        })
+                            as Arc<dyn ExecutionPlan>));
+                    }
                     if let Some(node) = plan.downcast_ref::<FlatMatchQueryExec>()
                         && node
                             .shared_scorer
