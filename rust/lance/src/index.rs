@@ -2433,21 +2433,23 @@ impl IndexDescriptionImpl {
                 return Err(Error::index("Fragment bitmap is required for index description.  This index must be retrained to support this method.".to_string()));
             };
 
-            // Externally maintained indices can keep coverage in their own
-            // payload and deliberately declare an empty bitmap. A genuinely
-            // empty built-in index still has known zero coverage.
-            if fragment_bitmap.is_empty() && empty_fragment_bitmap_has_unknown_coverage(shard) {
-                fragment_coverage_unknown = true;
+            if reports_fragment_coverage {
+                // Externally maintained indices can keep coverage in their own
+                // payload and deliberately declare an empty bitmap. A genuinely
+                // empty built-in index still has known zero coverage.
+                if fragment_bitmap.is_empty() && empty_fragment_bitmap_has_unknown_coverage(shard) {
+                    fragment_coverage_unknown = true;
+                }
+                indexed_fragments |= fragment_bitmap;
+                let serialized_size = shard.fragment_bitmap_serialized_size().ok_or_else(|| {
+                    Error::index("Fragment bitmap disappeared while describing index".to_string())
+                })?;
+                let serialized_size = u64::try_from(serialized_size)
+                    .map_err(|_| Error::index("Fragment bitmap size overflow".to_string()))?;
+                fragment_bitmap_size_bytes = fragment_bitmap_size_bytes
+                    .checked_add(serialized_size)
+                    .ok_or_else(|| Error::index("Fragment bitmap size overflow".to_string()))?;
             }
-            indexed_fragments |= fragment_bitmap;
-            let serialized_size = shard.fragment_bitmap_serialized_size().ok_or_else(|| {
-                Error::index("Fragment bitmap disappeared while describing index".to_string())
-            })?;
-            let serialized_size = u64::try_from(serialized_size)
-                .map_err(|_| Error::index("Fragment bitmap size overflow".to_string()))?;
-            fragment_bitmap_size_bytes = fragment_bitmap_size_bytes
-                .checked_add(serialized_size)
-                .ok_or_else(|| Error::index("Fragment bitmap size overflow".to_string()))?;
             indexed_fragment_refs += fragment_bitmap.len();
             for fragment_id in fragment_bitmap.iter() {
                 if let Some(fragment_rows) = fragment_rows.get(&fragment_id) {
