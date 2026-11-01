@@ -242,6 +242,9 @@ impl<'a> CreateIndexBuilder<'a> {
         } else {
             None
         };
+        if let Some(params) = &inverted_params {
+            params.validate_for_creation()?;
+        }
         let resolved_fts_field = if let Some(params) = &inverted_params {
             Some(crate::index::scalar::inverted::resolve_fts_field(
                 self.dataset.schema(),

@@ -8649,6 +8649,61 @@ async fn test_sql_contains_tokens() {
     assert_eq!(count_null_query_matches(dataset.clone()).await, 0);
 }
 
+/// An ngram FTS index with positions, which 13.0.0 could create and current
+/// versions refuse to, still loads, takes appended rows and answers queries.
+#[rstest]
+#[tokio::test]
+async fn test_existing_ngram_index_with_positions_keeps_working(
+    #[values(false, true)] merge: bool,
+) {
+    let test_dir =
+        copy_test_data_to_tmp("v13.0.0/ngram_with_position/ngram_with_position.lance").unwrap();
+    let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    let schema = Arc::new(dataset.schema().into());
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["yellow"]))]).unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let options = if merge {
+        OptimizeOptions::merge(2)
+    } else {
+        OptimizeOptions::append()
+    };
+    dataset.optimize_indices(&options).await.unwrap();
+
+    let results = dataset
+        .scan()
+        .project(&["text"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new("ello".to_owned()))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut texts = results["text"]
+        .as_string::<i32>()
+        .iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    texts.sort_unstable();
+    assert_eq!(texts, ["hello world", "world hello", "yellow"]);
+
+    // Creating such an index anew is rejected.
+    let params = InvertedIndexParams::default()
+        .base_tokenizer("ngram".to_string())
+        .with_position(true);
+    let err = dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+}
+
 #[tokio::test]
 async fn test_index_take_batch_size() -> Result<()> {
     use tempfile::tempdir;

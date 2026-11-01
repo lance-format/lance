@@ -1074,15 +1074,22 @@ impl InvertedIndexParams {
             default_format_version,
         )?);
         params.validate_format_version()?;
+        Ok(params)
+    }
+
+    /// Checks settings that a new index cannot use but an existing one may
+    /// carry. Indexes built this way by earlier releases must still load,
+    /// optimize and remap, so this is not part of [`Self::build`].
+    pub fn validate_for_creation(&self) -> Result<()> {
         // The ngram tokenizer puts every token at position 0, so its positions
-        // carry nothing a phrase query could use. Rejected only when an index
-        // is created: indexes built this way by earlier releases still load.
-        if params.with_position && params.base_tokenizer == "ngram" {
+        // carry nothing a phrase query could use.
+        if self.with_position && self.base_tokenizer == "ngram" {
             return Err(Error::invalid_input(
-                "with_position is not supported with base_tokenizer='ngram'".to_string(),
+                "with_position is not supported with base_tokenizer='ngram'; set with_position=false"
+                    .to_string(),
             ));
         }
-        Ok(params)
+        Ok(())
     }
 
     pub fn build(&self) -> Result<Box<dyn LanceTokenizer>> {
@@ -1563,7 +1570,8 @@ mod tests {
     #[test]
     fn test_creation_rejects_with_position_for_ngram_tokenizer() {
         let params = r#"{"base_tokenizer": "ngram", "with_position": true}"#;
-        let err = InvertedIndexParams::from_training_json(params).unwrap_err();
+        let loaded = InvertedIndexParams::from_training_json(params).unwrap();
+        let err = loaded.validate_for_creation().unwrap_err();
         assert!(matches!(&err, Error::InvalidInput { .. }));
         assert!(
             err.to_string()
