@@ -13,13 +13,15 @@
 //! Each benchmark varies the number of rows while keeping the number of
 //! ranges fixed at 1. A range-aware representation should make these
 //! near-constant time; today they are linear in N.
+//! The `owned_union` group separately measures copying versus moving bitmap
+//! storage when merging maps with disjoint or identical fragment IDs.
 //!
 //! Run with `cargo bench -p lance-select --bench row_addr_mask`.
 
 use std::ops::Range;
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use lance_select::{RowAddrMask, RowAddrTreeMap};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use lance_select::{NullableRowAddrMask, NullableRowAddrSet, RowAddrMask, RowAddrTreeMap};
 
 /// Row counts we sweep across. Chosen to cover the realistic range of
 /// matches a zonemap produces for an `IS NULL`-like predicate on a single
@@ -250,6 +252,175 @@ fn bench_runs_vs_rows(c: &mut Criterion) {
     group.finish();
 }
 
+const UNION_INPUT_COUNT: usize = 4;
+const UNION_ROWS_PER_FRAGMENT: u32 = 1 << 20;
+const UNION_FRAGMENT_COUNTS: &[u32] = &[32, 128];
+
+#[derive(Clone, Copy)]
+enum UnionTopology {
+    Disjoint,
+    Identical,
+}
+
+impl UnionTopology {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Disjoint => "disjoint",
+            Self::Identical => "identical_fragment_ids",
+        }
+    }
+}
+
+struct UnionInputs {
+    accumulator: RowAddrTreeMap,
+    remaining: Vec<RowAddrTreeMap>,
+}
+
+struct NullableUnionInputs {
+    accumulator: NullableRowAddrMask,
+    remaining: Vec<NullableRowAddrMask>,
+}
+
+/// Build one 50%-dense bitmap, then clone it into each fragment. With 1M
+/// offsets, this is 512K selected rows in 16 bitset containers (about 128 KiB
+/// of bitmap payload per fragment). The four input maps therefore hold about
+/// 16/64 MiB of bitmap payload at 32/128 fragments per map. This intentionally
+/// uses alternating offsets instead of ranges, which Roaring would compress
+/// into run containers.
+fn make_union_maps(
+    representative_bitmap: &roaring::RoaringBitmap,
+    fragment_count: u32,
+    topology: UnionTopology,
+) -> Vec<RowAddrTreeMap> {
+    (0..UNION_INPUT_COUNT)
+        .map(|input_index| {
+            let first_fragment = match topology {
+                UnionTopology::Disjoint => input_index as u32 * fragment_count,
+                UnionTopology::Identical => 0,
+            };
+            let mut map = RowAddrTreeMap::new();
+            for fragment_offset in 0..fragment_count {
+                map.insert_bitmap(
+                    first_fragment + fragment_offset,
+                    representative_bitmap.clone(),
+                );
+            }
+            map
+        })
+        .collect()
+}
+
+/// Clone and split a fixture during `iter_batched` setup, outside the timed
+/// routine. Every union method receives the same four-map shape and contents.
+fn clone_union_inputs(maps: &[RowAddrTreeMap]) -> UnionInputs {
+    UnionInputs {
+        accumulator: maps[0].clone(),
+        remaining: maps[1..].to_vec(),
+    }
+}
+
+fn clone_nullable_union_inputs(maps: &[RowAddrTreeMap]) -> NullableUnionInputs {
+    let as_allow_list = |map: &RowAddrTreeMap| {
+        NullableRowAddrMask::AllowList(NullableRowAddrSet::new(map.clone(), RowAddrTreeMap::new()))
+    };
+    NullableUnionInputs {
+        accumulator: as_allow_list(&maps[0]),
+        remaining: maps[1..].iter().map(as_allow_list).collect(),
+    }
+}
+
+/// Compare owned `|=` folding with borrowed `|=` and `Extend<Self>` controls.
+/// The fixture holds four maps, each with 32 or 128 fragments. Disjoint cases
+/// exercise insertion of new fragment bitmaps; identical cases merge the same
+/// fragment IDs and bitmap contents repeatedly. `iter_batched` clones inputs
+/// in setup (`PerIteration`), outside the timed routine. Results are returned
+/// through `black_box` so result destruction is outside the timed routine; the
+/// borrowed control also returns its source maps to keep their destruction out
+/// of the timed routine.
+fn bench_owned_union(c: &mut Criterion) {
+    let mut representative_bitmap = roaring::RoaringBitmap::new();
+    for row_offset in (0..UNION_ROWS_PER_FRAGMENT).step_by(2) {
+        representative_bitmap.insert(row_offset);
+    }
+
+    let mut group = c.benchmark_group("owned_union");
+    for &fragment_count in UNION_FRAGMENT_COUNTS {
+        for topology in [UnionTopology::Disjoint, UnionTopology::Identical] {
+            let maps = make_union_maps(&representative_bitmap, fragment_count, topology);
+            let case = format!("{}_{}fragments_per_input", topology.name(), fragment_count);
+
+            group.bench_function(BenchmarkId::new("owned_bitor_assign", &case), |b| {
+                b.iter_batched(
+                    || clone_union_inputs(&maps),
+                    |inputs| {
+                        let UnionInputs {
+                            mut accumulator,
+                            remaining,
+                        } = inputs;
+                        for rhs in remaining {
+                            accumulator |= rhs;
+                        }
+                        std::hint::black_box(accumulator)
+                    },
+                    BatchSize::PerIteration,
+                );
+            });
+
+            group.bench_function(BenchmarkId::new("borrowed_bitor_assign", &case), |b| {
+                b.iter_batched(
+                    || clone_union_inputs(&maps),
+                    |inputs| {
+                        let UnionInputs {
+                            mut accumulator,
+                            remaining,
+                        } = inputs;
+                        for rhs in &remaining {
+                            accumulator |= rhs;
+                        }
+                        std::hint::black_box((accumulator, remaining))
+                    },
+                    BatchSize::PerIteration,
+                );
+            });
+
+            group.bench_function(BenchmarkId::new("extend_self", &case), |b| {
+                b.iter_batched(
+                    || clone_union_inputs(&maps),
+                    |inputs| {
+                        let UnionInputs {
+                            mut accumulator,
+                            remaining,
+                        } = inputs;
+                        accumulator.extend(remaining);
+                        std::hint::black_box(accumulator)
+                    },
+                    BatchSize::PerIteration,
+                );
+            });
+
+            if matches!(topology, UnionTopology::Disjoint) {
+                group.bench_function(BenchmarkId::new("nullable_allow_list_bitor", &case), |b| {
+                    b.iter_batched(
+                        || clone_nullable_union_inputs(&maps),
+                        |inputs| {
+                            let NullableUnionInputs {
+                                mut accumulator,
+                                remaining,
+                            } = inputs;
+                            for rhs in remaining {
+                                accumulator = accumulator | rhs;
+                            }
+                            std::hint::black_box(accumulator)
+                        },
+                        BatchSize::PerIteration,
+                    );
+                });
+            }
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_insert_range,
@@ -260,5 +431,6 @@ criterion_group!(
     bench_range_to_ranges_round_trip,
     bench_range_to_ranges_round_trip_runs,
     bench_runs_vs_rows,
+    bench_owned_union,
 );
 criterion_main!(benches);

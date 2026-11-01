@@ -7,7 +7,7 @@ Lance maintains a linear commit history with a controlled release process.
 * Stable releases (non-prereleases) are created only after a voting process and come from a release branch `release/vX.Y`. These are typically created once every two weeks.
 * Release Candidates (RC) are created from release branches prior to voting.
 * Minor releases can be cut from either main branch or an existing release branch (when main is targeting a major release).
-* Patch releases are created by committing fixes directly to the release branch, voting on a new RC, and releasing.
+* Patch releases backport fixes from main to an existing release branch, vote on a new RC, and release.
 * All changes (features, fixes) must be committed to main first, then cherry-picked to release branches as needed.
 
 ```mermaid
@@ -302,6 +302,60 @@ Starting from v1.3.0-rc.1 cut, main at 1.4.0-beta.0 with `release-root/1.4.0-bet
 **Key insight**: Multiple beta version series can share the same release-root commit, with major version bumped only once when first detected.
 </details>
 
+## Validate an RC Before Approval
+
+Complete these checks before closing the vote and running **Approve RC** for any
+major, minor, or patch release.
+
+1. Wait for the RC publishing workflows to finish and test the exact RC artifacts
+   from the channels listed above. Record the RC tag and its peeled commit SHA.
+   A local build or a passing source-checkout CI run does not verify that the
+   published packages can be installed and consumed.
+2. For coordinated LanceDB releases, select the SDK product baseline and create
+   or reuse its release branch **before** opening the Lance RC upgrade draft PR.
+   Target that branch, especially when LanceDB main already uses a newer Lance
+   development version. Follow the [LanceDB release process](https://github.com/lancedb/lancedb/blob/main/release_process.md#prepare-a-stable-release).
+3. Bring the LanceDB RC pin PR to a **ready-to-merge state before publishing
+   Lance stable**. Complete the relevant CI and code/compatibility reviews against
+   the exact RC. If draft status skips Gatekeeper or another applicable review,
+   mark the PR ready for review or explicitly run that review. A skipped review
+   is missing validation evidence. Read review bodies and inline threads: a
+   request-changes recommendation or unresolved blocking finding still blocks
+   approval when GitHub records it as a comment and CI is green.
+4. Record the downstream base and PR head SHAs (and tested merge commit, when
+   applicable), dependency references, CI links, review outcomes and any expected
+   skips. Keep local source checks and tests of published artifacts identifiable
+   in the vote evidence. Refresh reviews and comments immediately before approval.
+5. If the RC, downstream candidate, or its release-branch base changes, rerun the
+   affected validation before using the result to approve the release. Bring
+   required fixes into the selected branch through reviewed backports instead of
+   silently switching the release to a later main snapshot.
+6. Confirm that the workflow will promote the voted RC. Changes that require a
+   new candidate must go through **Create RC** and renewed validation and voting.
+
+Ready to merge does not mean merging the RC dependency before Lance approval.
+All substantive code, compatibility and review work must be complete on the RC
+pin PR. After stable packages are published, only the mechanical RC-to-stable
+reference update and verification of those packages should remain; review of the
+dependency upgrade must not start after Lance stable has already been published.
+
+Coordinate any additional downstream checks with their owners. Projects should
+keep commands that require restricted access in their own runbooks and
+provide the release manager with the relevant validation result.
+
+### Verify Stable Publication
+
+The stable workflow creates a version commit and publishes packages asynchronously.
+Compare the stable tag with the voted RC: only the expected mechanical version and
+lockfile updates should differ. Investigate any code or dependency changes.
+
+Verify every publishing workflow and the exact versions in the intended package
+registries. A GitHub Release entry alone does not mean that all packages are
+available. Source workspace dependency overrides are not a substitute for testing
+the dependency graph used by published packages. Then validate downstream updates
+against the official stable artifacts before publishing coordinated downstream
+stable releases.
+
 ## Create a Major / Minor Release (from Main)
 
 **Purpose**: Create a new major or minor release from the main branch.
@@ -315,7 +369,7 @@ Starting from v1.3.0-rc.1 cut, main at 1.4.0-beta.0 with `release-root/1.4.0-bet
 5. Test RC artifacts (published to fury.io, Maven Central)
 6. Vote in the GitHub Discussion thread (created automatically)
 7. **If issues found**: Fix on release branch, run **"Create RC"** workflow to create `rc.2`, `rc.3`, etc.
-8. **If approved**: Trigger **"Approve RC"** workflow with **rc_tag** (e.g., `v1.3.0-rc.2`)
+8. **If approved**: Complete the [RC validation checks](#validate-an-rc-before-approval), then trigger **"Approve RC"** with **rc_tag** (e.g., `v1.3.0-rc.2`)
 
 **Result**:
 
@@ -366,7 +420,7 @@ Starting from v1.3.0-rc.1 cut, main at 1.4.0-beta.0 with `release-root/1.4.0-bet
 4. Run with **dry_run**: `false` to create new release branch and RC
 5. Test RC artifacts and vote in the GitHub Discussion
 6. **If issues found**: Fix and run **"Create RC"** workflow
-7. **If approved**: Trigger **"Approve RC"** workflow
+7. **If approved**: Complete the [RC validation checks](#validate-an-rc-before-approval), then trigger **"Approve RC"**
 
 **Result**:
 
@@ -411,7 +465,7 @@ Starting from v1.3.0-rc.1 cut, main at 1.4.0-beta.0 with `release-root/1.4.0-bet
 5. Run with **dry_run**: `false` to create the patch RC
 6. Test RC artifacts and vote in the GitHub Discussion
 7. **If issues found**: Fix and run **"Create RC"** again to create `rc.2`, `rc.3`, etc.
-8. **If approved**: Trigger **"Approve RC"** workflow with **rc_tag** (e.g., `v1.3.1-rc.1`)
+8. **If approved**: Complete the [RC validation checks](#validate-an-rc-before-approval), then trigger **"Approve RC"** with **rc_tag** (e.g., `v1.3.1-rc.1`)
 
 **Result**:
 

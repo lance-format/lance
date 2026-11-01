@@ -138,18 +138,29 @@ mod tests {
     use arrow_schema::{DataType, Field};
     use lance_datagen::{ArrayGeneratorExt, RowCount, array, gen_array};
 
-    use crate::testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data};
+    use crate::testing::{
+        TestCases, TestEncoding, check_basic_random_case, check_round_trip_encoding_of_data,
+    };
+    use rstest::rstest;
 
-    const PRIMITIVE_TYPES: &[DataType] = &[DataType::Int8, DataType::Float32, DataType::Float64];
-
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_value_fsl_primitive() {
-        for data_type in PRIMITIVE_TYPES {
-            let inner_field = Field::new("item", data_type.clone(), true);
-            let data_type = DataType::FixedSizeList(Arc::new(inner_field), 16);
-            let field = Field::new("", data_type, false);
-            check_basic_random(field).await;
-        }
+    async fn test_value_fsl_primitive(
+        #[values(DataType::Int8, DataType::Float32, DataType::Float64)] data_type: DataType,
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
+        let inner_field = Field::new("item", data_type, true);
+        let data_type = DataType::FixedSizeList(Arc::new(inner_field), 16);
+        let field = Field::new("", data_type, false);
+        check_basic_random_case(field, encoding, page_size, use_slicing).await;
     }
 
     #[test_log::test(tokio::test)]

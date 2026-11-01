@@ -4,6 +4,7 @@
 use arrow_buffer::ToByteSlice;
 use uuid::Uuid;
 
+pub(crate) mod clustering;
 mod fragment;
 mod index;
 pub mod key_existence;
@@ -15,6 +16,10 @@ mod transaction;
 pub use crate::rowids::version::{
     RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
 };
+pub use clustering::{
+    ClusteringDefinition, apply_complete_clustering_definitions, merge_clustering_definitions,
+    refuse_key_fields_that_changed_identity, same_field_identity, validate_clustering,
+};
 pub use fragment::*;
 pub use index::{IndexFile, IndexMetadata, index_metadata_codec, list_index_files_with_sizes};
 
@@ -23,8 +28,11 @@ pub use manifest::{
     SelfDescribingFileReader, WriterVersion, is_detached_version,
     populate_manifest_schema_dictionaries,
 };
-pub use row_ids::{ExternalFile, InlineRowIds, RowIdMeta};
-pub use transaction::Transaction;
+pub use row_ids::{
+    ExternalFile, InlineRowIds, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
+    ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowIdMeta,
+};
+pub use transaction::{Transaction, operation_may_change_schema};
 
 use lance_core::{Error, Result};
 

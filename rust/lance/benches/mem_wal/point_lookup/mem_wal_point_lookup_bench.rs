@@ -5,7 +5,7 @@
 //!
 //! Measures lookup latency against three tiers of the LSM tree:
 //!   - Base table (on-disk, compacted data)
-//!   - SSTables (on-disk L0)
+//!   - SSTables (on-disk, uncompacted)
 //!   - Active MemTable (in-memory write buffer)
 //!
 //! Two phases, selected with `--phase`:
@@ -411,7 +411,7 @@ async fn run_lookup(args: &Args) -> Result<serde_json::Value> {
     let collector = LsmDataSourceCollector::new(dataset.clone(), vec![shard_snapshot])
         .with_active_memtable(shard_id, active_ref);
     let pk_columns = vec!["id".to_string()];
-    let planner = LsmPointLookupPlanner::new(collector, pk_columns, arrow_schema);
+    let planner = LsmPointLookupPlanner::new(collector, pk_columns, arrow_schema).unwrap();
 
     // Generate lookup IDs for each category
     let (id_groups, category_names) = generate_lookup_ids(

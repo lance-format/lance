@@ -13,35 +13,77 @@
  */
 package org.lance.cleanup;
 
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Optional;
 
 /**
  * Cleanup policy for dataset cleanup.
  *
- * <p>All fields are optional. We intentionally do not set default values here to avoid conflicting
- * with Rust-side defaults. Refer to Rust CleanupPolicy for defaults.
+ * <p>Construct with ordered CleanupRule entries, or use the builder for legacy filters. The
+ * no-argument constructor defaults to a single two-week RemoveAll rule. All builder fields are
+ * optional. We intentionally do not set default values here to avoid conflicting with Rust-side
+ * defaults. Refer to Rust CleanupPolicy for defaults.
  */
 public class CleanupPolicy {
   private final Optional<Long> beforeTimestampMillis;
   private final Optional<Long> beforeVersion;
+  private final Optional<List<Long>> versions;
   private final Optional<Boolean> deleteUnverified;
   private final Optional<Boolean> errorIfTaggedOldVersions;
   private final Optional<Boolean> cleanReferencedBranches;
   private final Optional<Long> deleteRateLimit;
+  private final Optional<List<CleanupRule>> rules;
 
   private CleanupPolicy(
       Optional<Long> beforeTimestampMillis,
       Optional<Long> beforeVersion,
+      Optional<List<Long>> versions,
       Optional<Boolean> deleteUnverified,
       Optional<Boolean> errorIfTaggedOldVersions,
       Optional<Boolean> cleanReferencedBranches,
-      Optional<Long> deleteRateLimit) {
+      Optional<Long> deleteRateLimit,
+      Optional<List<CleanupRule>> rules) {
     this.beforeTimestampMillis = beforeTimestampMillis;
     this.beforeVersion = beforeVersion;
+    this.versions = versions;
     this.deleteUnverified = deleteUnverified;
     this.errorIfTaggedOldVersions = errorIfTaggedOldVersions;
     this.cleanReferencedBranches = cleanReferencedBranches;
     this.deleteRateLimit = deleteRateLimit;
+    this.rules = rules;
+  }
+
+  /** Create a policy with a single RemoveAll rule expiring history after two weeks. */
+  public CleanupPolicy() {
+    this(List.of(CleanupRule.removeAll(Duration.ofDays(14))));
+  }
+
+  /**
+   * Create a policy of ordered rules, validated during cleanup.
+   *
+   * <p>Example: {@code new CleanupPolicy(List.of( CleanupRule.keepOne(Duration.ofHours(1),
+   * Duration.ofDays(2)), CleanupRule.removeAll(Duration.ofDays(30))))}.
+   *
+   * @param rules ordered rules with increasing ages; RemoveAll may only appear last
+   */
+  public CleanupPolicy(List<CleanupRule> rules) {
+    this(
+        Optional.empty(),
+        Optional.empty(),
+        Optional.empty(),
+        Optional.empty(),
+        Optional.empty(),
+        Optional.empty(),
+        Optional.empty(),
+        Optional.of(List.copyOf(rules)));
+  }
+
+  /** Ordered retention rules; absent for policies built using only legacy filters. */
+  public Optional<List<CleanupRule>> getRules() {
+    return rules;
   }
 
   public static Builder builder() {
@@ -54,6 +96,10 @@ public class CleanupPolicy {
 
   public Optional<Long> getBeforeVersion() {
     return beforeVersion;
+  }
+
+  public Optional<List<Long>> getVersions() {
+    return versions;
   }
 
   public Optional<Boolean> getDeleteUnverified() {
@@ -76,10 +122,12 @@ public class CleanupPolicy {
   public static class Builder {
     private Optional<Long> beforeTimestampMillis = Optional.empty();
     private Optional<Long> beforeVersion = Optional.empty();
+    private Optional<List<Long>> versions = Optional.empty();
     private Optional<Boolean> deleteUnverified = Optional.empty();
     private Optional<Boolean> errorIfTaggedOldVersions = Optional.empty();
     private Optional<Boolean> cleanReferencedBranches = Optional.empty();
     private Optional<Long> deleteRateLimit = Optional.empty();
+    private Optional<List<CleanupRule>> rules = Optional.empty();
 
     private Builder() {}
 
@@ -92,6 +140,12 @@ public class CleanupPolicy {
     /** Set a version threshold; versions older than this will be cleaned. */
     public Builder withBeforeVersion(long beforeVersion) {
       this.beforeVersion = Optional.of(beforeVersion);
+      return this;
+    }
+
+    /** Set the exact dataset versions to clean. */
+    public Builder withVersions(List<Long> versions) {
+      this.versions = Optional.of(Collections.unmodifiableList(new ArrayList<>(versions)));
       return this;
     }
 
@@ -113,9 +167,18 @@ public class CleanupPolicy {
       return this;
     }
 
-    /** Set the maximum number of delete operations per second. */
+    /**
+     * Set delete requests per second, shared with all cascaded branches. An explicit operation rate
+     * overrides this value.
+     */
     public Builder withDeleteRateLimit(long deleteRateLimit) {
       this.deleteRateLimit = Optional.of(deleteRateLimit);
+      return this;
+    }
+
+    /** Set ordered retention rules, validated on explain/execute. */
+    public Builder withRules(List<CleanupRule> rules) {
+      this.rules = Optional.of(List.copyOf(rules));
       return this;
     }
 
@@ -123,10 +186,12 @@ public class CleanupPolicy {
       return new CleanupPolicy(
           beforeTimestampMillis,
           beforeVersion,
+          versions,
           deleteUnverified,
           errorIfTaggedOldVersions,
           cleanReferencedBranches,
-          deleteRateLimit);
+          deleteRateLimit,
+          rules);
     }
   }
 }

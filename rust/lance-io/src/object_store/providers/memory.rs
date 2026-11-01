@@ -24,6 +24,7 @@ impl ObjectStoreProvider for MemoryStoreProvider {
         Ok(ObjectStore {
             inner: Arc::new(InMemory::new()),
             local_dir_operations: None,
+            local_fsync: false,
             scheme: String::from("memory"),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -34,6 +35,9 @@ impl ObjectStoreProvider for MemoryStoreProvider {
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            // Listed in full: the store is already in memory, so a page costs no less than
+            // the directory does.
+            paginated_lister: None,
         })
     }
 

@@ -26,6 +26,7 @@ import org.lance.namespace.model.AnalyzeTableQueryPlanRequest;
 import org.lance.namespace.model.BatchDeleteTableVersionsRequest;
 import org.lance.namespace.model.BatchDeleteTableVersionsResponse;
 import org.lance.namespace.model.CountTableRowsRequest;
+import org.lance.namespace.model.CountTableRowsResponse;
 import org.lance.namespace.model.CreateMaterializedViewRequest;
 import org.lance.namespace.model.CreateMaterializedViewResponse;
 import org.lance.namespace.model.CreateNamespaceRequest;
@@ -83,7 +84,9 @@ import org.lance.namespace.model.ListTablesResponse;
 import org.lance.namespace.model.MergeInsertIntoTableRequest;
 import org.lance.namespace.model.MergeInsertIntoTableResponse;
 import org.lance.namespace.model.NamespaceExistsRequest;
+import org.lance.namespace.model.NamespaceExistsResponse;
 import org.lance.namespace.model.QueryTableRequest;
+import org.lance.namespace.model.QueryTableResponse;
 import org.lance.namespace.model.RegisterTableRequest;
 import org.lance.namespace.model.RegisterTableResponse;
 import org.lance.namespace.model.RenameTableRequest;
@@ -91,6 +94,7 @@ import org.lance.namespace.model.RenameTableResponse;
 import org.lance.namespace.model.RestoreTableRequest;
 import org.lance.namespace.model.RestoreTableResponse;
 import org.lance.namespace.model.TableExistsRequest;
+import org.lance.namespace.model.TableExistsResponse;
 import org.lance.namespace.model.UpdateTableRequest;
 import org.lance.namespace.model.UpdateTableResponse;
 import org.lance.namespace.model.UpdateTableSchemaMetadataRequest;
@@ -100,6 +104,7 @@ import org.lance.namespace.model.UpdateTableTagResponse;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.apache.arrow.memory.BufferAllocator;
 
 import java.io.Closeable;
@@ -124,6 +129,8 @@ import java.util.Optional;
  *   <li>tls.key_file (optional): Path to client key file
  *   <li>tls.ssl_ca_cert (optional): Path to CA certificate file
  *   <li>tls.assert_hostname (optional): "true" or "false" (default: true)
+ *   <li>tls.reload_interval_seconds (optional): How often the TLS files above are checked for
+ *       rotation (default: 300, "0" disables reloading)
  * </ul>
  *
  * <p>Example usage:
@@ -149,7 +156,8 @@ public class RestNamespace implements LanceNamespace, Closeable {
     JniLoader.ensureLoaded();
   }
 
-  private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+  private static final ObjectMapper OBJECT_MAPPER =
+      new ObjectMapper().registerModule(new JavaTimeModule());
 
   private long nativeRestNamespaceHandle;
   private BufferAllocator allocator;
@@ -241,10 +249,11 @@ public class RestNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
-  public void namespaceExists(NamespaceExistsRequest request) {
+  public NamespaceExistsResponse namespaceExists(NamespaceExistsRequest request) {
     ensureInitialized();
     String requestJson = toJson(request);
     namespaceExistsNative(nativeRestNamespaceHandle, requestJson);
+    return new NamespaceExistsResponse();
   }
 
   @Override
@@ -272,10 +281,11 @@ public class RestNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
-  public void tableExists(TableExistsRequest request) {
+  public TableExistsResponse tableExists(TableExistsRequest request) {
     ensureInitialized();
     String requestJson = toJson(request);
     tableExistsNative(nativeRestNamespaceHandle, requestJson);
+    return new TableExistsResponse();
   }
 
   @Override
@@ -295,10 +305,11 @@ public class RestNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
-  public Long countTableRows(CountTableRowsRequest request) {
+  public CountTableRowsResponse countTableRows(CountTableRowsRequest request) {
     ensureInitialized();
     String requestJson = toJson(request);
-    return countTableRowsNative(nativeRestNamespaceHandle, requestJson);
+    Long count = countTableRowsNative(nativeRestNamespaceHandle, requestJson);
+    return new CountTableRowsResponse().count(count);
   }
 
   @Override
@@ -362,10 +373,11 @@ public class RestNamespace implements LanceNamespace, Closeable {
   }
 
   @Override
-  public byte[] queryTable(QueryTableRequest request) {
+  public QueryTableResponse queryTable(QueryTableRequest request) {
     ensureInitialized();
     String requestJson = toJson(request);
-    return queryTableNative(nativeRestNamespaceHandle, requestJson);
+    byte[] data = queryTableNative(nativeRestNamespaceHandle, requestJson);
+    return new QueryTableResponse().data(data);
   }
 
   @Override

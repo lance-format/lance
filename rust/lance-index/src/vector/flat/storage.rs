@@ -4,7 +4,8 @@
 use std::{borrow::Cow, sync::Arc};
 
 use super::index::FlatMetadata;
-use crate::frag_reuse::FragReuseIndex;
+use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
+use crate::scalar::RowIdRemapper;
 use crate::vector::quantizer::QuantizerStorage;
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::utils::do_prefetch;
@@ -71,6 +72,17 @@ impl QuantizerStorage for FlatFloatStorage {
         metadata: &Self::Metadata,
         distance_type: DistanceType,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
+        let frag_reuse_index = frag_reuse_index
+            .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+        Self::try_from_batch_with_remapper(batch, metadata, distance_type, frag_reuse_index)
+    }
+
+    fn try_from_batch_with_remapper(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Result<Self> {
         let batch = if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
             frag_reuse_index_ref.remap_row_ids_record_batch(batch, 0)?
@@ -241,6 +253,17 @@ impl QuantizerStorage for FlatBinStorage {
         distance_type: DistanceType,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
     ) -> Result<Self> {
+        let frag_reuse_index = frag_reuse_index
+            .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+        Self::try_from_batch_with_remapper(batch, metadata, distance_type, frag_reuse_index)
+    }
+
+    fn try_from_batch_with_remapper(
+        batch: RecordBatch,
+        metadata: &Self::Metadata,
+        distance_type: DistanceType,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    ) -> Result<Self> {
         let batch = if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
             frag_reuse_index_ref.remap_row_ids_record_batch(batch, 0)?
         } else {
@@ -390,6 +413,7 @@ where
     T: ArrowPrimitiveType,
     T::Native: L2 + Cosine + Dot,
 {
+    #[allow(deprecated)] // The DistCalculator interface is infallible.
     fn new(
         vectors: &'a FixedSizeListArray,
         query: ArrayRef,
@@ -417,6 +441,7 @@ where
         }
     }
 
+    #[allow(deprecated)] // The DistCalculator interface is infallible.
     fn new_from_id(
         vectors: &'a FixedSizeListArray,
         id: u32,

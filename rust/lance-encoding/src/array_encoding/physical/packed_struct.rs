@@ -262,10 +262,23 @@ mod tests {
     use arrow_schema::{DataType, Field, Fields};
     use std::{collections::HashMap, sync::Arc, vec};
 
-    use crate::testing::{TestCases, check_basic_random, check_round_trip_encoding_of_data};
+    use crate::testing::{
+        TestCases, TestEncoding, check_basic_random_case, check_round_trip_encoding_of_data,
+    };
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_random_packed_struct() {
+    async fn test_random_packed_struct(
+        #[values(
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+        #[values(4096, 1024 * 1024)] page_size: u64,
+        #[values(false, true)] use_slicing: bool,
+    ) {
         let data_type = DataType::Struct(Fields::from(vec![
             Field::new("a", DataType::UInt64, false),
             Field::new("b", DataType::UInt32, false),
@@ -275,7 +288,7 @@ mod tests {
 
         let field = Field::new("", data_type, false).with_metadata(metadata);
 
-        check_basic_random(field).await;
+        check_basic_random_case(field, encoding, page_size, use_slicing).await;
     }
 
     #[test_log::test(tokio::test)]

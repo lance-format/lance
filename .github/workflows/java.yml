@@ -40,8 +40,6 @@ jobs:
         with:
           tool: protoc
       - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # cargo-llvm-cov
       - name: Run cargo fmt
         working-directory: java/lance-jni
         run: cargo fmt --check
@@ -68,8 +66,6 @@ jobs:
         with:
           toolchain: stable
       - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # cargo-llvm-cov
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
           workspaces: java/lance-jni -> ../target/rust-maven-plugin/lance-jni

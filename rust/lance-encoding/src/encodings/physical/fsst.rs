@@ -26,8 +26,8 @@ use crate::{
         miniblock::{MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor},
     },
     format::{
-        ProtobufUtils21,
-        pb21::{self, CompressiveEncoding},
+        EncodingUtils,
+        metadata::{self, CompressiveEncoding},
     },
 };
 
@@ -163,7 +163,7 @@ impl MiniBlockCompressor for FsstMiniBlockEncoder {
 
         Ok((
             binary_miniblock_compressed,
-            ProtobufUtils21::fsst(binary_array_encoding, compressed.symbol_table),
+            EncodingUtils::fsst(binary_array_encoding, compressed.symbol_table),
         ))
     }
 }
@@ -189,7 +189,7 @@ impl PerValueCompressor for FsstPerValueEncoder {
 
         Ok((
             binary_compressed,
-            ProtobufUtils21::fsst(binary_array_encoding, compressed.symbol_table),
+            EncodingUtils::fsst(binary_array_encoding, compressed.symbol_table),
         ))
     }
 }
@@ -304,7 +304,7 @@ pub struct FsstMiniBlockDecompressor {
 
 impl FsstMiniBlockDecompressor {
     pub fn new(
-        description: &pb21::Fsst,
+        description: &metadata::Fsst,
         inner_decompressor: Box<dyn MiniBlockDecompressor>,
     ) -> Self {
         Self {
@@ -315,6 +315,10 @@ impl FsstMiniBlockDecompressor {
 }
 
 impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
+    fn num_buffers(&self) -> usize {
+        self.inner_decompressor.num_buffers()
+    }
+
     fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         // Step 1. decompress data use `BinaryMiniBlockDecompressor`
         // Extract the bits_per_offset from the binary encoding
@@ -396,13 +400,22 @@ mod tests {
     use lance_datagen::{ByteCount, RowCount};
 
     use super::map_fsst_error;
-    use crate::testing::{TestCases, check_round_trip_encoding_of_data};
+    use crate::testing::{TestCases, TestEncoding, check_round_trip_encoding_of_data};
 
+    #[rstest::rstest]
     #[test_log::test(tokio::test)]
-    async fn test_fsst() {
+    async fn test_fsst(
+        #[values(false, true)] explicit: bool,
+        #[values(
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse
+        )]
+        encoding: TestEncoding,
+    ) {
         let test_cases = TestCases::default()
             .with_expected_encoding("fsst")
-            .with_structural_encodings();
+            .with_encoding(encoding);
 
         // Generate data suitable for FSST (large strings, total size > 32KB)
         let arr = lance_datagen::gen_batch()
@@ -412,15 +425,13 @@ mod tests {
             .column(0)
             .clone();
 
-        // Test both explicit metadata and automatic selection
-        // 1. Test with explicit FSST metadata
-        let metadata_explicit =
-            HashMap::from([("lance-encoding:compression".to_string(), "fsst".to_string())]);
-        check_round_trip_encoding_of_data(vec![arr.clone()], &test_cases, metadata_explicit).await;
-
-        // 2. Test automatic FSST selection based on data characteristics
-        // FSST should be chosen automatically: max_len >= 5 and total_size >= 32KB
-        check_round_trip_encoding_of_data(vec![arr], &test_cases, HashMap::new()).await;
+        let metadata = if explicit {
+            HashMap::from([("lance-encoding:compression".to_string(), "fsst".to_string())])
+        } else {
+            // Automatic selection requires max_len >= 5 and total_size >= 32KB.
+            HashMap::new()
+        };
+        check_round_trip_encoding_of_data(vec![arr], &test_cases, metadata).await;
     }
 
     #[test]

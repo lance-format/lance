@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, UInt32Array, cast::AsArray};
+use arrow_array::{RecordBatch, UInt32Array, cast::AsArray, types::Int32Type};
 use arrow_select::concat::concat_batches;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
@@ -95,6 +95,42 @@ async fn test_filter(original: &RecordBatch, ds: &Dataset, predicate: &str) {
     let expected = concat_batches(&original.schema(), &expected_batches).unwrap();
 
     assert_eq!(&expected, &scanned);
+}
+
+/// Assert a filtered scan returns exactly `expected_ids`, once through whatever
+/// index the dataset has and once with scalar indices turned off.
+///
+/// Use this instead of [`test_filter`] for predicates whose correct answer
+/// differs from what the pinned DataFusion release computes, so there is no
+/// reference implementation to compare against. The un-indexed pass matters
+/// because `DatasetTestCases` never actually generates the no-index variant: its
+/// combination generator drops the empty combination.
+async fn assert_filter_ids(ds: &Dataset, predicate: &str, expected_ids: &[i32]) {
+    for use_scalar_index in [true, false] {
+        let mut scanner = ds.scan();
+        scanner
+            .project(&["id"])
+            .unwrap()
+            .filter(predicate)
+            .unwrap()
+            .use_scalar_index(use_scalar_index)
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+                "id".to_string(),
+            )]))
+            .unwrap();
+        let scanned = scanner.try_into_batch().await.unwrap();
+        // Collected as options so a NULL id cannot read back as a real id, and so
+        // a length mismatch fails here rather than silently comparing a prefix.
+        let ids = scanned["id"]
+            .as_primitive::<Int32Type>()
+            .iter()
+            .collect::<Vec<_>>();
+        let expected = expected_ids.iter().copied().map(Some).collect::<Vec<_>>();
+        assert_eq!(
+            ids, expected,
+            "predicate: {predicate}, index: {use_scalar_index}"
+        );
+    }
 }
 
 // Rebuild a batch using only columns present in the schema (drops _score from FTS results).

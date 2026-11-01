@@ -16,12 +16,12 @@ use arrow_array::{
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
-use futures::{TryStreamExt, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_core::{Error, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
 use lance_encoding::constants::PACKED_STRUCT_META_KEY;
-use lance_file::version::LanceFileVersion;
+use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use rstest::rstest;
 
 use crate::dataset::optimize::{CompactionOptions, compact_files};
@@ -107,6 +107,79 @@ async fn commit(dataset: &Dataset, replacements: Vec<DataReplacementGroup>) -> R
     .await
 }
 
+#[rstest]
+#[tokio::test]
+async fn replacement_uses_exact_version(
+    #[values(
+        ConcreteFileVersion::V2_0,
+        ConcreteFileVersion::V2_1,
+        ConcreteFileVersion::V2_2,
+        ConcreteFileVersion::V2_3
+    )]
+    target: ConcreteFileVersion,
+) {
+    let dataset = dataset_of(
+        arrow_array::record_batch!(("id", Int32, [1, 2]), ("value", Int32, [3, 4])).unwrap(),
+        Some(LanceFileVersion::V2_0),
+    )
+    .await;
+    let values = arrow_array::record_batch!(("value", Int32, [7, 8])).unwrap();
+    let replacement = only_fragment(&dataset)
+        .write_column_with_version(
+            stream::iter([Ok(values.clone())]),
+            &declared_schema(&dataset, "value"),
+            target,
+        )
+        .await
+        .unwrap();
+    let dataset = commit(&dataset, vec![replacement]).await.unwrap();
+    assert_eq!(
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_0
+    );
+    let files = &dataset.manifest.fragments[0].files;
+    assert!(
+        files
+            .iter()
+            .any(|file| file.file_version().unwrap() == target)
+    );
+    let actual = dataset
+        .scan()
+        .project(&["value"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(actual, values);
+    dataset.validate().await.unwrap();
+}
+
+#[rstest]
+#[case(LanceFileVersion::Legacy, ConcreteFileVersion::V2_0)]
+#[case(LanceFileVersion::V2_0, ConcreteFileVersion::V1)]
+#[tokio::test]
+async fn replacement_rejects_cross_family_target(
+    #[case] source: LanceFileVersion,
+    #[case] target: ConcreteFileVersion,
+) {
+    let batch = arrow_array::record_batch!(("id", Int32, [1, 2])).unwrap();
+    let dataset = dataset_of(batch.clone(), Some(source)).await;
+    let error = only_fragment(&dataset)
+        .write_column_with_version(
+            stream::iter([Ok(batch)]),
+            &declared_schema(&dataset, "id"),
+            target,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("V1 and V2 storage versions cannot be mixed")
+    );
+}
+
 /// A multi-fragment dataset of `rows` sequential ids, with stable row ids so
 /// replacements can be checked against row lineage.
 async fn id_dataset_of(rows: i32, max_rows_per_file: usize) -> Dataset {
@@ -138,6 +211,50 @@ async fn declare_all_null(dataset: &mut Dataset, name: &str) {
         .add_columns(NewColumnTransform::AllNulls(arrow), None, None)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn test_compact_metadata_only_all_null_dictionary() {
+    let batch = batch_of(
+        vec![ArrowField::new("id", DataType::Int32, false)],
+        vec![ints(vec![1, 2])],
+    );
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            max_rows_per_file: 1,
+            enable_stable_row_ids: false,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let dictionary_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+    dataset
+        .add_columns(
+            NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "category",
+                dictionary_type.clone(),
+                true,
+            )]))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    assert_eq!(batch["category"].data_type(), &dictionary_type);
+    assert_eq!(batch["category"].null_count(), 2);
 }
 
 /// Stage `values` for an existing `column` of one fragment.
@@ -990,6 +1107,28 @@ async fn test_discards_staged_artifacts_on_stream_error() {
         count_files(&dataset).await,
         before,
         "a stream error must not leave staged artifacts behind"
+    );
+}
+
+#[tokio::test]
+async fn test_physical_slice_read_preserves_deleted_positions() {
+    let mut dataset = id_dataset_of(4, 1024).await;
+    dataset.delete("id = 2").await.unwrap();
+    let fragment = only_fragment(&dataset);
+    let schema = dataset.schema().clone();
+    let batches = fragment
+        .read_physical_slice(0..4, &schema, 2)
+        .await
+        .unwrap()
+        .buffered(1)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let batch =
+        arrow::compute::concat_batches(&Arc::new(ArrowSchema::from(&schema)), &batches).unwrap();
+    assert_eq!(
+        batch["id"].as_primitive::<Int32Type>().values(),
+        &[1, 2, 3, 4]
     );
 }
 

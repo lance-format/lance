@@ -8,14 +8,18 @@ use std::vec;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, UpdateMode, UpdatedFragmentOffsets};
 use crate::dataset::{
-    ColumnAlteration, ManifestWriteConfig, NewColumnTransform, TRANSACTIONS_DIR,
+    ColumnAlteration, ManifestWriteConfig, NewColumnTransform, TRANSACTIONS_DIR, UpdateBuilder,
     write_manifest_file,
 };
 use crate::io::ObjectStoreParams;
 use crate::session::Session;
 use crate::{Dataset, Result};
 use lance_file::version::LanceFileVersion;
+use lance_table::feature_flags::{FLAG_COVERED_INDEX_METADATA, FLAG_ROW_ADDR_INDICES};
+use lance_table::format::IndexMetadata;
 use lance_table::io::commit::ManifestNamingScheme;
+use roaring::RoaringBitmap;
+use uuid::Uuid;
 
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
@@ -24,7 +28,7 @@ use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{
-    Int32Array, RecordBatchIterator, StringArray, StructArray,
+    Int32Array, Int64Array, RecordBatchIterator, StringArray, StructArray, record_batch,
     types::{Int32Type, Int64Type},
 };
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
@@ -36,9 +40,14 @@ use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
 use lance_datagen::{BatchCount, RowCount, array};
 
 use crate::datafusion::LanceTableProvider;
+use datafusion::physical_plan::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::prelude::SessionContext;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance_datafusion::udf::register_functions;
+use lance_index::IndexType;
+use lance_index::scalar::ScalarIndexParams;
+use lance_io::utils::tracking_store::IoStats;
 use object_store::ObjectStoreExt;
 
 #[tokio::test]
@@ -221,6 +230,229 @@ async fn test_session_store_registry() {
     assert_eq!(registry.active_stores().len(), 0);
 }
 
+#[test]
+fn test_decode_inline_transaction_tolerates_unknown_operations() {
+    use crate::dataset::decode_inline_transaction;
+    use lance_table::format::pb;
+    use prost::Message;
+
+    // A transaction written by a newer version of Lance may carry an operation
+    // this version cannot decode; prost surfaces it as a missing oneof. It
+    // decodes as `Operation::Unknown` rather than failing.
+    let unknown_operation = pb::Transaction {
+        read_version: 1,
+        uuid: "test".to_string(),
+        ..Default::default()
+    };
+    let decoded = decode_inline_transaction(&unknown_operation.encode_to_vec(), 42).unwrap();
+    assert!(matches!(decoded.operation, Operation::Unknown { .. }));
+
+    // Corrupt bytes are likewise tolerated.
+    assert!(decode_inline_transaction(&[0xff, 0xff, 0xff], 42).is_none());
+
+    // A decodable transaction is returned.
+    let known = pb::Transaction::try_from(&Transaction::new(
+        1,
+        Operation::Append { fragments: vec![] },
+        None,
+    ))
+    .unwrap();
+    let decoded = decode_inline_transaction(&known.encode_to_vec(), 42).unwrap();
+    assert!(matches!(decoded.operation, Operation::Append { .. }));
+}
+
+/// A transaction as a future Lance might write it: the `operation` oneof holds
+/// a field number this version does not know. 199 is the top of the reserved
+/// operation range, the number least likely to be assigned; if it ever is, the
+/// `Unknown` assertions in these tests fail and a new number must be picked.
+#[derive(Clone, PartialEq, prost::Message)]
+struct FutureTransaction {
+    #[prost(uint64, tag = "1")]
+    read_version: u64,
+    #[prost(string, tag = "2")]
+    uuid: String,
+    #[prost(message, optional, tag = "199")]
+    future_operation: Option<()>,
+}
+
+fn future_transaction(uuid: &str) -> FutureTransaction {
+    FutureTransaction {
+        read_version: 1,
+        uuid: uuid.to_string(),
+        future_operation: Some(()),
+    }
+}
+
+/// Rewrite the latest manifest of `dataset` in place so its inline transaction
+/// section holds `inline_tx`, stored in the deprecated field 21 if
+/// `deprecated_field` is set and in field 23 otherwise.
+async fn rewrite_inline_transaction(
+    dataset: &Dataset,
+    inline_tx: &impl prost::Message,
+    deprecated_field: bool,
+) {
+    use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
+    use lance_io::object_writer::ObjectWriter;
+    use lance_io::traits::{WriteExt, Writer};
+    use lance_table::format::pb;
+
+    assert!(dataset.manifest.index_section.is_none());
+    let path = &dataset.manifest_location().path;
+    let mut writer = ObjectWriter::new(dataset.object_store.as_ref(), path)
+        .await
+        .unwrap();
+    let tx_pos = writer.write_protobuf(inline_tx).await.unwrap() as u64;
+    let mut manifest = pb::Manifest::from(dataset.manifest.as_ref());
+    if deprecated_field {
+        manifest.transaction_section = None;
+        manifest.transaction_section_deprecated = Some(tx_pos);
+    } else {
+        manifest.transaction_section = Some(tx_pos);
+        manifest.transaction_section_deprecated = None;
+    }
+    let pos = writer.write_protobuf(&manifest).await.unwrap();
+    writer
+        .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+        .await
+        .unwrap();
+    Writer::shutdown(&mut writer).await.unwrap();
+}
+
+async fn two_version_dataset(uri: &str) -> Dataset {
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+    let dataset = lance_datagen::gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_dataset(uri, FragmentCount::from(1), FragmentRowCount::from(10))
+        .await
+        .unwrap();
+    let batch = lance_datagen::gen_batch()
+        .col("i", array::step::<Int32Type>())
+        .into_batch_rows(RowCount::from(10))
+        .unwrap();
+    InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![batch])
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_open_version_with_unknown_operation() {
+    let test_uri = TempStrDir::default();
+    let dataset = two_version_dataset(&test_uri).await;
+    rewrite_inline_transaction(&dataset, &future_transaction("future"), false).await;
+
+    let dataset = Dataset::open(&test_uri).await.unwrap();
+    assert_eq!(dataset.version().version, 2);
+    let tx = dataset.read_transaction().await.unwrap().unwrap();
+    assert!(matches!(tx.operation, Operation::Unknown { .. }));
+    assert_eq!(tx.uuid, "future");
+
+    // It can be neither re-encoded nor committed.
+    assert!(lance_table::format::pb::Transaction::try_from(&tx).is_err());
+    assert!(
+        CommitBuilder::new(Arc::new(dataset.clone()))
+            .execute(tx)
+            .await
+            .is_err()
+    );
+
+    // A concurrent writer cannot tell what the unknown operation touched, so
+    // it must not commit over it.
+    let stale = dataset.checkout_version(1).await.unwrap();
+    let append = Transaction::new(1, Operation::Append { fragments: vec![] }, None);
+    let err = CommitBuilder::new(Arc::new(stale))
+        .execute(append)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::IncompatibleTransaction { .. }),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_inline_transaction_written_to_new_field() {
+    use lance_table::format::pb;
+    use prost::Message;
+
+    // Lance v1.0-v11.0 fail to open a version whose field 21 holds an
+    // operation they don't know, so it must never be written again.
+    let test_uri = TempStrDir::default();
+    let dataset = two_version_dataset(&test_uri).await;
+    let bytes = dataset
+        .object_store
+        .read_one_all(&dataset.manifest_location().path)
+        .await
+        .unwrap();
+    let footer = &bytes[bytes.len() - 16..];
+    let pos = u64::from_le_bytes(footer[..8].try_into().unwrap()) as usize;
+    let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+    let manifest = pb::Manifest::decode(&bytes[pos + 4..pos + 4 + len]).unwrap();
+    assert!(manifest.transaction_section_deprecated.is_none());
+    assert!(manifest.transaction_section.is_some());
+}
+
+#[tokio::test]
+async fn test_read_inline_transaction_from_deprecated_field() {
+    use lance_table::format::pb;
+
+    let test_uri = TempStrDir::default();
+    let dataset = two_version_dataset(&test_uri).await;
+    let expected = dataset.read_transaction().await.unwrap().unwrap();
+    rewrite_inline_transaction(
+        &dataset,
+        &pb::Transaction::try_from(&expected).unwrap(),
+        true,
+    )
+    .await;
+    // Remove the external copy so only field 21 can supply the transaction.
+    let tx_path = dataset
+        .base
+        .clone()
+        .join(TRANSACTIONS_DIR)
+        .join(dataset.manifest.transaction_file.as_deref().unwrap());
+    dataset.object_store.inner.delete(&tx_path).await.unwrap();
+
+    let dataset = Dataset::open(&test_uri).await.unwrap();
+    assert!(dataset.manifest.transaction_section.is_some());
+    assert_eq!(dataset.read_transaction().await.unwrap().unwrap(), expected);
+}
+
+#[tokio::test]
+async fn test_read_inline_transaction_from_released_deprecated_field() {
+    use crate::utils::test::copy_test_data_to_tmp;
+
+    // Written by Lance v1.0.1, which stores the inline transaction in field 21.
+    let test_dir = copy_test_data_to_tmp("v1.0.1/list_struct_reorder.lance").unwrap();
+    // Remove the external copies so only field 21 can supply the transactions.
+    std::fs::remove_dir_all(test_dir.std_path().join(TRANSACTIONS_DIR)).unwrap();
+
+    let dataset = Dataset::open(test_dir.path_str().as_str()).await.unwrap();
+    assert!(dataset.manifest.transaction_section.is_some());
+    let tx = dataset.read_transaction().await.unwrap().unwrap();
+    assert_eq!(tx.uuid, "87766aea-beb2-4942-8830-df51d2f17492");
+    assert_eq!(tx.read_version, 1);
+}
+
+#[test]
+fn test_distinct_unknown_transactions_are_not_equal() {
+    use crate::dataset::decode_inline_transaction;
+    use prost::Message;
+
+    // Commit-outcome detection compares transactions for equality; two
+    // unknown operations must not be mistaken for the same commit.
+    let decode = |uuid: &str| {
+        decode_inline_transaction(&future_transaction(uuid).encode_to_vec(), 2).unwrap()
+    };
+    assert_eq!(decode("a"), decode("a"));
+    assert_ne!(decode("a"), decode("b"));
+}
+
 #[tokio::test]
 async fn test_migrate_v2_manifest_paths() {
     let test_uri = TempStrDir::default();
@@ -398,7 +630,7 @@ async fn test_inline_transaction() {
     let tx_file = crate::io::commit::write_transaction_file(
         ds.object_store.as_ref(),
         &ds.base,
-        &lance_table::format::pb::Transaction::from(&tx),
+        &lance_table::format::pb::Transaction::try_from(&tx).unwrap(),
     )
     .await
     .unwrap();
@@ -423,21 +655,39 @@ async fn test_inline_transaction() {
         &ManifestWriteConfig::default(),
         ds.manifest_location.naming_scheme,
         None,
+        // Previously classified from a None inline copy, which validated.
+        true,
     )
     .await
     .unwrap();
     let ds_new = ds.checkout_version(location.version).await.unwrap();
     assert!(ds_new.manifest.transaction_section.is_none());
     assert!(ds_new.manifest.transaction_file.is_some());
-    let read_tx = ds_new.read_transaction().await.unwrap().unwrap();
-    assert_eq!(read_tx, tx);
 
-    // The direct read takes the same external-file fallback.
+    // The handle's own version takes the same external-file fallback without
+    // touching the manifest again.
+    ds_new.object_store.io_stats_incremental();
     let version_transaction = ds_new
         .read_version_transaction(location.version)
         .await
         .unwrap();
-    assert_eq!(version_transaction.transaction, Some(tx));
+    let stats = ds_new.object_store.io_stats_incremental();
+    assert_eq!(version_transaction.transaction, Some(tx.clone()));
+    assert!(
+        stats.read_iops >= 1,
+        "expected the external file to be read"
+    );
+    assert!(
+        stats
+            .requests
+            .iter()
+            .all(|request| request.path != ds_new.manifest_location().path),
+        "manifest must not be re-read: {:#?}",
+        stats.requests
+    );
+
+    let read_tx = ds_new.read_transaction().await.unwrap().unwrap();
+    assert_eq!(read_tx, tx);
 }
 
 #[tokio::test]
@@ -532,6 +782,267 @@ async fn test_read_version_transaction_does_not_populate_caches() {
         matches!(err, crate::Error::DatasetNotFound { .. }),
         "expected DatasetNotFound for a missing version, got {err:?}"
     );
+}
+
+/// Size of the config value used to inflate a manifest well past the 64 KiB
+/// tail prefetch, so a full manifest read is distinguishable from a ranged
+/// transaction read by byte count alone.
+const MANIFEST_PADDING_BYTES: usize = 256 * 1024;
+
+/// Bytes transferred by ranged reads. The tracking store records a HEAD as a
+/// read of the object's full size even though no body is transferred, so plain
+/// `read_bytes` cannot tell a manifest download from a `resolve_version_location`.
+fn ranged_read_bytes(stats: &IoStats) -> u64 {
+    stats
+        .requests
+        .iter()
+        .filter_map(|request| request.range.as_ref())
+        .map(|range| range.end - range.start)
+        .sum()
+}
+
+/// Manifest body bytes of the dataset handle's current version.
+async fn manifest_size(ds: &Dataset) -> u64 {
+    ds.object_store
+        .inner
+        .head(&ds.manifest_location().path)
+        .await
+        .unwrap()
+        .size
+}
+
+#[tokio::test]
+async fn test_read_version_transaction_same_version_skips_manifest_read() {
+    let test_uri = TempStrDir::default();
+    // v1: one fragment. v2: inflate the manifest via config so every later
+    // manifest is >= 256 KiB while the Append transactions stay tiny. v3..v5:
+    // three more fragments.
+    let mut writer = write_versions(&test_uri, 1, true).await;
+    let padding = "x".repeat(MANIFEST_PADDING_BYTES);
+    writer
+        .update_config([("padding", padding.as_str())])
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        writer
+            .append(
+                gen_rows(),
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    let latest = writer.version().version;
+    assert_eq!(latest, 5);
+    assert_eq!(writer.get_fragments().len(), 4);
+
+    let session = Arc::new(Session::default());
+    let ds = DatasetBuilder::from_uri(&test_uri)
+        .with_session(session.clone())
+        .load()
+        .await
+        .unwrap();
+    let latest_manifest_size = manifest_size(&ds).await;
+    assert!(latest_manifest_size > MANIFEST_PADDING_BYTES as u64);
+
+    // Cost of `read_transaction()` on an equivalent fresh handle is the yardstick.
+    let yardstick = DatasetBuilder::from_uri(&test_uri)
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap();
+    yardstick.object_store.io_stats_incremental();
+    let expected_transaction = yardstick.read_transaction().await.unwrap();
+    let yardstick_stats = yardstick.object_store.io_stats_incremental();
+
+    // Same version as the handle: no resolve, no manifest body, just the
+    // transaction message (one block).
+    ds.object_store.io_stats_incremental();
+    let same_version = ds.read_version_transaction(latest).await.unwrap();
+    let stats = ds.object_store.io_stats_incremental();
+    assert_eq!(stats.read_iops, yardstick_stats.read_iops);
+    assert_eq!(stats.read_bytes, yardstick_stats.read_bytes);
+    assert!(
+        stats.read_bytes <= 4 * 1024,
+        "expected at most one 4 KiB block, read {} bytes",
+        stats.read_bytes
+    );
+    assert!(stats.read_bytes < latest_manifest_size);
+    assert_eq!(same_version.version, latest);
+    assert_eq!(same_version.timestamp, ds.version().timestamp);
+    assert_eq!(same_version.transaction, expected_transaction);
+    assert!(same_version.transaction.is_some());
+    // The session transaction cache is keyed only by version, so it is not
+    // populated: `read_transaction()` still pays its own storage read.
+    assert_eq!(ds.read_transaction().await.unwrap(), expected_transaction);
+    let stats = ds.object_store.io_stats_incremental();
+    assert_eq!(stats.read_iops, yardstick_stats.read_iops);
+    assert_eq!(stats.read_bytes, yardstick_stats.read_bytes);
+
+    // The fallback path (a handle at another version, fresh session so nothing
+    // is cached) reads the whole manifest and must agree with the fast path.
+    let historical = DatasetBuilder::from_uri(&test_uri)
+        .with_version(1)
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap();
+    historical.object_store.io_stats_incremental();
+    let via_fallback = historical.read_version_transaction(latest).await.unwrap();
+    let stats = historical.object_store.io_stats_incremental();
+    assert!(
+        ranged_read_bytes(&stats) > MANIFEST_PADDING_BYTES as u64,
+        "fallback should read the manifest body: {:#?}",
+        stats.requests
+    );
+    assert_eq!(via_fallback.version, same_version.version);
+    assert_eq!(via_fallback.timestamp, same_version.timestamp);
+    assert_eq!(via_fallback.transaction, same_version.transaction);
+
+    // Missing versions still surface as DatasetNotFound.
+    let err = ds.read_version_transaction(9999).await.unwrap_err();
+    assert!(
+        matches!(err, crate::Error::DatasetNotFound { .. }),
+        "expected DatasetNotFound for a missing version, got {err:?}"
+    );
+
+    // After checkout_version(v_old) the historical handle serves v_old cheaply
+    // and still resolves latest through the fallback.
+    let old_version = 3;
+    let old = ds.checkout_version(old_version).await.unwrap();
+    old.object_store.io_stats_incremental();
+    let old_transaction = old.read_version_transaction(old_version).await.unwrap();
+    let stats = old.object_store.io_stats_incremental();
+    assert!(
+        stats.read_bytes <= 4 * 1024,
+        "expected at most one 4 KiB block, read {} bytes",
+        stats.read_bytes
+    );
+    assert_eq!(old_transaction.version, old_version);
+    assert_eq!(old_transaction.timestamp, old.version().timestamp);
+    assert_eq!(
+        old_transaction.transaction,
+        old.read_transaction().await.unwrap()
+    );
+    assert!(old_transaction.transaction.is_some());
+    assert_ne!(old_transaction.transaction, same_version.transaction);
+    let latest_from_old = old.read_version_transaction(latest).await.unwrap();
+    assert_eq!(latest_from_old.version, latest);
+    assert_eq!(latest_from_old.timestamp, same_version.timestamp);
+    assert_eq!(latest_from_old.transaction, same_version.transaction);
+
+    // A different handle on the same session finds v_old's manifest in the
+    // session cache (populated by checkout_version) and skips the manifest body.
+    let other = DatasetBuilder::from_uri(&test_uri)
+        .with_session(session.clone())
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(other.version().version, latest);
+    let metadata_stats_before = session.metadata_cache_stats().await;
+    other.object_store.io_stats_incremental();
+    let via_cached_manifest = other.read_version_transaction(old_version).await.unwrap();
+    let stats = other.object_store.io_stats_incremental();
+    // Resolving the location still costs a HEAD, but the manifest body is not
+    // fetched.
+    assert!(
+        ranged_read_bytes(&stats) <= 4 * 1024,
+        "cached manifest should not be re-read: {:#?}",
+        stats.requests
+    );
+    assert_eq!(via_cached_manifest.version, old_version);
+    assert_eq!(via_cached_manifest.timestamp, old_transaction.timestamp);
+    assert_eq!(via_cached_manifest.transaction, old_transaction.transaction);
+    // Reading another version through the cache does not add cache entries.
+    let metadata_stats_after = session.metadata_cache_stats().await;
+    assert_eq!(
+        metadata_stats_after.num_entries,
+        metadata_stats_before.num_entries
+    );
+
+    // Without the cached manifest the same read pays for the manifest body.
+    let uncached = DatasetBuilder::from_uri(&test_uri)
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap();
+    uncached.object_store.io_stats_incremental();
+    let via_uncached_manifest = uncached
+        .read_version_transaction(old_version)
+        .await
+        .unwrap();
+    let stats = uncached.object_store.io_stats_incremental();
+    assert!(
+        ranged_read_bytes(&stats) > MANIFEST_PADDING_BYTES as u64,
+        "uncached manifest should be read in full: {:#?}",
+        stats.requests
+    );
+    assert_eq!(
+        via_uncached_manifest.transaction,
+        via_cached_manifest.transaction
+    );
+    assert_eq!(
+        via_uncached_manifest.timestamp,
+        via_cached_manifest.timestamp
+    );
+}
+
+/// A table dropped and recreated at the same URI can reuse a version number
+/// that a long-lived session already holds a cached transaction for. Reading
+/// the recreated table's own version must return its transaction, not the
+/// stale cached one.
+#[tokio::test]
+async fn test_read_version_transaction_after_recreate_at_same_uri() {
+    let uri = TempStrDir::default();
+    let first = write_versions(&uri, 1, true).await;
+    let session = Arc::new(Session::default());
+    let old_reader = DatasetBuilder::from_uri(&uri)
+        .with_session(session.clone())
+        .load()
+        .await
+        .unwrap();
+    let old_tx = old_reader.read_transaction().await.unwrap().unwrap();
+    assert_eq!(old_tx, first.read_transaction().await.unwrap().unwrap());
+    std::fs::remove_dir_all(uri.as_str()).unwrap();
+
+    // Keep the new transaction outside the manifest tail read so loading the
+    // recreated table cannot overwrite the session's cached transaction.
+    let schema = Arc::new(ArrowSchema::new_with_metadata(
+        vec![ArrowField::new("key", DataType::Int32, false)],
+        HashMap::from([("padding".to_owned(), "x".repeat(MANIFEST_PADDING_BYTES))]),
+    ));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![42]))]).unwrap();
+    let recreated = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &uri,
+        Some(WriteParams {
+            enable_v2_manifest_paths: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let expected = recreated.read_transaction().await.unwrap().unwrap();
+    assert_ne!(expected.uuid, old_tx.uuid);
+
+    let reopened = DatasetBuilder::from_uri(&uri)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(reopened.version().version, 1);
+    assert_ne!(
+        reopened.manifest_location.e_tag,
+        old_reader.manifest_location.e_tag
+    );
+
+    let actual = reopened.read_version_transaction(1).await.unwrap();
+    assert_eq!(actual.timestamp, reopened.version().timestamp);
+    assert_eq!(actual.transaction.unwrap().uuid, expected.uuid);
 }
 
 #[tokio::test]
@@ -902,7 +1413,9 @@ async fn test_spilled_restore_and_deep_clone_read_own_transaction() {
     .transaction_properties(large_props("payload"))
     .build();
     let clone_uri = TempStrDir::default();
+    // Only the manifest is checked here, so skipping the file copy is fine.
     CommitBuilder::new(&clone_uri)
+        .with_deep_clone_files_copied()
         .execute(clone_tx.clone())
         .await
         .unwrap();
@@ -1042,6 +1555,7 @@ async fn test_build_manifest_partial_last_updated_rewrite_columns_stable_row_ids
         updated_fragments: vec![u.fragment],
         new_fragments: vec![],
         fields_modified: u.fields_modified,
+        mem_wal_dir_id: None,
         compacted_sstables: Vec::new(),
         fields_for_preserving_frag_bitmap: vec![],
         update_mode: Some(UpdateMode::RewriteColumns),
@@ -1176,6 +1690,242 @@ async fn commit_merge(dataset: &Dataset, schema: LanceSchema) -> Result<Dataset>
     .await
 }
 
+#[rstest::rstest]
+#[tokio::test]
+async fn test_alter_columns_rename_and_cast(
+    #[values(false, true)] non_reusable_field_ids: bool,
+    #[values(false, true)] rename_first: bool,
+) -> Result<()> {
+    let batch = record_batch!(
+        ("id", Int32, [1, 2, 3]),
+        ("name", Utf8, [Some("a"), None, Some("c")])
+    )?;
+    let uri = "memory://";
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await?;
+    assert_eq!(dataset.fragments().len(), 2);
+    if non_reusable_field_ids {
+        dataset.migrate_to_non_reusable_field_ids().await?;
+    }
+    let version = dataset.version().version;
+    let name_id = dataset.schema().field("name").unwrap().id;
+    let max_field_id = dataset.manifest.max_field_id();
+    let original = dataset.clone();
+
+    let mut alterations = [
+        ColumnAlteration::new("id".into()).cast_to(DataType::Int64),
+        ColumnAlteration::new("name".into()).rename("full_name".into()),
+    ];
+    if rename_first {
+        alterations.reverse();
+    }
+    dataset.alter_columns(&alterations).await?;
+    dataset.validate().await?;
+
+    assert_eq!(dataset.version().version, version + 1);
+    assert!(dataset.schema().field("name").is_none());
+    assert_eq!(dataset.schema().field("full_name").unwrap().id, name_id);
+    let id_field = dataset.schema().field("id").unwrap();
+    assert!(id_field.id > max_field_id);
+    assert_eq!(id_field.data_type(), DataType::Int64);
+
+    let reopened = original.checkout_version(version + 1).await?;
+    assert_eq!(reopened.schema(), dataset.schema());
+    let data = reopened.scan().try_into_batch().await?;
+    assert_eq!(data["id"].as_ref(), &Int64Array::from(vec![1, 2, 3]));
+    assert_eq!(data["full_name"].as_ref(), batch["name"].as_ref());
+    Ok(())
+}
+
+#[rstest::rstest]
+#[case::cast(false)]
+#[case::drop_and_readd(true)]
+#[tokio::test]
+async fn test_append_conflicts_with_concurrent_schema_change(
+    #[case] drop_and_readd: bool,
+    #[values(false, true)] streaming_write: bool,
+) {
+    let batch = record_batch!(
+        ("id", Int64, [1, 2, 3, 4]),
+        ("x", Int64, [Some(5), None, Some(7), Some(9)])
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            session: Some(Arc::new(Session::default())),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+    let session = dataset.session();
+    let mut changed = dataset.clone();
+    let change_schema = async move {
+        if drop_and_readd {
+            changed.drop_columns(&["x"]).await.unwrap();
+            changed
+                .add_columns(
+                    NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![
+                        ArrowField::new("x", DataType::Int64, true),
+                    ]))),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        } else {
+            changed
+                .alter_columns(&[ColumnAlteration::new("x".into()).cast_to(DataType::Int32)])
+                .await
+                .unwrap();
+        }
+    };
+    let append_batch = record_batch!(("id", Int64, [5, 6]), ("x", Int64, [Some(3), None])).unwrap();
+    let error = if streaming_write {
+        // The writer peeks the first batch before opening the URI. Change the
+        // schema on the second poll, after the append has resolved its schema.
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            append_batch.schema(),
+            futures::stream::iter([Ok(append_batch.clone())]).chain(futures::stream::once(
+                async move {
+                    change_schema.await;
+                    Ok(append_batch)
+                },
+            )),
+        ));
+        InsertBuilder::new(dataset.uri())
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                session: Some(session),
+                ..Default::default()
+            })
+            .execute_stream(stream)
+            .await
+            .unwrap_err()
+    } else {
+        change_schema.await;
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(append_batch.clone())], append_batch.schema()),
+                None,
+            )
+            .await
+            .unwrap_err()
+    };
+    assert!(matches!(error, Error::RetryableCommitConflict { .. }));
+    let message = error.to_string();
+    assert!(
+        message.contains("Append") && message.contains("Please retry"),
+        "{message}"
+    );
+
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(
+        dataset.version().version,
+        if drop_and_readd { 3 } else { 2 }
+    );
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 4);
+    let retry = if drop_and_readd {
+        record_batch!(("id", Int64, [5]), ("x", Int64, [3])).unwrap()
+    } else {
+        record_batch!(("id", Int64, [5]), ("x", Int32, [3])).unwrap()
+    };
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(retry.clone())], retry.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let rows = dataset
+        .scan()
+        .filter("id = 5")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(rows.num_rows(), 1);
+    assert_eq!(rows["x"].null_count(), 0);
+    if drop_and_readd {
+        assert_eq!(rows["x"].as_primitive::<Int64Type>().value(0), 3);
+    } else {
+        assert_eq!(rows["x"].as_primitive::<Int32Type>().value(0), 3);
+    }
+}
+
+#[rstest::rstest]
+#[case::rename("rename")]
+#[case::nullable_add("add")]
+#[case::drop("drop")]
+#[tokio::test]
+async fn test_append_allows_compatible_concurrent_schema_change(#[case] change: &str) {
+    let batch = record_batch!(("id", Int64, [1, 2]), ("x", Int64, [Some(5), None])).unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let mut changed = dataset.clone();
+    if change == "drop" {
+        changed.drop_columns(&["x"]).await.unwrap();
+    } else if change == "rename" {
+        changed
+            .alter_columns(&[ColumnAlteration::new("x".into()).rename("y".into())])
+            .await
+            .unwrap();
+    } else {
+        changed
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "y",
+                    DataType::Int64,
+                    true,
+                )]))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let rows = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(rows.num_rows(), 4);
+    assert_eq!(rows["id"].as_ref(), &Int64Array::from(vec![1, 2, 1, 2]));
+    if change == "drop" {
+        assert!(rows.schema().field_with_name("x").is_err());
+    } else {
+        assert_eq!(
+            rows[if change == "rename" { "y" } else { "x" }].as_ref(),
+            &Int64Array::from(vec![Some(5), None, Some(5), None])
+        );
+    }
+    if change == "add" {
+        assert_eq!(rows["y"].null_count(), 4);
+    }
+}
+
 // Which clause rejects the lossy round-trip depends on the hole's
 // position: a hole before the last field remaps a shared id, while a
 // hole at the end reuses the dropped id for the new field.
@@ -1264,6 +2014,55 @@ async fn test_merge_rejects_renumbered_nested_field_ids() {
         "unexpected error: {}",
         message
     );
+}
+
+#[rstest::rstest]
+#[case::dropped_parent(false)]
+#[case::retained_parent(true)]
+#[tokio::test]
+async fn test_merge_rejects_move_with_stale_parent_id(#[case] retain_parent: bool) -> Result<()> {
+    let nested = StructArray::from(record_batch!(
+        ("x", Int32, [Some(1), None, Some(3)]),
+        ("y", Int32, [10, 20, 30])
+    )?);
+    let batch = RecordBatch::try_from_iter([("s", Arc::new(nested) as Arc<dyn Array>)])?;
+    let uri = TempStrDir::default();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        &uri,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await?;
+    assert_eq!(dataset.fragments().len(), 2);
+    let version = dataset.version().version;
+
+    let mut moved = dataset.schema().clone();
+    let mut child = moved.fields[0].children.remove(0);
+    assert_eq!(child.parent_id, moved.fields[0].id);
+    if !retain_parent {
+        moved.fields.clear();
+    }
+    child.name = "renamed".into();
+    moved.fields.push(child);
+    moved.validate()?;
+
+    let err = commit_merge(&dataset, moved).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+    assert!(
+        err.to_string()
+            .contains("inconsistent parent ids for field id 1"),
+        "{err}"
+    );
+
+    // A rejected merge must leave the persisted version readable with its original schema.
+    let reopened = Dataset::open(&uri).await?;
+    assert_eq!(reopened.version().version, version);
+    assert_eq!(reopened.schema(), dataset.schema());
+    assert_eq!(reopened.scan().try_into_batch().await?, batch);
+    Ok(())
 }
 
 #[rstest::rstest]
@@ -1394,4 +2193,385 @@ async fn test_alter_columns_materializes_fresh_field_id_in_every_fragment() {
     );
     let batch = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(batch["a"].as_primitive::<Int64Type>().values(), &[1, 2]);
+}
+
+/// A covering declaration that is not a suffix of `fields` must be refused
+/// at commit, not silently accepted and later misread as a keyed column.
+#[tokio::test]
+async fn test_create_index_rejects_non_suffix_covering_fields() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("i", DataType::Int32, false),
+        ArrowField::new("x", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..8)),
+            Arc::new(Int32Array::from(vec![0_i32; 8])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+
+    // fields = [0, 1] with covering = [0]: field 0 is the leading entry,
+    // not the trailing one, so this claims the keyed column is covered.
+    let bad_index = IndexMetadata {
+        uuid: Uuid::new_v4(),
+        name: "bad_idx".to_string(),
+        fields: vec![0, 1],
+        covering_fields: vec![0],
+        dataset_version: dataset.manifest.version,
+        fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+        index_details: None,
+        index_version: 0,
+        created_at: None,
+        base_id: None,
+        files: None,
+        clustering_id: None,
+        metadata: Default::default(),
+    };
+
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: vec![bad_index],
+            removed_indices: vec![],
+        },
+        None,
+    );
+
+    let err = dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+        .expect_err("a non-suffix covering declaration must not commit");
+    assert!(
+        matches!(err, Error::InvalidInput { .. }),
+        "expected InvalidInput, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("must come last"),
+        "unexpected message: {err}"
+    );
+}
+
+/// A shallow clone copies the index metadata wholesale, `covering_fields`
+/// included, but `Manifest::shallow_clone` builds the new manifest directly --
+/// `Operation::Clone` is refused by `build_manifest` -- so the fence is not
+/// recomputed there and has to be carried explicitly. Without that, a clone of
+/// a covered table comes back unfenced and a build predating covering can open
+/// it and read carried columns as keyed ones.
+#[tokio::test]
+async fn test_shallow_clone_preserves_the_covering_fence() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("i", DataType::Int32, false),
+        ArrowField::new("x", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..8)),
+            Arc::new(Int32Array::from(vec![0_i32; 8])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+    let index = IndexMetadata {
+        uuid: Uuid::new_v4(),
+        name: "covered_idx".to_string(),
+        fields: vec![0, 1],
+        covering_fields: vec![1],
+        dataset_version: dataset.manifest.version,
+        fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+        index_details: None,
+        index_version: 0,
+        created_at: None,
+        base_id: None,
+        files: None,
+        clustering_id: None,
+        metadata: Default::default(),
+    };
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![index],
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "precondition: the source table is fenced"
+    );
+
+    let clone_dir = TempStrDir::default();
+    let cloned = dataset
+        .shallow_clone(clone_dir.as_str(), dataset.version().version, None)
+        .await
+        .unwrap();
+
+    // The clone really does carry the covering declaration, so it really does
+    // need the fence -- assert that first, or the flag check below could pass
+    // for a clone that simply dropped the index.
+    let cloned_indices = cloned.load_indices().await.unwrap();
+    assert_eq!(
+        cloned_indices
+            .iter()
+            .find(|i| i.name == "covered_idx")
+            .map(|i| i.covering_fields.clone()),
+        Some(vec![1]),
+        "precondition: the clone carries the covering declaration"
+    );
+    assert_ne!(
+        cloned.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "a clone of a covered table must stay fenced for readers"
+    );
+    assert_ne!(
+        cloned.manifest.writer_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "a clone of a covered table must stay fenced for writers"
+    );
+}
+
+#[tokio::test]
+async fn test_row_addr_index_writer_fence_survives_dataset_operations() {
+    let dir = TempStrDir::default();
+    let reader = lance_datagen::gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("value", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(12), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        reader,
+        dir.as_str(),
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 4,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("id_idx".to_string()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let indexed_version = dataset.version().version;
+    let assert_fenced = |dataset: &Dataset| {
+        let flag = FLAG_ROW_ADDR_INDICES;
+        assert_ne!(dataset.manifest.writer_feature_flags & flag, 0);
+        assert_eq!(dataset.manifest.reader_feature_flags & flag, 0);
+    };
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert_fenced(&dataset);
+
+    let dataset = UpdateBuilder::new(Arc::new(dataset))
+        .update_where("id < 2")
+        .unwrap()
+        .set("value", "value + 100")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap()
+        .new_dataset;
+    assert_fenced(&dataset);
+    assert_eq!(
+        dataset
+            .scan()
+            .filter("id < 2")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows(),
+        2
+    );
+
+    let mut dataset = dataset.as_ref().clone();
+    let clone_dir = TempStrDir::default();
+    let cloned = dataset
+        .shallow_clone(clone_dir.as_str(), dataset.version().version, None)
+        .await
+        .unwrap();
+    assert_fenced(&cloned);
+
+    dataset.drop_index("id_idx").await.unwrap();
+    assert_eq!(
+        dataset.manifest.writer_feature_flags & FLAG_ROW_ADDR_INDICES,
+        0
+    );
+
+    let mut dataset = dataset.checkout_version(indexed_version).await.unwrap();
+    dataset.restore().await.unwrap();
+    let restored = Dataset::open(dir.as_str()).await.unwrap();
+    assert_fenced(&restored);
+}
+
+/// Covering redefines what `fields` means, so a build that predates it would
+/// select a vector index by membership of `fields` and answer a query on a
+/// merely-carried column with an index keyed on a different one. The fence is
+/// the feature flag: a covering commit must set it in both words so such a
+/// build refuses the table outright, and dropping the last covering index
+/// must clear it again rather than fence the table forever.
+#[tokio::test]
+async fn test_covering_commit_fences_the_table_with_a_feature_flag() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("i", DataType::Int32, false),
+        ArrowField::new("x", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..8)),
+            Arc::new(Int32Array::from(vec![0_i32; 8])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
+
+    assert_eq!(
+        dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "precondition: a plain dataset carries no covering fence"
+    );
+
+    let index = IndexMetadata {
+        uuid: Uuid::new_v4(),
+        name: "covered_idx".to_string(),
+        fields: vec![0, 1],
+        covering_fields: vec![1],
+        dataset_version: dataset.manifest.version,
+        fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+        index_details: None,
+        index_version: 0,
+        created_at: None,
+        base_id: None,
+        files: None,
+        clustering_id: None,
+        metadata: Default::default(),
+    };
+    let uuid = index.uuid;
+
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![index.clone()],
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+    // Both words: a reader would select the wrong index, a writer would
+    // mismaintain it.
+    assert_ne!(
+        dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "a covering commit must fence readers"
+    );
+    assert_ne!(
+        dataset.manifest.writer_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "a covering commit must fence writers"
+    );
+
+    // The flag has to survive the reload, not just the in-memory manifest:
+    // `apply_feature_flags` runs a second time in `write_manifest_file` and
+    // resets both words.
+    let reopened = Dataset::open(uri).await.unwrap();
+    assert_ne!(
+        reopened.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "the fence must be persisted, not only set in memory"
+    );
+
+    // An ordinary commit that has nothing to do with indices must not drop the
+    // fence. `Manifest::new_from_previous` zeroes both flag words, so the bit
+    // survives only because `build_manifest` re-derives it from the surviving
+    // index list on every commit rather than inheriting it -- an append is the
+    // cheapest way to pin that.
+    let mut dataset = reopened;
+    let more = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(8..16)),
+            Arc::new(Int32Array::from(vec![1_i32; 8])),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(more)], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "an ordinary append must not lift the covering fence"
+    );
+    assert_ne!(
+        dataset.manifest.writer_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "an ordinary append must not lift the writer half of the fence"
+    );
+
+    // Dropping the last covering index lifts the fence. Nothing clears the bit
+    // explicitly -- the words start zeroed and it is simply not set again -- so
+    // this is the pin against someone making the fence sticky via an inherit
+    // step, the way MemWAL catch-up is.
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![],
+                    removed_indices: vec![IndexMetadata { uuid, ..index }],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+        0,
+        "dropping the last covering index must clear the fence"
+    );
 }

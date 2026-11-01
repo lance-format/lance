@@ -4,15 +4,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use object_store_opendal::OpendalStore;
 use opendal::{Operator, services::Cos};
 use url::Url;
 
+use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions,
 };
 use lance_core::error::{Error, Result};
+
+use super::opendal::finish_opendal_operator;
 
 #[derive(Default, Debug)]
 pub struct TencentStoreProvider;
@@ -21,7 +23,8 @@ pub struct TencentStoreProvider;
 impl ObjectStoreProvider for TencentStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
-        let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
+        let storage_options =
+            StorageOptions::new(params.storage_options().cloned().unwrap_or_default());
 
         let bucket = base_path
             .host_str()
@@ -81,6 +84,7 @@ impl ObjectStoreProvider for TencentStoreProvider {
 
         let operator = Operator::from_iter::<Cos>(config_map)
             .map_err(|e| Error::invalid_input(format!("Failed to create COS operator: {:?}", e)))?;
+        let operator = finish_opendal_operator(operator, storage_options.client_max_retries());
 
         let opendal_store = Arc::new(OpendalStore::new(operator));
 
@@ -93,6 +97,7 @@ impl ObjectStoreProvider for TencentStoreProvider {
             scheme: "cos".to_string(),
             inner: opendal_store,
             local_dir_operations: None,
+            local_fsync: false,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,
@@ -101,6 +106,8 @@ impl ObjectStoreProvider for TencentStoreProvider {
             download_retry_count: storage_options.download_retry_count(),
             io_tracker: Default::default(),
             store_prefix: self.calculate_object_store_prefix(&url, params.storage_options())?,
+            // Listed in full: no paginated lister covers OpenDAL yet.
+            paginated_lister: None,
         })
     }
 }

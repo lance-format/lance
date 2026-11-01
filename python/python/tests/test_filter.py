@@ -8,6 +8,7 @@ import random
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import lance
 import numpy as np
@@ -75,6 +76,23 @@ def test_simple_predicates(dataset):
         assert dataset.to_table(filter=expr) == dataset.to_table().filter(expr)
 
 
+def test_pyarrow_predicate_with_default_row_id(tmp_path: Path):
+    table = pa.table({"uid": [1, 2, 3], "number": [10, 20, 10]})
+    lance.write_dataset(table, tmp_path)
+    dataset = lance.dataset(tmp_path, default_scan_options={"with_row_id": True})
+
+    actual = dataset.to_table(filter=pc.field("number") == 10)
+
+    expected = pa.table(
+        {
+            "uid": [1, 3],
+            "number": [10, 10],
+            "_rowid": pa.array([0, 2], pa.uint64()),
+        }
+    )
+    assert actual == expected
+
+
 def test_sql_predicates(dataset):
     # Predicate and expected number of rows
     predicates_nrows = [
@@ -106,6 +124,28 @@ def test_sql_predicates(dataset):
 
     for expr, expected_num_rows in predicates_nrows:
         assert dataset.to_table(filter=expr).num_rows == expected_num_rows
+
+
+@pytest.mark.parametrize("unit", ["s", "ms", "us"])
+@pytest.mark.parametrize("timezone", [None, "UTC", "America/New_York"])
+def test_timestamp_pyarrow_predicates(tmp_path: Path, unit: str, timezone: str | None):
+    # PyArrow filters reach Lance as Substrait, where the timestamp literal used to be
+    # decoded in the wrong unit.
+    tz = ZoneInfo(timezone) if timezone else None
+    start = datetime(2021, 1, 1, tzinfo=tz)
+    ts_type = pa.timestamp(unit, timezone)
+    table = pa.table(
+        {"ts": pa.array([start + timedelta(hours=i) for i in range(100)], ts_type)}
+    )
+    dataset = lance.write_dataset(table, tmp_path / f"{unit}_{timezone}")
+
+    cutoff = pa.scalar(start + timedelta(hours=50), ts_type)
+    for expr in [
+        pc.field("ts") > cutoff,
+        pc.field("ts") < cutoff,
+        pc.field("ts") == cutoff,
+    ]:
+        assert dataset.to_table(filter=expr) == table.filter(expr)
 
 
 def test_sql_current_date(tmp_path: Path):
@@ -368,6 +408,51 @@ def test_filter_on_column_beside_root_extension_type(tmp_path):
     expr = pc.field("checkpoint").is_null() | (pc.field("checkpoint") == 0)
     result = ds.to_table(filter=expr)
     assert result["id"].to_pylist() == [1]
+
+
+@pytest.mark.parametrize(
+    "column",
+    [
+        # Polars writes list columns as large_list.
+        pytest.param(
+            pa.array([["a"], ["b"]], pa.large_list(pa.large_string())), id="large_list"
+        ),
+        # pandas writes timedelta columns as duration.
+        pytest.param(
+            pa.array([timedelta(seconds=1)] * 2, pa.duration("us")), id="duration"
+        ),
+        pytest.param(pa.array([Decimal(1)] * 2, pa.decimal256(40, 0)), id="decimal256"),
+        pytest.param(pa.array([1, 2], pa.time64("us")), id="time64_us"),
+        pytest.param(pa.array([[1], [2]], pa.list_(pa.uint8())), id="list_of_uint8"),
+        pytest.param(
+            pa.array([{"x": 1}] * 2, pa.struct([("x", pa.uint32())])),
+            id="struct_of_uint32",
+        ),
+        pytest.param(
+            pa.array([[("k", 1)]] * 2, pa.map_(pa.large_string(), pa.int64())),
+            id="map_with_large_string_key",
+        ),
+        # Polars writes categorical columns as dictionary<uint32, large_string>.
+        pytest.param(
+            pa.array(
+                [{"c": "a"}, {"c": "b"}],
+                pa.struct([("c", pa.dictionary(pa.uint32(), pa.large_string()))]),
+            ),
+            id="struct_of_categorical",
+        ),
+    ],
+)
+def test_filter_on_column_beside_unsupported_substrait_type(tmp_path, column):
+    """Filtering should work beside a column whose type cannot round-trip
+    through substrait."""
+    table = pa.table({"id": [1, 2], "other": column})
+    ds = lance.write_dataset(table, tmp_path, max_rows_per_file=1)
+    assert ds.to_table(filter=pc.field("id") == 1)["id"].to_pylist() == [1]
+    fragment = ds.get_fragments()[1]
+    assert fragment.to_table(filter=pc.field("id") == 2)["id"].to_pylist() == [2]
+    ds.update({"id": "id + 10"}, where=pc.field("id") == 2)
+    ds.delete(pc.field("id") == 1)
+    assert ds.to_table()["id"].to_pylist() == [12]
 
 
 @pytest.mark.skip(

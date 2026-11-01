@@ -45,6 +45,20 @@ use super::{CacheCodec, InternalCacheKey};
 /// A type-erased cache entry.
 pub type CacheEntry = Arc<dyn Any + Send + Sync>;
 
+/// The tier that would serve a read of an entry, as
+/// [`CacheBackend::peek_tier`] predicts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CacheTier {
+    /// In RAM: a read is a memory hit.
+    Resident,
+    /// Not in RAM but held by a local tier below it, such as a persistent
+    /// store or a buffer of recently evicted entries: a read costs local I/O
+    /// at most, never the caller's loader.
+    Local,
+    /// Held by no tier: a read runs the caller's loader.
+    Absent,
+}
+
 /// Low-level pluggable cache backend.
 ///
 /// Implementations store entries keyed by [`InternalCacheKey`] and return
@@ -53,6 +67,62 @@ pub type CacheEntry = Arc<dyn Any + Send + Sync>;
 /// backend authors only need to implement storage and eviction.
 #[async_trait]
 pub trait CacheBackend: Send + Sync + std::fmt::Debug {
+    /// Look up RAM only, without reading or promoting a persistent entry.
+    /// Backends without a resident lookup return a miss safely.
+    async fn get_resident(&self, _key: &InternalCacheKey) -> Option<CacheEntry> {
+        None
+    }
+
+    /// Report whether `key` is resident in RAM without counting as an access,
+    /// so a residency probe does not change what the backend evicts next.
+    /// The default uses [`get_resident`](Self::get_resident), which backends
+    /// with recency state may treat as an access.
+    async fn peek_resident(&self, key: &InternalCacheKey) -> bool {
+        self.get_resident(key).await.is_some()
+    }
+
+    /// Predict which tier would serve a read of `key`, without reading the
+    /// entry or counting as an access, so the check changes neither what the
+    /// backend evicts next nor its hit statistics. The default knows RAM only,
+    /// through [`peek_resident`](Self::peek_resident), and reports every other
+    /// entry as [`CacheTier::Absent`]; backends with a local tier below RAM
+    /// override it.
+    async fn peek_tier(&self, key: &InternalCacheKey) -> CacheTier {
+        if self.peek_resident(key).await {
+            CacheTier::Resident
+        } else {
+            CacheTier::Absent
+        }
+    }
+
+    /// Whether layered index planes should gate lower-plane RAM admission on
+    /// their sign plane being resident. Backends that admit plane entries
+    /// through their ordinary policy return `false`, so lower planes are
+    /// loaded and admitted like any other entry.
+    fn plane_admission_gated(&self) -> bool {
+        true
+    }
+
+    /// Read an entry without admitting a persistent hit into RAM.
+    /// Backends without this capability safely fall back to resident entries.
+    async fn get_without_promotion(
+        &self,
+        key: &InternalCacheKey,
+        _codec: Option<CacheCodec>,
+    ) -> Option<CacheEntry> {
+        self.get_resident(key).await
+    }
+
+    /// Gather selected rows from persistent storage, without RAM admission.
+    async fn get_rows(
+        &self,
+        _key: &InternalCacheKey,
+        _rows: &[u32],
+        _codec: Option<CacheCodec>,
+    ) -> Option<CacheEntry> {
+        None
+    }
+
     /// Look up an entry by its key.
     ///
     /// `codec` is provided so that persistent backends can deserialize the
@@ -78,7 +148,8 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// Get an existing entry or compute it from `loader`.
     ///
     /// Implementations should deduplicate concurrent loads for the same key
-    /// so the loader runs at most once.
+    /// so the loader runs at most once, unless caching is disabled. Disabled
+    /// caches may invoke each caller's loader independently.
     ///
     /// Returns `(entry, was_cached)` where `was_cached` is `true` if the entry
     /// was already present in the cache (the loader was not invoked).
@@ -90,6 +161,14 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
         loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
         codec: Option<CacheCodec>,
     ) -> Result<(CacheEntry, bool)>;
+
+    /// Largest entry size the backend admits to RAM, in bytes. Defaults to
+    /// the total capacity; sharded backends may report a smaller limit.
+    /// `None` means the backend does not expose an admission limit.
+    /// Admission never guarantees that an entry will remain cached.
+    fn max_entry_bytes(&self) -> Option<u64> {
+        self.capacity_bytes().map(|bytes| bytes as u64)
+    }
 
     /// Remove all entries.
     async fn clear(&self);
@@ -114,6 +193,13 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// returned total may overcount.
     fn approx_size_bytes(&self) -> usize {
         0
+    }
+
+    /// Weighted capacity in bytes, or `None` when the backend has no fixed
+    /// capacity or cannot report it. Lets callers skip loading entries that
+    /// could never be retained.
+    fn capacity_bytes(&self) -> Option<usize> {
+        None
     }
 
     /// Computes the size of the entries currently held in memory.
