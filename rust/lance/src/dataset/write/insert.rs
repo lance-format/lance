@@ -55,6 +55,7 @@ pub struct InsertBuilder<'a> {
     write_progress: Option<WriteProgressFn>,
     preassigned_data_file_name: Option<Arc<String>>,
     inherited_field_ids: bool,
+    disable_dictionary_split: bool,
 }
 
 impl<'a> InsertBuilder<'a> {
@@ -65,6 +66,7 @@ impl<'a> InsertBuilder<'a> {
             write_progress: None,
             preassigned_data_file_name: None,
             inherited_field_ids: false,
+            disable_dictionary_split: false,
         }
     }
 
@@ -85,6 +87,14 @@ impl<'a> InsertBuilder<'a> {
     /// even past the limit for caller-supplied IDs. For a MemWAL generation.
     pub(crate) fn with_inherited_field_ids(mut self) -> Self {
         self.inherited_field_ids = true;
+        self
+    }
+
+    /// Never starts another data file because a dictionary column outgrows its key
+    /// type; the encoder's own key-type check applies instead. For a MemWAL generation,
+    /// whose deletion vector and indexes address a single fragment.
+    pub(crate) fn with_dictionary_split_disabled(mut self) -> Self {
+        self.disable_dictionary_split = true;
         self
     }
 
@@ -257,6 +267,7 @@ impl<'a> InsertBuilder<'a> {
             None,
             self.preassigned_data_file_name.clone(),
             self.inherited_field_ids,
+            self.disable_dictionary_split,
             None,
         ))
         .await?;

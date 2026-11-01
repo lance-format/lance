@@ -1010,6 +1010,19 @@ where
                             "Writer received rows after all planned file boundaries were consumed",
                         )
                     })?
+                } else if dictionary_budget.is_some() {
+                    // The input is cut at multiples of `max_rows_per_file` from its start,
+                    // which a file finished early for its dictionaries no longer lines up
+                    // with, so take no more than the file has room for.
+                    params
+                        .max_rows_per_file
+                        .checked_sub(num_rows_in_current_file)
+                        .ok_or_else(|| {
+                            Error::internal(format!(
+                                "Writer holds {num_rows_in_current_file} rows in a file limited to {} rows",
+                                params.max_rows_per_file
+                            ))
+                        })?
                 } else {
                     usize::MAX
                 };
@@ -1816,6 +1829,7 @@ pub(crate) async fn write_fragments_internal_with_file_row_counts(
         file_row_counts,
         None,
         false,
+        false,
         None,
     )
     .await
@@ -1834,6 +1848,7 @@ pub(crate) async fn write_fragments_internal_impl(
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
     inherited_field_ids: bool,
+    disable_dictionary_split: bool,
     created_blob_payloads: Option<BlobPayloadInventory>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     let mut params = params;
@@ -1855,6 +1870,7 @@ pub(crate) async fn write_fragments_internal_impl(
         file_row_counts,
         preassigned_data_file_name,
         inherited_field_ids,
+        disable_dictionary_split,
         created_blob_payloads,
     )
     .await
@@ -5036,6 +5052,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await;
 
@@ -5100,6 +5117,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await;
 
@@ -5335,6 +5353,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await;
 

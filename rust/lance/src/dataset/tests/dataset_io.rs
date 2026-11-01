@@ -3426,6 +3426,48 @@ async fn write_splits_files_before_dictionary_outgrows_key_type(
     dataset.validate().await.unwrap();
 }
 
+/// A file finished early for its dictionary leaves the input's row-limit cuts out of line
+/// with the files. The next file must still stop at `max_rows_per_file` rows.
+#[rstest]
+#[tokio::test]
+async fn write_keeps_max_rows_per_file_after_dictionary_close(
+    #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        true,
+    )]));
+    // 150-row batches over 100 values each; the second and third share theirs, so the
+    // first file closes at 150 rows and the second holds no more than 128 values.
+    let batches = ["a", "b", "b"]
+        .into_iter()
+        .map(|prefix| {
+            let values = StringArray::from_iter_values((0..100).map(|i| format!("{prefix}{i}")));
+            let keys = Int8Array::from_iter_values((0..100).cycle().take(150));
+            let dictionary = Int8DictionaryArray::try_new(keys, Arc::new(values)).unwrap();
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+    let params = WriteParams {
+        data_storage_version: Some(version),
+        max_rows_per_file: 200,
+        ..Default::default()
+    };
+    let dataset = Dataset::write(reader, "memory://", Some(params))
+        .await
+        .unwrap();
+
+    let rows_per_fragment = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.metadata().physical_rows)
+        .collect::<Vec<_>>();
+    assert_eq!(rows_per_fragment, [Some(150), Some(200), Some(100)]);
+    dataset.validate().await.unwrap();
+}
+
 /// `dict:{value}:{index}:false` cannot express a value type whose own logical
 /// string carries ':', so `Schema::try_from` used to panic on the way in rather
 /// than rejecting the write.

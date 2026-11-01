@@ -18,6 +18,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_row::{RowConverter, SortField};
 use arrow_schema::{DataType, Schema as ArrowSchema};
+use lance_arrow::list::ListArrayExt;
 use lance_core::Result;
 use lance_encoding::encodings::logical::primitive::dict::encoded_dictionary_values;
 
@@ -259,9 +260,11 @@ impl TrackedDictionary {
         for step in &self.path {
             array = match step {
                 PathStep::Child(name) => array.as_struct_opt()?.column_by_name(name)?.clone(),
+                // A sliced list keeps its whole child, but the encoder only sees the
+                // items within the slice.
                 PathStep::Items => match array.data_type() {
-                    DataType::List(_) => array.as_list_opt::<i32>()?.values().clone(),
-                    DataType::LargeList(_) => array.as_list_opt::<i64>()?.values().clone(),
+                    DataType::List(_) => array.as_list_opt::<i32>()?.trimmed_values(),
+                    DataType::LargeList(_) => array.as_list_opt::<i64>()?.trimmed_values(),
                     DataType::FixedSizeList(_, _) => {
                         array.as_fixed_size_list_opt()?.values().clone()
                     }
@@ -378,6 +381,50 @@ mod tests {
             is_full: false,
         };
         assert_eq!(budget.admit(&batches, 150).unwrap(), admitted);
+    }
+
+    /// A list column `l` of `count` single-item rows over the Int8 dictionary values
+    /// `{prefix}0..{prefix}{count}`.
+    fn list_batch(prefix: &str, count: usize) -> RecordBatch {
+        let keys = (0..count).map(|key| key as i8).collect::<Int8Array>();
+        let dictionary =
+            Arc::new(DictionaryArray::<Int8Type>::try_new(keys, strings(prefix, count)).unwrap())
+                as ArrayRef;
+        let list = ListArray::new(
+            Arc::new(Field::new("item", dictionary.data_type().clone(), true)),
+            OffsetBuffer::from_lengths(std::iter::repeat_n(1, count)),
+            dictionary,
+            None,
+        );
+        RecordBatch::try_from_iter([("l", Arc::new(list) as ArrayRef)]).unwrap()
+    }
+
+    #[test]
+    fn counts_only_the_items_of_a_sliced_list() {
+        // The slice's items reference v64..v127 and, as the first value of their chunk,
+        // v0: 65 values, which leave room for the next batch's 63. Its whole child holds
+        // all 128.
+        let sliced = list_batch("v", 128).slice(64, 64);
+        let mut budget = DictionaryValueBudget::try_new(&sliced.schema())
+            .unwrap()
+            .unwrap();
+        let batches = VecDeque::from([sliced.clone(), list_batch("w", 63)]);
+        let admitted = Admission {
+            rows: usize::MAX,
+            is_full: false,
+        };
+        assert_eq!(budget.admit(&batches, usize::MAX).unwrap(), admitted);
+
+        // One more value overflows, so the slice's first value is counted too.
+        let mut budget = DictionaryValueBudget::try_new(&sliced.schema())
+            .unwrap()
+            .unwrap();
+        let batches = VecDeque::from([sliced, list_batch("w", 64)]);
+        let full = Admission {
+            rows: 64,
+            is_full: true,
+        };
+        assert_eq!(budget.admit(&batches, usize::MAX).unwrap(), full);
     }
 
     /// A single top-level Int8 dictionary column `d`.

@@ -134,6 +134,7 @@ pub async fn write_fragments(
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
     inherited_field_ids: bool,
+    disable_dictionary_split: bool,
     created_blob_payloads: Option<BlobPayloadInventory>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     // A writer that spills row lineage into the fragment's own data file
@@ -184,6 +185,7 @@ pub async fn write_fragments(
         file_row_counts,
         preassigned_data_file_name,
         created_blob_payloads,
+        disable_dictionary_split,
     )
     .await?;
     Ok((fragments, schema))
@@ -262,6 +264,7 @@ pub async fn write_fragments_direct(
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
     created_blob_payloads: Option<BlobPayloadInventory>,
+    disable_dictionary_split: bool,
 ) -> Result<Vec<Fragment>> {
     validate_row_limits(version, &params)?;
     let buffered_reader = if let Some(file_row_counts) = file_row_counts.as_ref() {
@@ -316,13 +319,15 @@ pub async fn write_fragments_direct(
         ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => None,
     };
     // The 2.0 writer stores a null as one more dictionary value and keeps its own key-type
-    // check, so its files are not split here. Neither is a write that must produce the one
-    // preassigned file; the encoder then rejects the overflowing column.
+    // check, so its files are not split here. Neither is a write that must produce one
+    // file, the preassigned one or a MemWAL generation's; the encoder's key-type check
+    // applies to it instead.
     let dictionary_budget = match version {
         ConcreteFileVersion::V2_1 | ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
-            match preassigned_data_file_name {
-                Some(_) => None,
-                None => DictionaryValueBudget::try_new(&ArrowSchema::from(schema))?,
+            if preassigned_data_file_name.is_some() || disable_dictionary_split {
+                None
+            } else {
+                DictionaryValueBudget::try_new(&ArrowSchema::from(schema))?
             }
         }
         ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 => None,
