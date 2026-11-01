@@ -161,7 +161,8 @@ public final class IndexDescription {
    *
    * @return coverage counts and bitmap size, or empty when fragment coverage is unknown or not
    *     applicable, including for system indexes and externally maintained indices that use an
-   *     empty bitmap for coverage stored in their payload
+   *     empty bitmap for coverage stored in their payload, or when the index plugin needed to
+   *     interpret the segment metadata is unavailable
    */
   public Optional<IndexFragmentCoverage> getFragmentCoverage() {
     return Optional.ofNullable(fragmentCoverage);

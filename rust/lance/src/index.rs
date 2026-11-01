@@ -2308,6 +2308,19 @@ fn is_externally_maintained_index(metadata: &IndexMetadata) -> bool {
     })
 }
 
+fn empty_fragment_bitmap_has_unknown_coverage(metadata: &IndexMetadata) -> bool {
+    let Some(details) = metadata.index_details.as_ref() else {
+        // Preserve best-effort behavior for legacy descriptions without details.
+        return false;
+    };
+    match scalar::SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(details) {
+        Ok(plugin) => !plugin.supports_optimization(),
+        // A description can still use a type URL whose plugin is unavailable.
+        // In that case an empty bitmap is not evidence of known-zero coverage.
+        Err(_) => true,
+    }
+}
+
 impl IndexDescriptionImpl {
     async fn try_new(segments: Vec<IndexMetadata>, dataset: &Dataset) -> Result<Self> {
         if segments.is_empty() {
@@ -2420,7 +2433,7 @@ impl IndexDescriptionImpl {
             // Externally maintained indices can keep coverage in their own
             // payload and deliberately declare an empty bitmap. A genuinely
             // empty built-in index still has known zero coverage.
-            if is_externally_maintained_index(shard) && fragment_bitmap.is_empty() {
+            if fragment_bitmap.is_empty() && empty_fragment_bitmap_has_unknown_coverage(shard) {
                 fragment_coverage_unknown = true;
             }
             indexed_fragments |= fragment_bitmap;
@@ -9812,6 +9825,42 @@ mod tests {
             .unwrap();
         assert_eq!(desc.index_type(), "Mystery");
         assert_eq!(desc.type_url(), "/lance.index.pb.MysteryIndexDetails");
+    }
+
+    #[tokio::test]
+    async fn test_describe_indices_unknown_type_empty_bitmap_has_unknown_coverage() {
+        let reader = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        let field_id = dataset.schema().field("id").unwrap().id;
+        let metadata = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "mystery_idx".to_string(),
+            fields: vec![field_id],
+            covering_fields: vec![],
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(RoaringBitmap::new()),
+            index_details: Some(Arc::new(prost_types::Any {
+                type_url: "/lance.index.pb.MysteryIndexDetails".to_string(),
+                value: Vec::new(),
+            })),
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            clustering_id: None,
+            metadata: Default::default(),
+        };
+
+        let description = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
+            .await
+            .unwrap();
+        assert_eq!(description.index_type(), "Mystery");
+        assert!(
+            description.fragment_coverage().is_none(),
+            "a missing plugin cannot make an empty bitmap authoritative coverage"
+        );
     }
 
     #[rstest]
