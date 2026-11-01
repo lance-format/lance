@@ -74,10 +74,10 @@ struct BloomFilterStatistics {
 
 impl DeepSizeOf for BloomFilterStatistics {
     fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
-        // Estimate the size of the bloom filter
-        // We could try to get the actual size from the Sbbf if it has a method for that,
-        // but for now we'll estimate based on the number of bytes it serializes to
-        self.bloom_filter.to_bytes().len()
+        // Identical to `to_bytes().len()` but O(1): the serialized payload is
+        // exactly `blocks.len() * 32` bytes, so there is no need to materialize
+        // it just to measure the filter.
+        self.bloom_filter.size_bytes()
     }
 }
 
@@ -115,8 +115,10 @@ impl BloomFilterIndex {
         fri: Option<Arc<dyn RowIdRemapper>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
-        Self::load_with_max_array_length(store, fri, index_cache, MAX_BLOOMFILTER_ARRAY_LENGTH)
-            .await
+        Ok(Arc::new(
+            Self::load_with_max_array_length(store, fri, index_cache, MAX_BLOOMFILTER_ARRAY_LENGTH)
+                .await?,
+        ))
     }
 
     /// Additive sibling of [`Self::load`] for mappings that require
@@ -127,18 +129,30 @@ impl BloomFilterIndex {
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
         lance_index_core::remapping::check_batch_remapping_entry()?;
-        let mut index = Self::load(store, None, index_cache).await?.as_ref().clone();
+        // The load path yields a uniquely-owned index, so the remapper is
+        // attached in place instead of deep-cloning every zone's filter.
+        let mut index = Self::load_with_max_array_length(
+            store,
+            None,
+            index_cache,
+            MAX_BLOOMFILTER_ARRAY_LENGTH,
+        )
+        .await?;
         index.batch_remapper = remapping;
         debug_assert!(index.frag_reuse_index.is_none() || index.batch_remapper.is_none());
         Ok(Arc::new(index))
     }
 
+    /// Load the index, returning it owned rather than shared. `load` and
+    /// `load_with_remapping` wrap the result in an [`Arc`] at their boundary;
+    /// `load_with_remapping` relies on the unique ownership to attach its
+    /// remapper without copying the zone payload.
     async fn load_with_max_array_length(
         store: Arc<dyn IndexStore>,
         fri: Option<Arc<dyn RowIdRemapper>>,
         _index_cache: &LanceCache,
         max_array_length: usize,
-    ) -> Result<Arc<Self>> {
+    ) -> Result<Self> {
         let index_file = store.open_index_file(BLOOMFILTER_FILENAME).await?;
         let file_schema = index_file.schema();
 
@@ -178,14 +192,14 @@ impl BloomFilterIndex {
             }
         }
 
-        Ok(Arc::new(Self {
+        Ok(Self {
             zones,
             number_of_items,
             probability,
             null_rows,
             frag_reuse_index: fri,
             batch_remapper: None,
-        }))
+        })
     }
 
     fn read_batch_size(
@@ -3084,6 +3098,56 @@ mod tests {
                 .await
                 .unwrap(),
             SearchResult::exact(RowAddrTreeMap::new())
+        );
+    }
+
+    // Pins the deep-size semantics: the reported size is exactly the serialized
+    // filter payload (`Sbbf::size_bytes()`, identical to `to_bytes().len()`),
+    // computed per zone without materializing it. The no-big-allocation proof
+    // for this property lives in tests/bloomfilter_alloc_tracking.rs, in its
+    // own test binary (the lib test binary already defines a global allocator).
+    #[test]
+    fn test_bloomfilter_deep_size_equals_serialized_payload() {
+        use lance_core::deepsize::DeepSizeOf;
+
+        use super::{BloomFilterProcessor, BloomFilterStatistics, ZoneBound};
+
+        // Default parameters yield a zone payload of tens of KiB.
+        let params = BloomFilterIndexBuilderParams::new(8192, 0.00057);
+        let filter = BloomFilterProcessor::build_filter(&params).unwrap();
+        let zone_payload = filter.size_bytes();
+        assert!(
+            zone_payload >= 8 * 1024,
+            "fixture too small to be meaningful: {zone_payload} bytes"
+        );
+
+        let make_zone = |fragment_id: u64| BloomFilterStatistics {
+            bound: ZoneBound {
+                fragment_id,
+                start: 0,
+                length: 1,
+            },
+            has_null: false,
+            bloom_filter: filter.clone(),
+        };
+        let index = BloomFilterIndex {
+            zones: vec![make_zone(0), make_zone(1)],
+            number_of_items: params.number_of_items,
+            probability: params.probability,
+            null_rows: None,
+            frag_reuse_index: None,
+            batch_remapper: None,
+        };
+
+        assert_eq!(index.zones.capacity(), index.zones.len());
+        // Value identity: `size_bytes()` is exactly what serializing returns,
+        // and the deep size is the shallow struct plus the two zone payloads.
+        assert_eq!(filter.to_bytes().len(), zone_payload);
+        assert_eq!(
+            index.deep_size_of(),
+            std::mem::size_of::<BloomFilterIndex>()
+                + index.zones.capacity() * std::mem::size_of::<BloomFilterStatistics>()
+                + 2 * zone_payload
         );
     }
 }
