@@ -46,26 +46,47 @@ async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &
         return Ok(());
     }
 
+    // Deleted rows count too: their values stay in the data files, and readers of a
+    // fragment's physical rows (the updater behind `add_columns`, an
+    // `include_deleted_rows` scan) reject a null in a non-nullable field.
     let mut scanner = dataset.scan();
-    scanner.project(&[path])?;
+    scanner
+        .project(&[path])?
+        .with_row_id()
+        .include_deleted_rows();
     let mut stream = scanner.try_into_stream().await?;
+    let mut null_in_deleted_row = false;
     while let Some(batch) = stream.try_next().await? {
         // `path` can be a nested path (e.g. "b.c") which will not be found by
-        // `RecordBatch::column_by_name`. We project exactly one column and validate it directly.
-        if batch.num_columns() != 1 {
+        // `RecordBatch::column_by_name`. We project exactly one column, plus the row id.
+        if batch.num_columns() != 2 {
             return Err(Error::internal(format!(
-                "Expected exactly one column in validation scan for {}, got {}",
+                "Expected exactly one column and the row id in validation scan for {}, got {} columns",
                 path,
                 batch.num_columns()
             )));
         }
         let col = batch.column(0);
-        if col.null_count() > 0 {
+        if col.null_count() == 0 {
+            continue;
+        }
+        // A deleted row reads with a null row id.
+        let row_ids = batch.column(1);
+        if (0..batch.num_rows()).any(|row| col.is_null(row) && row_ids.is_valid(row)) {
             return Err(Error::invalid_input(format!(
                 "Column \"{}\" contains NULL values and cannot be made non-nullable",
                 path
             )));
         }
+        null_in_deleted_row = true;
+    }
+    if null_in_deleted_row {
+        return Err(Error::invalid_input(format!(
+            "Column \"{}\" cannot be made non-nullable: deleted rows still store NULL values \
+             for it. Compact the dataset with materialize_deletions_threshold=0 to remove them \
+             first",
+            path
+        )));
     }
 
     Ok(())
@@ -5422,6 +5443,79 @@ mod test {
                 false
             )])
         );
+
+        Ok(())
+    }
+
+    /// Deleting the rows that hold NULL leaves their values in the data files, where
+    /// `add_columns` reads them back, so the column can be made non-nullable only after
+    /// compaction has removed them.
+    #[rstest]
+    #[tokio::test]
+    async fn test_set_not_null_fails_with_nulls_in_deleted_rows(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        use crate::dataset::optimize::{CompactionOptions, compact_files};
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![
+                Some(1),
+                None,
+                Some(3),
+                Some(4),
+            ]))],
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        dataset.delete("a IS NULL").await?;
+
+        let not_null = [ColumnAlteration::new("a".into()).set_nullable(false)];
+        let err = dataset.alter_columns(&not_null).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("deleted rows still store NULL values"),
+            "{err}"
+        );
+        assert!(dataset.schema().field("a").unwrap().nullable);
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                materialize_deletions_threshold: 0.0,
+                ..Default::default()
+            },
+            None,
+        )
+        .await?;
+        dataset.alter_columns(&not_null).await?;
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("b".into(), "a * 2".into())]),
+                None,
+                None,
+            )
+            .await?;
+        let batch = dataset.scan().try_into_batch().await?;
+        assert_eq!(
+            batch["b"].as_ref(),
+            &Int32Array::from(vec![2, 6, 8]) as &dyn Array
+        );
+        dataset.validate().await?;
 
         Ok(())
     }
