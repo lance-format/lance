@@ -290,8 +290,14 @@ impl PayloadMaterializationState {
             )));
         }
 
-        let (new_source_bytes, source_index) = match self.chunk.local_source {
-            Some((batch_id, source_index)) if batch_id == payload_batch_id => (0, source_index),
+        // Keep a prospective source batch out of the chunk until the budget
+        // check accepts it. Otherwise flushing an old chunk would retain a
+        // source batch that the current row never referenced.
+        let (source_to_add, new_source_bytes, existing_source_index) = match self.chunk.local_source
+        {
+            Some((batch_id, source_index)) if batch_id == payload_batch_id => {
+                (None, 0, Some(source_index))
+            }
             _ => {
                 let payload = self.current_payload.as_ref().ok_or_else(|| {
                     DataFusionError::Internal(
@@ -304,11 +310,7 @@ impl PayloadMaterializationState {
                 // shares a larger buffer, so allow one such batch and flush
                 // before retaining another.
                 let bytes = projected.get_array_memory_size();
-                self.chunk.source_batches.push(projected);
-                let source_index = self.chunk.source_batches.len() - 1;
-                self.chunk.source_batch_bytes = self.chunk.source_batch_bytes.saturating_add(bytes);
-                self.chunk.local_source = Some((payload_batch_id, source_index));
-                (bytes, source_index)
+                (Some(projected), bytes, None)
             }
         };
 
@@ -324,6 +326,23 @@ impl PayloadMaterializationState {
             self.pending_output = Some(self.flush_chunk()?);
             return Ok(());
         }
+
+        let source_index = if let Some(projected) = source_to_add {
+            self.chunk.source_batches.push(projected);
+            let source_index = self.chunk.source_batches.len() - 1;
+            self.chunk.source_batch_bytes = self
+                .chunk
+                .source_batch_bytes
+                .saturating_add(new_source_bytes);
+            self.chunk.local_source = Some((payload_batch_id, source_index));
+            source_index
+        } else {
+            existing_source_index.ok_or_else(|| {
+                DataFusionError::Internal(
+                    "Update payload source index disappeared during materialization".to_string(),
+                )
+            })?
+        };
 
         self.chunk
             .source_indices
@@ -748,5 +767,30 @@ mod tests {
                 .to_string()
                 .contains("exceeding the materialization batch budget")
         );
+    }
+
+    #[tokio::test]
+    async fn test_materialization_accepts_sliced_source_backing_buffer() {
+        const MAX_BYTES: usize = 1024;
+        let payload = wide_payload_batch(&(0..100).collect::<Vec<_>>(), 13).slice(99, 1);
+        assert!(
+            payload.get_array_memory_size() > MAX_BYTES,
+            "the sliced source must still reference its larger backing buffer"
+        );
+        let mapping = mapping_batch(&[99]);
+        let output = materialize_payloads(
+            batches(mapping.schema(), vec![mapping]),
+            batches(payload.schema(), vec![payload]),
+            "row_id",
+            payload_schema(),
+            MAX_BYTES,
+        )
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].num_rows(), 1);
+        assert!(logical_batch_size(&output[0]) <= MAX_BYTES);
     }
 }
