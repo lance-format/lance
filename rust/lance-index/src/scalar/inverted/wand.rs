@@ -1637,11 +1637,9 @@ impl PostingIterator {
         if let Some(up_to) = up_to
             && let PostingList::Compressed(_) = self.list
         {
-            // The window can extend past the current block: tail postings take
-            // `up_to` from other clauses' block ends, so the bound must cover
-            // every block in [current, up_to], not just the current block's
-            // baked max. `block_max_score_up_to_with_stats` keeps the tighter
-            // early returns (level0 memo, scorer bound) for the other shapes.
+            // A tail posting's window ends at another clause's block end and
+            // can cover several of its own blocks, so it has to be bounded over
+            // all of them, impacts or not.
             return self.block_max_score_up_to_with_stats(up_to, scorer).score;
         }
         self.block_max_score(scorer)
@@ -9671,50 +9669,109 @@ mod tests {
     }
 
     #[test]
-    fn test_window_max_score_without_impacts_spans_blocks() {
-        // Query-time fuzzy-union postings are compressed 128-doc lists with no
-        // impact skip data and no scorer upper bound. The bound over
-        // [current, up_to] must cover the later blocks' baked maxes, not only
-        // the current block's, or tail-parked postings under-estimate the
-        // window and prune documents that could beat the threshold.
+    fn or_search_finds_parked_union_hit_in_a_later_block_of_the_window() {
+        // A query-time fuzzy union (grouped, 128-doc blocks, no impacts) parks
+        // in the tail while the sparse clause's wide block sets the window end.
+        // The union's best document sits in a later block of that window, so a
+        // bound taken from its current block alone skips it and the top-1 is wrong.
         let block = crate::scalar::inverted::LEGACY_BLOCK_SIZE;
-        let total = 3 * block;
-        let doc_ids = (0..total as u32).collect::<Vec<_>>();
-        let freqs = vec![1; total];
-        let blocks = compress_posting_list_with_tail_codec_and_block_size(
-            doc_ids.len(),
-            doc_ids.iter(),
-            freqs.iter(),
-            [1.0, 5.0, 9.0].into_iter(),
-            crate::scalar::inverted::PostingTailCodec::VarintDelta,
-            block,
-        )
-        .unwrap();
-        let posting_list = PostingList::Compressed(CompressedPostingList::new(
-            blocks,
-            9.0,
-            doc_ids.len() as u32,
-            crate::scalar::inverted::PostingTailCodec::VarintDelta,
-            block,
-            None,
-            None,
-        ));
-        let mut posting = PostingIterator::with_query_weight(
-            String::from("term"),
+        let codec = crate::scalar::inverted::PostingTailCodec::VarintDelta;
+        let non_impact_list = |doc_ids: &[u32], freqs: &[u32]| {
+            let block_maxes = freqs
+                .chunks(block)
+                .map(|chunk| chunk.iter().copied().max().unwrap() as f32)
+                .collect::<Vec<_>>();
+            let max_score = block_maxes.iter().copied().fold(0.0, f32::max);
+            let blocks = compress_posting_list_with_tail_codec_and_block_size(
+                doc_ids.len(),
+                doc_ids.iter(),
+                freqs.iter(),
+                block_maxes.into_iter(),
+                codec,
+                block,
+            )
+            .unwrap();
+            PostingList::Compressed(CompressedPostingList::new(
+                blocks,
+                max_score,
+                doc_ids.len() as u32,
+                codec,
+                block,
+                None,
+                None,
+            ))
+        };
+
+        let block_docs = block as u32;
+        let num_docs = 6 * block_docs;
+        // Dense union over six blocks; every block max is 1 except block 2.
+        let hot_doc = 2 * block_docs + 44;
+        let union_docs = (0..num_docs).collect::<Vec<_>>();
+        let union_freqs = union_docs
+            .iter()
+            .map(|&doc| if doc == hot_doc { 12 } else { 1 })
+            .collect::<Vec<_>>();
+        // Sparse clause: a dense first block whose doc 0 sets the floor, then
+        // a stride-4 block spanning union blocks 1..=4, then a short tail.
+        let sparse_docs = (0..block_docs)
+            .chain((0..block_docs).map(|i| block_docs + 4 * i))
+            .chain([5 * block_docs, 5 * block_docs + 4])
+            .collect::<Vec<_>>();
+        let sparse_freqs = sparse_docs
+            .iter()
+            .map(|&doc| if doc == 0 { 9 } else { 1 })
+            .collect::<Vec<_>>();
+
+        let mut docs = DocSet::default();
+        let mut exhaustive = vec![0_u32; num_docs as usize];
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 1);
+        }
+        for (doc_ids, freqs) in [(&union_docs, &union_freqs), (&sparse_docs, &sparse_freqs)] {
+            for (&doc_id, &freq) in doc_ids.iter().zip(freqs.iter()) {
+                exhaustive[doc_id as usize] += freq;
+            }
+        }
+        let limit = 1;
+        let mut expected = (0..num_docs).map(u64::from).collect::<Vec<_>>();
+        expected.sort_by_key(|&doc| (std::cmp::Reverse(exhaustive[doc as usize]), doc));
+        expected.truncate(limit);
+        assert_eq!(expected, vec![u64::from(hot_doc)]);
+
+        let union_list = non_impact_list(&union_docs, &union_freqs);
+        let grouped_terms =
+            Arc::<[GroupedTermScorer]>::from([GroupedTermScorer::new(1.0, &union_list)]);
+        let union = PostingIterator::with_query_weight(
+            String::from("union"),
             0,
             0,
             1.0,
-            posting_list,
-            doc_ids.len(),
+            union_list,
+            docs.len(),
+        )
+        .with_grouped_terms(grouped_terms);
+        let sparse = PostingIterator::with_query_weight(
+            String::from("sparse"),
+            1,
+            1,
+            1.0,
+            non_impact_list(&sparse_docs, &sparse_freqs),
+            docs.len(),
         );
-        posting.shallow_next(0);
-        assert_eq!(posting.block_idx, 0);
-
-        let window_end = (total - 1) as u64;
-        let window_bound = posting.window_max_score(Some(window_end), &UnitScorer);
-        assert!(
-            window_bound >= 9.0,
-            "window over blocks 0..=2 must bound the highest baked block max, got {window_bound}"
+        let mut wand = Wand::new(Operator::Or, [union, sparse].into_iter(), &docs, UnitScorer);
+        let hits = wand
+            .search(
+                &FtsSearchParams::default().with_limit(Some(limit)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        let found = hits
+            .iter()
+            .map(|hit| hit.posting_doc_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            found, expected,
+            "WAND OR top-{limit} must match exhaustive scoring"
         );
     }
 
