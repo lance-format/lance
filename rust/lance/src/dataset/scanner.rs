@@ -25274,7 +25274,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
     }
 
     #[tokio::test]
-    async fn test_fts_global_statistics_preserves_ngram_groups_and_phrase_offsets() {
+    async fn test_fts_global_statistics_preserves_ngram_fuzzy_and_phrase_positions() {
         let batch =
             arrow_array::record_batch!(("text", Utf8, ["abcd", "xbcd", "axcd", "abxd"])).unwrap();
         let schema = batch.schema();
@@ -25290,13 +25290,26 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .await
             .unwrap();
 
-        let match_query = MatchQuery::new("abcd".into())
-            .with_column(Some("text".into()))
-            .with_fuzziness(None)
-            .with_max_expansions(50);
+        let match_query: FtsQuery = BooleanQuery::new([
+            (
+                Occur::Must,
+                MatchQuery::new("abcd".into())
+                    .with_column(Some("text".into()))
+                    .into(),
+            ),
+            (
+                Occur::Must,
+                MatchQuery::new("ab bc".into())
+                    .with_column(Some("text".into()))
+                    .with_fuzziness(Some(1))
+                    .with_max_expansions(50)
+                    .into(),
+            ),
+        ])
+        .into();
         let mut match_scanner = dataset.scan();
         match_scanner
-            .full_text_search(FullTextSearchQuery::new_query(match_query.into()))
+            .full_text_search(FullTextSearchQuery::new_query(match_query))
             .unwrap();
         let match_statistics = crate::pb::FtsGlobalStatisticsProto::decode(
             match_scanner
@@ -25306,6 +25319,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
                 .as_slice(),
         )
         .unwrap();
+        assert_eq!(match_statistics.query_leaves.len(), 2);
         let match_leaf = &match_statistics.query_leaves[0];
         assert_eq!(match_leaf.kind, crate::pb::FtsQueryLeafKind::Match as i32);
 
@@ -25324,9 +25338,23 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             terms_by_group.keys().copied().collect::<Vec<_>>(),
             [0, 1, 2]
         );
+        let fuzzy_leaf = &match_statistics.query_leaves[1];
+        let mut fuzzy_terms_by_group = BTreeMap::<u32, BTreeSet<&str>>::new();
+        for token in &fuzzy_leaf.tokens {
+            let term = match_statistics.terms[token.term_index.unwrap() as usize].as_str();
+            fuzzy_terms_by_group
+                .entry(token.query_position.unwrap())
+                .or_default()
+                .insert(term);
+        }
+        assert_eq!(
+            fuzzy_terms_by_group.keys().copied().collect::<Vec<_>>(),
+            [0, 1],
+            "fuzzy Match tokens must retain their source term groups: {fuzzy_terms_by_group:?}"
+        );
         assert!(
-            terms_by_group.values().any(|terms| terms.len() > 1),
-            "fuzzy alternatives must retain their source term group"
+            fuzzy_terms_by_group.values().any(|terms| terms.len() > 1),
+            "fuzzy alternatives must retain their source term group: {fuzzy_terms_by_group:?}"
         );
 
         let phrase_query = PhraseQuery::new("abcd".into()).with_column(Some("text".into()));
