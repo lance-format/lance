@@ -57,6 +57,11 @@ fn dot_scalar<
 }
 
 /// Dot product.
+///
+/// # Panics
+///
+/// The implementations in this crate panic if `from` and `to` have different
+/// lengths. A downstream [`Dot`] implementation may define different behavior.
 #[inline]
 pub fn dot<T: Dot>(from: &[T], to: &[T]) -> f32 {
     T::dot(from, to)
@@ -65,12 +70,21 @@ pub fn dot<T: Dot>(from: &[T], to: &[T]) -> f32 {
 /// Dot product between two f32 slices, dispatched to the widest SIMD backend
 /// available at runtime. See [`crate::distance::l2::l2_f32`] for why this is
 /// needed on top of the generic [`dot`].
+///
+/// # Panics
+///
+/// Panics if `x` and `y` have different lengths.
 #[inline]
 pub fn dot_f32(x: &[f32], y: &[f32]) -> f32 {
     f32::dot(x, y)
 }
 
 /// Negative [Dot] distance.
+///
+/// # Panics
+///
+/// The implementations in this crate panic if `from` and `to` have different
+/// lengths. A downstream [`Dot`] implementation may define different behavior.
 #[inline]
 pub fn dot_distance<T: Dot>(from: &[T], to: &[T]) -> f32 {
     1.0 - T::dot(from, to)
@@ -79,6 +93,11 @@ pub fn dot_distance<T: Dot>(from: &[T], to: &[T]) -> f32 {
 /// Dot product
 pub trait Dot: Num {
     /// Dot product.
+    ///
+    /// # Panics
+    ///
+    /// The implementations in this crate panic if `x` and `y` have different
+    /// lengths. A downstream implementation may define different behavior.
     fn dot(x: &[Self], y: &[Self]) -> f32;
 
     /// Writes the dot product of `x` with each `dimension`-sized vector in
@@ -91,7 +110,8 @@ pub trait Dot: Num {
     ///
     /// # Panics
     ///
-    /// Panics if `x.len() != dimension`, if `batch.len()` is not a multiple of
+    /// The default implementation panics if `dimension == 0`, if
+    /// `x.len() != dimension`, if `batch.len()` is not a multiple of
     /// `dimension`, or if `output.len() != batch.len() / dimension`.
     fn dot_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
         assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
@@ -667,8 +687,9 @@ impl Dot for u8 {
 ///
 /// # Panics
 ///
-/// Panics if `from.len() != dimension`, if `to.len()` is not a multiple of
-/// `dimension`, or if `output.len() != to.len() / dimension`.
+/// The implementations in this crate panic if `dimension == 0`, if
+/// `from.len() != dimension`, if `to.len()` is not a multiple of `dimension`,
+/// or if `output.len() != to.len() / dimension`.
 ///
 /// ```
 /// # use lance_linalg::distance::dot_distance_batch_into;
