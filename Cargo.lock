@@ -5345,11 +5345,14 @@ dependencies = [
 name = "lance-tools"
 version = "15.0.0-beta.7"
 dependencies = [
+ "chrono",
  "clap",
  "lance-core",
  "lance-file",
  "lance-io",
+ "lance-table",
  "object_store 0.14.2",
+ "prost",
  "tokio",
  "url",
 ]
