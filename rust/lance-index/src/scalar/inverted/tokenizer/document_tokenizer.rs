@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::str::FromStr;
 
+use super::MaxSubDocsPerRowExceedAction;
+
 /// Document type for full text search.
 #[derive(Debug, Clone)]
 pub enum DocType {
@@ -226,6 +228,8 @@ pub struct JsonTokenizer {
     tokenizer: TextAnalyzer,
     mode: JsonTokenizerMode,
     disable_cross_array_unnest: bool,
+    max_sub_docs_per_row: Option<usize>,
+    max_sub_docs_per_row_exceed_action: MaxSubDocsPerRowExceedAction,
 }
 
 impl JsonTokenizer {
@@ -234,6 +238,8 @@ impl JsonTokenizer {
             tokenizer,
             mode: JsonTokenizerMode::SingleDocument,
             disable_cross_array_unnest: false,
+            max_sub_docs_per_row: None,
+            max_sub_docs_per_row_exceed_action: MaxSubDocsPerRowExceedAction::Fail,
         }
     }
 
@@ -243,12 +249,21 @@ impl JsonTokenizer {
         self
     }
 
-    #[cfg(test)]
     pub(crate) fn with_disable_cross_array_unnest(
         mut self,
         disable_cross_array_unnest: bool,
     ) -> Self {
         self.disable_cross_array_unnest = disable_cross_array_unnest;
+        self
+    }
+
+    pub(crate) fn with_sub_doc_limit(
+        mut self,
+        max_sub_docs_per_row: Option<usize>,
+        exceed_action: MaxSubDocsPerRowExceedAction,
+    ) -> Self {
+        self.max_sub_docs_per_row = max_sub_docs_per_row;
+        self.max_sub_docs_per_row_exceed_action = exceed_action;
         self
     }
 }
@@ -260,6 +275,11 @@ impl std::fmt::Debug for JsonTokenizer {
             .field(
                 "disable_cross_array_unnest",
                 &self.disable_cross_array_unnest,
+            )
+            .field("max_sub_docs_per_row", &self.max_sub_docs_per_row)
+            .field(
+                "max_sub_docs_per_row_exceed_action",
+                &self.max_sub_docs_per_row_exceed_action,
             )
             .finish()
     }
@@ -304,11 +324,28 @@ impl LanceTokenizer for JsonTokenizer {
                 flatten_json(&value, "", &mut tokens, &mut position, &mut self.tokenizer);
                 Ok(vec![tokens])
             }
-            JsonTokenizerMode::FlattenedSubDocs => Ok(JsonFlattener {
-                tokenizer: &mut self.tokenizer,
-                disable_cross_array_unnest: self.disable_cross_array_unnest,
+            JsonTokenizerMode::FlattenedSubDocs => {
+                let sub_docs = JsonFlattener {
+                    tokenizer: &mut self.tokenizer,
+                    disable_cross_array_unnest: self.disable_cross_array_unnest,
+                    max_sub_docs_per_row: self.max_sub_docs_per_row,
+                }
+                .tokenize(&value);
+                match sub_docs {
+                    Ok(sub_docs) => Ok(sub_docs),
+                    Err(max_sub_docs_per_row) => match self.max_sub_docs_per_row_exceed_action {
+                        MaxSubDocsPerRowExceedAction::Fail => Err(Error::invalid_input(format!(
+                            "JSON row exceeds max_sub_docs_per_row={max_sub_docs_per_row}; increase max_sub_docs_per_row or set disable_cross_array_unnest=true"
+                        ))),
+                        MaxSubDocsPerRowExceedAction::SkipRow => {
+                            log::warn!(
+                                "skipping JSON row that exceeds max_sub_docs_per_row={max_sub_docs_per_row}"
+                            );
+                            Ok(Vec::new())
+                        }
+                    },
+                }
             }
-            .tokenize(&value)),
         }
     }
 
@@ -500,11 +537,13 @@ struct FlattenedJsonSubDocs {
 struct JsonFlattener<'a> {
     tokenizer: &'a mut TextAnalyzer,
     disable_cross_array_unnest: bool,
+    max_sub_docs_per_row: Option<usize>,
 }
 
 impl JsonFlattener<'_> {
-    fn tokenize(&mut self, value: &Value) -> Vec<Vec<Token>> {
-        self.flatten(value, "")
+    fn tokenize(&mut self, value: &Value) -> Result<Vec<Vec<Token>>, usize> {
+        Ok(self
+            .flatten(value, "")?
             .sub_docs
             .into_iter()
             .map(|sub_doc| {
@@ -520,10 +559,20 @@ impl JsonFlattener<'_> {
                     })
                     .collect()
             })
-            .collect()
+            .collect())
     }
 
-    fn flatten(&mut self, value: &Value, prefix: &str) -> FlattenedJsonSubDocs {
+    fn check_count(&self, count: Option<usize>) -> Result<usize, usize> {
+        let count = count.ok_or(self.max_sub_docs_per_row.unwrap_or(usize::MAX))?;
+        if let Some(limit) = self.max_sub_docs_per_row
+            && count > limit
+        {
+            return Err(limit);
+        }
+        Ok(count)
+    }
+
+    fn flatten(&mut self, value: &Value, prefix: &str) -> Result<FlattenedJsonSubDocs, usize> {
         match value {
             Value::Object(map) => {
                 let mut scalar_terms = Vec::new();
@@ -534,7 +583,7 @@ impl JsonFlattener<'_> {
                     } else {
                         format!("{prefix}.{key}")
                     };
-                    let child = self.flatten(child, &child_prefix);
+                    let child = self.flatten(child, &child_prefix)?;
                     if child.has_array {
                         if !child.sub_docs.is_empty() {
                             array_groups.push(child.sub_docs);
@@ -544,43 +593,53 @@ impl JsonFlattener<'_> {
                     }
                 }
                 if array_groups.is_empty() {
-                    return FlattenedJsonSubDocs {
+                    return Ok(FlattenedJsonSubDocs {
                         sub_docs: if scalar_terms.is_empty() {
                             Vec::new()
                         } else {
                             vec![scalar_terms]
                         },
                         has_array: false,
-                    };
+                    });
                 }
-                let mut sub_docs = Vec::new();
-                if self.disable_cross_array_unnest || array_groups.len() == 1 {
+                let mut sub_docs = if self.disable_cross_array_unnest || array_groups.len() == 1 {
+                    let capacity = array_groups.iter().try_fold(0usize, |count, group| {
+                        self.check_count(count.checked_add(group.len()))
+                    })?;
+                    let mut sub_docs = Vec::with_capacity(capacity);
                     sub_docs.extend(array_groups.into_iter().flatten());
+                    sub_docs
                 } else {
+                    let capacity = array_groups.iter().try_fold(1usize, |count, group| {
+                        self.check_count(count.checked_mul(group.len()))
+                    })?;
+                    let mut sub_docs = Vec::with_capacity(capacity);
                     cross_join_json_sub_docs(&array_groups, &mut Vec::new(), &mut sub_docs);
-                }
+                    sub_docs
+                };
                 for sub_doc in &mut sub_docs {
                     sub_doc.extend(scalar_terms.iter().cloned());
                 }
-                FlattenedJsonSubDocs {
+                Ok(FlattenedJsonSubDocs {
                     sub_docs,
                     has_array: true,
-                }
+                })
             }
             Value::Array(values) => {
                 let mut sub_docs = Vec::new();
                 let child_prefix = format!("{prefix}.");
                 for (array_index, child) in values.iter().enumerate() {
-                    let mut child = self.flatten(child, &child_prefix);
+                    let mut child = self.flatten(child, &child_prefix)?;
+                    self.check_count(sub_docs.len().checked_add(child.sub_docs.len()))?;
                     for sub_doc in &mut child.sub_docs {
                         sub_doc.push(format!("{prefix}$idx,number,{array_index}"));
                     }
                     sub_docs.extend(child.sub_docs);
                 }
-                FlattenedJsonSubDocs {
+                Ok(FlattenedJsonSubDocs {
                     sub_docs,
                     has_array: true,
-                }
+                })
             }
             _ => {
                 let terms = match value {
@@ -597,14 +656,14 @@ impl JsonFlattener<'_> {
                     Value::Number(value) => vec![format!("{prefix},number,{value}")],
                     _ => unreachable!(),
                 };
-                FlattenedJsonSubDocs {
+                Ok(FlattenedJsonSubDocs {
                     sub_docs: if terms.is_empty() {
                         Vec::new()
                     } else {
                         vec![terms]
                     },
                     has_array: false,
-                }
+                })
             }
         }
     }
@@ -660,6 +719,7 @@ impl TokenStream for OwnedTokenStream {
 #[cfg(test)]
 mod tests {
     use crate::scalar::inverted::query::try_collect_query_tokens;
+    use crate::scalar::inverted::tokenizer::MaxSubDocsPerRowExceedAction;
     use crate::scalar::inverted::tokenizer::document_tokenizer::{
         DocType, JsonTokenizer, JsonTokenizerMode, LanceTokenizer, flatten_json, flatten_triplet,
     };
@@ -907,6 +967,43 @@ mod tests {
             disable_cross_array_unnest,
             expected_sub_docs,
         );
+    }
+
+    #[rstest]
+    #[case::cartesian_product(false, 6)]
+    #[case::independent_arrays(true, 5)]
+    fn test_sub_doc_limit_enforces_row_policy(
+        #[case] disable_cross_array_unnest: bool,
+        #[case] sub_doc_count: usize,
+    ) {
+        let json = r#"{"a":["x","y"],"b":["u","v","w"]}"#;
+        let tokenizer = || {
+            JsonTokenizer::new(TextAnalyzer::builder(SimpleTokenizer::default()).build())
+                .with_mode(JsonTokenizerMode::FlattenedSubDocs)
+                .with_disable_cross_array_unnest(disable_cross_array_unnest)
+        };
+
+        assert_eq!(
+            tokenizer()
+                .with_sub_doc_limit(Some(sub_doc_count), MaxSubDocsPerRowExceedAction::Fail)
+                .token_streams_for_doc(json)
+                .unwrap()
+                .len(),
+            sub_doc_count
+        );
+        let limit = sub_doc_count - 1;
+        let mut failing_tokenizer =
+            tokenizer().with_sub_doc_limit(Some(limit), MaxSubDocsPerRowExceedAction::Fail);
+        let error = failing_tokenizer.token_streams_for_doc(json).unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        let expected_message = format!("max_sub_docs_per_row={limit}");
+        assert!(error.to_string().contains(&expected_message));
+
+        let sub_docs = tokenizer()
+            .with_sub_doc_limit(Some(limit), MaxSubDocsPerRowExceedAction::SkipRow)
+            .token_streams_for_doc(json)
+            .unwrap();
+        assert!(sub_docs.is_empty());
     }
 
     fn assert_token(token: &Token, position: usize, text: &str) {
