@@ -417,8 +417,12 @@ public class Query {
     /**
      * Reranks overfetched IVF_RQ candidates with the index's most accurate stored RQ data.
      *
-     * <p>This stage does not read original vectors. It can be combined with {@link
-     * #setRefineFactor(int)}, in which case exact refinement remains the final stage.
+     * <p>Indexed candidates are reranked without reading their original vectors. Unindexed
+     * fragments and stale overlay rows still use flat fallback and may read original vectors. It
+     * can be combined with {@link #setRefineFactor(int)}, in which case exact refinement remains
+     * the final stage and reads original vectors for its candidates. With a distance range, the
+     * selected partitions use Accurate RQ search directly so the range applies before top-k
+     * truncation.
      *
      * @param quantizedRefineFactor One-bit candidate overfetch factor; must be greater than zero.
      * @return The Builder instance for method chaining.

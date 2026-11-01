@@ -21,7 +21,7 @@ import pyarrow.compute as pc
 import pytest
 from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
 from lance import LanceDataset, LanceFragment
-from lance.dataset import VectorIndexReader, VectorSearchQuery
+from lance.dataset import ScannerBuilder, VectorIndexReader, VectorSearchQuery
 from lance.indices import IndexFileVersion, IndicesBuilder
 from lance.query import MatchQuery, PhraseQuery
 from lance.util import (  # noqa: E402
@@ -3355,6 +3355,44 @@ def test_vector_index_invalid_quantized_refine_factor(indexed_dataset):
                 "quantized_refine_factor": 0,
             }
         )
+
+
+def test_nearest_preserves_existing_positional_arguments(dataset):
+    query = np.random.default_rng(42).standard_normal(128).astype(np.float32)
+    expected = dataset.to_table(
+        columns=["id"],
+        nearest={
+            "column": "vector",
+            "q": query,
+            "k": 10,
+            "use_index": False,
+            "query_parallelism": 1,
+            "approx_mode": "fast",
+        },
+    )
+    actual = (
+        ScannerBuilder(dataset)
+        .columns(["id"])
+        .nearest(
+            "vector",
+            query,
+            10,
+            None,
+            None,
+            None,
+            None,
+            None,
+            False,
+            None,
+            1,
+            "fast",
+            None,
+            None,
+        )
+        .to_scanner()
+        .to_table()
+    )
+    assert actual == expected
 
 
 def test_knn_deleted_rows(tmp_path):

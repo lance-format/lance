@@ -7688,13 +7688,13 @@ class ScannerBuilder:
         minimum_nprobes: Optional[int] = None,
         maximum_nprobes: Optional[int] = None,
         refine_factor: Optional[int] = None,
-        quantized_refine_factor: Optional[int] = None,
         use_index: bool = True,
         ef: Optional[int] = None,
         query_parallelism: Optional[int] = None,
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
         search_effort: Optional[float] = None,
+        quantized_refine_factor: Optional[int] = None,
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
 
@@ -7745,9 +7745,13 @@ class ScannerBuilder:
         quantized_refine_factor: int, optional
             For an IVF_RQ flat index, overfetch this many one-bit candidates per
             requested result and rerank them with the index's most accurate stored
-            RQ representation. Unlike ``refine_factor``, this does not read the
-            original vectors. The two stages can be combined; exact refinement
-            remains the final stage.
+            RQ representation. Unlike ``refine_factor``, indexed candidates do not
+            read their original vectors. Unindexed fragments and stale overlay rows
+            still use flat fallback and may read original vectors. The two stages can
+            be combined; exact refinement remains the final stage and reads original
+            vectors for its candidates. With ``distance_range``, selected partitions
+            use Accurate RQ search directly so the range applies before top-k
+            truncation.
         """
         self._nearest = _build_vector_search_query(
             column,
@@ -9186,7 +9190,10 @@ def _build_vector_search_query(
     quantized_refine_factor: int, optional
         For an IVF_RQ flat index, overfetch this many one-bit candidates per
         requested result and rerank them using the most accurate stored RQ data.
-        This does not read original vectors.
+        Indexed candidates do not read their original vectors. Unindexed fragments
+        and stale overlay rows still use flat fallback and may read original vectors.
+        With ``distance_range``, selected partitions use Accurate RQ search directly
+        so the range applies before top-k truncation.
     use_index: bool, default True
         Whether to use the index for the search.
     ef: int, optional
