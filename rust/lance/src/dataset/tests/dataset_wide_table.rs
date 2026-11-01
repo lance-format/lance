@@ -12,10 +12,9 @@
 //!    whole manifest object, so the new manifest is a full snapshot rather than
 //!    a delta;
 //! 2. [`test_cold_open_reads_full_manifest`]: a cold open reads at least the
-//!    manifest size, even for a narrow query;
+//!    manifest size; a projected query still has to open the dataset first;
 //! 3. [`test_version_refresh_rereads_manifest`]: after another writer commits
-//!    a new version, the next `checkout_latest` re-reads the full manifest,
-//!    even though this reader's projection did not change.
+//!    a new version, the next `checkout_latest` re-reads the full manifest.
 //!
 //! These document current behavior. A format change that improves metadata
 //! amplification is expected to *relax* these assertions in the same PR that
@@ -130,9 +129,8 @@ async fn test_cold_open_reads_full_manifest() {
     let manifest = dataset.manifest().serialized().len() as u64;
     drop(dataset);
 
-    // Cold open with a fresh session: even though any real query would
-    // project a narrow set of columns, opening the dataset must read the
-    // full manifest first.
+    // Cold open with a fresh session: opening the dataset reads the full
+    // manifest before any query can run.
     let ds = Dataset::open(uri).await.unwrap();
     let io = ds.object_store.as_ref().io_stats_snapshot();
     assert!(
@@ -168,8 +166,8 @@ async fn test_version_refresh_rereads_manifest() {
         .unwrap();
     let manifest_v2 = writer.manifest().serialized().len() as u64;
 
-    // The reader's next version refresh re-reads the full manifest even
-    // though its projection (and the queried columns) did not change.
+    // The reader's next version refresh reads the full manifest for the new
+    // version.
     reader.object_store.as_ref().io_stats_incremental();
     reader.checkout_latest().await.unwrap();
     assert_eq!(reader.version().version, 2);
