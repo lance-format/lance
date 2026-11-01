@@ -541,6 +541,62 @@ mod test {
 
     #[cfg(not(windows))]
     #[tokio::test]
+    async fn restore_from_publishes_through_the_external_commit_handler() {
+        let external = Arc::new(TestExternalManifestStore::new());
+        let handler = Arc::new(ExternalManifestCommitHandler {
+            external_manifest_store: external.clone(),
+        });
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
+        let dir = TempStrDir::default();
+
+        Dataset::write(
+            data_gen.batch(10),
+            &dir,
+            Some(write_params(handler.clone())),
+        )
+        .await
+        .unwrap();
+        Dataset::write(
+            data_gen.batch(10),
+            &dir,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                commit_handler: Some(handler.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let latest = DatasetBuilder::from_uri(&dir)
+            .with_read_params(read_params(handler.clone()))
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(latest.version().version, 2);
+        let mut target = latest.checkout_version(1).await.unwrap();
+        target.restore_from(2).await.unwrap();
+        assert_eq!(target.version().version, 3);
+
+        let latest = external
+            .get_latest_version(target.base.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.0, 3);
+
+        let reopened = DatasetBuilder::from_uri(&dir)
+            .with_read_params(read_params(handler))
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(reopened.version().version, 3);
+        assert_eq!(reopened.count_rows(None).await.unwrap(), 10);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
     async fn test_concurrent_commits_are_okay() {
         const NUM_WRITERS: usize = 5;
         const CONTENDED_VERSION: u64 = 2;
