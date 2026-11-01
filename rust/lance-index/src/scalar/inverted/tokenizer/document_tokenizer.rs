@@ -243,6 +243,7 @@ impl JsonTokenizer {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_disable_cross_array_unnest(
         mut self,
         disable_cross_array_unnest: bool,
@@ -273,6 +274,12 @@ impl LanceTokenizer for JsonTokenizer {
     }
 
     fn token_stream_for_doc<'a>(&'a mut self, text: &'a str) -> BoxTokenStream<'a> {
+        if self.mode == JsonTokenizerMode::FlattenedSubDocs {
+            return BoxTokenStream::new(OwnedTokenStream::new(Vec::new())).with_error(
+                "flattened_sub_docs mode requires token_streams_for_doc; \
+                 token_stream_for_doc only supports single_document mode",
+            );
+        }
         match self.token_streams_for_doc(text) {
             Ok(documents) => BoxTokenStream::new(OwnedTokenStream::new(
                 documents.into_iter().next().unwrap_or_default(),
@@ -410,7 +417,17 @@ fn normalize_flattened_json_path(path: &str) -> Result<(String, Vec<String>), St
             return Err(format!("empty array index in JSON path {path:?}"));
         }
         if array_index != "*" {
-            index_tokens.push(format!("{normalized}$idx,number,{array_index}"));
+            if !array_index.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!(
+                    "unsupported array index {array_index:?} in JSON path {path:?}; \
+                     expected a non-negative decimal index or '*'"
+                ));
+            }
+            let index = array_index.parse::<usize>().map_err(|_| {
+                format!("array index {array_index:?} in JSON path {path:?} does not fit in usize")
+            })?;
+            // Canonicalize leading zeros so equivalent indexes produce the same token.
+            index_tokens.push(format!("{normalized}$idx,number,{index}"));
         }
         normalized.push('.');
     }
@@ -682,6 +699,10 @@ mod tests {
         }"#;
         let mut tokenizer =
             JsonTokenizer::new(TextAnalyzer::builder(SimpleTokenizer::default()).build());
+        assert_eq!(
+            tokenizer.json_tokenizer_mode(),
+            Some(JsonTokenizerMode::SingleDocument)
+        );
         let mut stream = tokenizer.token_stream_for_doc(text);
 
         let mut tokens: Vec<Token> = vec![];
@@ -758,6 +779,84 @@ mod tests {
     }
 
     #[test]
+    fn test_flattened_mode_rejects_single_document_stream() {
+        let mut tokenizer =
+            JsonTokenizer::new(TextAnalyzer::builder(SimpleTokenizer::default()).build())
+                .with_mode(JsonTokenizerMode::FlattenedSubDocs);
+        let mut stream = tokenizer.token_stream_for_doc(r#"{"a":1}"#);
+        let error = stream
+            .try_next()
+            .expect_err("flattened mode must not use the single-document API");
+
+        assert!(error.contains("requires token_streams_for_doc"), "{error}");
+        assert!(stream.try_next().unwrap().is_none());
+    }
+
+    #[rstest]
+    #[case::exact(
+        "foo[00].bar[01],str,y",
+        &[
+            "foo$idx,number,0",
+            "foo..bar$idx,number,1",
+            "foo..bar.,str,y",
+        ]
+    )]
+    #[case::wildcard("foo[*].bar[*],str,y", &["foo..bar.,str,y"])]
+    fn test_flattened_json_search_paths(#[case] query: &str, #[case] expected_tokens: &[&str]) {
+        let mut tokenizer: Box<dyn LanceTokenizer> = Box::new(
+            JsonTokenizer::new(TextAnalyzer::builder(SimpleTokenizer::default()).build())
+                .with_mode(JsonTokenizerMode::FlattenedSubDocs),
+        );
+        let tokens = try_collect_query_tokens(query, &mut tokenizer).unwrap();
+        let actual_tokens = (0..tokens.len())
+            .map(|index| tokens.get_token(index))
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual_tokens, expected_tokens);
+    }
+
+    #[rstest]
+    #[case::empty_index("a[],str,x", "empty array index")]
+    #[case::missing_right_bracket("a[0,str,x", "missing right bracket")]
+    #[case::non_numeric_index("a[foo],str,x", "unsupported array index")]
+    #[case::negative_index("a[-1],str,x", "unsupported array index")]
+    #[case::floating_point_index("a[1.2],str,x", "unsupported array index")]
+    fn test_invalid_flattened_json_search_path(
+        #[case] query: &str,
+        #[case] expected_message: &str,
+    ) {
+        let mut tokenizer: Box<dyn LanceTokenizer> = Box::new(
+            JsonTokenizer::new(TextAnalyzer::builder(SimpleTokenizer::default()).build())
+                .with_mode(JsonTokenizerMode::FlattenedSubDocs),
+        );
+        let error = try_collect_query_tokens(query, &mut tokenizer)
+            .err()
+            .expect("invalid JSON path should fail");
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(expected_message), "{error}");
+    }
+
+    #[test]
+    fn test_flattened_json_rejects_overflowing_array_index() {
+        let index = (usize::MAX as u128 + 1).to_string();
+        let query = format!("a[{index}],str,x");
+        let mut tokenizer: Box<dyn LanceTokenizer> = Box::new(
+            JsonTokenizer::new(TextAnalyzer::builder(SimpleTokenizer::default()).build())
+                .with_mode(JsonTokenizerMode::FlattenedSubDocs),
+        );
+        let error = try_collect_query_tokens(&query, &mut tokenizer)
+            .err()
+            .expect("overflowing JSON path index should fail");
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains("does not fit in usize"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn test_flattened_json_preserves_nested_array_paths() {
         assert_sub_docs(
             r#"{"foo":[{"bar":["x","y"]},{"bar":"z"}]}"#,
@@ -768,6 +867,16 @@ mod tests {
                 "foo$idx,number,1;foo..bar,str,z",
             ],
         );
+    }
+
+    #[test]
+    fn test_flattened_json_empty_and_null_values() {
+        assert_sub_docs(
+            r#"{"empty_array":[],"empty_object":{},"array":[null],"object":{"null":null}}"#,
+            false,
+            &["array$idx,number,0;array.,null,null;object.null,null,null"],
+        );
+        assert_sub_docs(r#"{"empty_array":[],"empty_object":{}}"#, false, &[]);
     }
 
     #[rstest]
