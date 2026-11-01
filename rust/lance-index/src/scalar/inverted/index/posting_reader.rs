@@ -98,9 +98,8 @@ pub struct PostingListReader {
     pub(super) block_size: usize,
     pub(super) positions_layout: PositionsLayout,
 
-    /// Runtime posting-list cache grouping. Non-empty v2 indexes use synthetic
-    /// fixed groups so prewarm can improve cache density without rebuilding the
-    /// index or relying on persisted grouping metadata.
+    /// Runtime cache groups. Byte boundaries are cached separately from the
+    /// immutable source index and shared by request-local reader handles.
     pub(super) grouping: PostingGrouping,
 
     /// Modern postings contain dense DocIds into the partition document table.
@@ -237,7 +236,13 @@ impl PostingListReader {
         };
 
         let is_legacy_layout = matches!(&metadata, PostingMetadata::LegacyV1 { .. });
-        let grouping = PostingGrouping::for_reader(is_legacy_layout, reader.num_rows());
+        let grouping = PostingGrouping::for_reader(
+            is_legacy_layout,
+            positions_layout,
+            reader.num_rows(),
+            index_cache,
+        )
+        .await?;
         let modern_doc_id_validations = (!is_legacy_layout).then(|| {
             (0..reader.num_rows())
                 .map(|_| AtomicBool::new(false))

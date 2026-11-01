@@ -9,6 +9,222 @@ use lance_core::cache::{
     CacheBackend, CacheEntry, InternalCacheKey, MokaCacheBackend, QuickCacheBackend,
 };
 
+/// Keep only serialized values so a reopened reader cannot accidentally reuse
+/// the original in-memory grouping state or posting objects.
+#[derive(Debug, Default)]
+struct SerializedPostingCache {
+    entries: Mutex<HashMap<InternalCacheKey, (bytes::Bytes, usize)>>,
+}
+
+#[async_trait]
+impl CacheBackend for SerializedPostingCache {
+    async fn get(&self, key: &InternalCacheKey, codec: Option<CacheCodec>) -> Option<CacheEntry> {
+        let bytes = self.entries.lock().await.get(key)?.0.clone();
+        codec?.deserialize(&bytes).hit()
+    }
+    async fn insert(
+        &self,
+        key: &InternalCacheKey,
+        entry: CacheEntry,
+        size: usize,
+        codec: Option<CacheCodec>,
+    ) {
+        if let Some(codec) = codec {
+            let mut bytes = Vec::new();
+            codec.serialize(&entry, &mut bytes).unwrap();
+            self.entries.lock().await.insert(*key, (bytes.into(), size));
+        }
+    }
+    async fn get_or_insert<'a>(
+        &self,
+        key: &InternalCacheKey,
+        loader: BoxFuture<'a, Result<(CacheEntry, usize)>>,
+        codec: Option<CacheCodec>,
+    ) -> Result<(CacheEntry, bool)> {
+        if let Some(entry) = self.get(key, codec).await {
+            return Ok((entry, true));
+        }
+        let (entry, size) = loader.await?;
+        self.insert(key, entry.clone(), size, codec).await;
+        Ok((entry, false))
+    }
+    async fn clear(&self) {
+        self.entries.lock().await.clear();
+    }
+    async fn num_entries(&self) -> usize {
+        self.entries.lock().await.len()
+    }
+    async fn size_bytes(&self) -> usize {
+        self.entries
+            .lock()
+            .await
+            .values()
+            .map(|(_, size)| size)
+            .sum()
+    }
+}
+
+#[rstest::rstest]
+#[case::postings(false, 1, 2, 256)]
+#[case::positions(true, 3, 2, 256)]
+#[case::whole_chunk(true, 12, 1, 256)]
+#[case::oversized(true, 2, 2, 1)]
+#[tokio::test]
+async fn test_byte_prewarm_reopens_serialized_groups(
+    #[case] with_position: bool,
+    #[case] chunk_rows: usize,
+    #[case] concurrency: usize,
+    #[case] budget: usize,
+) {
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let format = InvertedListFormatVersion::V3;
+    let mut builder =
+        InnerBuilder::new_with_format_version(0, true, TokenSetFormat::default(), format);
+    let mut doc_id = 0u32;
+    let mut expected = Vec::new();
+    for token in 0..12u32 {
+        builder.tokens.get_or_add(&format!("term{token}"));
+        let mut posting =
+            PostingListBuilder::new_with_posting_tail_codec(true, format.posting_tail_codec());
+        let mut rows = Vec::new();
+        for _ in 0..=token % 4 {
+            posting.add(doc_id, PositionRecorder::Position(vec![1, 3].into()));
+            builder.docs.append(doc_id as u64, 2);
+            rows.push((doc_id as u64, 2));
+            doc_id += 1;
+        }
+        builder.posting_lists.push(posting);
+        expected.push(rows);
+    }
+    builder.write(store.as_ref()).await.unwrap();
+    let file = store.open_index_file(&posting_file_path(0)).await.unwrap();
+    let backend = Arc::new(SerializedPostingCache::default());
+    let cache = LanceCache::with_backend(backend.clone());
+    let mut reader = PostingListReader::try_new(file.clone(), &cache)
+        .await
+        .unwrap();
+    reader.modern_num_docs = Some(doc_id as usize);
+
+    // Populate an old token-count entry before changing the policy. Its key
+    // must not alias any of the smaller byte ranges in the same cache.
+    reader.grouping = PostingGrouping::SyntheticFixed { group_size: 128 };
+    reader
+        .posting_list(0, false, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    reader.grouping = PostingGrouping::byte_bounded(budget);
+    reader
+        .prewarm_posting_lists_chunked(with_position, Some(chunk_rows), concurrency)
+        .await
+        .unwrap();
+    let ranges: Vec<_> = (0..12)
+        .map(|token| reader.group_range_for_token(token).unwrap())
+        .collect();
+    if budget > 1 {
+        assert!(ranges.iter().any(|(start, end)| end - start > 1));
+    } else {
+        assert!(ranges.iter().all(|(start, end)| end - start == 1));
+    }
+    assert!(ranges.iter().all(|(start, end)| end - start < 12));
+    assert!(
+        cache
+            .get_with_key(&posting_list_group_cache_key(0, 12, reader.has_impacts))
+            .await
+            .is_some()
+    );
+
+    // Recover the byte directory from encoded cache bytes, as after restart.
+    let key = PostingGroupBoundariesKey {
+        max_bytes: budget,
+        token_count: 12,
+    };
+    let bounds = cache.get_with_key(&key).await.unwrap();
+    let expected_ends = bounds.ends.clone();
+    drop(bounds);
+    drop(reader);
+    let mut reopened = PostingListReader::try_new(file, &cache).await.unwrap();
+    reopened.grouping = PostingGrouping::byte_bounded(budget);
+    reopened.grouping.restore(12, &cache).await;
+    reopened.modern_num_docs = Some(doc_id as usize);
+    reopened.ensure_metadata_loaded().await.unwrap();
+    for token in 0..12u32 {
+        assert_eq!(
+            reopened.group_range_for_token(token),
+            Some(ranges[token as usize])
+        );
+        let metrics = LocalMetricsCollector::default();
+        let posting = reopened
+            .posting_list_with_policy(
+                token,
+                with_position,
+                &metrics,
+                PostingReadPolicy::CacheAwareExact,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            posting
+                .iter()
+                .map(|(doc, freq, _)| (doc, freq))
+                .collect::<Vec<_>>(),
+            expected[token as usize]
+        );
+        assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 0);
+        if with_position {
+            for (_, _, positions) in posting.iter() {
+                assert_eq!(positions.unwrap().collect::<Vec<_>>(), vec![1, 3]);
+            }
+        }
+    }
+    // A different read chunk size and concurrency must reconstruct identical
+    // greedy boundaries, not duplicate groups based on I/O scheduling.
+    reopened
+        .prewarm_posting_lists_chunked(with_position, Some(2), 3)
+        .await
+        .unwrap();
+    assert_eq!(cache.get_with_key(&key).await.unwrap().ends, expected_ends);
+
+    // Rolling back to the old policy can still read the old cache entry.
+    reopened.grouping = PostingGrouping::SyntheticFixed { group_size: 128 };
+    let metrics = LocalMetricsCollector::default();
+    let posting = reopened.posting_list(5, false, &metrics).await.unwrap();
+    assert_eq!(
+        posting
+            .iter()
+            .map(|(doc, freq, _)| (doc, freq))
+            .collect::<Vec<_>>(),
+        expected[5]
+    );
+    assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 0);
+    // Losing only the directory keeps the old cold-read policy usable. The
+    // persisted small groups remain harmless entries under their range keys.
+    let directory_codec = CacheCodec::from_impl::<PostingGroupBoundaries>();
+    backend
+        .entries
+        .lock()
+        .await
+        .retain(|_, (bytes, _)| directory_codec.deserialize(bytes).hit().is_none());
+    reopened.grouping = PostingGrouping::byte_bounded(budget);
+    reopened.grouping.restore(12, &cache).await;
+    assert_eq!(reopened.group_range_for_token(5), Some((0, 12)));
+    let posting = reopened
+        .posting_list(5, false, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(
+        posting
+            .iter()
+            .map(|(doc, freq, _)| (doc, freq))
+            .collect::<Vec<_>>(),
+        expected[5]
+    );
+}
+
 #[rstest::rstest]
 #[case::quick(Arc::new(QuickCacheBackend::with_capacity(1 << 20)))]
 #[case::moka(Arc::new(MokaCacheBackend::with_capacity(1 << 20)))]
@@ -587,7 +803,7 @@ async fn test_prewarm_streams_in_chunks_preserves_content(
 
     // One partition with enough tokens to span multiple runtime synthetic
     // groups and several docs per token.
-    let num_tokens = runtime_posting_group_tokens() as u32 + 4;
+    let num_tokens = TEST_GROUP_TOKENS as u32 + 4;
     const DOCS_PER_TOKEN: u32 = 3;
     let posting_tail_codec = format_version.posting_tail_codec();
     let mut builder = InnerBuilder::new_with_format_version_and_block_size(
@@ -732,7 +948,7 @@ async fn test_prewarm_streams_in_chunks_with_positions(
     ));
 
     let posting_tail_codec = format_version.posting_tail_codec();
-    let num_tokens = runtime_posting_group_tokens() as u32 + 4;
+    let num_tokens = TEST_GROUP_TOKENS as u32 + 4;
     const DOCS_PER_TOKEN: u32 = 3;
     let mut builder =
         InnerBuilder::new_with_format_version(0, true, TokenSetFormat::default(), format_version);
