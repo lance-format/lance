@@ -2405,21 +2405,36 @@ fn visit_predicate_equality(
     Ok(expand())
 }
 
-/// `predicate IS TRUE`, or `predicate IS FALSE` when `value` is false, for an
-/// indexed Boolean column or a comparison or `IN` list of an indexed column
-/// against non-null literals.
+/// The plain column that `predicate` is NULL exactly where, when it only
+/// combines comparisons of that column against non-null literals.
 ///
-/// Such a predicate is NULL exactly where the column is, so `IS TRUE` is the
-/// predicate with NULL rows excluded. That is what tells the two apart once
-/// negated: `NOT (x = 1)` drops NULL rows, `NOT ((x = 1) IS TRUE)` keeps them.
-fn visit_is_truth_value(
-    predicate: &Expr,
-    value: bool,
+/// A function of a column, such as a JSON accessor, can be NULL where the
+/// column is not, so only a plain column qualifies.
+fn null_where_column_is<'a>(
+    predicate: &'a Expr,
     index_info: &dyn IndexInformationProvider,
-    depth: usize,
-) -> Result<Option<IndexedExpression>> {
-    let (column, literals) = match predicate {
-        Expr::Column(_) => (predicate, &[][..]),
+) -> Option<&'a Expr> {
+    let against_literals = |column: &'a Expr, literals: &[&Expr]| {
+        if !matches!(column, Expr::Column(_)) {
+            return None;
+        }
+        let (_, column_type, _) = maybe_indexed_column(column, index_info)?;
+        literals
+            .iter()
+            .all(|literal| maybe_scalar(literal, &column_type).is_some_and(|v| !v.is_null()))
+            .then_some(column)
+    };
+    match predicate {
+        Expr::Column(_) => Some(predicate),
+        Expr::Not(inner) => null_where_column_is(inner, index_info),
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::And | Operator::Or,
+            right,
+        }) => {
+            let column = null_where_column_is(left, index_info)?;
+            (null_where_column_is(right, index_info)? == column).then_some(column)
+        }
         Expr::BinaryExpr(BinaryExpr { left, op, right })
             if matches!(
                 op,
@@ -2431,25 +2446,35 @@ fn visit_is_truth_value(
                     | Operator::GtEq
             ) =>
         {
-            (left.as_ref(), std::slice::from_ref(right.as_ref()))
+            against_literals(left, &[right])
         }
-        Expr::InList(in_list) => (in_list.expr.as_ref(), in_list.list.as_slice()),
-        _ => return Ok(None),
-    };
-    // A function of a column, such as a JSON accessor, can be NULL where the
-    // column is not, so only a plain column is known to share its NULL rows.
-    if !matches!(column, Expr::Column(_)) {
-        return Ok(None);
+        Expr::Between(between) => against_literals(&between.expr, &[&between.low, &between.high]),
+        Expr::InList(in_list) => {
+            against_literals(&in_list.expr, &in_list.list.iter().collect::<Vec<_>>())
+        }
+        _ => None,
     }
-    let Some((column, column_type, query_parser)) = maybe_indexed_column(column, index_info) else {
+}
+
+/// `predicate IS TRUE`, or `predicate IS FALSE` when `value` is false, for a
+/// predicate that is NULL exactly where one indexed column is, such as a
+/// Boolean column or a comparison against a non-null literal.
+///
+/// That makes `IS TRUE` the predicate with the column's NULL rows excluded,
+/// which is what tells the two apart once negated: `NOT (x = 1)` drops NULL
+/// rows, `NOT ((x = 1) IS TRUE)` keeps them.
+fn visit_is_truth_value(
+    predicate: &Expr,
+    value: bool,
+    index_info: &dyn IndexInformationProvider,
+    depth: usize,
+) -> Result<Option<IndexedExpression>> {
+    let Some(column) = null_where_column_is(predicate, index_info) else {
         return Ok(None);
     };
-    let is_non_null_literal = |literal: &Expr| {
-        maybe_scalar(literal, &column_type).is_some_and(|literal| !literal.is_null())
-    };
-    if !literals.iter().all(is_non_null_literal) {
+    let Some((column, _, query_parser)) = maybe_indexed_column(column, index_info) else {
         return Ok(None);
-    }
+    };
     let matches = if matches!(predicate, Expr::Column(_)) {
         visit_is_bool(predicate, index_info, value)
     } else {
@@ -5640,6 +5665,10 @@ mod tests {
         "(x = 1) IS NOT TRUE",
         "NOT(AND([x = 1]@x_idx(BTree),NOT([x IS NULL]@x_idx(BTree))))"
     )]
+    #[case::or_chain(
+        "(x = 1 OR NOT x BETWEEN 3 AND 5) IS NOT TRUE",
+        "NOT(AND(OR([x = 1]@x_idx(BTree),NOT([x >= 3 && x <= 5]@x_idx(BTree))),NOT([x IS NULL]@x_idx(BTree))))"
+    )]
     #[case::is_false(
         "(x = 1) IS FALSE",
         "AND(NOT([x = 1]@x_idx(BTree)),NOT([x IS NULL]@x_idx(BTree)))"
@@ -5671,6 +5700,7 @@ mod tests {
     #[case::null_in_list("(x IN (1, NULL)) IS TRUE")]
     #[case::null_literal("(x = CAST(NULL AS BIGINT)) IS NOT TRUE")]
     #[case::computed("(x + 1 = 2) IS TRUE")]
+    #[case::two_columns("(x = 1 OR y = 2) IS NOT TRUE")]
     #[case::computed_side("(x > 2) != (x + y > 3)")]
     #[case::recheck_xor("(x > 2) != (y < 6)")]
     #[case::recheck_distinct("x IS DISTINCT FROM 3")]
