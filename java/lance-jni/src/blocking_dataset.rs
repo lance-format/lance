@@ -31,7 +31,7 @@ use jni::{JNIEnv, objects::JObject};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::cleanup::{
     CleanupCandidateFile, CleanupExplanation, CleanupFileKind, CleanupPolicy,
-    CleanupReferencedBranch, RemovalStats,
+    CleanupReferencedBranch, RemovalStats, parse_cleanup_policy,
 };
 use lance::dataset::optimize::{CompactionOptions as RustCompactionOptions, compact_files};
 use lance::dataset::refs::{Ref, TagContents};
@@ -204,7 +204,7 @@ impl BlockingDataset {
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         uri: &str,
-        version: Option<u64>,
+        reference: Option<Ref>,
         block_size: Option<i32>,
         index_cache_size_bytes: i64,
         metadata_cache_size_bytes: i64,
@@ -253,9 +253,14 @@ impl BlockingDataset {
             builder = builder.with_base_store_params(base_path, store_params);
         }
 
-        if let Some(ver) = version {
-            builder = builder.with_version(ver);
-        }
+        builder = match reference {
+            Some(Ref::VersionNumber(version)) | Some(Ref::Version(None, Some(version))) => {
+                builder.with_version(version)
+            }
+            Some(Ref::Version(Some(branch), version)) => builder.with_branch(&branch, version),
+            Some(Ref::Tag(tag)) => builder.with_tag(&tag),
+            Some(Ref::Version(None, None)) | None => builder,
+        };
 
         if let Some(serialized_manifest) = serialized_manifest {
             builder = builder.with_serialized_manifest(serialized_manifest)?;
@@ -476,22 +481,6 @@ impl BlockingDataset {
     pub fn compact(&mut self, options: RustCompactionOptions) -> Result<()> {
         block_on(compact_files(&mut self.inner, options, None))?;
         Ok(())
-    }
-
-    pub fn cleanup_with_policy(&mut self, policy: CleanupPolicy) -> Result<RemovalStats> {
-        Ok(block_on(self.inner.cleanup_with_policy(policy))?)
-    }
-
-    pub fn explain_cleanup_with_policy(
-        &self,
-        policy: CleanupPolicy,
-        max_candidate_files: Option<usize>,
-    ) -> Result<CleanupExplanation> {
-        let mut op = self.inner.cleanup(policy);
-        if let Some(limit) = max_candidate_files {
-            op = op.with_max_candidate_files(limit);
-        }
-        Ok(block_on(op.explain())?)
     }
 
     pub fn close(&self) {}
@@ -1198,7 +1187,8 @@ fn inner_create_index<'local>(
         | IndexType::ZoneMap
         | IndexType::BloomFilter
         | IndexType::Fm
-        | IndexType::RTree => {
+        | IndexType::RTree
+        | IndexType::MinHashLsh => {
             // For scalar indices, create a scalar IndexParams
             let (index_type_str, params_opt) = get_scalar_index_params(env, params_jobj)?;
             let scalar_params = lance_index::scalar::ScalarIndexParams {
@@ -1230,85 +1220,83 @@ fn inner_create_index<'local>(
 
     let params = params_result?;
 
-    let index_metadata = match progress {
-        Some(progress) => {
-            // Progress callbacks may re-enter read-only methods on this Dataset. Clone the Dataset
-            // and release the native field guard before the long-running build so those callbacks
-            // do not deadlock on the field mutex.
-            let mut working_dataset = {
-                let dataset_guard = unsafe {
-                    env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
-                }?;
-                dataset_guard.inner.clone()
-            };
-            let initial_version = working_dataset.version().version;
-            let index_metadata = execute_create_index(
-                &mut working_dataset,
-                &columns_slice,
-                index_type,
-                params.as_ref(),
-                replace,
-                train,
-                name,
-                fragment_ids,
-                index_uuid,
-                batch_reader,
-                Some(progress),
+    let index_metadata = if progress.is_some() || skip_commit {
+        // Progress callbacks may re-enter read-only methods on this Dataset. Clone the Dataset
+        // and release the native field guard before the long-running build so those callbacks
+        // do not deadlock on the field mutex. Uncommitted builds never publish a new version, so
+        // they also build on a clone instead of serializing every build on this handle.
+        let mut working_dataset = {
+            let dataset_guard = unsafe {
+                env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
+            }?;
+            dataset_guard.inner.clone()
+        };
+        let initial_version = working_dataset.version().version;
+        let index_metadata = execute_create_index(
+            &mut working_dataset,
+            &columns_slice,
+            index_type,
+            params.as_ref(),
+            replace,
+            train,
+            name,
+            fragment_ids,
+            index_uuid,
+            batch_reader,
+            progress,
+            skip_commit,
+        )
+        .inspect_err(|_| {
+            // A committed build may fail while materializing its return metadata. The clone
+            // has already observed the durable commit, so publish it before propagating.
+            if should_publish_working_dataset_on_error(
                 skip_commit,
-            )
-            .inspect_err(|_| {
-                // A committed build may fail while materializing its return metadata. The clone
-                // has already observed the durable commit, so publish it before propagating.
-                if should_publish_working_dataset_on_error(
-                    skip_commit,
-                    initial_version,
-                    working_dataset.version().version,
-                ) {
-                    match unsafe {
-                        env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
-                    } {
-                        Ok(mut dataset_guard) => {
-                            dataset_guard.inner = working_dataset.clone();
-                        }
-                        Err(publish_error) => {
-                            log::warn!(
-                                "Failed to publish committed dataset version {} after create-index failure: {}",
-                                working_dataset.version().version,
-                                publish_error
-                            );
-                        }
+                initial_version,
+                working_dataset.version().version,
+            ) {
+                match unsafe {
+                    env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
+                } {
+                    Ok(mut dataset_guard) => {
+                        dataset_guard.inner = working_dataset.clone();
+                    }
+                    Err(publish_error) => {
+                        log::warn!(
+                            "Failed to publish committed dataset version {} after create-index failure: {}",
+                            working_dataset.version().version,
+                            publish_error
+                        );
                     }
                 }
-            })?;
-
-            if !skip_commit {
-                let mut dataset_guard = unsafe {
-                    env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
-                }?;
-                dataset_guard.inner = working_dataset;
             }
-            index_metadata
-        }
-        None => {
-            // Preserve the existing no-progress path, including its native-field locking behavior.
+        })?;
+
+        if !skip_commit {
             let mut dataset_guard = unsafe {
-                env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET)
+                env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)
             }?;
-            execute_create_index(
-                &mut dataset_guard.inner,
-                &columns_slice,
-                index_type,
-                params.as_ref(),
-                replace,
-                train,
-                name,
-                fragment_ids,
-                index_uuid,
-                batch_reader,
-                None,
-                skip_commit,
-            )?
+            dataset_guard.inner = working_dataset;
         }
+        index_metadata
+    } else {
+        // Preserve the existing committed no-progress path, including its native-field locking
+        // behavior.
+        let mut dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        execute_create_index(
+            &mut dataset_guard.inner,
+            &columns_slice,
+            index_type,
+            params.as_ref(),
+            replace,
+            train,
+            name,
+            fragment_ids,
+            index_uuid,
+            batch_reader,
+            None,
+            skip_commit,
+        )?
     };
 
     (&index_metadata).into_java(env)
@@ -1646,6 +1634,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
     _obj: JObject,
     path: JString,
     version_obj: JObject,    // Optional<Long>
+    ref_obj: JObject,        // Optional<Ref>
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
@@ -1663,6 +1652,7 @@ pub extern "system" fn Java_org_lance_Dataset_openNative<'local>(
             &mut env,
             path,
             version_obj,
+            ref_obj,
             block_size_obj,
             index_cache_size_bytes,
             metadata_cache_size_bytes,
@@ -1720,6 +1710,7 @@ fn inner_open_native<'local>(
     env: &mut JNIEnv<'local>,
     path: JString,
     version_obj: JObject,    // Optional<Long>
+    ref_obj: JObject,        // Optional<Ref>
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size_bytes: jlong,
     metadata_cache_size_bytes: jlong,
@@ -1733,6 +1724,10 @@ fn inner_open_native<'local>(
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
     let version = env.get_u64_opt(&version_obj)?;
+    // ReadOptions.Builder rejects setting both, so at most one of them is present.
+    let reference = env
+        .get_optional(&ref_obj, |env, jref| transform_jref_to_ref(jref, env))?
+        .or(version.map(Ref::from));
     let block_size = env.get_int_opt(&block_size_obj)?;
     let jmap = JMap::from_env(env, &storage_options_obj)?;
     let storage_options = to_rust_map(env, &jmap)?;
@@ -1761,7 +1756,7 @@ fn inner_open_native<'local>(
 
     let dataset = BlockingDataset::open(
         &path_str,
-        version,
+        reference,
         block_size,
         index_cache_size_bytes,
         metadata_cache_size_bytes,
@@ -3641,21 +3636,66 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCleanupWithPolicy<'local>(
     mut env: JNIEnv<'local>,
     jdataset: JObject,
     jpolicy: JObject,
+    jdelete_concurrency: JObject,
+    jdelete_rate_limit: JObject,
+    jretention_policy: JObject,
 ) -> JObject<'local> {
-    ok_or_throw!(env, inner_cleanup_with_policy(&mut env, jdataset, jpolicy))
+    ok_or_throw!(
+        env,
+        inner_cleanup_with_policy(
+            &mut env,
+            jdataset,
+            jpolicy,
+            jdelete_concurrency,
+            jdelete_rate_limit,
+            jretention_policy
+        )
+    )
 }
 
 fn inner_cleanup_with_policy<'local>(
     env: &mut JNIEnv<'local>,
     jdataset: JObject,
     jpolicy: JObject,
+    jdelete_concurrency: JObject,
+    jdelete_rate_limit: JObject,
+    jretention_policy: JObject,
 ) -> Result<JObject<'local>> {
     let policy = extract_cleanup_policy(env, &jpolicy)?;
+    let retention_policy: Option<String> = env.get_optional(&jretention_policy, |env, obj| {
+        Ok(env.get_string(&JString::from(obj))?.into())
+    })?;
+    let delete_concurrency = env.get_optional(&jdelete_concurrency, |env, obj| {
+        let value = env.call_method(obj, "longValue", "()J", &[])?.j()?;
+        usize::try_from(value).map_err(|_| {
+            Error::input_error(format!(
+                "delete_concurrency is out of range for usize, got {value}"
+            ))
+        })
+    })?;
 
+    let delete_rate_limit = env.get_optional(&jdelete_rate_limit, |env, obj| {
+        let value = env.call_method(obj, "longValue", "()J", &[])?.j()?;
+        u64::try_from(value).map_err(|_| {
+            Error::input_error(format!(
+                "delete_rate_limit is out of range for u64, got {value}"
+            ))
+        })
+    })?;
     let stats = {
-        let mut dataset =
+        let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        dataset.cleanup_with_policy(policy)
+        let mut operation = dataset.inner.cleanup(policy);
+        if let Some(value) = retention_policy {
+            operation = operation.with_retention_policy(parse_cleanup_policy(&value)?)?;
+        }
+        if let Some(concurrency) = delete_concurrency {
+            operation = operation.with_delete_concurrency(concurrency)?;
+        }
+        if let Some(rate) = delete_rate_limit {
+            operation = operation.with_delete_rate_limit(rate)?;
+        }
+        block_on(operation.execute())
     }?;
 
     cleanup_stats_to_java(env, stats)
@@ -3667,10 +3707,17 @@ pub extern "system" fn Java_org_lance_Dataset_nativeExplainCleanupWithPolicy<'lo
     jdataset: JObject,
     jpolicy: JObject,
     jmax_candidate_files: JObject,
+    jretention_policy: JObject,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_explain_cleanup_with_policy(&mut env, jdataset, jpolicy, jmax_candidate_files)
+        inner_explain_cleanup_with_policy(
+            &mut env,
+            jdataset,
+            jpolicy,
+            jmax_candidate_files,
+            jretention_policy
+        )
     )
 }
 
@@ -3679,8 +3726,12 @@ fn inner_explain_cleanup_with_policy<'local>(
     jdataset: JObject,
     jpolicy: JObject,
     jmax_candidate_files: JObject,
+    jretention_policy: JObject,
 ) -> Result<JObject<'local>> {
     let policy = extract_cleanup_policy(env, &jpolicy)?;
+    let retention_policy: Option<String> = env.get_optional(&jretention_policy, |env, obj| {
+        Ok(env.get_string(&JString::from(obj))?.into())
+    })?;
     let max_candidate_files = env
         .get_optional(&jmax_candidate_files, |env, inner| {
             Ok(env.call_method(inner, "longValue", "()J", &[])?.j()?)
@@ -3698,7 +3749,14 @@ fn inner_explain_cleanup_with_policy<'local>(
     let explanation = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        dataset.explain_cleanup_with_policy(policy, max_candidate_files)
+        let mut operation = dataset.inner.cleanup(policy);
+        if let Some(value) = retention_policy {
+            operation = operation.with_retention_policy(parse_cleanup_policy(&value)?)?;
+        }
+        if let Some(limit) = max_candidate_files {
+            operation = operation.with_max_candidate_files(limit);
+        }
+        block_on(operation.explain())
     }?;
 
     cleanup_explanation_to_java(env, explanation)
@@ -3758,7 +3816,7 @@ fn cleanup_stats_to_java<'local>(
 ) -> Result<JObject<'local>> {
     Ok(env.new_object(
         "org/lance/cleanup/RemovalStats",
-        "(JJJJJJ)V",
+        "(JJJJJJJ)V",
         &[
             JValue::Long(stats.bytes_removed as i64),
             JValue::Long(stats.old_versions as i64),
@@ -3766,6 +3824,7 @@ fn cleanup_stats_to_java<'local>(
             JValue::Long(stats.transaction_files_removed as i64),
             JValue::Long(stats.index_files_removed as i64),
             JValue::Long(stats.deletion_files_removed as i64),
+            JValue::Long(stats.failed_deletes as i64),
         ],
     )?)
 }
@@ -3985,6 +4044,7 @@ fn inner_describe_indices<'local>(
             must_support_fts,
             fts_document_granularity: None,
             must_support_exact_equality,
+            must_support_minhash: false,
         })
     })?;
 
@@ -4015,73 +4075,105 @@ pub extern "system" fn Java_org_lance_Dataset_nativeCountIndexedRows(
 fn inner_count_indexed_rows(
     env: &mut JNIEnv,
     java_dataset: JObject,
-    _jindex_name: JString,
+    jindex_name: JString,
     jfilter: JString,
     jfragment_ids: JObject, // Optional<List<Integer>>
 ) -> Result<i64> {
+    let index_name: String = jindex_name.extract(env)?;
     let filter: String = jfilter.extract(env)?;
+    let fragment_ids = extract_count_fragment_ids(env, &jfragment_ids)?;
 
-    // Extract optional fragment IDs
-    let fragment_ids: Option<Vec<u32>> = if env
-        .call_method(&jfragment_ids, "isPresent", "()Z", &[])?
-        .z()?
-    {
-        let list_obj = env
-            .call_method(&jfragment_ids, "get", "()Ljava/lang/Object;", &[])?
-            .l()?;
-        let list = env.get_list(&list_obj)?;
-        let mut ids = Vec::new();
-        let mut iter = list.iter(env)?;
-        while let Some(elem) = iter.next(env)? {
-            let int_val = env.call_method(&elem, "intValue", "()I", &[])?.i()?;
-            ids.push(int_val as u32);
-        }
-        Some(ids)
-    } else {
-        None
-    };
+    count_indexed_rows(env, java_dataset, index_name, filter, None, fragment_ids)
+}
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeCountIndexedRowsWithSegments(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    jindex_name: JString,
+    jfilter: JString,
+    jsegment_uuids: JObject, // List<UUID>
+    jfragment_ids: JObject,  // Optional<List<Integer>>
+) -> jlong {
+    ok_or_throw_with_return!(
+        env,
+        inner_count_indexed_rows_with_segments(
+            &mut env,
+            java_dataset,
+            jindex_name,
+            jfilter,
+            jsegment_uuids,
+            jfragment_ids,
+        ),
+        -1
+    )
+}
+
+fn inner_count_indexed_rows_with_segments(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    jindex_name: JString,
+    jfilter: JString,
+    jsegment_uuids: JObject,
+    jfragment_ids: JObject,
+) -> Result<i64> {
+    let index_name: String = jindex_name.extract(env)?;
+    let filter: String = jfilter.extract(env)?;
+    let segment_uuids =
+        import_vec_to_rust(env, &jsegment_uuids, |env, obj| obj.extract_object(env))?;
+    let fragment_ids = extract_count_fragment_ids(env, &jfragment_ids)?;
+
+    count_indexed_rows(
+        env,
+        java_dataset,
+        index_name,
+        filter,
+        Some(segment_uuids),
+        fragment_ids,
+    )
+}
+
+fn extract_count_fragment_ids(
+    env: &mut JNIEnv,
+    jfragment_ids: &JObject,
+) -> Result<Option<Vec<u32>>> {
+    env.get_ints_opt(jfragment_ids)?
+        .map(|fragment_ids| {
+            fragment_ids
+                .into_iter()
+                .map(|fragment_id| {
+                    u32::try_from(fragment_id).map_err(|_| {
+                        Error::input_error(format!(
+                            "fragment ID must be non-negative, got {fragment_id}"
+                        ))
+                    })
+                })
+                .collect()
+        })
+        .transpose()
+}
+
+fn count_indexed_rows(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    index_name: String,
+    filter: String,
+    segment_uuids: Option<Vec<Uuid>>,
+    fragment_ids: Option<Vec<u32>>,
+) -> Result<i64> {
     let count = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-
-        // Use a scanner with fragment filtering to count rows
-        // This ensures we only count rows in the specified fragments
-        let inner = dataset_guard.inner.clone();
-
-        block_on(async {
-            let mut scanner = inner.scan();
-
-            // Apply filter
-            if !filter.is_empty() {
-                scanner.filter(&filter)?;
-            }
-
-            // Empty projection and enable row_id for count_rows to work
-            // count_rows() requires metadata-only projection
-            scanner.project::<String>(&[])?;
-            scanner.with_row_id();
-
-            // Apply fragment filter if specified
-            if let Some(frag_ids) = fragment_ids {
-                // Convert FileFragment to Fragment by extracting metadata
-                let filtered_fragments: Vec<_> = inner
-                    .get_fragments()
-                    .into_iter()
-                    .filter(|f| frag_ids.contains(&(f.id() as u32)))
-                    .map(|f| f.metadata().clone())
-                    .collect();
-                scanner.with_fragments(filtered_fragments);
-            }
-
-            // Use the scanner's count_rows method
-            let count = scanner.count_rows().await?;
-
-            Ok::<i64, lance::Error>(count as i64)
-        })?
+        block_on(dataset_guard.inner.count_indexed_rows(
+            &index_name,
+            &filter,
+            segment_uuids.as_deref(),
+            fragment_ids.as_deref(),
+        ))?
     };
 
-    Ok(count)
+    i64::try_from(count)
+        .map_err(|_| Error::input_error(format!("indexed row count {count} exceeds Java long")))
 }
 
 //////////////////////////////
@@ -4163,6 +4255,7 @@ fn inner_get_zonemap_stats<'local>(
                     must_support_fts: false,
                     fts_document_granularity: None,
                     must_support_exact_equality: false,
+                    must_support_minhash: false,
                 }))
                 .await
                 .map_err(Error::from)?;

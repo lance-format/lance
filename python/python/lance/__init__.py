@@ -17,19 +17,24 @@ from .blob import (
     BlobDescriptorArrayBuilder,
     BlobFile,
     DedicatedBlobWriter,
+    ManagedBlobWriter,
     PackedBlobWriter,
     blob_array,
     blob_field,
 )
 from .dataset import (
+    CleanupPolicy,
+    CleanupRule,
     DataStatistics,
     FieldStatistics,
     Index,
     IndexFile,
+    KeepOne,
     LanceDataset,
     LanceOperation,
     LanceScanner,
     MergeInsertBuilder,
+    RemoveAll,
     Session,
     Transaction,
     __version__,
@@ -44,6 +49,7 @@ from .lance import (
     CleanupStats,
     DatasetBasePath,
     FFILanceTableProvider,
+    FragmentAddColumnsCleanup,
     FtsToken,
     ScanStatistics,
     bytes_read_counter,
@@ -63,22 +69,16 @@ from .mem_wal import (
     ShardWriter,
     evaluate_sharding_spec,
 )
-from .namespace import (
-    DescribeTableRequest,
-    LanceNamespace,
-)
 from .progress import IndexProgress
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
 
 if TYPE_CHECKING:
-    from datetime import datetime
     from pathlib import Path
 
     from lance.commit import CommitLock
-    from lance.dependencies import pandas as pd
-
-    ts_types = Union[datetime, pd.Timestamp, str]
+    from lance.namespace import LanceNamespace
+    from lance.util import ts_types
 
 
 __all__ = [
@@ -89,6 +89,7 @@ __all__ = [
     "DedicatedBlobWriter",
     "BlobDescriptorArrayBuilder",
     "PackedBlobWriter",
+    "ManagedBlobWriter",
     "BlobDescriptor",
     "blob_array",
     "blob_field",
@@ -96,9 +97,14 @@ __all__ = [
     "CleanupExplanation",
     "CleanupReferencedBranch",
     "CleanupStats",
+    "CleanupPolicy",
+    "CleanupRule",
+    "KeepOne",
+    "RemoveAll",
     "DatasetBasePath",
     "DataStatistics",
     "FieldStatistics",
+    "FragmentAddColumnsCleanup",
     "FragmentMetadata",
     "FtsToken",
     "Index",
@@ -169,6 +175,9 @@ def dataset(
     asof : optional, datetime or str
         If specified, find the latest version created on or earlier than the given
         argument value. If a version is already specified, this arg is ignored.
+        Pandas timestamps are accepted, but ``pandas.NaT`` raises ``ValueError``.
+        Strings use pandas parsing when installed; otherwise they must match
+        ``YYYY-MM-DD HH:MM:SS``. Use ``version`` for version numbers or tags.
     block_size : optional, int
         Block size in bytes. Provide a hint for the size of the minimal I/O request.
     commit_lock : optional, lance.commit.CommitLock
@@ -269,6 +278,8 @@ def dataset(
 
         # Resolve the latest table metadata here. The requested dataset version is
         # applied by the lower-level dataset open path after namespace resolution.
+        from .namespace import DescribeTableRequest
+
         request = DescribeTableRequest(id=table_id, version=None)
         response = namespace_client.describe_table(request)
 
@@ -364,3 +375,14 @@ forkserver instead."
 
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(before=__warn_on_fork)
+
+
+# `lance.namespace` pulls in the generated `lance_namespace` REST client, which
+# costs more than a second of import time. Most users never touch a namespace,
+# so resolve these re-exports on first access instead of at `import lance`.
+def __getattr__(name: str):
+    if name in ("DescribeTableRequest", "LanceNamespace"):
+        from . import namespace
+
+        return getattr(namespace, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

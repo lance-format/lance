@@ -142,6 +142,7 @@ impl DatasetBuilder {
     ) -> Result<Self> {
         let request = DescribeTableRequest {
             id: Some(table_id.clone()),
+            vend_credentials: Some(true),
             ..Default::default()
         };
 
@@ -805,12 +806,20 @@ impl DatasetBuilder {
             (base_path, table_uri)
         };
 
+        // A delayed checkout resolves (branch, version) against the right chain
+        // afterwards, so the uri's chain only needs its latest version here: the
+        // requested version number may not exist on that chain at all.
+        let load_version = if need_delay_checkout {
+            None
+        } else {
+            version_number
+        };
         let dataset = Self::load_by_uri(
             session,
             manifest,
             file_reader_options,
             table_uri,
-            version_number,
+            load_version,
             object_store,
             base_path,
             commit_handler,
@@ -948,6 +957,8 @@ mod tests {
     use lance_table::io::commit::UnsafeCommitHandler;
 
     use super::*;
+    use lance_namespace::models::DescribeTableResponse;
+    use std::sync::Mutex;
 
     #[derive(Debug)]
     struct TestStorageOptionsProvider;
@@ -1032,5 +1043,61 @@ mod tests {
                     .contains("does not support external or custom commit handlers")
             );
         }
+    }
+
+    /// Mock namespace that records the describe request and vends storage
+    /// options only when explicitly asked -- the behavior of a fail-closed
+    /// server.
+    #[derive(Debug, Default)]
+    struct FailClosedNamespace {
+        seen: Mutex<Option<DescribeTableRequest>>,
+    }
+
+    #[async_trait]
+    impl LanceNamespace for FailClosedNamespace {
+        fn namespace_id(&self) -> String {
+            "fail-closed-mock".to_string()
+        }
+
+        async fn describe_table(
+            &self,
+            request: DescribeTableRequest,
+        ) -> lance_namespace::Result<DescribeTableResponse> {
+            let vend = request.vend_credentials == Some(true);
+            *self.seen.lock().unwrap() = Some(request);
+            Ok(DescribeTableResponse {
+                location: Some("memory://ns-table".to_string()),
+                storage_options: vend
+                    .then(|| HashMap::from([("vended".to_string(), "true".to_string())])),
+                ..Default::default()
+            })
+        }
+    }
+
+    /// The initial namespace describe must opt into credential vending
+    /// explicitly: a fail-closed server returns no storage options for an
+    /// unset flag, and the refresh provider is only installed when this first
+    /// response already carries them (ENT-2008).
+    #[tokio::test]
+    async fn test_from_namespace_requests_vended_credentials() {
+        let namespace = Arc::new(FailClosedNamespace::default());
+        let builder = DatasetBuilder::from_namespace(namespace.clone(), vec!["t".to_string()])
+            .await
+            .unwrap();
+
+        let seen = namespace.seen.lock().unwrap().take().unwrap();
+        assert_eq!(seen.vend_credentials, Some(true));
+        assert_eq!(seen.id, Some(vec!["t".to_string()]));
+        // The vended options made it onto the builder, so the refresh
+        // provider path (installed only when the first response carries
+        // options) is reachable.
+        assert_eq!(
+            builder
+                .storage_options_override
+                .as_ref()
+                .and_then(|o| o.get("vended"))
+                .map(String::as_str),
+            Some("true")
+        );
     }
 }

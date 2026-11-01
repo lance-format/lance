@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::{Dataset, Error, Result};
 use arrow_array::ArrayRef;
 use arrow_array::{Array, RecordBatch, RecordBatchReader, new_null_array};
+use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_row::{OwnedRow, RowConverter, Rows, SortField};
 use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use arrow_select::interleave::interleave;
@@ -37,6 +38,8 @@ impl HashJoiner {
     /// Create a new `HashJoiner`, building the hash index.
     ///
     /// Will run in parallel over batches using all available cores.
+    /// Returns an input error if the right-side join column contains duplicate keys,
+    /// including duplicate nulls.
     pub async fn try_new(reader: Box<dyn RecordBatchReader + Send>, on: &str) -> Result<Self> {
         // Check column exist
         let schema = reader.schema();
@@ -81,10 +84,19 @@ impl HashJoiner {
                 let map = map.clone();
                 async move {
                     let column = batch[on].clone();
+                    let on = on.to_owned();
                     let task_result = task::spawn_blocking(move || {
-                        let rows = column_to_rows(column)?;
+                        let rows = column_to_rows(column.clone())?;
                         for (row_i, row) in rows.iter().enumerate() {
-                            map.insert(row.owned(), (batch_i, row_i));
+                            if map.insert(row.owned(), (batch_i, row_i)).is_some() {
+                                let options = FormatOptions::default().with_null("NULL");
+                                let formatter = ArrayFormatter::try_new(column.as_ref(), &options)?;
+                                let key = formatter.value(row_i);
+                                return Err(Error::invalid_input(format!(
+                                    "Duplicate right-side join key in column '{on}': {key} \
+                                     (batch {batch_i}, row {row_i}). Right-side join keys must be unique."
+                                )));
+                            }
                         }
                         Ok(())
                     })
@@ -166,6 +178,8 @@ impl HashJoiner {
                 }
                 arrays.push(Arc::new(new_null_array(arrays[0].data_type(), 1)));
 
+                let column_name = self.batches[0].schema().field(column_i).name().clone();
+
                 // Clone of indices we can send to a new thread
                 let indices = indices.clone();
 
@@ -178,7 +192,7 @@ impl HashJoiner {
                     .await;
                     match task_result {
                         Ok(Ok(array)) => {
-                            Self::check_lance_support_null(&array, dataset)?;
+                            Self::check_lance_support_null(&column_name, &array, dataset)?;
                             Ok(array)
                         }
                         Ok(Err(err)) => Err(err),
@@ -193,9 +207,14 @@ impl HashJoiner {
         Ok(RecordBatch::try_new(self.batches[0].schema(), columns)?)
     }
 
-    pub fn check_lance_support_null(array: &ArrayRef, dataset: &Dataset) -> Result<()> {
+    pub fn check_lance_support_null(
+        column_name: &str,
+        array: &ArrayRef,
+        dataset: &Dataset,
+    ) -> Result<()> {
         super::versions::validate_nulls(
             dataset.manifest().data_storage_format.lance_file_format(),
+            column_name,
             array.data_type(),
             array.null_count() > 0,
         )
@@ -244,6 +263,7 @@ impl HashJoiner {
                     arrays.push(batch.column(column_i).clone());
                 }
                 arrays.push(left_batch.column(column_i).clone());
+                let column_name = self.batches[0].schema().field(column_i).name().clone();
                 // Clone of indices we can send to a new thread
                 let indices = indices.clone();
                 async move {
@@ -255,7 +275,7 @@ impl HashJoiner {
                     .await;
                     match task_result {
                         Ok(Ok(array)) => {
-                            Self::check_lance_support_null(&array, dataset)?;
+                            Self::check_lance_support_null(&column_name, &array, dataset)?;
                             Ok(array)
                         }
                         Ok(Err(err)) => Err(err),
@@ -304,18 +324,25 @@ mod tests {
         assert!(
             super::super::versions::validate_nulls(
                 ConcreteFileVersion::V1,
+                "i",
                 &DataType::Int32,
                 true,
             )
             .is_err()
         );
         assert!(
-            super::super::versions::validate_nulls(ConcreteFileVersion::V1, &DataType::Utf8, true,)
-                .is_ok()
+            super::super::versions::validate_nulls(
+                ConcreteFileVersion::V1,
+                "s",
+                &DataType::Utf8,
+                true,
+            )
+            .is_ok()
         );
         assert!(
             super::super::versions::validate_nulls(
                 ConcreteFileVersion::V2_0,
+                "st",
                 &DataType::Struct(arrow_schema::Fields::empty()),
                 true,
             )
@@ -324,6 +351,7 @@ mod tests {
         assert!(
             super::super::versions::validate_nulls(
                 ConcreteFileVersion::V2_1,
+                "st",
                 &DataType::Struct(arrow_schema::Fields::empty()),
                 true,
             )
@@ -332,6 +360,7 @@ mod tests {
         assert!(
             super::super::versions::validate_nulls(
                 ConcreteFileVersion::V1,
+                "i",
                 &DataType::Int32,
                 false,
             )
