@@ -6721,11 +6721,6 @@ def _write_overlay_file(
     )
 
 
-@pytest.fixture
-def enable_unstable_data_overlay_files(monkeypatch):
-    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
-
-
 @pytest.mark.parametrize("overlay_version", ["2.2", "2.3"])
 @pytest.mark.parametrize("mode", ["reencode", "try_binary_copy", "force_binary_copy"])
 def test_mixed_version_overlays_preserve_data(
