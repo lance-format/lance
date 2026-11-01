@@ -793,6 +793,53 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
         }
     }
 
+    fn decoded_bytes_from_chunk(
+        &self,
+        chunk_buffers: &[LanceBuffer],
+        offset_in_chunk: u64,
+        num_rows: u64,
+    ) -> Option<u64> {
+        let BinaryMiniBlockLayout::Legacy { bits_per_offset } = &self.layout else {
+            // Generic offsets are stored in a separate, possibly compressed buffer. Without
+            // decoding that buffer there is no reliable value-range bound.
+            return None;
+        };
+        let bits_per_offset = *bits_per_offset;
+        if chunk_buffers.len() != 1 || !matches!(bits_per_offset, 32 | 64) {
+            return None;
+        }
+
+        let data = &chunk_buffers[0];
+        let bytes_per_offset = usize::from(bits_per_offset / 8);
+        if !data.len().is_multiple_of(bytes_per_offset) {
+            return None;
+        }
+        let start = usize::try_from(offset_in_chunk).ok()?;
+        let end = start.checked_add(usize::try_from(num_rows).ok()?)?;
+        let needed = end.checked_add(1)?.checked_mul(bytes_per_offset)?;
+        if data.len() < needed {
+            return None;
+        }
+
+        let data_bytes = match bits_per_offset {
+            32 => {
+                let offsets = data.borrow_to_typed_slice::<u32>();
+                let offsets = offsets.as_ref();
+                u64::from(offsets.get(end)?.checked_sub(*offsets.get(start)?)?)
+            }
+            64 => {
+                let offsets = data.borrow_to_typed_slice::<u64>();
+                let offsets = offsets.as_ref();
+                offsets.get(end)?.checked_sub(*offsets.get(start)?)?
+            }
+            _ => return None,
+        };
+        let offset_bytes = u64::try_from(end.checked_sub(start)?.checked_add(1)?)
+            .ok()?
+            .checked_mul(bytes_per_offset as u64)?;
+        data_bytes.checked_add(offset_bytes)
+    }
+
     // decompress a MiniBlock of binary data, the num_values must be less than or equal
     // to the number of values this MiniBlock has, BinaryMiniBlock doesn't store `the number of values`
     // it has so assertion can not be done here and the caller of `decompress` must ensure
@@ -897,7 +944,7 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
             }
 
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::from(data[first as usize..last as usize].to_vec()),
+                data: data.slice_with_length(first as usize, last as usize - first as usize),
                 offsets: LanceBuffer::reinterpret_vec(result_offsets),
                 bits_per_offset: 64,
                 num_values,
@@ -927,7 +974,7 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
             }
 
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::from(data[first as usize..last as usize].to_vec()),
+                data: data.slice_with_length(first as usize, last as usize - first as usize),
                 offsets: LanceBuffer::reinterpret_vec(result_offsets),
                 bits_per_offset: 32,
                 num_values,
@@ -1047,6 +1094,15 @@ pub struct VariableDecoder {}
 impl VariablePerValueDecompressor for VariableDecoder {
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
         Ok(DataBlock::VariableWidth(data))
+    }
+
+    fn decompressed_size(
+        &self,
+        data: &[u8],
+        _offsets_bytes: &[u8],
+        _bits_per_offset: u8,
+    ) -> Option<u64> {
+        u64::try_from(data.len()).ok()
     }
 }
 
@@ -2029,6 +2085,48 @@ mod tests {
     }
 
     #[test]
+    fn test_binary_miniblock_slices_values_zero_copy() {
+        use super::BinaryMiniBlockDecompressor;
+        use crate::buffer::LanceBuffer;
+        use crate::compression::MiniBlockDecompressor;
+        use crate::data::DataBlock;
+
+        // The value region of a chunk is handed out as a shared slice of the chunk
+        // buffer, not as a fresh allocation: a page is decoded chunk by chunk, so a
+        // copy here copies every value byte read out of it.
+        for (bits_per_offset, offsets, values) in [
+            (32u8, vec![12u64, 15, 20], b"ABCXYZ".to_vec()),
+            (64u8, vec![24u64, 29, 40], b"HelloWorld".to_vec()),
+        ] {
+            let mut chunk = Vec::new();
+            for offset in &offsets {
+                if bits_per_offset == 32 {
+                    chunk.extend_from_slice(&(*offset as u32).to_le_bytes());
+                } else {
+                    chunk.extend_from_slice(&offset.to_le_bytes());
+                }
+            }
+            chunk.extend_from_slice(&values);
+            chunk.resize(*offsets.last().unwrap() as usize, 0);
+            let buffer = LanceBuffer::from(chunk);
+            let chunk_start = buffer.as_ref().as_ptr() as usize;
+
+            let decompressor = BinaryMiniBlockDecompressor::new(bits_per_offset).unwrap();
+            let DataBlock::VariableWidth(block) = decompressor.decompress(vec![buffer], 2).unwrap()
+            else {
+                panic!("expected a variable-width block");
+            };
+
+            assert_eq!(
+                block.data.as_ref().as_ptr() as usize,
+                chunk_start + offsets[0] as usize,
+                "value region must point into the chunk buffer, not a copy of it"
+            );
+            assert_eq!(&block.data.as_ref()[..values.len()], &values[..]);
+        }
+    }
+
+    #[test]
     fn test_binary_miniblock_rejects_corrupt_offsets() {
         use super::BinaryMiniBlockDecompressor;
         use crate::compression::MiniBlockDecompressor;
@@ -2065,6 +2163,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
         assert!(err.to_string().contains("decreases"), "{err}");
+        assert_eq!(
+            decompressor.decoded_bytes_from_chunk(&[chunk_u32(&[16, 8], &[])], 0, 1),
+            None
+        );
 
         // The first offset points inside the offset table, which would alias
         // the serialized offsets into the value bytes.
@@ -2087,6 +2189,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
         assert!(err.to_string().contains("multiple"), "{err}");
+        assert_eq!(
+            decompressor.decoded_bytes_from_chunk(&[LanceBuffer::from(vec![0u8; 10])], 0, 1),
+            None
+        );
 
         // 64-bit offsets take the same validation path.
         fn chunk_u64(offsets: &[u64], values: &[u8]) -> LanceBuffer {

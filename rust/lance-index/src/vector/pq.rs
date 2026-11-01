@@ -246,6 +246,7 @@ impl ProductQuantizer {
             }
             values
         } else {
+            let mut distances = vec![0.0; num_centroids];
             flatten_data
                 .values()
                 .chunks_exact(dim)
@@ -261,8 +262,8 @@ impl ProductQuantizer {
                                 sub_idx,
                             );
                             assume_eq!(centroids.len(), num_centroids * sub_dim);
-                            compute_partition(centroids, sub_vector, distance_type).unwrap_or(0)
-                                as u8
+                            compute_partition(centroids, sub_vector, distance_type, &mut distances)
+                                .unwrap_or(0) as u8
                         })
                         .collect();
                     if NUM_BITS == 4 {
@@ -509,6 +510,24 @@ pub fn validate_supplied_codebook(
     Ok(())
 }
 
+/// Check that a user-supplied PQ codebook has the value type of the vectors it
+/// will quantize. Quantization reads both as the vector type, so a mismatch
+/// would panic on the first batch instead of failing here.
+pub fn validate_codebook_value_type(
+    codebook_type: &DataType,
+    vector_type: &DataType,
+) -> Result<()> {
+    // Non-float columns are quantized as f32 residuals, so only a float
+    // column's own type is a contract here.
+    if vector_type.is_floating() && codebook_type != vector_type {
+        return Err(Error::invalid_input(format!(
+            "PQ codebook value type {codebook_type} does not match the vector value type \
+             {vector_type}"
+        )));
+    }
+    Ok(())
+}
+
 impl Quantization for ProductQuantizer {
     type BuildParams = PQBuildParams;
     type Metadata = ProductQuantizationMetadata;
@@ -527,6 +546,7 @@ impl Quantization for ProductQuantizer {
 
         if let Some(codebook) = params.codebook.as_ref() {
             let dimension = fsl.value_length() as usize;
+            validate_codebook_value_type(codebook.data_type(), &fsl.value_type())?;
             validate_supplied_codebook(
                 codebook.len(),
                 dimension,
@@ -683,7 +703,7 @@ mod tests {
     use arrow::datatypes::UInt8Type;
     use arrow_array::Float16Array;
     use half::f16;
-    use lance_linalg::distance::l2_distance_batch;
+    use lance_linalg::distance::{l2, l2_distance_batch_into};
     use lance_linalg::kernels::argmin;
     use lance_testing::datagen::generate_random_array;
     use num_traits::Zero;
@@ -739,15 +759,14 @@ mod tests {
             .map(|code| {
                 code.iter()
                     .enumerate()
-                    .flat_map(|(sub_idx, c)| {
+                    .map(|(sub_idx, c)| {
                         let subvec_centroids = pq.centroids::<datatypes::Float32Type>(sub_idx);
                         let subvec =
                             &query.values()[sub_idx * sub_vec_len..(sub_idx + 1) * sub_vec_len];
-                        l2_distance_batch(
+                        l2(
                             subvec,
                             &subvec_centroids
                                 [*c as usize * sub_vec_len..(*c as usize + 1) * sub_vec_len],
-                            sub_vec_len,
                         )
                     })
                     .sum::<f32>()
@@ -885,8 +904,9 @@ mod tests {
                     .enumerate()
                     .for_each(|(sub_idx, sub_vec)| {
                         let centroids = pq.centroids::<datatypes::Float32Type>(sub_idx);
-                        let dists = l2_distance_batch(sub_vec, centroids, DIM / 4);
-                        let code = argmin(dists).unwrap() as u8;
+                        let mut dists = vec![0.0; centroids.len() / (DIM / 4)];
+                        l2_distance_batch_into(sub_vec, centroids, DIM / 4, &mut dists);
+                        let code = argmin(dists.iter().copied()).unwrap() as u8;
                         expected.push(code);
                     });
             });
@@ -939,6 +959,29 @@ mod tests {
                 .values()
                 .as_primitive::<UInt8Type>()
                 .values()
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_codebook_value_type_mismatch() {
+        use arrow_array::Float16Array;
+        const DIM: usize = 8;
+
+        // An f16 column with an f32 flat codebook: the length check passes
+        // and the quantizer builds, but every later `as_primitive::<T>` panics
+        // (or trains on garbage), so the mismatch must be rejected at the boundary.
+        let values = Float16Array::from_iter((0..64 * DIM).map(|v| half::f16::from_f32(v as f32)));
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+        let codebook =
+            Arc::new(Float32Array::from_iter((0..256 * DIM).map(|v| v as f32))) as ArrayRef;
+
+        let params = PQBuildParams::with_codebook(8, 8, codebook);
+        let error =
+            <ProductQuantizer as Quantization>::build(&fsl, DistanceType::L2, &params).unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("codebook"),
+            "the error must name the codebook: {error}"
         );
     }
 

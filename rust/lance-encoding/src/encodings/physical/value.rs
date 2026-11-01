@@ -457,6 +457,16 @@ impl ValueEncoder {
 
 impl BlockCompressor for ValueEncoder {
     fn compress(&self, data: DataBlock) -> Result<(Option<LanceBuffer>, CompressiveEncoding)> {
+        if matches!(data, DataBlock::FixedSizeList(_)) {
+            let (PerValueDataBlock::Fixed(values), encoding) =
+                PerValueCompressor::compress(self, data)?
+            else {
+                return Err(Error::internal(
+                    "Fixed-size-list block has variable row width",
+                ));
+            };
+            return Ok((Some(values.data), encoding));
+        }
         let DataBlock::FixedWidth(fixed_width) = data else {
             return Err(Error::invalid_input(format!(
                 "ValueEncoder cannot compress a {} block",
@@ -606,6 +616,28 @@ impl ValueDecompressor {
 impl BlockDecompressor for ValueDecompressor {
     fn decompress(&self, data: Option<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
         let data = require_block_payload(data, "Flat block")?;
+        if !self.layers.is_empty() {
+            let expected = num_values
+                .checked_mul(self.bits_per_value)
+                .and_then(|bits| usize::try_from(bits.div_ceil(8)).ok())
+                .ok_or_else(|| Error::invalid_input("Fixed-size-list block length overflows"))?;
+            if data.len() != expected {
+                return Err(Error::invalid_input(format!(
+                    "Fixed-size-list block has {} bytes, expected {expected}",
+                    data.len()
+                )));
+            }
+            return FixedPerValueDecompressor::decompress(
+                self,
+                FixedWidthDataBlock {
+                    data,
+                    bits_per_value: self.bits_per_value,
+                    num_values,
+                    block_info: BlockInfo::new(),
+                },
+                num_values,
+            );
+        }
         let block = self.buffer_to_block(data, num_values);
         assert_eq!(block.num_values(), num_values);
         Ok(block)
@@ -882,7 +914,11 @@ mod tests {
     use lance_datagen::{ArrayGeneratorExt, Dimension, RowCount, Seed, array, gen_batch};
 
     use crate::{
-        compression::{FixedPerValueDecompressor, MiniBlockDecompressor},
+        compression::{
+            DecompressionStrategy, DefaultDecompressionStrategy, FixedPerValueDecompressor,
+            MiniBlockDecompressor, try_fixed_size_list_block,
+        },
+        compression_config::CompressionFieldParams,
         data::DataBlock,
         encodings::{
             logical::primitive::{
@@ -898,6 +934,49 @@ mod tests {
     };
 
     use super::ValueEncoder;
+
+    #[rstest::rstest]
+    #[case::raw("none", false)]
+    #[case::lz4("lz4", false)]
+    #[case::zstd("zstd", false)]
+    #[case::all_null_children("lz4", true)]
+    #[test]
+    fn test_vector_dictionary_block_lengths(#[case] compression: &str, #[case] all_null: bool) {
+        let array = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            3,
+            Arc::new(if all_null {
+                Int32Array::new_null(6)
+            } else {
+                Int32Array::from(vec![Some(1), None, Some(3), Some(4), Some(5), None])
+            }),
+            None,
+        );
+        let data_type = array.data_type().clone();
+        let data = DataBlock::from_array(array.clone());
+        let params = CompressionFieldParams {
+            compression: Some(compression.to_string()),
+            ..Default::default()
+        };
+        let encoder = try_fixed_size_list_block(&data, &params).unwrap().unwrap();
+        let (payload, encoding) = encoder.compress(data).unwrap();
+        let decoder = DefaultDecompressionStrategy::default()
+            .create_block_decompressor(&encoding)
+            .unwrap();
+        let decoded = decoder.decompress(payload.clone(), 2).unwrap();
+        assert_eq!(
+            decoded.into_arrow(data_type, true).unwrap(),
+            array.to_data()
+        );
+        assert!(decoder.decompress(payload.clone(), 1).is_err());
+        assert!(decoder.decompress(payload.clone(), 3).is_err());
+        let payload = payload.unwrap();
+        assert!(
+            decoder
+                .decompress(Some(payload.slice_with_length(0, payload.len() - 1)), 2)
+                .is_err()
+        );
+    }
 
     fn miniblock_context() -> MiniBlockCompressionContext {
         MiniBlockCompressionContext::new(0, true, true)

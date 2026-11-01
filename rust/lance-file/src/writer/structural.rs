@@ -454,6 +454,12 @@ impl EncodingPipeline {
         self.schema.is_some()
     }
 
+    pub fn prepare_for_flush(&mut self) {
+        for encoder in &mut self.field_encoders {
+            encoder.prepare_for_flush();
+        }
+    }
+
     fn verify_field_nullability(array: &dyn Array, field: &Field) -> Result<()> {
         Self::verify_field_nullability_where_reachable(array, field, None)
     }

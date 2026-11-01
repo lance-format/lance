@@ -1,0 +1,74 @@
+name: Critical Fix Labeler
+
+# Propagates the `critical-fix` label from issues to the open PRs that close
+# them, so release tracking can find critical fixes by PR. Covers both orders:
+# the label added to an issue that already has linked PRs, and a PR opened or
+# edited to close an issue that is already labeled.
+#
+# pull_request_target is required to write labels on PRs from forks. This
+# workflow never checks out or runs PR code; it only reads GraphQL metadata.
+on:
+  issues:
+    types: [labeled]
+  pull_request_target:
+    types: [opened, edited, reopened]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  label:
+    name: Propagate critical-fix label
+    if: github.event_name == 'pull_request_target' || github.event.label.name == 'critical-fix'
+    permissions:
+      issues: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const LABEL = 'critical-fix';
+            const { owner, repo } = context.repo;
+
+            async function addLabel(number) {
+              await github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: [LABEL] });
+              core.info(`Labeled #${number} with ${LABEL}`);
+            }
+
+            if (context.eventName === 'issues') {
+              const { repository } = await github.graphql(`
+                query($owner: String!, $repo: String!, $number: Int!) {
+                  repository(owner: $owner, name: $repo) {
+                    issue(number: $number) {
+                      closedByPullRequestsReferences(first: 50, includeClosedPrs: false) {
+                        nodes { number state labels(first: 100) { nodes { name } } }
+                      }
+                    }
+                  }
+                }`, { owner, repo, number: context.payload.issue.number });
+              for (const pr of repository.issue.closedByPullRequestsReferences.nodes) {
+                if (pr.state !== 'OPEN') continue;
+                if (pr.labels.nodes.some(l => l.name === LABEL)) continue;
+                await addLabel(pr.number);
+              }
+              return;
+            }
+
+            const pr = context.payload.pull_request;
+            if (pr.labels.some(l => l.name === LABEL)) return;
+            const { repository } = await github.graphql(`
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    closingIssuesReferences(first: 50) {
+                      nodes { number labels(first: 100) { nodes { name } } }
+                    }
+                  }
+                }
+              }`, { owner, repo, number: pr.number });
+            const issues = repository.pullRequest.closingIssuesReferences.nodes;
+            if (issues.some(i => i.labels.nodes.some(l => l.name === LABEL))) {
+              await addLabel(pr.number);
+            }

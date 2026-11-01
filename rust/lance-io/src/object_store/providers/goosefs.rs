@@ -19,6 +19,8 @@ use crate::object_store::{
 };
 use lance_core::error::{Error, Result};
 
+use super::opendal::finish_opendal_operator;
+
 /// Default GooseFS Master gRPC port.
 const DEFAULT_GOOSEFS_PORT: u16 = 9200;
 
@@ -415,7 +417,8 @@ impl GooseFsStoreProvider {
 impl ObjectStoreProvider for GooseFsStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
-        let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
+        let storage_options =
+            StorageOptions::new(params.storage_options().cloned().unwrap_or_default());
 
         Self::validate_storage_option_keys(&storage_options)?;
 
@@ -478,6 +481,7 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
         let operator = Operator::from_iter::<GooseFs>(config_map).map_err(|e| {
             Error::invalid_input(format!("Failed to create GooseFS operator: {:?}", e))
         })?;
+        let operator = finish_opendal_operator(operator, storage_options.client_max_retries());
 
         // Wrap as object_store::ObjectStore via OpendalStore bridge
         let opendal_store = Arc::new(OpendalStore::new(operator));
@@ -486,13 +490,14 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
             scheme: "goosefs".to_string(),
             inner: opendal_store,
             local_dir_operations: None,
+            local_fsync: false,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,
-            supports_conditional_multipart_put: false,
             list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or(false),
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count: storage_options.download_retry_count(),
+            scheduler_error_mode: Default::default(),
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,

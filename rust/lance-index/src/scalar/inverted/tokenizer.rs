@@ -1096,10 +1096,15 @@ impl InvertedIndexParams {
         }
         let tokenizer = builder.build();
 
-        match self.lance_tokenizer {
-            Some(ref t) if t == "text" => Ok(Box::new(TextTokenizer::new(tokenizer))),
-            Some(ref t) if t == "json" => Ok(Box::new(JsonTokenizer::new(tokenizer))),
-            None => Ok(Box::new(TextTokenizer::new(tokenizer))),
+        match self.lance_tokenizer.as_deref() {
+            Some("text") | None => {
+                let mut tokenizer = TextTokenizer::new(tokenizer);
+                tokenizer.discount_overlaps =
+                    self.base_tokenizer == "code" && self.split_identifiers;
+                tokenizer.has_independent_query_tokens = self.base_tokenizer == "ngram";
+                Ok(Box::new(tokenizer))
+            }
+            Some("json") => Ok(Box::new(JsonTokenizer::new(tokenizer))),
             _ => Err(Error::invalid_input(format!(
                 "unknown lance tokenizer {}",
                 self.lance_tokenizer.as_ref().unwrap()
@@ -1153,10 +1158,11 @@ impl InvertedIndexParams {
                 }
                 Ok(builder)
             }
-            "icu" => Ok(TextAnalyzer::builder(IcuTokenizer::default()).dynamic()),
-            "icu/split" => {
-                Ok(TextAnalyzer::builder(IcuTokenizer::default().with_simple_split()).dynamic())
-            }
+            "icu" => Ok(TextAnalyzer::builder(IcuTokenizer::default().into_streaming()).dynamic()),
+            "icu/split" => Ok(TextAnalyzer::builder(
+                IcuTokenizer::default().with_simple_split().into_streaming(),
+            )
+            .dynamic()),
             "ngram" => {
                 let tokenizer = NgramTokenizer::new(
                     self.min_ngram_length as usize,

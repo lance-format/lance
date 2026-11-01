@@ -8,6 +8,42 @@ use super::*;
 #[derive(Clone)]
 pub struct Positions(pub(in super::super) CompressedPositionStorage);
 
+/// Charge retained Arrow allocations once per cached group, including unused
+/// capacity and array objects. A slice keeps its backing allocation alive.
+pub(super) fn retained_cache_bytes(
+    array: &dyn Array,
+    context: &mut lance_core::deepsize::Context,
+) -> usize {
+    fn buffer_bytes(buffer: &Buffer, context: &mut lance_core::deepsize::Context) -> usize {
+        if context.mark_seen(buffer.data_ptr().as_ptr() as usize) {
+            buffer.capacity()
+        } else {
+            0
+        }
+    }
+    if !context.mark_seen(array as *const dyn Array as *const () as usize) {
+        return 0;
+    }
+    let null_bytes = array
+        .nulls()
+        .map(|nulls| buffer_bytes(nulls.inner().inner(), context))
+        .unwrap_or(0);
+    let children = match array.data_type() {
+        DataType::List(_) => {
+            let list = array.as_list::<i32>();
+            buffer_bytes(list.offsets().inner().inner(), context)
+                + retained_cache_bytes(list.values().as_ref(), context)
+        }
+        _ => array
+            .to_data()
+            .buffers()
+            .iter()
+            .map(|buffer| buffer_bytes(buffer, context))
+            .sum(),
+    };
+    std::mem::size_of_val(array) + null_bytes + children
+}
+
 /// Slice-aware cache-size charge for the Arrow array shapes stored in posting
 /// caches. [`Array::get_buffer_memory_size`] reports the full capacity of shared
 /// backing buffers; cached posting lists often reference only a small slice of a
@@ -405,7 +441,7 @@ impl DeepSizeOf for PostingListGroup {
                 .batch
                 .columns()
                 .iter()
-                .map(|column| sliced_cache_bytes(column.as_ref()))
+                .map(|column| retained_cache_bytes(column.as_ref(), context))
                 .sum::<usize>()
                 .saturating_add(group.first_docs_state_capacity_bytes)
                 .saturating_add(group.impact_state_capacity_bytes),

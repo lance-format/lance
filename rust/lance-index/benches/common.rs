@@ -7,8 +7,8 @@ use std::sync::Arc;
 use arrow::datatypes::{Int64Type, UInt64Type};
 use arrow_array::{Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use datafusion::physical_plan::SendableRecordBatchStream;
-use lance_datafusion::datagen::DatafusionDatagenExt;
+use datafusion_physical_plan::SendableRecordBatchStream;
+use lance_datafusion_exec::datagen::DatafusionDatagenExt;
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 
 /// Total number of rows in the dataset
@@ -78,7 +78,7 @@ pub fn generate_int_many_fragment_stream() -> SendableRecordBatchStream {
     }
 
     let stream = futures::stream::iter(batches);
-    Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
+    Box::pin(datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
 }
 
 /// Generate a stream of int64 data with unique values (sequential)
@@ -131,7 +131,7 @@ pub fn generate_int_low_cardinality_stream() -> SendableRecordBatchStream {
     }
 
     let stream = futures::stream::iter(batches);
-    Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
+    Box::pin(datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
 }
 
 /// Generate a stream of string data with unique values
@@ -168,7 +168,7 @@ pub fn generate_string_unique_stream() -> SendableRecordBatchStream {
     }
 
     let stream = futures::stream::iter(batches);
-    Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
+    Box::pin(datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
 }
 
 /// Generate sorted string data with low cardinality (100 unique values)
@@ -209,5 +209,5 @@ pub fn generate_string_low_cardinality_stream() -> SendableRecordBatchStream {
     }
 
     let stream = futures::stream::iter(batches);
-    Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
+    Box::pin(datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
 }

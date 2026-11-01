@@ -11,7 +11,7 @@ use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, make_array};
 use arrow_schema::{DataType, Field as ArrowField};
 use lance_arrow::*;
 use lance_core::{Error, ROW_ID, Result};
-use lance_linalg::distance::{DistanceType, multivec_distance};
+use lance_linalg::distance::DistanceType;
 use tracing::instrument;
 
 use super::DIST_COL;
@@ -119,11 +119,11 @@ pub async fn compute_distance(
         let distances = match vectors.data_type() {
             DataType::FixedSizeList(_, _) => {
                 let vectors = vectors.as_fixed_size_list();
-                dt.arrow_batch_func()(key.as_ref(), vectors)? as ArrayRef
+                Arc::new(dt.batch(key.as_ref(), vectors)?) as ArrayRef
             }
             DataType::List(_) => {
                 let vectors = vectors.as_list();
-                let dists = multivec_distance(key.as_ref(), vectors, dt)?;
+                let dists = dt.multivec(key.as_ref(), vectors)?;
                 Arc::new(Float32Array::from(dists))
             }
             _ => {

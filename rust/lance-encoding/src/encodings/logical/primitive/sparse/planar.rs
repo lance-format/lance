@@ -37,7 +37,7 @@ fn gather_materialized_values(
                 continue;
             }
             let take_end = end.min(array_end);
-            selected.extend(array_index, start - array_start, take_end - array_start);
+            selected.try_extend(array_index, start - array_start, take_end - array_start)?;
             start = take_end;
         }
     }
@@ -115,8 +115,8 @@ fn restore_leaf_slots(
                 "Materialized range exceeds decoded values",
             ));
         }
-        restored.extend_nulls(start - output_offset);
-        restored.extend(0, value_offset, value_offset + count);
+        restored.try_extend_nulls(start - output_offset)?;
+        restored.try_extend(0, value_offset, value_offset + count)?;
         output_offset = end;
         value_offset += count;
     }
@@ -125,7 +125,7 @@ fn restore_leaf_slots(
             "Decoded values exceed materialized ranges",
         ));
     }
-    restored.extend_nulls(slots - output_offset);
+    restored.try_extend_nulls(slots - output_offset)?;
     Ok(make_array(restored.freeze()))
 }
 
@@ -274,7 +274,10 @@ pub(in crate::encodings::logical::primitive) fn encode(
     };
     let wide_fixed = super::super::planar::fixed_width_bytes(&ctx.field.data_type())
         .is_some_and(|width| width >= 256);
-    let data = if wide_fixed || scalar.is_some() || positions.is_empty() {
+    // Avoid materializing wide tensor pages for a probe with too few valid rows.
+    let probe_vectors = matches!(ctx.field.data_type(), DataType::FixedSizeList(_, _))
+        && positions.len() >= PrimitiveStructuralEncoder::dictionary_min_values();
+    let data = if (wide_fixed && !probe_vectors) || scalar.is_some() || positions.is_empty() {
         None
     } else {
         let data = DataBlock::from_arrays(&arrays, plan.num_visible_items);
@@ -283,21 +286,23 @@ pub(in crate::encodings::logical::primitive) fn encode(
             other => other.remove_outer_validity(),
         })
     };
-    let dictionary = data.as_ref().and_then(|data| {
-        PrimitiveStructuralEncoder::should_dictionary_encode(
+    let dictionary = if let Some(data) = &data {
+        // Narrow values fall back to chunks covering every slot. Zipped values
+        // instead gather only materialized positions, so their budget is smaller.
+        let num_fallback_values = if PrimitiveStructuralEncoder::is_narrow(data) {
+            plan.num_visible_items
+        } else {
+            positions.len()
+        };
+        PrimitiveStructuralEncoder::try_dictionary_encode(
             data,
             &ctx.field,
             DictionaryEncodingPolicy::Planar,
-        )
-        .and_then(|budget| {
-            dict::dictionary_encode(
-                data,
-                budget.max_dict_entries,
-                budget.max_encoded_size,
-                budget.max_dict_bytes,
-            )
-        })
-    });
+            num_fallback_values,
+        )?
+    } else {
+        None
+    };
     let (values, mut buffers) = if positions.is_empty()
         || matches!(ctx.field.data_type(), DataType::Struct(fields) if fields.is_empty())
     {

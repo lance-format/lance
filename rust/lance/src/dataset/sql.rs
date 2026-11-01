@@ -6,8 +6,9 @@ use crate::datafusion::LanceTableProvider;
 use crate::dataset::scanner::validate_batch_size;
 use crate::dataset::utils::SchemaAdapter;
 use arrow_array::RecordBatch;
-use datafusion::common::DataFusionError;
+use datafusion::common::{DataFusionError, ResolvedTableReference, TableReference};
 use datafusion::dataframe::DataFrame;
+use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::{Expr as LogicalExpr, LogicalPlan};
 use datafusion::physical_plan::execute_stream;
@@ -42,6 +43,11 @@ pub struct SqlQueryBuilder {
     /// Override how blob columns are materialized for this query.
     pub(crate) blob_handling: Option<BlobHandling>,
 
+    /// Additional tables to register in the DataFusion context before running the query (name to provider).
+    /// This lets a `Dataset.sql` query join a caller-supplied relation, such as an in-memory `MemTable` (for
+    /// example a ranked id set to semi-join), another Lance dataset (`LanceTableProvider`), or a custom
+    /// `TableProvider`.
+    pub(crate) extra_tables: Vec<(String, Arc<dyn TableProvider>)>,
     /// Override the maximum number of rows in each scan batch.
     pub(crate) batch_size: Option<usize>,
 
@@ -58,9 +64,114 @@ impl SqlQueryBuilder {
             with_row_id: false,
             with_row_addr: false,
             blob_handling: None,
+            extra_tables: Vec::new(),
             batch_size: None,
             batch_size_bytes: None,
         }
+    }
+
+    /// Register an additional table named `name` in the query's DataFusion context, joinable alongside the
+    /// dataset. Accepts any `TableProvider`, such as a `MemTable` (an in-memory Arrow relation), another Lance
+    /// dataset's `LanceTableProvider`, or a view.
+    ///
+    /// `name` is parsed as a SQL identifier, so an unquoted name is lowercased (`IDs` registers the table
+    /// `ids`) while a quoted one keeps its case (`"IDs"` registers the table `IDs`). May be called more than
+    /// once; if two names resolve to the same table, the later registration wins. Registering a name that
+    /// resolves to the query's own [`Self::table_name`] would hide the dataset, so [`Self::build`] rejects it
+    /// with an invalid-input error.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use tokio::runtime::Runtime;
+    /// # use arrow_array::{RecordBatch, RecordBatchIterator, Int32Array};
+    /// # use arrow_schema::{Schema, Field, DataType};
+    /// # use datafusion::datasource::MemTable;
+    /// # use lance::dataset::{WriteParams, Dataset};
+    /// #
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let test_dir = tempfile::tempdir().unwrap();
+    /// # let uri = test_dir.path().to_str().unwrap().to_string();
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    /// # let batch = RecordBatch::try_new(
+    /// #     schema.clone(),
+    /// #     vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    /// # ).unwrap();
+    /// # let reader = RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), schema.clone());
+    /// # let dataset = Dataset::write(reader, &uri, Some(WriteParams::default())).await.unwrap();
+    /// #
+    /// // Register any `TableProvider` (here a `MemTable`) and join it in the query.
+    /// let ids = Arc::new(MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap());
+    /// let batches = dataset
+    ///     .sql("SELECT id FROM data WHERE id IN (SELECT id FROM ids)")
+    ///     .table_name("data")
+    ///     .register_table("ids", ids)
+    ///     .build()
+    ///     .await?
+    ///     .into_batch_records()
+    ///     .await?;
+    /// # assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+    /// # Ok::<(), lance_core::Error>(())
+    /// # }).unwrap();
+    /// ```
+    pub fn register_table(mut self, name: &str, provider: Arc<dyn TableProvider>) -> Self {
+        self.extra_tables.push((name.to_string(), provider));
+        self
+    }
+
+    /// Convenience over [`Self::register_table`] that wraps in-memory Arrow `batches` in a `MemTable`. `batches`
+    /// must be non-empty (the schema is derived from the first batch); for an empty relation, build a `MemTable`
+    /// yourself and pass it to [`Self::register_table`].
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use tokio::runtime::Runtime;
+    /// # use arrow_array::{RecordBatch, RecordBatchIterator, Int32Array};
+    /// # use arrow_schema::{Schema, Field, DataType};
+    /// # use lance::dataset::{WriteParams, Dataset};
+    /// #
+    /// # let rt = Runtime::new().unwrap();
+    /// # rt.block_on(async {
+    /// # let test_dir = tempfile::tempdir().unwrap();
+    /// # let uri = test_dir.path().to_str().unwrap().to_string();
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    /// # let batch = RecordBatch::try_new(
+    /// #     schema.clone(),
+    /// #     vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))],
+    /// # ).unwrap();
+    /// # let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+    /// # let dataset = Dataset::write(reader, &uri, Some(WriteParams::default())).await.unwrap();
+    /// #
+    /// // A caller-supplied relation to semi-join against the dataset.
+    /// let ids = RecordBatch::try_new(
+    ///     Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+    ///     vec![Arc::new(Int32Array::from(vec![2, 3]))],
+    /// ).unwrap();
+    /// let batches = dataset
+    ///     .sql("SELECT id FROM data WHERE id IN (SELECT id FROM ids)")
+    ///     .table_name("data")
+    ///     .register_arrow("ids", vec![ids])?
+    ///     .build()
+    ///     .await?
+    ///     .into_batch_records()
+    ///     .await?;
+    /// # assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    /// # Ok::<(), lance_core::Error>(())
+    /// # }).unwrap();
+    /// ```
+    pub fn register_arrow(self, name: &str, batches: Vec<RecordBatch>) -> lance_core::Result<Self> {
+        let n_batches = batches.len();
+        let schema = batches.first().map(|b| b.schema()).ok_or_else(|| {
+            lance_core::Error::invalid_input(format!(
+                "register_arrow for table '{name}' requires a non-empty relation to derive a schema \
+                 (received {n_batches} batches); use register_table with a MemTable for an empty relation"
+            ))
+        })?;
+        Ok(self.register_table(name, Arc::new(MemTable::try_new(schema, vec![batches])?)))
     }
 
     /// The table name to register in the datafusion context.
@@ -135,6 +246,18 @@ impl SqlQueryBuilder {
         };
         let row_id = self.with_row_id;
         let row_addr = self.with_row_addr;
+        // DataFusion parses a table name as a SQL identifier, lowercasing the unquoted parts, and
+        // resolves it to a catalog.schema.table slot. Resolve names the same way here so the
+        // duplicate detection below keys on the identifier DataFusion will actually register.
+        let config = ctx.copied_config();
+        let catalog_options = &config.options().catalog;
+        let resolve = |name: &str| {
+            TableReference::from(name).resolve(
+                &catalog_options.default_catalog,
+                &catalog_options.default_schema,
+            )
+        };
+        let dataset_table = resolve(&self.table_name);
         let mut provider = LanceTableProvider::new(self.dataset.clone(), row_id, row_addr);
         if let Some(blob_handling) = self.blob_handling {
             provider = provider.with_blob_handling(blob_handling);
@@ -145,7 +268,31 @@ impl SqlQueryBuilder {
         if let Some(batch_size_bytes) = self.batch_size_bytes {
             provider = provider.with_batch_size_bytes(batch_size_bytes);
         }
-        ctx.register_table(self.table_name, Arc::new(provider))?;
+        ctx.register_table(self.table_name.as_str(), Arc::new(provider))?;
+        // Register the extra tables, keeping the LAST provider for a name registered more than once (registering
+        // the same name into the context twice would otherwise error). Iterate in reverse and skip names already
+        // registered, so a later duplicate wins.
+        let mut registered = std::collections::HashSet::new();
+        for (name, provider) in self.extra_tables.into_iter().rev() {
+            if name.trim().is_empty() {
+                return Err(lance_core::Error::invalid_input(format!(
+                    "registered table name must be non-empty, got '{name}'"
+                )));
+            }
+            let table_ref = resolve(&name);
+            // An extra table on the dataset's own slot would hide the dataset from the query, so
+            // reject it rather than letting either one silently win.
+            if table_ref == dataset_table {
+                return Err(lance_core::Error::invalid_input(format!(
+                    "registered table name '{name}' resolves to '{table_ref}', the same table as \
+                     the query's table name '{}'; register it under a different name",
+                    self.table_name
+                )));
+            }
+            if registered.insert(table_ref) {
+                ctx.register_table(name, provider)?;
+            }
+        }
         register_functions(&ctx);
         let state = ctx.state();
         let dialect = state.config_options().sql_parser.dialect;
@@ -158,8 +305,13 @@ impl SqlQueryBuilder {
             .statement_to_plan(statement)
             .await
             .map_err(planning_error)?;
-        let plan = if safe_to_inject_system_columns(&plan, &columns)
-            && project_system_columns(&mut projected, &columns)
+        let plan = if safe_to_inject_system_columns(
+            &plan,
+            &columns,
+            &dataset_table,
+            &catalog_options.default_catalog,
+            &catalog_options.default_schema,
+        ) && project_system_columns(&mut projected, &columns)
         {
             // Fall back to the original plan when the rewritten statement
             // fails to plan (e.g. another expression aliased to a system
@@ -186,9 +338,22 @@ impl SqlQueryBuilder {
 /// 2. Name lineage: no intermediate projection redefines an enabled system
 ///    column name (e.g. `SELECT (_rowid + 1) AS _rowid` in a subquery), so
 ///    the injected identifiers can only bind to the real scan columns.
-fn safe_to_inject_system_columns(plan: &LogicalPlan, columns: &[(bool, &str)]) -> bool {
+/// 3. Table identity: the scan targets the query's resolved dataset table, not
+///    an additional table whose ordinary columns may use system-like names.
+fn safe_to_inject_system_columns(
+    plan: &LogicalPlan,
+    columns: &[(bool, &str)],
+    dataset_table: &ResolvedTableReference,
+    default_catalog: &str,
+    default_schema: &str,
+) -> bool {
     match plan {
-        LogicalPlan::TableScan(_) => true,
+        LogicalPlan::TableScan(scan) => {
+            scan.table_name
+                .clone()
+                .resolve(default_catalog, default_schema)
+                == *dataset_table
+        }
         LogicalPlan::Projection(projection) => {
             let shadows_system_column = projection
                 .schema
@@ -207,15 +372,27 @@ fn safe_to_inject_system_columns(plan: &LogicalPlan, columns: &[(bool, &str)]) -
                     }
                     !matches!(expr, LogicalExpr::Column(column) if &column.name == field.name())
                 });
-            !shadows_system_column && safe_to_inject_system_columns(&projection.input, columns)
+            !shadows_system_column
+                && safe_to_inject_system_columns(
+                    &projection.input,
+                    columns,
+                    dataset_table,
+                    default_catalog,
+                    default_schema,
+                )
         }
         LogicalPlan::Filter(_)
         | LogicalPlan::Sort(_)
         | LogicalPlan::Limit(_)
-        | LogicalPlan::SubqueryAlias(_) => plan
-            .inputs()
-            .iter()
-            .all(|input| safe_to_inject_system_columns(input, columns)),
+        | LogicalPlan::SubqueryAlias(_) => plan.inputs().iter().all(|input| {
+            safe_to_inject_system_columns(
+                input,
+                columns,
+                dataset_table,
+                default_catalog,
+                default_schema,
+            )
+        }),
         _ => false,
     }
 }
@@ -370,10 +547,11 @@ mod tests {
     use all_asserts::assert_true;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field};
     use datafusion::common::DataFusionError;
+    use datafusion::datasource::{MemTable, TableProvider};
     use lance_arrow::json::ARROW_JSON_EXT_NAME;
     use lance_arrow::{ARROW_EXT_NAME_KEY, SchemaExt};
     use lance_core::datatypes::BlobHandling;
@@ -909,9 +1087,12 @@ mod tests {
   "Plan with Metrics",
 ], StringArray
 [
-  "ProjectionExec: expr=[x@0 as x, y@1 as y], metrics=[output_rows=50, elapsed_compute=...]\n  CooperativeExec, metrics=[]\n    LanceRead: uri=test_sql_dataset/data, projection=[x, y], num_fragments=..., range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=y >= Int32(100), refine_filter=y >= Int32(100), metrics=[output_rows=..., elapsed_compute=..., fragments_scanned=..., ranges_scanned=..., rows_scanned=..., bytes_read=..., iops=..., requests=..., task_wait_time=...]\n",
+  "ProjectionExec: expr=[x@0 as x, y@1 as y], metrics=[output_rows=50, elapsed_compute=...]\n  CooperativeExec, metrics=[]\n    LanceRead: uri=test_sql_dataset/data, projection=[x, y], num_fragments=..., range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=y >= Int32(100), refine_filter=y >= Int32(100), metrics=[output_rows=..., elapsed_compute=..., fragments_scanned=..., ranges_scanned=..., rows_scanned=..., bytes_read=..., iops=..., requests=..., decode_time=..., task_wait_time=...]\n",
 ]], row_count: 1 }"#;
         assert_string_matches(&plan, expected_pattern).unwrap();
+        // The timers must run on the executed path, not just be registered.
+        assert!(!plan.contains("task_wait_time=0ns"), "{plan}");
+        assert!(!plan.contains("decode_time=0ns"), "{plan}");
     }
 
     #[tokio::test]
@@ -976,6 +1157,314 @@ mod tests {
         pretty_assertions::assert_eq!(batch.num_rows(), 1);
         pretty_assertions::assert_eq!(batch.num_columns(), 1);
         pretty_assertions::assert_eq!(batch.column(0).as_primitive::<Int32Type>().value(0), 1);
+    }
+
+    /// A dataset with an `id` column = 0..=99 across 10 fragments (for the register-table tests below).
+    async fn ids_dataset(uri: &str) -> Dataset {
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_dataset(uri, FragmentCount::from(10), FragmentRowCount::from(10))
+            .await
+            .unwrap()
+    }
+
+    /// A one-batch relation `(id: Int32)` from `ids`.
+    fn ids_batch(ids: Vec<i32>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids))]).unwrap()
+    }
+
+    fn collect_ids(batches: &[RecordBatch]) -> Vec<i32> {
+        batches
+            .iter()
+            .flat_map(|b| b["id"].as_primitive::<Int32Type>().values().to_vec())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_sql_register_arrow() {
+        let ds = ids_dataset("memory://test_sql_register_arrow").await;
+
+        // Semi-join against a registered in-memory relation; 200 is absent from the dataset.
+        let results = ds
+            .sql("SELECT id FROM t WHERE id IN (SELECT id FROM ids) ORDER BY id")
+            .table_name("t")
+            .register_arrow("ids", vec![ids_batch(vec![5, 10, 42, 200])])
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        // 200 is dropped (not in the dataset); the rest are the intersection, in order.
+        pretty_assertions::assert_eq!(collect_ids(&results), vec![5, 10, 42]);
+
+        // The registered relation is also selectable directly.
+        let counted = ds
+            .sql("SELECT count(*) AS n FROM ids")
+            .table_name("t")
+            .register_arrow("ids", vec![ids_batch(vec![5, 10, 42, 200])])
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        pretty_assertions::assert_eq!(counted[0]["n"].as_primitive::<Int64Type>().value(0), 4);
+
+        // Registering the same name twice: the later relation replaces the earlier one.
+        let dup = ds
+            .sql("SELECT id FROM ids ORDER BY id")
+            .table_name("t")
+            .register_arrow("ids", vec![ids_batch(vec![1, 2])])
+            .unwrap()
+            .register_arrow("ids", vec![ids_batch(vec![7, 8, 9])])
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        pretty_assertions::assert_eq!(collect_ids(&dup), vec![7, 8, 9]);
+
+        // register_arrow with no batches cannot derive a schema, so it returns an InvalidInput error.
+        let err = ds
+            .sql("SELECT 1")
+            .table_name("t")
+            .register_arrow("ids", vec![])
+            .unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("schema"),
+            "message should mention the missing schema: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sql_register_table_provider() {
+        let ds = ids_dataset("memory://test_sql_register_table_provider").await;
+        let schema = ids_batch(vec![]).schema();
+
+        // The general path: register any TableProvider (here a MemTable) and join it.
+        let table = Arc::new(
+            MemTable::try_new(schema.clone(), vec![vec![ids_batch(vec![7, 88])]]).unwrap(),
+        );
+        let results = ds
+            .sql("SELECT id FROM t WHERE id IN (SELECT id FROM ids) ORDER BY id")
+            .table_name("t")
+            .register_table("ids", table)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        pretty_assertions::assert_eq!(collect_ids(&results), vec![7, 88]);
+
+        // An empty registered relation is a valid table (schema, zero rows), so the semi-join returns zero rows
+        // rather than a "table not found" error. (`vec![vec![]]` is one partition with no batches; MemTable
+        // requires at least one partition.)
+        let empty = Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap());
+        let results = ds
+            .sql("SELECT id FROM t WHERE id IN (SELECT id FROM ids)")
+            .table_name("t")
+            .register_table("ids", empty)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        pretty_assertions::assert_eq!(collect_ids(&results), Vec::<i32>::new());
+
+        // A blank relation name is rejected when the query is built.
+        let blank = Arc::new(MemTable::try_new(ids_batch(vec![]).schema(), vec![vec![]]).unwrap());
+        let err = ds
+            .sql("SELECT 1")
+            .table_name("t")
+            .register_table("  ", blank)
+            .build()
+            .await
+            .err()
+            .expect("expected an error for a blank table name");
+        assert!(
+            matches!(&err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("non-empty"),
+            "message should mention the empty name: {err}"
+        );
+    }
+
+    /// DataFusion parses a registered name as a SQL identifier and resolves it to a
+    /// catalog.schema.table slot, so two spellings of the same table are one registration and the
+    /// later one wins.
+    #[rstest]
+    #[case::later_lowercase("IDs", "ids")]
+    #[case::later_mixed_case("ids", "IDs")]
+    #[case::later_quoted("ids", "\"ids\"")]
+    #[case::later_schema_qualified("ids", "public.ids")]
+    #[case::earlier_fully_qualified("datafusion.public.ids", "ids")]
+    #[case::both_qualified("public.IDs", "datafusion.public.ids")]
+    #[tokio::test]
+    async fn test_sql_register_duplicate_name_resolution(
+        #[case] first: &str,
+        #[case] second: &str,
+    ) {
+        let ds = ids_dataset("memory://").await;
+
+        let results = ds
+            .sql("SELECT id FROM ids ORDER BY id")
+            .table_name("t")
+            .register_arrow(first, vec![ids_batch(vec![1, 2])])
+            .unwrap()
+            .register_arrow(second, vec![ids_batch(vec![7, 8, 9])])
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        pretty_assertions::assert_eq!(collect_ids(&results), vec![7, 8, 9]);
+    }
+
+    #[tokio::test]
+    async fn test_sql_register_quoted_name_keeps_case() {
+        let ds = ids_dataset("memory://").await;
+
+        // A quoted identifier is not lowercased, so `"IDs"` and `ids` are two different tables and
+        // both stay registered.
+        let results = ds
+            .sql(r#"SELECT id FROM "IDs" UNION ALL SELECT id FROM ids ORDER BY id"#)
+            .table_name("t")
+            .register_arrow(r#""IDs""#, vec![ids_batch(vec![1, 2])])
+            .unwrap()
+            .register_arrow("ids", vec![ids_batch(vec![7, 8, 9])])
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        pretty_assertions::assert_eq!(collect_ids(&results), vec![1, 2, 7, 8, 9]);
+    }
+
+    /// A registered name that resolves to the query's own table name would shadow the dataset, so
+    /// it is rejected instead of reaching DataFusion's opaque "table already exists" error.
+    #[rstest]
+    #[case::exact("t")]
+    #[case::different_case("T")]
+    #[case::quoted("\"t\"")]
+    #[tokio::test]
+    async fn test_sql_register_collides_with_table_name(#[case] name: &str) {
+        let ds = ids_dataset("memory://").await;
+
+        let err = ds
+            .sql("SELECT id FROM t")
+            .table_name("t")
+            .register_arrow(name, vec![ids_batch(vec![1, 2])])
+            .unwrap()
+            .build()
+            .await
+            .err()
+            .expect("expected an error for a name colliding with the query's table name");
+        assert!(
+            matches!(&err, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains(name) && message.contains("table name 't'"),
+            "message should name the registered table and the query table: {message}"
+        );
+    }
+
+    /// System-column injection must only target the registered dataset provider.
+    /// A query whose top-level scan is an extra provider's ordinary `_rowid` /
+    /// `_rowaddr` columns must not gain them as dataset system identifiers.
+    #[tokio::test]
+    async fn test_sql_register_arrow_extra_only_not_injected_as_system_columns() {
+        let ds = ids_dataset("memory://test_sql_register_arrow_extra_system_columns").await;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![7, 8])),
+                Arc::new(UInt64Array::from(vec![70, 80])),
+                Arc::new(UInt64Array::from(vec![700, 800])),
+            ],
+        )
+        .unwrap();
+        let extra: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap());
+
+        // The top-level scan comes from the extra provider, so requesting a
+        // dataset row id/address must not append the extra provider's ordinary
+        // system-like columns.
+        let results = ds
+            .sql("SELECT id FROM extra ORDER BY id")
+            .table_name("t")
+            .register_table("extra", Arc::clone(&extra))
+            .with_row_id(true)
+            .with_row_addr(true)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let names: Vec<String> = results[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        pretty_assertions::assert_eq!(names, vec!["id".to_string()]);
+        pretty_assertions::assert_eq!(collect_ids(&results), vec![7, 8]);
+
+        // Ordinary extra-table columns with system-like names remain directly
+        // selectable.
+        let results = ds
+            .sql("SELECT _rowid, _rowaddr FROM extra ORDER BY _rowid")
+            .table_name("t")
+            .register_table("extra", extra)
+            .with_row_id(true)
+            .with_row_addr(true)
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        let batch = &results[0];
+        pretty_assertions::assert_eq!(
+            batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec(),
+            vec![70, 80]
+        );
+        pretty_assertions::assert_eq!(
+            batch[ROW_ADDR]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .to_vec(),
+            vec![700, 800]
+        );
     }
 
     /// A malformed query is user error and must surface as [`Error::InvalidInput`]

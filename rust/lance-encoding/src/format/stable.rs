@@ -271,7 +271,7 @@ variants!(
     metadata::compressive_encoding::Compression,
     [Flat, Variable, Constant, OutOfLineBitpacking, InlineBitpacking, Fsst, Dictionary,
      Rle, ByteStreamSplit, General, FixedSizeList, PackedStruct, VariablePackedStruct],
-    unsupported: [Range, Delta]
+    unsupported: [Range, Delta, AxisDelta, Alp]
 );
 variants!(
     pb21::page_layout::Layout,

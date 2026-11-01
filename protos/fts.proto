@@ -136,24 +136,27 @@ message FtsPreparedQueryLeafProto {
   repeated uint32 corpus_indices = 3;
   /* Final tokens selected against the complete segment set. Entries are unique
    * by (query_position, term_index), ordered first by query_position and then
-   * by term_index.
+   * by term_index. query_position is interpreted according to kind.
    */
   repeated FtsPreparedTokenProto tokens = 4;
-  /* Whether at least one final token remains for every original query position.
-   * Presence is required in V1. Consumers use false to preserve empty results
-   * for AND and Phrase leaves after capped fuzzy expansion.
+  /* Whether at least one final token remains for every original Match term
+   * group or Phrase token position. Presence is required in V1. Consumers use
+   * false to preserve empty results for AND and Phrase leaves after capped
+   * fuzzy expansion.
    */
   optional bool has_all_query_positions = 5;
 }
 
-// One final token and the original query position to which it belongs.
+// One final token and the query group or position to which it belongs.
 message FtsPreparedTokenProto {
   /* Zero-based index into FtsGlobalStatisticsProto.terms. Presence is required
    * in V1.
    */
   optional uint32 term_index = 1;
-  /* Position produced when the query leaf was tokenized. Fuzzy alternatives
-   * for the same source token share this value. Presence is required in V1.
+  /* Stable grouping value for the prepared source token. For MATCH it is the
+   * logical term group used by AND/OR scoring. For PHRASE it is the tokenizer
+   * position, including offsets left by removed tokens. Fuzzy alternatives for
+   * the same source token share this value. Presence is required in V1.
    */
   optional uint32 query_position = 2;
 }
