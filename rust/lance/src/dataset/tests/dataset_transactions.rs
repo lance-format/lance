@@ -1425,6 +1425,123 @@ async fn test_spilled_restore_and_deep_clone_read_own_transaction() {
     assert_eq!(cloned.read_transaction().await.unwrap().unwrap(), clone_tx);
 }
 
+async fn restore_fence_dataset() -> (TempStrDir, Dataset) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let first = record_batch! {
+        "id" => Int32Array::from(vec![1])
+    }
+    .unwrap();
+    let second = record_batch! {
+        "id" => Int32Array::from(vec![2])
+    }
+    .unwrap();
+    let dir = TempStrDir::default();
+    Dataset::write(
+        RecordBatchIterator::new([Ok(first)], schema.clone()),
+        &dir,
+        None,
+    )
+    .await
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(second)], schema),
+        &dir,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.version().version, 2);
+    (dir, dataset)
+}
+
+#[tokio::test]
+async fn test_restore_from_requires_the_expected_latest_version() {
+    let (dir, _) = restore_fence_dataset().await;
+    let mut target = reopen(&dir).await.checkout_version(1).await.unwrap();
+
+    target.restore_from(2).await.unwrap();
+
+    assert_eq!(target.version().version, 3);
+    let restored = reopen(&dir).await;
+    assert_eq!(restored.version().version, 3);
+    assert_eq!(restored.count_rows(None).await.unwrap(), 1);
+    let batch = restored.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch["id"].as_primitive::<Int32Type>().values(), &[1]);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConcurrentCommit {
+    UpdateConfig,
+    Merge,
+}
+
+#[rstest::rstest]
+#[case::update_config(ConcurrentCommit::UpdateConfig)]
+#[case::merge(ConcurrentCommit::Merge)]
+#[tokio::test]
+async fn test_restore_from_rejects_a_concurrent_commit(#[case] commit: ConcurrentCommit) {
+    let (dir, _) = restore_fence_dataset().await;
+    let mut target = reopen(&dir).await.checkout_version(1).await.unwrap();
+    let mut writer = reopen(&dir).await;
+    match commit {
+        ConcurrentCommit::UpdateConfig => {
+            writer
+                .update_schema_metadata([("restore_fence", "advanced")])
+                .await
+                .unwrap();
+        }
+        ConcurrentCommit::Merge => {
+            writer
+                .add_columns(
+                    NewColumnTransform::SqlExpressions(vec![(
+                        "added".to_string(),
+                        "id + 10".to_string(),
+                    )]),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    let error = target.restore_from(2).await.unwrap_err();
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { version: 2, .. }),
+        "restore must return a retryable conflict: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("latest version advanced"),
+        "{error}"
+    );
+
+    let latest = reopen(&dir).await;
+    assert_eq!(latest.version().version, 3);
+    assert_eq!(latest.count_rows(None).await.unwrap(), 2);
+    match commit {
+        ConcurrentCommit::UpdateConfig => {
+            assert_eq!(
+                latest
+                    .schema()
+                    .metadata
+                    .get("restore_fence")
+                    .map(String::as_str),
+                Some("advanced")
+            );
+        }
+        ConcurrentCommit::Merge => {
+            assert!(latest.schema().field("added").is_some());
+        }
+    }
+}
+
 /// Partial RewriteColumns refresh in `build_manifest`: only matched physical
 /// rows get `last_updated_at_version` bumped; same-fragment unmatched rows and
 /// untouched fragments keep both version sequences.

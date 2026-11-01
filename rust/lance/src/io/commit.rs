@@ -1746,12 +1746,22 @@ pub(crate) async fn commit_transaction(
     retry_timeout: Duration,
     manifest_naming_scheme: ManifestNamingScheme,
     affected_rows: Option<&RowAddrTreeMap>,
+    expected_latest_version: Option<u64>,
 ) -> Result<(Manifest, ManifestLocation)> {
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let read_version = transaction.read_version;
     let mut target_version = read_version + 1;
     let original_dataset = dataset.clone();
+    let conditional_commit = expected_latest_version.is_some();
+    if let Some(expected) = expected_latest_version
+        && expected != read_version
+    {
+        return Err(Error::invalid_input(format!(
+            "expected latest version {expected} does not match the transaction read version \
+             {read_version}"
+        )));
+    }
 
     // read_version sometimes defaults to zero for overwrite.
     // If num_retries is zero, we are in "strict overwrite" mode.
@@ -1789,7 +1799,11 @@ pub(crate) async fn commit_transaction(
     // `transaction`.
     let mut tagged_rewrite = None;
 
-    let num_attempts = std::cmp::max(commit_config.num_retries, 1);
+    let num_attempts = if conditional_commit {
+        1
+    } else {
+        std::cmp::max(commit_config.num_retries, 1)
+    };
     let mut backoff = SlotBackoff::default();
     // `retry_timeout` bounds the conflict-retry phase, which starts once the
     // first attempt has caught up with the versions committed since
@@ -1821,8 +1835,22 @@ pub(crate) async fn commit_transaction(
         // slower performance for concurrent writes. But that makes the fast path
         // faster and the slow path slower, which makes performance less predictable
         // for users. So we always check for other transactions.
-        // We skip this for strict overwrites, because strict overwrites can't be rebased.
-        if !strict_overwrite {
+        if let Some(expected_version) = expected_latest_version {
+            ensure_can_write_manifest(&dataset.manifest)?;
+            let (latest_manifest, _) = dataset.latest_manifest().await?;
+            if latest_manifest.version != expected_version {
+                return Err(Error::retryable_commit_conflict_source(
+                    expected_version,
+                    format!(
+                        "latest version advanced from the expected {expected_version} to {} \
+                         before the conditional restore could commit",
+                        latest_manifest.version
+                    )
+                    .into(),
+                ));
+            }
+            other_transactions = Vec::new();
+        } else if !strict_overwrite {
             let checked_since = dataset.manifest.version;
             (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
 
@@ -3636,6 +3664,7 @@ mod tests {
             &CommitConfig::default(),
             DEFAULT_COMMIT_RETRY_TIMEOUT,
             dataset.manifest_location.naming_scheme,
+            None,
             None,
         )
         .await
