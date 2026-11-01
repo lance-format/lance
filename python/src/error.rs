@@ -65,8 +65,15 @@ fn namespace_error_to_pyerr(py: Python<'_>, ns_err: &NamespaceError) -> PyErr {
                 Ok(from_error_code) => {
                     match from_error_code.call1((code, message.clone())) {
                         Ok(exc) => {
+                            let exc = exc.into_bound();
+                            // Expose server-directed retry guidance as an
+                            // attribute rather than encoding it in the message,
+                            // so callers can drive retry loops programmatically.
+                            if let Some(retry_after) = ns_err.retry_after() {
+                                let _ = exc.setattr("retry_after", retry_after.as_secs_f64());
+                            }
                             // Create a PyErr from the exception object
-                            PyErr::from_value(exc.into_bound())
+                            PyErr::from_value(exc)
                         }
                         Err(_) => PyRuntimeError::new_err(format!(
                             "[NamespaceError code={}] {}",
