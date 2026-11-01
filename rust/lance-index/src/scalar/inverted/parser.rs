@@ -73,7 +73,9 @@ impl JsonParser for PhraseQuery {
             .as_str()
             .ok_or_else(|| Error::invalid_input("missing terms in phrase query"))?
             .to_string();
-        let slop = value["slop"].as_u64().map(|v| v as u32).unwrap_or(0);
+        let slop = parse_bounded_u64(&value["slop"], "slop", u32::MAX as u64)?
+            .map(|v| v as u32)
+            .unwrap_or(0);
         let document_granularity = parse_document_granularity(value)?;
 
         Ok(Self {
@@ -329,16 +331,19 @@ mod tests {
     }
 
     #[test]
-    fn test_from_json_match_invalid_integer_fields_rejected() {
+    fn test_from_json_invalid_integer_fields_rejected() {
         for (field, value) in [
             ("max_expansions", "10.0"),
             ("max_expansions", "-1"),
             ("max_expansions", "\"10\""),
             ("prefix_length", "4294967296"),
             ("prefix_length", "2.0"),
+            ("slop", "1.0"),
+            ("slop", "4294967297"),
         ] {
+            let query = if field == "slop" { "phrase" } else { "match" };
             let json = format!(
-                r#"{{ "match": {{ "column": "text", "terms": "hello", "{field}": {value} }} }}"#
+                r#"{{ "{query}": {{ "column": "text", "terms": "hello", "{field}": {value} }} }}"#
             );
             let error = from_json(&json).unwrap_err();
             assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
