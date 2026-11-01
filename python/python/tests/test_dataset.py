@@ -7472,6 +7472,63 @@ def test_dataset_sql(tmp_path: Path):
     assert pa.Table.from_batches(complex_result) == expected_complex
 
 
+@pytest.mark.parametrize("as_reader", [False, True], ids=["table", "reader"])
+def test_dataset_sql_register_arrow(tmp_path: Path, as_reader: bool):
+    table = pa.table({"id": [1, 2, 3, 4, 5], "value": ["a", "b", "c", "d", "e"]})
+    ds = lance.write_dataset(table, tmp_path / "test")
+
+    # A subset of ids to join against, including one id (99) not in the dataset.
+    # Exercise both accepted input forms: a pyarrow Table and a RecordBatchReader.
+    ids = pa.table({"id": [4, 2, 99]})
+    data = ids.to_reader() if as_reader else ids
+
+    result = (
+        ds.sql("SELECT id FROM t WHERE id IN (SELECT id FROM ids) ORDER BY id")
+        .table_name("t")
+        .register_arrow("ids", data)
+        .build()
+        .to_batch_records()
+    )
+
+    # Only the intersection, in ascending order.
+    expected = pa.table({"id": [2, 4]})
+    assert pa.Table.from_batches(result) == expected
+
+
+@pytest.mark.parametrize("name", ["t", "T", '"t"'], ids=["exact", "case", "quoted"])
+def test_dataset_sql_register_arrow_table_name_collision(tmp_path: Path, name: str):
+    table = pa.table({"id": [1, 2, 3]})
+    ds = lance.write_dataset(table, tmp_path / "test")
+
+    # A registered name that resolves to the query's own table name would hide the
+    # dataset. The check lives in the Rust builder, which runs when the query is
+    # executed rather than when build() returns, so build() itself succeeds.
+    builder = (
+        ds.sql("SELECT id FROM t")
+        .table_name("t")
+        .register_arrow(name, pa.table({"id": [4]}))
+    )
+    query = builder.build()
+
+    # to_batch_records surfaces Lance errors as ValueError, to_stream_reader as OSError.
+    with pytest.raises(ValueError, match="resolves to"):
+        query.to_batch_records()
+    with pytest.raises(OSError, match="resolves to"):
+        builder.build().to_stream_reader()
+
+
+def test_dataset_sql_register_arrow_empty(tmp_path: Path):
+    table = pa.table({"id": [1, 2, 3]})
+    ds = lance.write_dataset(table, tmp_path / "test")
+
+    # An empty relation has no batches to derive a schema from, so registration
+    # raises (translated to ValueError by the PyO3 binding).
+    schema = pa.schema([("id", pa.int64())])
+    empty = pa.RecordBatchReader.from_batches(schema, [])
+    with pytest.raises(ValueError):
+        ds.sql("SELECT id FROM ids").table_name("t").register_arrow("ids", empty)
+
+
 def test_dataset_sql_batch_size_rows(tmp_path: Path):
     table = pa.table({"id": range(50)})
     ds = lance.write_dataset(table, tmp_path / "test_sql_batch_size_rows")
