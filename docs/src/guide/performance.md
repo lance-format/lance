@@ -4,10 +4,11 @@ This guide provides tips and tricks for optimizing the performance of your Lance
 
 ## Logging
 
-Lance uses the `log` crate to log messages. Displaying these log messages will depend on the client
-library you are using. For rust, you will need to configure a logging subscriber. For more details
-ses the [log](https://docs.rs/log/latest/log/) docs. The Python and Java clients configure a default
-logging subscriber that logs to stderr.
+Lance emits log messages through the `log` crate and structured events through the `tracing` crate.
+Rust applications configure their own logger and tracing subscriber, including filtering and output
+destinations; the Rust library does not install either globally. See the
+[log](https://docs.rs/log/latest/log/) and [tracing](https://docs.rs/tracing/latest/tracing/) docs.
+The Python and Java clients configure a default logger that logs to stderr.
 
 The Python/Java logger can be configured with several environment variables:
 
@@ -244,15 +245,15 @@ over environment variables:
 | ------------------ | ------------------------------- | ------------------------------- | ------- |
 | Initial rate       | `lance_aimd_initial_rate`       | `LANCE_AIMD_INITIAL_RATE`       | 2000    |
 | Min rate           | `lance_aimd_min_rate`           | `LANCE_AIMD_MIN_RATE`           | 1       |
-| Max rate           | `lance_aimd_max_rate`           | `LANCE_AIMD_MAX_RATE`           | 5000    |
+| Max rate           | `lance_aimd_max_rate`           | `LANCE_AIMD_MAX_RATE`           | 10000   |
 | Decrease factor    | `lance_aimd_decrease_factor`    | `LANCE_AIMD_DECREASE_FACTOR`    | 0.5     |
 | Additive increment | `lance_aimd_additive_increment` | `LANCE_AIMD_ADDITIVE_INCREMENT` | 300     |
 | Burst capacity     | `lance_aimd_burst_capacity`     | `LANCE_AIMD_BURST_CAPACITY`     | 100     |
 
-These initial settings are balanced and should work for most
-use cases. For example, S3 can typically get up to 5000
-req/s and with these settings we should get there in about
-10 seconds.
+Under sustained success, the default rate grows from 2000 to 10000 requests/s
+in about 27 seconds. Each operation category has its own rate controller.
+The ceiling is a client-side tuning parameter, not a storage-provider limit;
+override it to match the workload and the store's throttling behavior.
 
 ## Fragment Sizing
 
@@ -322,6 +323,14 @@ To enable the FRI, set `defer_index_remap=True` when compacting:
 ```python
 dataset.optimize.compact_files(defer_index_remap=True)
 ```
+
+Rust callers can open the FRI for the dataset version they have loaded with
+`Dataset::frag_reuse_index()`, which returns `None` when that version has no FRI. The returned
+index exposes the raw remap: a physical row address is either unmapped, deleted by a recorded
+compaction, or mapped to the last address reached through the retained mappings. Neither outcome
+is validated against the loaded manifest. Unmapped addresses may still have moved in a compaction
+whose history was trimmed, and mapped destinations may since have been removed, so callers that
+need a complete translation must verify coverage and destinations themselves.
 
 For details on the index format and usage patterns, see the
 [Fragment Reuse Index specification](../format/index/system/frag_reuse.md).
@@ -480,14 +489,26 @@ exact size depends on the quantizer:
 100M * (768 + 8) = ~72.3 GiB
 ```
 
-**RQ (RaBitQ):** Vectors are currently quantized to 1-bit binary codes. Each row also stores per-row
-scale and offset factors (4 bytes each) used for distance correction. Each row requires
-`dimension / 8 + 16` bytes (8 bytes for the row ID plus 8 bytes for the factors). For example, 100M
-rows with 768 dimensions and 1 bit per dimension:
+**RQ (RaBitQ):** New indexes default to 5 bits per dimension. Every bit width stores a 1-bit sign
+code plus three 4-byte correction factors. Multi-bit indexes also store the remaining bits in
+64-dimension-padded blocks and two additional 4-byte correction factors. Including the 8-byte row
+ID, the approximate size per row is:
+
+- 1-bit: `dimension / 8 + 20` bytes
+- Multi-bit: `dimension / 8 + round_up(dimension, 64) * (num_bits - 1) / 8 + 28` bytes
+
+For example, the default 5-bit index for 100M rows with 768 dimensions requires:
 
 ```
-100M * (768 / 8 + 16) = ~10.8 GiB
+100M * (768 / 8 + 768 * 4 / 8 + 28) = ~47.3 GiB
 ```
+
+The 5-bit default retains more information for the higher-fidelity distance estimates used by
+`Normal` and `Accurate` search modes, at the cost of more quantization work and index I/O during
+the build and a larger index. `Fast` search mode uses only the 1-bit sign code even when the index
+stores additional bits. Set `num_bits=1` explicitly to minimize index size and build I/O; the same
+100M-row example uses about 10.8 GiB, but searches cannot use the multi-bit distance estimate and
+may have lower recall.
 
 #### AMX Acceleration
 

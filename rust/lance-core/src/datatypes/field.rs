@@ -30,7 +30,7 @@ use super::{
 };
 use crate::{
     Error, Result,
-    datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_V2_DESC_LANCE_FIELD},
+    datatypes::{BLOB_DESC_LANCE_FIELD, BLOB_V2_DESC_LANCE_FIELD, BlobV2Layout},
     utils::parse::str_is_truthy,
 };
 
@@ -368,12 +368,22 @@ impl Field {
                 self_name
             ));
         }
-        let children_differences = explain_fields_difference(
-            &self.children,
-            &expected.children,
-            options,
-            Some(&self_name),
-        );
+        let children_differences =
+            if let Some(shared_child_count) = self.blob_v2_logical_shared_child_count(expected) {
+                explain_fields_difference(
+                    &self.children[..shared_child_count],
+                    &expected.children[..shared_child_count],
+                    options,
+                    Some(&self_name),
+                )
+            } else {
+                explain_fields_difference(
+                    &self.children,
+                    &expected.children,
+                    options,
+                    Some(&self_name),
+                )
+            };
         if !children_differences.is_empty() {
             let children_differences = format!(
                 "`{}` had mismatched children: {}",
@@ -411,10 +421,20 @@ impl Field {
     }
 
     pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
+        let children_match = self
+            .blob_v2_logical_shared_child_count(expected)
+            .map(|shared_child_count| {
+                compare_fields(
+                    &self.children[..shared_child_count],
+                    &expected.children[..shared_child_count],
+                    options,
+                )
+            })
+            .unwrap_or_else(|| compare_fields(&self.children, &expected.children, options));
         self.name == expected.name
             && self.logical_type == expected.logical_type
             && Self::compare_nullability(expected.nullable, self.nullable, options)
-            && compare_fields(&self.children, &expected.children, options)
+            && children_match
             && (!options.compare_field_ids || self.id == expected.id)
             && (!options.compare_dictionary || self.dictionary == expected.dictionary)
             && (!options.compare_metadata || self.metadata == expected.metadata)
@@ -544,6 +564,60 @@ impl Field {
             .map(|name| name == BLOB_V2_EXT_NAME)
             .unwrap_or(false)
             || self.is_blob_v2_descriptor()
+    }
+
+    /// Represent legacy blobs in this field tree as Blob v2 logical inputs, preserving their identities.
+    ///
+    /// The new logical children have unassigned IDs; callers persisting the schema
+    /// must assign them with [`Self::set_id`]. Existing Blob v2 fields are unchanged.
+    ///
+    /// ```
+    /// # use lance_core::datatypes::Field;
+    /// # fn prepare(field: &mut Field) -> lance_core::Result<()> {
+    /// field.promote_blob_v2()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn promote_blob_v2(&mut self) -> Result<()> {
+        if !self.is_blob() {
+            for child in &mut self.children {
+                child.promote_blob_v2()?;
+            }
+            return Ok(());
+        }
+        if self.is_blob_v2() {
+            return Ok(());
+        }
+        self.logical_type = LogicalType::from("struct");
+        self.encoding = None;
+        self.children = super::BLOB_V2_LOGICAL_MINIMAL_FIELDS
+            .iter()
+            .map(|field| Self::try_from(field.as_ref()))
+            .collect::<Result<Vec<_>>>()?;
+        self.metadata.remove(BLOB_META_KEY);
+        self.metadata
+            .insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());
+        Ok(())
+    }
+
+    fn blob_v2_layout(&self) -> Option<BlobV2Layout> {
+        if self.extension_name() != Some(BLOB_V2_EXT_NAME) {
+            return None;
+        }
+        let DataType::Struct(fields) = self.data_type() else {
+            return None;
+        };
+        BlobV2Layout::classify(&fields)
+    }
+
+    fn blob_v2_logical_shared_child_count(&self, other: &Self) -> Option<usize> {
+        if self.blob_v2_layout() == Some(BlobV2Layout::Logical)
+            && other.blob_v2_layout() == Some(BlobV2Layout::Logical)
+        {
+            Some(self.children.len().min(other.children.len()))
+        } else {
+            None
+        }
     }
 
     fn is_blob_v2_descriptor(&self) -> bool {
@@ -873,6 +947,7 @@ impl Field {
             (&self_type, &other_type),
             (DataType::Struct(_), DataType::Struct(_))
                 | (DataType::List(_), DataType::List(_))
+                | (DataType::LargeList(_), DataType::LargeList(_))
                 | (DataType::Map(_, _), DataType::Map(_, _))
         ) {
             // Blob v2 uses a struct logical type for descriptors, which differs from the logical
@@ -894,6 +969,22 @@ impl Field {
                     }
                 })
                 .collect::<Vec<_>>();
+            // A list or map with no surviving children cannot be materialized:
+            // `data_type()` indexes children[0] for these logical types, so
+            // returning the field here would panic at the next type access. A
+            // child is dropped either because the other field has no child of
+            // that name or because the recursive intersection failed.
+            if children.is_empty()
+                && matches!(
+                    self_type,
+                    DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _)
+                )
+            {
+                return Err(Error::arrow(format!(
+                    "Attempt to intersect fields whose children do not intersect: ({}, {}) and ({}, {})",
+                    self.name, self_type, other.name, other_type
+                )));
+            }
             let f = Self {
                 name: self.name.clone(),
                 id: if self.id >= 0 { self.id } else { other.id },
@@ -1028,6 +1119,27 @@ impl Field {
         self.children
             .iter_mut()
             .for_each(|f| f.set_id(self.id, id_seed));
+    }
+
+    /// Recursively assign missing field IDs without overflowing the `i32` ID space.
+    ///
+    /// Callers that persist the result should prefer this method over [`Self::set_id`].
+    /// The `i64` seed represents the next candidate ID so `i32::MAX + 1` can be
+    /// reported as an error instead of wrapping.
+    pub fn try_set_id(&mut self, parent_id: i32, id_seed: &mut i64) -> Result<()> {
+        self.parent_id = parent_id;
+        if self.id < 0 {
+            self.id = i32::try_from(*id_seed).map_err(|_| {
+                Error::invalid_input(
+                    "No further field ID can be allocated because IDs are exhausted",
+                )
+            })?;
+            *id_seed += 1;
+        }
+        for child in &mut self.children {
+            child.try_set_id(self.id, id_seed)?;
+        }
+        Ok(())
     }
 
     /// Recursively reset field ID for this field and all its children.
@@ -1204,6 +1316,12 @@ impl TryFrom<&ArrowField> for Field {
 
         // Check for JSON extension types (both Arrow and Lance)
         let logical_type = if is_arrow_json_field(field) || is_json_field(field) {
+            // A `json` field is stored as Lance JSONB whatever the input
+            // representation, so record the stored extension.
+            metadata.insert(
+                ARROW_EXT_NAME_KEY.to_string(),
+                lance_arrow::json::JSON_EXT_NAME.to_string(),
+            );
             LogicalType::from("json")
         } else if is_blob_v2 {
             LogicalType::from("struct")
@@ -1274,7 +1392,103 @@ mod tests {
     use arrow_array::{DictionaryArray, StringArray, UInt32Array};
     use arrow_schema::{Fields, TimeUnit};
     use lance_arrow::BLOB_META_KEY;
+    use rstest::rstest;
     use std::collections::HashMap;
+
+    use crate::datatypes::{BLOB_V2_LOGICAL_FIELDS, BLOB_V2_LOGICAL_MINIMAL_FIELDS};
+
+    fn blob_v2_logical_field(children: Fields) -> Field {
+        ArrowField::new("blob", DataType::Struct(children), true)
+            .with_metadata(HashMap::from([(
+                ARROW_EXT_NAME_KEY.to_string(),
+                BLOB_V2_EXT_NAME.to_string(),
+            )]))
+            .try_into()
+            .unwrap()
+    }
+
+    #[test]
+    fn blob_v2_logical_shapes_are_compatible() {
+        let minimal = blob_v2_logical_field(BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone());
+        let complete = blob_v2_logical_field(BLOB_V2_LOGICAL_FIELDS.clone());
+        let complete_required_range = blob_v2_logical_field(Fields::from(
+            BLOB_V2_LOGICAL_FIELDS
+                .iter()
+                .enumerate()
+                .map(|(index, field)| Arc::new(field.as_ref().clone().with_nullable(index < 2)))
+                .collect::<Vec<_>>(),
+        ));
+        let options = SchemaCompareOptions::default();
+
+        for complete_shape in [&complete, &complete_required_range] {
+            assert!(minimal.compare_with_options(complete_shape, &options));
+            assert!(complete_shape.compare_with_options(&minimal, &options));
+            assert_eq!(minimal.explain_difference(complete_shape, &options), None);
+            assert_eq!(complete_shape.explain_difference(&minimal, &options), None);
+        }
+
+        assert!(!complete.compare_with_options(&complete_required_range, &options));
+        let ignore_nullability = SchemaCompareOptions {
+            compare_nullability: NullabilityComparison::Ignore,
+            ..Default::default()
+        };
+        assert!(complete.compare_with_options(&complete_required_range, &ignore_nullability));
+
+        let complete_with_child_metadata = blob_v2_logical_field(Fields::from(
+            BLOB_V2_LOGICAL_FIELDS
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    let field = if index == 0 {
+                        field.as_ref().clone().with_metadata(HashMap::from([(
+                            "source".to_string(),
+                            "test".to_string(),
+                        )]))
+                    } else {
+                        field.as_ref().clone()
+                    };
+                    Arc::new(field)
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let compare_metadata = SchemaCompareOptions {
+            compare_metadata: true,
+            ..Default::default()
+        };
+        assert!(!complete.compare_with_options(&complete_with_child_metadata, &compare_metadata));
+
+        let nested_minimal: Field = ArrowField::new(
+            "outer",
+            DataType::Struct(Fields::from(vec![ArrowField::from(&minimal)])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+        let nested_complete: Field = ArrowField::new(
+            "outer",
+            DataType::Struct(Fields::from(vec![ArrowField::from(&complete)])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+        assert!(nested_minimal.compare_with_options(&nested_complete, &options));
+        assert!(nested_complete.compare_with_options(&nested_minimal, &options));
+    }
+
+    #[test]
+    fn malformed_blob_v2_logical_shapes_remain_incompatible() {
+        let minimal = blob_v2_logical_field(BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone());
+        let malformed = blob_v2_logical_field(Fields::from(vec![
+            ArrowField::new("data", DataType::LargeBinary, true),
+            ArrowField::new("uri", DataType::LargeUtf8, true),
+        ]));
+        let options = SchemaCompareOptions::default();
+
+        assert!(!minimal.compare_with_options(&malformed, &options));
+        assert!(!malformed.compare_with_options(&minimal, &options));
+        assert!(minimal.explain_difference(&malformed, &options).is_some());
+        assert!(malformed.explain_difference(&minimal, &options).is_some());
+    }
 
     #[test]
     fn arrow_field_to_field_metadata() {
@@ -1598,6 +1812,93 @@ mod tests {
         .try_into()
         .unwrap();
         assert_eq!(actual, expected);
+    }
+
+    /// A struct is exempt from the no-children guard on purpose: `data_type()`
+    /// maps over the children, so `Struct([])` is representable.
+    #[test]
+    fn test_struct_field_intersection_without_shared_children() {
+        let f1: Field = ArrowField::new(
+            "a",
+            DataType::Struct(Fields::from(vec![ArrowField::new(
+                "b",
+                DataType::Int32,
+                true,
+            )])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+        let f2: Field = ArrowField::new(
+            "a",
+            DataType::Struct(Fields::from(vec![ArrowField::new(
+                "c",
+                DataType::Int32,
+                true,
+            )])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+
+        let actual = f1.intersection(&f2).unwrap();
+        assert!(actual.children.is_empty());
+        assert_eq!(actual.data_type(), DataType::Struct(Fields::empty()));
+    }
+
+    fn map_entries(name: &str) -> Arc<ArrowField> {
+        Arc::new(ArrowField::new(
+            name,
+            DataType::Struct(Fields::from(vec![
+                ArrowField::new("key", DataType::Int32, false),
+                ArrowField::new("value", DataType::Int32, true),
+            ])),
+            false,
+        ))
+    }
+
+    /// Arrow does not fix the name of a list's item child or a map's entries
+    /// child, so two fields can describe compatible data and still share no
+    /// child by name. `data_type()` indexes `children[0]` for these logical
+    /// types, so an intersection with no surviving child has to error rather
+    /// than return a field that panics on the next type access.
+    #[rstest]
+    #[case::list_item_name(
+        DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+        DataType::List(Arc::new(ArrowField::new("element", DataType::Int32, true)))
+    )]
+    #[case::large_list_item_name(
+        DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+        DataType::LargeList(Arc::new(ArrowField::new("element", DataType::Int32, true)))
+    )]
+    // Names match but the item types conflict, so the recursive intersection
+    // errors and `.ok()?` drops the child: same zero-children result.
+    #[case::large_list_item_type(
+        DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+        DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Utf8, true)))
+    )]
+    #[case::map_entries_name(
+        DataType::Map(map_entries("entries"), false),
+        DataType::Map(map_entries("pairs"), false)
+    )]
+    fn test_list_field_intersection_without_shared_children(
+        #[case] self_type: DataType,
+        #[case] other_type: DataType,
+    ) {
+        let f1: Field = ArrowField::new("a", self_type, true).try_into().unwrap();
+        let f2: Field = ArrowField::new("a", other_type, true).try_into().unwrap();
+
+        let err = f1
+            .intersection(&f2)
+            .expect_err("a list or map with no shared child cannot be materialized");
+        assert!(
+            matches!(err, Error::Arrow { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("children do not intersect"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

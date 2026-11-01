@@ -13,6 +13,10 @@
  */
 package org.lance;
 
+import org.lance.index.IndexOptions;
+import org.lance.index.IndexParams;
+import org.lance.index.IndexType;
+import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.merge.MergeInsertParams;
 import org.lance.merge.MergeInsertResult;
 
@@ -25,12 +29,17 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -40,10 +49,29 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.TreeMap;
 import java.util.UUID;
 
 public class MergeInsertTest {
+  private static final Schema WIDE_SCHEMA =
+      new Schema(
+          Arrays.asList(
+              Field.nullable("id", new ArrowType.Int(32, true)),
+              Field.nullable("name", new ArrowType.Utf8()),
+              Field.nullable("score", new ArrowType.Int(32, true))));
+
+  /** {@link #WIDE_SCHEMA} minus "score", so a source over it is a partial-schema update. */
+  private static final Schema PARTIAL_SOURCE_SCHEMA =
+      new Schema(
+          Arrays.asList(
+              Field.nullable("id", new ArrowType.Int(32, true)),
+              Field.nullable("name", new ArrowType.Utf8())));
+
+  /** {@link #createWideDataset()} after the rows with id 1 and 4 are renamed. */
+  private static final String WIDE_AFTER_UPDATE =
+      "{0=Person 0/0, 1=Updated 1/10, 2=Person 2/20, 3=Person 3/30, 4=Updated 4/40, 5=Person 5/50}";
+
   @TempDir private Path tempDir;
   private RootAllocator allocator;
   private TestUtils.SimpleTestDataset testDataset;
@@ -64,15 +92,39 @@ public class MergeInsertTest {
     allocator.close();
   }
 
-  @Test
-  public void testWhenNotMatchedInsertAll() throws Exception {
+  @ParameterizedTest
+  @EnumSource(DataStorageVersion.class)
+  public void testWhenNotMatchedInsertAll(DataStorageVersion version) throws Exception {
     // Test insert all unmatched source rows
 
     try (VectorSchemaRoot source = buildSource(testDataset.getSchema(), allocator)) {
       try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
-        MergeInsertResult result =
-            dataset.mergeInsert(
-                new MergeInsertParams(Collections.singletonList("id")), sourceStream);
+        MergeInsertParams params =
+            new MergeInsertParams(Collections.singletonList("id")).withDataStorageVersion(version);
+        if (version == DataStorageVersion.LEGACY) {
+          IllegalArgumentException error =
+              Assertions.assertThrows(
+                  IllegalArgumentException.class, () -> dataset.mergeInsert(params, sourceStream));
+          Assertions.assertTrue(error.getMessage().contains("V1 and V2"));
+          return;
+        }
+        String exactVersion =
+            version == DataStorageVersion.STABLE
+                ? "2.2"
+                : version == DataStorageVersion.NEXT ? "2.3" : version.toRustString();
+        MergeInsertResult result = dataset.mergeInsert(params, sourceStream);
+
+        Assertions.assertTrue(
+            result.dataset().getFragments().stream()
+                .filter(
+                    fragment ->
+                        fragment.metadata().getId()
+                            != dataset.getFragments().get(0).metadata().getId())
+                .flatMap(fragment -> fragment.metadata().getFiles().stream())
+                .allMatch(
+                    file ->
+                        exactVersion.equals(
+                            file.getFileMajorVersion() + "." + file.getFileMinorVersion())));
 
         Assertions.assertEquals(
             "{0=Person 0, 1=Person 1, 2=Person 2, 3=Person 3, 4=Person 4, 7=Source 7, 8=Source 8, 9=Source 9}",
@@ -257,6 +309,79 @@ public class MergeInsertTest {
     return root;
   }
 
+  /**
+   * Build a source whose join key {@code id=0} appears twice ("First 0", then "Second 0"), so the
+   * source-dedupe behavior is exercised. Remaining ids (3, 4) are unique matches.
+   */
+  private VectorSchemaRoot buildDuplicateKeySource(Schema schema, RootAllocator allocator) {
+    List<Integer> sourceIds = Arrays.asList(0, 0, 3, 4);
+    List<String> sourceNames = Arrays.asList("First 0", "Second 0", "Source 3", "Source 4");
+
+    VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+    root.allocateNew();
+
+    IntVector idVector = (IntVector) root.getVector("id");
+    VarCharVector nameVector = (VarCharVector) root.getVector("name");
+
+    for (int i = 0; i < sourceIds.size(); i++) {
+      idVector.setSafe(i, sourceIds.get(i));
+      nameVector.setSafe(i, sourceNames.get(i).getBytes(StandardCharsets.UTF_8));
+    }
+
+    root.setRowCount(sourceIds.size());
+
+    return root;
+  }
+
+  /**
+   * Build a key-only source (only the join key column) whose key {@code id=0} appears twice. A pure
+   * delete over such a source routes through the delete-only plan, exercising source dedupe there.
+   */
+  private VectorSchemaRoot buildDuplicateKeyOnlySource(Schema schema, RootAllocator allocator) {
+    Field idField = schema.findField("id");
+    Schema keyOnlySchema = new Schema(Collections.singletonList(idField));
+
+    List<Integer> sourceIds = Arrays.asList(0, 0);
+
+    VectorSchemaRoot root = VectorSchemaRoot.create(keyOnlySchema, allocator);
+    root.allocateNew();
+
+    IntVector idVector = (IntVector) root.getVector("id");
+    for (int i = 0; i < sourceIds.size(); i++) {
+      idVector.setSafe(i, sourceIds.get(i));
+    }
+
+    root.setRowCount(sourceIds.size());
+
+    return root;
+  }
+
+  /**
+   * Build a full-schema source from parallel {@code (id, name)} lists. A {@code null} id is written
+   * as a NULL join key, which merge insert never treats as a duplicate (SQL {@code NULL != NULL}).
+   */
+  private VectorSchemaRoot buildSourceFrom(
+      Schema schema, RootAllocator allocator, List<Integer> ids, List<String> names) {
+    VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+    root.allocateNew();
+
+    IntVector idVector = (IntVector) root.getVector("id");
+    VarCharVector nameVector = (VarCharVector) root.getVector("name");
+
+    for (int i = 0; i < ids.size(); i++) {
+      if (ids.get(i) == null) {
+        idVector.setNull(i);
+      } else {
+        idVector.setSafe(i, ids.get(i));
+      }
+      nameVector.setSafe(i, names.get(i).getBytes(StandardCharsets.UTF_8));
+    }
+
+    root.setRowCount(ids.size());
+
+    return root;
+  }
+
   private ArrowArrayStream convertToStream(VectorSchemaRoot root, RootAllocator allocator)
       throws Exception {
     ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -273,6 +398,272 @@ public class MergeInsertTest {
     Data.exportArrayStream(allocator, reader, stream);
 
     return stream;
+  }
+
+  @Test
+  public void testSourceDedupeFirstSeenKeepsFirst() throws Exception {
+    // Source has two rows for id=0 ("First 0" then "Second 0"). FirstSeen keeps
+    // the first encountered row and skips the duplicate.
+
+    try (VectorSchemaRoot source = buildDuplicateKeySource(testDataset.getSchema(), allocator)) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        MergeInsertResult result =
+            dataset.mergeInsert(
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withMatchedUpdateAll()
+                    .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
+                    .withSourceDedupeBehavior(MergeInsertParams.SourceDedupeBehavior.FirstSeen),
+                sourceStream);
+
+        Assertions.assertEquals(
+            "{0=First 0, 1=Person 1, 2=Person 2, 3=Source 3, 4=Source 4}",
+            readAll(result.dataset()).toString(),
+            "FirstSeen should keep the first duplicate source row (id=0) and update unique matches");
+      }
+    }
+  }
+
+  @Test
+  public void testSourceDedupeFailWithDuplicates() throws Exception {
+    // Default behavior (Fail) must error when the source contains duplicate join keys.
+
+    try (VectorSchemaRoot source = buildDuplicateKeySource(testDataset.getSchema(), allocator)) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        String originalDataset = readAll(dataset).toString();
+
+        Exception ex =
+            Assertions.assertThrows(
+                Exception.class,
+                () ->
+                    dataset.mergeInsert(
+                        new MergeInsertParams(Collections.singletonList("id"))
+                            .withMatchedUpdateAll()
+                            .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll),
+                        sourceStream));
+
+        Assertions.assertNotNull(ex.getMessage(), "exception should carry a message");
+        Assertions.assertTrue(
+            ex.getMessage().contains("Ambiguous merge inserts are prohibited"),
+            "Fail should report the ambiguous-merge cause, got: " + ex.getMessage());
+
+        Assertions.assertEquals(
+            originalDataset,
+            readAll(dataset).toString(),
+            "Dataset should remain unchanged after a failed mergeInsert");
+      }
+    }
+  }
+
+  @Test
+  public void testSourceDedupeDeleteFullSchemaFirstSeen() throws Exception {
+    // Full-schema delete: source id=0 is duplicated ("First 0", then "Second 0").
+    // FirstSeen deletes the matched target row once and skips the duplicate; ids
+    // 3 and 4 are unique matches that are also deleted.
+
+    try (VectorSchemaRoot source = buildDuplicateKeySource(testDataset.getSchema(), allocator)) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        MergeInsertResult result =
+            dataset.mergeInsert(
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withMatchedDelete()
+                    .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
+                    .withSourceDedupeBehavior(MergeInsertParams.SourceDedupeBehavior.FirstSeen),
+                sourceStream);
+
+        Assertions.assertEquals(
+            "{1=Person 1, 2=Person 2}",
+            readAll(result.dataset()).toString(),
+            "FirstSeen should delete each matched target row once, skipping the duplicate id=0");
+      }
+    }
+  }
+
+  @Test
+  public void testSourceDedupeDeleteFullSchemaFailWithDuplicates() throws Exception {
+    // Full-schema delete with Fail must reject the ambiguous duplicate source key
+    // and leave the target unchanged.
+
+    try (VectorSchemaRoot source = buildDuplicateKeySource(testDataset.getSchema(), allocator)) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        String originalDataset = readAll(dataset).toString();
+
+        Exception ex =
+            Assertions.assertThrows(
+                Exception.class,
+                () ->
+                    dataset.mergeInsert(
+                        new MergeInsertParams(Collections.singletonList("id"))
+                            .withMatchedDelete()
+                            .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
+                            .withSourceDedupeBehavior(MergeInsertParams.SourceDedupeBehavior.Fail),
+                        sourceStream));
+
+        Assertions.assertNotNull(ex.getMessage(), "exception should carry a message");
+        Assertions.assertTrue(
+            ex.getMessage().contains("Ambiguous merge inserts are prohibited"),
+            "Fail should report the ambiguous-merge cause, got: " + ex.getMessage());
+
+        Assertions.assertEquals(
+            originalDataset,
+            readAll(dataset).toString(),
+            "Dataset should remain unchanged after a failed delete mergeInsert");
+      }
+    }
+  }
+
+  @Test
+  public void testSourceDedupeDeleteOnlyKeyOnlyFirstSeen() throws Exception {
+    // Key-only delete-only plan: the source carries just the join key and id=0 is
+    // duplicated. FirstSeen deletes the matched target row once and skips the
+    // duplicate; no other rows are touched.
+
+    try (VectorSchemaRoot source =
+        buildDuplicateKeyOnlySource(testDataset.getSchema(), allocator)) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        MergeInsertResult result =
+            dataset.mergeInsert(
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withMatchedDelete()
+                    .withNotMatched(MergeInsertParams.WhenNotMatched.DoNothing)
+                    .withSourceDedupeBehavior(MergeInsertParams.SourceDedupeBehavior.FirstSeen),
+                sourceStream);
+
+        Assertions.assertEquals(
+            "{1=Person 1, 2=Person 2, 3=Person 3, 4=Person 4}",
+            readAll(result.dataset()).toString(),
+            "FirstSeen should delete the matched id=0 once and skip the duplicate");
+      }
+    }
+  }
+
+  @Test
+  public void testSourceDedupeDeleteOnlyKeyOnlyFailWithDuplicates() throws Exception {
+    // Key-only delete-only plan with Fail must reject the ambiguous duplicate
+    // source key and leave the target unchanged.
+
+    try (VectorSchemaRoot source =
+        buildDuplicateKeyOnlySource(testDataset.getSchema(), allocator)) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        String originalDataset = readAll(dataset).toString();
+
+        Exception ex =
+            Assertions.assertThrows(
+                Exception.class,
+                () ->
+                    dataset.mergeInsert(
+                        new MergeInsertParams(Collections.singletonList("id"))
+                            .withMatchedDelete()
+                            .withNotMatched(MergeInsertParams.WhenNotMatched.DoNothing)
+                            .withSourceDedupeBehavior(MergeInsertParams.SourceDedupeBehavior.Fail),
+                        sourceStream));
+
+        Assertions.assertNotNull(ex.getMessage(), "exception should carry a message");
+        Assertions.assertTrue(
+            ex.getMessage().contains("Ambiguous merge inserts are prohibited"),
+            "Fail should report the ambiguous-merge cause, got: " + ex.getMessage());
+
+        Assertions.assertEquals(
+            originalDataset,
+            readAll(dataset).toString(),
+            "Dataset should remain unchanged after a failed delete-only mergeInsert");
+      }
+    }
+  }
+
+  @Test
+  public void testSourceDedupeFailAllowsUnmatchedDuplicateKeys() throws Exception {
+    // Boundary: Fail only rejects multiple source rows matching the SAME target row.
+    // Two unmatched source rows share id=10 (no target match), so Fail must NOT error
+    // and both rows are inserted.
+
+    try (VectorSchemaRoot source =
+        buildSourceFrom(
+            testDataset.getSchema(),
+            allocator,
+            Arrays.asList(10, 10),
+            Arrays.asList("First 10", "Second 10"))) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        MergeInsertResult result =
+            dataset.mergeInsert(
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withMatchedUpdateAll()
+                    .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
+                    .withSourceDedupeBehavior(MergeInsertParams.SourceDedupeBehavior.Fail),
+                sourceStream);
+
+        Assertions.assertEquals(
+            2,
+            result.stats().numInsertedRows(),
+            "Fail should insert both unmatched duplicate-key rows, not reject them");
+        Assertions.assertEquals(
+            7, result.dataset().countRows(), "Base 5 rows plus 2 unmatched inserts for id=10");
+      }
+    }
+  }
+
+  @Test
+  public void testSourceDedupeFirstSeenDedupesUnmatchedKeys() throws Exception {
+    // Boundary: FirstSeen deduplicates unmatched rows that would otherwise insert the
+    // same non-null join key more than once. Two unmatched id=10 rows collapse to one.
+
+    try (VectorSchemaRoot source =
+        buildSourceFrom(
+            testDataset.getSchema(),
+            allocator,
+            Arrays.asList(10, 10),
+            Arrays.asList("First 10", "Second 10"))) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        MergeInsertResult result =
+            dataset.mergeInsert(
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withMatchedUpdateAll()
+                    .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
+                    .withSourceDedupeBehavior(MergeInsertParams.SourceDedupeBehavior.FirstSeen),
+                sourceStream);
+
+        Assertions.assertEquals(
+            1,
+            result.stats().numInsertedRows(),
+            "FirstSeen should insert only the first row for the duplicate key id=10");
+        TreeMap<Integer, String> rows = readAll(result.dataset());
+        Assertions.assertEquals(6, rows.size(), "Base 5 rows plus 1 deduplicated insert for id=10");
+        Assertions.assertEquals(
+            "First 10",
+            rows.get(10),
+            "FirstSeen should keep the first unmatched row for the duplicate key id=10");
+      }
+    }
+  }
+
+  @Test
+  public void testSourceDedupeNullKeysNeverDuplicate() throws Exception {
+    // Boundary: rows whose join key is NULL are never duplicates, because merge insert
+    // uses SQL equality where NULL does not equal NULL. Even under FirstSeen, two NULL-key
+    // rows are both inserted.
+
+    try (VectorSchemaRoot source =
+        buildSourceFrom(
+            testDataset.getSchema(),
+            allocator,
+            Arrays.asList((Integer) null, (Integer) null),
+            Arrays.asList("Null A", "Null B"))) {
+      try (ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        MergeInsertResult result =
+            dataset.mergeInsert(
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withMatchedUpdateAll()
+                    .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
+                    .withSourceDedupeBehavior(MergeInsertParams.SourceDedupeBehavior.FirstSeen),
+                sourceStream);
+
+        Assertions.assertEquals(
+            2,
+            result.stats().numInsertedRows(),
+            "NULL join keys are never duplicates, so both rows insert even under FirstSeen");
+        Assertions.assertEquals(
+            7, result.dataset().countRows(), "Base 5 rows plus 2 NULL-key inserts");
+      }
+    }
   }
 
   @Test
@@ -296,6 +687,148 @@ public class MergeInsertTest {
             "merge insert with useIndex=false should produce correct upsert results");
       }
     }
+  }
+
+  @ParameterizedTest
+  @CsvSource({"Auto, 2", "RewriteRows, 3"})
+  public void testWriteModeOnIndexedPartialUpdate(
+      MergeInsertParams.MergeWriteMode writeMode, int expectedFragments) throws Exception {
+    try (Dataset wideDataset = createWideDataset()) {
+      createIdIndex(wideDataset);
+
+      try (VectorSchemaRoot source = buildPartialSource(1, 4);
+          ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        MergeInsertResult result =
+            wideDataset.mergeInsert(
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withMatchedUpdateAll()
+                    .withNotMatched(MergeInsertParams.WhenNotMatched.DoNothing)
+                    .withWriteMode(writeMode),
+                sourceStream);
+
+        Assertions.assertEquals(2, result.stats().numUpdatedRows());
+        try (Dataset merged = result.dataset()) {
+          Assertions.assertEquals(expectedFragments, merged.getFragments().size());
+          Assertions.assertEquals(WIDE_AFTER_UPDATE, readWide(merged).toString());
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testWriteModeRewriteColumns() throws Exception {
+    try (Dataset wideDataset = createWideDataset()) {
+      try (VectorSchemaRoot source = buildPartialSource(1, 4);
+          ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        MergeInsertResult result =
+            wideDataset.mergeInsert(
+                new MergeInsertParams(Collections.singletonList("id"))
+                    .withMatchedUpdateAll()
+                    .withNotMatched(MergeInsertParams.WhenNotMatched.DoNothing)
+                    .withWriteMode(MergeInsertParams.MergeWriteMode.RewriteColumns),
+                sourceStream);
+
+        Assertions.assertEquals(2, result.stats().numUpdatedRows());
+        try (Dataset merged = result.dataset()) {
+          Assertions.assertEquals(2, merged.getFragments().size());
+          // "score", which the source omits, is carried through untouched.
+          Assertions.assertEquals(WIDE_AFTER_UPDATE, readWide(merged).toString());
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testWriteModeRewriteColumnsRejectsInserts() throws Exception {
+
+    try (Dataset wideDataset = createWideDataset()) {
+      try (VectorSchemaRoot source = buildPartialSource(100);
+          ArrowArrayStream sourceStream = convertToStream(source, allocator)) {
+        Exception e =
+            Assertions.assertThrows(
+                Exception.class,
+                () ->
+                    wideDataset.mergeInsert(
+                        // WhenNotMatched defaults to InsertAll.
+                        new MergeInsertParams(Collections.singletonList("id"))
+                            .withMatchedUpdateAll()
+                            .withWriteMode(MergeInsertParams.MergeWriteMode.RewriteColumns)
+                            .withConflictRetries(0),
+                        sourceStream));
+        Assertions.assertTrue(
+            e.getMessage().contains("RewriteColumns cannot express"),
+            "expected the RewriteColumns rejection, got: " + e.getMessage());
+      }
+    }
+  }
+
+  /** A dataset of 6 rows over 2 fragments, whose "score" column no partial source carries. */
+  private Dataset createWideDataset() {
+    String path = tempDir.resolve(UUID.randomUUID().toString()).toString();
+    Dataset.create(allocator, path, WIDE_SCHEMA, new WriteParams.Builder().build()).close();
+
+    List<FragmentMetadata> fragments;
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(WIDE_SCHEMA, allocator)) {
+      root.allocateNew();
+      IntVector idVector = (IntVector) root.getVector("id");
+      VarCharVector nameVector = (VarCharVector) root.getVector("name");
+      IntVector scoreVector = (IntVector) root.getVector("score");
+      for (int i = 0; i < 6; i++) {
+        idVector.setSafe(i, i);
+        nameVector.setSafe(i, ("Person " + i).getBytes(StandardCharsets.UTF_8));
+        scoreVector.setSafe(i, i * 10);
+      }
+      root.setRowCount(6);
+      fragments =
+          Fragment.create(
+              path, allocator, root, new WriteParams.Builder().withMaxRowsPerFile(3).build());
+    }
+
+    Dataset wideDataset =
+        Dataset.commit(allocator, path, new FragmentOperation.Append(fragments), Optional.of(1L));
+    Assertions.assertEquals(2, wideDataset.getFragments().size());
+    return wideDataset;
+  }
+
+  private void createIdIndex(Dataset dataset) {
+    IndexParams indexParams =
+        IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("btree", "{}")).build();
+    dataset.createIndex(
+        IndexOptions.builder(Collections.singletonList("id"), IndexType.BTREE, indexParams)
+            .withIndexName("id_btree")
+            .replace(true)
+            .build());
+  }
+
+  /** A source over {@link #WIDE_SCHEMA} minus "score", renaming the rows it names. */
+  private VectorSchemaRoot buildPartialSource(int... ids) {
+    VectorSchemaRoot source = VectorSchemaRoot.create(PARTIAL_SOURCE_SCHEMA, allocator);
+    source.allocateNew();
+    IntVector idVector = (IntVector) source.getVector("id");
+    VarCharVector nameVector = (VarCharVector) source.getVector("name");
+    for (int i = 0; i < ids.length; i++) {
+      idVector.setSafe(i, ids[i]);
+      nameVector.setSafe(i, ("Updated " + ids[i]).getBytes(StandardCharsets.UTF_8));
+    }
+    source.setRowCount(ids.length);
+    return source;
+  }
+
+  /** Reads a {@link #WIDE_SCHEMA} dataset as id -&gt; "name/score". */
+  private TreeMap<Integer, String> readWide(Dataset dataset) throws Exception {
+    TreeMap<Integer, String> rows = new TreeMap<>();
+    try (ArrowReader reader = dataset.newScan().scanBatches()) {
+      while (reader.loadNextBatch()) {
+        VectorSchemaRoot batch = reader.getVectorSchemaRoot();
+        IntVector ids = (IntVector) batch.getVector("id");
+        VarCharVector names = (VarCharVector) batch.getVector("name");
+        IntVector scores = (IntVector) batch.getVector("score");
+        for (int i = 0; i < batch.getRowCount(); i++) {
+          rows.put(ids.get(i), new String(names.get(i)) + "/" + scores.get(i));
+        }
+      }
+    }
+    return rows;
   }
 
   private TreeMap<Integer, String> readAll(Dataset dataset) throws Exception {

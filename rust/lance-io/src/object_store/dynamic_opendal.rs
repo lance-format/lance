@@ -254,9 +254,11 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use object_store::ObjectStoreExt as _;
     use opendal::{Operator, services::Memory};
 
     use super::*;
+    use crate::object_store::ObjectStore;
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
 
     #[tokio::test]
@@ -292,6 +294,22 @@ mod tests {
             .expect("second store should reuse cache");
 
         assert!(Arc::ptr_eq(&first, &second));
+        let dynamic = Arc::new(store);
+        let (mut object_store, _) = ObjectStore::from_uri("memory://").await.unwrap();
+        let object_store_mut = Arc::get_mut(&mut object_store).unwrap();
+        object_store_mut.inner = dynamic.clone();
+        first
+            .put(
+                &Path::from("dataset/file"),
+                Bytes::from_static(b"test").into(),
+            )
+            .await
+            .unwrap();
+        object_store.remove_dir_all("dataset").await.unwrap();
+        assert!(matches!(
+            first.head(&Path::from("dataset/file")).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::scalar::inverted::document_tokenizer::DocType;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use lance_core::cache::{LanceCache, QuickCacheBackend};
 use lance_core::utils::tempfile::TempObjDir;
@@ -12,14 +12,15 @@ use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
 use crate::prefilter::NoFilter;
 use crate::scalar::ScalarIndex;
 use crate::scalar::inverted::builder::{
-    InnerBuilder, InvertedIndexBuilder, PositionRecorder, doc_file_path, inverted_list_schema,
-    inverted_list_schema_for_version_with_block_size,
+    BLOCK_SIZE, InnerBuilder, InvertedIndexBuilder, PositionRecorder, doc_file_path,
+    inverted_list_schema, inverted_list_schema_for_version_with_block_size,
     inverted_list_schema_for_version_with_block_size_and_impacts, posting_file_path,
     token_file_path,
 };
 use crate::scalar::inverted::encoding::{
     compress_positions, compress_posting_list_with_tail_codec,
-    decompress_posting_list_with_tail_codec, encode_position_stream_block_into,
+    compress_posting_list_with_tail_codec_and_block_size, decompress_posting_list_with_tail_codec,
+    encode_position_stream_block_into,
 };
 use crate::scalar::inverted::query::{FtsSearchParams, Operator};
 use crate::scalar::lance_format::LanceIndexStore;
@@ -55,7 +56,7 @@ async fn write_single_partition_index(
         format_version,
         block_size,
     );
-    partition.tokens.add(token.to_owned());
+    partition.tokens.get_or_add(token);
     let mut posting_list = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
         false,
         format_version.posting_tail_codec(),
@@ -101,7 +102,7 @@ fn empty_doc_stream() -> SendableRecordBatchStream {
     ]));
     Box::pin(RecordBatchStreamAdapter::new(
         schema,
-        stream::iter(Vec::<datafusion::error::Result<RecordBatch>>::new()),
+        stream::iter(Vec::<datafusion_common::Result<RecordBatch>>::new()),
     ))
 }
 

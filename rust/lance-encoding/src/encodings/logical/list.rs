@@ -12,7 +12,7 @@ use lance_core::Result;
 
 use crate::{
     decoder::{
-        DecodedArray, FilterExpression, ScheduledScanLine, SchedulerContext,
+        DecodedArray, DrainLimit, FilterExpression, ScheduledScanLine, SchedulerContext,
         StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
         StructuralSchedulingJob,
     },
@@ -120,10 +120,14 @@ impl StructuralFieldScheduler for StructuralListScheduler {
 
     fn initialize<'a>(
         &'a mut self,
+        requested_ranges: Option<&'a [Range<u64>]>,
         filter: &'a FilterExpression,
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>> {
-        self.child.initialize(filter, context)
+        // The child (items) column is scheduled with the same top-level row
+        // ranges (see `schedule_ranges`); the page repetition index maps those
+        // rows to items, so forward the ranges unchanged.
+        self.child.initialize(requested_ranges, filter, context)
     }
 }
 
@@ -161,6 +165,30 @@ impl StructuralListDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralListDecoder {
+    fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
+        let child_limit = self.child.max_rows_to_drain(num_rows, byte_budget)?;
+        let child_plan_rows = child_limit
+            .dictionary_rows
+            .map(|dictionary_rows| child_limit.rows.min(dictionary_rows))
+            .unwrap_or(child_limit.rows);
+        if child_plan_rows < num_rows {
+            // The child limit is expressed in decoded child rows. Without walking
+            // repetition levels here, one parent row is the largest universally safe
+            // batch size. A single parent row that still exceeds the limit will be
+            // reported by the dictionary conversion path.
+            return Ok(DrainLimit {
+                rows: num_rows,
+                bytes: child_limit.bytes,
+                dictionary_rows: Some(num_rows.min(1)),
+            });
+        }
+        Ok(DrainLimit {
+            rows: num_rows,
+            bytes: child_limit.bytes,
+            dictionary_rows: None,
+        })
+    }
+
     fn accept_page(&mut self, child: crate::decoder::LoadedPageShard) -> Result<()> {
         self.child.accept_page(child)
     }
@@ -175,6 +203,13 @@ impl StructuralFieldDecoder for StructuralListDecoder {
 
     fn data_type(&self) -> &DataType {
         &self.data_type
+    }
+
+    fn plan_decoded_bytes(&self, _rows_remaining: u64) -> lance_core::Result<[u64; 8]> {
+        Err(lance_core::Error::not_supported(
+            "plan_decoded_bytes is not yet supported for fields with repetition (list/repeated types)"
+                .to_string(),
+        ))
     }
 }
 
@@ -240,8 +275,8 @@ mod tests {
         STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
     };
     use arrow_array::{
-        Array, ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, ListArray, StructArray,
-        UInt8Array, UInt64Array,
+        Array, ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, ListArray, StringArray,
+        StructArray, UInt8Array, UInt64Array,
         builder::{
             Int32Builder, Int64Builder, LargeListBuilder, ListBuilder, StringBuilder, UInt32Builder,
         },
@@ -249,9 +284,13 @@ mod tests {
 
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
+    use lance_core::Result;
     use lance_datagen::{RowCount, Seed, array, gen_batch};
     use rstest::rstest;
 
+    use crate::decoder::{
+        DecodedArray, DrainLimit, StructuralDecodeArrayTask, StructuralFieldDecoder,
+    };
     use crate::testing::{
         TestCases, TestEncoding, check_round_trip_encoding_of_data, create_test_field_encoder,
         test_encoding_strategy,
@@ -383,21 +422,20 @@ mod tests {
                 continue;
             };
             match layout.layout.as_ref().unwrap() {
-                crate::format::pb21::page_layout::Layout::MiniBlockLayout(_) => {
+                crate::format::metadata::page_layout::Layout::MiniBlockLayout(_) => {
                     miniblock_pages += 1;
                 }
-                crate::format::pb21::page_layout::Layout::FullZipLayout(_) => {
+                crate::format::metadata::page_layout::Layout::FullZipLayout(_) => {
                     fullzip_pages += 1;
                 }
-                crate::format::pb21::page_layout::Layout::ConstantLayout(layout) => {
+                crate::format::metadata::page_layout::Layout::ConstantLayout(layout) => {
                     if layout.inline_value.is_none()
                         && (layout.num_rep_values > 0 || layout.num_def_values > 0)
                     {
                         structural_only_pages += 1;
                     }
                 }
-                crate::format::pb21::page_layout::Layout::BlobLayout(_) => {}
-                crate::format::pb21::page_layout::Layout::SparseLayout(_) => {}
+                crate::format::metadata::page_layout::Layout::BlobLayout(_) => {}
             }
         }
 
@@ -423,7 +461,7 @@ mod tests {
             };
             matches!(
                 layout.layout.as_ref().unwrap(),
-                crate::format::pb21::page_layout::Layout::FullZipLayout(_)
+                crate::format::metadata::page_layout::Layout::FullZipLayout(_)
             )
         });
         assert!(has_fullzip, "expected at least one full-zip page");
@@ -1493,74 +1531,37 @@ mod tests {
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
-    #[test_log::test(tokio::test)]
-    async fn test_nested_sparse_boolean_list_fails_without_panic() {
-        let empty_inner_lists = 70_000usize;
-        let booleans_per_list = 8usize;
-
+    fn unsplittable_nested_list(items: ArrayRef, empty_inner_lists: usize) -> ArrayRef {
         let mut inner_offsets = vec![0i32; empty_inner_lists + 1];
-        let values = (0..booleans_per_list)
-            .map(|idx| idx % 2 == 0)
-            .collect::<Vec<_>>();
-        inner_offsets.push(values.len() as i32);
-
-        let inner_items = BooleanArray::from(values);
+        inner_offsets.push(items.len() as i32);
         let inner_list = ListArray::new(
-            Arc::new(Field::new("item", DataType::Boolean, true)),
+            Arc::new(Field::new("item", items.data_type().clone(), true)),
             OffsetBuffer::new(ScalarBuffer::from(inner_offsets)),
-            Arc::new(inner_items),
+            items,
             None,
         );
-        let outer_list = ListArray::new(
+        Arc::new(ListArray::new(
             Arc::new(Field::new("item", inner_list.data_type().clone(), true)),
             OffsetBuffer::new(ScalarBuffer::from(vec![0i32, empty_inner_lists as i32 + 1])),
             Arc::new(inner_list),
             None,
-        );
-
-        let err = try_encode_v22_pages(Arc::new(outer_list))
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("Mini-block cannot encode"),
-            "unexpected error: {err}"
-        );
+        ))
     }
 
+    #[rstest]
+    #[case::boolean(Arc::new(BooleanArray::from(vec![true, false, true, false, true, false, true, false])))]
+    #[case::string(Arc::new(StringArray::from(vec!["value", "other"])))]
     #[test_log::test(tokio::test)]
-    async fn test_nested_sparse_string_single_row_falls_back_to_fullzip() {
-        let empty_inner_lists = 70_000usize;
-
-        let mut inner_offsets = vec![0i32; empty_inner_lists + 1];
-        inner_offsets.push(1);
-        inner_offsets.push(2);
-
-        let mut strings = StringBuilder::new();
-        strings.append_value("value");
-        strings.append_value("other");
-        let inner_items = strings.finish();
-        let inner_list = ListArray::new(
-            Arc::new(Field::new("item", DataType::Utf8, true)),
-            OffsetBuffer::new(ScalarBuffer::from(inner_offsets)),
-            Arc::new(inner_items),
-            None,
-        );
-        let outer_list = ListArray::new(
-            Arc::new(Field::new("item", inner_list.data_type().clone(), true)),
-            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, empty_inner_lists as i32 + 2])),
-            Arc::new(inner_list),
-            None,
-        );
-
-        let outer_list = Arc::new(outer_list) as ArrayRef;
-        let pages = encode_v22_pages(outer_list.clone()).await;
+    async fn test_nested_sparse_single_row_falls_back_to_fullzip(#[case] items: ArrayRef) {
+        let list = unsplittable_nested_list(items, 70_000);
+        let pages = encode_v22_pages(list.clone()).await;
         assert_has_fullzip_layout(&pages);
 
         let test_cases = TestCases::default()
             .with_range(0..1)
             .with_indices(vec![0])
             .with_dense_encodings();
-        check_round_trip_encoding_of_data(vec![outer_list], &test_cases, HashMap::new()).await;
+        check_round_trip_encoding_of_data(vec![list], &test_cases, HashMap::new()).await;
     }
 
     /// Builds the HNSW-flush repro shape: a dense prefix where every row has
@@ -1639,5 +1640,105 @@ mod tests {
             .unwrap();
         assert_split_miniblock_layout(&pages, 1, true);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, field_metadata).await;
+    }
+
+    #[test]
+    fn test_plan_decoded_bytes_list_i32_not_supported() {
+        // Lists encode items using repetition levels so the number of decoded
+        // bytes depends on the per-row list lengths, which are not known at
+        // planning time without inspecting page data.  For this PR we
+        // explicitly reject the call rather than returning a wrong estimate.
+        use crate::encodings::logical::primitive::StructuralPrimitiveFieldDecoder;
+        use arrow_array::builder::{Int32Builder, ListBuilder};
+        use arrow_schema::Field;
+
+        // Build a List<i32> array where every row has a random (variable) length
+        // to illustrate the case we cannot plan for.
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        let lengths = [0usize, 3, 1, 7, 2, 0, 5];
+        let mut value = 0i32;
+        for &len in &lengths {
+            for _ in 0..len {
+                builder.values().append_value(value);
+                value += 1;
+            }
+            builder.append(true);
+        }
+        let _list_array = builder.finish(); // variable-length rows confirmed
+
+        // Construct the decoder tree directly (no pages needed for this check).
+        let item_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let list_type = DataType::List(item_field.clone());
+
+        let child = Box::new(StructuralPrimitiveFieldDecoder::new(&item_field, false));
+        let decoder = super::StructuralListDecoder::new(child, list_type);
+
+        let err = decoder
+            .plan_decoded_bytes(lengths.len() as u64)
+            .unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::NotSupported { .. }),
+            "expected NotSupported, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("repetition"),
+            "error should mention repetition, got: {err}"
+        );
+    }
+
+    #[derive(Debug)]
+    struct RowLimitedStructuralDecoder {
+        data_type: DataType,
+        row_limit: u64,
+    }
+
+    #[derive(Debug)]
+    struct UnusedStructuralDecodeTask;
+
+    impl StructuralDecodeArrayTask for UnusedStructuralDecodeTask {
+        fn decode(self: Box<Self>) -> Result<DecodedArray> {
+            Err(lance_core::Error::internal(
+                "row-limited structural decoder is used only for planning".to_string(),
+            ))
+        }
+    }
+
+    impl StructuralFieldDecoder for RowLimitedStructuralDecoder {
+        fn max_rows_to_drain(&self, num_rows: u64, _byte_budget: u64) -> Result<DrainLimit> {
+            Ok(DrainLimit {
+                rows: num_rows,
+                bytes: 0,
+                dictionary_rows: Some(self.row_limit),
+            })
+        }
+
+        fn accept_page(&mut self, _child: crate::decoder::LoadedPageShard) -> Result<()> {
+            Ok(())
+        }
+
+        fn drain(&mut self, _num_rows: u64) -> Result<Box<dyn StructuralDecodeArrayTask>> {
+            Ok(Box::new(UnusedStructuralDecodeTask))
+        }
+
+        fn data_type(&self) -> &DataType {
+            &self.data_type
+        }
+    }
+
+    #[test]
+    fn test_list_caps_parent_rows_when_repeated_child_has_row_limit() {
+        let item_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let list_type = DataType::List(Arc::new(Field::new("item", item_type.clone(), true)));
+        let child = Box::new(RowLimitedStructuralDecoder {
+            data_type: item_type,
+            row_limit: 128,
+        });
+        let decoder = super::StructuralListDecoder::new(child, list_type);
+
+        let limit = decoder.max_rows_to_drain(300, i32::MAX as u64).unwrap();
+
+        assert_eq!(limit.rows, 300);
+        assert_eq!(limit.bytes, 0);
+        assert_eq!(limit.dictionary_rows, Some(1));
     }
 }

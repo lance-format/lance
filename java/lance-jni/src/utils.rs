@@ -13,6 +13,7 @@ use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use lance::io::ObjectStoreParams;
 use lance_file::version::LanceFileVersion;
+use lance_file::writer::FileWriterOptions;
 use lance_index::IndexParams;
 use lance_index::vector::bq::RQBuildParams;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -88,6 +89,25 @@ pub(crate) fn parse_approx_mode(value: &str) -> Result<ApproxMode> {
     }
 }
 
+pub(crate) fn extract_file_writer_options(
+    env: &mut JNIEnv,
+    file_write_options: &JObject,
+) -> Result<Option<FileWriterOptions>> {
+    let data_cache_bytes =
+        env.get_optional_u64_from_method(file_write_options, "getDataCacheBytes")?;
+    let max_page_bytes = env.get_optional_u64_from_method(file_write_options, "getMaxPageBytes")?;
+
+    if data_cache_bytes.is_none() && max_page_bytes.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(FileWriterOptions {
+        data_cache_bytes,
+        max_page_bytes,
+        ..Default::default()
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn extract_write_params(
     env: &mut JNIEnv,
@@ -104,6 +124,7 @@ pub fn extract_write_params(
     target_bases: &JObject,                      // Optional<String>
     allow_external_blob_outside_bases: &JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: &JObject,     // Optional<Long>
+    file_write_options: &JObject,                // FileWriteOptions
 ) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
 
@@ -157,6 +178,7 @@ pub fn extract_write_params(
     if let Some(max_bytes) = env.get_long_opt(blob_pack_file_size_threshold)? {
         write_params.blob_pack_file_size_threshold = Some(max_bytes as usize);
     }
+    write_params.file_writer_options = extract_file_writer_options(env, file_write_options)?;
 
     // Create storage options accessor from static storage_options
     let accessor = if storage_options.is_empty() {
@@ -194,6 +216,7 @@ pub fn build_compaction_options(
     max_source_rows: &JObject,                 // Optional<Long>
     max_source_bytes: &JObject,                // Optional<Long>
     excluded_fragment_ids: &JObject,           // List<Long>
+    data_storage_version: &JObject,            // Optional<String>
     config: &std::collections::HashMap<String, String>,
 ) -> Result<CompactionOptions> {
     let mut compaction_options = CompactionOptions::from_dataset_config(config)?;
@@ -256,6 +279,9 @@ pub fn build_compaction_options(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    if let Some(version) = env.get_string_opt(data_storage_version)? {
+        compaction_options.data_storage_version = Some(LanceFileVersion::from_str(&version)?);
+    }
 
     Ok(compaction_options)
 }
@@ -268,6 +294,14 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
         let key = Arc::new(Float32Array::from(key_array));
 
         let k = env.get_int_as_usize_from_method(&java_obj, "getK")?;
+        let lower_bound =
+            env.get_optional_from_method(&java_obj, "getLowerBound", |env, value| {
+                env.get_f32_from_method(&value, "floatValue")
+            })?;
+        let upper_bound =
+            env.get_optional_from_method(&java_obj, "getUpperBound", |env, value| {
+                env.get_f32_from_method(&value, "floatValue")
+            })?;
         let minimum_nprobes = env.get_int_as_usize_from_method(&java_obj, "getMinimumNprobes")?;
         let maximum_nprobes = env.get_optional_usize_from_method(&java_obj, "getMaximumNprobes")?;
 
@@ -290,14 +324,18 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
         let approx_mode_str = env.get_string_from_method(&java_obj, "getApproxModeString")?;
         let approx_mode = parse_approx_mode(&approx_mode_str)?;
 
-        Ok(Query {
+        let search_effort = env
+            .call_method(&java_obj, "getSearchEffort", "()D", &[])?
+            .d()?;
+        let query = Query {
             column,
             key,
             k,
-            lower_bound: None,
-            upper_bound: None,
+            lower_bound,
+            upper_bound,
             minimum_nprobes,
             maximum_nprobes,
+            search_effort,
             ef,
             refine_factor,
             metric_type: distance_type,
@@ -305,7 +343,9 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             dist_q_c: 0.0,
             query_parallelism,
             approx_mode,
-        })
+        };
+        query.validate_search_effort()?;
+        Ok(query)
     })?;
 
     Ok(query)

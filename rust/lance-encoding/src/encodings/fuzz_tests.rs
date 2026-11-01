@@ -132,8 +132,9 @@ fn encoding_config_strategy() -> impl Strategy<Value = EncodingTestConfig> {
         .prop_filter(
             "Skip unsupported combinations",
             |(_, structure, width, _)| {
-                // FSL with Variable width types is not supported
-                // This combination causes compute_stat to be called twice
+                // FSL with Variable width types is not supported by the
+                // writer: FSL blocks are compressed by the value encoder, and
+                // all of its FSL paths assume a fixed-width leaf.
                 !matches!(
                     (structure, width),
                     (DataStructure::FixedSizeList(_), DataWidth::Variable(_))

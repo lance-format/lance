@@ -170,7 +170,8 @@ async fn full_listing_page(
     dir: &Path,
     options: ReadDirOptions,
 ) -> Result<PaginatedListResult> {
-    let listed = store.list_with_delimiter(Some(dir)).await?;
+    let mut listed = store.list_with_delimiter(Some(dir)).await?;
+    let extensions = std::mem::take(&mut listed.extensions);
     let mut children = keyed_children(listed, list_prefix(dir).as_deref());
     if let Some(resume) = &options.page_token {
         children.retain(|child| child.key > *resume);
@@ -187,6 +188,7 @@ async fn full_listing_page(
     let mut result = ListResult {
         common_prefixes: Vec::new(),
         objects: Vec::new(),
+        extensions,
     };
     for child in children {
         match child.child {
@@ -233,6 +235,7 @@ fn keyed_children(listed: ListResult, prefix: Option<&str>) -> Vec<KeyedChild> {
     let ListResult {
         common_prefixes,
         objects,
+        ..
     } = listed;
     let directories = common_prefixes.into_iter().filter_map(|location| {
         let key = format!("{}{DELIMITER}", relative_key(prefix, &location)?);
@@ -327,6 +330,7 @@ mod tests {
             let mut result = ListResult {
                 common_prefixes: Vec::new(),
                 objects: Vec::new(),
+                extensions: Default::default(),
             };
             let mut idx: usize = match &opts.page_token {
                 Some(token) => token.parse().expect("a token this store minted"),
@@ -482,6 +486,38 @@ mod tests {
         "db/loose.txt",
         "other/d.lance/data/1.lance",
     ];
+
+    #[tokio::test]
+    async fn test_full_listing_page_preserves_response_extensions() {
+        let mut store = crate::testing::MockObjectStore::new();
+        store.expect_list_with_delimiter().once().returning(|_| {
+            let mut extensions = object_store::Extensions::new();
+            extensions.insert(String::from("listing-request-id"));
+            Ok(ListResult {
+                common_prefixes: vec![Path::from("db/b"), Path::from("db/a")],
+                objects: Vec::new(),
+                extensions,
+            })
+        });
+
+        let page = full_listing_page(
+            &store,
+            &Path::from("db"),
+            ReadDirOptions {
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(page.result.common_prefixes, vec![Path::from("db/a")]);
+        assert_eq!(page.page_token.as_deref(), Some("a/"));
+        assert_eq!(
+            page.result.extensions.get::<String>().map(String::as_str),
+            Some("listing-request-id")
+        );
+    }
 
     /// Walking a directory hands back every child exactly once, however the store resolves the
     /// listing and however small the pages are. That it holds whatever order the store lists
