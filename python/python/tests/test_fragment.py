@@ -786,7 +786,8 @@ def test_fragment_update_columns_basic(tmp_path):
 @pytest.mark.parametrize("strategy", ["auto", "hash", "sort_merge"])
 def test_fragment_update_columns_join_options(tmp_path, strategy):
     data = pa.table({"id": [1, 2, 3], "value": [10, 20, 30]})
-    dataset = lance.write_dataset(data, tmp_path / strategy)
+    dataset_uri = tmp_path / strategy
+    dataset = lance.write_dataset(data, dataset_uri)
     updates = pa.table({"id": [1, 3], "value": [100, 300]})
 
     fragment = dataset.get_fragment(0)
@@ -803,6 +804,17 @@ def test_fragment_update_columns_join_options(tmp_path, strategy):
 
     assert updated_fragment.id == fragment.fragment_id
     assert fields_modified
+
+    op = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri), op, read_version=dataset.version
+    )
+    result = updated_dataset.to_table().to_pydict()
+    assert result["id"] == [1, 2, 3]
+    assert result["value"] == [100, 20, 300]
 
 
 def test_fragment_update_columns_rejects_invalid_join_options(tmp_path):
