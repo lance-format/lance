@@ -753,6 +753,11 @@ impl TopHits {
         self.heap.peek().map(|worst| worst.distance.0)
     }
 
+    /// The hits held so far, in no particular order.
+    pub fn iter(&self) -> impl Iterator<Item = &MinHashHit> {
+        self.heap.iter()
+    }
+
     /// Hits ordered by ascending distance, ties broken by row id.
     pub fn into_sorted(self) -> Vec<MinHashHit> {
         self.heap.into_sorted_vec()
