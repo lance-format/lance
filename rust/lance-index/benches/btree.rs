@@ -12,10 +12,12 @@
 //! - IN filters with varying size (10, 20, 30 values)
 //! - Key lookups with varying batch size (1000, 8192 keys), sorted or random
 //! - Range filters over pages whose row ids span many fragments
+//! - Filter planning per column and as a tuple query over composite keys
 
 mod common;
 
 use std::{
+    collections::HashMap,
     ops::Bound,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -25,15 +27,21 @@ use common::{LOW_CARDINALITY_COUNT, TOTAL_ROWS};
 use std::hint::black_box;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use arrow_schema::{DataType, Field, Fields};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
+use datafusion_expr::{Expr, col, lit};
 use futures::TryStreamExt;
 use lance_core::cache::LanceCache;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold;
 use lance_index::scalar::btree::{BTreeIndexPlugin, DEFAULT_BTREE_BATCH_SIZE, train_btree_index};
+use lance_index::scalar::expression::{
+    IndexInformationProvider, MultiQueryParser, SargableQueryParser, apply_scalar_indices,
+};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::ScalarIndexPlugin;
+use lance_index::scalar::tuple::planner::plan_tuple_predicate;
 use lance_index::scalar::{SargableQuery, ScalarIndex};
 use lance_io::object_store::ObjectStore;
 #[cfg(target_os = "linux")]
@@ -912,6 +920,83 @@ fn bench_btree(c: &mut Criterion) {
     bench_range_many_fragments(c);
 }
 
+struct BTreeColumns(HashMap<String, (DataType, MultiQueryParser)>);
+
+impl IndexInformationProvider for BTreeColumns {
+    fn get_index(&self, col: &str) -> Option<(&DataType, &MultiQueryParser)> {
+        self.0
+            .get(col)
+            .map(|(data_type, parser)| (data_type, parser))
+    }
+}
+
+fn bench_tuple_planning(c: &mut Criterion) {
+    let fields = [
+        Field::new("tenant", DataType::Int32, true),
+        Field::new("ts", DataType::Int64, true),
+        Field::new("kind", DataType::Utf8, true),
+        Field::new("status", DataType::Utf8, true),
+        Field::new("score", DataType::Float64, true),
+        Field::new("region", DataType::Utf8, true),
+    ];
+    let keys = Fields::from(fields[..3].to_vec());
+    let indices = BTreeColumns(
+        fields
+            .iter()
+            .map(|field| {
+                let parser = SargableQueryParser::new(
+                    format!("{}_idx", field.name()),
+                    "BTree".into(),
+                    false,
+                );
+                (
+                    field.name().clone(),
+                    (
+                        field.data_type().clone(),
+                        MultiQueryParser::single(Box::new(parser)),
+                    ),
+                )
+            })
+            .collect(),
+    );
+    let conjuncts = [
+        col("tenant").in_list(vec![lit(1), lit(2), lit(3)], false),
+        col("ts").gt_eq(lit(10_i64)),
+        col("ts").lt(lit(20_i64)),
+        col("kind").eq(lit("x")),
+        col("status").eq(lit("a")),
+        col("score").gt(lit(0.5)),
+        col("region").in_list(vec![lit("us"), lit("eu")], false),
+        (col("ts") % lit(7_i64)).eq(lit(0_i64)),
+        col("tenant").is_not_null(),
+        col("status").is_not_null(),
+    ];
+    let predicate = conjuncts.iter().cloned().reduce(Expr::and).unwrap();
+    let cross_product = [
+        col("tenant").in_list((0..64).map(lit).collect(), false),
+        col("ts").in_list((0..128_i64).map(lit).collect(), false),
+    ];
+
+    let mut group = c.benchmark_group("tuple_planning");
+    group
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(10));
+    group.bench_function("per_column_parse/10_conjuncts", |b| {
+        b.iter_batched(
+            || predicate.clone(),
+            |predicate| black_box(apply_scalar_indices(predicate, &indices).unwrap()),
+            BatchSize::SmallInput,
+        )
+    });
+    group.bench_function("tuple_plan/10_conjuncts", |b| {
+        b.iter(|| black_box(plan_tuple_predicate(&conjuncts, &keys).unwrap()))
+    });
+    group.bench_function("tuple_plan/8192_tuples", |b| {
+        b.iter(|| black_box(plan_tuple_predicate(&cross_product, &keys).unwrap()))
+    });
+    group.finish();
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
@@ -930,4 +1015,6 @@ criterion_group!(
         .sample_size(10);
     targets = bench_btree);
 
-criterion_main!(benches);
+criterion_group!(tuple_planning, bench_tuple_planning);
+
+criterion_main!(benches, tuple_planning);
