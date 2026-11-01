@@ -34,10 +34,10 @@ pub use combined::{
     combined_fields_search, flat_combined_fields_search_stream, validate_combined_tokenizers,
 };
 pub use compound::{
-    compound_search, compound_search_prepared_match,
-    compound_search_prepared_match_with_score_floor, compound_search_with_base_scorer,
-    compound_search_with_base_scorer_and_score_floor, exclusive_scaled_score_floor,
-    materialized_compound_top_k,
+    PreparedFtsGlobalStatistics, PreparedFtsQueryLeaf, compound_search,
+    compound_search_prepared_match, compound_search_prepared_match_with_score_floor,
+    compound_search_with_base_scorer, compound_search_with_base_scorer_and_score_floor,
+    exclusive_scaled_score_floor, materialized_compound_top_k, prepare_fts_global_statistics,
 };
 #[doc(hidden)]
 pub use cross_column::cross_column_compound_search;
@@ -107,7 +107,8 @@ impl PreparedBm25Query {
         self.can_reuse_scorer.then_some(&self.scorer)
     }
 
-    pub(crate) fn has_all_query_positions(&self) -> bool {
+    #[doc(hidden)]
+    pub fn has_all_query_positions(&self) -> bool {
         self.has_all_query_positions
     }
 
