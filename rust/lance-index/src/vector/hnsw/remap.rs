@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayBuilder, AsArray, Float32Builder, ListBuilder, UInt32Builder};
 use arrow::datatypes::{Float32Type, UInt32Type};
-use arrow_array::{Array, RecordBatch};
+use arrow_array::{Array, ListArray, PrimitiveArray, RecordBatch};
 use itertools::Itertools;
 use lance_core::{Error, Result};
 use rayon::prelude::*;
@@ -32,22 +32,24 @@ use crate::vector::graph::{
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::v3::subindex::IvfSubIndex;
 
-/// Rewrite a serialized HNSW graph after some of its nodes were removed.
-///
-/// `graph` is the batch written by [`HNSW::to_batch`], including the distance
-/// column. `new_ids[old_id]` is the id node `old_id` takes after the removal,
-/// or `None` if it was removed; surviving ids must keep their relative order,
-/// which is what every vector storage `remap` produces.
-///
-/// Surviving adjacency lists and their distances are kept, minus the edges to
-/// removed nodes; nothing is re-linked, so node degree drops by the number of
-/// removed neighbors. If the entry point is removed, the first surviving node
-/// on the highest non-empty level replaces it, so search still starts from
-/// the top of the graph.
-///
-/// `new_ids` must have one entry per graph node. If no node is removed, the
-/// input batch is returned as is. Returns an empty batch if no node survives.
-pub fn remap_graph_batch(graph: &RecordBatch, new_ids: &[Option<u32>]) -> Result<RecordBatch> {
+/// A serialized HNSW graph batch, decoded and validated against the
+/// `new_ids` a remap supplies.
+struct DecodedGraph<'a> {
+    metadata: HnswMetadata,
+    ids: &'a PrimitiveArray<UInt32Type>,
+    neighbors: &'a ListArray,
+    distances: &'a ListArray,
+    neighbor_values: &'a [u32],
+    distance_values: &'a [f32],
+    /// `true` when `new_ids` keeps every node's id, so callers can return
+    /// the batch unchanged.
+    identity: bool,
+}
+
+/// Decode the metadata and columns both remap paths walk, enforcing the
+/// writer-schema contract (metadata presence, level-0 node count versus the
+/// remap coverage, column presence and types) exactly once.
+fn decode_graph<'a>(graph: &'a RecordBatch, new_ids: &[Option<u32>]) -> Result<DecodedGraph<'a>> {
     let metadata_json = graph
         .schema_ref()
         .metadata()
@@ -94,11 +96,48 @@ pub fn remap_graph_batch(graph: &RecordBatch, new_ids: &[Option<u32>]) -> Result
         .as_primitive_opt::<Float32Type>()
         .ok_or_else(|| Error::index(format!("{DIST_COL} must be List<Float32>")))?
         .values();
-    if new_ids
+    let identity = new_ids
         .iter()
         .enumerate()
-        .all(|(old_id, new_id)| *new_id == Some(old_id as u32))
-    {
+        .all(|(old_id, new_id)| *new_id == Some(old_id as u32));
+    Ok(DecodedGraph {
+        metadata,
+        ids,
+        neighbors,
+        distances,
+        neighbor_values,
+        distance_values,
+        identity,
+    })
+}
+
+/// Rewrite a serialized HNSW graph after some of its nodes were removed.
+///
+/// `graph` is the batch written by [`HNSW::to_batch`], including the distance
+/// column. `new_ids[old_id]` is the id node `old_id` takes after the removal,
+/// or `None` if it was removed; surviving ids must keep their relative order,
+/// which is what every vector storage `remap` produces.
+///
+/// Surviving adjacency lists and their distances are kept, minus the edges to
+/// removed nodes; nothing is re-linked, so node degree drops by the number of
+/// removed neighbors. If the entry point is removed, the first surviving node
+/// on the highest non-empty level replaces it, so search still starts from
+/// the top of the graph.
+///
+/// `new_ids` must have one entry per graph node. If no node is removed, the
+/// input batch is returned as is. Returns an empty batch if no node survives.
+pub fn remap_graph_batch(graph: &RecordBatch, new_ids: &[Option<u32>]) -> Result<RecordBatch> {
+    let decoded = decode_graph(graph, new_ids)?;
+    let DecodedGraph {
+        metadata,
+        ids,
+        neighbors,
+        distances,
+        neighbor_values,
+        distance_values,
+        identity,
+    } = decoded;
+    if identity {
         return Ok(graph.clone());
     }
     let new_id = |old_id: u32| new_ids.get(old_id as usize).copied().flatten();
@@ -216,56 +255,16 @@ struct ParsedGraph {
 }
 
 fn parse_graph(graph: &RecordBatch, new_ids: &[Option<u32>]) -> Result<ParsedGraph> {
-    let metadata_json = graph
-        .schema_ref()
-        .metadata()
-        .get(HNSW_METADATA_KEY)
-        .ok_or_else(|| Error::index(format!("{HNSW_METADATA_KEY} not found in HNSW batch")))?;
-    let metadata: HnswMetadata = serde_json::from_str(metadata_json).map_err(|e| {
-        Error::index(format!(
-            "Failed to decode HNSW metadata: {e}, json: {metadata_json}"
-        ))
-    })?;
-    let num_nodes = match metadata.level_offsets.as_slice() {
-        [start, end, ..] => end.saturating_sub(*start),
-        _ => 0,
-    };
-    if num_nodes != new_ids.len() {
-        return Err(Error::invalid_input(format!(
-            "HNSW graph has {num_nodes} nodes but the remap covers {} nodes",
-            new_ids.len()
-        )));
-    }
-    let column = |name: &str| {
-        graph.column_by_name(name).ok_or_else(|| {
-            Error::index(format!(
-                "HNSW batch has no {name} column; remapping needs every column the writer emits"
-            ))
-        })
-    };
-    let ids = column(VECTOR_ID_COL)?
-        .as_primitive_opt::<UInt32Type>()
-        .ok_or_else(|| Error::index(format!("{VECTOR_ID_COL} must be UInt32")))?;
-    let neighbors = column(NEIGHBORS_COL)?
-        .as_list_opt::<i32>()
-        .ok_or_else(|| Error::index(format!("{NEIGHBORS_COL} must be List<UInt32>")))?;
-    let distances = column(DIST_COL)?
-        .as_list_opt::<i32>()
-        .ok_or_else(|| Error::index(format!("{DIST_COL} must be List<Float32>")))?;
-    let neighbor_values = neighbors
-        .values()
-        .as_primitive_opt::<UInt32Type>()
-        .ok_or_else(|| Error::index(format!("{NEIGHBORS_COL} must be List<UInt32>")))?
-        .values();
-    let distance_values = distances
-        .values()
-        .as_primitive_opt::<Float32Type>()
-        .ok_or_else(|| Error::index(format!("{DIST_COL} must be List<Float32>")))?
-        .values();
-    let identity = new_ids
-        .iter()
-        .enumerate()
-        .all(|(old_id, new_id)| *new_id == Some(old_id as u32));
+    let decoded = decode_graph(graph, new_ids)?;
+    let DecodedGraph {
+        metadata,
+        ids,
+        neighbors,
+        distances,
+        neighbor_values,
+        distance_values,
+        identity,
+    } = decoded;
     let new_id = |old_id: u32| new_ids.get(old_id as usize).copied().flatten();
     let num_rows = graph.num_rows();
     let mut levels = Vec::with_capacity(metadata.level_offsets.len().saturating_sub(1));
