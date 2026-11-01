@@ -68,42 +68,84 @@ async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &
         Ok(())
     })
     .await?;
-    if !null_in_deleted_row {
-        return Ok(());
+    if null_in_deleted_row && has_unmasked_null(dataset, field, path).await? {
+        return Err(Error::invalid_input(format!(
+            "Column \"{}\" cannot be made non-nullable: deleted rows still store NULL values \
+             for it. Compact the dataset with materialize_deletions_threshold=0 to remove them \
+             first",
+            path
+        )));
     }
 
-    // A NULL child under a NULL struct is masked, which those readers accept, so
-    // check the parent's validity.
+    // An overlay only shadows a base value on read; the base file keeps it.
+    if let Some(base) = overlaid_fragments_without_overlays(dataset) {
+        let mut null_in_base = false;
+        scan_with_deleted_rows(&base, path, |column, _| {
+            null_in_base |= column.null_count() > 0;
+            Ok(())
+        })
+        .await?;
+        if null_in_base && has_unmasked_null(&base, field, path).await? {
+            return Err(Error::invalid_input(format!(
+                "Column \"{}\" cannot be made non-nullable: data overlays hide NULL values \
+                 the base data files still store for it. Compact the dataset with \
+                 max_overlays_per_fragment=0 to fold the overlays in first",
+                path
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether a NULL of `field`, which a scan of `path` found, is not masked by a NULL
+/// parent struct. Those readers accept a masked one.
+async fn has_unmasked_null(dataset: &Dataset, field: &Field, path: &str) -> Result<bool> {
     let schema = dataset.schema();
     let ancestry = schema
         .field_ancestry_by_id(field.id)
         .ok_or_else(|| Error::internal(format!("No ancestry for field \"{}\"", path)))?;
-    if let [.., parent, _] = ancestry.as_slice() {
-        let mut unmasked_null = false;
-        scan_with_deleted_rows(dataset, &schema.field_path(parent.id)?, |column, _| {
-            unmasked_null |= match column.as_struct_opt() {
-                Some(parent_array) => {
-                    let child = parent_array.column_by_name(&field.name).ok_or_else(|| {
-                        Error::internal(format!("Validation scan for {} lost the column", path))
-                    })?;
-                    (0..parent_array.len())
-                        .any(|row| parent_array.is_valid(row) && child.is_null(row))
-                }
-                None => true,
-            };
-            Ok(())
+    let [.., parent, _] = ancestry.as_slice() else {
+        return Ok(true);
+    };
+    let mut unmasked_null = false;
+    scan_with_deleted_rows(dataset, &schema.field_path(parent.id)?, |column, _| {
+        unmasked_null |= match column.as_struct_opt() {
+            Some(parent_array) => {
+                let child = parent_array.column_by_name(&field.name).ok_or_else(|| {
+                    Error::internal(format!("Validation scan for {} lost the column", path))
+                })?;
+                (0..parent_array.len()).any(|row| parent_array.is_valid(row) && child.is_null(row))
+            }
+            None => true,
+        };
+        Ok(())
+    })
+    .await?;
+    Ok(unmasked_null)
+}
+
+/// A view of `dataset` holding only its fragments that carry overlays, with the
+/// overlays removed, or `None` when no fragment carries one.
+fn overlaid_fragments_without_overlays(dataset: &Dataset) -> Option<Dataset> {
+    let fragments: Vec<Fragment> = dataset
+        .manifest
+        .fragments
+        .iter()
+        .filter(|fragment| !fragment.overlays.is_empty())
+        .map(|fragment| Fragment {
+            overlays: Vec::new(),
+            ..fragment.clone()
         })
-        .await?;
-        if !unmasked_null {
-            return Ok(());
-        }
+        .collect();
+    if fragments.is_empty() {
+        return None;
     }
-    Err(Error::invalid_input(format!(
-        "Column \"{}\" cannot be made non-nullable: deleted rows still store NULL values \
-         for it. Compact the dataset with materialize_deletions_threshold=0 to remove them \
-         first",
-        path
-    )))
+    let mut manifest = dataset.manifest.as_ref().clone();
+    manifest.fragments = Arc::new(fragments);
+    let mut base = dataset.clone();
+    base.manifest = Arc::new(manifest);
+    Some(base)
 }
 
 /// Scan `path`, deleted rows included, and hand each batch's column and row ids to `f`.
@@ -5628,6 +5670,123 @@ mod test {
             batch["d"].as_ref(),
             &Int32Array::from(vec![2, 4]) as &dyn Array
         );
+
+        Ok(())
+    }
+
+    /// An overlay shadows a base value only on read, so a NULL the base file still
+    /// stores under it keeps the column from becoming non-nullable until compaction
+    /// folds the overlay in. A non-NULL base value under an overlay does not.
+    #[rstest]
+    #[case::live_row(None, false, false)]
+    #[case::deleted_row(None, true, false)]
+    #[case::base_not_null(Some(1), false, true)]
+    #[tokio::test]
+    async fn test_set_not_null_with_overlaid_base_values(
+        #[case] base_value: Option<i32>,
+        #[case] delete_overlaid_row: bool,
+        #[case] succeeds: bool,
+    ) -> Result<()> {
+        use crate::dataset::WriteDestination;
+        use crate::dataset::optimize::{CompactionOptions, compact_files};
+        use arrow_array::UInt64Array;
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("x", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2])),
+                Arc::new(Int32Array::from(vec![Some(0), base_value, Some(2)])),
+            ],
+        )?;
+        let test_dir = TempStrDir::default();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+                &test_dir,
+                None,
+            )
+            .await?,
+        );
+        // Overlay row 1 with x = 100.
+        let x_id = dataset.schema().field("x").unwrap().id;
+        let mut writer = dataset
+            .get_fragment(0)
+            .unwrap()
+            .write_overlay(&dataset.schema().project_by_ids(&[x_id], true))
+            .await
+            .unwrap();
+        let overlay = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("_rowaddr", DataType::UInt64, false),
+                ArrowField::new("x", DataType::Int32, true),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![100])),
+            ],
+        )?;
+        writer.write_batch(&overlay).await?;
+        let group = writer.finish().await?.unwrap();
+        let read_version = dataset.version().version;
+        let mut dataset = Dataset::commit(
+            WriteDestination::Dataset(dataset),
+            Operation::DataOverlay {
+                groups: vec![group],
+            },
+            Some(read_version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await?;
+        if delete_overlaid_row {
+            dataset.delete("id = 1").await?;
+        }
+
+        let not_null = [ColumnAlteration::new("x".into()).set_nullable(false)];
+        if succeeds {
+            dataset.alter_columns(&not_null).await?;
+        } else {
+            let err = dataset.alter_columns(&not_null).await.unwrap_err();
+            assert!(
+                err.to_string().contains("data overlays hide NULL values"),
+                "{err}"
+            );
+            assert!(dataset.schema().field("x").unwrap().nullable);
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    max_overlays_per_fragment: Some(0),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await?;
+            dataset.alter_columns(&not_null).await?;
+        }
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("y".into(), "x * 2".into())]),
+                None,
+                None,
+            )
+            .await?;
+        let batch = dataset.scan().try_into_batch().await?;
+        let expected = if delete_overlaid_row {
+            vec![0, 4]
+        } else {
+            vec![0, 200, 4]
+        };
+        assert_eq!(
+            batch["y"].as_ref(),
+            &Int32Array::from(expected) as &dyn Array
+        );
+        dataset.validate().await?;
 
         Ok(())
     }
