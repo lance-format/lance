@@ -7,14 +7,19 @@ use lance_core::Result;
 use lance_io::object_store::ObjectStore;
 use lance_io::utils::read_message;
 use lance_table::feature_flags::{
-    FLAG_BASE_PATHS, FLAG_DELETION_FILES, FLAG_DISABLE_TRANSACTION_FILE, FLAG_STABLE_ROW_IDS,
+    FLAG_BASE_PATHS, FLAG_COVERED_INDEX_METADATA, FLAG_DELETION_FILES,
+    FLAG_DISABLE_TRANSACTION_FILE, FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, FLAG_FRAGMENT_REUSE_INDEX,
+    FLAG_FRAGMENT_TREE, FLAG_INDEPENDENT_COVERING_FIELDS, FLAG_INLINE_DELETIONS,
+    FLAG_MANAGED_BLOBS, FLAG_MIXED_DATA_FILE_VERSIONS, FLAG_NON_REUSABLE_FIELD_IDS,
+    FLAG_OBJECT_METADATA, FLAG_ROW_ADDR_INDICES, FLAG_SPILLED_ROW_LINEAGE, FLAG_STABLE_ROW_IDS,
     FLAG_TABLE_CONFIG, FLAG_UNKNOWN, FLAG_UNSTABLE_DATA_OVERLAY_FILES,
-    FLAG_USE_V2_FORMAT_DEPRECATED,
+    FLAG_USE_V2_FORMAT_DEPRECATED, FLAG_ZONE_WRITE_SEEDS,
 };
 use lance_table::format::overlay::OverlayCoverage;
 use lance_table::format::pb;
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, ExternalFile, Fragment, IndexMetadata, Manifest,
+    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
+    ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
     RowDatasetVersionMeta, RowIdMeta, WriterVersion,
 };
 use lance_table::io::manifest::read_manifest_proto;
@@ -116,8 +121,8 @@ async fn resolve_manifest_source(source: &str) -> Result<ManifestSource> {
 /// `<base>/_versions/*.manifest`.
 ///
 /// Returns `None` when the dataset base cannot be inferred, which means
-/// external transaction files cannot be resolved. Root-level manifests also
-/// return `None` because [`path_from_parts`] rejects an empty prefix.
+/// external transaction files cannot be resolved. Root-level manifests return
+/// the empty object-store path as the dataset base.
 fn infer_dataset_base_from_manifest_path(path: &Path) -> Option<Path> {
     let parts = path
         .parts()
@@ -125,25 +130,19 @@ fn infer_dataset_base_from_manifest_path(path: &Path) -> Option<Path> {
         .collect::<Vec<_>>();
     let filename = parts.last()?;
     if filename == LATEST_MANIFEST {
-        return path_from_parts(&parts[..parts.len().saturating_sub(1)]);
+        return Some(path_from_parts(&parts[..parts.len().saturating_sub(1)]));
     }
     if filename.ends_with(".manifest") && parts.len() >= 2 && parts[parts.len() - 2] == VERSIONS_DIR
     {
-        return path_from_parts(&parts[..parts.len() - 2]);
+        return Some(path_from_parts(&parts[..parts.len() - 2]));
     }
     None
 }
 
-/// Build a non-empty object-store path from path parts.
-///
-/// Returns `None` for an empty prefix, including root-level `_latest.manifest`
-/// paths where there is no dataset base before the manifest filename.
-fn path_from_parts(parts: &[String]) -> Option<Path> {
-    if parts.is_empty() {
-        None
-    } else {
-        Some(Path::from_iter(parts.iter().map(|part| part.as_str())))
-    }
+/// Build an object-store path from path parts. An empty slice represents the
+/// store root.
+fn path_from_parts(parts: &[String]) -> Path {
+    Path::from_iter(parts.iter().map(|part| part.as_str()))
 }
 
 async fn load_indices(
@@ -297,6 +296,24 @@ impl fmt::Display for LanceToolManifest {
             "max_field_id",
             &self.manifest.max_field_id().to_string(),
         )?;
+        write_kv(
+            f,
+            2,
+            "max_allocated_field_id",
+            &format_option_i32(self.manifest.max_allocated_field_id),
+        )?;
+        write_kv(
+            f,
+            2,
+            "max_clustering_id",
+            &self.manifest.max_clustering_id.to_string(),
+        )?;
+        write_kv(
+            f,
+            2,
+            "clustering_definitions",
+            &self.manifest.clustering.len().to_string(),
+        )?;
         write_kv(f, 2, "next_row_id", &self.manifest.next_row_id.to_string())?;
         write_kv(
             f,
@@ -444,6 +461,31 @@ fn write_fragment(f: &mut Formatter<'_>, indent: usize, fragment: &Fragment) -> 
         "created_at_version_meta",
         &format_row_dataset_version_meta(fragment.created_at_version_meta.as_ref()),
     )?;
+    write_kv(
+        f,
+        indent + 2,
+        "row_id_file",
+        &format_row_lineage_file(fragment, ROW_ID_FIELD_ID),
+    )?;
+    write_kv(
+        f,
+        indent + 2,
+        "last_updated_at_version_file",
+        &format_row_lineage_file(fragment, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID),
+    )?;
+    write_kv(
+        f,
+        indent + 2,
+        "created_at_version_file",
+        &format_row_lineage_file(fragment, ROW_CREATED_AT_VERSION_FIELD_ID),
+    )?;
+    write_kv(
+        f,
+        indent + 2,
+        "clustering_id",
+        &format_option_u32(fragment.clustering_id),
+    )?;
+    write_string_map(f, indent + 2, "metadata", &fragment.metadata)?;
     write_deletion_file(f, indent + 2, fragment.deletion_file.as_ref())?;
     writeln!(
         f,
@@ -519,6 +561,12 @@ fn write_data_file(f: &mut Formatter<'_>, indent: usize, data_file: &DataFile) -
     write_kv(
         f,
         indent + 2,
+        "file_metadata_size_bytes",
+        &format_cached_size(data_file.file_metadata_size_bytes),
+    )?;
+    write_kv(
+        f,
+        indent + 2,
         "base_id",
         &format_option_u32(data_file.base_id),
     )
@@ -557,6 +605,16 @@ fn write_deletion_file(
         indent + 2,
         "base_id",
         &format_option_u32(deletion_file.base_id),
+    )?;
+    write_kv(
+        f,
+        indent + 2,
+        "inline_bytes",
+        &deletion_file
+            .inline
+            .as_ref()
+            .map(|inline| inline.len().to_string())
+            .unwrap_or_else(|| "absent".to_string()),
     )
 }
 
@@ -580,6 +638,12 @@ fn write_index(f: &mut Formatter<'_>, index: &IndexView) -> fmt::Result {
             writeln!(f, "    - uuid: {}", parsed.uuid)?;
             write_kv(f, 6, "name", &parsed.name)?;
             write_kv(f, 6, "fields", &format!("{:?}", parsed.fields))?;
+            write_kv(
+                f,
+                6,
+                "covering_fields",
+                &format!("{:?}", parsed.covering_fields),
+            )?;
             write_kv(f, 6, "dataset_version", &parsed.dataset_version.to_string())?;
             let fragment_bitmap = parsed
                 .fragment_bitmap
@@ -610,6 +674,13 @@ fn write_index(f: &mut Formatter<'_>, index: &IndexView) -> fmt::Result {
                     .unwrap_or_else(|| "absent".to_string()),
             )?;
             write_kv(f, 6, "base_id", &format_option_u32(parsed.base_id))?;
+            write_kv(
+                f,
+                6,
+                "clustering_id",
+                &format_option_u32(parsed.clustering_id),
+            )?;
+            write_string_map(f, 6, "metadata", &parsed.metadata)?;
             write_index_files(f, parsed.files.as_ref())
         }
         Err(error) => {
@@ -617,6 +688,12 @@ fn write_index(f: &mut Formatter<'_>, index: &IndexView) -> fmt::Result {
             write_kv(f, 8, "parse_error", error)?;
             write_kv(f, 8, "name", &index.raw.name)?;
             write_kv(f, 8, "fields", &format!("{:?}", index.raw.fields))?;
+            write_kv(
+                f,
+                8,
+                "covering_fields",
+                &format!("{:?}", index.raw.covering_fields),
+            )?;
             write_kv(
                 f,
                 8,
@@ -672,6 +749,13 @@ fn write_index(f: &mut Formatter<'_>, index: &IndexView) -> fmt::Result {
                     .unwrap_or_else(|| "absent".to_string()),
             )?;
             write_kv(f, 8, "base_id", &format_option_u32(index.raw.base_id))?;
+            write_kv(
+                f,
+                8,
+                "clustering_id",
+                &format_option_u32(index.raw.clustering_id),
+            )?;
+            write_string_map(f, 8, "metadata", &index.raw.metadata)?;
             write_kv(f, 8, "files", &index.raw.files.len().to_string())
         }
     }
@@ -688,6 +772,12 @@ fn write_index_files(
     for file in files {
         writeln!(f, "        - path: {}", file.path)?;
         write_kv(f, 10, "size_bytes", &file.size_bytes.to_string())?;
+        write_kv(
+            f,
+            10,
+            "file_metadata_size_bytes",
+            &format_cached_size(file.file_metadata_size_bytes),
+        )?;
     }
     Ok(())
 }
@@ -833,6 +923,12 @@ fn write_transaction_operation(
                 indent,
                 "schema_metadata",
                 &format_bytes_map_summary(&merge.schema_metadata),
+            )?;
+            write_kv(
+                f,
+                indent,
+                "preserves_nullability",
+                &merge.preserves_nullability.to_string(),
             )
         }
         pb::transaction::Operation::Restore(restore) => {
@@ -895,8 +991,20 @@ fn write_transaction_operation(
             write_kv(
                 f,
                 indent,
-                "updated_fragment_offsets",
+                "deprecated_updated_fragment_offsets",
                 &update.updated_fragment_offsets.len().to_string(),
+            )?;
+            write_kv(
+                f,
+                indent,
+                "updated_fragment_offset_bitmaps",
+                &format_offset_bitmap_map(&update.updated_fragment_offset_bitmaps),
+            )?;
+            write_kv(
+                f,
+                indent,
+                "mem_wal_dir_id",
+                &format_optional(update.mem_wal_dir_id.as_ref()),
             )
         }
         pb::transaction::Operation::Project(project) => {
@@ -906,6 +1014,12 @@ fn write_transaction_operation(
                 indent,
                 "schema_fields",
                 &project.schema.len().to_string(),
+            )?;
+            write_kv(
+                f,
+                indent,
+                "preserves_nullability",
+                &project.preserves_nullability.to_string(),
             )
         }
         pb::transaction::Operation::UpdateConfig(update_config) => {
@@ -1119,6 +1233,12 @@ fn format_option_u32(value: Option<u32>) -> String {
         .unwrap_or_else(|| "absent".to_string())
 }
 
+fn format_option_i32(value: Option<i32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "absent".to_string())
+}
+
 fn format_option_u64(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
@@ -1198,6 +1318,25 @@ fn format_feature_flags(flags: u64) -> String {
             FLAG_UNSTABLE_DATA_OVERLAY_FILES,
             "unstable_data_overlay_files",
         ),
+        (FLAG_COVERED_INDEX_METADATA, "covered_index_metadata"),
+        (FLAG_MIXED_DATA_FILE_VERSIONS, "mixed_data_file_versions"),
+        (
+            FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
+            "frag_reuse_with_stable_row_ids",
+        ),
+        (FLAG_FRAGMENT_REUSE_INDEX, "fragment_reuse_index"),
+        (FLAG_SPILLED_ROW_LINEAGE, "spilled_row_lineage"),
+        (FLAG_FRAGMENT_TREE, "fragment_tree"),
+        (
+            FLAG_INDEPENDENT_COVERING_FIELDS,
+            "independent_covering_fields",
+        ),
+        (FLAG_MANAGED_BLOBS, "managed_blobs"),
+        (FLAG_NON_REUSABLE_FIELD_IDS, "non_reusable_field_ids"),
+        (FLAG_ZONE_WRITE_SEEDS, "zone_write_seeds"),
+        (FLAG_OBJECT_METADATA, "object_metadata"),
+        (FLAG_ROW_ADDR_INDICES, "row_addr_indices"),
+        (FLAG_INLINE_DELETIONS, "inline_deletions"),
     ];
     let mut names = known_flags
         .iter()
@@ -1223,7 +1362,7 @@ fn format_update_mode(value: i32) -> String {
 fn format_row_id_meta(value: Option<&RowIdMeta>) -> String {
     match value {
         Some(RowIdMeta::Inline(data)) => format!("inline ({} bytes)", data.len()),
-        Some(RowIdMeta::External(file)) => format_external_file(file),
+        Some(RowIdMeta::Column) => "column".to_string(),
         None => "absent".to_string(),
     }
 }
@@ -1231,16 +1370,17 @@ fn format_row_id_meta(value: Option<&RowIdMeta>) -> String {
 fn format_row_dataset_version_meta(value: Option<&RowDatasetVersionMeta>) -> String {
     match value {
         Some(RowDatasetVersionMeta::Inline(data)) => format!("inline ({} bytes)", data.len()),
-        Some(RowDatasetVersionMeta::External(file)) => format_external_file(file),
+        Some(RowDatasetVersionMeta::Column) => "column".to_string(),
         None => "absent".to_string(),
     }
 }
 
-fn format_external_file(file: &ExternalFile) -> String {
-    format!(
-        "external path={} offset={} size={}",
-        file.path, file.offset, file.size
-    )
+fn format_row_lineage_file(fragment: &Fragment, field_id: i32) -> String {
+    match fragment.row_lineage_file(field_id) {
+        Ok(Some(file)) => file.path.clone(),
+        Ok(None) => "absent".to_string(),
+        Err(error) => format!("error: {error}"),
+    }
 }
 
 fn format_overlay_coverage(coverage: &OverlayCoverage) -> String {
@@ -1272,6 +1412,19 @@ fn format_bytes_map_summary(map: &HashMap<String, Vec<u8>>) -> String {
     parts.join(", ")
 }
 
+fn format_offset_bitmap_map(map: &HashMap<u64, Vec<u8>>) -> String {
+    if map.is_empty() {
+        return "{}".to_string();
+    }
+    let mut entries = map.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(fragment_id, _)| **fragment_id);
+    let summaries = entries
+        .into_iter()
+        .map(|(fragment_id, bitmap)| format!("{fragment_id}={} bytes", bitmap.len()))
+        .collect::<Vec<_>>();
+    summaries.join(", ")
+}
+
 fn format_update_map(update_map: Option<&pb::transaction::UpdateMap>) -> String {
     update_map
         .map(|update_map| {
@@ -1296,7 +1449,10 @@ pub(crate) async fn show_table_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::LanceToolsArgs;
+    use clap::Parser;
     use lance_core::datatypes::Schema;
+    use std::num::NonZero;
     use std::path::{Path as FsPath, PathBuf};
 
     #[test]
@@ -1318,12 +1474,22 @@ mod tests {
     }
 
     #[test]
+    fn test_infer_root_dataset_base() {
+        for path in ["_latest.manifest", "_versions/1.manifest"] {
+            assert_eq!(
+                infer_dataset_base_from_manifest_path(&Path::from(path)),
+                Some(Path::default()),
+                "path {path} should infer the store root"
+            );
+        }
+    }
+
+    #[test]
     fn test_infer_dataset_base_from_unrecognized_manifest_paths() {
         let cases = [
             "1.manifest",
             "dataset/_versions/1.lance",
             "dataset/versions/1.manifest",
-            "_latest.manifest",
         ];
         for path in cases {
             assert_eq!(
@@ -1380,6 +1546,172 @@ mod tests {
             "RewriteRows"
         );
         assert_eq!(format_update_mode(99), "99");
+    }
+
+    #[test]
+    fn test_format_feature_flags_names_all_known_bits() {
+        let known_flags = [
+            (FLAG_DELETION_FILES, "deletion_files"),
+            (FLAG_STABLE_ROW_IDS, "stable_row_ids"),
+            (FLAG_USE_V2_FORMAT_DEPRECATED, "use_v2_format_deprecated"),
+            (FLAG_TABLE_CONFIG, "table_config"),
+            (FLAG_BASE_PATHS, "base_paths"),
+            (FLAG_DISABLE_TRANSACTION_FILE, "disable_transaction_file"),
+            (
+                FLAG_UNSTABLE_DATA_OVERLAY_FILES,
+                "unstable_data_overlay_files",
+            ),
+            (FLAG_COVERED_INDEX_METADATA, "covered_index_metadata"),
+            (FLAG_MIXED_DATA_FILE_VERSIONS, "mixed_data_file_versions"),
+            (
+                FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
+                "frag_reuse_with_stable_row_ids",
+            ),
+            (FLAG_FRAGMENT_REUSE_INDEX, "fragment_reuse_index"),
+            (FLAG_SPILLED_ROW_LINEAGE, "spilled_row_lineage"),
+            (FLAG_FRAGMENT_TREE, "fragment_tree"),
+            (
+                FLAG_INDEPENDENT_COVERING_FIELDS,
+                "independent_covering_fields",
+            ),
+            (FLAG_MANAGED_BLOBS, "managed_blobs"),
+            (FLAG_NON_REUSABLE_FIELD_IDS, "non_reusable_field_ids"),
+            (FLAG_ZONE_WRITE_SEEDS, "zone_write_seeds"),
+            (FLAG_OBJECT_METADATA, "object_metadata"),
+            (FLAG_ROW_ADDR_INDICES, "row_addr_indices"),
+            (FLAG_INLINE_DELETIONS, "inline_deletions"),
+        ];
+        let rendered = format_feature_flags(FLAG_UNKNOWN - 1);
+        for (_, name) in known_flags {
+            assert!(
+                rendered.contains(name),
+                "missing flag name {name}: {rendered}"
+            );
+        }
+        assert!(!rendered.contains("unknown"), "{rendered}");
+
+        let future = format_feature_flags(FLAG_UNKNOWN);
+        assert!(future.contains("unknown"), "{future}");
+    }
+
+    #[test]
+    fn test_render_row_lineage_column_metadata() {
+        let schema = Schema::default();
+        let mut fragment = Fragment::with_file_legacy(7, "row-lineage.lance", &schema, Some(3));
+        fragment.files[0].fields = Arc::from([
+            ROW_ID_FIELD_ID,
+            ROW_CREATED_AT_VERSION_FIELD_ID,
+            ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
+        ]);
+        fragment.files[0].file_metadata_size_bytes = NonZero::new(4096);
+        fragment.row_id_meta = Some(RowIdMeta::Column);
+        fragment.created_at_version_meta = Some(RowDatasetVersionMeta::Column);
+        fragment.last_updated_at_version_meta = Some(RowDatasetVersionMeta::Column);
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        let tool_manifest = LanceToolManifest {
+            path: Path::from("dataset/_versions/1.manifest"),
+            dataset_base: Some(Path::from("dataset")),
+            has_timestamp: false,
+            has_data_format: true,
+            manifest,
+            indices: OptionalSection::NotPresent,
+            transaction: OptionalSection::NotPresent,
+        };
+
+        let rendered = tool_manifest.to_string();
+
+        assert!(rendered.contains("row_id_meta: column"), "{rendered}");
+        assert!(
+            rendered.contains("created_at_version_meta: column"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("last_updated_at_version_meta: column"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("row_id_file: row-lineage.lance"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("file_metadata_size_bytes: 4096"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_render_covering_fields_and_current_offset_bitmaps() {
+        let raw_index = pb::IndexMetadata {
+            uuid: Some(pb::Uuid { uuid: vec![0; 16] }),
+            fields: vec![1, 2],
+            covering_fields: vec![2],
+            ..Default::default()
+        };
+        let parsed_index =
+            IndexMetadata::try_from(raw_index.clone()).map_err(|error| error.to_string());
+        let update = pb::transaction::Update {
+            updated_fragment_offset_bitmaps: HashMap::from([(7, vec![1, 2, 3])]),
+            ..Default::default()
+        };
+        let transaction = pb::Transaction {
+            operation: Some(pb::transaction::Operation::Update(update)),
+            ..Default::default()
+        };
+        let tool_manifest = LanceToolManifest {
+            path: Path::from("dataset/_versions/1.manifest"),
+            dataset_base: Some(Path::from("dataset")),
+            has_timestamp: false,
+            has_data_format: true,
+            manifest: empty_manifest(),
+            indices: OptionalSection::Loaded(vec![IndexView {
+                raw: raw_index,
+                parsed: parsed_index,
+            }]),
+            transaction: OptionalSection::Loaded(TransactionView {
+                source: TransactionSource::Inline { position: 1 },
+                transaction,
+            }),
+        };
+
+        let rendered = tool_manifest.to_string();
+
+        assert!(rendered.contains("covering_fields: [2]"), "{rendered}");
+        assert!(
+            rendered.contains("deprecated_updated_fragment_offsets: 0"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("updated_fragment_offset_bitmaps: 7=3 bytes"),
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_table_manifest_cli_dispatch() {
+        let manifest_path = repo_root().join(
+            "test_data/v14.0.0-beta.15/stable_row_id_btree.lance/_versions/18446744073709551614.manifest",
+        );
+        assert!(manifest_path.is_file(), "{}", manifest_path.display());
+        let args = LanceToolsArgs::try_parse_from([
+            "lance-tools",
+            "table",
+            "manifest",
+            "--source",
+            &manifest_path.to_string_lossy(),
+        ])
+        .unwrap();
+        let mut output = Vec::new();
+
+        args.run(&mut output).await.unwrap();
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("manifest:"), "{rendered}");
+        assert!(rendered.contains("schema:"), "{rendered}");
     }
 
     #[tokio::test]
