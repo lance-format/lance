@@ -454,7 +454,7 @@ mod tests {
             FragReuseIndexDetails {
                 versions: Vec::new(),
             },
-            Default::default(),
+            std::iter::once(0_u32).collect(),
         )
         .await
         .unwrap();
@@ -474,6 +474,19 @@ mod tests {
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].name, FRAG_REUSE_INDEX_NAME);
+        assert_eq!(
+            indices[0].fragment_bitmap.as_ref().unwrap().len(),
+            1,
+            "the regression requires a bitmap-bearing system index"
+        );
+
+        let descriptions = dataset.describe_indices(None).await.unwrap();
+        assert_eq!(descriptions.len(), 1);
+        assert_eq!(descriptions[0].name(), FRAG_REUSE_INDEX_NAME);
+        assert!(
+            descriptions[0].fragment_coverage().is_none(),
+            "fragment-reuse metadata does not represent data-index coverage"
+        );
         assert!(options.create_remapper(&dataset).await.unwrap().is_none());
     }
 

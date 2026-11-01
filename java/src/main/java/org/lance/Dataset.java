@@ -1810,6 +1810,42 @@ public class Dataset implements Closeable {
   private native List<IndexDescription> nativeDescribeIndices(Optional<IndexCriteria> criteria);
 
   /**
+   * Describe indices on this dataset without materializing per-segment metadata.
+   *
+   * <p>The returned descriptions contain the same logical index properties and aggregate fragment
+   * coverage as {@link #describeIndices(IndexCriteria)}, but their segment lists are empty. Use
+   * this method when only summary information is needed, especially for indices covering many
+   * fragments.
+   *
+   * @param criteria filter options such as column, name or index capabilities
+   * @return list of index descriptions with empty segment lists
+   */
+  public List<IndexDescription> describeIndexSummaries(IndexCriteria criteria) {
+    Preconditions.checkNotNull(criteria, "criteria cannot be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeDescribeIndexSummaries(Optional.of(criteria));
+    }
+  }
+
+  /**
+   * Describe all indices on this dataset without materializing per-segment metadata.
+   *
+   * <p>The returned descriptions contain aggregate fragment coverage and have empty segment lists.
+   *
+   * @return list of index descriptions with empty segment lists
+   */
+  public List<IndexDescription> describeIndexSummaries() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeDescribeIndexSummaries(Optional.empty());
+    }
+  }
+
+  private native List<IndexDescription> nativeDescribeIndexSummaries(
+      Optional<IndexCriteria> criteria);
+
+  /**
    * Read zonemap statistics for a column.
    *
    * <p>Returns per-zone min/max/null_count statistics for the given column, if a zonemap index
