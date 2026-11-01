@@ -379,14 +379,16 @@ pub async fn prepare_bm25_query(
         let parallelism = get_num_compute_intensive_cpus()
             .clamp(1, MAX_CONCURRENT_SOURCE_LOADS)
             .min(indices.len());
-        let segment_stats = stream::iter(
-            indices
-                .iter()
-                .map(|index| index.bm25_stats_for_terms(&terms, metrics)),
-        )
-        .buffered(parallelism)
-        .try_collect::<Vec<_>>()
-        .await?;
+        // Collected first: a lazily mapped iterator here leaves the stream's
+        // type higher-ranked over the borrow, which callers cannot prove Send.
+        let fetches = indices
+            .iter()
+            .map(|index| index.bm25_stats_for_terms(&terms, metrics))
+            .collect::<Vec<_>>();
+        let segment_stats = stream::iter(fetches)
+            .buffered(parallelism)
+            .try_collect::<Vec<_>>()
+            .await?;
         let scorer = merge_loaded_bm25_stats(&terms, segment_stats)?.ok_or_else(|| {
             lance_core::Error::internal("BM25 scorer aggregation requires at least one segment")
         })?;
