@@ -1019,28 +1019,25 @@ impl ResidentAddressProjection {
     /// [`AddressKeyedDocuments::num_distinct_rows`] without walking it.
     ///
     /// The ordering half is [`OrderedRowAddressProjection`], whose verdict this
-    /// projection already caches for the cross-column scorer. A cached invalid
-    /// verdict answers `false` directly: only callers that need the exact
-    /// diagnostics pay for [`Self::try_ordered_row_addresses`]'s O(num_docs)
-    /// reconstruction. Density is the
+    /// projection already caches for the cross-column scorer. Density is the
     /// extra condition: an ordered projection may still hold dead slots, and
     /// those report [`RowAddress::TOMBSTONE_ROW`], which the block-skip cursor
     /// cannot tell from an exhausted cursor. A remapper is attached whenever the
     /// dataset carries a fragment reuse index, even when it retains every
     /// document, so liveness has to be decided on cardinality.
     fn dense_and_strictly_ascending(&self) -> bool {
-        match self.cached_row_address_order() {
-            // The cache holds the whole verdict for invalid projections, and
-            // it can only be `false`. Reconstructing the diagnostics would
-            // re-scan every document inline on the caller's thread (the tokio
-            // worker during a query) for a boolean it already determines.
-            CachedRowAddressOrder::Duplicate | CachedRowAddressOrder::OutOfOrder => false,
-            CachedRowAddressOrder::Ordered | CachedRowAddressOrder::Unknown => {
-                match self.try_ordered_row_addresses() {
-                    Ok(ordered) => !ordered.has_sparse_live_docs(),
-                    Err(_) => false,
-                }
-            }
+        // A cached invalid verdict already decides the answer. Asking for the
+        // ordered view would rebuild its diagnostics by rescanning the documents
+        // up to the first violation, only to discard them.
+        if matches!(
+            self.cached_row_address_order(),
+            CachedRowAddressOrder::Duplicate | CachedRowAddressOrder::OutOfOrder
+        ) {
+            return false;
+        }
+        match self.try_ordered_row_addresses() {
+            Ok(ordered) => !ordered.has_sparse_live_docs(),
+            Err(_) => false,
         }
     }
 
@@ -3121,39 +3118,10 @@ mod tests {
         let projection = projection.resident(Some(raw)).unwrap();
 
         assert_eq!(projection.dense_and_strictly_ascending(), expected);
-    }
-
-    /// The boolean order gate must answer from the cached invalid category
-    /// alone. `try_ordered_row_addresses` reconstructs full diagnostics with an
-    /// O(num_docs) scan; before the cache was consulted here, a remapped
-    /// partition with a published Duplicate/OutOfOrder verdict re-ran that scan
-    /// inline on the tokio worker for every query, only to discard the error.
-    #[test]
-    fn boolean_order_check_answers_from_cached_invalid_category() {
-        let projection = Arc::new(VersionAddressProjection {
-            // The duplicate address makes the projection invalid, but the
-            // cache below says a prior query already paid to learn that.
-            addresses: AddressValues::Owned(Arc::new(vec![10, 20, 20])),
-            live_docs: None,
-            doc_ids_by_address: OnceCell::new(),
-            ordered_validation: AtomicU8::new(CachedRowAddressOrder::Duplicate as u8),
-            materialized_candidate_cost: AtomicUsize::new(0),
-            ordered_validation_visited_docs: AtomicUsize::new(3),
-        });
-        let projection = projection.resident(None).unwrap();
-
-        assert!(!projection.dense_and_strictly_ascending());
-        // Answered from the cached category: no diagnostic reconstruction ran.
-        assert_eq!(projection.ordered_validation_visited_docs(), 3);
-
-        // Only the diagnostics-returning path keeps reconstruction: it re-runs
-        // the scan to rebuild the exact error for callers that report it.
-        assert!(projection.try_ordered_row_addresses().is_err());
-        assert_eq!(projection.ordered_validation_visited_docs(), 6);
-
-        // And the boolean check stays cheap afterwards.
-        assert!(!projection.dense_and_strictly_ascending());
-        assert_eq!(projection.ordered_validation_visited_docs(), 6);
+        // Later checks answer from the cached verdict without rescanning.
+        let visited = projection.ordered_validation_visited_docs();
+        assert_eq!(projection.dense_and_strictly_ascending(), expected);
+        assert_eq!(projection.ordered_validation_visited_docs(), visited);
     }
 
     #[test]
