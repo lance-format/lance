@@ -99,7 +99,7 @@ async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &
 }
 
 /// Whether a NULL of `field`, which a scan of `path` found, is not masked by a NULL
-/// parent struct. Those readers accept a masked one.
+/// parent struct. Readers of physical rows accept a masked one.
 async fn has_unmasked_null(dataset: &Dataset, field: &Field, path: &str) -> Result<bool> {
     let schema = dataset.schema();
     let ancestry = schema
@@ -5698,8 +5698,15 @@ mod test {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(Int32Array::from(vec![0, 1, 2])),
-                Arc::new(Int32Array::from(vec![Some(0), base_value, Some(2)])),
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5])),
+                Arc::new(Int32Array::from(vec![
+                    Some(0),
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                    base_value,
+                    Some(5),
+                ])),
             ],
         )?;
         let test_dir = TempStrDir::default();
@@ -5707,14 +5714,17 @@ mod test {
             Dataset::write(
                 RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
                 &test_dir,
-                None,
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    ..Default::default()
+                }),
             )
             .await?,
         );
-        // Overlay row 1 with x = 100.
+        // Overlay id 4, offset 1 of the second fragment, with x = 100.
         let x_id = dataset.schema().field("x").unwrap().id;
         let mut writer = dataset
-            .get_fragment(0)
+            .get_fragment(1)
             .unwrap()
             .write_overlay(&dataset.schema().project_by_ids(&[x_id], true))
             .await
@@ -5725,7 +5735,7 @@ mod test {
                 ArrowField::new("x", DataType::Int32, true),
             ])),
             vec![
-                Arc::new(UInt64Array::from(vec![1])),
+                Arc::new(UInt64Array::from(vec![(1 << 32) | 1])),
                 Arc::new(Int32Array::from(vec![100])),
             ],
         )?;
@@ -5745,7 +5755,7 @@ mod test {
         )
         .await?;
         if delete_overlaid_row {
-            dataset.delete("id = 1").await?;
+            dataset.delete("id = 4").await?;
         }
 
         let not_null = [ColumnAlteration::new("x".into()).set_nullable(false)];
@@ -5778,9 +5788,9 @@ mod test {
             .await?;
         let batch = dataset.scan().try_into_batch().await?;
         let expected = if delete_overlaid_row {
-            vec![0, 4]
+            vec![0, 2, 4, 6, 10]
         } else {
-            vec![0, 200, 4]
+            vec![0, 2, 4, 6, 200, 10]
         };
         assert_eq!(
             batch["y"].as_ref(),
