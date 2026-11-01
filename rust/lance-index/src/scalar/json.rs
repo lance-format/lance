@@ -338,6 +338,19 @@ impl From<JsonIndexTargetType> for DataType {
 //
 // I think the only thing we really gain is a different format impl (e.g. it shows up as a json query
 // in the explain plan) but I don't know if that helps the user much.
+/// A predicate evaluated by an index on a value extracted from a JSON column.
+///
+/// The path and target query are exposed so distributed planners can preserve
+/// the extraction boundary when encoding and reconstructing the query.
+///
+/// ```
+/// use std::sync::Arc;
+/// use lance_index::scalar::{SargableQuery, json::JsonQuery};
+///
+/// let query = JsonQuery::new(Arc::new(SargableQuery::IsNull()), "address.city".into());
+/// let rebuilt = JsonQuery::new(query.target_query().clone(), query.path().to_owned());
+/// assert_eq!(query, rebuilt);
+/// ```
 #[derive(Debug, Clone)]
 pub struct JsonQuery {
     target_query: Arc<dyn AnyQuery>,
@@ -347,6 +360,16 @@ pub struct JsonQuery {
 impl JsonQuery {
     pub fn new(target_query: Arc<dyn AnyQuery>, path: String) -> Self {
         Self { target_query, path }
+    }
+
+    /// The JSON path used to extract the values searched by the target index.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// The typed predicate applied to the extracted JSON values.
+    pub fn target_query(&self) -> &Arc<dyn AnyQuery> {
+        &self.target_query
     }
 }
 
@@ -1540,6 +1563,17 @@ mod tests {
             panic!("JSON parser should wrap the target index query");
         };
         assert_eq!(search.index_type, "ZoneMap");
+        let query = search.query.as_any().downcast_ref::<JsonQuery>().unwrap();
+        assert_eq!(query.path(), "$.value");
+        assert!(matches!(
+            query
+                .target_query()
+                .as_any()
+                .downcast_ref::<SargableQuery>(),
+            Some(SargableQuery::IsNull())
+        ));
+        let rebuilt = JsonQuery::new(query.target_query().clone(), query.path().to_owned());
+        assert!(search.query.dyn_eq(&rebuilt));
         assert!(
             !search.needs_recheck,
             "the target's exact null-tracking detail should reach its query parser"
