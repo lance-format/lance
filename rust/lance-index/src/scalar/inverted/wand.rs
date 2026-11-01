@@ -637,8 +637,6 @@ impl CompressedState {
 struct BlockMaxWindow {
     // Sliding block range used for Lucene-style getMaxScore(upTo). The deque is
     // monotonic by score and covers blocks in [start_block_idx, next_block_idx).
-    // Only used for compressed lists without impact skip data; impact lists
-    // answer window max scores from the anchored level caches instead.
     start_block_idx: usize,
     next_block_idx: usize,
     max_scores: VecDeque<(usize, f32)>,
