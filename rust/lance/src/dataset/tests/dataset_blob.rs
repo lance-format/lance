@@ -2640,21 +2640,35 @@ async fn test_read_blob_ranges_rejects_overflow_and_out_of_bounds() {
 }
 
 #[tokio::test]
-async fn test_take_blob_v2_from_non_default_base_inline() {
+async fn test_take_blob_v2_from_non_default_base_inline_reuses_store() {
     let fixture = create_multi_base_blob_v2_fixture(b"inline".to_vec(), None, true).await;
+    let registry = fixture.dataset.session.store_registry();
+    let stats = registry.stats();
+    let attempts_before = stats.hits + stats.misses;
 
-    let blobs = fixture
-        .dataset
-        .take_blobs_by_indices(&[0], "blob")
-        .await
-        .unwrap();
+    for _ in 0..2 {
+        let blobs = fixture
+            .dataset
+            .take_blobs_by_indices(&[0, 1], "blob")
+            .await
+            .unwrap();
 
-    assert_eq!(blobs.len(), 1);
-    let blob = blobs[0].as_ref().unwrap();
-    assert_eq!(blob.kind(), BlobKind::Inline);
+        assert_eq!(blobs.len(), 2);
+        for blob in blobs {
+            let blob = blob.as_ref().unwrap();
+            assert_eq!(blob.kind(), BlobKind::Inline);
+            assert_eq!(
+                blob.read().await.unwrap().as_ref(),
+                fixture.expected.as_slice()
+            );
+        }
+    }
+
+    let stats = registry.stats();
     assert_eq!(
-        blob.read().await.unwrap().as_ref(),
-        fixture.expected.as_slice()
+        stats.hits + stats.misses - attempts_before,
+        1,
+        "repeated blob reads must resolve the additional base store once"
     );
 }
 
