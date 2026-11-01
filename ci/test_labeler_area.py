@@ -10,6 +10,7 @@ LABELER_CONFIG = ROOT / ".github" / "labeler-area.yml"
 EXECUTION_PROTO_PATHS = {
     "protos/ann.proto",
     "protos/filtered_read.proto",
+    "protos/fts.proto",
     "protos/table_identifier.proto",
 }
 
