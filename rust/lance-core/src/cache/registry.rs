@@ -260,7 +260,6 @@ mod tests {
             Ok((entry, false))
         }
 
-        async fn invalidate(&self, _key: &InternalCacheKey) {}
         async fn clear(&self) {}
         async fn num_entries(&self) -> usize {
             0

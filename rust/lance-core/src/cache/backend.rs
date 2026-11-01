@@ -174,6 +174,12 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// after it deletes a version's files) rebuild the exact [`CacheKey`]s and
     /// invalidate them one by one.
     ///
+    /// The default is a best-effort no-op so external implementations keep
+    /// compiling without it: stale entries in such a backend age out through
+    /// its capacity-based eviction instead of being removed eagerly. Backends
+    /// that can remove a single entry should override it; the built-in moka
+    /// and quick backends do.
+    ///
     /// # Examples
     ///
     /// ```
@@ -187,7 +193,7 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// assert!(backend.get(&key, None).await.is_none());
     /// # }
     /// ```
-    async fn invalidate(&self, key: &InternalCacheKey);
+    async fn invalidate(&self, _key: &InternalCacheKey) {}
 
     /// Remove all entries.
     async fn clear(&self);
