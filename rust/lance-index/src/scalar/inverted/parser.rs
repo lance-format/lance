@@ -308,6 +308,7 @@ mod tests {
                 r#"{{ "match": {{ "column": "text", "terms": "hello", "fuzziness": {fuzziness} }} }}"#
             );
             let error = from_json(&json).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
             assert!(
                 error.to_string().contains("fuzziness"),
                 "fuzziness={fuzziness}: {error}"
