@@ -99,8 +99,9 @@ fn parse_document_granularity(value: &Value) -> Result<Option<DocumentGranularit
 }
 
 /// Parses an optional non-negative integer field bounded by `max`, rejecting
-/// present-but-invalid values (negative or fractional numbers, non-numbers,
-/// or values above `max`) instead of silently coercing them to a default.
+/// present-but-invalid values (negative numbers, numbers written as floats
+/// such as `1.0`, non-numbers, or values above `max`) instead of silently
+/// coercing them to a default.
 /// Absent keys and explicit nulls map to `None` so callers keep their defaults.
 fn parse_bounded_u64(value: &Value, field: &str, max: u64) -> Result<Option<u64>> {
     let invalid = |repr: &dyn std::fmt::Display| {
@@ -324,6 +325,35 @@ mod tests {
             };
             assert_eq!(query.fuzziness, None);
         }
+    }
+
+    #[test]
+    fn test_from_json_match_invalid_integer_fields_rejected() {
+        for (field, value) in [
+            ("max_expansions", "10.0"),
+            ("max_expansions", "-1"),
+            ("max_expansions", "\"10\""),
+            ("prefix_length", "4294967296"),
+            ("prefix_length", "2.0"),
+        ] {
+            let json = format!(
+                r#"{{ "match": {{ "column": "text", "terms": "hello", "{field}": {value} }} }}"#
+            );
+            let error = from_json(&json).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(
+                error.to_string().contains(field) && error.to_string().contains(value),
+                "{field}={value}: {error}"
+            );
+        }
+
+        // An explicit null keeps the default.
+        let json = r#"{ "match": { "column": "text", "terms": "hello", "max_expansions": null, "prefix_length": null } }"#;
+        let FtsQuery::Match(query) = from_json(json).unwrap() else {
+            panic!("expected match query");
+        };
+        assert_eq!(query.max_expansions, MatchQuery::default_max_expansions());
+        assert_eq!(query.prefix_length, 0);
     }
 
     #[test]
