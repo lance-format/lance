@@ -299,6 +299,21 @@ impl DatasetPreFilter {
             .await
     }
 
+    /// True when the only rows this prefilter removes are deleted rows and rows
+    /// outside the indexed fragments: no query filter, no FTS fragment pruning and
+    /// no overlay block. `self` is destructured so that a new filter field fails to
+    /// compile here until it is accounted for.
+    pub(crate) fn only_deletions(&self) -> bool {
+        let Self {
+            deleted_ids: _,
+            filtered_ids,
+            deleted_fragments,
+            overlay_block,
+            final_mask: _,
+        } = self;
+        filtered_ids.is_none() && deleted_fragments.is_none() && overlay_block.is_none()
+    }
+
     /// Sets the deleted fragment IDs to block during search.
     ///
     /// Used by FTS indices which track fragments that have been removed from the
@@ -450,6 +465,13 @@ impl PreFilter for DatasetPreFilter {
         }
         let final_mask = self.final_mask.lock().unwrap();
         final_mask.get_or_init(|| {
+            // Deletions only: `RowAddrMask::default()` selects every row, so the
+            // combined mask is the deletion mask itself. Share it instead of copying.
+            if self.only_deletions()
+                && let Some(deleted_ids) = &self.deleted_ids
+            {
+                return deleted_ids.get_ready();
+            }
             let mut combined = RowAddrMask::default();
             if let Some(filtered_ids) = &self.filtered_ids {
                 combined = combined & filtered_ids.get_ready().as_ref().clone();
@@ -938,6 +960,21 @@ mod test {
 
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(second.allow_list(), Some(&RowAddrTreeMap::from_iter(0..8)));
+    }
+
+    #[tokio::test]
+    async fn test_deletions_only_prefilter_shares_mask() {
+        let datasets = test_datasets(false).await;
+        let prefilter = DatasetPreFilter::new_restricted_to_fragments(
+            datasets.deletions_no_missing_frags.clone(),
+            RoaringBitmap::from_iter(0..3),
+            None,
+        );
+        assert!(prefilter.only_deletions());
+        prefilter.wait_for_ready().await.unwrap();
+        let deleted = prefilter.deleted_ids.as_ref().unwrap().get_ready();
+        assert!(Arc::ptr_eq(&prefilter.mask(), &deleted));
+        assert!(!prefilter.mask().selected((2 << 32) + 2));
     }
 
     // Regression test for issue #6877.
