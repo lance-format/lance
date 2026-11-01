@@ -42,10 +42,11 @@ use lance_namespace::models::{
     ListTableBranchesResponse, ListTableIndicesRequest, ListTableIndicesResponse,
     ListTableTagsRequest, ListTableTagsResponse, ListTableVersionsRequest,
     ListTableVersionsResponse, ListTablesRequest, ListTablesResponse, MergeInsertIntoTableRequest,
-    MergeInsertIntoTableResponse, NamespaceExistsRequest, QueryTableRequest, RestoreTableRequest,
-    RestoreTableResponse, TableExistsRequest, TagContents as ModelTagContents, UpdateTableRequest,
-    UpdateTableResponse, UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse,
-    UpdateTableTagRequest, UpdateTableTagResponse,
+    MergeInsertIntoTableResponse, NamespaceExistsRequest, QueryTableRequest, RenameTableRequest,
+    RenameTableResponse, RestoreTableRequest, RestoreTableResponse, TableExistsRequest,
+    TagContents as ModelTagContents, UpdateTableRequest, UpdateTableResponse,
+    UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse, UpdateTableTagRequest,
+    UpdateTableTagResponse,
 };
 use lance_table::io::commit::ManifestNamingScheme;
 use object_store::path::Path;
@@ -347,6 +348,51 @@ impl LanceNamespace for DirectoryNamespace {
             location: Some(table_uri),
             ..Default::default()
         })
+    }
+
+    async fn rename_table(&self, request: RenameTableRequest) -> Result<RenameTableResponse> {
+        self.record_op("rename_table");
+
+        let table_id = request.id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Table ID is required".to_string(),
+            })
+        })?;
+        if table_id.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "Table ID cannot be empty".to_string(),
+            }
+            .into());
+        }
+        if request.new_table_name.trim().is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "new_table_name cannot be empty".to_string(),
+            }
+            .into());
+        }
+
+        let source_is_child = table_id.len() > 1;
+        let destination_is_child = request
+            .new_namespace_id
+            .as_ref()
+            .is_none_or(|namespace| !namespace.is_empty());
+        let manifest_is_authoritative =
+            !self.dir_listing_enabled || (source_is_child && destination_is_child);
+
+        if !self.manifest_enabled || !manifest_is_authoritative {
+            return Err(NamespaceError::Unsupported {
+                message: "rename_table requires manifest-authoritative source and destination resolution; directory-only and directory-listing root tables are not supported".to_string(),
+            }
+            .into());
+        }
+
+        let Some(manifest_ns) = self.manifest_ns_for_write().await? else {
+            return Err(NamespaceError::Unsupported {
+                message: "rename_table is only supported when manifest mode is enabled".to_string(),
+            }
+            .into());
+        };
+        LanceNamespace::rename_table(manifest_ns.as_ref(), request).await
     }
 
     async fn create_table(

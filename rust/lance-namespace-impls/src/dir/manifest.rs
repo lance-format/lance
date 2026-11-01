@@ -55,7 +55,7 @@ use lance_namespace::models::{
     DescribeTableResponse, DropNamespaceRequest, DropNamespaceResponse, DropTableRequest,
     DropTableResponse, ListNamespacesRequest, ListNamespacesResponse, ListTablesRequest,
     ListTablesResponse, NamespaceExistsRequest, RegisterTableRequest, RegisterTableResponse,
-    TableExistsRequest,
+    RenameTableRequest, RenameTableResponse, TableExistsRequest,
 };
 use lance_namespace::schema::arrow_schema_to_json;
 use lance_table::feature_flags::{apply_feature_flags, ensure_can_write_manifest};
@@ -681,6 +681,107 @@ impl ManifestStreamMutation for DeleteObjectMutation {
             object_id: self.object_id.clone(),
             output: (),
         }
+    }
+}
+
+/// Replace one object's identity in a single manifest rewrite.
+///
+/// The destination row copies every non-identity field from the source row observed by
+/// the rewrite, so a concurrent metadata or location update is not replaced with a
+/// stale snapshot taken before the commit.
+struct RenameObjectMutation {
+    source_object_id: String,
+    destination_object_id: String,
+    source_row: Option<ManifestRowValue>,
+}
+
+impl RenameObjectMutation {
+    fn new(source_object_id: String, destination_object_id: String) -> Self {
+        Self {
+            source_object_id,
+            destination_object_id,
+            source_row: None,
+        }
+    }
+}
+
+impl ManifestStreamMutation for RenameObjectMutation {
+    type Output = ();
+
+    fn process_existing_row(
+        &mut self,
+        row: ManifestRowValue,
+        output: &mut ManifestBatchBuilder,
+        index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()> {
+        if row.object_id == self.source_object_id {
+            self.source_row = Some(row);
+            return Ok(());
+        }
+
+        if row.object_id == self.destination_object_id {
+            return Err(NamespaceError::ConcurrentModification {
+                message: format!(
+                    "Object '{}' was concurrently created by another operation",
+                    row.object_id
+                ),
+            }
+            .into());
+        }
+
+        output.append(
+            index_data,
+            ManifestOutputRow {
+                object_id: &row.object_id,
+                object_type: row.object_type,
+                location: row.location.as_deref(),
+                metadata: row.metadata.as_deref(),
+                base_objects: row.base_objects.as_deref(),
+            },
+        )
+    }
+
+    fn append_rows(
+        &mut self,
+        output: &mut ManifestBatchBuilder,
+        index_data: &mut ManifestIndexAccumulator,
+    ) -> Result<()> {
+        let source_row =
+            self.source_row
+                .take()
+                .ok_or_else(|| NamespaceError::ConcurrentModification {
+                    message: format!(
+                        "Object '{}' was concurrently removed by another operation",
+                        self.source_object_id
+                    ),
+                })?;
+        if source_row.object_type != ObjectType::Table {
+            return Err(NamespaceError::ConcurrentModification {
+                message: format!("Object '{}' is no longer a table", self.source_object_id),
+            }
+            .into());
+        }
+
+        output.append(
+            index_data,
+            ManifestOutputRow {
+                object_id: &self.destination_object_id,
+                object_type: source_row.object_type,
+                location: source_row.location.as_deref(),
+                metadata: source_row.metadata.as_deref(),
+                base_objects: source_row.base_objects.as_deref(),
+            },
+        )
+    }
+
+    fn finish(&self) -> CopyOnWriteMutation<Self::Output> {
+        CopyOnWriteMutation::updated(())
+    }
+
+    fn conflict_resolution(&self) -> ConflictResolution<Self::Output> {
+        // The new name must still be free after losing a commit race; re-applying against
+        // the latest manifest is otherwise safe.
+        ConflictResolution::FailIfExists(vec![self.destination_object_id.clone()])
     }
 }
 
@@ -2691,6 +2792,21 @@ impl ManifestNamespace {
         .await
     }
 
+    /// Move an entry to a new object id in a single manifest commit.
+    ///
+    /// Fails if `destination` already exists or if the source entry is gone, in both
+    /// cases leaving the manifest untouched.
+    async fn rename_in_manifest(
+        &self,
+        source_object_id: &str,
+        destination_object_id: String,
+    ) -> Result<()> {
+        self.rewrite_manifest("Failed to rename in manifest", || {
+            RenameObjectMutation::new(source_object_id.to_string(), destination_object_id.clone())
+        })
+        .await
+    }
+
     /// Register a table in the manifest without creating the physical table (internal helper for migration)
     pub async fn register_table(&self, name: &str, location: String) -> Result<()> {
         let object_id = Self::build_object_id(&[], name);
@@ -3556,6 +3672,79 @@ impl LanceNamespace for ManifestNamespace {
             }
             .into()),
         }
+    }
+
+    async fn rename_table(&self, request: RenameTableRequest) -> Result<RenameTableResponse> {
+        let table_id = request.id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Table ID is required".to_string(),
+            })
+        })?;
+
+        if table_id.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "Table ID cannot be empty".to_string(),
+            }
+            .into());
+        }
+
+        if request.new_table_name.trim().is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "new_table_name cannot be empty".to_string(),
+            }
+            .into());
+        }
+
+        let (source_namespace, _) = Self::split_object_id(table_id);
+        let source_object_id = Self::str_object_id(table_id);
+
+        let source_exists = self
+            .query_manifest_for_table(&source_object_id)
+            .boxed()
+            .await?
+            .is_some();
+        if !source_exists {
+            return Err(NamespaceError::TableNotFound {
+                message: Self::format_table_id(table_id),
+            }
+            .into());
+        }
+
+        // Default to the source namespace when no destination namespace is provided.
+        let destination_namespace = match request.new_namespace_id.as_ref() {
+            Some(namespace) => namespace.clone(),
+            None => source_namespace,
+        };
+        if !destination_namespace.is_empty() {
+            self.validate_namespace_levels_exist(&destination_namespace)
+                .boxed()
+                .await?;
+        }
+
+        let destination_object_id =
+            Self::build_object_id(&destination_namespace, &request.new_table_name);
+        if self
+            .manifest_contains_object(&destination_object_id)
+            .boxed()
+            .await?
+        {
+            return Err(NamespaceError::TableAlreadyExists {
+                message: request.new_table_name.clone(),
+            }
+            .into());
+        }
+
+        // Refuse an unwritable manifest before changing any catalog state.
+        self.ensure_manifest_writable().boxed().await?;
+
+        // Moving the row is the whole rename. The source location remains the table's
+        // storage, so aliases of the same path stay valid and readers already holding
+        // that URI keep working.
+        self.rename_in_manifest(&source_object_id, destination_object_id)
+            .boxed()
+            .await?;
+
+        Ok(RenameTableResponse::new())
     }
 
     async fn list_namespaces(
@@ -5179,6 +5368,105 @@ mod tests {
         let mut tables = reader.list_tables(list_request).await.unwrap().tables;
         tables.sort();
         assert_eq!(tables, vec!["t1", "t2", "t3", "t4"]);
+    }
+
+    #[tokio::test]
+    async fn test_rename_mutation_uses_latest_source_row() {
+        let temp_dir = TempStdDir::default();
+        let manifest_ns = create_manifest_namespace(temp_dir.to_str().unwrap(), false).await;
+
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: "source".to_string(),
+                    object_type: ObjectType::Table,
+                    location: Some("initial.lance".to_string()),
+                    metadata: Some(r#"{"version":"initial"}"#.to_string()),
+                }],
+                Some(vec!["initial_base".to_string()]),
+            )
+            .await
+            .unwrap();
+        let initial = manifest_ns
+            .query_manifest_for_table("source")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial.location, "initial.lance");
+
+        manifest_ns
+            .upsert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: "source".to_string(),
+                    object_type: ObjectType::Table,
+                    location: Some("latest.lance".to_string()),
+                    metadata: Some(r#"{"version":"latest"}"#.to_string()),
+                }],
+                Some(vec!["latest_base".to_string()]),
+            )
+            .await
+            .unwrap();
+
+        manifest_ns
+            .rename_in_manifest("source", "destination".to_string())
+            .await
+            .unwrap();
+
+        let renamed = manifest_ns
+            .query_manifest_for_table("destination")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(renamed.location, "latest.lance");
+        assert_eq!(
+            renamed.metadata,
+            Some(HashMap::from([(
+                "version".to_string(),
+                "latest".to_string()
+            )]))
+        );
+        assert_eq!(
+            manifest_base_objects(&manifest_ns).await["destination"],
+            Some(vec!["latest_base".to_string()])
+        );
+        assert!(
+            manifest_ns
+                .query_manifest_for_table("source")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_mutation_rejects_source_replaced_by_namespace() {
+        let temp_dir = TempStdDir::default();
+        let manifest_ns = create_manifest_namespace(temp_dir.to_str().unwrap(), false).await;
+        manifest_ns
+            .insert_into_manifest_with_metadata(
+                vec![ManifestEntry {
+                    object_id: "source".to_string(),
+                    object_type: ObjectType::Namespace,
+                    location: None,
+                    metadata: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+
+        let error = manifest_ns
+            .rename_in_manifest("source", "destination".to_string())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("is no longer a table"));
+        assert!(
+            manifest_ns
+                .query_manifest_for_table("destination")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
