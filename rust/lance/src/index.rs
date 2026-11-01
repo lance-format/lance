@@ -4163,17 +4163,10 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
     /// Loads information about all the available scalar indices on the dataset
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo>;
 
-    /// Loads scalar index information, omitting logical indices with the given names.
-    async fn scalar_index_info_ignoring(
-        &self,
-        ignored_index_names: &HashSet<String>,
-    ) -> Result<ScalarIndexInfo>;
-
-    /// Loads scalar-index planning information from selected metadata, omitting ignored names.
+    /// Loads scalar-index planning information from an explicitly selected metadata set.
     async fn scalar_index_info_for_segments(
         &self,
         segments: &[IndexMetadata],
-        ignored_index_names: &HashSet<String>,
     ) -> Result<ScalarIndexInfo>;
 
     /// Return the fragments that are not covered by any of the deltas of the index.
@@ -4218,6 +4211,154 @@ pub(crate) async fn frag_reuse_cache_scope(dataset: &Dataset) -> Option<Uuid> {
 }
 
 impl Dataset {
+    #[instrument(level = "trace", skip_all)]
+    pub(crate) async fn scalar_index_info_ignoring(
+        &self,
+        ignored_index_names: &HashSet<String>,
+    ) -> Result<ScalarIndexInfo> {
+        let indices = self.load_indices().await?;
+        if !ignored_index_names.is_empty() && log::log_enabled!(log::Level::Debug) {
+            let available_names: HashSet<&str> =
+                indices.iter().map(|index| index.name.as_str()).collect();
+            let mut unmatched_names: Vec<&str> = ignored_index_names
+                .iter()
+                .map(String::as_str)
+                .filter(|name| !available_names.contains(name))
+                .collect();
+            if !unmatched_names.is_empty() {
+                unmatched_names.sort_unstable();
+                log::debug!("Ignored index names not found: {unmatched_names:?}");
+            }
+        }
+        self.scalar_index_info_for_segments_ignoring(indices.as_ref(), ignored_index_names)
+            .await
+    }
+
+    #[instrument(level = "trace", skip_all)]
+    pub(crate) async fn scalar_index_info_for_segments_ignoring(
+        &self,
+        indices: &[IndexMetadata],
+        ignored_index_names: &HashSet<String>,
+    ) -> Result<ScalarIndexInfo> {
+        let schema = self.schema();
+        let mut indexed_fields = Vec::new();
+        // (column, index_name) → union of every contributing IndexMetadata's
+        // fragment_bitmap. Multiple entries can land here for delta-merged
+        // indices that share a name. We only insert when every contributing
+        // entry has a bitmap; if any are missing, we leave the entry absent
+        // so the optimizer treats coverage as unknown.
+        let mut fragment_bitmaps: HashMap<(String, String), Option<RoaringBitmap>> = HashMap::new();
+        for index in indices.iter().filter(|idx| {
+            if ignored_index_names.contains(&idx.name) {
+                return false;
+            }
+
+            // Check if this is an FTS index by looking at index details
+            let is_fts_index = if let Some(details) = &idx.index_details {
+                IndexDetails(details.clone()).supports_fts()
+            } else {
+                false
+            };
+
+            // Only include indices with non-empty fragment bitmaps, except for FTS indices
+            // which need to be discoverable even when empty
+            let has_non_empty_bitmap = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
+                !bitmap.is_empty() && !(bitmap & self.fragment_bitmap.as_ref()).is_empty()
+            });
+
+            // Same name-collision rationale as `CreateIndexBuilder`'s
+            // default-name loop in create.rs: only the keyed prefix decides
+            // which column this index answers for.
+            idx.keyed_field().is_some() && (has_non_empty_bitmap || is_fts_index)
+        }) {
+            let field = index.fields[0];
+            let field = schema.field_by_id(field).ok_or_else(|| {
+                Error::internal(format!(
+                    "Index referenced a field with id {field} which did not exist in the schema"
+                ))
+            })?;
+
+            // Build the full field path for nested fields
+            let field_path = if let Some(ancestors) = schema.field_ancestry_by_id(field.id) {
+                let field_refs: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
+                lance_core::datatypes::format_field_path(&field_refs)
+            } else {
+                field.name.clone()
+            };
+
+            let index_details = IndexDetails(fetch_index_details(self, &field_path, index).await?);
+            if index_details.is_vector() {
+                continue;
+            }
+
+            let plugin = match index_details.get_plugin() {
+                Ok(plugin) => plugin,
+                Err(e) => {
+                    log::warn!(
+                        "Skipping index '{}' on column '{}': {}. \
+                         Queries on this column will fall back to a full scan.",
+                        index.name,
+                        field_path,
+                        e
+                    );
+                    continue;
+                }
+            };
+            let query_parser = plugin.new_query_parser(index.name.clone(), &index_details.0);
+
+            if let Some(query_parser) = query_parser {
+                // Union the per-segment fragment bitmap into this
+                // (column, index_name) entry. If any segment is missing a
+                // bitmap, downgrade the entry to None so callers know
+                // coverage is partial/unknown.
+                let key = (field_path.clone(), index.name.clone());
+                fragment_bitmaps
+                    .entry(key)
+                    .and_modify(|entry| {
+                        if let (Some(acc), Some(seg)) =
+                            (entry.as_mut(), index.fragment_bitmap.as_ref())
+                        {
+                            *acc |= seg;
+                        } else {
+                            *entry = None;
+                        }
+                    })
+                    .or_insert_with(|| index.fragment_bitmap.clone());
+                indexed_fields.push((field_path, (field.data_type(), query_parser)));
+            }
+        }
+        let mut index_info_map = HashMap::with_capacity(indexed_fields.len());
+        for indexed_field in indexed_fields {
+            // Need to wrap in an option here because we know that only one of and_modify and or_insert will be called
+            // but the rust compiler does not.
+            let mut parser = Some(indexed_field.1.1);
+            let parser = &mut parser;
+            index_info_map
+                .entry(indexed_field.0)
+                .and_modify(|existing: &mut (DataType, Box<MultiQueryParser>)| {
+                    // If there are two indices on the same column, they must have the same type
+                    debug_assert_eq!(existing.0, indexed_field.1.0);
+
+                    existing.1.add(parser.take().unwrap());
+                })
+                .or_insert_with(|| {
+                    (
+                        indexed_field.1.0,
+                        Box::new(MultiQueryParser::single(parser.take().unwrap())),
+                    )
+                });
+        }
+        // Drop entries we couldn't pin to a known bitmap.
+        let fragment_bitmaps = fragment_bitmaps
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|bm| (k, bm)))
+            .collect();
+        Ok(ScalarIndexInfo {
+            indexed_columns: index_info_map,
+            fragment_bitmaps,
+        })
+    }
+
     /// The segment's metadata for the given purpose. A query sees the derived
     /// listing only. Maintenance also reaches a registered segment the tagged
     /// reader left out of the listing (its coverage was withdrawn by an
@@ -5014,151 +5155,12 @@ impl DatasetIndexInternalExt for Dataset {
     }
 
     #[instrument(level = "trace", skip_all)]
-    async fn scalar_index_info_ignoring(
-        &self,
-        ignored_index_names: &HashSet<String>,
-    ) -> Result<ScalarIndexInfo> {
-        let indices = self.load_indices().await?;
-        if !ignored_index_names.is_empty() && log::log_enabled!(log::Level::Debug) {
-            let available_names: HashSet<&str> =
-                indices.iter().map(|index| index.name.as_str()).collect();
-            let mut unmatched_names: Vec<&str> = ignored_index_names
-                .iter()
-                .map(String::as_str)
-                .filter(|name| !available_names.contains(name))
-                .collect();
-            if !unmatched_names.is_empty() {
-                unmatched_names.sort_unstable();
-                log::debug!("Ignored index names not found: {unmatched_names:?}");
-            }
-        }
-        self.scalar_index_info_for_segments(indices.as_ref(), ignored_index_names)
-            .await
-    }
-
-    #[instrument(level = "trace", skip_all)]
     async fn scalar_index_info_for_segments(
         &self,
-        indices: &[IndexMetadata],
-        ignored_index_names: &HashSet<String>,
+        segments: &[IndexMetadata],
     ) -> Result<ScalarIndexInfo> {
-        let schema = self.schema();
-        let mut indexed_fields = Vec::new();
-        // (column, index_name) → union of every contributing IndexMetadata's
-        // fragment_bitmap. Multiple entries can land here for delta-merged
-        // indices that share a name. We only insert when every contributing
-        // entry has a bitmap; if any are missing, we leave the entry absent
-        // so the optimizer treats coverage as unknown.
-        let mut fragment_bitmaps: HashMap<(String, String), Option<RoaringBitmap>> = HashMap::new();
-        for index in indices.iter().filter(|idx| {
-            if ignored_index_names.contains(&idx.name) {
-                return false;
-            }
-
-            // Check if this is an FTS index by looking at index details
-            let is_fts_index = if let Some(details) = &idx.index_details {
-                IndexDetails(details.clone()).supports_fts()
-            } else {
-                false
-            };
-
-            // Only include indices with non-empty fragment bitmaps, except for FTS indices
-            // which need to be discoverable even when empty
-            let has_non_empty_bitmap = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
-                !bitmap.is_empty() && !(bitmap & self.fragment_bitmap.as_ref()).is_empty()
-            });
-
-            // Same name-collision rationale as `CreateIndexBuilder`'s
-            // default-name loop in create.rs: only the keyed prefix decides
-            // which column this index answers for.
-            idx.keyed_field().is_some() && (has_non_empty_bitmap || is_fts_index)
-        }) {
-            let field = index.fields[0];
-            let field = schema.field_by_id(field).ok_or_else(|| {
-                Error::internal(format!(
-                    "Index referenced a field with id {field} which did not exist in the schema"
-                ))
-            })?;
-
-            // Build the full field path for nested fields
-            let field_path = if let Some(ancestors) = schema.field_ancestry_by_id(field.id) {
-                let field_refs: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
-                lance_core::datatypes::format_field_path(&field_refs)
-            } else {
-                field.name.clone()
-            };
-
-            let index_details = IndexDetails(fetch_index_details(self, &field_path, index).await?);
-            if index_details.is_vector() {
-                continue;
-            }
-
-            let plugin = match index_details.get_plugin() {
-                Ok(plugin) => plugin,
-                Err(e) => {
-                    log::warn!(
-                        "Skipping index '{}' on column '{}': {}. \
-                         Queries on this column will fall back to a full scan.",
-                        index.name,
-                        field_path,
-                        e
-                    );
-                    continue;
-                }
-            };
-            let query_parser = plugin.new_query_parser(index.name.clone(), &index_details.0);
-
-            if let Some(query_parser) = query_parser {
-                // Union the per-segment fragment bitmap into this
-                // (column, index_name) entry. If any segment is missing a
-                // bitmap, downgrade the entry to None so callers know
-                // coverage is partial/unknown.
-                let key = (field_path.clone(), index.name.clone());
-                fragment_bitmaps
-                    .entry(key)
-                    .and_modify(|entry| {
-                        if let (Some(acc), Some(seg)) =
-                            (entry.as_mut(), index.fragment_bitmap.as_ref())
-                        {
-                            *acc |= seg;
-                        } else {
-                            *entry = None;
-                        }
-                    })
-                    .or_insert_with(|| index.fragment_bitmap.clone());
-                indexed_fields.push((field_path, (field.data_type(), query_parser)));
-            }
-        }
-        let mut index_info_map = HashMap::with_capacity(indexed_fields.len());
-        for indexed_field in indexed_fields {
-            // Need to wrap in an option here because we know that only one of and_modify and or_insert will be called
-            // but the rust compiler does not.
-            let mut parser = Some(indexed_field.1.1);
-            let parser = &mut parser;
-            index_info_map
-                .entry(indexed_field.0)
-                .and_modify(|existing: &mut (DataType, Box<MultiQueryParser>)| {
-                    // If there are two indices on the same column, they must have the same type
-                    debug_assert_eq!(existing.0, indexed_field.1.0);
-
-                    existing.1.add(parser.take().unwrap());
-                })
-                .or_insert_with(|| {
-                    (
-                        indexed_field.1.0,
-                        Box::new(MultiQueryParser::single(parser.take().unwrap())),
-                    )
-                });
-        }
-        // Drop entries we couldn't pin to a known bitmap.
-        let fragment_bitmaps = fragment_bitmaps
-            .into_iter()
-            .filter_map(|(k, v)| v.map(|bm| (k, bm)))
-            .collect();
-        Ok(ScalarIndexInfo {
-            indexed_columns: index_info_map,
-            fragment_bitmaps,
-        })
+        self.scalar_index_info_for_segments_ignoring(segments, &HashSet::new())
+            .await
     }
 
     async fn unindexed_fragments(&self, name: &str) -> Result<Vec<Fragment>> {
@@ -9285,6 +9287,16 @@ mod tests {
             .unwrap();
 
         crate::utils::test::covering::declare_covering(&mut dataset, "a", "b").await;
+
+        let indices = dataset.load_indices().await.unwrap();
+        let segment_info = dataset
+            .scalar_index_info_for_segments(indices.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            segment_info.get_index("a").is_some(),
+            "the released segment helper must retain its one-argument behavior"
+        );
 
         let index_info = dataset.scalar_index_info().await.unwrap();
         assert!(

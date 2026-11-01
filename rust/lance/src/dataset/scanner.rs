@@ -3874,7 +3874,7 @@ impl Scanner {
             let index_info = match self.scalar_index_selection.as_ref() {
                 Some(selection) => {
                     self.dataset
-                        .scalar_index_info_for_segments(
+                        .scalar_index_info_for_segments_ignoring(
                             selection.segments.as_ref(),
                             &self.ignored_scalar_index_names,
                         )
