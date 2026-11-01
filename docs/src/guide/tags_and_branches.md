@@ -2,6 +2,20 @@
 
 Lance provides Git-like tag and branch capabilities through the `LanceDataset.tags` and `LanceDataset.branches` properties.
 
+Cleanup and operations that publish references to dataset history (creating or
+updating tags, creating branches, and restoring versions) acquire an exclusive
+storage lock shared by all branches. An overlapping operation fails with a
+reference conflict and can be retried after the first operation completes.
+
+The lock is stored at `<table-root>/_refs/history.lock` and is released on
+completion. If a protected operation is cancelled, its process crashes, or
+releasing the lock fails, stop all cleanup and history reference mutations on
+the table before manually removing that object. Cancellation retains the lock
+because storage requests can finish after their caller is cancelled.
+The lock does not expire automatically because a paused
+cleanup could otherwise resume deleting files after another operation took over.
+All participating processes must use a Lance version that implements this lock.
+
 ## Tags
 Tags label specific versions within a branch's history.
 

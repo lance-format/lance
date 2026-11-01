@@ -41,12 +41,12 @@ pub mod retention;
 use retention::{CleanupPolicy as RetentionPolicy, MIN_THINNING_AGE, validate_retention_policy};
 pub use retention::{CleanupRule, parse_cleanup_policy};
 
-use super::refs::{TagContents, normalize_branch};
+use super::refs::{HistoryLock, TagContents, normalize_branch};
 use crate::dataset::TRANSACTIONS_DIR;
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
 use dashmap::DashSet;
-use futures::future::try_join_all;
+use futures::future::{join_all, try_join_all};
 use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use humantime::parse_duration;
 use lance_core::{
@@ -705,7 +705,13 @@ impl<'a> CleanupOperation<'a> {
     pub async fn execute(&self) -> Result<RemovalStats> {
         info!(target: TRACE_DATASET_EVENTS, event=DATASET_CLEANING_EVENT, uri=&self.dataset.uri);
         let cleanup = CleanupTask::new(self, CleanupAction::Execute)?;
-        Ok(cleanup.run().await?.stats)
+        let guard = HistoryLock::acquire(
+            self.dataset.object_store.clone(),
+            &self.dataset.branch_location(),
+            "clean up old versions",
+        )
+        .await?;
+        guard.finish(cleanup.run().await.map(|run| run.stats)).await
     }
 }
 
@@ -1610,7 +1616,10 @@ impl<'a> CleanupTask<'a> {
             // attached to its file, which is what lets the stats below count what was
             // actually removed instead of what was merely attempted.
             let store = &self.dataset.object_store;
-            all_files_to_remove
+            // A listing error must not drop already submitted deletions. Finish
+            // the sweep before returning the first error and releasing history
+            // exclusion, including deletion of the expired manifests.
+            let first_error = all_files_to_remove
                 .map(|file| async move {
                     let file = file?;
                     // Acquire concurrency before QPS so queued deletes cannot spend
@@ -1633,7 +1642,11 @@ impl<'a> CleanupTask<'a> {
                     Ok::<_, Error>((file, outcome))
                 })
                 .buffer_unordered(execution.concurrency)
-                .try_for_each(|(file, outcome)| {
+                .fold(None, |first_error, deletion| {
+                    let (file, outcome) = match deletion {
+                        Ok(deletion) => deletion,
+                        Err(error) => return future::ready(first_error.or(Some(error))),
+                    };
                     let mut result = cleanup_result.lock().unwrap();
                     match outcome {
                         Ok(()) => result.record_file(
@@ -1664,9 +1677,12 @@ impl<'a> CleanupTask<'a> {
                             }
                         }
                     }
-                    future::ready(Ok(()))
+                    future::ready(first_error)
                 })
-                .await?;
+                .await;
+            if let Some(error) = first_error {
+                return Err(error);
+            }
 
             // Only after the objects are gone: a record that outlives its
             // manifest is retired by the next cleanup, the reverse is a lost
@@ -2185,7 +2201,11 @@ impl<'a> CleanupTask<'a> {
                 }
             })
             .collect();
-        try_join_all(tasks).await?;
+        // A failed lineage must not cancel siblings with submitted deletions:
+        // all of them must settle before the shared history lock is released.
+        for result in join_all(tasks).await {
+            result?;
+        }
         Ok(final_result.into_inner().unwrap())
     }
 
@@ -2767,6 +2787,12 @@ pub async fn cleanup_cascade_branch(
     let Some(operation) = build_cleanup_operation(dataset, manifest, false).await? else {
         return Ok(None);
     };
+    let guard = HistoryLock::acquire(
+        dataset.object_store.clone(),
+        &dataset.branch_location(),
+        "clean up a referenced branch",
+    )
+    .await?;
     let result = cleanup_cascade_branch_run(
         operation,
         CleanupAction::Execute,
@@ -2774,8 +2800,8 @@ pub async fn cleanup_cascade_branch(
         None,
         None,
     )
-    .await?;
-    Ok(Some(result.stats))
+    .await;
+    guard.finish(result.map(|run| Some(run.stats))).await
 }
 
 async fn cleanup_cascade_branch_run(
@@ -3028,6 +3054,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use datafusion::common::assert_contains;
+    use futures::stream::BoxStream;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_index::IndexType;
@@ -3042,10 +3069,324 @@ mod tests {
     use mock_instant::thread_local::MockClock;
     use object_store::ObjectStoreExt;
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, RenameOptions,
+    };
     use rstest::rstest;
     use uuid::Uuid;
 
     mod branch_source;
+
+    #[rstest]
+    #[case::create_tag("create_tag")]
+    #[case::update_tag("update_tag")]
+    #[case::create_branch("create_branch")]
+    #[case::restore("restore")]
+    #[case::detached_restore("detached_restore")]
+    #[tokio::test]
+    async fn cleanup_excludes_concurrent_history_references(
+        #[case] operation: &str,
+        #[values(false, true)] is_local: bool,
+        #[values(false, true)] on_branch: bool,
+    ) {
+        tokio::time::pause();
+        let dir = TempStrDir::default();
+        let uri = if is_local {
+            dir.as_str()
+        } else {
+            "memory://table"
+        };
+        let wrapper = Arc::new(MockObjectStore {
+            delete_latency: Duration::from_secs(1),
+            ..MockObjectStore::new()
+        });
+        let data = || {
+            lance_datagen::gen_batch()
+                .col(
+                    "id",
+                    lance_datagen::array::step::<arrow_array::types::Int32Type>(),
+                )
+                .into_reader_rows(4.into(), 4.into())
+        };
+        let mut dataset = Dataset::write(
+            data(),
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(wrapper.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        if on_branch {
+            dataset = dataset.create_branch("source", 1, None).await.unwrap();
+        }
+        dataset.append(data(), None).await.unwrap();
+        let source_version = dataset.version().version;
+        let mut source = dataset.clone();
+        dataset = Dataset::write(
+            data(),
+            Arc::new(dataset),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .tags()
+            .create("existing", dataset.version().version)
+            .await
+            .unwrap();
+        let expected = dataset.scan().try_into_batch().await.unwrap();
+        let mut author = dataset.clone();
+        let deleting = Arc::new(tokio::sync::Notify::new());
+        wrapper.policy.lock().unwrap().set_before_policy(
+            "observe_cleanup_delete",
+            Arc::new({
+                let deleting = deleting.clone();
+                move |method, path| {
+                    if method == "delete" && path.extension() != Some("lock") {
+                        deleting.notify_one();
+                    }
+                    Ok(())
+                }
+            }),
+        );
+        let cleanup = tokio::spawn({
+            let dataset = dataset.clone();
+            async move {
+                dataset
+                    .cleanup(CleanupPolicy {
+                        before_version: Some(dataset.version().version),
+                        error_if_tagged_old_versions: false,
+                        ..Default::default()
+                    })
+                    .execute()
+                    .await
+            }
+        });
+        // The store pauses the first delete after cleanup has inspected refs.
+        // No manifest or data has disappeared yet, so every operation below
+        // would succeed without coordination with cleanup.
+        deleting.notified().await;
+        let result = match operation {
+            "create_tag" => author.tags().create("during", source_version).await,
+            "update_tag" => author.tags().update("existing", source_version).await,
+            "create_branch" => author
+                .create_branch("during", source_version, None)
+                .await
+                .map(|_| ()),
+            "restore" => source.restore().await,
+            "detached_restore" => CommitBuilder::new(Arc::new(author.clone()))
+                .with_detached(true)
+                .execute(Transaction::new(
+                    author.version().version,
+                    Operation::Restore {
+                        version: source_version,
+                    },
+                    None,
+                ))
+                .await
+                .map(|_| ()),
+            _ => unreachable!(),
+        };
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+        assert_contains!(error.to_string(), "history.lock");
+        let stats = cleanup.await.unwrap().unwrap();
+        assert_eq!(stats.old_versions, 2);
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
+        assert_eq!(
+            dataset.tags().get_version("existing").await.unwrap(),
+            dataset.version().version
+        );
+        assert!(!dataset.tags().list().await.unwrap().contains_key("during"));
+        assert!(
+            !dataset
+                .branches()
+                .list()
+                .await
+                .unwrap()
+                .contains_key("during")
+        );
+        // Completion releases the guard before returning to the caller.
+        author
+            .tags()
+            .create("after", author.version().version)
+            .await
+            .unwrap();
+    }
+
+    #[rstest]
+    #[case::execute("execute")]
+    #[case::standalone_cascade("standalone")]
+    #[case::sibling_cascade("siblings")]
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_error_drains_submitted_deletes(
+        #[case] mode: &str,
+        #[values(false, true)] is_local: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let uri = if is_local {
+            dir.as_str()
+        } else {
+            "memory://table"
+        };
+        let wrapper = Arc::new(MockObjectStore {
+            delete_latency: Duration::from_secs(1),
+            ..MockObjectStore::new()
+        });
+        let data = || {
+            lance_datagen::gen_batch()
+                .col(
+                    "id",
+                    lance_datagen::array::step::<arrow_array::types::Int32Type>(),
+                )
+                .into_reader_rows(4.into(), 1.into())
+        };
+        let mut parent = Dataset::write(
+            data(),
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                store_params: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(wrapper.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut deleting = parent.clone();
+        let mut failing_indices = parent.indices_dir();
+        if mode == "siblings" {
+            deleting = parent.create_branch("deleting", 1, None).await.unwrap();
+            deleting
+                .update_config([
+                    ("lance.auto_cleanup.interval", "1"),
+                    ("lance.auto_cleanup.retain_versions", "1"),
+                ])
+                .await
+                .unwrap();
+            // The old data must belong to this branch, rather than its parent.
+            deleting = Dataset::write(
+                data(),
+                Arc::new(deleting),
+                Some(WriteParams {
+                    mode: WriteMode::Overwrite,
+                    max_rows_per_file: 2,
+                    skip_auto_cleanup: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            // Distinct parent versions make these independently scheduled lineages.
+            parent.append(data(), None).await.unwrap();
+            let mut failing = parent.create_branch("failing", 2, None).await.unwrap();
+            failing
+                .update_config([
+                    ("lance.auto_cleanup.interval", "1"),
+                    // No deletions of its own may delay this branch's error.
+                    ("lance.auto_cleanup.retain_versions", "2"),
+                ])
+                .await
+                .unwrap();
+            failing_indices = failing.indices_dir();
+            parent.append(data(), None).await.unwrap();
+        }
+        let source_version = deleting.version_id();
+        let old_data = deleting
+            .data_dir()
+            .join(deleting.manifest.fragments[0].files[0].path.as_str());
+        deleting = Dataset::write(
+            data(),
+            Arc::new(deleting),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                max_rows_per_file: 2,
+                skip_auto_cleanup: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(deleting.get_fragments().len(), 2);
+        let expected = deleting.scan().try_into_batch().await.unwrap();
+        assert!(deleting.object_store.exists(&old_data).await.unwrap());
+        assert_eq!(wrapper.deletes.pending.load(Ordering::SeqCst), 0);
+        *wrapper.deletes.fail_listing.lock().unwrap() = Some(failing_indices);
+
+        let error = if mode == "standalone" {
+            let mut manifest = deleting.manifest.as_ref().clone();
+            manifest
+                .config
+                .insert("lance.auto_cleanup.interval".into(), "1".into());
+            manifest
+                .config
+                .insert("lance.auto_cleanup.retain_versions".into(), "1".into());
+            cleanup_cascade_branch(&deleting, &manifest)
+                .await
+                .unwrap_err()
+        } else {
+            let dataset = if mode == "siblings" {
+                &parent
+            } else {
+                &deleting
+            };
+            dataset
+                .cleanup(CleanupPolicy {
+                    before_version: Some(dataset.version_id()),
+                    error_if_tagged_old_versions: false,
+                    clean_referenced_branches: mode == "siblings",
+                    ..Default::default()
+                })
+                .execute()
+                .await
+                .unwrap_err()
+        };
+        assert!(matches!(error, Error::IO { .. }), "{error}");
+        assert_contains!(error.to_string(), "injected listing failure");
+        *wrapper.deletes.fail_listing.lock().unwrap() = None;
+        // Submitted requests survive cancellation of their waiting futures.
+        // Both the failed sweep and its sibling lineages must finish them
+        // before releasing the table's history lock and returning the error.
+        assert_eq!(wrapper.deletes.pending.load(Ordering::SeqCst), 0);
+        assert!(!deleting.object_store.exists(&old_data).await.unwrap());
+        let error = deleting
+            .tags()
+            .create("after_error", source_version)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::VersionNotFound { .. }), "{error}");
+        assert_contains!(error.to_string(), "does not exist");
+        deleting
+            .tags()
+            .create("latest", deleting.version_id())
+            .await
+            .unwrap();
+        assert_eq!(
+            deleting
+                .checkout_version("latest")
+                .await
+                .unwrap()
+                .scan()
+                .try_into_batch()
+                .await
+                .unwrap(),
+            expected
+        );
+    }
 
     mod retention;
 
@@ -3066,8 +3407,142 @@ mod tests {
     #[derive(Debug)]
     struct MockObjectStore {
         delete_latency: Duration,
+        deletes: Arc<SubmittedDeletes>,
         policy: Arc<Mutex<ProxyObjectStorePolicy>>,
         last_modified_times: Arc<Mutex<HashMap<Path, DateTime<Utc>>>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct SubmittedDeletes {
+        pending: AtomicUsize,
+        data_submitted: tokio::sync::Notify,
+        fail_listing: Mutex<Option<Path>>,
+    }
+
+    /// Model backend requests that continue after their waiting future is
+    /// dropped. Unlike ThrottledStore, this also supports local-file reads.
+    #[derive(Debug)]
+    struct DelayedDeletes {
+        inner: Arc<dyn object_store::ObjectStore>,
+        latency: Duration,
+        submitted: Arc<SubmittedDeletes>,
+    }
+
+    impl std::fmt::Display for DelayedDeletes {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "DelayedDeletes({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for DelayedDeletes {
+        async fn put_opts(
+            &self,
+            path: &Path,
+            payload: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(path, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            path: &Path,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(path, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            path: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(path, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            let latency = self.latency;
+            let inner = self.inner.clone();
+            let submitted = self.submitted.clone();
+            locations
+                .map(move |location| {
+                    let inner = inner.clone();
+                    let submitted = submitted.clone();
+                    async move {
+                        let path = location?;
+                        if path.extension() == Some("lock") {
+                            inner.delete(&path).await?;
+                            return Ok(path);
+                        }
+                        submitted.pending.fetch_add(1, Ordering::SeqCst);
+                        let is_data = path.extension() == Some("lance");
+                        let task = tokio::spawn({
+                            let submitted = submitted.clone();
+                            async move {
+                                tokio::time::sleep(latency).await;
+                                let result = inner.delete(&path).await.map(|()| path);
+                                submitted.pending.fetch_sub(1, Ordering::SeqCst);
+                                result
+                            }
+                        });
+                        if is_data {
+                            submitted.data_submitted.notify_one();
+                        }
+                        task.await.unwrap()
+                    }
+                })
+                .buffer_unordered(16)
+                .boxed()
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            if prefix.is_some() && prefix == self.submitted.fail_listing.lock().unwrap().as_ref() {
+                let submitted = self.submitted.clone();
+                return stream::once(async move {
+                    // A sibling's deletion must be submitted before this error
+                    // can cancel its future, independent of branch scheduling.
+                    submitted.data_submitted.notified().await;
+                    Err(object_store::Error::Generic {
+                        store: "DelayedDeletes",
+                        source: "injected listing failure".into(),
+                    })
+                })
+                .boxed();
+            }
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+
+        async fn rename_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: RenameOptions,
+        ) -> object_store::Result<()> {
+            self.inner.rename_opts(from, to, options).await
+        }
     }
 
     impl WrappingObjectStore for MockObjectStore {
@@ -3079,13 +3554,11 @@ mod tests {
             let original: Arc<dyn object_store::ObjectStore> = if self.delete_latency.is_zero() {
                 original
             } else {
-                Arc::new(ThrottledStore::new(
-                    original,
-                    ThrottleConfig {
-                        wait_delete_per_call: self.delete_latency,
-                        ..Default::default()
-                    },
-                ))
+                Arc::new(DelayedDeletes {
+                    inner: original,
+                    latency: self.delete_latency,
+                    submitted: self.deletes.clone(),
+                })
             };
             Arc::new(ProxyObjectStore::new(original, self.policy.clone()))
         }
@@ -3104,6 +3577,7 @@ mod tests {
         pub(crate) fn new() -> Self {
             let instance = Self {
                 delete_latency: Duration::ZERO,
+                deletes: Arc::default(),
                 policy: Arc::new(Mutex::new(ProxyObjectStorePolicy::new())),
                 last_modified_times: Arc::new(Mutex::new(HashMap::new())),
             };
@@ -8991,952 +9465,5 @@ mod tests {
     }
 
     /// D-rows: `_fri/` row-map garbage collection.
-    mod frag_reuse_map_gc {
-        use super::*;
-        use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
-        use crate::dataset::write::CommitBuilder;
-        use crate::index::frag_reuse_reader::tests as reader_tests;
-        use arrow_array::types::Int32Type;
-        use chrono::TimeDelta;
-        use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
-        use lance_index::scalar::ScalarIndexParams;
-        use lance_table::format::Fragment;
-        use lance_table::format::IndexMetadata;
-        use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
-        use lance_table::transaction::RewriteGroup;
-        use prost::Message;
-
-        impl MockDatasetFixture {
-            /// The `_fri/<map_id>/` directories currently on disk.
-            async fn list_fri_map_dirs(&self) -> Vec<String> {
-                let registry = Arc::new(ObjectStoreRegistry::default());
-                let (os, path) = ObjectStore::from_uri_and_params(
-                    registry,
-                    &self.dataset_path,
-                    &self.os_params(),
-                )
-                .await
-                .unwrap();
-                let mut ids = std::collections::HashSet::new();
-                let mut stream = os.read_dir_all(&path.clone().join("_fri"), None);
-                loop {
-                    match stream.try_next().await {
-                        Ok(Some(meta)) => {
-                            let relative = remove_prefix(&meta.location, &path);
-                            if let Some(map_id) = relative.parts().nth(1) {
-                                ids.insert(map_id.as_ref().to_string());
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(Error::NotFound { .. }) => break,
-                        Err(e) => panic!("{e}"),
-                    }
-                }
-                let mut ids: Vec<String> = ids.into_iter().collect();
-                ids.sort();
-                ids
-            }
-        }
-
-        async fn reserve_fragments(dataset: &mut Dataset, num_fragments: u32) {
-            dataset
-                .apply_commit(
-                    Transaction::new(
-                        dataset.manifest.version,
-                        Operation::ReserveFragments { num_fragments },
-                        None,
-                    ),
-                    &Default::default(),
-                    &Default::default(),
-                )
-                .await
-                .unwrap();
-        }
-
-        /// A persisted dataset (mock store, recorded mtimes) with one
-        /// committed stable-partition rewrite; returns the map id of its
-        /// row map.
-        async fn make_tagged(fixture: &MockDatasetFixture) -> (Dataset, String) {
-            let data = lance_datagen::gen_batch()
-                .col("i", lance_datagen::array::step::<Int32Type>())
-                .into_reader_rows(
-                    lance_datagen::RowCount::from(4),
-                    lance_datagen::BatchCount::from(2),
-                );
-            Dataset::write(
-                data,
-                &fixture.dataset_path,
-                Some(WriteParams {
-                    store_params: Some(fixture.os_params()),
-                    commit_handler: Some(Arc::new(RenameCommitHandler)),
-                    mode: WriteMode::Create,
-                    max_rows_per_file: 4,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap();
-            let mut dataset = *fixture.open().await.unwrap();
-            dataset
-                .create_index(
-                    &["i"],
-                    IndexType::Scalar,
-                    Some("i_idx".into()),
-                    &ScalarIndexParams::default(),
-                    false,
-                )
-                .await
-                .unwrap();
-            reserve_fragments(&mut dataset, 20).await;
-            let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
-            let (transition, destinations) = reader_tests::prepare(&dataset).await;
-            let Some(pb_fri::transition::Mapping::StablePartition(mapping)) = &transition.mapping
-            else {
-                unreachable!()
-            };
-            let map_id = mapping.map_id.clone();
-            let read_version = dataset.manifest.version;
-            let frag_reuse_index = Some(
-                crate::index::frag_reuse::frag_reuse_entry_appending(&dataset, vec![transition])
-                    .await
-                    .unwrap(),
-            );
-            let dataset = CommitBuilder::new(Arc::new(dataset))
-                .execute(Transaction::new(
-                    read_version,
-                    Operation::Rewrite {
-                        groups: vec![RewriteGroup {
-                            old_fragments,
-                            new_fragments: destinations,
-                        }],
-                        rewritten_indices: vec![],
-                        frag_reuse_index,
-                    },
-                    None,
-                ))
-                .await
-                .unwrap();
-            (dataset, map_id)
-        }
-
-        /// D1: a map referenced by a retained manifest survives cleanup, no
-        /// matter how old it is.
-        #[tokio::test]
-        #[serial_test::serial(frag_reuse_maintenance)]
-        async fn referenced_map_is_kept() {
-            let fixture = MockDatasetFixture::try_new().unwrap();
-            let (_, map_id) = make_tagged(&fixture).await;
-            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
-            fixture
-                .run_cleanup(utc_now() - TimeDelta::try_seconds(1).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id]);
-        }
-
-        #[tokio::test]
-        #[serial_test::serial(frag_reuse_maintenance)]
-        async fn version_cleanup_keeps_maps_of_rescued_branch_roots() {
-            let fixture = MockDatasetFixture::try_new().unwrap();
-            let (mut dataset, map_id) = make_tagged(&fixture).await;
-            let root_version = dataset.version().version;
-            let mut branch = fixture
-                .create_branch_and_load(&mut dataset, "child", (None, None))
-                .await
-                .unwrap();
-            branch
-                .create_index(
-                    &["i"],
-                    IndexType::Scalar,
-                    Some("i_idx".into()),
-                    &ScalarIndexParams::default(),
-                    true,
-                )
-                .await
-                .unwrap();
-            cleanup_frag_reuse_index(&mut branch).await.unwrap();
-            assert!(
-                branch
-                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
-            branch
-                .cleanup(expire_below(branch.version().version, true))
-                .execute()
-                .await
-                .unwrap();
-            fixture.overwrite_some_data().await.unwrap();
-            let latest = fixture.open().await.unwrap().version().version;
-
-            fixture
-                .run_cleanup_with_policy(expire_below(latest, true))
-                .await
-                .unwrap();
-
-            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id]);
-            fixture
-                .open()
-                .await
-                .unwrap()
-                .checkout_version(root_version)
-                .await
-                .unwrap();
-            assert_eq!(branch.count_rows(None).await.unwrap(), 8);
-        }
-
-        #[tokio::test]
-        #[serial_test::serial(frag_reuse_maintenance)]
-        async fn parent_cleanup_keeps_a_row_map_named_only_by_a_branch_history() {
-            let fixture = MockDatasetFixture::try_new().unwrap();
-            let (mut dataset, map_id) = make_tagged(&fixture).await;
-            let mut branch = fixture
-                .create_branch_and_load(&mut dataset, "child", (None, None))
-                .await
-                .unwrap();
-            // With its own data and index the branch rescues no parent
-            // version, so only its tagged history names the parent's row map.
-            branch.delete("true").await.unwrap();
-            branch
-                .append(
-                    lance_datagen::gen_batch()
-                        .col("i", lance_datagen::array::step::<Int32Type>())
-                        .into_reader_rows(
-                            lance_datagen::RowCount::from(4),
-                            lance_datagen::BatchCount::from(1),
-                        ),
-                    None,
-                )
-                .await
-                .unwrap();
-            branch
-                .create_index(
-                    &["i"],
-                    IndexType::Scalar,
-                    Some("i_idx".into()),
-                    &ScalarIndexParams::default(),
-                    true,
-                )
-                .await
-                .unwrap();
-            let branch_entry = branch
-                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
-                .await
-                .unwrap()
-                .unwrap();
-            // Writers leave base_id unset on tagged index entries.
-            assert_ne!(branch_entry.index_version, 0);
-            assert_eq!(branch_entry.base_id, None);
-            branch
-                .cleanup(expire_below(branch.version().version, true))
-                .execute()
-                .await
-                .unwrap();
-
-            dataset
-                .create_index(
-                    &["i"],
-                    IndexType::Scalar,
-                    Some("i_idx".into()),
-                    &ScalarIndexParams::default(),
-                    true,
-                )
-                .await
-                .unwrap();
-            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
-            let latest = dataset.version().version;
-            // The branch recorded the parent uri without the trailing slash.
-            let respelled = fixture
-                .load_dataset(&format!("{}/", fixture.dataset_path))
-                .await
-                .unwrap();
-            cleanup_old_versions(&respelled, expire_below(latest, true))
-                .await
-                .unwrap();
-
-            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id]);
-        }
-
-        /// D2: a map referenced only by expiring manifests goes away in the
-        /// same pass that removes them (the trim released it from the entry
-        /// first).
-        #[tokio::test]
-        #[serial_test::serial(frag_reuse_maintenance)]
-        async fn map_released_by_trim_is_collected_with_its_manifests() {
-            let fixture = MockDatasetFixture::try_new().unwrap();
-            let (mut dataset, map_id) = make_tagged(&fixture).await;
-            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id]);
-
-            // Drain the index onto the destinations, then trim: the entry is
-            // deleted, so only old manifests reference the map.
-            dataset
-                .create_index(
-                    &["i"],
-                    IndexType::Scalar,
-                    Some("i_idx".into()),
-                    &ScalarIndexParams::default(),
-                    true,
-                )
-                .await
-                .unwrap();
-            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
-            assert!(
-                dataset
-                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
-
-            // Young files referenced by expiring manifests still wait for the
-            // unverified retention window unless verified; the reference from
-            // the removed manifest is that verification.
-            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
-            fixture
-                .run_cleanup(utc_now() - TimeDelta::try_seconds(1).unwrap())
-                .await
-                .unwrap();
-            assert!(fixture.list_fri_map_dirs().await.is_empty());
-        }
-
-        /// D3 + D4: an unreferenced map (a failed commit's orphan) is kept
-        /// while young and collected once it ages past the unverified
-        /// retention threshold.
-        #[tokio::test]
-        #[serial_test::serial(frag_reuse_maintenance)]
-        async fn orphan_map_ages_out() {
-            let fixture = MockDatasetFixture::try_new().unwrap();
-            let (dataset, committed_map_id) = make_tagged(&fixture).await;
-
-            // A row map written at day 10 whose commit never lands.
-            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
-            let (orphan_transition, _) = reader_tests::prepare(&dataset).await;
-            let Some(pb_fri::transition::Mapping::StablePartition(mapping)) =
-                &orphan_transition.mapping
-            else {
-                unreachable!()
-            };
-            let orphan_map_id = mapping.map_id.clone();
-            let mut expected = vec![committed_map_id.clone(), orphan_map_id.clone()];
-            expected.sort();
-            assert_eq!(fixture.list_fri_map_dirs().await, expected);
-
-            // D3: unreferenced but young, kept.
-            fixture
-                .run_cleanup(utc_now() + TimeDelta::try_seconds(1).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(fixture.list_fri_map_dirs().await, expected);
-
-            // D4: unreferenced and old, collected; the referenced map stays.
-            MockClock::set_system_time(TimeDelta::try_days(20).unwrap().to_std().unwrap());
-            fixture
-                .run_cleanup(utc_now() + TimeDelta::try_seconds(1).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(fixture.list_fri_map_dirs().await, vec![committed_map_id]);
-        }
-
-        /// D5: reference resolution decodes external entry content too. The
-        /// integration tests above cover inline entries; this drives the
-        /// resolver directly over an entry whose details live in an external
-        /// file.
-        #[tokio::test]
-        #[serial_test::serial(frag_reuse_maintenance)]
-        async fn reference_resolution_reads_external_entries() {
-            let fixture = MockDatasetFixture::try_new().unwrap();
-            let (dataset, _) = make_tagged(&fixture).await;
-
-            let map_id = Uuid::new_v4().to_string();
-            let digest = |id: u64| pb_fri::FragmentDigest {
-                id,
-                physical_rows: 4,
-                num_deleted_rows: 0,
-            };
-            let content = {
-                let mut content = Vec::new();
-                let transition = pb_fri::Transition {
-                    sources: vec![digest(100)],
-                    destinations: vec![digest(101)],
-                    mapping: Some(pb_fri::transition::Mapping::StablePartition(
-                        pb_fri::StablePartition {
-                            map_id: map_id.clone(),
-                            map_size_bytes: 1,
-                            base_id: None,
-                        },
-                    )),
-                };
-                content.extend(reader_tests::field(2, &transition.encode_to_vec()));
-                content
-            };
-            let uuid = Uuid::new_v4();
-            let details_path = dataset
-                .indices_dir()
-                .join(uuid.to_string())
-                .join("frag_reuse_details.binpb");
-            let mut writer = dataset.object_store.create(&details_path).await.unwrap();
-            use tokio::io::AsyncWriteExt;
-            writer.write_all(&content).await.unwrap();
-            writer.shutdown().await.unwrap();
-            let entry = IndexMetadata {
-                uuid,
-                fields: vec![],
-                covering_fields: vec![],
-                name: FRAG_REUSE_INDEX_NAME.into(),
-                dataset_version: dataset.manifest.version,
-                fragment_bitmap: None,
-                index_details: Some(Arc::new(prost_types::Any {
-                    type_url: "/lance.table.FragmentReuseIndexDetails".into(),
-                    value: reader_tests::field(
-                        2,
-                        &lance_table::format::pb::ExternalFile {
-                            path: "frag_reuse_details.binpb".into(),
-                            offset: 0,
-                            size: content.len() as u64,
-                        }
-                        .encode_to_vec(),
-                    ),
-                })),
-                index_version: 1,
-                created_at: None,
-                base_id: None,
-                files: None,
-                clustering_id: None,
-                metadata: Default::default(),
-            };
-
-            let task = CleanupTask::new(
-                &dataset.cleanup(CleanupPolicy::default()),
-                CleanupAction::Execute,
-            )
-            .unwrap();
-            let mut inspection = CleanupInspection::default();
-            inspection
-                .frag_reuse_entries
-                .insert(uuid, (entry.clone(), true));
-            assert!(task.resolve_frag_reuse_map_ids(&mut inspection).await);
-            assert!(
-                inspection
-                    .referenced_files
-                    .frag_reuse_map_ids
-                    .contains(&map_id)
-            );
-
-            // An uninterpretable entry (a future index_version) disables
-            // `_fri` collection for the whole run instead of guessing.
-            let future_entry = IndexMetadata {
-                index_version: 2,
-                ..entry.clone()
-            };
-            let mut inspection = CleanupInspection::default();
-            inspection
-                .frag_reuse_entries
-                .insert(uuid, (future_entry, true));
-            assert!(!task.resolve_frag_reuse_map_ids(&mut inspection).await);
-
-            // So does an unknown envelope-level record inside a supported
-            // index_version: it may reference row maps this build cannot
-            // see, so no map may be treated as unreferenced this run.
-            let mut unknown_content = content.clone();
-            unknown_content.extend(reader_tests::field(9, b"future envelope record"));
-            let unknown_entry = IndexMetadata {
-                index_details: Some(Arc::new(prost_types::Any {
-                    type_url: "/lance.table.FragmentReuseIndexDetails".into(),
-                    value: reader_tests::field(1, &unknown_content),
-                })),
-                ..entry
-            };
-            let mut inspection = CleanupInspection::default();
-            inspection
-                .frag_reuse_entries
-                .insert(uuid, (unknown_entry, true));
-            assert!(
-                !task.resolve_frag_reuse_map_ids(&mut inspection).await,
-                "an unknown envelope record must disable _fri collection"
-            );
-        }
-
-        /// E: the full lifecycle, asserting every stage. A stable-partition
-        /// commit installs the tagged entry and its row map; an index rebuild
-        /// over the destinations simulates the drain and drops the old
-        /// segment; the trim then deletes the fully drained entry; a young
-        /// cleanup keeps the map (still referenced by retained manifests);
-        /// an aged cleanup removes those manifests and the map with them,
-        /// leaving a working table.
-        #[tokio::test]
-        #[serial_test::serial(frag_reuse_maintenance)]
-        async fn end_to_end_lifecycle() {
-            use crate::index::frag_reuse::decode_frag_reuse_ledger;
-            use lance_table::system_index::frag_reuse::ledger::Mapping;
-
-            let fixture = MockDatasetFixture::try_new().unwrap();
-            let (mut dataset, map_id) = make_tagged(&fixture).await;
-
-            // Stage 1: the tagged entry holds one stable-partition
-            // transition referencing the on-disk row map, and the old index
-            // segment still hangs off the sources.
-            let entry = dataset
-                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
-                .await
-                .unwrap()
-                .expect("the stable-partition commit installs the entry");
-            assert_eq!(entry.index_version, 1);
-            let ledger = decode_frag_reuse_ledger(&dataset, &entry).await.unwrap();
-            assert_eq!(ledger.transitions().len(), 1);
-            let Mapping::StablePartition(partition) = ledger.transitions()[0].mapping() else {
-                panic!("expected a stable-partition transition");
-            };
-            assert_eq!(partition.map_id, map_id);
-            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id.clone()]);
-            let old_segment = dataset
-                .load_index_by_name("i_idx")
-                .await
-                .unwrap()
-                .expect("fixture index");
-
-            // Stage 2: the trim retains the entry while the segment still
-            // derives from the sources.
-            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
-            assert!(
-                dataset
-                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
-                    .await
-                    .unwrap()
-                    .is_some()
-            );
-
-            // Stage 3: drain -- rebuild the index over the destinations,
-            // dropping the old segment.
-            dataset
-                .create_index(
-                    &["i"],
-                    IndexType::Scalar,
-                    Some("i_idx".into()),
-                    &ScalarIndexParams::default(),
-                    true,
-                )
-                .await
-                .unwrap();
-            let rebuilt = dataset
-                .load_index_by_name("i_idx")
-                .await
-                .unwrap()
-                .expect("rebuilt index");
-            assert_ne!(rebuilt.uuid, old_segment.uuid);
-
-            // Stage 4: the trim now deletes the fully drained entry.
-            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
-            assert!(
-                dataset
-                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
-
-            // Stage 5: a young cleanup keeps the map -- the manifests that
-            // reference it are still retained.
-            fixture
-                .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id]);
-
-            // Stage 6: once aged, the referencing manifests expire and the
-            // map goes with them; the table keeps working.
-            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
-            fixture
-                .run_cleanup(utc_now() - TimeDelta::try_seconds(1).unwrap())
-                .await
-                .unwrap();
-            assert!(fixture.list_fri_map_dirs().await.is_empty());
-            let reopened = fixture.open().await.unwrap();
-            assert_eq!(reopened.count_rows(None).await.unwrap(), 8);
-            assert_eq!(
-                reopened
-                    .count_rows(Some("i >= 4".to_string()))
-                    .await
-                    .unwrap(),
-                4
-            );
-        }
-
-        /// Commit a fresh `i_idx` delta segment built over the current
-        /// (translated) table state; `covered` optionally narrows the
-        /// committed bitmap to an under-claim.
-        async fn commit_delta_segment(dataset: &mut Dataset, covered: Option<&[u32]>) -> Uuid {
-            let params = ScalarIndexParams::default();
-            let mut delta =
-                crate::index::CreateIndexBuilder::new(dataset, &["i"], IndexType::BTree, &params)
-                    .name("i_idx_delta".into())
-                    .execute_uncommitted()
-                    .await
-                    .unwrap();
-            delta.name = "i_idx".into();
-            if let Some(covered) = covered {
-                delta.fragment_bitmap = Some(covered.iter().copied().collect());
-            }
-            let uuid = delta.uuid;
-            dataset
-                .apply_commit(
-                    Transaction::new(
-                        dataset.manifest.version,
-                        Operation::CreateIndex {
-                            new_indices: vec![delta],
-                            removed_indices: vec![],
-                        },
-                        None,
-                    ),
-                    &Default::default(),
-                    &Default::default(),
-                )
-                .await
-                .unwrap();
-            uuid
-        }
-
-        async fn stored_segments(dataset: &Dataset, name: &str) -> Vec<IndexMetadata> {
-            lance_table::io::manifest::read_manifest_indexes(
-                &dataset.object_store,
-                &dataset.manifest_location,
-                &dataset.manifest,
-            )
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|idx| idx.name == name)
-            .collect()
-        }
-
-        /// Draining through `optimize_indices` merge on a tagged table. A
-        /// provenance-only segment still owning translated coverage is opened
-        /// through the translating loader, so the merged file holds live
-        /// addresses. The merged segment commits the UNION of the selected
-        /// segments' stored bitmaps (provenance, retired sources included):
-        /// the tagged reader treats a segment's bitmap as provenance, stops
-        /// translating at a live fragment, and derives coverage of a
-        /// destination whenever every contributing source is present, so the
-        /// merged segment keeps the translated destination coverage instead
-        /// of degrading to scan fallback, and the transition it still names
-        /// stays retained.
-        ///
-        /// A provenance-only segment whose translated coverage is fully taken
-        /// over by siblings is excluded from the query listing by
-        /// direct-coverage-wins and cannot be selected for a merge; it is
-        /// dead weight that the prune step removes
-        /// (`delta_drain_stages_partial_then_full`).
-        #[tokio::test]
-        #[serial_test::serial(frag_reuse_maintenance)]
-        async fn merge_keeps_translated_coverage_on_tagged_tables() {
-            use lance_index::optimize::OptimizeOptions;
-
-            let fixture = MockDatasetFixture::try_new().unwrap();
-            let (mut dataset, _map_id) = make_tagged(&fixture).await;
-            // A partial delta: the old segment keeps exclusive translated
-            // coverage of destination 11, so it stays openable.
-            commit_delta_segment(&mut dataset, Some(&[10])).await;
-            assert_eq!(stored_segments(&dataset, "i_idx").await.len(), 2);
-            let all_rows = dataset.count_rows(None).await.unwrap();
-            let scan_counts = counts_without_index(&dataset).await;
-
-            dataset
-                .optimize_indices(&OptimizeOptions::merge(2))
-                .await
-                .unwrap();
-
-            // One merged segment; its stored bitmap is provenance: the retired
-            // sources of the old segment plus the delta's direct coverage.
-            let merged = stored_segments(&dataset, "i_idx").await;
-            assert_eq!(merged.len(), 1, "{merged:?}");
-            let stored = merged[0].fragment_bitmap.clone().unwrap();
-            assert!(
-                stored.contains(0) && stored.contains(1) && stored.contains(10),
-                "{stored:?}"
-            );
-
-            // The reader derives coverage of BOTH destinations from that
-            // provenance, so nothing falls back to scan.
-            let derived = derived_coverage(&dataset, "i_idx").await;
-            assert_eq!(
-                derived,
-                dataset.fragment_bitmap.as_ref().clone(),
-                "the merged segment must answer for every live fragment"
-            );
-            assert_index_used(&dataset).await;
-            assert_eq!(dataset.count_rows(None).await.unwrap(), all_rows);
-            assert_eq!(counts_with_index(&dataset).await, scan_counts);
-
-            // Trim keeps the transition: the merged segment's provenance still
-            // names its sources and destination 11 has no direct coverage.
-            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
-            assert!(
-                dataset
-                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
-                    .await
-                    .unwrap()
-                    .is_some(),
-                "the merged segment still depends on the transition"
-            );
-            assert_eq!(stored_segments(&dataset, "i_idx").await.len(), 1);
-            assert_eq!(counts_with_index(&dataset).await, scan_counts);
-        }
-
-        /// A merge that selects only SOME of the segments contributing to a
-        /// destination must not strip the unselected sibling of its coverage.
-        /// Two per-fragment segments S1 (fragment 0) and S2 (fragment 1) both
-        /// contribute to destinations 10 and 11 after the recluster. Merging
-        /// S2 with newly appended data produces M whose provenance still names
-        /// fragment 1, so the reader keeps resolving 10 and 11 from {S1, M}.
-        /// With a `stored ∩ live` bitmap M would drop fragment 1 and S1 would
-        /// lose both destinations.
-        #[tokio::test]
-        #[serial_test::serial(frag_reuse_maintenance)]
-        async fn merge_keeps_unselected_sibling_coverage_on_tagged_tables() {
-            use lance_index::optimize::OptimizeOptions;
-
-            let fixture = MockDatasetFixture::try_new().unwrap();
-            let (mut dataset, _map_id) = make_tagged_per_fragment(&fixture).await;
-            let segments = stored_segments(&dataset, "i_idx").await;
-            assert_eq!(segments.len(), 2);
-            let s1 = segments
-                .iter()
-                .find(|s| s.fragment_bitmap.as_ref().unwrap().contains(0))
-                .unwrap()
-                .uuid;
-
-            // New data so a one-segment merge has something to fold in.
-            let appended = arrow_array::record_batch!(("i", Int32, [8, 9, 10, 11])).unwrap();
-            dataset
-                .append(
-                    RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
-                    Some(WriteParams {
-                        store_params: Some(fixture.os_params()),
-                        commit_handler: Some(Arc::new(RenameCommitHandler)),
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .unwrap();
-            let all_rows = dataset.count_rows(None).await.unwrap();
-            let scan_counts = counts_without_index(&dataset).await;
-
-            dataset
-                .optimize_indices(&OptimizeOptions::merge(1))
-                .await
-                .unwrap();
-
-            let after = stored_segments(&dataset, "i_idx").await;
-            assert_eq!(after.len(), 2, "{after:?}");
-            assert!(after.iter().any(|s| s.uuid == s1), "S1 was not selected");
-            // Both destinations are still derived for S1 and for the merged
-            // segment, and every live fragment is covered.
-            let derived = dataset.load_indices().await.unwrap();
-            for segment in derived.iter().filter(|s| s.name == "i_idx") {
-                let coverage = segment.fragment_bitmap.as_ref().unwrap();
-                assert!(
-                    coverage.contains(10) && coverage.contains(11),
-                    "segment {} lost translated coverage: {coverage:?}",
-                    segment.uuid
-                );
-            }
-            assert_eq!(
-                derived_coverage(&dataset, "i_idx").await,
-                dataset.fragment_bitmap.as_ref().clone()
-            );
-            assert_index_used(&dataset).await;
-            assert_eq!(dataset.count_rows(None).await.unwrap(), all_rows);
-            assert_eq!(counts_with_index(&dataset).await, scan_counts);
-        }
-
-        /// Sorted per-value row counts through the scalar index.
-        async fn counts_with_index(dataset: &Dataset) -> Vec<usize> {
-            let mut counts = Vec::new();
-            for value in 0..12 {
-                let mut scan = dataset.scan();
-                scan.filter(&format!("i = {value}")).unwrap();
-                counts.push(scan.try_into_batch().await.unwrap().num_rows());
-            }
-            counts
-        }
-
-        /// The same counts with the scalar index disabled: the ground truth.
-        async fn counts_without_index(dataset: &Dataset) -> Vec<usize> {
-            let mut counts = Vec::new();
-            for value in 0..12 {
-                let mut scan = dataset.scan();
-                scan.filter(&format!("i = {value}")).unwrap();
-                scan.use_scalar_index(false);
-                counts.push(scan.try_into_batch().await.unwrap().num_rows());
-            }
-            counts
-        }
-
-        /// Union of the coverage the tagged reader derives for `name`.
-        async fn derived_coverage(dataset: &Dataset, name: &str) -> roaring::RoaringBitmap {
-            dataset
-                .load_indices()
-                .await
-                .unwrap()
-                .iter()
-                .filter(|s| s.name == name)
-                .filter_map(|s| s.fragment_bitmap.clone())
-                .fold(roaring::RoaringBitmap::new(), |acc, b| acc | b)
-        }
-
-        /// A filtered scan plans through the scalar index (no scan fallback).
-        async fn assert_index_used(dataset: &Dataset) {
-            let mut scan = dataset.scan();
-            scan.filter("i >= 4").unwrap();
-            let plan = scan.explain_plan(false).await.unwrap();
-            assert!(plan.contains("ScalarIndexQuery"), "{plan}");
-        }
-
-        /// `make_tagged` with `i_idx` built as one segment per source fragment.
-        async fn make_tagged_per_fragment(fixture: &MockDatasetFixture) -> (Dataset, String) {
-            let data = lance_datagen::gen_batch()
-                .col("i", lance_datagen::array::step::<Int32Type>())
-                .into_reader_rows(
-                    lance_datagen::RowCount::from(4),
-                    lance_datagen::BatchCount::from(2),
-                );
-            Dataset::write(
-                data,
-                &fixture.dataset_path,
-                Some(WriteParams {
-                    store_params: Some(fixture.os_params()),
-                    commit_handler: Some(Arc::new(RenameCommitHandler)),
-                    mode: WriteMode::Create,
-                    max_rows_per_file: 4,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap();
-            let mut dataset = *fixture.open().await.unwrap();
-            let params = ScalarIndexParams::default();
-            let fragment_ids: Vec<u32> = dataset.fragments().iter().map(|f| f.id as u32).collect();
-            let mut segments = Vec::new();
-            for fragment in fragment_ids {
-                segments.push(
-                    crate::index::CreateIndexBuilder::new(
-                        &mut dataset,
-                        &["i"],
-                        IndexType::BTree,
-                        &params,
-                    )
-                    .name("i_idx".into())
-                    .fragments(vec![fragment])
-                    .execute_uncommitted()
-                    .await
-                    .unwrap(),
-                );
-            }
-            dataset
-                .commit_existing_index_segments("i_idx", "i", segments)
-                .await
-                .unwrap();
-            reserve_fragments(&mut dataset, 20).await;
-            let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
-            let (transition, destinations) = reader_tests::prepare(&dataset).await;
-            let Some(pb_fri::transition::Mapping::StablePartition(mapping)) = &transition.mapping
-            else {
-                unreachable!()
-            };
-            let map_id = mapping.map_id.clone();
-            let read_version = dataset.manifest.version;
-            let frag_reuse_index = Some(
-                crate::index::frag_reuse::frag_reuse_entry_appending(&dataset, vec![transition])
-                    .await
-                    .unwrap(),
-            );
-            let dataset = CommitBuilder::new(Arc::new(dataset))
-                .execute(Transaction::new(
-                    read_version,
-                    Operation::Rewrite {
-                        groups: vec![RewriteGroup {
-                            old_fragments,
-                            new_fragments: destinations,
-                        }],
-                        rewritten_indices: vec![],
-                        frag_reuse_index,
-                    },
-                    None,
-                ))
-                .await
-                .unwrap();
-            (dataset, map_id)
-        }
-
-        /// The staged drain the merge tests were after, via delta segments:
-        /// partial direct coverage retains the transition; completing the
-        /// coverage lets one maintenance run prune the superseded segment,
-        /// release the transition, and (aged) collect the row map.
-        #[tokio::test]
-        #[serial_test::serial(frag_reuse_maintenance)]
-        async fn delta_drain_stages_partial_then_full() {
-            let fixture = MockDatasetFixture::try_new().unwrap();
-            let (mut dataset, map_id) = make_tagged(&fixture).await;
-            let all_rows = dataset.count_rows(None).await.unwrap();
-
-            // Stage 1: only destination 10 gains direct coverage; the
-            // transition and the old segment must both stay.
-            commit_delta_segment(&mut dataset, Some(&[10])).await;
-            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
-            assert_eq!(stored_segments(&dataset, "i_idx").await.len(), 2);
-            assert!(
-                dataset
-                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
-                    .await
-                    .unwrap()
-                    .is_some(),
-                "destination 11 lacks direct coverage, so the transition stays"
-            );
-            assert_eq!(fixture.list_fri_map_dirs().await, vec![map_id.clone()]);
-
-            // Stage 2: destination 11 gains direct coverage too. One
-            // maintenance run prunes the superseded old segment and releases
-            // the transition.
-            let second = commit_delta_segment(&mut dataset, Some(&[11])).await;
-            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
-            let segments = stored_segments(&dataset, "i_idx").await;
-            assert_eq!(segments.len(), 2, "the two deltas remain");
-            assert!(segments.iter().any(|s| s.uuid == second));
-            assert!(
-                dataset
-                    .load_index_by_name(FRAG_REUSE_INDEX_NAME)
-                    .await
-                    .unwrap()
-                    .is_none(),
-                "with the old segment pruned, nothing needs the transition"
-            );
-            assert_eq!(dataset.count_rows(None).await.unwrap(), all_rows);
-
-            // Stage 3: the released row map ages out with its manifests.
-            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
-            fixture
-                .run_cleanup(utc_now() - TimeDelta::try_seconds(1).unwrap())
-                .await
-                .unwrap();
-            assert!(fixture.list_fri_map_dirs().await.is_empty());
-            let reopened = fixture.open().await.unwrap();
-            assert_eq!(reopened.count_rows(None).await.unwrap(), all_rows);
-        }
-
-        /// D-guard: a v0 dataset records no tagged entries and has no `_fri`
-        /// directory; cleanup behaves exactly as before.
-        #[tokio::test]
-        async fn v0_dataset_is_untouched() {
-            let fixture = MockDatasetFixture::try_new().unwrap();
-            fixture.create_some_data().await.unwrap();
-            fixture.overwrite_some_data().await.unwrap();
-            MockClock::set_system_time(TimeDelta::try_days(10).unwrap().to_std().unwrap());
-            let removed = fixture
-                .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(removed.old_versions, 1);
-            assert!(fixture.list_fri_map_dirs().await.is_empty());
-        }
-    }
+    mod frag_reuse_map_gc;
 }
