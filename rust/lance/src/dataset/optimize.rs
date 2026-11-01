@@ -13533,6 +13533,98 @@ mod tests {
         assert_index_answers(&dataset, &address_index.cases(true)).await;
     }
 
+    #[rstest]
+    #[tokio::test]
+    async fn test_read_fm_index_with_defer_index_remap(#[values(false, true)] has_deletions: bool) {
+        let dir = TempStrDir::default();
+        let batch = arrow_array::record_batch!(
+            ("id", Int32, (0..12).collect::<Vec<_>>()),
+            (
+                "text",
+                Utf8,
+                [
+                    Some("needle alpha"),
+                    None,
+                    Some("needle deleted"),
+                    Some("haystack"),
+                    Some("needle"),
+                    Some("haystack"),
+                    Some("needle"),
+                    Some("haystack"),
+                    Some("needle"),
+                    None,
+                    Some("needle needle"),
+                    Some("haystack")
+                ]
+            )
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                max_rows_per_group: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Fm,
+                Some("addr_idx".to_string()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Fm),
+                false,
+            )
+            .await
+            .unwrap();
+        if has_deletions {
+            dataset.delete("id = 2").await.unwrap();
+        }
+        let cases = [
+            (
+                "contains(text, 'needle')",
+                (0..12)
+                    .step_by(2)
+                    .filter(|id| !has_deletions || *id != 2)
+                    .collect(),
+            ),
+            (
+                "contains(text, 'deleted')",
+                if has_deletions { vec![] } else { vec![2] },
+            ),
+            ("contains(text, 'haystack')", vec![3, 5, 7, 11]),
+            ("contains(text, 'absent')", vec![]),
+        ];
+        assert_index_answers(&dataset, &cases).await;
+
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metrics.fragments_removed, 3);
+        assert_eq!(metrics.fragments_added, 1);
+        let fri = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("deferred compaction must record a fragment reuse index");
+        assert_eq!(fri.index_version, 0);
+        assert_index_answers(&dataset, &cases).await;
+
+        let reopened = Dataset::open(dir.as_str()).await.unwrap();
+        assert_index_answers(&reopened, &cases).await;
+    }
+
     #[tokio::test]
     async fn test_read_btree_index_with_defer_index_remap() {
         // Create a dataset with an incremental ID column
