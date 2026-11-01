@@ -1340,15 +1340,10 @@ impl InvertedPartition {
     // return the doc info and the doc length
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
     //
-    // search the documents that contain the query
-    // return the doc info and the doc length
-    // ref: https://en.wikipedia.org/wiki/Okapi_BM25
-    //
-    // Query weights always come from the global `impact_scorer`: compound
-    // search needs leaf scores and bounds to share corpus-level statistics
-    // before the global collector can propagate its threshold, and postings
-    // without stored impacts must fall back to scorer-derived corpus-global
-    // upper bounds rather than partition-local statistics.
+    // Query weights always come from the corpus-global `impact_scorer`, so every
+    // partition scores in one space and standard and compound search can share
+    // one top-k threshold across partitions. Postings without stored impacts
+    // also take their upper bounds from that scorer.
     pub(in super::super) async fn load_posting_lists(
         &self,
         tokens: &Tokens,
@@ -1401,7 +1396,9 @@ impl InvertedPartition {
         options: PostingLoadOptions,
         term_ids: Option<PartitionTermIds<'_>>,
     ) -> Result<Option<FetchedPostings>> {
-        let read_policy = options.read_policy;
+        let PostingLoadOptions {
+            read_policy: requested_read_policy,
+        } = options;
         let is_phrase_query = params.phrase_slop.is_some();
         let is_and_query = operator == Operator::And;
         // The caller passes final tokens after any fuzzy expansion. Query groups
@@ -1434,7 +1431,7 @@ impl InvertedPartition {
 
         let has_expansions = token_ids.windows(2).any(|pair| pair[0].2 == pair[1].2);
 
-        let group_demand_counts = if read_policy == PostingReadPolicy::CacheAwareExact {
+        let group_demand_counts = if requested_read_policy == PostingReadPolicy::CacheAwareExact {
             posting_group_demand_counts(self.inverted_list.as_ref(), &token_ids)
         } else {
             HashMap::new()
@@ -1447,7 +1444,7 @@ impl InvertedPartition {
             .map(|(token_id, token_index, position)| {
                 let read_policy = effective_posting_read_policy(
                     self.inverted_list.as_ref(),
-                    read_policy,
+                    requested_read_policy,
                     &group_demand_counts,
                     has_expansions,
                     token_id,
@@ -1734,10 +1731,6 @@ impl FetchedPostings {
                     .map(|(token_id, token_index, position, posting)| {
                         let token = tokens.get_token(token_index);
                         let needs_scorer_upper_bound = !posting.has_impacts();
-                        // Always the corpus-global weight: compound search
-                        // must share corpus-level statistics across leaves,
-                        // and no-impact postings have no partition-local
-                        // statistics to fall back on.
                         let query_weight = impact_scorer.query_weight(token);
                         let posting = PostingIterator::with_query_weight(
                             token.to_owned(),
