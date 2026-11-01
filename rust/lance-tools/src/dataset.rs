@@ -207,6 +207,8 @@ pub(crate) async fn repair_manifest(
         None,
     );
     let committed = CommitBuilder::new(Arc::new(dataset))
+        // Preserve recovery options even when this version would trigger cleanup.
+        .with_skip_auto_cleanup(true)
         .execute(transaction)
         .await?;
     writeln!(writer, "new_version: {}", committed.version_id())?;
@@ -259,7 +261,7 @@ mod tests {
 
     use arrow_array::{cast::AsArray, types::Int32Type};
     use clap::Parser;
-    use lance::dataset::NewColumnTransform;
+    use lance::dataset::{NewColumnTransform, WriteMode, WriteParams};
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use rstest::rstest;
     use tempfile::TempDir;
@@ -400,6 +402,79 @@ mod tests {
         assert_eq!(
             store.exists(&path).await.unwrap(),
             !matches!(damage, Damage::Missing)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repair_preserves_history_with_auto_cleanup() {
+        let (_dir, dataset) = two_version_dataset().await;
+        let (store, historical_path) = dataset
+            .resolve_data_file_location(&dataset.fragments()[0].files[0])
+            .await
+            .unwrap();
+        let reader = gen_batch()
+            .col("id", array::step_custom::<Int32Type>(100, 1))
+            .into_reader_rows(RowCount::from(4), BatchCount::from(1));
+        let mut dataset = Dataset::write(
+            reader,
+            dataset.uri(),
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .update_config([
+                ("lance.auto_cleanup.interval", "5"),
+                ("lance.auto_cleanup.retain_versions", "1"),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(dataset.version_id(), 4);
+        assert_eq!(dataset.versions().await.unwrap().len(), 4);
+        assert!(store.exists(&historical_path).await.unwrap());
+
+        let damaged = &dataset.fragments()[1].files[0];
+        let (damaged_store, damaged_path) =
+            dataset.resolve_data_file_location(damaged).await.unwrap();
+        damaged_store
+            .put(&damaged_path, b"truncated")
+            .await
+            .unwrap();
+        run_command(
+            "repair-manifest",
+            dataset.uri(),
+            &["--remove-data-files", &damaged.path],
+        )
+        .await
+        .unwrap();
+
+        let repaired = Dataset::open(dataset.uri()).await.unwrap();
+        assert_eq!(repaired.version_id(), 5);
+        let versions: Vec<_> = repaired
+            .versions()
+            .await
+            .unwrap()
+            .iter()
+            .map(|version| version.version)
+            .collect();
+        assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+        assert!(store.exists(&historical_path).await.unwrap());
+        let historical = repaired.checkout_version(2).await.unwrap();
+        assert_eq!(
+            historical.scan().try_into_batch().await.unwrap()["id"]
+                .as_primitive::<Int32Type>()
+                .values(),
+            &[0, 1, 2, 3]
+        );
+        assert_eq!(
+            repaired.scan().try_into_batch().await.unwrap()["id"]
+                .as_primitive::<Int32Type>()
+                .values(),
+            &[100, 101]
         );
     }
 

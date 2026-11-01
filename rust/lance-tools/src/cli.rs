@@ -81,7 +81,7 @@ pub struct LanceDatasetRepairArgs {
     #[command(flatten)]
     pub(crate) dataset: LanceDatasetSourceArgs,
 
-    /// Exact manifest paths, data/<path>, or resolved object keys. Removes all rows
+    /// Exact manifest paths, `data/<path>`, or resolved object keys. Removes all rows
     /// in every matching fragment, including its other columns. Repeat or comma-separate.
     #[arg(
         long,
@@ -102,7 +102,7 @@ pub struct LanceDatasetLocateArgs {
     #[command(flatten)]
     pub(crate) dataset: LanceDatasetSourceArgs,
 
-    /// Exact manifest path, data/<path>, or resolved object key to find.
+    /// Exact manifest path, `data/<path>`, or resolved object key to find.
     #[arg(
         short = 'f',
         long,
