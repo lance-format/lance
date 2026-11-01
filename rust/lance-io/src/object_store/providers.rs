@@ -30,6 +30,17 @@ pub mod goosefs;
 pub mod huggingface;
 pub mod local;
 pub mod memory;
+#[cfg(any(
+    feature = "aws",
+    feature = "azure",
+    feature = "gcp",
+    feature = "goosefs",
+    feature = "huggingface",
+    feature = "oss",
+    feature = "tencent",
+    feature = "tos"
+))]
+pub(in crate::object_store) mod opendal;
 #[cfg(feature = "oss")]
 pub mod oss;
 pub mod shared_memory;

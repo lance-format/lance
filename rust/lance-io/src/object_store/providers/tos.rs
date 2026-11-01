@@ -16,6 +16,8 @@ use crate::object_store::{
 };
 use lance_core::error::{Error, Result};
 
+use super::opendal::finish_opendal_operator;
+
 #[derive(Default, Debug)]
 pub struct TosStoreProvider;
 
@@ -100,8 +102,11 @@ impl TosStoreProvider {
     }
 
     fn build_tos_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
-        let operator = Operator::from_iter::<Tos>(config_map)
+        let storage_options = StorageOptions(config_map);
+        let max_retries = storage_options.client_max_retries();
+        let operator = Operator::from_iter::<Tos>(storage_options.0)
             .map_err(|e| Error::invalid_input(format!("Failed to create TOS operator: {:?}", e)))?;
+        let operator = finish_opendal_operator(operator, max_retries);
 
         Ok(OpendalStore::new(operator))
     }
@@ -111,7 +116,8 @@ impl TosStoreProvider {
 impl ObjectStoreProvider for TosStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
-        let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
+        let storage_options =
+            StorageOptions::new(params.storage_options().cloned().unwrap_or_default());
 
         let base_options = Self::base_tos_options(&base_path, &storage_options)?;
         let accessor = params.get_accessor();
