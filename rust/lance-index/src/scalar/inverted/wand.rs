@@ -1635,9 +1635,13 @@ impl PostingIterator {
 
     fn window_max_score<S: Scorer + ?Sized>(&self, up_to: Option<u64>, scorer: &S) -> f32 {
         if let Some(up_to) = up_to
-            && let PostingList::Compressed(ref list) = self.list
-            && list.impacts.is_some()
+            && let PostingList::Compressed(_) = self.list
         {
+            // The window can extend past the current block: tail postings take
+            // `up_to` from other clauses' block ends, so the bound must cover
+            // every block in [current, up_to], not just the current block's
+            // baked max. `block_max_score_up_to_with_stats` keeps the tighter
+            // early returns (level0 memo, scorer bound) for the other shapes.
             return self.block_max_score_up_to_with_stats(up_to, scorer).score;
         }
         self.block_max_score(scorer)
@@ -9663,6 +9667,54 @@ mod tests {
             scored.load(Ordering::Relaxed) <= total_entries + 8,
             "bounds should be baked once instead of recomputed per window; scored={}",
             scored.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn test_window_max_score_without_impacts_spans_blocks() {
+        // Query-time fuzzy-union postings are compressed 128-doc lists with no
+        // impact skip data and no scorer upper bound. The bound over
+        // [current, up_to] must cover the later blocks' baked maxes, not only
+        // the current block's, or tail-parked postings under-estimate the
+        // window and prune documents that could beat the threshold.
+        let block = crate::scalar::inverted::LEGACY_BLOCK_SIZE;
+        let total = 3 * block;
+        let doc_ids = (0..total as u32).collect::<Vec<_>>();
+        let freqs = vec![1; total];
+        let blocks = compress_posting_list_with_tail_codec_and_block_size(
+            doc_ids.len(),
+            doc_ids.iter(),
+            freqs.iter(),
+            [1.0, 5.0, 9.0].into_iter(),
+            crate::scalar::inverted::PostingTailCodec::VarintDelta,
+            block,
+        )
+        .unwrap();
+        let posting_list = PostingList::Compressed(CompressedPostingList::new(
+            blocks,
+            9.0,
+            doc_ids.len() as u32,
+            crate::scalar::inverted::PostingTailCodec::VarintDelta,
+            block,
+            None,
+            None,
+        ));
+        let mut posting = PostingIterator::with_query_weight(
+            String::from("term"),
+            0,
+            0,
+            1.0,
+            posting_list,
+            doc_ids.len(),
+        );
+        posting.shallow_next(0);
+        assert_eq!(posting.block_idx, 0);
+
+        let window_end = (total - 1) as u64;
+        let window_bound = posting.window_max_score(Some(window_end), &UnitScorer);
+        assert!(
+            window_bound >= 9.0,
+            "window over blocks 0..=2 must bound the highest baked block max, got {window_bound}"
         );
     }
 
