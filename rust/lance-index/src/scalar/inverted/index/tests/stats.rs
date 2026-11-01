@@ -1236,7 +1236,7 @@ async fn test_cache_aware_same_group_expansions_bound_read_amplification(
             Operator::Or,
             &scorer,
             &metrics,
-            PostingLoadOptions::cache_aware_exact(true),
+            PostingLoadOptions::cache_aware_exact(),
         )
         .await
         .unwrap();
@@ -1273,7 +1273,7 @@ async fn test_cache_aware_repeated_token_positions_share_one_singleton() {
             Operator::And,
             &scorer,
             &metrics,
-            PostingLoadOptions::cache_aware_exact(true),
+            PostingLoadOptions::cache_aware_exact(),
         )
         .await
         .unwrap();
