@@ -8705,9 +8705,10 @@ async fn test_sql_contains_tokens() {
     }
 }
 
-/// On legacy storage the index result is materialized before the recheck. A
-/// query made only of the index's custom stop words leaves the index no
-/// tokens, and must still match the rows the scan matches.
+/// On legacy storage the index result is materialized before the recheck. The
+/// query parser does not see the index's custom stop words: 'cat' reaches the
+/// index, which drops it, and 'a' is dropped by the parser but not the index.
+/// Both must match the rows the scan matches.
 #[tokio::test]
 async fn test_sql_contains_tokens_custom_stop_words_on_legacy_storage() {
     let text_col = Arc::new(StringArray::from(vec![
@@ -8715,7 +8716,6 @@ async fn test_sql_contains_tokens_custom_stop_words_on_legacy_storage() {
         "a fish catch a cat",
         "dog fish",
     ]));
-    // Not a built-in stop word, so only the index's own list drops it.
     let batch = RecordBatch::try_new(
         arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
         vec![text_col],
@@ -8738,6 +8738,7 @@ async fn test_sql_contains_tokens_custom_stop_words_on_legacy_storage() {
             &InvertedIndexParams::default()
                 .max_token_length(None)
                 .stem(false)
+                // Not a built-in stop word, so only the index's own list drops it.
                 .custom_stop_words(Some(vec!["cat".to_string()])),
             true,
         )
