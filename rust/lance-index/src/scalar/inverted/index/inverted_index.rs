@@ -1021,12 +1021,9 @@ impl InvertedIndex {
             failing_partitions,
         }
     }
-    /// Search docs match the input text.
-    async fn do_search(&self, text: &str) -> Result<RecordBatch> {
+    /// Search docs match the input tokens.
+    async fn do_search(&self, tokens: Tokens) -> Result<RecordBatch> {
         let params = FtsSearchParams::new();
-        let mut tokenizer = self.tokenizer.clone();
-        let tokens = try_collect_query_tokens(text, &mut tokenizer)?;
-
         let (doc_ids, _) = self
             .bm25_search(
                 Arc::new(tokens),
@@ -1083,7 +1080,15 @@ impl ScalarIndex for InvertedIndex {
 
         match query {
             TokenQuery::TokensContains(text) => {
-                let records = self.do_search(text).await?;
+                let mut tokenizer = self.tokenizer.clone();
+                let tokens = try_collect_query_tokens(text, &mut tokenizer)?;
+                // The index tokenizer can leave nothing of a query the scan
+                // still evaluates, such as one made only of stop words, so the
+                // index cannot narrow the rows and every row is rechecked.
+                if tokens.is_empty() {
+                    return Ok(SearchResult::at_least(RowAddrTreeMap::new()));
+                }
+                let records = self.do_search(tokens).await?;
                 let row_ids = records
                     .column(0)
                     .as_any()

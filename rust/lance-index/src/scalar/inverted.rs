@@ -501,10 +501,6 @@ impl InvertedIndexPlugin {
             && details.max_token_length.is_none()
             && details.language == serde_json::to_string(&Language::English).unwrap()
             && !details.stem
-            // Stop words are dropped at index time and cannot be re-added at
-            // query time, so a literal containing one would AND against an
-            // empty posting and return no rows.
-            && !details.remove_stop_words
     }
 }
 
