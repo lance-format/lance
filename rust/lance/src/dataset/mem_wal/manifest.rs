@@ -74,6 +74,15 @@ struct VersionHint {
     version: u64,
 }
 
+pub(super) fn validate_manifest_scan_batch_size(batch_size: usize) -> Result<()> {
+    if batch_size == 0 {
+        return Err(Error::invalid_input(format!(
+            "manifest_scan_batch_size={batch_size} is invalid; expected a value greater than 0"
+        )));
+    }
+    Ok(())
+}
+
 /// Store for reading and writing shard manifests.
 ///
 /// Handles versioned manifest files with bit-reversed naming scheme
@@ -388,6 +397,8 @@ impl ShardManifestStore {
     /// hint is missing or unreadable or its version was pruned, then scans
     /// forward with HEAD requests until a version is not found.
     async fn find_latest_version(&self) -> Result<u64> {
+        validate_manifest_scan_batch_size(self.manifest_scan_batch_size)?;
+
         let mut latest_found = match self.read_version_hint().await {
             Some(hint) if hint > 0 && self.version_exists(hint).await? => hint,
             _ => self.list_versions().await?.last().copied().unwrap_or(0),
@@ -1038,6 +1049,32 @@ mod tests {
         // List should return all versions
         let versions = manifest_store.list_versions().await.unwrap();
         assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn test_zero_manifest_scan_batch_size_rejects_stale_hint() {
+        let (store, base_path, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+
+        for version in 1..=3 {
+            manifest_store
+                .write(&create_test_manifest(shard_id, version, version))
+                .await
+                .unwrap();
+        }
+        manifest_store.write_version_hint(1).await;
+
+        let zero_batch_reader = ShardManifestStore::new(store, &base_path, shard_id, 0);
+        let error = zero_batch_reader
+            .read_latest()
+            .await
+            .expect_err("manifest_scan_batch_size=0 must not trust a stale version hint");
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains("manifest_scan_batch_size=0"),
+            "the error must name manifest_scan_batch_size and its value, got: {error}"
+        );
     }
 
     #[tokio::test]

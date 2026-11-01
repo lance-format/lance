@@ -62,7 +62,8 @@ use crate::dataset::blob::{BlobPreprocessor, prepared_blob_ids};
 use crate::dataset::write::ExternalBlobMode;
 use crate::session::Session;
 
-use super::manifest::ShardManifestStore;
+use super::manifest::{ShardManifestStore, validate_manifest_scan_batch_size};
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -143,7 +144,8 @@ pub struct ShardWriterConfig {
 
     /// Batch size for parallel HEAD requests when scanning for manifest versions.
     ///
-    /// Higher values scan faster but use more parallel requests.
+    /// Must be greater than zero. Higher values scan faster but use more parallel
+    /// requests.
     /// Default: 2
     pub manifest_scan_batch_size: usize,
 
@@ -375,7 +377,8 @@ impl ShardWriterConfig {
         self
     }
 
-    /// Set manifest scan batch size.
+    /// Set manifest scan batch size. Values must be greater than zero and are
+    /// validated when opening the writer.
     pub fn with_manifest_scan_batch_size(mut self, size: usize) -> Self {
         self.manifest_scan_batch_size = size;
         self
@@ -2813,6 +2816,8 @@ impl ShardWriter {
         schema: Arc<ArrowSchema>,
         index_specs: Vec<MemIndexSpec>,
     ) -> Result<Self> {
+        validate_manifest_scan_batch_size(config.manifest_scan_batch_size)?;
+
         if !config.enable_memtable && !index_specs.is_empty() {
             return Err(Error::invalid_input(
                 "indexes require enable_memtable = true; \
@@ -10970,6 +10975,26 @@ mod tests {
         assert!(
             err.to_string().contains("max_wal_flush_interval"),
             "the error must name the knob, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open_rejects_zero_manifest_scan_batch_size() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let config = ShardWriterConfig {
+            manifest_scan_batch_size: 0,
+            ..memtable_config_with_pk(Uuid::new_v4())
+        };
+
+        let Err(err) =
+            ShardWriter::open(store, base_path, base_uri, config, schema_with_pk(), vec![]).await
+        else {
+            panic!("manifest_scan_batch_size=0 must be rejected");
+        };
+        assert!(matches!(&err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string().contains("manifest_scan_batch_size=0"),
+            "the error must name manifest_scan_batch_size and its value, got: {err}"
         );
     }
 
