@@ -955,6 +955,10 @@ impl ComplexAllNullPageDecoder {
 }
 
 impl StructuralPageDecoder for ComplexAllNullPageDecoder {
+    fn decoded_bytes(&self, _num_rows: u64) -> Result<u64> {
+        Ok(0)
+    }
+
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
         let drained_ranges = self.drain_ranges(num_rows);
         let mut level_slices: Vec<LevelSlice> = Vec::with_capacity(drained_ranges.len());
@@ -1145,6 +1149,10 @@ pub struct SimpleAllNullPageDecoder {
 }
 
 impl StructuralPageDecoder for SimpleAllNullPageDecoder {
+    fn decoded_bytes(&self, _num_rows: u64) -> Result<u64> {
+        Ok(0)
+    }
+
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
         Ok(Box::new(SimpleAllNullDecodePageTask {
             num_values: num_rows,
