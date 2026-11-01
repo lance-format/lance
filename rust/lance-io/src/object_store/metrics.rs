@@ -177,6 +177,12 @@ fn operation_labels(base: &str, operation: &'static str) -> Vec<metrics::Label> 
     labels
 }
 
+/// The `base` (+ optional `dataset`) label set of a store, for metrics
+/// recorded next to its IO rather than by it.
+pub(crate) fn store_labels(base: &str) -> Vec<metrics::Label> {
+    base_labels(base_label_mode(), base)
+}
+
 /// Recommended histogram bucket boundaries for [`METRIC_DURATION`], in seconds.
 ///
 /// Object store requests can take anywhere from a few milliseconds to the
@@ -230,6 +236,16 @@ pub fn describe_metrics() {
         METRIC_IN_FLIGHT,
         metrics::Unit::Count,
         "Number of object store requests currently in flight, by operation and scheme."
+    );
+    metrics::describe_counter!(
+        crate::object_store::METRIC_SCAN_DECODE_TIME,
+        metrics::Unit::Nanoseconds,
+        "Wall time of scan decode tasks, summed over concurrent tasks, by scheme."
+    );
+    metrics::describe_counter!(
+        crate::object_store::METRIC_SCAN_TASK_WAIT_TIME,
+        metrics::Unit::Nanoseconds,
+        "Time scan partitions spent waiting for scheduled I/O, by scheme."
     );
 }
 

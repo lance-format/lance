@@ -7,6 +7,7 @@ use std::task::Poll;
 use std::{
     ops::{Range, RangeInclusive},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use arrow_array::cast::AsArray;
@@ -53,6 +54,9 @@ use lance_datafusion::utils::{
 };
 use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::FilterPlan;
+use lance_io::object_store::{
+    METRIC_SCAN_DECODE_TIME, METRIC_SCAN_TASK_WAIT_TIME, ObjectStore, StoreCounter,
+};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_select::{
     IndexExprResult, RowAddrMask, RowAddrSelection, RowAddrTreeMap, RowSetOps, bitmap_to_ranges,
@@ -356,15 +360,32 @@ pub struct FilteredReadPartitionMetrics {
     /// sum can exceed the elapsed time.
     decode_time: Time,
     baseline_metrics: BaselineMetrics,
+    /// The two timers again, as cumulative process-wide `metrics` counters a
+    /// scrape can read while the scan runs; the plan metrics exist only once
+    /// it has ended.
+    task_wait_counter: StoreCounter,
+    decode_counter: StoreCounter,
 }
 
 impl FilteredReadPartitionMetrics {
-    pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+    pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize, store: &ObjectStore) -> Self {
         Self {
             task_wait_time: metrics.new_time(TASK_WAIT_TIME_METRIC, partition),
             decode_time: metrics.new_time(DECODE_TIME_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
+            task_wait_counter: store.counter(METRIC_SCAN_TASK_WAIT_TIME),
+            decode_counter: store.counter(METRIC_SCAN_DECODE_TIME),
         }
+    }
+
+    fn record_task_wait(&self, elapsed: Duration) {
+        self.task_wait_time.add_duration(elapsed);
+        self.task_wait_counter.increment(elapsed.as_nanos() as u64);
+    }
+
+    fn record_decode(&self, elapsed: Duration) {
+        self.decode_time.add_duration(elapsed);
+        self.decode_counter.increment(elapsed.as_nanos() as u64);
     }
 }
 
@@ -473,6 +494,8 @@ struct FilteredReadStream {
     /// execute time, so the detection lives there too)
     touched_fragments: usize,
     planned_rows: u64,
+    /// The dataset's primary store, whose labels the scan's `metrics` counters carry
+    object_store: Arc<ObjectStore>,
 }
 
 /// Below this many fragments there are too few handoffs to be worth
@@ -613,6 +636,7 @@ impl FilteredReadStream {
         let threading_mode = options.threading_mode;
 
         let io_parallelism = dataset.object_store.io_parallelism();
+        let object_store = dataset.object_store.clone();
         let fragment_readahead = options
             .fragment_readahead
             .unwrap_or_else(|| (*DEFAULT_FRAGMENT_READAHEAD).unwrap_or(io_parallelism * 2))
@@ -708,6 +732,7 @@ impl FilteredReadStream {
             scan_range_after_filter,
             touched_fragments,
             planned_rows,
+            object_store,
         })
     }
 
@@ -1398,7 +1423,11 @@ impl FilteredReadStream {
         let global_metrics = self.metrics.clone();
         let scan_scheduler = self.scan_scheduler.clone();
 
-        let partition_metrics = Arc::new(FilteredReadPartitionMetrics::new(metrics, partition));
+        let partition_metrics = Arc::new(FilteredReadPartitionMetrics::new(
+            metrics,
+            partition,
+            &self.object_store,
+        ));
 
         match self.threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(num_threads) => {
@@ -1414,15 +1443,16 @@ impl FilteredReadStream {
                             // done by spawned background threads.
                             let _timer =
                                 partition_metrics.baseline_metrics.elapsed_compute().timer();
-                            let maybe_task = {
-                                let _task_wait_timer = partition_metrics.task_wait_time.timer();
-                                task_stream.lock().await.next().await.transpose()?
-                            };
-                            Result::Ok(maybe_task.map(|task| {
+                            let wait_start = Instant::now();
+                            let maybe_task = task_stream.lock().await.next().await;
+                            partition_metrics.record_task_wait(wait_start.elapsed());
+                            Result::Ok(maybe_task.transpose()?.map(|task| {
                                 let partition_metrics = partition_metrics.clone();
                                 let task = async move {
-                                    let _decode_timer = partition_metrics.decode_time.timer();
-                                    task.await
+                                    let decode_start = Instant::now();
+                                    let batches = task.await;
+                                    partition_metrics.record_decode(decode_start.elapsed());
+                                    batches
                                 };
                                 (task, task_stream)
                             }))
@@ -1491,16 +1521,15 @@ impl FilteredReadStream {
                             // the 'wait' portion of the task is complete.
                             let _timer =
                                 partition_metrics.baseline_metrics.elapsed_compute().timer();
-                            let maybe_task = {
-                                let _task_wait_timer = partition_metrics.task_wait_time.timer();
-                                task_stream.lock().await.next().await
-                            };
+                            let wait_start = Instant::now();
+                            let maybe_task = task_stream.lock().await.next().await;
+                            partition_metrics.record_task_wait(wait_start.elapsed());
                             if let Some(task) = maybe_task {
                                 let task = task?;
-                                let batches = {
-                                    let _decode_timer = partition_metrics.decode_time.timer();
-                                    task.await?
-                                };
+                                let decode_start = Instant::now();
+                                let batches = task.await;
+                                partition_metrics.record_decode(decode_start.elapsed());
+                                let batches = batches?;
                                 let batch_rows = batches
                                     .iter()
                                     .map(|batch| batch.batch().num_rows())
@@ -8141,5 +8170,54 @@ mod tests {
             projected_column_names(&narrow),
             vec!["id", "cells.item.idx"]
         );
+    }
+
+    /// The scan timers also reach the `metrics` facade, as cumulative counters
+    /// a scrape can read while a scan runs.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn test_scan_timers_reach_the_metrics_facade() {
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        // A thread-local recorder: the counters are registered when the scan
+        // starts, on this thread, so a current-thread runtime keeps every
+        // increment on them visible to it.
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let dataset = gen_batch()
+                        .col("x", array::step::<UInt32Type>())
+                        .into_dataset(
+                            "memory://scan_timers",
+                            FragmentCount::from(4),
+                            FragmentRowCount::from(16),
+                        )
+                        .await
+                        .unwrap();
+                    let batch = dataset.scan().try_into_batch().await.unwrap();
+                    assert_eq!(batch.num_rows(), 64);
+                });
+        });
+        let counters: HashMap<String, u64> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(key, _, _, value)| match value {
+                DebugValue::Counter(value) => Some((key.key().name().to_string(), value)),
+                _ => None,
+            })
+            .collect();
+        for name in [METRIC_SCAN_DECODE_TIME, METRIC_SCAN_TASK_WAIT_TIME] {
+            assert!(
+                counters.get(name).is_some_and(|&nanos| nanos > 0),
+                "{name}: {counters:?}"
+            );
+        }
     }
 }

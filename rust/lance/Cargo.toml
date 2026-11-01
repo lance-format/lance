@@ -109,6 +109,8 @@ lzma-sys = { version = "0.1" }
 
 [dev-dependencies]
 lance-test-macros = { workspace = true }
+metrics = { workspace = true }
+metrics-util = { workspace = true }
 lance-datagen = { workspace = true }
 lance-datafusion = { workspace = true, features = ["datagen"] }
 pretty_assertions = { workspace = true }
