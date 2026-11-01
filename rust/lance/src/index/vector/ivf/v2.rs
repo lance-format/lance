@@ -1738,7 +1738,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         )
         .await?;
         let storage = match frag_reuse_index {
-            Some(ResolvedRemapping::V0(remapper)) => {
+            Some(ResolvedRemapping::V0 { remapper, .. }) => {
                 IvfQuantizationStorage::try_new_with_remapper(storage_reader, Some(remapper))
                     .await?
             }
@@ -3814,7 +3814,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         )
     };
     let storage = match frag_reuse_index {
-        Some(ResolvedRemapping::V0(remapper)) => make_storage(Some(remapper)),
+        Some(ResolvedRemapping::V0 { remapper, .. }) => make_storage(Some(remapper)),
         Some(ResolvedRemapping::V1Translate { remapper, .. }) => {
             make_storage(None).with_row_id_remapping(remapper)
         }
