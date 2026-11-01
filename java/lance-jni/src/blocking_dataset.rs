@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::blocking_scanner::build_full_text_search_query;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::index_progress::JavaIndexBuildProgress;
@@ -52,6 +53,7 @@ use lance_file::version::LanceFileVersion;
 use lance_index::IndexCriteria as RustIndexCriteria;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::progress::{IndexBuildProgress, noop_progress};
+use lance_index::scalar::FullTextSearchQuery;
 use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOptionsProvider};
@@ -4011,6 +4013,35 @@ fn inner_get_index_statistics<'local>(
     };
     let jstats = env.new_string(stats_json)?;
     Ok(jstats)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetFtsGlobalStatistics(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    query_obj: JObject,
+) -> jbyteArray {
+    ok_or_throw_with_return!(
+        env,
+        inner_get_fts_global_statistics(&mut env, java_dataset, query_obj),
+        std::ptr::null_mut()
+    )
+}
+
+fn inner_get_fts_global_statistics(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    query_obj: JObject,
+) -> Result<jbyteArray> {
+    let query = build_full_text_search_query(env, query_obj)?;
+    let mut scanner = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.inner.scan()
+    };
+    scanner.full_text_search(FullTextSearchQuery::new_query(query))?;
+    let statistics = block_on(scanner.fts_global_statistics())?;
+    Ok(**env.byte_array_from_slice(&statistics)?)
 }
 
 #[unsafe(no_mangle)]
