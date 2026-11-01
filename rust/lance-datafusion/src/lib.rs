@@ -9,6 +9,7 @@ pub use lance_datafusion_exec::datagen;
 pub mod exec;
 pub use lance_datafusion_exec::expr;
 pub mod logical_expr;
+mod membership;
 pub mod planner;
 pub mod projection;
 pub mod pb {
