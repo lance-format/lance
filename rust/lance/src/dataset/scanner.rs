@@ -2169,9 +2169,10 @@ impl Scanner {
     /// Statistics are aggregated across every committed physical segment of
     /// the selected logical FTS index. The payload is bound to the current
     /// dataset version, exact segment UUIDs, indexed column, document
-    /// granularity, and all query terms including fuzzy expansions. It does not
-    /// include documents in unindexed fragments. Scanner filters, fragment or
-    /// segment selection, limits, and offsets do not restrict the corpus.
+    /// granularity, and the prepared Match term groups or Phrase token
+    /// positions, including fuzzy expansions. It does not include documents in
+    /// unindexed fragments. Scanner filters, fragment or segment selection,
+    /// limits, and offsets do not restrict the corpus.
     ///
     /// The query must resolve to exactly one indexed column. The returned bytes
     /// are an opaque transport handle intended for Lance bindings and

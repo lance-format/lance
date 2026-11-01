@@ -1755,11 +1755,12 @@ public class Dataset implements Closeable {
    * logical FTS index.
    *
    * <p>The returned opaque protobuf is bound to this dataset version and the exact segment set. It
-   * also preserves the prepared vocabulary and original token positions of every scoring query
-   * leaf, including fuzzy expansions. It does not include documents in unindexed fragments. Queries
-   * spanning more than one indexed column are not supported. V1 emits one DOCUMENT-counted corpus
-   * with prepared Match/Phrase leaves. The caller must attach the payload only to the same query
-   * used to produce it because V1 consumers cannot independently verify the source query identity.
+   * also preserves every scoring query leaf's prepared vocabulary, Match term groups, or Phrase
+   * token positions, including fuzzy expansions. It does not include documents in unindexed
+   * fragments. Queries spanning more than one indexed column are not supported. V1 emits one
+   * DOCUMENT-counted corpus with prepared Match/Phrase leaves. The caller must attach the payload
+   * only to the same query used to produce it because V1 consumers cannot independently verify the
+   * source query identity.
    *
    * <pre>{@code
    * FtsGlobalStatistics statistics =

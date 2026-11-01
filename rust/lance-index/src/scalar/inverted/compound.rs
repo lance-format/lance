@@ -3802,8 +3802,8 @@ pub enum PreparedFtsQueryLeaf {
 /// Prepared query leaves and their shared corpus-wide BM25 scorer.
 ///
 /// Leaf order follows [`collect_leaf_queries`], so callers can preserve the
-/// identity and original token positions of every scoring leaf when moving
-/// statistics between distributed executors.
+/// identity and Match term groups or Phrase token positions of every scoring
+/// leaf when moving statistics between distributed executors.
 #[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct PreparedFtsGlobalStatistics {
@@ -3831,8 +3831,8 @@ impl PreparedFtsGlobalStatistics {
 /// Compound queries can contain multiple leaves with different fuzzy and
 /// phrase parameters. This helper applies each leaf's effective parameters,
 /// collects fuzzy expansions across every supplied segment, and retains each
-/// leaf's final vocabulary and original query positions alongside a scorer
-/// whose term table is complete for every leaf.
+/// leaf's final vocabulary with its Match term groups or Phrase token
+/// positions alongside a scorer whose term table is complete for every leaf.
 ///
 /// ```no_run
 /// # use std::sync::Arc;

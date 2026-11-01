@@ -20,10 +20,10 @@ import java.util.Objects;
  * Opaque protobuf-encoded global BM25 statistics for one full-text query.
  *
  * <p>The payload is bound to the dataset version, logical FTS index, exact committed segment set,
- * indexed column, document granularity, prepared query leaves, and their original token positions.
- * It can be transported to another Lance executor without exposing Rust scorer internals as a Java
- * API. The caller must attach it only to the same query used to produce it because V1 consumers
- * cannot independently verify the source query identity.
+ * indexed column, document granularity, and prepared query vocabulary with Match term groups and
+ * Phrase token positions. It can be transported to another Lance executor without exposing Rust
+ * scorer internals as a Java API. The caller must attach it only to the same query used to produce
+ * it because V1 consumers cannot independently verify the source query identity.
  *
  * <p>V1 contains one DOCUMENT-counted corpus and prepared Match/Phrase leaves. This class only
  * transports the bytes; reconstructing a handle does not validate its protobuf contents.
