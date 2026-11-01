@@ -17,7 +17,7 @@ use lance_core::{
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
     utils::deletion::DeletionVector,
 };
-use lance_select::RowAddrMask;
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::{
     format::{
         DataFile, DeletionFile, DeletionFileType, Manifest, RowDatasetVersionSequence, RowIdMeta,
@@ -127,6 +127,27 @@ pub struct DeletionFileKey<'a> {
     pub deletion_file: &'a DeletionFile,
 }
 
+fn write_deletion_file_identity(builder: &mut KeyBuilder, deletion_file: &DeletionFile) {
+    builder.write_u64(deletion_file.read_version);
+    builder.write_u64(deletion_file.id);
+    builder.write_variant(match &deletion_file.file_type {
+        DeletionFileType::Array => 0,
+        DeletionFileType::Bitmap => 1,
+    });
+    if let Some(base_id) = deletion_file.base_id {
+        builder.write_some();
+        builder.write_u32(base_id);
+    } else {
+        builder.write_none();
+    }
+    if let Some(inline) = &deletion_file.inline {
+        builder.write_some();
+        builder.write_bytes(inline);
+    } else {
+        builder.write_none();
+    }
+}
+
 impl CacheKey for DeletionFileKey<'_> {
     type ValueType = DeletionVector;
     fn key(&self) -> Cow<'_, str> {
@@ -143,23 +164,12 @@ impl CacheKey for DeletionFileKey<'_> {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.deletion-file-key", 1)
+        CacheKeySchema::new("lance.dataset.deletion-file-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u64(self.fragment_id);
-        builder.write_u64(self.deletion_file.read_version);
-        builder.write_u64(self.deletion_file.id);
-        builder.write_variant(match &self.deletion_file.file_type {
-            DeletionFileType::Array => 0,
-            DeletionFileType::Bitmap => 1,
-        });
-        if let Some(base_id) = self.deletion_file.base_id {
-            builder.write_some();
-            builder.write_u32(base_id);
-        } else {
-            builder.write_none();
-        }
+        write_deletion_file_identity(builder, self.deletion_file);
     }
 }
 
@@ -210,6 +220,56 @@ impl CacheKey for RowAddrMaskKey<'_> {
             builder.write_u64(restrict_hash);
         } else {
             builder.write_none();
+        }
+    }
+}
+
+/// One fragment's live stable-row-id set (an allow-list "piece") for
+/// stable-row-id datasets.
+///
+/// [`RowAddrMaskKey`] is keyed by manifest version, so every commit
+/// invalidates the whole-dataset mask and every distinct `restrict_to` set
+/// pays its own full rebuild (lance-format/lance#8849). This key identifies
+/// the piece by the fragment's *content* instead: the row id generation
+/// (same identity [`RowIdSequenceKey`] uses, #7645), including the lineage
+/// data file for spilled row ids, plus the actual deletion identity, including
+/// inline deletion payloads. Commits that leave a fragment's row ids and
+/// deletions untouched keep hitting the same piece, so a whole-dataset allow
+/// list is assembled by OR-ing cached pieces and only fragments whose content
+/// changed reload.
+#[derive(Debug)]
+pub struct RowIdAllowListPieceKey {
+    pub fragment_id: u64,
+    pub row_id_meta: RowIdMeta,
+    /// The data file carrying a spilled row id sequence, when `row_id_meta` is
+    /// [`RowIdMeta::Column`].
+    pub lineage_file: Option<DataFile>,
+    pub deletion_file: Option<DeletionFile>,
+}
+
+impl CacheKey for RowIdAllowListPieceKey {
+    type ValueType = RowAddrTreeMap;
+    // Only the legacy display form. Identity comes from `write_key` below.
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!("row_id_allow_list_piece/{}", self.fragment_id))
+    }
+    fn type_name() -> &'static str {
+        "RowAddrTreeMap"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-id-allow-list-piece-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.fragment_id);
+        write_row_id_identity(builder, &self.row_id_meta, self.lineage_file.as_ref());
+        match &self.deletion_file {
+            None => builder.write_variant(0),
+            Some(deletion_file) => {
+                builder.write_variant(1);
+                write_deletion_file_identity(builder, deletion_file);
+            }
         }
     }
 }
@@ -286,6 +346,32 @@ pub struct RowIdSequenceKey<'a> {
     pub lineage_file: Option<&'a DataFile>,
 }
 
+fn write_row_id_identity(
+    builder: &mut KeyBuilder,
+    row_id_meta: &RowIdMeta,
+    lineage_file: Option<&DataFile>,
+) {
+    match row_id_meta {
+        RowIdMeta::Inline(data) => {
+            builder.write_variant(0);
+            builder.write_fixed_bytes(data.digest());
+        }
+        // The sequence lives in one of the fragment's data files, which is
+        // named freshly per rewrite; the file identifies the contents the way
+        // the inline digest does.
+        RowIdMeta::Column => {
+            builder.write_variant(1);
+            match lineage_file {
+                Some(file) => {
+                    builder.write_str(&file.path);
+                    builder.write_u64(file.base_id.map_or(u64::MAX, u64::from));
+                }
+                None => builder.write_str(""),
+            }
+        }
+    }
+}
+
 impl CacheKey for RowIdSequenceKey<'_> {
     type ValueType = RowIdSequence;
     // Only the legacy display form. Identity comes from `write_key` below.
@@ -302,25 +388,7 @@ impl CacheKey for RowIdSequenceKey<'_> {
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         builder.write_u64(self.fragment_id);
-        match self.row_id_meta {
-            RowIdMeta::Inline(data) => {
-                builder.write_variant(0);
-                builder.write_fixed_bytes(data.digest());
-            }
-            // The sequence lives in one of the fragment's data files, which is
-            // named freshly per rewrite; the file identifies the contents the
-            // way the inline digest does.
-            RowIdMeta::Column => {
-                builder.write_variant(1);
-                match self.lineage_file {
-                    Some(file) => {
-                        builder.write_str(&file.path);
-                        builder.write_u64(file.base_id.map_or(u64::MAX, u64::from));
-                    }
-                    None => builder.write_str(""),
-                }
-            }
-        }
+        write_row_id_identity(builder, self.row_id_meta, self.lineage_file);
     }
 }
 
@@ -375,6 +443,7 @@ impl DSMetadataCache {
 mod tests {
     use std::sync::Arc;
 
+    use lance_table::format::ROW_ID_FIELD_ID;
     use lance_table::rowids::write_row_ids;
 
     use super::*;
@@ -409,6 +478,97 @@ mod tests {
                 .get_with_key(&DeletionFileKey {
                     fragment_id: 2,
                     deletion_file: &deletion_file_on_other_base,
+                })
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_file_key_separates_inline_payloads() {
+        let cache = LanceCache::with_capacity(4096);
+        let deletion_file = DeletionFile {
+            read_version: 3,
+            id: 4,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            inline: Some(vec![1].into()),
+        };
+        cache
+            .insert_with_key(
+                &DeletionFileKey {
+                    fragment_id: 2,
+                    deletion_file: &deletion_file,
+                },
+                Arc::new(DeletionVector::NoDeletions),
+            )
+            .await;
+
+        let deletion_file_with_other_inline_payload = DeletionFile {
+            inline: Some(vec![2].into()),
+            ..deletion_file
+        };
+        assert!(
+            cache
+                .get_with_key(&DeletionFileKey {
+                    fragment_id: 2,
+                    deletion_file: &deletion_file_with_other_inline_payload,
+                })
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn row_id_allow_list_piece_key_uses_content_identity() {
+        let cache = LanceCache::with_capacity(4096);
+        let lineage_file =
+            DataFile::new_legacy_from_fields("lineage.lance", vec![ROW_ID_FIELD_ID], Some(1));
+        let deletion_file = DeletionFile {
+            read_version: 3,
+            id: 4,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            inline: Some(vec![1].into()),
+        };
+        let key = RowIdAllowListPieceKey {
+            fragment_id: 2,
+            row_id_meta: RowIdMeta::Column,
+            lineage_file: Some(lineage_file.clone()),
+            deletion_file: Some(deletion_file.clone()),
+        };
+        cache
+            .insert_with_key(&key, Arc::new(RowAddrTreeMap::from_iter(0..3)))
+            .await;
+        assert!(cache.get_with_key(&key).await.is_some());
+
+        let other_lineage_file =
+            DataFile::new_legacy_from_fields("other-lineage.lance", vec![ROW_ID_FIELD_ID], Some(1));
+        assert!(
+            cache
+                .get_with_key(&RowIdAllowListPieceKey {
+                    fragment_id: 2,
+                    row_id_meta: RowIdMeta::Column,
+                    lineage_file: Some(other_lineage_file),
+                    deletion_file: Some(deletion_file.clone()),
+                })
+                .await
+                .is_none()
+        );
+
+        let deletion_file_with_other_inline_payload = DeletionFile {
+            inline: Some(vec![2].into()),
+            ..deletion_file
+        };
+        assert!(
+            cache
+                .get_with_key(&RowIdAllowListPieceKey {
+                    fragment_id: 2,
+                    row_id_meta: RowIdMeta::Column,
+                    lineage_file: Some(lineage_file),
+                    deletion_file: Some(deletion_file_with_other_inline_payload),
                 })
                 .await
                 .is_none()
