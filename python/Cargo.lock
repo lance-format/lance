@@ -4330,6 +4330,7 @@ dependencies = [
  "num-traits",
  "prost",
  "prost-build",
+ "rayon",
  "serde_json",
  "tokio",
  "tracing",
