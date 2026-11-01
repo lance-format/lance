@@ -1144,6 +1144,15 @@ pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
 pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
     /// Decompress one or more values
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock>;
+
+    /// Whether every buffer returned by `decompress` is newly allocated, never a
+    /// view of the input, on all paths.
+    ///
+    /// Full-zip decoding copies a batch's input out of the page buffer unless this
+    /// is true, so that output batches never keep the whole page alive.
+    fn allocates_output(&self) -> bool {
+        false
+    }
 }
 
 pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {

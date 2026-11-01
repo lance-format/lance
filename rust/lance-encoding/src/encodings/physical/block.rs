@@ -800,6 +800,10 @@ impl PerValueCompressor for CompressedBufferEncoder {
 }
 
 impl VariablePerValueDecompressor for CompressedBufferEncoder {
+    fn allocates_output(&self) -> bool {
+        true
+    }
+
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
         let data_bytes = &data.data;
         let mut decompressed = Vec::with_capacity(data_bytes.len() * 2);
