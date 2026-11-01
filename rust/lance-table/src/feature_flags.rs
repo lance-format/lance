@@ -448,6 +448,31 @@ fn data_overlay_files_enabled() -> bool {
     cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV).is_some()
 }
 
+/// Refuse to publish a manifest that carries data overlay files from a build that
+/// does not understand them: every later open of the dataset by this build would
+/// be refused.
+pub fn validate_data_overlay_files(manifest: &Manifest) -> Result<()> {
+    validate_data_overlay_files_when(manifest, data_overlay_files_enabled())
+}
+
+/// Split out so the release-build refusal is testable from a debug build.
+fn validate_data_overlay_files_when(manifest: &Manifest, enabled: bool) -> Result<()> {
+    if enabled
+        || manifest
+            .fragments
+            .iter()
+            .all(|fragment| fragment.overlays.is_empty())
+    {
+        return Ok(());
+    }
+    Err(Error::not_supported(format!(
+        "Cannot commit version {}: it carries data overlay files, an unreleased format that \
+         may still change; set {ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV} to read and write \
+         them with this build of Lance",
+        manifest.version
+    )))
+}
+
 /// Debug builds only, with no environment override, until continuous recording
 /// and retention land. Hidden because it is removed then.
 #[doc(hidden)]
@@ -1011,6 +1036,17 @@ mod tests {
             manifest.writer_feature_flags & FLAG_UNSTABLE_DATA_OVERLAY_FILES,
             0
         );
+
+        // A build that does not understand overlays refuses to publish them.
+        let err = validate_data_overlay_files_when(&manifest, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV),
+            "{err}"
+        );
+        validate_data_overlay_files_when(&manifest, true).unwrap();
+        manifest.fragments = Arc::new(vec![Fragment::new(0)]);
+        validate_data_overlay_files_when(&manifest, false).unwrap();
     }
 
     #[test]

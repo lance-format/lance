@@ -4730,6 +4730,7 @@ pub(crate) async fn write_manifest_file(
         manifest,
         indices.as_deref().unwrap_or_default(),
     )?;
+    lance_table::feature_flags::validate_data_overlay_files(manifest)?;
 
     validate_non_reusable_field_id_flags(manifest).map_err(CommitError::OtherError)?;
     versions::finalize_manifest_storage_version(manifest)?;

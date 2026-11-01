@@ -492,6 +492,8 @@
                             <useSystemClassLoader>false</useSystemClassLoader>
                             <environmentVariables>
                                 <LANCE_LANGUAGE_MODEL_HOME>${project.basedir}/src/test/resources/language_models</LANCE_LANGUAGE_MODEL_HOME>
+                                <!-- Data overlay files are unreleased; the overlay tests opt in. -->
+                                <LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES>1</LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES>
                             </environmentVariables>
                         </configuration>
                     </plugin>
