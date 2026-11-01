@@ -171,7 +171,7 @@ pub(crate) type PairKernel = unsafe fn(&[f32], &[f32]) -> f32;
 
 /// Writes the distance from `key` to each `dimension`-sized vector of `batch`
 /// into the matching element of `output`.
-pub(crate) type BatchKernel = unsafe fn(&[f32], &[f32], usize, &mut [f32]);
+pub(crate) type BatchKernel<T = f32> = unsafe fn(&[T], &[T], usize, &mut [f32]);
 
 pub use cosine::*;
 pub use dot::*;
