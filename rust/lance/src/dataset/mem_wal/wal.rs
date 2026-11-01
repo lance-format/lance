@@ -1468,12 +1468,11 @@ pub async fn fence_shard(
     shard_id: Uuid,
     writer_epoch: u64,
 ) -> Result<u64> {
-    let manifest_store = Arc::new(ShardManifestStore::new(
+    let manifest_store = Arc::new(ShardManifestStore::new_adaptive(
         object_store.clone(),
         base_path,
         dir_id,
         shard_id,
-        2,
     ));
     WalAppender::with_claimed_epoch(
         object_store,
