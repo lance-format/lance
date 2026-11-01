@@ -1026,6 +1026,15 @@ impl ResidentAddressProjection {
     /// dataset carries a fragment reuse index, even when it retains every
     /// document, so liveness has to be decided on cardinality.
     fn dense_and_strictly_ascending(&self) -> bool {
+        // A cached invalid verdict already decides the answer. Asking for the
+        // ordered view would rebuild its diagnostics by rescanning the documents
+        // up to the first violation, only to discard them.
+        if matches!(
+            self.cached_row_address_order(),
+            CachedRowAddressOrder::Duplicate | CachedRowAddressOrder::OutOfOrder
+        ) {
+            return false;
+        }
         match self.try_ordered_row_addresses() {
             Ok(ordered) => !ordered.has_sparse_live_docs(),
             Err(_) => false,
@@ -3109,6 +3118,10 @@ mod tests {
         let projection = projection.resident(Some(raw)).unwrap();
 
         assert_eq!(projection.dense_and_strictly_ascending(), expected);
+        // Later checks answer from the cached verdict without rescanning.
+        let visited = projection.ordered_validation_visited_docs();
+        assert_eq!(projection.dense_and_strictly_ascending(), expected);
+        assert_eq!(projection.ordered_validation_visited_docs(), visited);
     }
 
     #[test]
