@@ -141,12 +141,20 @@ async fn repack_keeps_the_biggest_file() {
     dataset.validate().await.unwrap();
 }
 
-/// Deleted rows stay deleted and the new files line up with the old ones.
+/// Deleted rows stay deleted, and the new files hold the values every
+/// physical row, deleted or not, had before.
 #[tokio::test]
 async fn repack_keeps_deletions() {
     let mut dataset = write_backfilled().await;
     dataset.delete("a = 1 OR a = 6").await.unwrap();
     let before = dataset.scan().try_into_batch().await.unwrap();
+    let stored = async |dataset: &Dataset| {
+        let mut scanner = dataset.scan();
+        scanner.with_row_id().include_deleted_rows();
+        scanner.try_into_batch().await
+    };
+    let stored_before = stored(&dataset).await.unwrap();
+    assert_eq!(stored_before.num_rows(), 8);
 
     let options = CompactionOptions {
         // Neither small nor deleted enough to be rewritten.
@@ -165,6 +173,7 @@ async fn repack_keeps_deletions() {
             .all(|fragment| fragment.metadata().deletion_file.is_some())
     );
     assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
+    assert_eq!(stored(&dataset).await.unwrap(), stored_before);
     dataset.validate().await.unwrap();
 }
 

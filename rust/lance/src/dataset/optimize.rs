@@ -8093,11 +8093,7 @@ mod tests {
             ..Default::default()
         };
         let original_indices = dataset.load_indices().await.unwrap();
-        let task = TaskData {
-            fragments: dataset.fragments().as_ref().clone(),
-            output_clustering_id: None,
-            output_metadata: HashMap::new(),
-        };
+        let task = TaskData::rewrite_fragments(dataset.fragments().as_ref().clone());
         let mut result = rewrite_files(Cow::Borrowed(&dataset), task, &options)
             .await
             .unwrap();

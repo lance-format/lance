@@ -1847,6 +1847,7 @@ async fn test_read_legacy_and_v2_blob_layouts_from_one_file() {
         dataset.manifest.version,
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, data_file)],
+            data_change: true,
         },
         None,
     );

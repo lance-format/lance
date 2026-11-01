@@ -247,10 +247,12 @@ pub(super) async fn execute_repack(
         write_version,
     )?;
 
-    // Read the base values only: the overlays stay on the fragment and keep
-    // shadowing them, so every live row reads as it did.
+    // Copy the stored values of every physical row, deleted ones included,
+    // as `data_change: false` requires. The overlays and the deletion file
+    // stay on the fragment and keep applying to the new files.
     let mut base = fragment.clone();
     base.overlays.clear();
+    base.deletion_file = None;
     let source = FileFragment::new(Arc::new(dataset.clone()), base);
     let schema = dataset.schema();
     let batch_size = options.batch_size.map(|size| size as u32);
