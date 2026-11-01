@@ -1637,9 +1637,9 @@ impl PostingIterator {
         if let Some(up_to) = up_to
             && let PostingList::Compressed(_) = self.list
         {
-            // A tail posting's window ends at another clause's block end and
-            // can cover several of its own blocks, so it has to be bounded over
-            // all of them, impacts or not.
+            // The window end can come from other postings' block ends, so it can
+            // cover several of this posting's blocks; bound all of them,
+            // impacts or not.
             return self.block_max_score_up_to_with_stats(up_to, scorer).score;
         }
         self.block_max_score(scorer)
@@ -9712,7 +9712,9 @@ mod tests {
             .map(|&doc| if doc == hot_doc { 12 } else { 1 })
             .collect::<Vec<_>>();
         // Sparse clause: a dense first block whose doc 0 sets the floor, then
-        // a stride-4 block spanning union blocks 1..=4, then a short tail.
+        // a stride-4 block spanning union blocks 1..=4, then a short tail. It
+        // carries no scorer-bound flag so its block maxes stay finite under
+        // `UnitScorer`.
         let sparse_docs = (0..block_docs)
             .chain((0..block_docs).map(|i| block_docs + 4 * i))
             .chain([5 * block_docs, 5 * block_docs + 4])
