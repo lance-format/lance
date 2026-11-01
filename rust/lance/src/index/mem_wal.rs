@@ -27,8 +27,15 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
 
+    use crate::dataset::mem_wal::DatasetMemWalExt;
     use crate::dataset::transaction::{Operation, Transaction};
+    use crate::dataset::write::merge_insert::{
+        MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched,
+    };
     use crate::dataset::{CommitBuilder, InsertBuilder, WriteParams};
+    use arrow_array::cast::AsArray;
+    use arrow_array::record_batch;
+    use arrow_array::types::Int32Type;
 
     async fn test_dataset() -> crate::Dataset {
         let write_params = WriteParams {
@@ -89,6 +96,7 @@ mod tests {
         let txn = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(Uuid::new_v4(), 1)],
             },
             None,
@@ -121,6 +129,7 @@ mod tests {
         let txn1 = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
@@ -135,6 +144,7 @@ mod tests {
         let txn2 = Transaction::new(
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
             },
             None,
@@ -158,6 +168,7 @@ mod tests {
         let txn1 = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
@@ -171,6 +182,7 @@ mod tests {
         let txn2 = Transaction::new(
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
@@ -195,6 +207,7 @@ mod tests {
         let txn1 = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
             },
             None,
@@ -209,6 +222,7 @@ mod tests {
         let txn2 = Transaction::new(
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
@@ -233,6 +247,7 @@ mod tests {
         let txn1 = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard1, 10)],
             },
             None,
@@ -247,6 +262,7 @@ mod tests {
         let txn2 = Transaction::new(
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard2, 5)],
             },
             None,
@@ -284,6 +300,7 @@ mod tests {
         let txn1 = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
             },
             None,
@@ -364,6 +381,7 @@ mod tests {
         let txn2 = Transaction::new(
             dataset.manifest.version - 1, // Based on old version
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
             },
             None,
@@ -383,6 +401,7 @@ mod tests {
         let txn = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, generation)],
             },
             None,
@@ -486,6 +505,7 @@ mod tests {
         let txn = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 9)],
             },
             None,
@@ -552,6 +572,7 @@ mod tests {
         let txn = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
             },
             None,
@@ -641,6 +662,7 @@ mod tests {
         let txn = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 9)],
             },
             None,
@@ -881,6 +903,7 @@ mod tests {
             .execute(Transaction::new(
                 version,
                 Operation::UpdateMemWalState {
+                    dir_id: String::new(),
                     compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
                 },
                 None,
@@ -904,6 +927,7 @@ mod tests {
                 updated_fragments: vec![],
                 new_fragments: vec![new_fragment],
                 fields_modified: vec![],
+                mem_wal_dir_id: Some(String::new()),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
@@ -999,6 +1023,7 @@ mod tests {
         let txn = Transaction::new(
             dataset.manifest.version,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 1)],
             },
             None,
@@ -1041,5 +1066,346 @@ mod tests {
             2,
             "both the real scalar index and __mem_wal must be listed"
         );
+    }
+
+    const DIR_A: &str = "a1b2c3d4";
+    const DIR_B: &str = "c3d4e5f6";
+
+    /// Commit a MemWAL index with `dir_id`, as an initialization would.
+    async fn enable(dataset: crate::Dataset, dir_id: &str) -> crate::Dataset {
+        let details = MemWalIndexDetails {
+            dir_id: dir_id.to_string(),
+            ..Default::default()
+        };
+        let index = new_mem_wal_index_meta(dataset.manifest.version, details).unwrap();
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap()
+    }
+
+    /// Remove the MemWAL index, as a disable would.
+    async fn disable(dataset: crate::Dataset) -> crate::Dataset {
+        let mem_wal = dataset
+            .load_index_by_name(MEM_WAL_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("MemWAL index present");
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![],
+                removed_indices: vec![mem_wal],
+            },
+            None,
+        );
+        CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap()
+    }
+
+    fn progress(read_version: u64, dir_id: &str, compacted: Vec<CompactedSsTable>) -> Transaction {
+        Transaction::new(
+            read_version,
+            Operation::UpdateMemWalState {
+                compacted_sstables: compacted,
+                dir_id: dir_id.to_string(),
+            },
+            None,
+        )
+    }
+
+    async fn commit(dataset: &crate::Dataset, txn: Transaction) -> crate::Result<crate::Dataset> {
+        CommitBuilder::new(Arc::new(dataset.clone()))
+            .execute(txn)
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_fence_commits_while_its_mem_wal_is_present() {
+        let dataset = enable(test_dataset().await, DIR_A).await;
+        let fenced = commit(&dataset, progress(dataset.manifest.version, DIR_A, vec![]))
+            .await
+            .unwrap();
+        assert_eq!(fenced.manifest.version, dataset.manifest.version + 1);
+        assert!(
+            fenced.mem_wal_index_details().await.unwrap().is_some(),
+            "a fence keeps the MemWAL index"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fence_built_on_head_without_mem_wal_is_stale() {
+        let dataset = disable(enable(test_dataset().await, DIR_A).await).await;
+        let error = commit(&dataset, progress(dataset.manifest.version, DIR_A, vec![]))
+            .await
+            .expect_err("the MemWAL was removed");
+        assert!(error.is_stale_mem_wal(), "unexpected: {error}");
+    }
+
+    #[tokio::test]
+    async fn test_fence_rebased_over_removal_is_stale() {
+        let enabled = enable(test_dataset().await, DIR_A).await;
+        let read_version = enabled.manifest.version;
+        let disabled = disable(enabled).await;
+        let error = commit(&disabled, progress(read_version, DIR_A, vec![]))
+            .await
+            .expect_err("the fence rebases over the removal");
+        assert!(error.is_stale_mem_wal(), "unexpected: {error}");
+    }
+
+    #[tokio::test]
+    async fn test_progress_for_a_replaced_mem_wal_is_stale() {
+        let shard = Uuid::new_v4();
+        let enabled = enable(test_dataset().await, DIR_A).await;
+        let read_version = enabled.manifest.version;
+        let reenabled = enable(disable(enabled).await, DIR_B).await;
+
+        // Built directly on the re-enabled HEAD, as a job that checks out latest
+        // between chunks would.
+        let on_head = commit(
+            &reenabled,
+            progress(
+                reenabled.manifest.version,
+                DIR_A,
+                vec![CompactedSsTable::new(shard, 3)],
+            ),
+        )
+        .await
+        .expect_err("progress names the replaced MemWAL");
+        assert!(on_head.is_stale_mem_wal(), "unexpected: {on_head}");
+
+        // Rebased over the disable and re-enable.
+        let rebased = commit(
+            &reenabled,
+            progress(read_version, DIR_A, vec![CompactedSsTable::new(shard, 3)]),
+        )
+        .await
+        .expect_err("progress names the replaced MemWAL");
+        assert!(rebased.is_stale_mem_wal(), "unexpected: {rebased}");
+
+        let details = reenabled.mem_wal_index_details().await.unwrap().unwrap();
+        assert!(
+            details.compacted_sstables.is_empty(),
+            "the new MemWAL recorded the old one's progress"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_progress_rebases_over_same_mem_wal_progress() {
+        let dataset = enable(test_dataset().await, DIR_A).await;
+        let read_version = dataset.manifest.version;
+        let dataset = commit(
+            &dataset,
+            progress(
+                read_version,
+                DIR_A,
+                vec![CompactedSsTable::new(Uuid::new_v4(), 2)],
+            ),
+        )
+        .await
+        .unwrap();
+        commit(
+            &dataset,
+            progress(
+                read_version,
+                DIR_A,
+                vec![CompactedSsTable::new(Uuid::new_v4(), 5)],
+            ),
+        )
+        .await
+        .expect("progress for another shard of the same MemWAL rebases");
+    }
+
+    fn compaction_update(
+        compacted_sstables: Vec<CompactedSsTable>,
+        mem_wal_dir_id: Option<&str>,
+    ) -> Operation {
+        Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![],
+            new_fragments: vec![],
+            fields_modified: vec![],
+            compacted_sstables,
+            mem_wal_dir_id: mem_wal_dir_id.map(str::to_string),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: None,
+            inserted_rows_filter: None,
+            updated_fragment_offsets: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_compaction_update_checks_its_mem_wal() {
+        let shard = Uuid::new_v4();
+        let dataset = enable(
+            disable(enable(test_dataset().await, DIR_A).await).await,
+            DIR_B,
+        )
+        .await;
+        let version = dataset.manifest.version;
+
+        let stale = commit(
+            &dataset,
+            Transaction::new(
+                version,
+                compaction_update(vec![CompactedSsTable::new(shard, 1)], Some(DIR_A)),
+                None,
+            ),
+        )
+        .await
+        .expect_err("a compaction from the replaced MemWAL");
+        assert!(stale.is_stale_mem_wal(), "unexpected: {stale}");
+
+        // An earlier chunk of the same compaction records no progress, and is
+        // refused all the same.
+        let stale_chunk = commit(
+            &dataset,
+            Transaction::new(version, compaction_update(vec![], Some(DIR_A)), None),
+        )
+        .await
+        .expect_err("a progress-less chunk from the replaced MemWAL");
+        assert!(stale_chunk.is_stale_mem_wal(), "unexpected: {stale_chunk}");
+
+        let unnamed = commit(
+            &dataset,
+            Transaction::new(
+                version,
+                compaction_update(vec![CompactedSsTable::new(shard, 1)], None),
+                None,
+            ),
+        )
+        .await
+        .expect_err("compaction progress must name its MemWAL");
+        assert!(
+            unnamed.to_string().contains("mem_wal_dir_id"),
+            "unexpected: {unnamed}"
+        );
+
+        commit(
+            &dataset,
+            Transaction::new(
+                version,
+                compaction_update(vec![CompactedSsTable::new(shard, 1)], Some(DIR_B)),
+                None,
+            ),
+        )
+        .await
+        .expect("a compaction from the current MemWAL commits");
+    }
+
+    /// Every merge-insert executor carries the MemWAL named by
+    /// `mark_sstables_as_compacted` into its commit, including the in-place
+    /// column rewrite and chunks that record no progress.
+    #[rstest::rstest]
+    #[case::rewrite_rows(MergeInsertWriteMode::RewriteRows)]
+    #[case::rewrite_columns(MergeInsertWriteMode::RewriteColumns)]
+    #[tokio::test]
+    async fn test_merge_insert_checks_its_mem_wal(#[case] write_mode: MergeInsertWriteMode) {
+        let initial = record_batch!(
+            ("id", Int32, [1, 2, 3, 4]),
+            ("value", Int32, [10, 20, 30, 40]),
+            ("other", Int32, [100, 200, 300, 400])
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            })
+            .execute(vec![initial])
+            .await
+            .unwrap();
+        let dataset = Arc::new(enable(disable(enable(dataset, DIR_A).await).await, DIR_B).await);
+
+        let merge = |dir_id: &str, compacted: Vec<CompactedSsTable>, value: i32| {
+            let dataset = dataset.clone();
+            let dir_id = dir_id.to_string();
+            async move {
+                let source = record_batch!(("id", Int32, [1]), ("value", Int32, [value])).unwrap();
+                let uncommitted = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".into()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::DoNothing)
+                    .use_index(false)
+                    .write_mode(write_mode)
+                    .mark_sstables_as_compacted(dir_id, compacted)
+                    .try_build()
+                    .unwrap()
+                    .execute_uncommitted_batches(vec![source])
+                    .await
+                    .unwrap();
+                CommitBuilder::new(dataset)
+                    .execute(uncommitted.transaction)
+                    .await
+            }
+        };
+
+        let stale = merge(DIR_A, vec![], 999)
+            .await
+            .expect_err("a progress-less chunk from the replaced MemWAL");
+        assert!(stale.is_stale_mem_wal(), "unexpected: {stale}");
+
+        let merged = merge(DIR_B, vec![CompactedSsTable::new(Uuid::new_v4(), 1)], 11)
+            .await
+            .expect("progress for the current MemWAL commits");
+        let batch = merged
+            .scan()
+            .filter("id = 1")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            batch["value"].as_primitive::<Int32Type>().values(),
+            &[11],
+            "only the current MemWAL's merge lands"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enable_rejected_when_a_mem_wal_is_present() {
+        let enabled = enable(test_dataset().await, DIR_A).await;
+
+        // Built on the HEAD that already carries a MemWAL, so no rebase runs and
+        // only the manifest-build check can refuse it.
+        let index = new_mem_wal_index_meta(
+            enabled.manifest.version,
+            MemWalIndexDetails {
+                dir_id: DIR_B.to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let error = commit(
+            &enabled,
+            Transaction::new(
+                enabled.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![index],
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+        )
+        .await
+        .expect_err("a second enable must not replace the first");
+        // A same-name index is folded in as a replacement, so this reads as a
+        // rewrite naming another MemWAL.
+        assert!(
+            error.is_stale_mem_wal() || error.to_string().contains("already initialized"),
+            "unexpected: {error}"
+        );
+        let details = enabled.mem_wal_index_details().await.unwrap().unwrap();
+        assert_eq!(details.dir_id, DIR_A);
     }
 }

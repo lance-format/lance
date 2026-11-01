@@ -60,6 +60,7 @@ use lance_index::vector::{
     sq::{ScalarQuantizer, builder::SQBuildParams},
 };
 use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, IndexType};
+use lance_io::object_reader::LazyReader;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Reader;
 use lance_linalg::distance::*;
@@ -883,6 +884,12 @@ pub(crate) async fn build_distributed_vector_index(
             dim,
             pq_params.num_sub_vectors,
             pq_params.num_bits,
+        )?;
+        let (_, value_type) =
+            crate::index::vector::utils::get_vector_type(filtered_dataset.schema(), column)?;
+        lance_index::vector::pq::validate_codebook_value_type(
+            pre_codebook.data_type(),
+            &value_type,
         )?;
         let codebook_fsl =
             arrow_array::FixedSizeListArray::try_new_from_values(pre_codebook, dim as i32)?;
@@ -2033,6 +2040,37 @@ pub(crate) async fn open_index_file(
     }
 }
 
+/// Open an index file for storage inside a long-lived cache entry.
+///
+/// On local stores a reader keeps its file open, which pins the inode even
+/// after cleanup unlinks it. Legacy vector indexes are cached whole, so such a
+/// cache entry would hold a descriptor for every index it has seen. Those
+/// stores get a [`LazyReader`] instead, which reopens the file per read.
+///
+/// Other stores hold no descriptor, and their readers cache small files in
+/// memory, so they keep the regular reader.
+pub(crate) async fn open_cache_reader(
+    object_store: Arc<ObjectStore>,
+    path: &Path,
+    file_name: &str,
+    file_sizes: &HashMap<String, u64>,
+) -> Result<Arc<dyn Reader>> {
+    if object_store.scheme().starts_with("file") {
+        let known_size = file_sizes.get(file_name).map(|&size| size as usize);
+        Ok(Arc::new(LazyReader::new(
+            object_store,
+            path.clone(),
+            known_size,
+        )))
+    } else {
+        Ok(
+            open_index_file(object_store.as_ref(), path, file_name, file_sizes)
+                .await?
+                .into(),
+        )
+    }
+}
+
 #[instrument(level = "debug", skip(dataset, reader))]
 pub(crate) async fn open_vector_index_v2(
     dataset: Arc<Dataset>,
@@ -2065,8 +2103,10 @@ pub(crate) async fn open_vector_index_v2(
                 .clone()
                 .join(uuid.to_string())
                 .join(INDEX_AUXILIARY_FILE_NAME);
-            let aux_reader = open_index_file(
-                object_store.as_ref(),
+            // The cached index keeps this reader alive, so it must not pin an
+            // open descriptor (see [`open_cache_reader`]).
+            let aux_reader = open_cache_reader(
+                object_store.clone(),
                 &aux_path,
                 INDEX_AUXILIARY_FILE_NAME,
                 &file_sizes,
@@ -2077,7 +2117,7 @@ pub(crate) async fn open_vector_index_v2(
             let options = HNSWIndexOptions { use_residual: true };
             let hnsw = HNSWIndex::<ProductQuantizer>::try_new(
                 reader.object_reader.clone(),
-                aux_reader.into(),
+                aux_reader,
                 options,
             )
             .await?;
@@ -2101,8 +2141,8 @@ pub(crate) async fn open_vector_index_v2(
                 .clone()
                 .join(uuid.to_string())
                 .join(INDEX_AUXILIARY_FILE_NAME);
-            let aux_reader = open_index_file(
-                object_store.as_ref(),
+            let aux_reader = open_cache_reader(
+                object_store.clone(),
                 &aux_path,
                 INDEX_AUXILIARY_FILE_NAME,
                 &file_sizes,
@@ -2116,7 +2156,7 @@ pub(crate) async fn open_vector_index_v2(
 
             let hnsw = HNSWIndex::<ScalarQuantizer>::try_new(
                 reader.object_reader.clone(),
-                aux_reader.into(),
+                aux_reader,
                 options,
             )
             .await?;
@@ -2517,7 +2557,8 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use arrow_array::types::{Float32Type, Int32Type};
     use arrow_array::{
-        Array, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
+        Array, FixedSizeListArray, Float16Array, Float32Array, Int32Array, RecordBatch,
+        RecordBatchIterator,
     };
     use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
@@ -3511,6 +3552,61 @@ mod tests {
             result.is_ok(),
             "Expected Ok for invalid fragment ids, got {:?}",
             result
+        );
+    }
+
+    /// Distributed builds take the codebook through their own path, so they
+    /// need the same value-type check as `create_index`.
+    #[tokio::test]
+    async fn test_build_distributed_rejects_codebook_of_another_value_type() {
+        let test_dir = TempStrDir::default();
+        let uri = format!("{}/ds", test_dir.as_str());
+
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float16Array::from_iter_values((0..128 * 32).map(|i| half::f16::from_f32(i as f32))),
+            32,
+        )
+        .unwrap();
+        let batch =
+            RecordBatch::try_from_iter([("vector", Arc::new(vectors) as arrow_array::ArrayRef)])
+                .unwrap();
+        let schema = batch.schema();
+        let dataset = Dataset::write(RecordBatchIterator::new([Ok(batch)], schema), &uri, None)
+            .await
+            .unwrap();
+
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float16Array::from(vec![half::f16::ZERO; 2 * 32]),
+            32,
+        )
+        .unwrap();
+        let ivf_params = IvfBuildParams::try_with_centroids(2, Arc::new(centroids)).unwrap();
+        let codebook = Arc::new(Float32Array::from(vec![0.0f32; 256 * 32]));
+        let params = VectorIndexParams::with_ivf_pq_params(
+            MetricType::L2,
+            ivf_params,
+            PQBuildParams::with_codebook(4, 8, codebook),
+        );
+        let fragments: Vec<u32> = dataset.fragments().iter().map(|f| f.id as u32).collect();
+
+        let error = build_distributed_vector_index(
+            &dataset,
+            "vector",
+            "vector_ivf_pq_dist",
+            Uuid::new_v4(),
+            &params,
+            None,
+            &fragments,
+            noop_progress(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains(
+                "PQ codebook value type Float32 does not match the vector value type Float16"
+            ),
+            "{error}"
         );
     }
 

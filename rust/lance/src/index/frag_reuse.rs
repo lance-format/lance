@@ -383,6 +383,82 @@ async fn fri_query_plan(
         .await
 }
 
+/// Resolve the current fragment coverage for committed query segments.
+///
+/// Tagged histories derive coverage from [`FriQueryPlan`]; all other histories use the segment
+/// metadata resolved for the query listing. Query callers must not substitute provenance for
+/// derived coverage, and an unknown or unavailable plan is refused instead of treated as empty
+/// coverage.
+pub(crate) async fn resolve_query_segment_coverages(
+    dataset: &Dataset,
+    segments: &[&IndexMetadata],
+) -> lance_core::Result<Vec<RoaringBitmap>> {
+    let direct = |segment: &IndexMetadata| {
+        segment
+            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Index '{}' segment {} is missing fragment coverage",
+                    segment.name, segment.uuid
+                ))
+            })
+    };
+
+    let stored = super::load_all_indices(dataset).await?;
+    let Some(fri) = stored
+        .iter()
+        .find(|entry| entry.name == FRAG_REUSE_INDEX_NAME)
+    else {
+        return segments.iter().map(|segment| direct(segment)).collect();
+    };
+    if fri.index_version == 0 {
+        return segments.iter().map(|segment| direct(segment)).collect();
+    }
+    if fri.index_version != 1 {
+        return Err(Error::not_supported(format!(
+            "FRI index_version {} is unsupported. Please upgrade to a newer version",
+            fri.index_version
+        )));
+    }
+
+    let mapping = super::frag_reuse_reader::FragmentReuseIndex::open(dataset, fri).await?;
+    let plan = fri_query_plan(dataset, fri, &stored, &mapping).await?;
+    let stored_by_uuid: HashMap<Uuid, &IndexMetadata> =
+        stored.iter().map(|entry| (entry.uuid, entry)).collect();
+    segments
+        .iter()
+        .map(|segment| match plan.segments.get(&segment.uuid) {
+            Some(SegmentRemappingPlan::Identity) => {
+                let stored = stored_by_uuid.get(&segment.uuid).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "Index segment {} is not registered in the manifest",
+                        segment.uuid
+                    ))
+                })?;
+                direct(stored)
+            }
+            Some(SegmentRemappingPlan::Translate { coverage, .. }) => Ok(coverage.clone()),
+            Some(SegmentRemappingPlan::MissingCoverage(reason)) => {
+                Err(Error::not_supported(format!(
+                    "FRI query coverage is unavailable for segment {} ({reason})",
+                    segment.uuid
+                )))
+            }
+            None if stored_by_uuid.contains_key(&segment.uuid) => {
+                Err(Error::not_supported(format!(
+                    "FRI query coverage is unavailable for segment {} (the reader derives no \
+                     coverage for it)",
+                    segment.uuid
+                )))
+            }
+            None => Err(Error::invalid_input(format!(
+                "Index segment {} is not registered in the manifest",
+                segment.uuid
+            ))),
+        })
+        .collect()
+}
+
 /// Why the reader derives no coverage for the registered segment `index` on
 /// this snapshot, or `None` when it derives coverage (or identity) for it.
 /// Maintenance that rewrites a segment (remap) decides its eligibility from
@@ -2373,6 +2449,7 @@ pub(crate) async fn collect_tagged_row_map_paths(
     dataset: &Dataset,
     entry: &IndexMetadata,
 ) -> lance_core::Result<Vec<(String, Path)>> {
+    use crate::dataset::FRAG_REUSE_DIR;
     use futures::TryStreamExt;
     use lance_index::frag_reuse::stable_partition::MAPPING_FILE;
     use lance_table::system_index::frag_reuse::ledger::Mapping;
@@ -2411,7 +2488,7 @@ pub(crate) async fn collect_tagged_row_map_paths(
         };
         let map_dir = base_root
             .clone()
-            .join("_fri")
+            .join(FRAG_REUSE_DIR)
             .join(reference.map_id.as_str());
         let mut mapping_size = None;
         let mut stream = dataset.object_store.read_dir_all(&map_dir, None);
@@ -2433,7 +2510,7 @@ pub(crate) async fn collect_tagged_row_map_paths(
                         mapping_size = Some(meta.size);
                     }
                     paths.push((
-                        format!("_fri/{}/{relative}", reference.map_id),
+                        format!("{FRAG_REUSE_DIR}/{}/{relative}", reference.map_id),
                         base_root.clone(),
                     ));
                 }
@@ -3876,6 +3953,7 @@ mod tests {
             file_type: lance_table::format::DeletionFileType::Array,
             num_deleted_rows: Some(1),
             base_id: None,
+            inline: None,
         });
         let error = build_frag_reuse_rewrite_entry(
             &dataset,
@@ -5738,6 +5816,7 @@ mod tests {
             harness.read_version,
             &deletion_vector,
             &harness.dataset.object_store,
+            0,
         )
         .await
         .unwrap()
@@ -5935,6 +6014,7 @@ mod tests {
             dataset.manifest.version,
             &deletion_vector,
             &dataset.object_store,
+            0,
         )
         .await
         .unwrap()
@@ -5985,6 +6065,7 @@ mod tests {
             dataset.manifest.version,
             &deletion_vector,
             &dataset.object_store,
+            0,
         )
         .await
         .unwrap()
@@ -6011,6 +6092,7 @@ mod tests {
             read_version,
             &deletion_vector,
             &dataset.object_store,
+            0,
         )
         .await
         .unwrap()
@@ -6122,6 +6204,7 @@ mod tests {
             read_version,
             &deletion_vector,
             &dataset.object_store,
+            0,
         )
         .await
         .unwrap()
@@ -6269,6 +6352,7 @@ mod tests {
                 base_version,
                 &deletion_vector,
                 &dataset.object_store,
+                0,
             )
             .await
             .unwrap()
@@ -6438,6 +6522,7 @@ mod tests {
             harness.read_version,
             &forged,
             &harness.dataset.object_store,
+            0,
         )
         .await
         .unwrap()

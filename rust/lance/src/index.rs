@@ -92,6 +92,7 @@ pub mod optimize;
 pub mod prefilter;
 pub mod scalar;
 pub(crate) mod scalar_logical;
+pub(crate) mod segment_coverage;
 pub mod vector;
 
 use self::frag_reuse_with_stable_row_ids::{
@@ -683,14 +684,18 @@ async fn build_provenance(
 /// must each match the version their entries describe
 /// ([`indexed_data_differs`]). A changed input, or a manifest the comparison
 /// needs that was cleaned up, leaves out every fragment its group produced.
-async fn fresh_fragments(
+pub(crate) async fn fresh_fragments(
     dataset: &Dataset,
     frag_reuse_index: &CompactFragReuseIndex,
     segments: &[IndexMetadata],
 ) -> Result<RoaringBitmap> {
     let mut indexed = HashSet::new();
     for segment in segments {
-        indexed.extend(indexed_field_ids(dataset, &segment.fields)?);
+        indexed.extend(indexed_field_ids(
+            dataset,
+            &segment.fields,
+            &segment.covering_fields,
+        )?);
     }
     let mut history = History::new(dataset).await?;
     // Each followed fragment's version, or `None` once it cannot be shown fresh.
@@ -787,9 +792,9 @@ async fn fresh_fragments(
 /// segment's carried columns can go stale independently of its keyed column, so
 /// checking only the keyed subtree would leave a fragment covered after a carried
 /// column was rewritten, and the segment would answer with the obsolete value.
-fn indexed_field_ids(dataset: &Dataset, fields: &[i32]) -> Result<HashSet<i32>> {
+fn indexed_field_ids(dataset: &Dataset, fields: &[i32], carried: &[i32]) -> Result<HashSet<i32>> {
     let mut indexed_field_ids = HashSet::new();
-    for field_id in fields {
+    for field_id in fields.iter().chain(carried) {
         let field = dataset.schema().field_by_id(*field_id).ok_or_else(|| {
             Error::invalid_input(format!(
                 "CreateIndex: field id {field_id} does not exist in the current schema"
@@ -804,7 +809,7 @@ fn indexed_field_ids(dataset: &Dataset, fields: &[i32]) -> Result<HashSet<i32>> 
 /// since it was built. `historically_missing_exempt` names fragments compaction
 /// created after the segments were built, whose absence from a segment's
 /// history is expected rather than stale.
-async fn prune_stale_segment_coverage(
+pub(crate) async fn prune_stale_segment_coverage(
     dataset: &Dataset,
     segments: &mut [IndexSegment],
     prune_historically_missing: bool,
@@ -865,7 +870,8 @@ async fn prune_stale_segment_coverage(
             .iter_mut()
             .filter(|segment| segment.dataset_version() == version)
         {
-            let indexed_field_ids = indexed_field_ids(dataset, segment.fields())?;
+            let indexed_field_ids =
+                indexed_field_ids(dataset, segment.fields(), segment.covering_fields())?;
             let stale_fragments = segment
                 .fragment_bitmap()
                 .iter()
@@ -2050,7 +2056,7 @@ pub(crate) async fn remap_index(
     // values in the first place, and each index type's `remap` rewrites only the
     // schema that type knows about, so the remapped segment would still declare
     // payload its storage no longer holds. Withdraw it instead, exactly as an
-    // index whose type reports `can_remap() == false` is withdrawn below: an
+    // index whose plugin reports `can_remap(details) == false` is withdrawn below: an
     // absent index costs a fallback scan, whereas a surviving false declaration
     // is answered from data that is not there. Erroring here would instead block
     // compaction of the whole table.
@@ -2119,7 +2125,18 @@ pub(crate) async fn remap_index(
             let scalar_index = dataset
                 .open_scalar_index(&field_path, index_id, &NoOpMetricsCollector)
                 .await?;
+            // Keep the deprecated instance-level check for external indexes
+            // written before ScalarIndexPlugin::can_remap existed. The plugin
+            // capability below covers built-ins and new implementations.
+            #[allow(deprecated)]
             if !scalar_index.can_remap() {
+                return Ok(RemapResult::Drop);
+            }
+            let details = fetch_index_details(dataset, &field_path, matched).await?;
+            if !IndexDetails(details.clone())
+                .get_plugin()?
+                .can_remap(details.as_ref())?
+            {
                 return Ok(RemapResult::Drop);
             }
 
@@ -4376,6 +4393,18 @@ impl Dataset {
         let tailing_bytes = read_last_block(reader.as_ref()).await?;
         let (major_version, minor_version) = read_version(&tailing_bytes)?;
 
+        // Legacy vector indexes are cached whole and can outlive the files they
+        // were opened from: cleanup unlinks old index files while the cache still
+        // holds an entry for them. Anything stored in the cached index must
+        // therefore reopen the file per read instead of pinning a descriptor.
+        let lazy_reader = vector::open_cache_reader(
+            object_store.clone(),
+            &index_file,
+            INDEX_FILE_NAME,
+            &file_sizes,
+        )
+        .await?;
+
         // Namespace the index cache by the UUID of the index. v2+ partition
         // entries are store-free and remain reusable across object-store
         // generations alongside their serializable state.
@@ -4405,7 +4434,7 @@ impl Dataset {
                             dataset,
                             uuid,
                             vector_index,
-                            reader,
+                            lazy_reader,
                             frag_reuse_index,
                         )
                         .await?;
@@ -4420,7 +4449,7 @@ impl Dataset {
             (0, 2) => {
                 info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
                 let reader = V1FileReader::try_new_self_described_from_reader(
-                    reader.clone(),
+                    lazy_reader,
                     Some(&self.metadata_cache.file_metadata_cache(&index_file)),
                 )
                 .await?;
@@ -6853,16 +6882,47 @@ mod tests {
         assert_eq!(stats["num_indexed_rows"], 512);
     }
 
+    #[rstest]
+    #[case::missing_details("v0.18.2/index_no_details.lance", None)]
+    #[case::v036(
+        "0.36.0/btree_in_index_pkg.lance",
+        Some("/lance.index.pb.BTreeIndexDetails")
+    )]
     #[tokio::test]
-    async fn test_v036_scalar_details_are_still_known() {
-        let test_dir = copy_test_data_to_tmp("0.36.0/btree_in_index_pkg.lance").unwrap();
+    async fn test_historical_scalar_indices_support_remapping(
+        #[case] fixture: &str,
+        #[case] type_url: Option<&str>,
+    ) {
+        let test_dir = copy_test_data_to_tmp(fixture).unwrap();
         let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
         let indices = dataset.load_indices().await.unwrap();
-        let details = indices[0].index_details.clone().unwrap();
+        assert!(!indices.is_empty());
 
-        assert_eq!(details.type_url, "/lance.index.pb.BTreeIndexDetails");
-        assert_eq!(IndexDetails(details).get_plugin().unwrap().name(), "BTree");
-        assert!(index_type_is_known(&indices[0]));
+        for index in indices.iter() {
+            assert_eq!(
+                index
+                    .index_details
+                    .as_ref()
+                    .map(|details| details.type_url.as_str()),
+                type_url
+            );
+            if let Some(details) = &index.index_details {
+                assert_eq!(
+                    IndexDetails(details.clone()).get_plugin().unwrap().name(),
+                    "BTree"
+                );
+            }
+            assert!(index_type_is_known(index));
+            let result = remap_index(
+                &dataset,
+                &index.uuid,
+                &RowAddrTranslator::sync(RowAddrRemap::empty()),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(result, RemapResult::Remapped(_)), "{result:?}");
+        }
     }
 
     #[tokio::test]
@@ -9955,24 +10015,21 @@ mod tests {
 
         // Verify index is NOT being used in queries after delete (empty bitmap)
         if column_name == "text" {
-            // Inverted indexes will still appear to be used in FTS queries.
-            // TODO: once metrics are working on FTS queries, we can check the
-            // analyze plan output instead for index usage.
-            let _plan_after_delete = dataset
-                .scan()
-                .project(&[column_name])
+            // The retained index has no live fragments, so an empty snapshot
+            // needs no index scan to return an empty FTS result.
+            let mut scan = dataset.scan();
+            scan.project(&[column_name])
                 .unwrap()
                 .full_text_search(FullTextSearchQuery::new("test".to_string()))
-                .unwrap()
-                .explain_plan(false)
-                .await
                 .unwrap();
+            let plan_after_delete = scan.explain_plan(false).await.unwrap();
             assert_index_usage(
-                &_plan_after_delete,
+                &plan_after_delete,
                 column_name,
-                true,
+                false,
                 "after delete (empty bitmap)",
             );
+            assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 0);
         } else {
             // Use equality filter for btree/bitmap indices
             let _plan_after_delete = dataset
@@ -15489,6 +15546,8 @@ mod tests {
                     .filter(|fragment| covered.contains(fragment.id as u32))
                     .cloned()
                     .collect(),
+                output_clustering_id: None,
+                output_metadata: Default::default(),
             }],
             read_version: dataset.version().version,
             options: CompactionOptions::default(),
@@ -15527,10 +15586,9 @@ mod tests {
     /// bitmap into the current space through the fragment-reuse index and leaves
     /// a `None` one alone, so the reconstruction has to make that move itself.
     ///
-    /// Without it, a deferred compaction is enough to defeat both guards: the
-    /// coverage still names the fragments the rows moved out of, which no later
-    /// rewrite can intersect, so the planner stops holding anything back and the
-    /// commit boundary waves the rewrite through.
+    /// Without it, coverage still names the fragments the rows moved out of:
+    /// deferred planning loses the boundary between indexed and unindexed rows,
+    /// and the unreadable-index commit guard cannot detect a covered rewrite.
     #[tokio::test]
     async fn test_reconstructed_coverage_follows_a_deferred_compaction() {
         use crate::dataset::index::DatasetIndexRemapperOptions;
@@ -15605,6 +15663,8 @@ mod tests {
         let plan = CompactionPlan {
             tasks: vec![TaskData {
                 fragments: dataset.fragments().as_ref().clone(),
+                output_clustering_id: None,
+                output_metadata: Default::default(),
             }],
             read_version: dataset.version().version,
             options: CompactionOptions::default(),
@@ -15641,10 +15701,29 @@ mod tests {
         .unwrap();
         assert_eq!(dataset.get_fragments().len(), 3);
 
-        // The planner half: the appended pair coalesces, fragment 2 is held back.
-        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+        // Eager planning refuses pending FRI moves before considering coverage.
+        let version = dataset.version().version;
+        let err = compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        assert!(err.to_string().contains("pending remaps"), "{err}");
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.version().version, version);
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        // Deferred planning still honors the reconstructed boundary: the
+        // appended pair coalesces and the indexed fragment 2 is left alone.
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(metrics.fragments_removed, 2);
         assert_eq!(metrics.fragments_added, 1);
         assert!(
@@ -15878,18 +15957,17 @@ mod tests {
         }
     }
 
-    /// Compactions rewrite fragments 2 and 3 into 4 and 5, then 0 and 1 into
-    /// 6 and 7 (relabeling 4 and 5 to 8 and 9), then 7 and 8 into 10 and 11
-    /// (relabeling 9 to 12). The index is caught up past the first compaction,
-    /// so a cleanup trims its record: 10, 11 and 12 no longer trace to the
-    /// build through 4 and 5, though the shared group's other source, 7, does,
-    /// as 6 still does.
+    /// Compactions rewrite fragments 0 and 1 into 4 and 5, 2 and 3 into 6 and
+    /// 7, then 5 and 6 into 8 and 9. The index is caught up past the first
+    /// one, so a cleanup trims its record: 4 and 5 no longer trace to the
+    /// build, and neither do 8 and 9, though their other source, 6, does, as 7
+    /// still does.
     #[tokio::test]
     async fn test_sources_at_build_fails_on_a_missing_link_beside_a_traced_one() {
         let dir = TempStrDir::default();
         let (mut dataset, built) = recording_btree_table(dir.as_str(), 4).await;
         let version = dataset.manifest.version;
-        let first = compact_into_two(&mut dataset, &[2, 3]).await;
+        let first = compact_into_two(&mut dataset, &[0, 1]).await;
         crate::dataset::optimize::remapping::remap_column_index(
             &mut dataset,
             &["i"],
@@ -15897,20 +15975,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let second = compact_into_two(&mut dataset, &[0, 1]).await;
-        let third = compact_into_two(&mut dataset, &[second[1], 8]).await;
-        assert_eq!(first, [4, 5]);
-        assert_eq!(second, [6, 7]);
-        assert_eq!(third, [10, 11]);
-        assert_eq!(
-            dataset
-                .manifest
-                .fragments
-                .iter()
-                .map(|fragment| fragment.id)
-                .collect::<Vec<_>>(),
-            [6, 10, 11, 12]
-        );
+        let second = compact_into_two(&mut dataset, &[2, 3]).await;
+        let third = compact_into_two(&mut dataset, &[first[1], second[0]]).await;
         let trace = |versions: &[FragReuseVersion], fragment: u64| {
             sources_at_build(versions, version, fragment as u32, |id| built.contains(id)).map(
                 |mut sources| {
@@ -15930,13 +15996,13 @@ mod tests {
             .unwrap();
         let kept = dataset.frag_reuse_index().await.unwrap().unwrap();
         assert_eq!(kept.details.versions.len(), 2);
-        for fragment in [12, third[0], third[1]] {
+        for fragment in [first[0], third[0], third[1]] {
             assert_eq!(
                 trace(&kept.details.versions, fragment),
                 None,
                 "fragment {fragment}"
             );
         }
-        assert_eq!(trace(&kept.details.versions, second[0]), Some(vec![0, 1]));
+        assert_eq!(trace(&kept.details.versions, second[1]), Some(vec![2, 3]));
     }
 }

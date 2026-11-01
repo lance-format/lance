@@ -9,14 +9,11 @@ use std::any::Any;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::compute::filter_record_batch;
-use arrow_array::cast::AsArray;
-use arrow_array::types::UInt64Type;
-use arrow_array::{ArrayRef, BooleanArray, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
+use futures::StreamExt;
 use futures::future::try_join_all;
 use futures::stream::{self, BoxStream};
-use futures::{StreamExt, TryStreamExt};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use lance_index::metrics::MetricsCollector;
@@ -24,15 +21,14 @@ use lance_index::scalar::{
     AnyQuery, CreatedIndex, ScalarIndex, SearchOptions, SearchResult, UpdateCriteria,
 };
 use lance_index::{Index, IndexType};
-use lance_select::{NullableRowAddrSet, RowSetOps};
+use lance_select::NullableRowAddrSet;
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
 use serde_json::json;
-use tokio::sync::OnceCell;
 
 use crate::dataset::Dataset;
-use crate::index::prefilter::DatasetPreFilter;
 use crate::index::scalar::fetch_index_details;
+use crate::index::segment_coverage::{SegmentCoverage, SegmentRowDomain};
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 
 /// Query-time view that exposes several physical scalar index segments as a single [`ScalarIndex`].
@@ -51,8 +47,7 @@ use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 ///
 /// Under stable row ids each segment's row-id hits (and lookup matches) are restricted to
 /// the live rows currently stored in its own fragments before the results are combined (see
-/// `SegmentCoverage`). This drops deleted rows too, but only here: an index with a single
-/// segment is opened without this wrapper and returns its segment's results unrestricted.
+/// `SegmentCoverage`).
 ///
 /// This is a read-only wrapper. [`ScalarIndex::remap`] and [`ScalarIndex::update`] both return
 /// an error — callers must rebuild the index to consolidate segments before mutating it.
@@ -65,81 +60,6 @@ pub struct LogicalScalarIndex {
     coverage: Option<SegmentCoverage>,
 }
 
-/// Per-segment fragment coverage, used to drop stale hits under stable row ids.
-///
-/// A rewritten row keeps its row id but moves to a fragment another segment may cover, so
-/// the old segment still maps the old value to a live row id. Each segment's hits are
-/// therefore restricted to the live row ids currently stored in its own fragments. The
-/// allow-list is cached per dataset version and coverage and fetched only for segments with
-/// hits. Address-domain hits are exempt: a stale address is a deleted one, and the
-/// translation to row ids drops it.
-#[derive(Debug)]
-struct SegmentCoverage {
-    dataset: Arc<Dataset>,
-    /// In segment order.
-    fragments: Vec<RoaringBitmap>,
-}
-
-impl SegmentCoverage {
-    /// Drop the hits of segment `index` that are not live rows of the fragments it covers.
-    async fn restrict(&self, index: usize, result: SearchResult) -> Result<SearchResult> {
-        let set = result.row_addrs();
-        if set.selected_rows().is_empty() && set.null_rows().is_empty() {
-            return Ok(result);
-        }
-        let allowed = DatasetPreFilter::do_create_deletion_mask_row_id(
-            self.dataset.clone(),
-            Some(self.fragments[index].clone()),
-        )
-        .await?;
-        let restrict = |set: NullableRowAddrSet| {
-            let (mut selected, mut nulls) = set.into_parts();
-            selected.mask(&allowed);
-            nulls.mask(&allowed);
-            NullableRowAddrSet::new(selected, nulls)
-        };
-        Ok(match result {
-            SearchResult::Exact(set) => SearchResult::Exact(restrict(set)),
-            SearchResult::AtMost(set) => SearchResult::AtMost(restrict(set)),
-            SearchResult::AtLeast(set) => SearchResult::AtLeast(restrict(set)),
-        })
-    }
-
-    /// Drop the lookup matches of segment `index` that are not live rows of the
-    /// fragments it covers.
-    fn restrict_lookup<'a>(
-        &'a self,
-        index: usize,
-        matches: BoxStream<'a, Result<RecordBatch>>,
-    ) -> BoxStream<'a, Result<RecordBatch>> {
-        let allowed = Arc::new(OnceCell::new());
-        matches
-            .and_then(move |batch| {
-                let allowed = allowed.clone();
-                async move {
-                    let allowed = allowed
-                        .get_or_try_init(|| {
-                            DatasetPreFilter::do_create_deletion_mask_row_id(
-                                self.dataset.clone(),
-                                Some(self.fragments[index].clone()),
-                            )
-                        })
-                        .await?;
-                    let keep = batch
-                        .column(1)
-                        .as_primitive::<UInt64Type>()
-                        .values()
-                        .iter()
-                        .map(|&row_id| allowed.selected(row_id))
-                        .collect::<BooleanArray>();
-                    Ok(filter_record_batch(&batch, &keep)?)
-                }
-            })
-            .try_filter(|batch| std::future::ready(batch.num_rows() > 0))
-            .boxed()
-    }
-}
-
 impl LogicalScalarIndex {
     /// Merge several already-opened segments of one scalar index into a single
     /// searchable [`ScalarIndex`].
@@ -149,7 +69,7 @@ impl LogicalScalarIndex {
     /// Used internally by `open_named_scalar_index`, and exposed so a
     /// distributed query engine can open an explicit subset of a scalar
     /// index's segments and present them as one index.
-    pub fn try_new(
+    pub async fn try_new(
         dataset: &Dataset,
         name: String,
         column: String,
@@ -181,28 +101,16 @@ impl LogicalScalarIndex {
             )));
         }
 
-        let coverage =
-            if dataset.manifest.uses_stable_row_ids() && !first.results_are_row_addresses() {
-                let fragments = segments
-                    .iter()
-                    .map(|(metadata, _)| {
-                        metadata
-                            .effective_fragment_bitmap(&dataset.fragment_bitmap)
-                            .ok_or_else(|| {
-                                Error::invalid_input(format!(
-                                    "Scalar index '{}' segment {} is missing fragment coverage",
-                                    name, metadata.uuid
-                                ))
-                            })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Some(SegmentCoverage {
-                    dataset: Arc::new(dataset.clone()),
-                    fragments,
-                })
-            } else {
-                None
-            };
+        let row_domain = if first.results_are_row_addresses() {
+            SegmentRowDomain::RowAddress
+        } else {
+            SegmentRowDomain::RowId
+        };
+        let metadata = segments
+            .iter()
+            .map(|(metadata, _)| metadata)
+            .collect::<Vec<_>>();
+        let coverage = SegmentCoverage::resolve(dataset, &metadata, row_domain).await?;
 
         Ok(Self {
             name,
@@ -219,13 +127,10 @@ impl DeepSizeOf for LogicalScalarIndex {
         self.name.deep_size_of_children(context)
             + self.column.deep_size_of_children(context)
             + self.segments.deep_size_of_children(context)
-            + self.coverage.as_ref().map_or(0, |coverage| {
-                coverage
-                    .fragments
-                    .iter()
-                    .map(|fragments| fragments.serialized_size())
-                    .sum()
-            })
+            + self
+                .coverage
+                .as_ref()
+                .map_or(0, |coverage| coverage.deep_size_of_children(context))
     }
 }
 
@@ -555,12 +460,15 @@ pub async fn open_scalar_index_segments(
             }))
             .await?;
 
-            Ok(Arc::new(LogicalScalarIndex::try_new(
-                dataset,
-                index_name.to_string(),
-                column.to_string(),
-                indices.into_iter().zip(segments).collect(),
-            )?) as Arc<dyn ScalarIndex>)
+            Ok(Arc::new(
+                LogicalScalarIndex::try_new(
+                    dataset,
+                    index_name.to_string(),
+                    column.to_string(),
+                    indices.into_iter().zip(segments).collect(),
+                )
+                .await?,
+            ) as Arc<dyn ScalarIndex>)
         }
     }
 }
@@ -649,6 +557,7 @@ mod tests {
         }
         let error =
             LogicalScalarIndex::try_new(&dataset, "value_idx".into(), "value".into(), segments)
+                .await
                 .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains("mixes row-ID and row-address"));
@@ -1396,10 +1305,8 @@ mod tests {
             .await
             .unwrap();
         let coverage = merged.fragment_bitmap.as_ref().unwrap();
-        assert!(
-            coverage.is_empty(),
-            "physical-address coverage must be invalidated by fragment relabeling"
-        );
+        assert!(!coverage.contains(0), "must drop retired frag 0");
+        assert!(coverage.contains(1), "must keep live indexed frag 1");
 
         let field_path = dataset.schema().field_path(merged.fields[0]).unwrap();
         let index = crate::index::scalar::open_scalar_index(
@@ -1492,10 +1399,6 @@ mod tests {
             .await
             .unwrap();
         let merged_coverage = merged.fragment_bitmap.as_ref().unwrap().clone();
-        assert!(
-            merged_coverage.is_empty(),
-            "physical-address coverage must be invalidated by fragment relabeling"
-        );
         let merged_uuid = merged.uuid;
 
         dataset
@@ -1514,7 +1417,7 @@ mod tests {
             scalar_index_fragment_bitmap(&dataset, "value", "value_zonemap_replace_retired")
                 .await
                 .unwrap()
-                .unwrap_or_default();
+                .unwrap();
         assert_eq!(combined_bitmap, merged_coverage);
     }
 
@@ -1854,14 +1757,14 @@ mod tests {
             arrow_array::RecordBatch::try_new(
                 schema.clone(),
                 vec![Arc::new(arrow_array::StringArray::from(vec![
-                    "epsilon zeta eta",
-                    "zeta eta theta",
-                    "eta theta iota",
-                    "theta iota kappa",
                     "alpha beta gamma",
                     "beta gamma delta",
                     "gamma delta epsilon",
                     "delta epsilon zeta",
+                    "epsilon zeta eta",
+                    "zeta eta theta",
+                    "eta theta iota",
+                    "theta iota kappa",
                 ]))],
             )
             .unwrap(),
@@ -1874,8 +1777,6 @@ mod tests {
 
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
-        let surviving_fragment_id = fragments[0].id() as u32;
-        let rewritten_fragment_id = fragments[1].id() as u32;
 
         // Build per-fragment FM-Index segments and commit
         let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Fm);
@@ -1901,8 +1802,7 @@ mod tests {
             .unwrap();
         assert_eq!(committed.len(), 2);
 
-        // Delete rows from the trailing fragment so compaction leaves the
-        // leading indexed fragment's physical addresses intact.
+        // Delete rows from fragment 0 to trigger compaction retirement
         dataset.delete("text = 'alpha beta gamma'").await.unwrap();
         dataset.delete("text = 'beta gamma delta'").await.unwrap();
         crate::dataset::optimize::compact_files(
@@ -1922,13 +1822,11 @@ mod tests {
             .map(|f| f.id() as u32)
             .collect();
         assert!(
-            !live_frags.contains(rewritten_fragment_id),
-            "compaction should retire the trailing fragment"
+            !live_frags.contains(0),
+            "compaction should retire fragment 0"
         );
-        assert!(live_frags.contains(surviving_fragment_id));
 
-        // The surviving leading segment remains usable; the rewritten
-        // trailing segment cannot claim its new physical addresses.
+        // Merge: the retired fragment should be dropped from coverage
         let segments = dataset
             .load_indices_by_name("text_fmindex_compact")
             .await
@@ -1939,7 +1837,14 @@ mod tests {
             .unwrap();
 
         let coverage = merged.fragment_bitmap.as_ref().unwrap();
-        assert_eq!(coverage, &RoaringBitmap::from_iter([surviving_fragment_id]));
+        assert!(
+            !coverage.contains(0),
+            "merged coverage must drop retired fragment 0"
+        );
+        assert!(
+            coverage.contains(1),
+            "merged coverage must keep live fragment 1"
+        );
 
         // Commit the merged segment and verify search works
         dataset
@@ -1975,7 +1880,7 @@ mod tests {
             "deleted rows from retired fragment should not appear in merged index"
         );
 
-        // "theta" exists in the surviving leading fragment.
+        // "theta" exists in fragment 1 rows only
         let query = lance_index::scalar::TextQuery::StringContains("theta".to_string());
         let result = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
         let row_addrs = match result {
@@ -2344,7 +2249,6 @@ mod tests {
             .await
             .unwrap();
         let source_uuid = segment.uuid;
-        let source_coverage = segment.fragment_bitmap.as_ref().unwrap().clone();
 
         // Retire fragment 0: delete its rows and compact it away.
         dataset.delete("text = 'alpha beta gamma'").await.unwrap();
@@ -2369,15 +2273,9 @@ mod tests {
             !live_frags.contains(0),
             "compaction should retire fragment 0"
         );
-        assert_eq!(
-            source_coverage.intersection_len(&live_frags),
-            0,
-            "compaction should retire every fragment covered by the stale segment"
-        );
+        assert!(live_frags.contains(1), "fragment 1 should stay live");
 
-        // The uncommitted segment was not present for compaction to relabel its
-        // coverage, so even a single segment must be rebuilt without claiming
-        // any current fragment.
+        // Coverage shrank, so even a single segment must be rebuilt.
         let merged = dataset
             .merge_existing_index_segments(vec![segment])
             .await
@@ -2386,9 +2284,14 @@ mod tests {
             merged.uuid, source_uuid,
             "shrunk coverage must trigger a rebuild"
         );
-        assert!(
-            merged.fragment_bitmap.as_ref().unwrap().is_empty(),
-            "rebuilt coverage must exclude every retired fragment"
+        assert_eq!(
+            merged
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![1]
         );
     }
 
@@ -2521,6 +2424,7 @@ mod tests {
             .unwrap();
         let segments = dataset.load_indices_by_name("id_idx").await.unwrap();
         assert_eq!(segments[0].results_are_row_addrs(), row_addresses);
+        assert_eq!(count(&dataset, "id = 0", true).await, 1);
 
         let mut dataset = UpdateBuilder::new(Arc::new(dataset))
             .update_where("id = 0")

@@ -96,6 +96,7 @@ pub fn update_txn(new_fragments: Vec<Fragment>) -> Transaction {
             updated_fragments: vec![],
             new_fragments,
             fields_modified: vec![],
+            mem_wal_dir_id: None,
             compacted_sstables: vec![],
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,

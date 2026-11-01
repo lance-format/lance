@@ -12,8 +12,8 @@ use jni::objects::{JObject, JString, JValueGen};
 use jni::sys::jlong;
 use lance::dataset::scanner::ExprFilter;
 use lance::dataset::{
-    MergeInsertBuilder, MergeInsertWriteMode, MergeStats, WhenMatched, WhenNotMatched,
-    WhenNotMatchedBySource,
+    MergeInsertBuilder, MergeInsertWriteMode, MergeStats, SourceDedupeBehavior, WhenMatched,
+    WhenNotMatched, WhenNotMatchedBySource,
 };
 use lance_core::datatypes::Schema;
 use lance_file::version::LanceFileVersion;
@@ -36,6 +36,8 @@ pub extern "system" fn Java_org_lance_Dataset_nativeMergeInsert<'a>(
     )
 }
 
+/// Run the merge insert `jparam` describes, reading the source from the Arrow
+/// stream at `batch_address`.
 #[allow(clippy::too_many_arguments)]
 fn inner_merge_insert<'local>(
     env: &mut JNIEnv<'local>,
@@ -57,7 +59,9 @@ fn inner_merge_insert<'local>(
     let use_index = extract_use_index(env, &jparam)?;
     let write_mode = extract_write_mode(env, &jparam)?;
     let compacted_sstables = extract_compacted_sstables(env, &jparam)?;
+    let mem_wal_dir_id = env.get_optional_string_from_method(&jparam, "getMemWalDirId")?;
     let data_storage_version = extract_data_storage_version(env, &jparam)?;
+    let source_dedupe_behavior = extract_source_dedupe_behavior(env, &jparam)?;
 
     let (new_ds, merge_stats) = unsafe {
         let dataset = env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET)?;
@@ -72,7 +76,7 @@ fn inner_merge_insert<'local>(
         if let Some(version) = data_storage_version {
             builder.data_storage_version(LanceFileVersion::from_str(&version)?);
         }
-        let merge_insert_job = builder
+        builder
             .when_matched(when_matched)
             .when_not_matched(when_not_matched)
             .when_not_matched_by_source(when_not_matched_by_source)
@@ -81,8 +85,11 @@ fn inner_merge_insert<'local>(
             .skip_auto_cleanup(skip_auto_cleanup)
             .use_index(use_index)
             .write_mode(write_mode)
-            .mark_sstables_as_compacted(compacted_sstables)
-            .try_build()?;
+            .source_dedupe_behavior(source_dedupe_behavior);
+        if let Some(dir_id) = mem_wal_dir_id {
+            builder.mark_sstables_as_compacted(dir_id, compacted_sstables);
+        }
+        let merge_insert_job = builder.try_build()?;
 
         let stream_ptr = batch_address as *mut FFI_ArrowArrayStream;
         let source_stream = ArrowArrayStreamReader::from_raw(stream_ptr)?;
@@ -282,6 +289,29 @@ fn extract_write_mode<'local>(
         "RewriteColumns" => Ok(MergeInsertWriteMode::RewriteColumns),
         _ => Err(Error::input_error(format!(
             "Illegal write_mode: {write_mode}",
+        ))),
+    }
+}
+
+fn extract_source_dedupe_behavior<'local>(
+    env: &mut JNIEnv<'local>,
+    jparam: &JObject,
+) -> Result<SourceDedupeBehavior> {
+    let behavior: JString = env
+        .call_method(
+            jparam,
+            "sourceDedupeBehaviorValue",
+            "()Ljava/lang/String;",
+            &[],
+        )?
+        .l()?
+        .into();
+    let behavior = behavior.extract(env)?;
+    match behavior.as_str() {
+        "Fail" => Ok(SourceDedupeBehavior::Fail),
+        "FirstSeen" => Ok(SourceDedupeBehavior::FirstSeen),
+        _ => Err(Error::input_error(format!(
+            "Illegal source_dedupe_behavior: {behavior}",
         ))),
     }
 }

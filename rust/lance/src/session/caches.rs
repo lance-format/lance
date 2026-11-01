@@ -388,6 +388,7 @@ mod tests {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(1),
             base_id: None,
+            inline: None,
         };
         cache
             .insert_with_key(
