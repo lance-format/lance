@@ -184,6 +184,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::dataset::WriteParams;
     use arrow_array::{
         ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array, types::Int32Type,
     };
@@ -260,6 +261,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_config_rejects_policy_with_legacy_filters() {
+        let data = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+        let error = dataset
+            .update_config([
+                ("lance.auto_cleanup.policy_interval", "1"),
+                (
+                    "lance.auto_cleanup.policy",
+                    r#"{"rules":[{"type":"remove_all","older_than":"30days"}]}"#,
+                ),
+                ("lance.auto_cleanup.older_than", "7days"),
+            ])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("cannot be combined"));
+        assert_eq!(dataset.version_id(), 1);
+    }
+
+    #[tokio::test]
     async fn test_update_table_metadata() {
         let data = gen_batch()
             .col("i", array::step::<Int32Type>())
@@ -315,6 +338,89 @@ mod tests {
             .await
             .unwrap();
         assert!(dataset.manifest.table_metadata.is_empty());
+    }
+
+    #[rstest]
+    #[case::different_keys("key_b", Some("value_b"), false, false, false)]
+    #[case::delete_different_key("key_b", None, false, false, false)]
+    #[case::same_key("key_a", Some("value_b"), false, false, true)]
+    #[case::delete_same_key("key_a", None, false, false, true)]
+    #[case::first_replaces("key_b", Some("value_b"), true, false, true)]
+    #[case::second_replaces("key_b", Some("value_b"), false, true, true)]
+    #[tokio::test]
+    async fn test_concurrent_schema_metadata_updates(
+        #[case] second_key: &str,
+        #[case] second_value: Option<&str>,
+        #[case] first_replaces: bool,
+        #[case] second_replaces: bool,
+        #[case] expected_conflict: bool,
+    ) {
+        let data = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(2), BatchCount::from(1));
+        let params = WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        };
+        let mut first = Dataset::write(data, "memory://", Some(params))
+            .await
+            .unwrap();
+        let initial_metadata = [("untouched", "preserved"), ("key_b", "old_value")];
+        first
+            .update_schema_metadata(initial_metadata)
+            .await
+            .unwrap();
+        let fragments = first.manifest.fragments.clone();
+        assert_eq!(fragments.len(), 2);
+        let mut second = first.clone();
+        let read_version = first.version_id();
+
+        let update = first.update_schema_metadata([("key_a", "value_a")]);
+        let update = if first_replaces {
+            update.replace()
+        } else {
+            update
+        };
+        update.await.unwrap();
+
+        let update = second.update_schema_metadata([(second_key, second_value)]);
+        let update = if second_replaces {
+            update.replace()
+        } else {
+            update
+        };
+        let result = update.await;
+        let mut expected_metadata = if first_replaces {
+            HashMap::new()
+        } else {
+            HashMap::from(initial_metadata.map(|(key, value)| (key.to_string(), value.to_string())))
+        };
+        expected_metadata.insert("key_a".to_string(), "value_a".to_string());
+        if expected_conflict {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::IncompatibleTransaction { .. }));
+            assert!(error.to_string().contains(
+                "This UpdateConfig transaction is incompatible with concurrent transaction UpdateConfig"
+            ));
+        } else {
+            assert!(result.is_ok(), "{result:?}");
+            if let Some(value) = second_value {
+                expected_metadata.insert(second_key.to_string(), value.to_string());
+            } else {
+                expected_metadata.remove(second_key);
+            }
+            assert_eq!(second.schema().metadata, expected_metadata);
+            assert_eq!(second.version_id(), read_version + 2);
+        }
+
+        first.checkout_latest().await.unwrap();
+        assert_eq!(first.schema().metadata, expected_metadata);
+        assert_eq!(first.manifest.fragments, fragments);
+        assert_eq!(first.count_rows(None).await.unwrap(), 2);
+        assert_eq!(
+            first.version_id(),
+            read_version + if expected_conflict { 1 } else { 2 }
+        );
     }
 
     #[rstest]

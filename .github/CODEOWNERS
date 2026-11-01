@@ -5,6 +5,7 @@ docs/src/format/file/ @file-spec-team
 
 # table specification
 protos/table.proto @table-spec-team
+protos/fragment_metadata.proto @table-spec-team
 protos/rowids.proto @table-spec-team
 docs/src/format/table/ @table-spec-team
 

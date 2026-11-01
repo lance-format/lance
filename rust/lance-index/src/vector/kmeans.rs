@@ -3,10 +3,11 @@
 
 //! KMeans implementation for Apache Arrow Arrays.
 //!
-//! Support ``l2``, ``cosine`` and ``dot`` distances, see [DistanceType].
+//! Supports ``l2`` and ``dot`` over float vectors and ``hamming`` over
+//! ``uint8`` vectors, see [DistanceType].
 //!
-//! ``Cosine`` distance are calculated by normalizing the vectors to unit length,
-//! and run ``l2`` distance on the unit vectors.
+//! ``Cosine`` is not supported: callers normalize the vectors to unit length
+//! and train with ``l2``.
 //!
 
 use core::f32;
@@ -32,7 +33,7 @@ use lance_linalg::distance::dot_f16::{
     PackedCentroidsF16, amx_fp16_available, amx_fp16_supported, dot_f16_batch_16,
 };
 use lance_linalg::distance::hamming::{hamming, hamming_distance_batch};
-use lance_linalg::distance::{DistanceType, Normalize, dot_distance_batch};
+use lance_linalg::distance::{DistanceType, Normalize, dot_distance_batch_into};
 use lance_linalg::kernels::{
     Normalizable, argmin_value_float, argmin_value_float_with_bias, normalize,
 };
@@ -44,7 +45,7 @@ use rayon::prelude::*;
 use {
     lance_linalg::distance::{
         Dot,
-        l2::{L2, l2_distance_batch},
+        l2::{L2, L2Prepared, l2_distance_batch_into},
     },
     lance_linalg::kernels::argmin_value,
 };
@@ -103,8 +104,8 @@ pub struct KMeansParams {
     /// training already iterates globally and ignores it.
     pub refine_iters: u32,
 
-    /// Seed for centroid initialization. `None` draws a seed from the OS, so two
-    /// trainings of the same data may pick different initial centroids.
+    /// Seed for centroid initialization and hierarchical subsampling. `None`
+    /// uses OS randomness, so two trainings of the same data may differ.
     pub seed: Option<u64>,
 
     /// Optional sync callback for iteration progress: (current_iteration, max_iterations).
@@ -194,7 +195,8 @@ impl KMeansParams {
         self
     }
 
-    /// Seed centroid initialization, making training reproducible.
+    /// Seed centroid initialization and hierarchical subsampling, making
+    /// training reproducible.
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
         self
@@ -208,7 +210,7 @@ impl KMeansParams {
     }
 
     /// The same parameters with a seed derived for one sub-problem, so sibling
-    /// sub-trees of a hierarchical training do not share initial centroids.
+    /// sub-trees do not share subsampling and initialization randomness.
     /// Unseeded parameters stay unseeded.
     fn derive(&self, salt: u64) -> Self {
         let mut params = self.clone();
@@ -330,6 +332,14 @@ where
     ))
 }
 
+fn kmeans_has_converged(previous_loss: f64, loss: f64, tolerance: f64) -> bool {
+    if loss == 0.0 {
+        previous_loss == 0.0
+    } else {
+        (previous_loss - loss).abs() < tolerance * loss.abs()
+    }
+}
+
 pub trait KMeansAlgo<T: Num> {
     /// Recompute the membership of each vector.
     ///
@@ -361,7 +371,7 @@ pub trait KMeansAlgo<T: Num> {
         );
 
         let k = centroids.len() / dimension;
-        let mut cluster_radius = vec![0.0; k];
+        let mut cluster_radius = vec![f32::NEG_INFINITY; k];
         let mut losses = vec![0.0; k];
         for (cluster_id, dist) in membership.iter().zip(dists.iter()) {
             if let (Some(cluster_id), Some(dist)) = (cluster_id, dist) {
@@ -370,6 +380,11 @@ pub trait KMeansAlgo<T: Num> {
                 losses[cluster_id] += *dist as f64;
             }
         }
+        cluster_radius.iter_mut().for_each(|radius| {
+            if *radius == f32::NEG_INFINITY {
+                *radius = 0.0;
+            }
+        });
 
         (membership, cluster_radius, losses)
     }
@@ -416,6 +431,111 @@ impl MaybeF16 for Float16Type {
 }
 impl MaybeF16 for Float32Type {}
 impl MaybeF16 for Float64Type {}
+
+/// The `f32` counterpart of [`MaybeF16`], for the pre-transposed L2 path below.
+pub(crate) trait MaybeF32: ArrowNumericType {
+    fn as_f32_slice(_values: &[Self::Native]) -> Option<&[f32]> {
+        None
+    }
+}
+
+impl MaybeF32 for Float32Type {
+    fn as_f32_slice(values: &[f32]) -> Option<&[f32]> {
+        Some(values)
+    }
+}
+impl MaybeF32 for Float16Type {}
+impl MaybeF32 for Float64Type {}
+
+/// [`L2Prepared`] (SoA, all centroids of a vector in one pass) is used only for
+/// PQ sub-vectors: at most 16 dimensions, where the per-centroid kernels are
+/// dominated by call overhead (a 16 × 512 IVF node ran 4× slower through SoA),
+/// and a table that fits the L1 data cache.
+const L2_PREPARED_MAX_DIMENSION: usize = 16;
+const L2_PREPARED_MAX_BYTES: usize = 32 * 1024;
+
+/// Centroid tables up to this size are summed with one partial table per data
+/// chunk ([`sum_members_single_pass`]); larger tables keep the centroid-split
+/// update, whose redundant passes over the data cost less than replicating the
+/// table per chunk.
+const SINGLE_PASS_SUMS_MAX_BYTES: usize = 1024 * 1024;
+/// Chunks, hence partial tables and workers, of a single-pass update. Fixed
+/// rather than derived from the CPU count so the summation order, and with it
+/// the trained centroids, is the same on every host.
+const SINGLE_PASS_MAX_CHUNKS: usize = 64;
+
+/// Sums the members of each centroid with one partial table per chunk of
+/// `rows_per_chunk` rows, merged in chunk order. Memberships outside `0..k`
+/// are skipped, as the centroid-split update skips them.
+fn sum_members_single_pass<N: Float + AddAssign + Send + Sync>(
+    data: &[N],
+    dimension: usize,
+    k: usize,
+    membership: &[Option<u32>],
+    rows_per_chunk: usize,
+) -> Vec<N> {
+    let partial_sums = data
+        .par_chunks(rows_per_chunk * dimension)
+        .zip(membership.par_chunks(rows_per_chunk))
+        .map(|(vectors, members)| {
+            let mut sums = vec![N::zero(); k * dimension];
+            for (vector, cluster_id) in vectors.chunks(dimension).zip(members) {
+                if let Some(cluster_id) = cluster_id.filter(|&id| (id as usize) < k) {
+                    let centroid = &mut sums[cluster_id as usize * dimension..][..dimension];
+                    centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+                }
+            }
+            sums
+        })
+        .collect::<Vec<_>>();
+    partial_sums
+        .into_iter()
+        .reduce(|mut total, sums| {
+            total.iter_mut().zip(sums).for_each(|(t, s)| *t += s);
+            total
+        })
+        .unwrap_or_else(|| vec![N::zero(); k * dimension])
+}
+
+/// Sums the members of each centroid with the centroids split across workers,
+/// each scanning all of `data` for its own slice of the table.
+fn sum_members_centroid_split<N: Float + AddAssign + Send + Sync>(
+    data: &[N],
+    dimension: usize,
+    k: usize,
+    membership: &[Option<u32>],
+) -> Vec<N> {
+    let mut centroids = vec![N::zero(); k * dimension];
+
+    let mut num_cpus = get_num_compute_intensive_cpus();
+    if k < num_cpus || k < 16 {
+        num_cpus = 1;
+    }
+    let chunk_size = k / num_cpus;
+
+    centroids
+        .par_chunks_mut(dimension * chunk_size)
+        .enumerate()
+        .with_max_len(1)
+        .for_each(|(i, centroids)| {
+            let start = i * chunk_size;
+            let end = ((i + 1) * chunk_size).min(k);
+            data.chunks(dimension)
+                .zip(membership.iter())
+                .filter_map(|(vector, cluster_id)| {
+                    cluster_id.map(|cluster_id| (vector, cluster_id as usize))
+                })
+                .for_each(|(vector, cluster_id)| {
+                    if start <= cluster_id && cluster_id < end {
+                        let local_id = cluster_id - start;
+                        let centroid =
+                            &mut centroids[local_id * dimension..(local_id + 1) * dimension];
+                        centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+                    }
+                });
+        });
+    centroids
+}
 
 /// Per-thread score-buffer budget for [`dot_membership_amx_f16`], in f32
 /// values: 256 KB, sized to stay within a typical private L2 alongside the
@@ -469,8 +589,8 @@ fn dot_membership_amx_f16(
     Some(
         data.par_chunks(block_rows * dimension)
             .map_init(
-                || vec![0f32; block_rows * n_padded],
-                |scores, block| {
+                || (vec![0f32; block_rows * n_padded], vec![0f32; k]),
+                |(scores, distances), block| {
                     let rows = block.len() / dimension;
                     let tiled = rows - rows % 32;
                     let mut assignments = Vec::with_capacity(rows);
@@ -489,8 +609,9 @@ fn dot_membership_amx_f16(
                     }
                     // Rows past the last whole tile pass keep the per-vector path.
                     for vector in block[tiled * dimension..].chunks(dimension) {
+                        dot_distance_batch_into(vector, centroids, dimension, distances);
                         assignments.push(argmin_value_float_with_bias(
-                            dot_distance_batch(vector, centroids, dimension),
+                            distances.iter().copied(),
                             biases(),
                         ));
                     }
@@ -509,7 +630,7 @@ where
     phantom_data: std::marker::PhantomData<T>,
 }
 
-impl<T: ArrowNumericType + MaybeF16> KMeansAlgo<T::Native> for KMeansAlgoFloat<T>
+impl<T: ArrowNumericType + MaybeF16 + MaybeF32> KMeansAlgo<T::Native> for KMeansAlgoFloat<T>
 where
     T::Native: Float + Dot + L2 + MulAssign + DivAssign + AddAssign + FromPrimitive + Sync,
     PrimitiveArray<T>: From<Vec<T::Native>>,
@@ -523,6 +644,8 @@ where
         cluster_sizes: Option<&[usize]>,
         index: Option<&SimpleIndex>,
     ) -> (Vec<Option<u32>>, Vec<Option<f32>>) {
+        let biases =
+            || cluster_sizes.map(|size| size.iter().map(|size| balance_factor * *size as f32));
         let cluster_and_dists = match index {
             Some(index) => data
                 .par_chunks(dimension)
@@ -536,16 +659,38 @@ where
                 })
                 .collect::<Vec<_>>(),
             None => match distance_type {
-                DistanceType::L2 => data
-                    .par_chunks(dimension)
-                    .map(|vec| {
-                        argmin_value_float_with_bias(
-                            l2_distance_batch(vec, centroids, dimension),
-                            cluster_sizes
-                                .map(|size| size.iter().map(|size| balance_factor * *size as f32)),
+                DistanceType::L2 => match T::as_f32_slice(centroids)
+                    .zip(T::as_f32_slice(data))
+                    .filter(|_| {
+                        dimension <= L2_PREPARED_MAX_DIMENSION
+                            && centroids.len() * size_of::<f32>() <= L2_PREPARED_MAX_BYTES
+                    }) {
+                    // PQ sub-vector codebooks: one SoA pass per vector instead of one
+                    // kernel call per centroid, whose call and dispatch overhead
+                    // dominates at these dimensions.
+                    Some((centroids, data)) => {
+                        let prepared = L2Prepared::new(centroids, dimension);
+                        data.par_chunks(dimension)
+                            .map_init(
+                                || vec![0f32; prepared.num_targets()],
+                                |dists, vec| {
+                                    prepared.distances_into(vec, dists);
+                                    argmin_value_float_with_bias(dists.iter().copied(), biases())
+                                },
+                            )
+                            .collect::<Vec<_>>()
+                    }
+                    None => data
+                        .par_chunks(dimension)
+                        .map_init(
+                            || vec![0.0; centroids.len() / dimension],
+                            |distances, vec| {
+                                l2_distance_batch_into(vec, centroids, dimension, distances);
+                                argmin_value_float_with_bias(distances.iter().copied(), biases())
+                            },
                         )
-                    })
-                    .collect::<Vec<_>>(),
+                        .collect::<Vec<_>>(),
+                },
                 DistanceType::Dot => T::as_f16_slice(centroids)
                     .zip(T::as_f16_slice(data))
                     // The kill switch is enforced here rather than inside the
@@ -564,14 +709,18 @@ where
                     })
                     .unwrap_or_else(|| {
                         data.par_chunks(dimension)
-                            .map(|vec| {
-                                argmin_value_float_with_bias(
-                                    dot_distance_batch(vec, centroids, dimension),
-                                    cluster_sizes.map(|size| {
-                                        size.iter().map(|size| balance_factor * *size as f32)
-                                    }),
-                                )
-                            })
+                            .map_init(
+                                || vec![0.0; centroids.len() / dimension],
+                                |distances, vec| {
+                                    dot_distance_batch_into(vec, centroids, dimension, distances);
+                                    argmin_value_float_with_bias(
+                                        distances.iter().copied(),
+                                        cluster_sizes.map(|size| {
+                                            size.iter().map(|size| balance_factor * *size as f32)
+                                        }),
+                                    )
+                                },
+                            )
                             .collect::<Vec<_>>()
                     }),
                 _ => {
@@ -595,35 +744,13 @@ where
         distance_type: DistanceType,
         loss: f64,
     ) -> KMeans {
-        let mut centroids = vec![T::Native::zero(); k * dimension];
-
-        let mut num_cpus = get_num_compute_intensive_cpus();
-        if k < num_cpus || k < 16 {
-            num_cpus = 1;
-        }
-        let chunk_size = k / num_cpus;
-
-        centroids
-            .par_chunks_mut(dimension * chunk_size)
-            .enumerate()
-            .with_max_len(1)
-            .for_each(|(i, centroids)| {
-                let start = i * chunk_size;
-                let end = ((i + 1) * chunk_size).min(k);
-                data.chunks(dimension)
-                    .zip(membership.iter())
-                    .filter_map(|(vector, cluster_id)| {
-                        cluster_id.map(|cluster_id| (vector, cluster_id as usize))
-                    })
-                    .for_each(|(vector, cluster_id)| {
-                        if start <= cluster_id && cluster_id < end {
-                            let local_id = cluster_id - start;
-                            let centroid =
-                                &mut centroids[local_id * dimension..(local_id + 1) * dimension];
-                            centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
-                        }
-                    });
-            });
+        let mut centroids = if k * dimension * size_of::<T::Native>() <= SINGLE_PASS_SUMS_MAX_BYTES
+        {
+            let rows_per_chunk = membership.len().div_ceil(SINGLE_PASS_MAX_CHUNKS).max(1);
+            sum_members_single_pass(data, dimension, k, membership, rows_per_chunk)
+        } else {
+            sum_members_centroid_split(data, dimension, k, membership)
+        };
 
         centroids
             .par_chunks_mut(dimension)
@@ -926,7 +1053,7 @@ impl KMeans {
     ) -> arrow::error::Result<KMeansMembershipAndLoss> {
         let (membership, distances) = self.compute_membership_and_distances(data)?;
         let k = self.centroids.len() / self.dimension;
-        let mut cluster_radius: Vec<f32> = vec![0.0_f32; k];
+        let mut cluster_radius = vec![f32::NEG_INFINITY; k];
         let mut losses = vec![0.0; k];
         for (cluster_id, dist) in membership.iter().zip(distances.iter()) {
             if let (Some(cluster_id), Some(dist)) = (cluster_id, dist) {
@@ -935,6 +1062,11 @@ impl KMeans {
                 losses[cluster_id] += *dist as f64;
             }
         }
+        cluster_radius.iter_mut().for_each(|radius| {
+            if *radius == f32::NEG_INFINITY {
+                *radius = 0.0;
+            }
+        });
         Ok((membership, cluster_radius, losses))
     }
 
@@ -951,18 +1083,36 @@ impl KMeans {
             )));
         }
 
+        // Before the optional centroid index is built, not after: the index is
+        // built from `self.distance_type`, and HNSW construction panics on a
+        // metric its kernels do not implement, which would beat the dispatch
+        // below to the rejection.
+        let combination = (
+            data.value_type(),
+            self.centroids.data_type().clone(),
+            self.distance_type,
+        );
+        match &combination {
+            (DataType::Float16, DataType::Float16, DistanceType::L2 | DistanceType::Dot)
+            | (DataType::Float32, DataType::Float32, DistanceType::L2 | DistanceType::Dot)
+            | (DataType::Float64, DataType::Float64, DistanceType::L2 | DistanceType::Dot)
+            | (DataType::UInt8, DataType::UInt8, DistanceType::Hamming) => {}
+            (value_type, centroid_type, distance_type) => {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "KMeans: can not compute membership for data type {} with centroid type {} and distance type {}",
+                    value_type, centroid_type, distance_type
+                )));
+            }
+        }
+
         let index = SimpleIndex::may_train_index(
             self.centroids.clone(),
             self.dimension,
             self.distance_type,
         )
         .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
-        match (
-            data.value_type(),
-            self.centroids.data_type(),
-            self.distance_type,
-        ) {
-            (DataType::Float16, DataType::Float16, _) => {
+        match combination {
+            (DataType::Float16, DataType::Float16, DistanceType::L2 | DistanceType::Dot) => {
                 let data_values = data.values().as_primitive::<Float16Type>().values();
                 let centroids = self.centroids.as_primitive::<Float16Type>().values();
                 Ok(KMeansAlgoFloat::<Float16Type>::compute_membership_and_dist(
@@ -975,7 +1125,7 @@ impl KMeans {
                     index.as_ref(),
                 ))
             }
-            (DataType::Float32, DataType::Float32, _) => {
+            (DataType::Float32, DataType::Float32, DistanceType::L2 | DistanceType::Dot) => {
                 let data_values = data.values().as_primitive::<Float32Type>().values();
                 let centroids = self.centroids.as_primitive::<Float32Type>().values();
                 Ok(KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
@@ -988,7 +1138,7 @@ impl KMeans {
                     index.as_ref(),
                 ))
             }
-            (DataType::Float64, DataType::Float64, _) => {
+            (DataType::Float64, DataType::Float64, DistanceType::L2 | DistanceType::Dot) => {
                 let data_values = data.values().as_primitive::<Float64Type>().values();
                 let centroids = self.centroids.as_primitive::<Float64Type>().values();
                 Ok(KMeansAlgoFloat::<Float64Type>::compute_membership_and_dist(
@@ -1128,15 +1278,17 @@ impl KMeans {
                     params.distance_type,
                     last_loss,
                 );
-                if (loss - last_loss).abs() < params.tolerance * last_loss {
+                // Keep `last_loss` as the scale reference to preserve the legacy
+                // convergence threshold.
+                if kmeans_has_converged(loss, last_loss, params.tolerance) {
+                    let relative_loss_diff = if last_loss == 0.0 {
+                        if loss == 0.0 { 0.0 } else { f64::INFINITY }
+                    } else {
+                        (loss - last_loss).abs() / last_loss.abs()
+                    };
                     info!(
                         "KMeans training: converged at iteration {} / {}, redo={}, loss={}, last_loss={}, loss_diff={}",
-                        i,
-                        params.max_iters,
-                        redo,
-                        loss,
-                        last_loss,
-                        (loss - last_loss).abs() / last_loss
+                        i, params.max_iters, redo, loss, last_loss, relative_loss_diff
                     );
                     break;
                 }
@@ -1302,12 +1454,12 @@ impl KMeans {
     /// Grow the sub-tree under one node of the proportional hierarchy.
     ///
     /// `indices` are the node's training vectors and `quota` the number of leaf
-    /// centroids it owes. `salt` derives per-node seeds from a seeded training,
-    /// so sibling sub-trees do not repeat each other's initialization.
+    /// centroids it owes. `salt` derives per-node seeds for subsampling and
+    /// initialization, so sibling sub-trees use different randomness.
     fn grow_proportional_subtree<T: ArrowNumericType, Algo: KMeansAlgo<T::Native>>(
         data_values: &[T::Native],
         dimension: usize,
-        indices: Vec<usize>,
+        mut indices: Vec<usize>,
         quota: usize,
         params: &KMeansParams,
         salt: u64,
@@ -1328,18 +1480,22 @@ impl KMeans {
 
         let branching = params.hierarchical_k.max(2);
         let k = branching.min(quota).min(n);
-        // Train on a prefix of the node's rows, which is a uniform subsample
-        // because the sample is in random order (`train_kmeans` would take the
-        // same prefix itself). Gathering only the prefix, and assigning the rest
-        // in chunks, keeps memory at the sample plus one chunk instead of a copy
-        // of every level of the tree.
-        let training_rows = indices.len().min(k * TRAINING_ROWS_PER_CENTROID);
-        let training = Self::create_array_from_indices::<T>(
-            &indices[..training_rows],
-            data_values,
-            dimension,
-        )?;
-        let kmeans = Self::train_kmeans::<T, Algo>(&training, k, &params.derive(salt))?;
+        // Each node samples uniformly regardless of input order: upstream
+        // reads can be sorted, and merging zero-quota children appends rows.
+        // Partially shuffle the existing indices instead of copying all vectors
+        // or allocating another full index array. All rows still get assigned.
+        let node_params = params.derive(salt);
+        let training_rows = n.min(k * TRAINING_ROWS_PER_CENTROID);
+        let training_indices = if training_rows < n {
+            indices
+                .partial_shuffle(&mut node_params.rng(), training_rows)
+                .0
+        } else {
+            indices.as_mut_slice()
+        };
+        let training =
+            Self::create_array_from_indices::<T>(training_indices, data_values, dimension)?;
+        let kmeans = Self::train_kmeans::<T, Algo>(&training, k, &node_params)?;
         drop(training);
         let membership = Self::membership_of_rows::<T, Algo>(
             kmeans.centroids.as_primitive::<T>().values(),
@@ -1570,6 +1726,9 @@ impl KMeans {
 
     /// Train a [`KMeans`] model with full parameters.
     ///
+    /// `Cosine` is not supported here: callers must normalize the input
+    /// vectors themselves and train with [`DistanceType::L2`].
+    ///
     /// Dot training normalizes centroids, including initialization and
     /// hierarchical leaves, while preserving the norms of the input vectors.
     pub fn new_with_params(
@@ -1592,18 +1751,21 @@ impl KMeans {
         if k > 256 && params.hierarchical_k > 1 {
             log::debug!("Using hierarchical clustering for k={}", k);
             return match (data.value_type(), params.distance_type) {
-                (DataType::Float16, _) => Self::train_hierarchical_kmeans::<
-                    Float16Type,
-                    KMeansAlgoFloat<Float16Type>,
-                >(data, k, params),
-                (DataType::Float32, _) => Self::train_hierarchical_kmeans::<
-                    Float32Type,
-                    KMeansAlgoFloat<Float32Type>,
-                >(data, k, params),
-                (DataType::Float64, _) => Self::train_hierarchical_kmeans::<
-                    Float64Type,
-                    KMeansAlgoFloat<Float64Type>,
-                >(data, k, params),
+                (DataType::Float16, DistanceType::L2 | DistanceType::Dot) => {
+                    Self::train_hierarchical_kmeans::<Float16Type, KMeansAlgoFloat<Float16Type>>(
+                        data, k, params,
+                    )
+                }
+                (DataType::Float32, DistanceType::L2 | DistanceType::Dot) => {
+                    Self::train_hierarchical_kmeans::<Float32Type, KMeansAlgoFloat<Float32Type>>(
+                        data, k, params,
+                    )
+                }
+                (DataType::Float64, DistanceType::L2 | DistanceType::Dot) => {
+                    Self::train_hierarchical_kmeans::<Float64Type, KMeansAlgoFloat<Float64Type>>(
+                        data, k, params,
+                    )
+                }
                 (DataType::UInt8, DistanceType::Hamming) => {
                     Self::train_hierarchical_kmeans::<UInt8Type, KModeAlgo>(data, k, params)
                 }
@@ -1616,14 +1778,14 @@ impl KMeans {
         }
 
         match (data.value_type(), params.distance_type) {
-            (DataType::Float16, _) => {
+            (DataType::Float16, DistanceType::L2 | DistanceType::Dot) => {
                 Self::train_kmeans::<Float16Type, KMeansAlgoFloat<Float16Type>>(data, k, params)
             }
 
-            (DataType::Float32, _) => {
+            (DataType::Float32, DistanceType::L2 | DistanceType::Dot) => {
                 Self::train_kmeans::<Float32Type, KMeansAlgoFloat<Float32Type>>(data, k, params)
             }
-            (DataType::Float64, _) => {
+            (DataType::Float64, DistanceType::L2 | DistanceType::Dot) => {
                 Self::train_kmeans::<Float64Type, KMeansAlgoFloat<Float64Type>>(data, k, params)
             }
             (DataType::UInt8, DistanceType::Hamming) => {
@@ -1752,7 +1914,7 @@ fn dot_f16_partitions_amx(centroids: &[f16], query: &[f16]) -> Option<Vec<f32>> 
             *slot = row(base + i);
         }
         // The kernel returns raw dot products; `Dot` distance is `1 - dot`, the
-        // same convention `dot_distance_batch` applies.
+        // same convention `dot_distance_batch_into` applies.
         let dots = dot_f16_batch_16(query, &group, out.len());
         for (d, dot) in out.iter_mut().zip(dots.iter()) {
             *d = 1.0 - *dot;
@@ -1775,16 +1937,17 @@ pub fn kmeans_find_partitions<T: Float + L2 + Dot>(
     nprobes: usize,
     distance_type: DistanceType,
 ) -> arrow::error::Result<(UInt32Array, Float32Array)> {
-    let dists: Vec<f32> = match distance_type {
-        DistanceType::L2 => l2_distance_batch(query, centroids, query.len()).collect(),
-        DistanceType::Dot => dot_distance_batch(query, centroids, query.len()).collect(),
+    let mut dists = vec![0.0; centroids.len() / query.len()];
+    match distance_type {
+        DistanceType::L2 => l2_distance_batch_into(query, centroids, query.len(), &mut dists),
+        DistanceType::Dot => dot_distance_batch_into(query, centroids, query.len(), &mut dists),
         _ => {
             panic!(
                 "KMeans::find_partitions: {} is not supported",
                 distance_type
             );
         }
-    };
+    }
 
     smallest_nprobes(dists, nprobes)
 }
@@ -1978,19 +2141,20 @@ where
     Ok(model)
 }
 
+/// Returns the centroid nearest to `vector`.
+///
+/// `distances` is scratch space with one slot per centroid, so that callers
+/// assigning many vectors can reuse it.
 #[inline]
 pub fn compute_partition<T: Float + L2 + Dot>(
     centroids: &[T],
     vector: &[T],
     distance_type: DistanceType,
+    distances: &mut [f32],
 ) -> Option<u32> {
     match distance_type {
-        DistanceType::L2 => {
-            argmin_value_float(l2_distance_batch(vector, centroids, vector.len())).map(|(c, _)| c)
-        }
-        DistanceType::Dot => {
-            argmin_value_float(dot_distance_batch(vector, centroids, vector.len())).map(|(c, _)| c)
-        }
+        DistanceType::L2 => l2_distance_batch_into(vector, centroids, vector.len(), distances),
+        DistanceType::Dot => dot_distance_batch_into(vector, centroids, vector.len(), distances),
         _ => {
             panic!(
                 "KMeans::compute_partition: distance type {} is not supported",
@@ -1998,6 +2162,7 @@ pub fn compute_partition<T: Float + L2 + Dot>(
             );
         }
     }
+    argmin_value_float(distances.iter().copied()).map(|(c, _)| c)
 }
 
 #[cfg(test)]
@@ -2008,7 +2173,8 @@ mod tests {
     use arrow_array::types::Float16Type;
     use half::f16;
     use lance_arrow::*;
-    use lance_testing::datagen::generate_random_array;
+    use lance_testing::datagen::{generate_random_array, generate_random_array_with_seed};
+    use rstest::rstest;
 
     use super::*;
     use lance_linalg::distance::dot_f16::amx_fp16_supported;
@@ -2037,7 +2203,8 @@ mod tests {
 
             let amx = dot_f16_partitions_amx(&centroids, &query)
                 .expect("the AMX path declined a shape it should accept");
-            let scalar: Vec<f32> = dot_distance_batch(&query[..], &centroids[..], dim).collect();
+            let mut scalar = vec![0.0; k];
+            dot_distance_batch_into(&query[..], &centroids[..], dim, &mut scalar);
             assert_eq!(amx.len(), scalar.len(), "dim={dim} k={k}");
 
             for nprobes in [1usize, 8, 32] {
@@ -2050,6 +2217,82 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_kmeans_rejects_cosine_and_hamming_for_floats() {
+        // Cosine/Hamming used to be accepted by the float dispatch arms and
+        // then hit a panic in the first membership pass; they must be
+        // rejected up front (callers normalize cosine input and train L2).
+        let dimension = 8;
+        let values: Vec<f32> = (0..16).map(|i| i as f32 * 0.5).collect();
+        let data =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dimension).unwrap();
+        for distance_type in [DistanceType::Cosine, DistanceType::Hamming] {
+            let params = KMeansParams {
+                distance_type,
+                max_iters: 1,
+                ..KMeansParams::default()
+            };
+            let err = KMeans::new_with_params(&data, 2, &params).unwrap_err();
+            assert!(
+                err.to_string().contains("can not train"),
+                "expected rejection for {distance_type}, got: {err}"
+            );
+        }
+
+        // The hierarchical dispatch (k > 256 with default hierarchical_k)
+        // is a separate match that used to keep the wildcard arms.
+        let dimension = 8;
+        let values: Vec<f32> = (0..257 * dimension).map(|i| i as f32 * 0.5).collect();
+        let data =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), dimension).unwrap();
+        let params = KMeansParams {
+            distance_type: DistanceType::Cosine,
+            max_iters: 1,
+            ..KMeansParams::default()
+        };
+        let err = KMeans::new_with_params(&data, 257, &params).unwrap_err();
+        assert!(err.to_string().contains("can not train"), "got: {err}");
+    }
+
+    /// Assignment dispatches on the same triple as training, so it has to
+    /// reject the same combinations: a caller that builds a cosine model with
+    /// `with_centroids` used to reach the panic through this path instead.
+    ///
+    /// The rejection has to happen before the optional centroid index is built.
+    /// This test only covers that ordering when the index is actually built,
+    /// which the default `Auto` mode does not do at this size: run it with
+    /// `LANCE_USE_HNSW_SPEEDUP_INDEXING=enabled` to exercise that path, where
+    /// validating after the build panics in the HNSW kernels instead.
+    #[test]
+    fn test_compute_membership_rejects_cosine_and_hamming_for_floats() {
+        let dimension = 8;
+        let values: Vec<f32> = (0..16).map(|i| i as f32 * 0.5).collect();
+        let data =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values.clone()), dimension)
+                .unwrap();
+        let centroids = Arc::new(Float32Array::from(values));
+
+        for distance_type in [DistanceType::Cosine, DistanceType::Hamming] {
+            let kmeans = KMeans::with_centroids(
+                centroids.clone(),
+                dimension as usize,
+                distance_type,
+                f64::MAX,
+            );
+            let err = kmeans.compute_membership_and_distances(&data).unwrap_err();
+            assert!(
+                err.to_string().contains("can not compute membership"),
+                "expected rejection for {distance_type}, got: {err}"
+            );
+        }
+
+        let kmeans =
+            KMeans::with_centroids(centroids, dimension as usize, DistanceType::L2, f64::MAX);
+        kmeans
+            .compute_membership_and_distances(&data)
+            .expect("l2 must still be assigned");
     }
 
     #[test]
@@ -2150,7 +2393,7 @@ mod tests {
             0.0,
         );
         let centroids = model.centroids.as_primitive::<Float32Type>().values();
-        for centroid in centroids.chunks_exact(2) {
+        for centroid in centroids.as_chunks::<2>().0 {
             assert!((centroid.iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-6);
         }
         assert_ne!(&centroids[..2], &centroids[2..]);
@@ -2179,7 +2422,8 @@ mod tests {
             .centroids
             .as_primitive::<Float32Type>()
             .values()
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
         {
             assert!((centroid.iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-6);
         }
@@ -2224,6 +2468,137 @@ mod tests {
         assert_eq!(expected, actual);
     }
 
+    /// The SoA path and the per-centroid fallback must pick the centroids the
+    /// per-centroid f64 path picks, up to rounding on exact ties.
+    #[rstest]
+    #[case::pq_table(8, 256, 0.0, true)]
+    #[case::pq_table_with_bias(8, 256, 0.5, true)]
+    #[case::wide_table_falls_back(32, 256, 0.0, false)]
+    #[case::large_table_falls_back(16, 4096, 0.0, false)]
+    fn test_l2_assignment_matches_per_centroid_path(
+        #[case] dim: usize,
+        #[case] k: usize,
+        #[case] balance_factor: f32,
+        #[case] expect_soa: bool,
+    ) {
+        assert_eq!(
+            expect_soa,
+            dim <= L2_PREPARED_MAX_DIMENSION && k * dim * size_of::<f32>() <= L2_PREPARED_MAX_BYTES,
+            "the case must exercise the path its name claims"
+        );
+        let centroids = generate_random_array_with_seed::<Float32Type>(dim * k, [7; 32]);
+        let data = generate_random_array_with_seed::<Float32Type>(dim * 1000, [8; 32]);
+        let cluster_sizes = (balance_factor != 0.0)
+            .then(|| (0..k).map(|cluster| cluster * 3).collect::<Vec<usize>>());
+        let (prepared, prepared_dists) =
+            KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
+                centroids.values(),
+                data.values(),
+                dim,
+                DistanceType::L2,
+                balance_factor,
+                cluster_sizes.as_deref(),
+                None,
+            );
+        let widen = |array: &Float32Array| arrow::compute::cast(array, &DataType::Float64).unwrap();
+        let (reference, reference_dists) =
+            KMeansAlgoFloat::<Float64Type>::compute_membership_and_dist(
+                widen(&centroids).as_primitive::<Float64Type>().values(),
+                widen(&data).as_primitive::<Float64Type>().values(),
+                dim,
+                DistanceType::L2,
+                balance_factor,
+                cluster_sizes.as_deref(),
+                None,
+            );
+        assert_eq!(prepared, reference);
+        for (dist, expected) in prepared_dists.iter().zip(&reference_dists) {
+            let (dist, expected) = (dist.unwrap(), expected.unwrap());
+            assert!(
+                (dist - expected).abs() <= 1e-4 * expected.max(1.0),
+                "{dist} vs {expected}"
+            );
+        }
+    }
+
+    /// Sums every row into its centroid one row at a time, in input order.
+    fn sum_members_sequential(
+        data: &[f32],
+        dimension: usize,
+        k: usize,
+        membership: &[Option<u32>],
+    ) -> Vec<f32> {
+        let mut sums = vec![0f32; k * dimension];
+        for (vector, cluster_id) in data.chunks(dimension).zip(membership) {
+            if let Some(cluster_id) = cluster_id.filter(|&id| (id as usize) < k) {
+                let centroid = &mut sums[cluster_id as usize * dimension..][..dimension];
+                centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+            }
+        }
+        sums
+    }
+
+    /// Both update strategies must agree with the sequential sums, including
+    /// when the single pass merges several partial tables and when a membership
+    /// points outside the table.
+    #[test]
+    fn test_member_sums_match_sequential_reference() {
+        let (k, dim, rows) = (3, 2, 50);
+        let data = generate_random_array_with_seed::<Float32Type>(rows * dim, [9; 32]);
+        let mut membership: Vec<Option<u32>> = (0..rows)
+            .map(|row| (row % 4 != 3).then_some((row % k) as u32))
+            .collect();
+        membership[5] = Some(k as u32);
+        let expected = sum_members_sequential(data.values(), dim, k, &membership);
+        // 50 rows in chunks of 4: 13 partial tables to merge.
+        let single_pass = sum_members_single_pass(data.values(), dim, k, &membership, 4);
+        let split = sum_members_centroid_split(data.values(), dim, k, &membership);
+        for (actual, name) in [(&single_pass, "single pass"), (&split, "centroid split")] {
+            for (value, reference) in actual.iter().zip(&expected) {
+                assert!(
+                    (value - reference).abs() <= 1e-4,
+                    "{name}: {value} vs {reference}"
+                );
+            }
+        }
+    }
+
+    /// Both update strategies must return the member means: a table under
+    /// `SINGLE_PASS_SUMS_MAX_BYTES` takes the single pass, a larger one the
+    /// centroid split.
+    #[rstest]
+    #[case::single_pass(3, 2)]
+    #[case::centroid_split(256, 1025)]
+    fn test_to_kmeans_centroids_are_member_means(#[case] k: usize, #[case] dim: usize) {
+        assert_eq!(
+            k == 3,
+            k * dim * size_of::<f32>() <= SINGLE_PASS_SUMS_MAX_BYTES,
+            "the case must exercise the update its name claims"
+        );
+        let rows = 2 * k;
+        let data: Vec<f32> = (0..rows).flat_map(|row| vec![row as f32; dim]).collect();
+        let membership: Vec<Option<u32>> = (0..rows).map(|row| Some((row % k) as u32)).collect();
+        let mut cluster_sizes = vec![2; k];
+        let model = KMeansAlgoFloat::<Float32Type>::to_kmeans(
+            &data,
+            dim,
+            k,
+            &membership,
+            &mut cluster_sizes,
+            DistanceType::L2,
+            0.0,
+        );
+        let centroids = model.centroids.as_primitive::<Float32Type>().values();
+        for (cluster, centroid) in centroids.chunks(dim).enumerate() {
+            // Rows `cluster` and `cluster + k` are its members.
+            let mean = cluster as f32 + k as f32 / 2.0;
+            assert!(
+                centroid.iter().all(|&v| (v - mean).abs() < 1e-3),
+                "cluster {cluster}: expected {mean}, got {centroid:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_random_init_advances_rng() {
         let values = Float32Array::from_iter_values((0..64).map(|value| value as f32));
@@ -2259,6 +2634,64 @@ mod tests {
         membership.iter().for_each(|cd| {
             assert!(cd.is_some());
         });
+    }
+
+    #[test]
+    fn test_dot_membership_preserves_negative_distances_and_radius() {
+        let centroids = Float32Array::from(vec![2.0, 1.0]);
+        let kmeans = KMeans::with_centroids(Arc::new(centroids), 1, DistanceType::Dot, f64::MAX);
+        let data =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![2.0, 3.0]), 1).unwrap();
+
+        let (membership, radii, losses) = kmeans.compute_membership_and_loss(&data).unwrap();
+
+        assert_eq!(membership, vec![Some(0), Some(0)]);
+        assert_eq!(radii, vec![-3.0, 0.0]);
+        assert_eq!(losses, vec![-8.0, 0.0]);
+    }
+
+    #[test]
+    fn test_l2_membership_preserves_positive_radii() {
+        let centroids = Float32Array::from(vec![0.0, 10.0]);
+        let kmeans = KMeans::with_centroids(Arc::new(centroids), 1, DistanceType::L2, f64::MAX);
+        let data = FixedSizeListArray::try_new_from_values(Float32Array::from(vec![1.0, 12.0]), 1)
+            .unwrap();
+
+        let (membership, radii, losses) = kmeans.compute_membership_and_loss(&data).unwrap();
+
+        assert_eq!(membership, vec![Some(0), Some(1)]);
+        assert_eq!(radii, vec![1.0, 4.0]);
+        assert_eq!(losses, vec![1.0, 4.0]);
+    }
+
+    #[test]
+    fn test_convergence_scale_is_sign_independent() {
+        assert!(kmeans_has_converged(-10.0, -10.0005, 1e-4));
+        assert!(kmeans_has_converged(10.0, 10.0005, 1e-4));
+        assert!(!kmeans_has_converged(-10.0, -10.01, 1e-4));
+        assert!(!kmeans_has_converged(10.0, 10.01, 1e-4));
+        assert!(kmeans_has_converged(0.0, 0.0, 1e-4));
+        assert!(!kmeans_has_converged(1.0, 0.0, 1e-4));
+    }
+
+    #[test]
+    fn scaled_l2_does_not_stop_early() {
+        let scale = 1e-5_f32;
+        let data = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values((0..=100).map(|value| value as f32 * scale)),
+            1,
+        )
+        .unwrap();
+        let initial =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0, scale]), 1)
+                .unwrap();
+        let params = KMeansParams::new(Some(Arc::new(initial)), 50, 1, DistanceType::L2);
+
+        let model = KMeans::new_with_params(&data, 2, &params).unwrap();
+        let centroids = model.centroids.as_primitive::<Float32Type>().values();
+
+        assert!((centroids[0] - 24.5 * scale).abs() < 1e-7, "{centroids:?}");
+        assert!((centroids[1] - 75.0 * scale).abs() < 1e-7, "{centroids:?}");
     }
 
     #[tokio::test]
@@ -2437,8 +2870,9 @@ mod tests {
                 panic!("{ctx}: the AMX path declined this shape, so agreeing proves nothing")
             });
 
+        let mut row = vec![0.0; centroids.len() / dimension];
         for (i, vector) in data.chunks(dimension).enumerate() {
-            let row = dot_distance_batch(vector, centroids, dimension).collect::<Vec<_>>();
+            dot_distance_batch_into(vector, centroids, dimension, &mut row);
             let want = argmin_value_float_with_bias(
                 row.iter().copied(),
                 cluster_sizes.map(|sizes| sizes.iter().map(|size| balance_factor * *size as f32)),
@@ -2539,9 +2973,11 @@ mod tests {
             .map(|v| f16::from_f32(v.to_f32().abs() + 0.1))
             .collect::<Vec<_>>();
 
+        let mut distances = vec![0.0; centroids.len() / DIM];
         for vector in data.chunks(DIM) {
+            dot_distance_batch_into(vector, &centroids, DIM, &mut distances);
             assert!(
-                dot_distance_batch(vector, &centroids, DIM).all(|dist| dist > 1.0),
+                distances.iter().all(|&dist| dist > 1.0),
                 "premise broken: a real centroid is nearer than the zero padding"
             );
         }
@@ -2852,7 +3288,13 @@ mod tests {
         // 80% of the vectors sit in one dense blob near the origin, the rest
         // spread over the unit cube, so a fixed fan-out would starve the blob
         // of centroids.
-        let mut values = generate_random_array(rows * dim).values().to_vec();
+        //
+        // Seeded so that tests asserting on seeded training see the same input
+        // every run: on about 1% of random inputs, exact reassignment leaves a
+        // hierarchical leaf without vectors when refinement is off.
+        let mut values = generate_random_array_with_seed::<Float32Type>(rows * dim, [42; 32])
+            .values()
+            .to_vec();
         for value in values.iter_mut().take(rows * 8 / 10 * dim) {
             *value *= 0.05;
         }
@@ -2872,6 +3314,120 @@ mod tests {
             sizes[cluster as usize] += 1;
         }
         sizes
+    }
+
+    #[rstest::rstest]
+    #[case::all_rows(8)]
+    #[case::subsampled(1024)]
+    fn test_hierarchical_node_handles_sorted_input(#[case] rows_per_group: usize) {
+        // Contiguous groups model upstream samples read in source-row order.
+        let mut values = vec![0.0_f32; rows_per_group];
+        values.extend(repeat_n(100.0, rows_per_group));
+        let params = KMeansParams {
+            max_iters: 5,
+            hierarchical_k: 2,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let leaves =
+            KMeans::grow_proportional_subtree::<Float32Type, KMeansAlgoFloat<Float32Type>>(
+                &values,
+                1,
+                (0..values.len()).collect(),
+                2,
+                &params,
+                7,
+            )
+            .unwrap();
+        let mut centroids: Vec<f32> = leaves.iter().map(|leaf| leaf.centroid[0]).collect();
+        centroids.sort_by(f32::total_cmp);
+        assert_eq!(centroids, vec![0.0, 100.0]);
+        let mut indices: Vec<usize> = leaves.into_iter().flat_map(|leaf| leaf.indices).collect();
+        indices.sort_unstable();
+        assert_eq!(indices, (0..values.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_hierarchical_node_handles_merged_children() {
+        // A zero-quota child is merged into its nearest funded sibling.
+        // Its rows must participate in the sibling's clustering.
+        let mut values = vec![0.0_f32; 2048];
+        values.extend(repeat_n(1000.0, 4096));
+        values.extend(repeat_n(100.0, 128));
+        let children = vec![
+            (0, (0..2048).collect()),
+            (1, (2048..6144).collect()),
+            (2, (6144..6272).collect()),
+        ];
+        let quotas = allocate_quotas(&[2048, 4096, 128], 5);
+        assert_eq!(quotas, vec![2, 3, 0]);
+        let (mut children, quotas) =
+            KMeans::merge_unfunded_children::<Float32Type, KMeansAlgoFloat<Float32Type>>(
+                &values,
+                1,
+                children,
+                quotas,
+                &[0.0, 1000.0, 100.0],
+                DistanceType::L2,
+            )
+            .unwrap();
+        assert_eq!(children[0].len(), 2176);
+        let params = KMeansParams {
+            max_iters: 5,
+            hierarchical_k: 2,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let leaves =
+            KMeans::grow_proportional_subtree::<Float32Type, KMeansAlgoFloat<Float32Type>>(
+                &values,
+                1,
+                std::mem::take(&mut children[0]),
+                quotas[0],
+                &params,
+                4,
+            )
+            .unwrap();
+        let mut centroids: Vec<f32> = leaves.iter().map(|leaf| leaf.centroid[0]).collect();
+        centroids.sort_by(f32::total_cmp);
+        assert_eq!(centroids, vec![0.0, 100.0]);
+        let mut indices: Vec<usize> = leaves.into_iter().flat_map(|leaf| leaf.indices).collect();
+        indices.sort_unstable();
+        let expected: Vec<usize> = (0..2048).chain(6144..6272).collect();
+        assert_eq!(indices, expected);
+    }
+
+    #[test]
+    fn test_hierarchical_kmeans_sorted_groups() {
+        const K: usize = 257; // Greater than 256 to trigger hierarchical clustering
+        // Ordered groups include exactly K distinct vectors, so successful
+        // hierarchical training must recover every group.
+        let mut values = vec![0.0_f32; 1024];
+        for group in 1..K {
+            values.extend(repeat_n(group as f32, 4));
+        }
+        let data = FixedSizeListArray::try_new_from_values(Float32Array::from(values), 1).unwrap();
+        let params = KMeansParams {
+            max_iters: 5,
+            hierarchical_k: 2,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let kmeans = KMeans::new_with_params(&data, K, &params).unwrap();
+        assert_eq!(kmeans.dimension, 1);
+        assert_eq!(kmeans.centroids.data_type(), &DataType::Float32);
+        let mut centroids = kmeans
+            .centroids
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        centroids.sort_by(f32::total_cmp);
+        assert_eq!(
+            centroids,
+            (0..K).map(|group| group as f32).collect::<Vec<_>>()
+        );
+        assert_eq!(kmeans.compute_loss(&data).unwrap(), 0.0);
+        assert!(assigned_sizes(&kmeans, &data).iter().all(|&size| size > 0));
     }
 
     #[test]

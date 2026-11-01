@@ -251,7 +251,7 @@ mod tests {
     use crate::decoder::{DecodedArray, StructuralDecodeArrayTask};
     use crate::encoder::{ColumnIndexSequence, EncodingOptions};
     use crate::encodings::logical::primitive::sparse::{
-        SparseCountSet, SparsePositionSet, SparseStructuralLayerPlan, SparseStructuralPlan,
+        SparseCountPlan, SparsePositionPlan, SparseStructuralLayerPlan, SparseStructuralPlan,
         SparseValidityMeaning, SparseValiditySet,
     };
     use crate::repdef::{CompositeRepDefUnraveler, RepDefUnraveler};
@@ -310,17 +310,16 @@ mod tests {
         .unwrap();
         let validity = SparseValiditySet {
             meaning: SparseValidityMeaning::NullPositions,
-            positions: SparsePositionSet::Empty,
+            positions: SparsePositionPlan::Empty,
         };
         let plan = SparseStructuralPlan {
             layers: vec![SparseStructuralLayerPlan::List {
                 num_slots: 1,
                 num_child_slots: 1,
-                non_empty_positions: SparsePositionSet::All { len: 1 },
-                counts: SparseCountSet::Constant { value: 1, len: 1 },
+                non_empty_positions: SparsePositionPlan::All { len: 1 },
+                counts: SparseCountPlan::Constant { value: 1, len: 1 },
                 validity,
             }],
-            num_items: 1,
             num_visible_items: 1,
         };
         let child_task = StaticMapEntriesTask {

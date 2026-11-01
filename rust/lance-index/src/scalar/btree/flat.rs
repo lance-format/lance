@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::RowAddrTranslator;
 use std::collections::BTreeSet;
 use std::{ops::Bound, sync::Arc};
 
@@ -12,6 +13,7 @@ use arrow_array::{
 
 use datafusion_common::DFSchema;
 use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use lance_arrow::RecordBatchExt;
 use lance_core::Result;
@@ -123,11 +125,11 @@ impl FlatIndex {
         })
     }
 
-    fn ids(&self) -> &UInt64Array {
+    pub(crate) fn ids(&self) -> &UInt64Array {
         self.data.column(IDS_COL_IDX).as_primitive::<UInt64Type>()
     }
 
-    fn values(&self) -> &ArrayRef {
+    pub(crate) fn values(&self) -> &ArrayRef {
         self.data.column(VALUES_COL_IDX)
     }
 
@@ -180,7 +182,12 @@ impl FlatIndex {
         }
         let query = SargableQuery::IsIn(needles.iter().map(|v| v.0.clone()).collect());
         let expr = query.to_expr(BTREE_VALUES_COLUMN.to_string());
-        let expr = create_physical_expr(&expr, &self.df_schema, &ExecutionProps::default())?;
+        let expr = create_physical_expr(
+            &expr,
+            &self.df_schema,
+            &ExecutionProps::default(),
+            &PhysicalPlanningContext::default(),
+        )?;
         let predicate = expr.evaluate(&self.data)?;
         let predicate = predicate.into_array(self.data.num_rows())?;
         let predicate = predicate
@@ -224,6 +231,18 @@ impl FlatIndex {
     /// Return every non-null row as TRUE without preserving NULL rows.
     pub fn all_non_null(&self) -> Result<NullableRowAddrSet> {
         self.all_non_null_matches()?.into_row_addr_set()
+    }
+
+    /// [`Self::remap_batch`] through a [`RowAddrTranslator`]: the page's
+    /// addresses are translated first, so a batch translator performs one
+    /// bounded translation per page.
+    pub async fn remap_batch_with(
+        batch: RecordBatch,
+        translator: &RowAddrTranslator,
+    ) -> Result<RecordBatch> {
+        let row_ids = batch.column(IDS_COL_IDX).as_primitive::<UInt64Type>();
+        let resolved = translator.resolve(row_ids.values().iter().copied()).await?;
+        Self::remap_batch(batch, &resolved)
     }
 
     pub fn remap_batch(batch: RecordBatch, mapping: &RowAddrRemap) -> Result<RecordBatch> {
@@ -315,7 +334,12 @@ impl FlatIndex {
 
         // No shortcut possible, need to actually evaluate the query
         let expr = query.to_expr(BTREE_VALUES_COLUMN.to_string());
-        let expr = create_physical_expr(&expr, &self.df_schema, &ExecutionProps::default())?;
+        let expr = create_physical_expr(
+            &expr,
+            &self.df_schema,
+            &ExecutionProps::default(),
+            &PhysicalPlanningContext::default(),
+        )?;
         self.eval_expr(&expr, track_nulls)
     }
 
