@@ -15,7 +15,13 @@ package org.lance.index;
 
 import java.util.OptionalDouble;
 
-/** Fragment coverage summary for a logical index across all of its physical segments. */
+/**
+ * Fragment coverage summary for a logical index across all of its physical segments.
+ *
+ * <p>Counts and the bitmap-size estimate describe the fragment masks exposed for the current query
+ * view. Those masks may be derived, such as after fragment reuse, and need not match the original
+ * manifest entries or physical provenance.
+ */
 public final class IndexFragmentCoverage {
 
   private final long coveredFragmentCount;
@@ -57,7 +63,13 @@ public final class IndexFragmentCoverage {
     return staleFragmentCount;
   }
 
-  /** Serialized size of all physical segment fragment bitmaps in bytes. */
+  /**
+   * Sum of the serialized sizes of the segment fragment masks used to derive this coverage, in
+   * bytes.
+   *
+   * <p>This is an estimate for the described masks. It is not necessarily the number of bytes
+   * persisted in a manifest or the size of the index's original physical fragment provenance.
+   */
   public long getFragmentBitmapSizeBytes() {
     return fragmentBitmapSizeBytes;
   }

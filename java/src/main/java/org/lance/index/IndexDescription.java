@@ -21,7 +21,7 @@ import java.util.Optional;
  * High-level description of an index, aggregating metadata across all segments.
  *
  * <p>This mirrors the Rust {@code IndexDescription} trait and is returned from {@code
- * Dataset.describeIndices}.
+ * Dataset.describeIndices} and {@code Dataset.describeIndexSummaries}.
  */
 public final class IndexDescription {
 
@@ -155,8 +155,13 @@ public final class IndexDescription {
   /**
    * Aggregate fragment coverage for this logical index.
    *
+   * <p>Counts and the bitmap-size estimate describe the fragment bitmaps exposed for the current
+   * query view. Those bitmaps may be derived and need not match the original manifest entries or
+   * physical provenance.
+   *
    * @return coverage counts and bitmap size, or empty when fragment coverage is unknown or not
-   *     applicable, including for system indexes
+   *     applicable, including for system indexes and externally maintained indices that use an
+   *     empty bitmap for coverage stored in their payload
    */
   public Optional<IndexFragmentCoverage> getFragmentCoverage() {
     return Optional.ofNullable(fragmentCoverage);

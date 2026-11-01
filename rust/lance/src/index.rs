@@ -2300,6 +2300,14 @@ struct IndexDescriptionImpl {
     fragment_coverage: Option<IndexFragmentCoverage>,
 }
 
+fn is_externally_maintained_index(metadata: &IndexMetadata) -> bool {
+    metadata.index_details.as_ref().is_some_and(|details| {
+        scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+            .get_plugin_by_details(details)
+            .is_ok_and(|plugin| !plugin.supports_optimization())
+    })
+}
+
 impl IndexDescriptionImpl {
     async fn try_new(segments: Vec<IndexMetadata>, dataset: &Dataset) -> Result<Self> {
         if segments.is_empty() {
@@ -2393,6 +2401,7 @@ impl IndexDescriptionImpl {
         let mut missing_fragment_refs = 0u64;
         let mut indexed_fragments = RoaringBitmap::new();
         let mut fragment_bitmap_size_bytes = 0u64;
+        let mut fragment_coverage_unknown = false;
         // System-index bitmaps have index-specific meanings (for example,
         // fragment-reuse participation), not data-index coverage.
         let reports_fragment_coverage = !is_system_index(example_metadata);
@@ -2408,6 +2417,12 @@ impl IndexDescriptionImpl {
                 return Err(Error::index("Fragment bitmap is required for index description.  This index must be retrained to support this method.".to_string()));
             };
 
+            // Externally maintained indices can keep coverage in their own
+            // payload and deliberately declare an empty bitmap. A genuinely
+            // empty built-in index still has known zero coverage.
+            if is_externally_maintained_index(shard) && fragment_bitmap.is_empty() {
+                fragment_coverage_unknown = true;
+            }
             indexed_fragments |= fragment_bitmap;
             let serialized_size = shard.fragment_bitmap_serialized_size().ok_or_else(|| {
                 Error::index("Fragment bitmap disappeared while describing index".to_string())
@@ -2437,7 +2452,7 @@ impl IndexDescriptionImpl {
             "described index row coverage from fragment metadata"
         );
 
-        let fragment_coverage = if reports_fragment_coverage {
+        let fragment_coverage = if reports_fragment_coverage && !fragment_coverage_unknown {
             let current_fragments = fragment_rows.keys().copied().collect::<RoaringBitmap>();
             Some(IndexFragmentCoverage {
                 covered_fragment_count: indexed_fragments.intersection_len(&current_fragments),
@@ -3779,11 +3794,7 @@ async fn collect_regular_indices_statistics(
         // Externally maintained indices can keep coverage in their own payload
         // and deliberately declare an empty bitmap. Other empty indices carry
         // only a definition until there is enough data to train them.
-        let is_externally_maintained = meta.index_details.as_ref().is_some_and(|details| {
-            scalar::SCALAR_INDEX_PLUGIN_REGISTRY
-                .get_plugin_by_details(details)
-                .is_ok_and(|plugin| !plugin.supports_optimization())
-        });
+        let is_externally_maintained = is_externally_maintained_index(meta);
         if !is_externally_maintained
             && meta
                 .fragment_bitmap
@@ -9704,6 +9715,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_describe_indices_fragment_coverage_unions_segments() {
+        let reader = gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1));
+        let dataset = Dataset::write(
+            reader,
+            "memory://fragment-coverage-union",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 4);
+
+        let field_id = dataset.schema().field("id").unwrap().id;
+        let index_details =
+            Arc::new(prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap());
+        let segment = |fragment_ids: &[u32]| IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "id_idx".to_string(),
+            fields: vec![field_id],
+            covering_fields: vec![],
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(fragment_ids.iter().copied().collect()),
+            index_details: Some(index_details.clone()),
+            index_version: IndexType::BTree.version(),
+            created_at: None,
+            base_id: None,
+            files: None,
+            clustering_id: None,
+            metadata: Default::default(),
+        };
+
+        // Query-time fragment reuse can make two segment masks overlap. Union
+        // them before comparing with the current dataset fragment ids.
+        let first = segment(&[0, 1, 99]);
+        let second = segment(&[1, 2]);
+        let expected_bitmap_size = u64::try_from(first.fragment_bitmap_serialized_size().unwrap())
+            .unwrap()
+            + u64::try_from(second.fragment_bitmap_serialized_size().unwrap()).unwrap();
+        let description = IndexDescriptionImpl::try_new(vec![first, second], &dataset)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            description.fragment_coverage(),
+            Some(&IndexFragmentCoverage {
+                covered_fragment_count: 3,
+                current_fragment_count: 4,
+                missing_fragment_count: 1,
+                stale_fragment_count: 1,
+                fragment_bitmap_size_bytes: expected_bitmap_size,
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn test_describe_indices_derives_type_from_url_without_plugin() {
         // When index details exist but no plugin is registered for the type
         // URL, the index type is derived from the type URL rather than being
@@ -9778,6 +9848,26 @@ mod tests {
         assert_eq!(
             stats["num_indexed_rows"], 0,
             "Empty index should have zero indexed rows"
+        );
+        let descriptions = dataset.describe_indices(None).await.unwrap();
+        assert_eq!(descriptions.len(), 1);
+        let current_fragment_count = u64::try_from(dataset.fragments().len()).unwrap();
+        let fragment_bitmap_size_bytes = u64::try_from(
+            dataset.load_indices().await.unwrap()[0]
+                .fragment_bitmap_serialized_size()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            descriptions[0].fragment_coverage(),
+            Some(&IndexFragmentCoverage {
+                covered_fragment_count: 0,
+                current_fragment_count,
+                missing_fragment_count: current_fragment_count,
+                stale_fragment_count: 0,
+                fragment_bitmap_size_bytes,
+            }),
+            "an empty built-in index has known zero coverage"
         );
 
         // Append new data using lance_datagen

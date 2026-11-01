@@ -2738,6 +2738,9 @@ public class DatasetTest {
         assertEquals(coverage.getStaleFragmentCount(), summaryCoverage.getStaleFragmentCount());
         assertEquals(
             coverage.getFragmentBitmapSizeBytes(), summaryCoverage.getFragmentBitmapSizeBytes());
+        assertTrue(
+            new IndexFragmentCoverage(0, 0, 0, 0, 0).getCoverageRatio().isEmpty(),
+            "an empty fragment set has no coverage ratio");
 
         descriptions = dataset.describeIndices();
         assertEquals(2, descriptions.size(), "Expected exactly one matching index");

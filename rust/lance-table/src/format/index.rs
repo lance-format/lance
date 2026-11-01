@@ -123,11 +123,12 @@ pub struct IndexMetadata {
 }
 
 impl IndexMetadata {
-    /// Returns the size of the fragment bitmap in its manifest serialization.
+    /// Returns the run-optimized serialized size of this fragment bitmap.
     ///
     /// Fragment bitmaps are run-optimized before they are persisted. This method
-    /// applies the same optimization so callers can report the stored metadata
-    /// size without serializing or exporting the bitmap itself.
+    /// applies the same optimization without serializing or exporting the
+    /// bitmap itself. The bitmap can be a query-time derived view, so this size
+    /// need not match the original manifest bytes.
     pub fn fragment_bitmap_serialized_size(&self) -> Option<usize> {
         let mut bitmap = self.fragment_bitmap.clone()?;
         bitmap.optimize();

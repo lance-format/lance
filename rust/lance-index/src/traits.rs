@@ -331,7 +331,12 @@ pub struct IndexFragmentCoverage {
     pub missing_fragment_count: u64,
     /// Number of indexed fragments that are no longer in the current dataset.
     pub stale_fragment_count: u64,
-    /// Serialized size of all physical segment fragment bitmaps in bytes.
+    /// Sum of the serialized sizes of the segment fragment bitmaps used to
+    /// derive this coverage, in bytes.
+    ///
+    /// The bitmaps may be derived for the current query view (for example, by
+    /// fragment reuse), so this estimate need not match the bytes persisted in
+    /// the manifest or the original physical provenance of every segment.
     pub fragment_bitmap_size_bytes: u64,
 }
 
@@ -349,10 +354,11 @@ pub trait IndexDescription: Send + Sync {
     /// within the dataset.
     fn name(&self) -> &str;
 
-    /// Returns the index metadata
+    /// Returns the index metadata used by this description.
     ///
-    /// This is the raw metadata information stored in the manifest.  There is one
-    /// IndexMetadata for each segment of the index.
+    /// There is one `IndexMetadata` for each segment of the index. In a query
+    /// view, fields such as fragment coverage may be derived and therefore need
+    /// not equal the raw values stored in the manifest.
     fn metadata(&self) -> &[IndexMetadata];
 
     /// Returns the physical index segments that make up this logical index.
@@ -408,9 +414,13 @@ pub trait IndexDescription: Send + Sync {
 
     /// Returns aggregate fragment coverage for this logical index.
     ///
+    /// Counts and the bitmap-size estimate describe the fragment bitmaps
+    /// exposed by [`Self::metadata`] for the current query view. Those bitmaps
+    /// may be derived and need not match the original manifest entries.
+    ///
     /// Returns `None` for system indices, whose bitmaps have index-specific
-    /// semantics, or when any segment has no fragment bitmap and coverage is
-    /// unknown.
+    /// semantics, or when any segment's coverage cannot be represented by its
+    /// fragment bitmap.
     fn fragment_coverage(&self) -> Option<&IndexFragmentCoverage> {
         None
     }
