@@ -2435,19 +2435,17 @@ fn null_where_column_is<'a>(
             let column = null_where_column_is(left, index_info)?;
             (null_where_column_is(right, index_info)? == column).then_some(column)
         }
-        Expr::BinaryExpr(BinaryExpr { left, op, right })
-            if matches!(
-                op,
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op:
                 Operator::Eq
-                    | Operator::NotEq
-                    | Operator::Lt
-                    | Operator::LtEq
-                    | Operator::Gt
-                    | Operator::GtEq
-            ) =>
-        {
-            against_literals(left, &[right])
-        }
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq,
+            right,
+        }) => against_literals(left, &[right]),
         Expr::Between(between) => against_literals(&between.expr, &[&between.low, &between.high]),
         Expr::InList(in_list) => {
             against_literals(&in_list.expr, &in_list.list.iter().collect::<Vec<_>>())
