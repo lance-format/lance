@@ -157,6 +157,62 @@ where
 /// Use this entry when zone statistics can be computed independently. The
 /// factory and statistics cross the CPU-pool boundary; the processor itself is
 /// constructed and consumed on the worker thread.
+///
+/// ```rust,no_run
+/// use std::sync::Arc;
+///
+/// use arrow_array::{ArrayRef, Int32Array, RecordBatch, UInt64Array};
+/// use arrow_schema::{DataType, Field, Schema};
+/// use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+/// use futures::stream;
+/// use lance_core::{Result, ROW_ADDR};
+/// use lance_index::scalar::zoned::{ParallelZoneTrainer, ZoneBound, ZoneProcessor};
+///
+/// #[derive(Default)]
+/// struct Sum(i32);
+///
+/// impl ZoneProcessor for Sum {
+///     type ZoneStatistics = i32;
+///
+///     fn process_chunk(&mut self, values: &ArrayRef) -> Result<()> {
+///         let values = values.as_any().downcast_ref::<Int32Array>().unwrap();
+///         self.0 += values.values().iter().copied().sum::<i32>();
+///         Ok(())
+///     }
+///
+///     fn finish_zone(&mut self, _bound: ZoneBound) -> Result<Self::ZoneStatistics> {
+///         Ok(std::mem::take(&mut self.0))
+///     }
+///
+///     fn reset(&mut self) -> Result<()> {
+///         self.0 = 0;
+///         Ok(())
+///     }
+/// }
+///
+/// async fn train() -> Result<()> {
+///     let schema = Arc::new(Schema::new(vec![
+///         Field::new("value", DataType::Int32, false),
+///         Field::new(ROW_ADDR, DataType::UInt64, false),
+///     ]));
+///     let batch = RecordBatch::try_new(
+///         schema.clone(),
+///         vec![
+///             Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+///             Arc::new(UInt64Array::from(vec![0, 1, 2])) as ArrayRef,
+///         ],
+///     )?;
+///     let stream = Box::pin(RecordBatchStreamAdapter::new(
+///         schema,
+///         stream::once(async { Ok(batch) }),
+///     ));
+///
+///     let trainer = ParallelZoneTrainer::new(|| Ok(Sum::default()), 2)?;
+///     let (statistics, _) = trainer.train(stream).await?;
+///     assert_eq!(statistics, vec![3, 3]);
+///     Ok(())
+/// }
+/// ```
 pub struct ParallelZoneTrainer<P> {
     processor_factory: Arc<dyn Fn() -> Result<P> + Send + Sync>,
     zone_capacity: u64,
@@ -181,7 +237,8 @@ where
 {
     /// Create a parallel trainer from a pure-CPU processor factory.
     ///
-    /// The factory is invoked once per zone. It must not perform I/O or wait.
+    /// The factory is invoked once during construction and once per zone. It
+    /// must not perform I/O or wait.
     pub fn new(
         processor_factory: impl Fn() -> Result<P> + Send + Sync + 'static,
         zone_capacity: u64,
@@ -363,7 +420,7 @@ impl ZoneSplitAssembler {
             let run_len = row_addrs[self.input_offset..limit]
                 .iter()
                 .take_while(|addr| {
-                    (addr >> 32) == fragment_id
+                    (**addr >> 32) == fragment_id
                         && (!has_alignment
                             || RowAddress::new_from_u64(**addr).row_offset() as u64 / capacity
                                 == zone_index)
@@ -726,7 +783,7 @@ mod tests {
 
         let mut zones = Vec::new();
         let mut nulls = Vec::new();
-        let mut current = Vec::new();
+        let mut current: Vec<(u64, Option<i32>)> = Vec::new();
         for &(addr, value) in rows {
             if !current.is_empty() && current[current.len() - 1].0 >> 32 != addr >> 32 {
                 flush(&mut current, &mut zones);
@@ -980,7 +1037,7 @@ mod tests {
                 Ok(())
             }
 
-            fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
+            fn finish_zone(&mut self, _bound: ZoneBound) -> Result<Self::ZoneStatistics> {
                 Ok(BorrowedStats {
                     sum: std::mem::take(&mut self.sum),
                     _not_send: std::rc::Rc::new(()),
