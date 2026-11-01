@@ -63,6 +63,7 @@ use crate::dataset::write::ExternalBlobMode;
 use crate::session::Session;
 
 use super::manifest::ShardManifestStore;
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -141,10 +142,14 @@ pub struct ShardWriterConfig {
     /// Default: 8,000 batches
     pub max_memtable_batches: usize,
 
-    /// Batch size for parallel HEAD requests when scanning for manifest versions.
+    /// Legacy batch size for parallel manifest HEAD requests.
     ///
-    /// Higher values scan faster but use more parallel requests.
-    /// Default: 2
+    /// This value is ignored because manifest discovery now uses an internal
+    /// adaptive batch size. It is retained for source compatibility.
+    #[deprecated(
+        since = "12.0.0",
+        note = "manifest scan concurrency is managed internally and this field is ignored"
+    )]
     pub manifest_scan_batch_size: usize,
 
     /// Maximum unflushed bytes before applying backpressure.
@@ -278,6 +283,7 @@ pub struct ShardWriterConfig {
     pub backpressure: Option<Arc<dyn BackpressureController>>,
 }
 
+#[allow(deprecated)]
 impl Default for ShardWriterConfig {
     fn default() -> Self {
         Self {
@@ -375,7 +381,15 @@ impl ShardWriterConfig {
         self
     }
 
-    /// Set manifest scan batch size.
+    /// Retain a legacy manifest scan batch size without changing scan behavior.
+    ///
+    /// Manifest discovery now uses an internal adaptive batch size, so `size`
+    /// is ignored.
+    #[allow(deprecated)]
+    #[deprecated(
+        since = "12.0.0",
+        note = "manifest scan concurrency is managed internally and this method has no effect"
+    )]
     pub fn with_manifest_scan_batch_size(mut self, size: usize) -> Self {
         self.manifest_scan_batch_size = size;
         self
@@ -2836,12 +2850,11 @@ impl ShardWriter {
         }
 
         let shard_id = config.shard_id;
-        let manifest_store = Arc::new(ShardManifestStore::new(
+        let manifest_store = Arc::new(ShardManifestStore::new_adaptive(
             object_store.clone(),
             &base_path,
             &config.dir_id,
             shard_id,
-            config.manifest_scan_batch_size,
         ));
 
         // Derive PK metadata and run every side-effect-free validation *before*
@@ -5497,6 +5510,7 @@ pub fn new_shared_stats() -> SharedWriteStats {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::Dataset;
@@ -13214,6 +13228,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod shard_writer_tests {
     use std::sync::Arc;
 
@@ -13360,6 +13375,8 @@ mod shard_writer_tests {
         );
         // Every tunable field is present.
         assert!(defaults.contains_key("enable_memtable"));
+        // The ignored legacy setting is no longer persisted as a writer default.
+        assert!(!defaults.contains_key("manifest_scan_batch_size"));
         // add_writer_config_default records arbitrary keys.
         assert_eq!(
             defaults.get("custom_knob").map(String::as_str),
