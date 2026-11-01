@@ -28,6 +28,11 @@ use crate::distance::{
 ///
 pub trait L2: Num {
     /// Calculate the L2 distance between two vectors.
+    ///
+    /// # Panics
+    ///
+    /// The implementations in this crate panic if `x` and `y` have different
+    /// lengths. A downstream implementation may define different behavior.
     fn l2(x: &[Self], y: &[Self]) -> f32;
 
     /// Writes the L2 distance from `x` to each `dimension`-sized vector in
@@ -41,7 +46,8 @@ pub trait L2: Num {
     ///
     /// # Panics
     ///
-    /// Panics if `x.len() != dimension`, if `batch.len()` is not a multiple of
+    /// The default implementation panics if `dimension == 0`, if
+    /// `x.len() != dimension`, if `batch.len()` is not a multiple of
     /// `dimension`, or if `output.len() != batch.len() / dimension`.
     fn l2_batch_into(x: &[Self], batch: &[Self], dimension: usize, output: &mut [f32]) {
         assert_batch_output_layout(x.len(), batch.len(), dimension, output.len());
@@ -51,6 +57,12 @@ pub trait L2: Num {
     }
 }
 
+/// Squared L2 distance between two vectors of any [`L2`] element type.
+///
+/// # Panics
+///
+/// The implementations in this crate panic if `from` and `to` have different
+/// lengths. A downstream [`L2`] implementation may define different behavior.
 #[inline]
 pub fn l2<T: L2>(from: &[T], to: &[T]) -> f32 {
     T::l2(from, to)
@@ -63,12 +75,20 @@ pub fn l2<T: L2>(from: &[T], to: &[T]) -> f32 {
 /// to [`l2`], whose x86_64 implementation selects the best runtime-supported
 /// kernel. This entry point gives hot-path callers such as the in-memory HNSW
 /// index an explicit f32 API.
+///
+/// # Panics
+///
+/// Panics if `x` and `y` have different lengths.
 #[inline]
 pub fn l2_f32(x: &[f32], y: &[f32]) -> f32 {
     f32::l2(x, y)
 }
 
 /// Calculate L2 distance between two uint8 slices.
+///
+/// # Panics
+///
+/// Panics if `key` and `target` have different lengths.
 #[inline]
 pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
     assert_equal_lengths(key.len(), target.len());
@@ -98,6 +118,11 @@ pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
 /// It relies on LLVM for auto-vectorization and unrolling.
 ///
 /// This is pub for test/benchmark only. use [l2] instead.
+///
+/// # Panics
+///
+/// Panics if `from` and `to` have different lengths, and separately if `LANES`
+/// is zero, which `as_chunks` rejects.
 #[inline(always)]
 pub fn l2_scalar<
     T: AsPrimitive<Output>,
@@ -913,6 +938,14 @@ pub struct L2Prepared {
 
 impl L2Prepared {
     /// Transpose `targets` from AoS `[num_targets][dimension]` to SoA layout.
+    ///
+    /// `targets.len()` must be a multiple of `dimension`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dimension` is zero. With debug assertions on, also panics if
+    /// `targets.len()` is not a multiple of `dimension`; without them the
+    /// trailing partial vector is dropped.
     pub fn new(targets: &[f32], dimension: usize) -> Self {
         let num_targets = targets.len() / dimension;
         debug_assert_eq!(targets.len(), num_targets * dimension);
@@ -933,7 +966,13 @@ impl L2Prepared {
 
     /// Compute L2 distances from `query` to every target, writing into `out`.
     ///
-    /// `out` must have length `num_targets`. It will be zeroed before accumulation.
+    /// `query` must have length `dimension` and `out` must have length
+    /// `num_targets`. `out` will be zeroed before accumulation.
+    ///
+    /// # Panics
+    ///
+    /// With debug assertions on, panics unless both lengths match. A `query`
+    /// longer than `dimension` can also panic on a slice range without them.
     pub fn distances_into(&self, query: &[f32], out: &mut [f32]) {
         debug_assert_eq!(query.len(), self.dimension);
         debug_assert_eq!(out.len(), self.num_targets);
@@ -946,6 +985,13 @@ impl L2Prepared {
     }
 
     /// Compute L2 distances from `query` to every target.
+    ///
+    /// `query` must have length `dimension`.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the conditions [`Self::distances_into`] documents, with the
+    /// same debug/release behavior.
     pub fn distances(&self, query: &[f32]) -> Vec<f32> {
         let mut result = vec![0.0f32; self.num_targets];
         self.distances_into(query, &mut result);
@@ -954,8 +1000,14 @@ impl L2Prepared {
 
     /// Return the index of the nearest target to `query`, using `buf` as scratch space.
     ///
-    /// `buf` must have length `num_targets`. NaN distances are ignored; on ties the
-    /// lowest index wins. Returns `None` if there are no targets or no distance is finite.
+    /// `query` must have length `dimension`, and `buf` must have length
+    /// `num_targets`. NaN distances are ignored; on ties the lowest index wins.
+    /// Returns `None` if there are no targets or no distance is finite.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the conditions [`Self::distances_into`] documents, with the
+    /// same debug/release behavior.
     pub fn nearest_into(&self, query: &[f32], buf: &mut [f32]) -> Option<u32> {
         self.distances_into(query, buf);
         let distances: &[f32] = buf;
@@ -969,6 +1021,13 @@ impl L2Prepared {
     }
 
     /// Return the index of the nearest target to `query`.
+    ///
+    /// `query` must have length `dimension`.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the conditions [`Self::distances_into`] documents, with the
+    /// same debug/release behavior.
     pub fn nearest(&self, query: &[f32]) -> Option<u32> {
         self.nearest_into(query, &mut vec![0.0f32; self.num_targets])
     }
@@ -990,6 +1049,10 @@ impl L2Prepared {
 }
 
 /// Compute L2 distance between two vectors.
+///
+/// # Panics
+///
+/// Panics if `from` and `to` have different lengths.
 #[inline]
 pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
     l2(from, to)
@@ -1000,8 +1063,9 @@ pub fn l2_distance(from: &[f32], to: &[f32]) -> f32 {
 ///
 /// # Panics
 ///
-/// Panics if `from.len() != dimension`, if `to.len()` is not a multiple of
-/// `dimension`, or if `output.len() != to.len() / dimension`.
+/// The implementations in this crate panic if `dimension == 0`, if
+/// `from.len() != dimension`, if `to.len()` is not a multiple of `dimension`,
+/// or if `output.len() != to.len() / dimension`.
 ///
 /// ```
 /// # use lance_linalg::distance::l2_distance_batch_into;
