@@ -21,9 +21,9 @@
 //! interface: one-way digests cannot support either operation without
 //! retaining the logical strings that fixed-size keys are designed to remove.
 //! Callers that know which logical entries have become stale rebuild the exact
-//! [`CacheKey`]s and remove them one by one through
-//! [`invalidate`](Self::invalidate). Existing callers should migrate removed
-//! symbols as follows:
+//! [`CacheKey`](crate::cache::CacheKey)s and remove them one by one through
+//! [`invalidate`](CacheBackend::invalidate). Existing callers should migrate
+//! removed symbols as follows:
 //! - replace `with_backend_and_prefix(backend, prefix)` with
 //!   [`LanceCache::with_backend`](super::LanceCache::with_backend) followed by
 //!   [`LanceCache::with_key_prefix`](super::LanceCache::with_key_prefix);
@@ -179,8 +179,8 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
     /// This is the only invalidation operation on this trait. Cache keys are
     /// one-way digests, so backends cannot match by logical prefix; callers
     /// that know which logical entries have become stale (for example, cleanup
-    /// after it deletes a version's files) rebuild the exact [`CacheKey`]s and
-    /// invalidate them one by one.
+    /// after it deletes a version's files) rebuild the exact
+    /// [`CacheKey`](crate::cache::CacheKey)s and invalidate them one by one.
     ///
     /// The default is a best-effort no-op so external implementations keep
     /// compiling without it: stale entries in such a backend age out through

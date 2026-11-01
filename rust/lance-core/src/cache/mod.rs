@@ -654,7 +654,7 @@ impl LanceCache {
     /// files it just deleted.
     ///
     /// Removal is only as supported as the backend allows: a backend leaving
-    /// [`CacheBackend::invalidate`](crate::cache::backend::CacheBackend::invalidate)
+    /// [`CacheBackend::invalidate`]
     /// defaulted keeps its entries until capacity-based eviction retires them.
     ///
     /// # Examples
