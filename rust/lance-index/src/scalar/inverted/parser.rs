@@ -27,7 +27,7 @@ impl JsonParser for MatchQuery {
             .map(|v| v as f32)
             .unwrap_or(Self::default_boost());
         let fuzziness = match &value["fuzziness"] {
-            Value::String(s) if s.as_str() == "auto" => None,
+            Value::String(s) if s.eq_ignore_ascii_case("auto") => None,
             Value::String(s) => {
                 return Err(Error::invalid_input(format!(
                     "fuzziness must be a non-negative integer or \"auto\", got \"{s}\""
@@ -302,7 +302,7 @@ mod tests {
     fn test_from_json_match_invalid_fuzziness_rejected() {
         // Present-but-invalid fuzziness must be rejected instead of silently
         // coercing to exact match (Some(0)) or truncating modulo 2^32.
-        for fuzziness in ["4294967296", "\"AUTO\"", "\"1\"", "1.5", "-1", "true"] {
+        for fuzziness in ["4294967296", "\"fuzzy\"", "\"1\"", "1.5", "-1", "true"] {
             let json = format!(
                 r#"{{ "match": {{ "column": "text", "terms": "hello", "fuzziness": {fuzziness} }} }}"#
             );
@@ -313,13 +313,17 @@ mod tests {
             );
         }
 
-        // The one accepted string spelling keeps its "determine automatically"
-        // meaning.
-        let json = r#"{ "match": { "column": "text", "terms": "hello", "fuzziness": "auto" } }"#;
-        let FtsQuery::Match(query) = from_json(json).unwrap() else {
-            panic!("expected match query");
-        };
-        assert_eq!(query.fuzziness, None);
+        // "auto", in any case like the operator, keeps its "determine
+        // automatically" meaning.
+        for auto in ["auto", "AUTO"] {
+            let json = format!(
+                r#"{{ "match": {{ "column": "text", "terms": "hello", "fuzziness": "{auto}" }} }}"#
+            );
+            let FtsQuery::Match(query) = from_json(&json).unwrap() else {
+                panic!("expected match query");
+            };
+            assert_eq!(query.fuzziness, None);
+        }
     }
 
     #[test]
