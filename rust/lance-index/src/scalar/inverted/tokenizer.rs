@@ -844,8 +844,8 @@ impl InvertedIndexParams {
     /// Set whether to store the position of the term in the document.
     /// This can significantly increase the size of the index.
     /// If false, only store the frequency of the term in the document.
-    /// This is not supported with the `ngram` tokenizer; requesting both is
-    /// rejected with an error.
+    /// This is not supported with the `ngram` tokenizer; creating an index with
+    /// both is rejected.
     /// Default to `false`.
     pub fn with_position(mut self, with_position: bool) -> Self {
         self.with_position = with_position;
@@ -1074,6 +1074,14 @@ impl InvertedIndexParams {
             default_format_version,
         )?);
         params.validate_format_version()?;
+        // The ngram tokenizer puts every token at position 0, so its positions
+        // carry nothing a phrase query could use. Rejected only when an index
+        // is created: indexes built this way by earlier releases still load.
+        if params.with_position && params.base_tokenizer == "ngram" {
+            return Err(Error::invalid_input(
+                "with_position is not supported with base_tokenizer='ngram'".to_string(),
+            ));
+        }
         Ok(params)
     }
 
@@ -1130,14 +1138,6 @@ impl InvertedIndexParams {
 
     fn validate(&self) -> Result<()> {
         validate_block_size(self.block_size)?;
-        // The ngram tokenizer emits every token at position 0, so a position
-        // stream built from it carries no information. Reject the combination
-        // instead of silently storing useless (and large) position data.
-        if self.with_position && self.base_tokenizer == "ngram" {
-            return Err(Error::invalid_input(
-                "with_position is not supported with base_tokenizer='ngram'".to_string(),
-            ));
-        }
         if self.base_tokenizer != "code"
             && (self.split_identifiers
                 || self.split_on_numerics
@@ -1561,17 +1561,19 @@ mod tests {
     }
 
     #[test]
-    fn test_build_rejects_with_position_for_ngram_tokenizer() {
-        let err = InvertedIndexParams::default()
-            .base_tokenizer("ngram".to_string())
-            .with_position(true)
-            .build()
-            .unwrap_err();
+    fn test_creation_rejects_with_position_for_ngram_tokenizer() {
+        let params = r#"{"base_tokenizer": "ngram", "with_position": true}"#;
+        let err = InvertedIndexParams::from_training_json(params).unwrap_err();
         assert!(matches!(&err, Error::InvalidInput { .. }));
         assert!(
             err.to_string()
                 .contains("with_position is not supported with base_tokenizer='ngram'")
         );
+
+        // An existing index with these params still loads and builds its tokenizer.
+        let loaded: InvertedIndexParams = serde_json::from_str(params).unwrap();
+        assert!(loaded.with_position);
+        loaded.build().unwrap();
     }
 
     #[test]
