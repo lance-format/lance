@@ -87,6 +87,9 @@ pub struct CreateIndexBuilder<'a> {
     progress: Arc<dyn IndexBuildProgress>,
     /// Transaction properties to store with this commit.
     transaction_properties: Option<Arc<HashMap<String, String>>>,
+    /// The parameters come from an existing index, which may carry settings a
+    /// new index is refused, see [`InvertedIndexParams::validate_for_creation`].
+    is_copy_of_existing: bool,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -109,7 +112,14 @@ impl<'a> CreateIndexBuilder<'a> {
             preprocessed_data: None,
             progress: Arc::new(NoopIndexBuildProgress),
             transaction_properties: None,
+            is_copy_of_existing: false,
         }
+    }
+
+    /// Mark the parameters as copied from an existing index.
+    pub(crate) fn copy_of_existing(mut self) -> Self {
+        self.is_copy_of_existing = true;
+        self
     }
 
     pub fn name(mut self, name: String) -> Self {
@@ -242,7 +252,9 @@ impl<'a> CreateIndexBuilder<'a> {
         } else {
             None
         };
-        if let Some(params) = &inverted_params {
+        if let Some(params) = &inverted_params
+            && !self.is_copy_of_existing
+        {
             params.validate_for_creation()?;
         }
         let resolved_fts_field = if let Some(params) = &inverted_params {

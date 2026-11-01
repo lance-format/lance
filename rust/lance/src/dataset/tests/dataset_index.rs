@@ -8693,6 +8693,20 @@ async fn test_existing_ngram_index_with_positions_keeps_working(
     texts.sort_unstable();
     assert_eq!(texts, ["hello world", "world hello", "yellow"]);
 
+    // Copying the index to another dataset keeps its settings.
+    let target_dir = TempStrDir::default();
+    let rows = dataset
+        .scan()
+        .project(&["text"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(rows.clone())], rows.schema());
+    let mut target = Dataset::write(reader, &target_dir, None).await.unwrap();
+    target.initialize_indices(&dataset).await.unwrap();
+    assert_eq!(target.load_indices().await.unwrap().len(), 1);
+
     // Creating such an index anew is rejected.
     let params = InvertedIndexParams::default()
         .base_tokenizer("ngram".to_string())
@@ -8702,6 +8716,11 @@ async fn test_existing_ngram_index_with_positions_keeps_working(
         .await
         .unwrap_err();
     assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+    assert!(
+        err.to_string()
+            .contains("with_position is not supported with base_tokenizer='ngram'"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
