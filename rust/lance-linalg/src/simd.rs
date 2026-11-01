@@ -67,17 +67,12 @@ pub trait SIMD<T: Num + Copy, const N: usize>:
     ///
     /// `ptr` must be valid for reads of `N` elements of `T`.
     ///
-    /// Most implementations also require a target feature that the build's
-    /// baseline may not provide, and none of them check for it at runtime:
+    /// On loongarch64, `f32x8`, `f32x16`, `f64x4`, `f64x8`, and `i32x8`
+    /// additionally require LASX. These implementations do not check for it at
+    /// runtime, and calling one without LASX is undefined behavior.
     ///
-    /// - `f32x8`, `f32x16`, `f64x4`, `f64x8` and `i32x8` need AVX on x86_64 and
-    ///   LASX on loongarch64;
-    /// - `u8x16` needs nothing beyond the baseline on any target.
-    ///
-    /// Calling one without its feature is undefined behaviour rather than a
-    /// wrong answer, so either build with the feature enabled, as
-    /// `.cargo/config.toml` does for `x86_64-unknown-linux-gnu`, or check with
-    /// `is_x86_feature_detected!` first. See #8872.
+    /// `u8x16` has no target-feature requirements beyond the architecture
+    /// baseline.
     unsafe fn load_unaligned(ptr: *const T) -> Self;
 
     /// Store the values to aligned memory.
