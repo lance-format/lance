@@ -72,6 +72,9 @@ impl PrimitiveFieldEncoding {
         }
     }
 
+    /// Compose a primitive encoder at an already allocated physical column.
+    /// File grammars use this when another logical type, such as a Blob,
+    /// supplies the physical descriptor field instead of the logical field.
     fn create_at(
         &self,
         field: Field,

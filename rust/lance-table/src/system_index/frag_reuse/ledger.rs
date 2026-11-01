@@ -60,6 +60,7 @@ pub struct Transition {
     sources: Vec<pb::FragmentDigest>,
     destinations: Vec<pb::FragmentDigest>,
     mapping: Mapping,
+    legacy_dataset_version: Option<u64>,
 }
 
 impl Transition {
@@ -82,6 +83,14 @@ impl Transition {
     /// Mapping semantics for a supported index version.
     pub fn mapping(&self) -> &Mapping {
         &self.mapping
+    }
+
+    /// Some for a transition lifted from a v0 `Version` (wire field 1): that
+    /// version's `dataset_version`, the stamp the v0 `data_predates_version`
+    /// rule compares a segment against. None for a tagged transition, whose
+    /// provenance is never swapped.
+    pub fn legacy_dataset_version(&self) -> Option<u64> {
+        self.legacy_dataset_version
     }
 }
 
@@ -182,15 +191,18 @@ impl FragReuseLedger {
                     let version = pb::Version::decode(require_message(tag, payload)?)
                         .map_err(|e| corrupt(e.to_string()))?;
                     for group in version.groups {
-                        transitions.push(decode_transition(pb::Transition {
-                            sources: group.old_fragments,
-                            destinations: group.new_fragments,
-                            mapping: Some(transition::Mapping::OrderedCompaction(
-                                pb::OrderedCompaction {
-                                    changed_row_addrs: group.changed_row_addrs,
-                                },
-                            )),
-                        })?);
+                        transitions.push(decode_transition(
+                            pb::Transition {
+                                sources: group.old_fragments,
+                                destinations: group.new_fragments,
+                                mapping: Some(transition::Mapping::OrderedCompaction(
+                                    pb::OrderedCompaction {
+                                        changed_row_addrs: group.changed_row_addrs,
+                                    },
+                                )),
+                            },
+                            Some(version.dataset_version),
+                        )?);
                     }
                 }
                 2 => {
@@ -226,9 +238,19 @@ impl FragReuseLedger {
                     }
                     let decoded =
                         pb::Transition::decode(raw).map_err(|e| corrupt(e.to_string()))?;
-                    transitions.push(decode_transition(decoded)?);
+                    transitions.push(decode_transition(decoded, None)?);
                 }
-                _ => {} // Unknown envelope fields do not participate in address resolution.
+                _ => {
+                    // An unknown envelope record does not participate in
+                    // address resolution here, but it may carry lineage or
+                    // row-map references this build cannot see, so the ledger
+                    // is not fully interpretable: maintenance (trim, remap,
+                    // row-map collection) and writers extending the history
+                    // must refuse, exactly as they do for a transition with
+                    // an unknown mapping. Reads are unaffected (the reader
+                    // only logs this flag).
+                    has_unsupported_transitions = true;
+                }
             }
         }
         let transitions = order_lineage(transitions)?;
@@ -260,8 +282,10 @@ impl FragReuseLedger {
         })
     }
 
-    /// Whether decoding omitted transitions this implementation cannot interpret.
-    /// Such a ledger is insufficient for maintenance; carrying the original
+    /// Whether decoding omitted content this implementation cannot interpret:
+    /// a transition with unknown fields or an unknown mapping, or an unknown
+    /// envelope-level record. Such a ledger is insufficient for maintenance
+    /// (and for writers extending the history); carrying the original
     /// serialized details forward without interpreting them is still possible.
     pub fn has_unsupported_transitions(&self) -> bool {
         self.has_unsupported_transitions
@@ -383,7 +407,10 @@ fn validate_digests(digests: &[pb::FragmentDigest], is_destination: bool) -> Res
     Ok(live_rows)
 }
 
-fn decode_transition(value: pb::Transition) -> Result<Transition> {
+fn decode_transition(
+    value: pb::Transition,
+    legacy_dataset_version: Option<u64>,
+) -> Result<Transition> {
     if value.sources.is_empty() {
         return Err(corrupt("transition has no source fragments"));
     }
@@ -446,6 +473,7 @@ fn decode_transition(value: pb::Transition) -> Result<Transition> {
         sources: value.sources,
         destinations: value.destinations,
         mapping,
+        legacy_dataset_version,
     })
 }
 
@@ -697,6 +725,26 @@ mod tests {
         message_field(2, &raw, &mut content);
         let ledger = FragReuseLedger::decode_content(1, content.into()).unwrap();
         assert!(ledger.transitions().is_empty());
+        assert!(ledger.has_unsupported_transitions());
+    }
+
+    /// An unknown envelope-level record may carry lineage or row-map
+    /// references this build cannot see: the known transitions still decode
+    /// (reads proceed), but the ledger reports itself uninterpretable so
+    /// maintenance and history-extending writers refuse.
+    #[test]
+    fn unknown_envelope_record_marks_ledger_unsupported() {
+        let mut content = history(vec![partition(1, 2)]).to_vec();
+        message_field(9, b"future envelope record", &mut content);
+        let ledger = FragReuseLedger::decode_content(1, content.into()).unwrap();
+        assert_eq!(ledger.transitions().len(), 1);
+        assert!(ledger.has_unsupported_transitions());
+
+        // Non-message unknown envelope fields flag too.
+        let mut content = history(vec![partition(1, 2)]).to_vec();
+        prost::encoding::encode_key(9, WireType::Varint, &mut content);
+        prost::encoding::encode_varint(7, &mut content);
+        let ledger = FragReuseLedger::decode_content(1, content.into()).unwrap();
         assert!(ledger.has_unsupported_transitions());
     }
 

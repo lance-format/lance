@@ -239,6 +239,8 @@ struct SourceDescriptor {
     column_ordinal: usize,
     segment_ordinal: usize,
     partition: Arc<InvertedPartition>,
+    /// The query mask restricted to the rows the segment may report.
+    mask: Arc<RowAddrMask>,
 }
 
 fn staged_candidate_budget(num_docs: usize, limit: usize) -> usize {
@@ -256,7 +258,7 @@ fn leaf_plan_input(leaf: &PreparedCrossColumnLeaf) -> Result<CompoundLeafPlanInp
     let mut costs_by_position = HashMap::<u32, usize>::new();
     let tokens = leaf.query.tokens();
     for token_index in 0..tokens.len() {
-        let position = tokens.position(token_index);
+        let position = tokens.position_for_query(token_index, leaf.params.phrase_slop.is_some());
         let token = tokens.get_token(token_index);
         if seen_terms.insert((position, token.to_owned())) {
             let frequency = leaf.query.scorer().num_docs_containing_token(token);
@@ -553,7 +555,11 @@ async fn prepare_column_leaves(
                 union_terms.push(token.clone());
             }
         }
-        let has_all_positions = has_all_query_positions(&tokens, final_tokens.as_ref());
+        let has_all_positions = has_all_query_positions(
+            &tokens,
+            final_tokens.as_ref(),
+            effective_params.phrase_slop.is_some(),
+        );
         leaf_metadata.push((
             *leaf_ordinal,
             final_tokens,
@@ -697,13 +703,13 @@ async fn load_masked_cross_column_source_for_leaves(
     descriptor: SourceDescriptor,
     prepared_leaves: Arc<Vec<PreparedCrossColumnLeaf>>,
     leaf_ordinals: Vec<usize>,
-    mask: Arc<RowAddrMask>,
     metrics: Arc<dyn MetricsCollector>,
 ) -> Result<Option<LoadedCrossColumnSource>> {
     let SourceDescriptor {
         column_ordinal,
         segment_ordinal,
         partition,
+        mask,
     } = descriptor;
     let viable_leaf_ordinals = viable_leaf_ordinals(
         column_ordinal,
@@ -763,13 +769,13 @@ async fn load_masked_generator_source(
     descriptor: SourceDescriptor,
     prepared_leaves: Arc<Vec<PreparedCrossColumnLeaf>>,
     leaf_ordinals: Vec<usize>,
-    mask: Arc<RowAddrMask>,
     metrics: Arc<dyn MetricsCollector>,
 ) -> Result<Option<LoadedGeneratorSource>> {
     let SourceDescriptor {
         column_ordinal,
         segment_ordinal,
         partition,
+        mask,
     } = descriptor;
     let viable_leaf_ordinals = viable_leaf_ordinals(
         column_ordinal,
@@ -811,21 +817,14 @@ async fn load_masked_cross_column_source(
     descriptor: SourceDescriptor,
     prepared_leaves: Arc<Vec<PreparedCrossColumnLeaf>>,
     leaves_by_column: Arc<Vec<Vec<usize>>>,
-    mask: Arc<RowAddrMask>,
     metrics: Arc<dyn MetricsCollector>,
 ) -> Result<Option<LoadedCrossColumnSource>> {
     let leaf_ordinals = leaves_by_column
         .get(descriptor.column_ordinal)
         .cloned()
         .ok_or_else(|| Error::internal("cross-column FTS source references a missing column"))?;
-    load_masked_cross_column_source_for_leaves(
-        descriptor,
-        prepared_leaves,
-        leaf_ordinals,
-        mask,
-        metrics,
-    )
-    .await
+    load_masked_cross_column_source_for_leaves(descriptor, prepared_leaves, leaf_ordinals, metrics)
+        .await
 }
 
 async fn load_candidate_cross_column_source(
@@ -839,7 +838,21 @@ async fn load_candidate_cross_column_source(
         column_ordinal,
         segment_ordinal,
         partition,
+        mask,
     } = descriptor;
+    // Candidates come from every segment; this source may only score the ones its
+    // segment is allowed to report.
+    let candidates = if mask.is_select_all() {
+        candidates
+    } else {
+        Arc::new(
+            candidates
+                .iter()
+                .copied()
+                .filter(|address| mask.selected(*address))
+                .collect(),
+        )
+    };
     let leaf_ordinals = leaves_by_column
         .get(column_ordinal)
         .ok_or_else(|| Error::internal("cross-column FTS source references a missing column"))?;
@@ -1481,10 +1494,12 @@ pub async fn cross_column_compound_search(
         .iter()
         .enumerate()
         .flat_map(|(column_ordinal, (_, indices))| {
+            let mask = mask.clone();
             indices
                 .iter()
                 .enumerate()
                 .flat_map(move |(segment_ordinal, index)| {
+                    let mask = index.restrict_mask(mask.clone());
                     index
                         .partitions
                         .iter()
@@ -1493,6 +1508,7 @@ pub async fn cross_column_compound_search(
                             column_ordinal,
                             segment_ordinal,
                             partition,
+                            mask: mask.clone(),
                         })
                 })
         })
@@ -1535,7 +1551,6 @@ pub async fn cross_column_compound_search(
                 descriptor,
                 prepared_leaves.clone(),
                 leaf_ordinals,
-                mask.clone(),
                 metrics.clone(),
             )
         }))
@@ -1629,7 +1644,6 @@ pub async fn cross_column_compound_search(
                 descriptor,
                 prepared_leaves.clone(),
                 leaves_by_column.clone(),
-                mask.clone(),
                 metrics.clone(),
             )
         }))
@@ -1910,42 +1924,66 @@ mod tests {
         assert_eq!(leaves, vec![(0, 100), (2, 100), (1, 10), (3, 10)]);
     }
 
+    #[rstest::rstest]
+    #[case::aliases(false, false, 10)]
+    #[case::ngram_match(true, false, 3)]
+    #[case::ngram_phrase(true, true, 1010)]
     #[test]
-    fn estimates_generator_cost_by_unique_query_positions() {
+    fn estimates_generator_cost_by_unique_query_positions(
+        #[case] has_independent_groups: bool,
+        #[case] is_phrase_query: bool,
+        #[case] expected_cost: usize,
+    ) {
         let tokens = Tokens::with_positions(
             vec![
                 "rare".to_owned(),
                 "rare_alt".to_owned(),
                 "common".to_owned(),
             ],
-            vec![0, 0, 1],
+            if has_independent_groups {
+                vec![0, 0, 0]
+            } else {
+                vec![0, 0, 1]
+            },
             DocType::Text,
-        );
+        )
+        .with_term_groups(if has_independent_groups {
+            vec![0, 1, 2]
+        } else {
+            vec![0, 0, 1]
+        });
         let leaf = prepared_leaf(
             vec![tokens.clone(), tokens],
             Operator::And,
-            None,
+            is_phrase_query.then_some(0),
             10_000,
             [("rare", 7), ("rare_alt", 3), ("common", 1_000)],
         );
         let input = leaf_plan_input(&leaf).unwrap();
         assert!(input.possible);
-        assert_eq!(input.cost, 10);
+        assert_eq!(input.cost, expected_cost);
         assert_eq!(input.bounds.lower(), 0.0);
         assert_eq!(input.bounds.upper(), f32::INFINITY);
 
         let missing = prepared_leaf(
-            vec![Tokens::with_positions(
-                vec!["rare".to_owned(), "missing".to_owned()],
-                vec![0, 1],
-                DocType::Text,
-            )],
+            vec![
+                Tokens::with_positions(
+                    vec!["rare".to_owned(), "missing".to_owned()],
+                    if has_independent_groups {
+                        vec![0, 0]
+                    } else {
+                        vec![0, 1]
+                    },
+                    DocType::Text,
+                )
+                .with_term_groups(vec![0, 1]),
+            ],
             Operator::And,
-            None,
+            is_phrase_query.then_some(0),
             10_000,
             [("rare", 7), ("missing", 0)],
         );
-        assert!(!leaf_plan_input(&missing).unwrap().possible);
+        assert_eq!(leaf_plan_input(&missing).unwrap().possible, is_phrase_query);
     }
 
     #[test]

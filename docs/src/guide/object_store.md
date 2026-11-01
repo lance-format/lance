@@ -42,6 +42,7 @@ These options apply to all object stores.
 | `client_max_retries`         | Number of times for the object store client to retry the request. Default, `3`.                                                                                                                                                                                                                         |
 | `client_retry_timeout`       | Timeout for the object store client to retry the request in seconds. Default, `180`.                                                                                                                                                                                                                    |
 | `scheduler_error_mode`       | Scheduler error handling. `best_effort` preserves the default behavior. `fail_fast` returns the first observed error and cancels the remaining physical reads in the same logical request. Other requests are not cancelled.                                                                            |
+| `object_store_cache_prune_threshold` | Smallest number of cached object stores at which a session's object store cache sweeps out entries for stores that are no longer in use. Default, `64`; `0` disables the sweep. The cache is shared by every dataset opened with the same session, and the last value seen applies to all of them. Mainly relevant when a shared session opens many tables with distinct storage options, such as tables opened through a namespace that vends per-table credentials. |
 
 An engine can apply `scheduler_error_mode` to every operation in a session by
 adding it to the storage options used for every dataset open. For example, a
@@ -61,6 +62,29 @@ For example, a Lance Spark catalog named `lance` forwards settings below its
 ```bash
 spark-sql --conf "spark.sql.catalog.lance.storage.scheduler_error_mode=fail_fast"
 ```
+
+### Local filesystem durability
+
+Set `local_fsync` to `"true"` for local datasets when writes must be durable
+before they return:
+
+```python
+import lance
+import pyarrow as pa
+
+lance.write_dataset(
+    pa.table({"id": [1]}),
+    "/path/to/data.lance",
+    storage_options={"local_fsync": "true"},
+)
+```
+
+The default is `"false"`. When enabled, Lance syncs local data, transaction,
+and manifest files before reporting successful writes, including copied files
+during deep clones. Local copies use the destination's setting. On Unix it also
+syncs their directory entries, including newly created directories. This increases
+write latency. Pass the option again when reopening a dataset for later writes;
+it is a store setting, not a dataset property. Only `"true"` and `"false"` are accepted.
 
 ### Bulk copy strategy
 
@@ -204,6 +228,36 @@ ds = lance.dataset(
 ```
 
 This can also be done with the `AWS_ENDPOINT` and `AWS_DEFAULT_REGION` environment variables.
+
+!!! warning
+
+    Safe concurrent writes through `s3://` require the store to atomically enforce
+    create-only `PutObject` requests with `If-None-Match: *`. Some S3-compatible
+    stores, including Garage, accept this header but ignore the condition and
+    overwrite existing objects. Concurrent writers can then both report success
+    while silently losing acknowledged data.
+
+    Lance does not check whether the store enforces this condition. Before using
+    concurrent writers, verify that your provider supports atomic conditional
+    writes, or configure a [custom distributed commit lock](#custom-commit-locks)
+    shared by every writer. Reads do not require a commit lock.
+
+#### Custom commit locks
+
+In Python, pass `commit_lock` to `lance.write_dataset` when creating or appending
+to a dataset, and to `lance.dataset` when opening a dataset for subsequent writes.
+The callback accepts the manifest version to commit and returns a context manager
+that acquires a distributed lock on entry and releases it on exit. Hold the lock
+for the entire context and release it even if the commit raises an exception.
+
+Every writer to the same dataset must use the same lock service and lock key for
+that dataset (optionally including the manifest version). The lock must coordinate
+writers across all processes and machines; a process-local lock is insufficient.
+
+Rust applications can provide a
+[`CommitLock`](https://docs.rs/lance-table/latest/lance_table/io/commit/trait.CommitLock.html)
+implementation or a custom
+[`CommitHandler`](https://docs.rs/lance-table/latest/lance_table/io/commit/trait.CommitHandler.html).
 
 ### S3 Express (Directory Bucket)
 
@@ -646,3 +700,87 @@ Environment variables keep the `GOOSEFS_*` form.
     cargo test -p lance-io --features "goosefs goosefs-test" \
         --test goosefs_integration -- --ignored --nocapture --test-threads=1
     ```
+
+### Apache Ozone Configuration
+
+[Apache Ozone](https://ozone.apache.org/) is a Scalable, reliable, distributed storage system 
+optimized for data analytics and object store workloads.  Its S3 Gateway service exposes the standard S3
+REST API, so Lance uses it through the existing S3 code path with no additional
+Rust features required.
+
+#### Prerequisites
+
+1. A secure Ozone cluster(>= 2.2.0 version) with the S3 Gateway service running (default HTTP port `9878`, HTTPS port `9879`).
+2. An Ozone bucket created for Lance datasets, for example:
+
+    ```bash
+    # both OBS (flat) and FSO (file-system-optimized) bucket layouts are supported
+    ozone sh bucket create /s3v/lance
+    ```
+
+3. Credential based on your kerberos keytab via:
+
+    ```bash
+    kinit -kt /etc/security/keytabs/<user>.keytab <user>@YOUR.REALM
+    ozone s3 getsecret
+    # → awsAccessKey=<user>@YOUR.REALM
+    #   awsSecret=<long‑hex‑string>
+    ```
+
+   The command prints an `awsAccessKey` / `awsSecret` pair
+   that maps to the Ozone user's S3 access credentials.
+
+#### Connection
+
+Point `endpoint` at the S3 Gateway address. By default, Ozone's S3 Gateway
+only handles path-style requests (`http://host:port/bucket/key`), so set
+`virtual_hosted_style_request` to `false`. Virtual-hosted style
+(`http://bucket.host:port/key`) is also supported when the gateway is
+configured with `ozone.s3g.domain.name`; in that case you can omit this
+option or set it to `true`.
+
+```python
+import lance
+
+ds = lance.dataset(
+    "s3://lance/path/to/dataset.lance",
+    storage_options={
+        "endpoint": "http://ozone-s3g-host:9878",
+        "region": "us-east-1",               # any non-empty string
+        "access_key_id": "<ozone-access-key>",
+        "secret_access_key": "<ozone-secret-key>",
+        "virtual_hosted_style_request": "false",
+        "allow_http": "true",                # omit when TLS is enabled
+    },
+)
+```
+
+When writing a new dataset:
+
+```python
+import lance
+import pyarrow as pa
+
+table = pa.table({"id": [1, 2, 3], "value": [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]})
+ds = lance.write_dataset(
+    table,
+    "s3://lance/path/to/dataset.lance",
+    storage_options={
+        "endpoint": "http://ozone-s3g-host:9878",
+        "region": "us-east-1",
+        "access_key_id": "<ozone-access-key>",
+        "secret_access_key": "<ozone-secret-key>",
+        "virtual_hosted_style_request": "false",
+        "allow_http": "true",
+    },
+)
+```
+
+| Key | Description |
+|-----|-------------|
+| `endpoint` | Ozone S3 Gateway address (for example, `http://ozone-s3g-host:9878`). Required. |
+| `region` | Any non-empty string (for example, `us-east-1`). Required for S3-compatible stores. |
+| `access_key_id` | Ozone S3 access key obtained via `ozone s3 getsecret`. Required. |
+| `secret_access_key` | Ozone S3 secret key obtained via `ozone s3 getsecret`. Required. |
+| `virtual_hosted_style_request` | Set to `false` for path-style requests (the default Ozone mode). Set to `true` when the gateway is configured with `ozone.s3g.domain.name`. Default, `false`. |
+| `allow_http` | Set to `true` for non-TLS connections. Omit when TLS is enabled. Default, `false`. |
