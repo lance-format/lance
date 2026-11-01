@@ -2824,3 +2824,121 @@ async fn restored_manifest_keeps_the_mark_for_later_submissions() {
     assert_eq!(ids(&dataset), vec![1, 3]);
     assert_eq!(dataset.manifest().max_clustering_id, 3);
 }
+
+/// A commit that states the table-metadata entries it relies on is refused,
+/// with a hard error, once any of them differs on the version it would land
+/// on, however late the writer re-read; an unrelated write in the window
+/// does not disturb it, and a writer expecting the new value lands. This is
+/// the guard a clustering run puts on its batch, merge and index commits:
+/// its record still running, its pair still the table's latest.
+#[tokio::test]
+async fn a_commit_expecting_table_metadata_is_refused_once_it_changed() {
+    use lance_table::format::COMMIT_EXPECT_TABLE_METADATA_PREFIX;
+    const RUN: &str = "org.example.cluster.run";
+    let dir = TempStrDir::default();
+    let dataset = write_dataset(&dir).await;
+    let dataset = commit(
+        &dataset,
+        submission(
+            dataset.manifest().version,
+            vec![],
+            vec![(RUN.to_string(), Some("running".to_string()))],
+        ),
+    )
+    .await
+    .unwrap();
+    let expecting = |read_version: u64, progress: &str, expected: Vec<(&str, &str)>| {
+        let (desired, mut transaction) = submission(
+            read_version,
+            vec![],
+            vec![(
+                "org.example.cluster.progress".to_string(),
+                Some(progress.to_string()),
+            )],
+        );
+        transaction.transaction_properties = Some(Arc::new(
+            expected
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        format!("{COMMIT_EXPECT_TABLE_METADATA_PREFIX}{key}"),
+                        value.to_string(),
+                    )
+                })
+                .collect(),
+        ));
+        (desired, transaction)
+    };
+    // The premise holds: the commit lands, rebased over an unrelated write
+    // that landed after the writer read.
+    let read = dataset.manifest().version;
+    let _other = commit(
+        &dataset,
+        submission(
+            read,
+            vec![],
+            vec![("org.other.key".to_string(), Some("x".to_string()))],
+        ),
+    )
+    .await
+    .unwrap();
+    let dataset = commit(&dataset, expecting(read, "1", vec![(RUN, "running")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset
+            .manifest()
+            .table_metadata
+            .get("org.example.cluster.progress"),
+        Some(&"1".to_string())
+    );
+    // Another writer moves the premise.
+    let cancelled = commit(
+        &dataset,
+        submission(
+            dataset.manifest().version,
+            vec![],
+            vec![(RUN.to_string(), Some("cancelled".to_string()))],
+        ),
+    )
+    .await
+    .unwrap();
+    let landed = cancelled.manifest().version;
+    // The writer that read before the change is refused, and so is one that
+    // re-read the latest: the premise is gone for good.
+    for reader in [&dataset, &cancelled] {
+        let error = commit(
+            reader,
+            expecting(reader.manifest().version, "2", vec![(RUN, "running")]),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        let text = error.to_string();
+        assert!(text.contains(RUN), "{text}");
+        assert!(text.contains("'cancelled'"), "{text}");
+        assert!(text.contains("expected 'running'"), "{text}");
+    }
+    // An absent key is a mismatch too.
+    let error = commit(
+        &cancelled,
+        expecting(landed, "2", vec![("org.example.cluster.missing", "x")]),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("is absent"), "{error}");
+    let mut latest = cancelled.clone();
+    latest.checkout_latest().await.unwrap();
+    assert_eq!(latest.manifest().version, landed, "nothing landed");
+    // The writer expecting the state as it is now lands.
+    let dataset = commit(&cancelled, expecting(landed, "3", vec![(RUN, "cancelled")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset
+            .manifest()
+            .table_metadata
+            .get("org.example.cluster.progress"),
+        Some(&"3".to_string())
+    );
+}
