@@ -29,6 +29,8 @@ import org.lance.index.IndexType;
 import org.lance.index.OptimizeOptions;
 import org.lance.index.scalar.ZoneStats;
 import org.lance.ipc.DataStatistics;
+import org.lance.ipc.FtsGlobalStatistics;
+import org.lance.ipc.FullTextQuery;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.lance.memwal.InitializeMemWalParams;
@@ -1749,6 +1751,37 @@ public class Dataset implements Closeable {
   private native String nativeGetIndexStatistics(String indexName);
 
   /**
+   * Build global BM25 statistics for a full-text query across every committed segment of its
+   * logical FTS index.
+   *
+   * <p>The returned opaque protobuf is bound to this dataset version and the exact segment set. It
+   * also preserves every scoring query leaf's prepared vocabulary, Match term groups, or Phrase
+   * token positions, including fuzzy expansions. It does not include documents in unindexed
+   * fragments. Queries spanning more than one indexed column are not supported. V1 emits one
+   * DOCUMENT-counted corpus with prepared Match/Phrase leaves. The caller must attach the payload
+   * only to the same query used to produce it because V1 consumers cannot independently verify the
+   * source query identity.
+   *
+   * <pre>{@code
+   * FtsGlobalStatistics statistics =
+   *     dataset.getFtsGlobalStatistics(FullTextQuery.match("hello", "text"));
+   * byte[] transportPayload = statistics.toBytes();
+   * }</pre>
+   *
+   * @param query full-text query whose token statistics should be collected
+   * @return opaque, protobuf-encoded global FTS statistics
+   */
+  public FtsGlobalStatistics getFtsGlobalStatistics(FullTextQuery query) {
+    Preconditions.checkNotNull(query, "query must not be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return FtsGlobalStatistics.fromBytes(nativeGetFtsGlobalStatistics(query));
+    }
+  }
+
+  private native byte[] nativeGetFtsGlobalStatistics(FullTextQuery query);
+
+  /**
    * Describe indices on this dataset filtered by criteria.
    *
    * @param criteria filter options such as column, name or index capabilities
@@ -1775,6 +1808,42 @@ public class Dataset implements Closeable {
   }
 
   private native List<IndexDescription> nativeDescribeIndices(Optional<IndexCriteria> criteria);
+
+  /**
+   * Describe indices on this dataset without materializing per-segment metadata.
+   *
+   * <p>The returned descriptions contain the same logical index properties and aggregate fragment
+   * coverage as {@link #describeIndices(IndexCriteria)}, but their segment lists are empty. Use
+   * this method when only summary information is needed, especially for indices covering many
+   * fragments.
+   *
+   * @param criteria filter options such as column, name or index capabilities
+   * @return list of index descriptions with empty segment lists
+   */
+  public List<IndexDescription> describeIndexSummaries(IndexCriteria criteria) {
+    Preconditions.checkNotNull(criteria, "criteria cannot be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeDescribeIndexSummaries(Optional.of(criteria));
+    }
+  }
+
+  /**
+   * Describe all indices on this dataset without materializing per-segment metadata.
+   *
+   * <p>The returned descriptions contain aggregate fragment coverage and have empty segment lists.
+   *
+   * @return list of index descriptions with empty segment lists
+   */
+  public List<IndexDescription> describeIndexSummaries() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeDescribeIndexSummaries(Optional.empty());
+    }
+  }
+
+  private native List<IndexDescription> nativeDescribeIndexSummaries(
+      Optional<IndexCriteria> criteria);
 
   /**
    * Read zonemap statistics for a column.
