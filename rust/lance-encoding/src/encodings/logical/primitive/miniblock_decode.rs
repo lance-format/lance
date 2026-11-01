@@ -2163,6 +2163,7 @@ mod tests {
             for value in values {
                 buffer.extend_from_slice(value);
             }
+            buffer.resize(buffer.len().next_multiple_of(4), 0);
             buffer
         }
 
@@ -2211,6 +2212,34 @@ mod tests {
         let planned = decoder.decoded_bytes(3).unwrap();
         let actual = decoder.drain(3).unwrap().decode().unwrap();
         assert_eq!(planned, actual.data.data_size());
+    }
+
+    #[test]
+    fn test_miniblock_planned_dictionary_bytes_include_shared_values() {
+        use crate::encodings::physical::binary::BinaryMiniBlockDecompressor;
+
+        let dictionary = Arc::new(DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::from(vec![0_u8; 64]),
+            bits_per_value: 8,
+            num_values: 8,
+            block_info: BlockInfo::new(),
+        }));
+        let decoder = MiniBlockDecoder {
+            rep_decompressor: None,
+            def_decompressor: None,
+            value_decompressor: Arc::new(BinaryMiniBlockDecompressor::new(32).unwrap()),
+            def_meaning: Arc::from([]),
+            loaded_chunks: VecDeque::new(),
+            instructions: VecDeque::new(),
+            offset_in_current_chunk: 0,
+            num_rows: 3,
+            num_buffers: 1,
+            dictionary: Some(dictionary),
+            has_large_chunk: false,
+        };
+
+        assert_eq!(decoder.dictionary_len(), Some(8));
+        assert_eq!(decoder.decoded_bytes(3).unwrap(), 64 + 3 * 8);
     }
 
     #[cfg(feature = "bitpacking")]

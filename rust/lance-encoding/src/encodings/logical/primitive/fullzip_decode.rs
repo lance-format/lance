@@ -1479,19 +1479,19 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField};
 
     use crate::buffer::LanceBuffer;
-    use crate::compression::{
-        DecompressionStrategy, FixedPerValueDecompressor, VariablePerValueDecompressor,
-    };
-    #[cfg(feature = "zstd")]
-    use crate::compression_config::CompressionConfig;
+    use crate::compression::{DecompressionStrategy, FixedPerValueDecompressor};
     use crate::constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK};
     use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
-    use crate::decoder::{DecodePageTask, StructuralPageDecoder};
-    use crate::encodings::logical::primitive::StructuralPageScheduler;
+    use crate::decoder::{DecodePageTask, LoadedPageShard, StructuralFieldDecoder};
     use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
+    use crate::encodings::logical::primitive::{
+        StructuralPageScheduler, StructuralPrimitiveFieldDecoder,
+    };
     use crate::encodings::physical::binary::VariableEncoder;
     #[cfg(feature = "zstd")]
-    use crate::encodings::physical::block::{CompressedBufferEncoder, CompressionScheme};
+    use crate::encodings::physical::block::{
+        CompressedBufferEncoder, CompressionConfig, CompressionScheme,
+    };
     use crate::encodings::physical::fsst::FsstPerValueEncoder;
     use crate::encodings::physical::value::{ValueDecompressor, ValueEncoder};
     use crate::format::metadata::compressive_encoding::Compression;
@@ -2321,7 +2321,7 @@ mod tests {
             Some(0),
         ))
         .unwrap();
-        let mut decoder = compressed_variable_full_zip(
+        let page = compressed_variable_full_zip(
             &compressor,
             &[
                 "alpha-alpha",
@@ -2331,17 +2331,25 @@ mod tests {
                 "epsilon",
             ],
         );
+        let field = Arc::new(ArrowField::new("value", DataType::Utf8, false));
+        let mut decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+        decoder
+            .accept_page(LoadedPageShard {
+                decoder: Box::new(page),
+                path: std::collections::VecDeque::new(),
+            })
+            .unwrap();
 
         decoder.drain(2).unwrap().decode().unwrap();
-        let planned = decoder.decoded_bytes(3).unwrap();
+        let planned = decoder.plan_decoded_bytes(3).unwrap()[1];
         let actual = decoder.drain(3).unwrap().decode().unwrap();
-        assert_eq!(planned, actual.data.data_size());
+        assert_eq!(planned, actual.data_size);
     }
 
     #[test]
     fn test_planned_fsst_fullzip_bounds_partial_drain() {
         let compressor = FsstPerValueEncoder::new(Box::new(VariableEncoder::default()));
-        let mut decoder = compressed_variable_full_zip(
+        let page = compressed_variable_full_zip(
             &compressor,
             &[
                 "alpha-alpha-alpha",
@@ -2351,14 +2359,22 @@ mod tests {
                 "epsilon-epsilon",
             ],
         );
+        let field = Arc::new(ArrowField::new("value", DataType::Utf8, false));
+        let mut decoder = StructuralPrimitiveFieldDecoder::new(&field, false);
+        decoder
+            .accept_page(LoadedPageShard {
+                decoder: Box::new(page),
+                path: std::collections::VecDeque::new(),
+            })
+            .unwrap();
 
         decoder.drain(2).unwrap().decode().unwrap();
-        let planned = decoder.decoded_bytes(3).unwrap();
+        let planned = decoder.plan_decoded_bytes(3).unwrap()[1];
         let actual = decoder.drain(3).unwrap().decode().unwrap();
         assert!(
-            planned >= actual.data.data_size(),
+            planned >= actual.data_size,
             "planned {planned} bytes must cover actual {} bytes",
-            actual.data.data_size()
+            actual.data_size
         );
     }
 

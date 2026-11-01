@@ -1423,10 +1423,13 @@ mod tests {
                 Some(0),
             ))
             .unwrap();
-            let offsets: Vec<u8> = [0_u32, 8].into_iter().flat_map(u32::to_le_bytes).collect();
+            let offsets: Vec<u8> = [0_u32, 8, 16]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
 
             assert_eq!(
-                compressor.decompressed_size(&[u8::MAX; 8], &offsets, 32),
+                compressor.decompressed_size(&[u8::MAX; 16], &offsets, 32),
                 None
             );
         }

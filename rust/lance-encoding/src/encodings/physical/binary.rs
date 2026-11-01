@@ -1092,6 +1092,15 @@ impl VariablePerValueDecompressor for VariableDecoder {
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
         Ok(DataBlock::VariableWidth(data))
     }
+
+    fn decompressed_size(
+        &self,
+        data: &[u8],
+        _offsets_bytes: &[u8],
+        _bits_per_offset: u8,
+    ) -> Option<u64> {
+        u64::try_from(data.len()).ok()
+    }
 }
 
 #[derive(Debug, Default)]
