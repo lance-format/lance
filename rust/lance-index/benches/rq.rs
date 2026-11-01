@@ -20,7 +20,7 @@ use lance_datagen::{BatchGeneratorBuilder, RowCount};
 use lance_index::vector::bq::RQRotationType;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::ex_dot::{
-    blocked_ex_code_bytes, ex_dot_kernel, pack_blocked_row, packed_ex_code_value,
+    blocked_ex_code_bytes, ex_dot_host_kernel, pack_blocked_row, packed_ex_code_value,
 };
 use lance_index::vector::bq::storage::*;
 use lance_index::vector::bq::transform::{ADD_FACTORS_COLUMN, RQTransformer, SCALE_FACTORS_COLUMN};
@@ -191,14 +191,14 @@ fn ex_dot_kernels_for_dim(c: &mut Criterion, ex_dim: usize) {
 
         // ex_dim is block-aligned here, so the kernels read the query as-is.
         let ex_query = &query;
-        let kernel = ex_dot_kernel(ex_bits);
+        let kernel = ex_dot_host_kernel(ex_bits);
         c.bench_function(
             format!("RQ ex_dot kernel: ex_bits={ex_bits}, DIM={ex_dim}, rows={NUM_ROWS}").as_str(),
             |b| {
                 b.iter(|| {
                     let mut sum = 0.0f32;
                     for row in kernel_codes.chunks_exact(kernel_code_len) {
-                        sum += kernel(ex_query, row);
+                        sum += kernel.call(ex_query, row);
                     }
                     black_box(sum)
                 })
@@ -489,7 +489,7 @@ fn ex_bulk_paths(c: &mut Criterion) {
             );
         }
 
-        let kernel = ex_dot_kernel(ex_bits);
+        let kernel = ex_dot_host_kernel(ex_bits);
         let mut ex_query = vec![0.0f32; BULK_DIM];
         pad_query_into(
             query
@@ -508,7 +508,7 @@ fn ex_bulk_paths(c: &mut Criterion) {
                 b.iter(|| {
                     let mut sum = 0.0f32;
                     for row in ex_codes.chunks_exact(ex_code_len) {
-                        sum += kernel(&ex_query, row);
+                        sum += kernel.call(&ex_query, row);
                     }
                     black_box(sum)
                 })
