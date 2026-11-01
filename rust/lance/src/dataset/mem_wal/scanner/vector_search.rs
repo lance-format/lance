@@ -31,7 +31,8 @@ use super::data_source::LsmDataSource;
 use super::generation_read::{GenerationRead, memtable_matches_table};
 use super::projection::{
     DISTANCE_COLUMN, build_scanner_projection, canonical_output_schema, null_columns,
-    project_to_canonical, scale_distance, validate_projection_names, wants_row_id,
+    project_to_canonical, scale_distance, search_projection, validate_projection_names,
+    wants_row_id,
 };
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::session::Session;
@@ -620,7 +621,12 @@ impl LsmVectorSearchPlanner {
                 // Resolve against the *source* schema so a nested path narrows the
                 // struct rather than flattening it; expressions cannot express a
                 // partial nested projection, only a schema can.
-                scanner.project_with_schema(&dataset.schema().project(&cols)?)?;
+                scanner.disable_scoring_autoprojection();
+                scanner.project_with_schema(&search_projection(
+                    dataset,
+                    &cols,
+                    DISTANCE_COLUMN,
+                )?)?;
                 if let Some(ref filter) = self.filter {
                     // Native scanner prefilter: the ANN runs over rows matching
                     // the predicate, so the top-k holds only matching rows.
@@ -693,9 +699,12 @@ impl LsmVectorSearchPlanner {
                 // Resolve against the *source* schema so a nested path narrows the
                 // struct rather than flattening it; expressions cannot express a
                 // partial nested projection, only a schema can.
-                scanner.project_with_schema(
-                    &dataset.schema().project(&generation.stored_projection())?,
-                )?;
+                scanner.disable_scoring_autoprojection();
+                scanner.project_with_schema(&search_projection(
+                    &dataset,
+                    &generation.stored_projection(),
+                    DISTANCE_COLUMN,
+                )?)?;
                 if let Some(ref stored) = stored_filter {
                     // See the base arm: `prefilter(true)` makes this a true
                     // prefilter rather than a lossy post-filter on the top-k.
