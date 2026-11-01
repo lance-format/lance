@@ -1082,9 +1082,8 @@ impl ScalarIndex for InvertedIndex {
             TokenQuery::TokensContains(text) => {
                 let mut tokenizer = self.tokenizer.clone();
                 let tokens = try_collect_query_tokens(text, &mut tokenizer)?;
-                // The index tokenizer can leave nothing of a query the scan
-                // still evaluates, such as one made only of stop words, so the
-                // index cannot narrow the rows and every row is rechecked.
+                // A query the index tokenizer empties, such as one made only of
+                // stop words, still matches rows; the index cannot narrow them.
                 if tokens.is_empty() {
                     return Ok(SearchResult::at_least(RowAddrTreeMap::new()));
                 }
