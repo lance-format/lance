@@ -79,11 +79,12 @@ async fn validate_no_nulls_before_making_non_nullable(dataset: &Dataset, path: &
         let mut unmasked_null = false;
         scan_with_deleted_rows(dataset, &schema.field_path(parent.id)?, |column, _| {
             unmasked_null |= match column.as_struct_opt() {
-                Some(parent) => {
-                    let child = parent.column_by_name(&field.name).ok_or_else(|| {
+                Some(parent_array) => {
+                    let child = parent_array.column_by_name(&field.name).ok_or_else(|| {
                         Error::internal(format!("Validation scan for {} lost the column", path))
                     })?;
-                    (0..parent.len()).any(|row| parent.is_valid(row) && child.is_null(row))
+                    (0..parent_array.len())
+                        .any(|row| parent_array.is_valid(row) && child.is_null(row))
                 }
                 None => true,
             };
