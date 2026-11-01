@@ -634,7 +634,7 @@ mod test {
     use crate::dataset::rowids::{
         INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, SPILL_ROW_LINEAGE_CONFIG_KEY,
     };
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::{UpdateBuilder, WriteParams};
     use crate::session::Session;
     use crate::session::caches::{DeletionFileKey, RowIdAllowListPieceKey, RowIdSequenceKey};
 
@@ -1127,48 +1127,45 @@ mod test {
             .await
             .unwrap();
 
-        let appended = BatchGenerator::new()
-            .col(Box::new(IncrementingInt32::new().start(6).named("x")))
-            .batch(6);
-        dataset = Dataset::write(
-            appended,
-            uri,
-            Some(WriteParams {
-                mode: WriteMode::Append,
-                max_rows_per_file: 3,
-                enable_stable_row_ids: true,
-                session: Some(write_session),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        dataset.delete("x = 11").await.unwrap();
-        dataset.delete("x = 2").await.unwrap();
+        let updated = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("x IN (0, 2)")
+            .unwrap()
+            .set("x", "x + 100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        dataset = (*updated.new_dataset).clone();
+        dataset.delete("x = 102").await.unwrap();
+        dataset.delete("x = 5").await.unwrap();
 
         let fragments = dataset.get_fragments();
-        assert!(matches!(
-            &fragments[0].metadata().row_id_meta,
-            Some(RowIdMeta::Inline(_))
-        ));
-        assert!(matches!(
-            &fragments[2].metadata().row_id_meta,
-            Some(RowIdMeta::Column)
-        ));
-        for fragment_id in [0_u64, 3] {
-            let fragment = fragments
-                .iter()
-                .find(|fragment| fragment.id() == fragment_id)
-                .unwrap();
-            assert!(
-                fragment
-                    .metadata()
-                    .deletion_file
-                    .as_ref()
-                    .is_some_and(|file| file.is_inline()),
-                "fragment {fragment_id} should exercise inline deletion identity"
-            );
-        }
+        let inline_deleted_fragment = fragments
+            .iter()
+            .find(|fragment| {
+                matches!(&fragment.metadata().row_id_meta, Some(RowIdMeta::Inline(_)))
+                    && fragment
+                        .metadata()
+                        .deletion_file
+                        .as_ref()
+                        .is_some_and(|file| file.is_inline())
+            })
+            .expect("an inline row-id fragment with inline deletions");
+        let spilled_deleted_fragment = fragments
+            .iter()
+            .find(|fragment| {
+                matches!(&fragment.metadata().row_id_meta, Some(RowIdMeta::Column))
+                    && fragment
+                        .metadata()
+                        .deletion_file
+                        .as_ref()
+                        .is_some_and(|file| file.is_inline())
+            })
+            .expect("a spilled row-id fragment with inline deletions");
+        assert_ne!(inline_deleted_fragment.id(), spilled_deleted_fragment.id());
+        let spilled_fragment_id = spilled_deleted_fragment.id() as u32;
 
         let read_session = Arc::new(Session::default());
         let mut dataset = DatasetBuilder::from_uri(uri)
@@ -1183,11 +1180,11 @@ mod test {
         );
 
         let mask =
-            DatasetPreFilter::create_deletion_mask(dataset.clone(), RoaringBitmap::from_iter(0..4))
+            DatasetPreFilter::create_deletion_mask(dataset.clone(), RoaringBitmap::from_iter(0..1))
                 .expect("stable-row-id deletion mask")
                 .await
                 .unwrap();
-        assert_eq!(mask.allow_list().and_then(|rows| rows.len()), Some(10));
+        assert_eq!(mask.allow_list().and_then(|rows| rows.len()), Some(4));
         let cold_io = tracker.incremental_stats();
         assert_io_gt!(
             cold_io,
@@ -1199,7 +1196,7 @@ mod test {
         let fragment = dataset
             .get_fragments()
             .into_iter()
-            .find(|fragment| fragment.id() == 3)
+            .find(|fragment| fragment.id() as u32 == spilled_fragment_id)
             .unwrap();
         let metadata = fragment.metadata();
         let row_id_meta = metadata.row_id_meta.as_ref().unwrap();
@@ -1210,7 +1207,7 @@ mod test {
                 .metadata_cache
                 .as_ref()
                 .peek_resident_with_key(&RowIdSequenceKey {
-                    fragment_id: 3,
+                    fragment_id: u64::from(spilled_fragment_id),
                     row_id_meta,
                     lineage_file: Some(lineage_file),
                 })
@@ -1221,7 +1218,7 @@ mod test {
                 .metadata_cache
                 .as_ref()
                 .peek_resident_with_key(&DeletionFileKey {
-                    fragment_id: 3,
+                    fragment_id: u64::from(spilled_fragment_id),
                     deletion_file,
                 })
                 .await
@@ -1231,7 +1228,7 @@ mod test {
                 .metadata_cache
                 .as_ref()
                 .peek_resident_with_key(&RowIdAllowListPieceKey {
-                    fragment_id: 3,
+                    fragment_id: u64::from(spilled_fragment_id),
                     row_id_meta: row_id_meta.clone(),
                     lineage_file: Some(lineage_file.clone()),
                     deletion_file: Some(deletion_file.clone()),
@@ -1242,12 +1239,12 @@ mod test {
         let cache_before = read_session.metadata_cache_stats().await;
         let mask = DatasetPreFilter::create_restricted_deletion_mask(
             dataset.clone(),
-            RoaringBitmap::from_iter(3..4),
+            RoaringBitmap::from_iter([spilled_fragment_id]),
         )
         .expect("restricted stable-row-id deletion mask")
         .await
         .unwrap();
-        assert_eq!(mask.allow_list(), Some(&RowAddrTreeMap::from_iter(6..11)));
+        assert_eq!(mask.allow_list(), Some(&RowAddrTreeMap::from_iter([0])));
         let warm_io = tracker.incremental_stats();
         assert_io_eq!(
             warm_io,
@@ -1275,12 +1272,12 @@ mod test {
         let cache_before = read_session.metadata_cache_stats().await;
         let mask = DatasetPreFilter::create_restricted_deletion_mask(
             updated.clone(),
-            RoaringBitmap::from_iter(3..4),
+            RoaringBitmap::from_iter([spilled_fragment_id]),
         )
         .expect("restricted mask after a new commit")
         .await
         .unwrap();
-        assert_eq!(mask.allow_list(), Some(&RowAddrTreeMap::from_iter(6..11)));
+        assert_eq!(mask.allow_list(), Some(&RowAddrTreeMap::from_iter([0])));
         let committed_io = tracker.incremental_stats();
         assert_io_eq!(
             committed_io,
@@ -1292,11 +1289,11 @@ mod test {
         assert_eq!(cache_after.hits - cache_before.hits, 1);
         assert_eq!(cache_after.misses - cache_before.misses, 1);
 
-        let mask = DatasetPreFilter::create_deletion_mask(updated, RoaringBitmap::from_iter(0..4))
+        let mask = DatasetPreFilter::create_deletion_mask(updated, RoaringBitmap::from_iter(0..1))
             .expect("full mask after a new commit")
             .await
             .unwrap();
-        assert_eq!(mask.allow_list().and_then(|rows| rows.len()), Some(9));
+        assert_eq!(mask.allow_list().and_then(|rows| rows.len()), Some(3));
         assert!(!mask.selected(4));
     }
 }
