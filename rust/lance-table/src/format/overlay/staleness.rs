@@ -44,26 +44,44 @@ pub fn overlay_exclusion_offsets(
             continue;
         }
         for (field_pos, field_id) in overlay.data_file.fields.iter().enumerate() {
-            let overlay_ancestry = schema.field_ancestry_by_id(*field_id);
-            let affects_index = indexed_field_ids.iter().any(|indexed_field_id| {
-                indexed_field_id == field_id
-                    || overlay_ancestry.as_ref().is_some_and(|ancestry| {
-                        ancestry
-                            .iter()
-                            .any(|ancestor| ancestor.id == *indexed_field_id)
-                    })
-                    || schema
-                        .field_ancestry_by_id(*indexed_field_id)
-                        .is_some_and(|ancestry| {
-                            ancestry.iter().any(|ancestor| ancestor.id == *field_id)
-                        })
-            });
+            let affects_index = field_affects_index(*field_id, indexed_field_ids, schema);
             if affects_index {
                 excluded |= &*overlay.coverage_for_field(field_pos)?;
             }
         }
     }
     Ok(excluded)
+}
+
+/// Whether `overlay` makes an index built at `index_version` stale.
+pub fn overlay_affects_index(
+    overlay: &DataOverlayFile,
+    indexed_field_ids: &[i32],
+    index_version: u64,
+    schema: &Schema,
+) -> bool {
+    overlay.committed_version > index_version
+        && overlay
+            .data_file
+            .fields
+            .iter()
+            .any(|field_id| field_affects_index(*field_id, indexed_field_ids, schema))
+}
+
+/// Whether `field_id` is, contains, or is nested in an indexed field.
+pub fn field_affects_index(field_id: i32, indexed_field_ids: &[i32], schema: &Schema) -> bool {
+    let field_ancestry = schema.field_ancestry_by_id(field_id);
+    indexed_field_ids.iter().any(|indexed_field_id| {
+        *indexed_field_id == field_id
+            || field_ancestry.as_ref().is_some_and(|ancestry| {
+                ancestry
+                    .iter()
+                    .any(|ancestor| ancestor.id == *indexed_field_id)
+            })
+            || schema
+                .field_ancestry_by_id(*indexed_field_id)
+                .is_some_and(|ancestry| ancestry.iter().any(|ancestor| ancestor.id == field_id))
+    })
 }
 
 // Stale row offsets contributed by one fragment's overlays for a given index version.
@@ -117,11 +135,12 @@ pub fn collect_overlay_stale_frags(
     schema: &Schema,
 ) -> Result<()> {
     let coverage = segment.fragment_bitmap.as_ref();
+    let fields = segment.dependency_fields();
     for (&frag_id, fragment) in overlaid_frags {
         if stale.contains(frag_id) || !covers_fragment(coverage, frag_id) {
             continue;
         }
-        if !stale_offsets_for_fragment(fragment, &segment.fields, segment.dataset_version, schema)?
+        if !stale_offsets_for_fragment(fragment, &fields, segment.dataset_version, schema)?
             .is_empty()
         {
             stale.insert(frag_id);
@@ -144,17 +163,38 @@ pub fn collect_overlay_stale_rows_for_segment(
     schema: &Schema,
 ) -> Result<()> {
     let coverage = segment.fragment_bitmap.as_ref();
+    let fields = segment.dependency_fields();
     for (&frag_id, fragment) in overlaid_frags {
         if !covers_fragment(coverage, frag_id) {
             continue;
         }
         let excluded =
-            stale_offsets_for_fragment(fragment, &segment.fields, segment.dataset_version, schema)?;
+            stale_offsets_for_fragment(fragment, &fields, segment.dataset_version, schema)?;
         if !excluded.is_empty() {
             *stale.entry(frag_id).or_default() |= &excluded;
         }
     }
     Ok(())
+}
+
+/// Remove from `coverage` every fragment with an overlay that makes `index`
+/// stale ([`overlay_affects_index`]).
+pub fn remove_overlay_stale_frags(
+    coverage: &mut RoaringBitmap,
+    fragments: &[Fragment],
+    index: &IndexMetadata,
+    schema: &Schema,
+) {
+    let fields = index.dependency_fields();
+    for fragment in fragments {
+        if fragment
+            .overlays
+            .iter()
+            .any(|overlay| overlay_affects_index(overlay, &fields, index.dataset_version, schema))
+        {
+            coverage.remove(fragment.id as u32);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -329,6 +369,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 

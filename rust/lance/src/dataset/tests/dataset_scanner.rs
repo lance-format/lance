@@ -7,16 +7,17 @@ use std::vec;
 
 use crate::index::vector::VectorIndexParams;
 use lance_arrow::json::{ARROW_JSON_EXT_NAME, JsonArray, is_arrow_json_field, json_field};
-use lance_arrow::{ARROW_EXT_NAME_KEY, FixedSizeListArrayExt};
+use lance_arrow::{ARROW_EXT_NAME_KEY, FixedSizeListArrayExt, RecordBatchExt};
 
 use crate::index::DatasetIndexExt;
 use arrow::compute::concat_batches;
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, LargeListArray, ListArray, StructArray};
 use arrow_array::{Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
-use arrow_array::{Int64Array, UInt64Array};
+use arrow_array::{Int64Array, UInt32Array, UInt64Array, record_batch};
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema, SchemaRef};
+use arrow_select::take::take_record_batch;
 use futures::TryStreamExt;
 use lance_arrow::SchemaExt;
 use lance_core::cache::LanceCache;
@@ -44,6 +45,68 @@ use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
 use pretty_assertions::assert_eq;
 use rstest::rstest;
+
+#[rstest]
+#[case::struct_null_check(false, "c IS NOT NULL", vec![0, 1, 2])]
+#[case::struct_value(false, "c.t > 0", vec![1, 2])]
+#[case::struct_null(false, "c IS NULL", vec![3])]
+#[case::list_null_check(true, "c IS NOT NULL", vec![0, 1, 2])]
+#[case::list_null(true, "c IS NULL", vec![3])]
+#[tokio::test]
+async fn test_partial_projection_with_filter_on_same_column(
+    #[case] is_list: bool,
+    #[case] filter: &str,
+    #[case] expected_indices: Vec<u32>,
+) {
+    let children = record_batch!(
+        ("t", Int32, [-1, 2, 3, 4]),
+        ("b", Utf8, [Some("x"), Some("y"), None, Some("z")])
+    )
+    .unwrap();
+    let item = StructArray::new(
+        children.schema().fields().clone(),
+        children.columns().to_vec(),
+        Some(NullBuffer::from(vec![true, true, true, false])),
+    );
+    let c: ArrayRef = if is_list {
+        Arc::new(ListArray::new(
+            Arc::new(ArrowField::new("item", item.data_type().clone(), true)),
+            OffsetBuffer::from_lengths([1, 0, 2, 1]),
+            Arc::new(item),
+            Some(NullBuffer::from(vec![true, true, true, false])),
+        ))
+    } else {
+        Arc::new(item)
+    };
+    let batch = record_batch!(("k", Int32, [0, 1, 2, 3]))
+        .unwrap()
+        .try_with_column(ArrowField::new("c", c.data_type().clone(), true), c)
+        .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let leaf = if is_list { "c.item.b" } else { "c.b" };
+    let projection = dataset.schema().project(&["k", leaf]).unwrap();
+    let expected_schema = ArrowSchema::from(&projection);
+    let expected = batch.project_by_schema(&expected_schema).unwrap();
+    let expected = take_record_batch(&expected, &UInt32Array::from(expected_indices)).unwrap();
+
+    let mut scan = dataset.scan();
+    scan.project_with_schema(&projection).unwrap();
+    scan.filter(filter).unwrap();
+    let result = scan.try_into_batch().await.unwrap();
+    assert_eq!(result.schema().as_ref(), &expected_schema, "{filter}");
+    assert_eq!(result, expected, "{filter}");
+}
 
 /// A null struct must not read back as a valid struct with null children.
 ///
@@ -275,6 +338,7 @@ async fn test_vector_filter_fts_search() {
         upper_bound: None,
         minimum_nprobes: 20,
         maximum_nprobes: None,
+        search_effort: 0.5,
         ef: None,
         refine_factor: None,
         metric_type: Some(MetricType::L2),
@@ -412,12 +476,15 @@ async fn test_fts_filter_vector_search() {
     let dataset = prepare_query_filter_dataset().await;
     let schema: ArrowSchema = dataset.schema().into();
 
+    // Assert filtering and exact distance order without depending on PQ's
+    // approximate distances, which can tie for adjacent vectors.
     // Case 1: search with prefilter=true, query_filter=match("text")
     let query_vector = Float32Array::from(vec![300f32, 300f32, 300f32, 300f32]);
     let mut scanner = dataset.scan();
     let stream = scanner
         .nearest("vector", &query_vector, 5)
         .unwrap()
+        .refine(1)
         .prefilter(true)
         .filter_query(QueryFilter::Fts(FullTextSearchQuery::new(
             "text".to_string(),
@@ -441,6 +508,7 @@ async fn test_fts_filter_vector_search() {
     let stream = scanner
         .nearest("vector", &query_vector, 5)
         .unwrap()
+        .refine(1)
         .prefilter(true)
         .filter("category='geography'")
         .unwrap()
@@ -466,6 +534,7 @@ async fn test_fts_filter_vector_search() {
     let stream = scanner
         .nearest("vector", &query_vector, 5)
         .unwrap()
+        .refine(1)
         .prefilter(false)
         .filter_query(QueryFilter::Fts(FullTextSearchQuery::new(
             "text".to_string(),
@@ -489,6 +558,7 @@ async fn test_fts_filter_vector_search() {
     let stream = scanner
         .nearest("vector", &query_vector, 5)
         .unwrap()
+        .refine(1)
         .prefilter(false)
         .filter("category='geography'")
         .unwrap()

@@ -29,6 +29,7 @@
 //! job that routes rows through parallel writers must restore that order
 //! per destination before feeding this writer.
 
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -38,6 +39,8 @@ use arrow_array::types::UInt16Type;
 use arrow_array::{Array, RecordBatch, UInt16Array};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use bytes::Bytes;
+use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, WeakLanceCache};
+use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::stable_partition::{
     CountsMatrix, CountsMatrixBuilder, DEFAULT_BLOCK_ROWS, SweepTranslator, translate_in_block,
 };
@@ -48,6 +51,106 @@ use crate::scalar::{IndexFile, IndexReader, IndexWriter};
 
 /// The single column of a row map file.
 pub const LABEL_COLUMN: &str = "label";
+
+/// Namespace prefix for cached row-map label chunks in the index cache.
+pub const ROW_MAP_CACHE_PREFIX: &str = "row-map-blocks";
+
+/// Number of logical row-map blocks per cache chunk (the cache unit).
+///
+/// A block holds [`DEFAULT_BLOCK_ROWS`] (64K) rows; one label is a u16, so a
+/// full block is ~128 KiB decoded. Grouping 32 blocks makes a ~4 MiB chunk:
+/// this keeps the number of cache entries small (~48 at 100M rows, ~477 at 1B)
+/// while turning what would be many small block reads into one big sequential
+/// range read per chunk on a cold miss. Whole-file caching (one 2 GiB blob at
+/// 1B rows) would blow the LRU; per-block caching (thousands of entries) would
+/// bloat the entry count. This is the middle ground.
+pub const ROW_MAP_CACHE_CHUNK_BLOCKS: usize = 32;
+
+/// Decoded size of one full chunk: the smallest index-cache capacity at which
+/// a chunk entry can be retained at all. A cache that is known to be smaller
+/// must not be used for chunks, since every block request would then read a
+/// whole chunk only to discard it.
+pub const ROW_MAP_CACHE_CHUNK_BYTES: usize =
+    ROW_MAP_CACHE_CHUNK_BLOCKS * DEFAULT_BLOCK_ROWS as usize * std::mem::size_of::<u16>();
+
+/// Cached decoded labels for one chunk (`ROW_MAP_CACHE_CHUNK_BLOCKS` contiguous
+/// blocks) of a row map file. The concrete `UInt16Array` does not implement
+/// `DeepSizeOf`, so this newtype delegates to the `dyn Array` impl for weight
+/// accounting in the index cache.
+#[derive(Debug, Clone)]
+pub struct RowMapChunk {
+    labels: UInt16Array,
+}
+
+/// Labels a reader holds across the blocks of one request (see
+/// [`RowMapReader::block_labels_reusing`]): the contiguous block range they
+/// cover and the labels themselves, a cached chunk or a one-off span read.
+#[derive(Debug, Clone)]
+pub struct HeldLabels {
+    blocks: Range<usize>,
+    labels: Arc<RowMapChunk>,
+}
+
+impl DeepSizeOf for RowMapChunk {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        (&self.labels as &dyn Array).deep_size_of_children(context)
+    }
+}
+
+/// Index-cache key for one row-map label chunk. Keyed by a stable per-map
+/// identity plus the chunk index so distinct row maps never collide and the
+/// entry survives across queries and dataset snapshots.
+#[derive(Clone)]
+pub struct RowMapChunkKey {
+    /// Stable identity of the row map (e.g. the transition fingerprint).
+    pub row_map_id: [u8; 32],
+    /// Chunk index = block / [`ROW_MAP_CACHE_CHUNK_BLOCKS`].
+    pub chunk: usize,
+}
+
+impl CacheKey for RowMapChunkKey {
+    type ValueType = RowMapChunk;
+
+    fn key(&self) -> Cow<'_, str> {
+        format!("{:x?}:{}", self.row_map_id, self.chunk).into()
+    }
+
+    fn type_name() -> &'static str {
+        "RowMapChunk"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.fri-row-map-chunk", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(&self.row_map_id);
+        builder.write_u64(self.chunk as u64);
+    }
+}
+
+/// A handle that routes row-map label reads through the shared index cache.
+///
+/// Cloned cheaply; carries the stable per-map identity and the (already
+/// namespaced) cache. Absence of this handle on a [`RowMapReader`] means the
+/// reader reads labels directly, byte-identical to the pre-cache behavior.
+#[derive(Clone)]
+pub struct RowMapBlockCache {
+    cache: WeakLanceCache,
+    row_map_id: [u8; 32],
+}
+
+impl RowMapBlockCache {
+    /// Wrap a cache for row-map chunk storage. The cache is namespaced with
+    /// [`ROW_MAP_CACHE_PREFIX`] so chunk entries never collide with other
+    /// index-cache values.
+    pub fn new(cache: WeakLanceCache, row_map_id: [u8; 32]) -> Self {
+        Self {
+            cache: cache.with_key_prefix(ROW_MAP_CACHE_PREFIX),
+            row_map_id,
+        }
+    }
+}
 
 /// Schema-metadata key holding the global buffer index of the encoded counts
 /// matrix.
@@ -249,6 +352,9 @@ impl RowMapWriter {
 pub struct RowMapReader {
     reader: Arc<dyn IndexReader>,
     counts: CountsMatrix,
+    /// When present, block reads are served from (and populated into) the shared
+    /// index cache in ~4 MiB chunks. When absent, reads go straight to the file.
+    block_cache: Option<RowMapBlockCache>,
 }
 
 impl std::fmt::Debug for RowMapReader {
@@ -264,6 +370,19 @@ impl RowMapReader {
     /// global buffer without touching any label data. A corrupt counts buffer
     /// must fail here rather than translate rows to wrong addresses.
     pub async fn open(reader: Arc<dyn IndexReader>) -> Result<Self> {
+        Self::open_with_cache(reader, None).await
+    }
+
+    /// Open a row map file, optionally routing label reads through the shared
+    /// index cache. With `block_cache = None` this is identical to [`open`] and
+    /// every label read hits the file; with a cache, reads are served from and
+    /// populated into ~4 MiB chunks.
+    ///
+    /// [`open`]: Self::open
+    pub async fn open_with_cache(
+        reader: Arc<dyn IndexReader>,
+        block_cache: Option<RowMapBlockCache>,
+    ) -> Result<Self> {
         let schema = reader.schema();
         let [label_field] = schema.fields.as_slice() else {
             return Err(Error::corrupt_file_named(
@@ -309,7 +428,11 @@ impl RowMapReader {
                 ),
             ));
         }
-        Ok(Self { reader, counts })
+        Ok(Self {
+            reader,
+            counts,
+            block_cache,
+        })
     }
 
     /// The validated counts matrix decoded at open: per-destination totals
@@ -319,16 +442,119 @@ impl RowMapReader {
     }
 
     /// The decoded labels of one block.
+    ///
+    /// With a block cache attached, the block's enclosing ~4 MiB chunk is loaded
+    /// (or served from cache) with one range read, and the block's labels are
+    /// sliced out. Without a cache, exactly the block's rows are read, identical
+    /// to the pre-cache behavior.
     pub async fn block_labels(&self, block: usize) -> Result<UInt16Array> {
-        let range = self.counts.block_range(block);
-        let batch = self
-            .reader
-            .read_range(
-                range.start as usize..range.end as usize,
-                Some(&[LABEL_COLUMN]),
-            )
-            .await?;
+        self.block_labels_reusing(block, block, &mut None).await
+    }
+
+    /// [`Self::block_labels`] for a caller that visits blocks in order and
+    /// wants the labels it just loaded to serve the next blocks. `last_block`
+    /// is the end of the run of adjacent blocks, starting at `block`, that
+    /// the caller will request next (every block in between included); `held`
+    /// carries the loaded labels between calls, and a block inside the held
+    /// span never touches the cache or the file. With a block cache the span
+    /// is the block's chunk, so a request performs one read per chunk whether
+    /// or not the cache retains it. Without a block cache the span is the
+    /// run `block..=last_block`, bounded to a chunk's worth, so a point
+    /// lookup reads exactly its block, a run of adjacent blocks is read in
+    /// one range read, and a sparse request never reads a block it does not
+    /// touch (its caller passes each run's end, not the request's last
+    /// block).
+    pub async fn block_labels_reusing(
+        &self,
+        block: usize,
+        last_block: usize,
+        held: &mut Option<HeldLabels>,
+    ) -> Result<UInt16Array> {
+        let span = match held {
+            Some(span) if span.blocks.contains(&block) => span,
+            _ => {
+                let loaded = match &self.block_cache {
+                    Some(block_cache) => {
+                        let chunk_idx = block / ROW_MAP_CACHE_CHUNK_BLOCKS;
+                        let first = chunk_idx * ROW_MAP_CACHE_CHUNK_BLOCKS;
+                        HeldLabels {
+                            blocks: first
+                                ..(first + ROW_MAP_CACHE_CHUNK_BLOCKS)
+                                    .min(self.counts.num_blocks()),
+                            labels: self.chunk_labels(block_cache, chunk_idx).await?,
+                        }
+                    }
+                    None => {
+                        let end = last_block
+                            .max(block)
+                            .min(block + ROW_MAP_CACHE_CHUNK_BLOCKS - 1)
+                            .min(self.counts.num_blocks() - 1);
+                        let rows =
+                            self.counts.block_range(block).start..self.counts.block_range(end).end;
+                        HeldLabels {
+                            blocks: block..end + 1,
+                            labels: Arc::new(RowMapChunk {
+                                labels: self
+                                    .read_labels(rows.start as usize..rows.end as usize)
+                                    .await?,
+                            }),
+                        }
+                    }
+                };
+                held.insert(loaded)
+            }
+        };
+        // Slice the requested block out of the held labels.
+        let span_start = self.counts.block_range(span.blocks.start).start;
+        let block_range = self.counts.block_range(block);
+        let offset = (block_range.start - span_start) as usize;
+        let len = (block_range.end - block_range.start) as usize;
+        Ok(span.labels.labels.slice(offset, len))
+    }
+
+    /// Read a contiguous row range of labels straight from the file.
+    async fn read_labels(&self, range: Range<usize>) -> Result<UInt16Array> {
+        let batch = self.reader.read_range(range, Some(&[LABEL_COLUMN])).await?;
         Ok(label_column(&batch)?.clone())
+    }
+
+    /// The row range covered by one chunk, clamped to the total row count (the
+    /// last chunk may hold fewer than a full complement of blocks).
+    fn chunk_row_range(&self, chunk_idx: usize) -> Range<u64> {
+        let first_block = chunk_idx * ROW_MAP_CACHE_CHUNK_BLOCKS;
+        let last_block =
+            ((chunk_idx + 1) * ROW_MAP_CACHE_CHUNK_BLOCKS - 1).min(self.counts.num_blocks() - 1);
+        self.counts.block_range(first_block).start..self.counts.block_range(last_block).end
+    }
+
+    /// Load one chunk of labels, serving from the index cache when present and
+    /// otherwise reading the chunk's full row range with one sequential read.
+    /// Concurrent loads of the same chunk are deduplicated by the cache.
+    async fn chunk_labels(
+        &self,
+        block_cache: &RowMapBlockCache,
+        chunk_idx: usize,
+    ) -> Result<Arc<RowMapChunk>> {
+        let key = RowMapChunkKey {
+            row_map_id: block_cache.row_map_id,
+            chunk: chunk_idx,
+        };
+        let range = self.chunk_row_range(chunk_idx);
+        let reader = self.reader.clone();
+        block_cache
+            .cache
+            .get_or_insert_with_key(key, || async move {
+                let batch = reader
+                    .read_range(
+                        range.start as usize..range.end as usize,
+                        Some(&[LABEL_COLUMN]),
+                    )
+                    .await?;
+                Ok(RowMapChunk {
+                    labels: label_column(&batch)?.clone(),
+                })
+            })
+            .await
     }
 
     /// Translate one physical source row (concatenated scan order). Returns
@@ -414,8 +640,14 @@ impl RowMapReader {
         // The sweep counters start at a block boundary; rows before
         // `rows.start` in the first block are translated and discarded.
         let mut translator = SweepTranslator::new(&self.counts, start_block)?;
+        // Consecutive blocks reuse the labels loaded for the first of them, so
+        // the sweep pays one read per chunk's worth of blocks even when the
+        // cache cannot retain anything.
+        let mut held = None;
         for block in start_block..=end_block {
-            let labels = self.block_labels(block).await?;
+            let labels = self
+                .block_labels_reusing(block, end_block, &mut held)
+                .await?;
             let block_start = self.counts.block_range(block).start;
             let validity = labels.nulls();
             for (i, &value) in labels.values().iter().enumerate() {
@@ -632,6 +864,268 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(swept, map.expected);
+    }
+
+    #[tokio::test]
+    async fn test_block_cache_matches_uncached() {
+        // Enough rows that a chunk (ROW_MAP_CACHE_CHUNK_BLOCKS blocks) is not the
+        // whole file: with block_rows=8 and 32 blocks/chunk a chunk is 256 rows,
+        // so ~5000 rows spans multiple chunks with a short final chunk.
+        let num_destinations = 6u32;
+        let map = make_test_map(&[2000, 1, 2999], num_destinations, 99);
+        let total = map.expected.len() as u64;
+        let tempdir = TempDir::default();
+        let store = test_store(&tempdir);
+        let (_, _) = write_map(&store, &map, num_destinations, 8, 137).await;
+
+        let cache = lance_core::cache::LanceCache::with_capacity(64 * 1024 * 1024);
+        let block_cache = RowMapBlockCache::new(WeakLanceCache::from(&cache), [7u8; 32]);
+        let reader = RowMapReader::open_with_cache(
+            store.open_index_file("row_map.lance").await.unwrap(),
+            Some(block_cache),
+        )
+        .await
+        .unwrap();
+
+        // Every physical row translates identically to the reference.
+        let rows: Vec<u64> = (0..total).collect();
+        assert_eq!(
+            reader.translate_many(&rows).await.unwrap(),
+            map.expected,
+            "cached batch translation of every row"
+        );
+        // Point lookups (repeat some rows to exercise cache hits).
+        for row in [0u64, 255, 256, 257, total - 1, 256, 0] {
+            assert_eq!(
+                reader.translate(row).await.unwrap(),
+                map.expected[row as usize],
+                "cached point lookup row {row}"
+            );
+        }
+        // A full sweep goes through the same chunked block reads.
+        let mut swept = Vec::new();
+        reader
+            .sweep(0..total, |_, translated| {
+                swept.push(translated);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(swept, map.expected, "cached sweep");
+
+        // Cache-off reader over the same file must produce identical output.
+        let uncached = RowMapReader::open(store.open_index_file("row_map.lance").await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            uncached.translate_many(&rows).await.unwrap(),
+            reader.translate_many(&rows).await.unwrap(),
+            "cache-off path is byte-identical to cache-on translations"
+        );
+    }
+
+    /// Counts the label reads an [`IndexReader`] serves, and how many rows
+    /// they asked for, so a test can pin the number of file reads a request
+    /// performs.
+    struct CountingReader {
+        inner: Arc<dyn IndexReader>,
+        reads: std::sync::atomic::AtomicUsize,
+        rows: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingReader {
+        fn new(inner: Arc<dyn IndexReader>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                reads: Default::default(),
+                rows: Default::default(),
+            })
+        }
+
+        /// `(reads, rows)` since the last call.
+        fn take(&self) -> (usize, usize) {
+            use std::sync::atomic::Ordering::Relaxed;
+            (self.reads.swap(0, Relaxed), self.rows.swap(0, Relaxed))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IndexReader for CountingReader {
+        async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch> {
+            self.inner.read_record_batch(n, batch_size).await
+        }
+
+        async fn read_global_buffer(&self, index: u32) -> Result<Bytes> {
+            self.inner.read_global_buffer(index).await
+        }
+
+        async fn read_range(
+            &self,
+            range: Range<usize>,
+            projection: Option<&[&str]>,
+        ) -> Result<RecordBatch> {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.reads.fetch_add(1, Relaxed);
+            self.rows.fetch_add(range.len(), Relaxed);
+            self.inner.read_range(range, projection).await
+        }
+
+        async fn read_ranges(
+            &self,
+            ranges: &[Range<usize>],
+            projection: Option<&[&str]>,
+        ) -> Result<RecordBatch> {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.reads.fetch_add(1, Relaxed);
+            self.rows
+                .fetch_add(ranges.iter().map(Range::len).sum(), Relaxed);
+            self.inner.read_ranges(ranges, projection).await
+        }
+
+        async fn num_batches(&self, batch_size: u64) -> u32 {
+            self.inner.num_batches(batch_size).await
+        }
+
+        fn num_rows(&self) -> usize {
+            self.inner.num_rows()
+        }
+
+        fn schema(&self) -> &lance_core::datatypes::Schema {
+            self.inner.schema()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_reads_each_chunk_once_without_cache_retention() {
+        // Three full chunks of 32 blocks (block_rows=8 -> 256 rows per chunk)
+        // and a short fourth chunk.
+        let num_destinations = 3u32;
+        let map = make_test_map(&[500, 300], num_destinations, 17);
+        let total = map.expected.len() as u64;
+        let tempdir = TempDir::default();
+        let store = test_store(&tempdir);
+        let (_, _) = write_map(&store, &map, num_destinations, 8, 101).await;
+        let counting = CountingReader::new(store.open_index_file("row_map.lance").await.unwrap());
+        let num_blocks = 100usize;
+        let num_chunks = num_blocks.div_ceil(ROW_MAP_CACHE_CHUNK_BLOCKS);
+
+        // A zero-capacity cache runs every loader and retains nothing: the
+        // block cache is attached, but no chunk survives past its request.
+        let cache = lance_core::cache::LanceCache::with_capacity(0);
+        let block_cache = RowMapBlockCache::new(WeakLanceCache::from(&cache), [3u8; 32]);
+        let reader = RowMapReader::open_with_cache(counting.clone(), Some(block_cache))
+            .await
+            .unwrap();
+        assert_eq!(reader.counts().num_blocks(), num_blocks);
+        counting.take();
+
+        // Block by block with held labels: one whole-chunk read per chunk.
+        let mut held = None;
+        let mut labels = Vec::new();
+        for block in 0..num_blocks {
+            labels.push(
+                reader
+                    .block_labels_reusing(block, num_blocks - 1, &mut held)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let (reads, rows) = counting.take();
+        assert_eq!(reads, num_chunks, "one read per chunk with a held chunk");
+        assert_eq!(rows as u64, total, "each row read exactly once");
+
+        // A sweep visits blocks in order and must do the same.
+        let mut swept = Vec::new();
+        reader
+            .sweep(0..total, |_, translated| {
+                swept.push(translated);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(swept, map.expected);
+        let (reads, rows) = counting.take();
+        assert_eq!(reads, num_chunks, "a sweep reads each chunk once");
+        assert_eq!(rows as u64, total);
+
+        // Independent block requests cannot reuse anything: without retention
+        // every one of them pays a whole-chunk read. This is the amplification
+        // the held chunk avoids for a request, and the reason the reader is
+        // opened without a block cache when the cache is known to be smaller
+        // than a chunk.
+        for (block, expected) in labels.iter().enumerate() {
+            assert_eq!(
+                &reader.block_labels(block).await.unwrap(),
+                expected,
+                "block {block}"
+            );
+        }
+        let (reads, rows) = counting.take();
+        assert_eq!(reads, num_blocks);
+        assert!(rows as u64 > total * (ROW_MAP_CACHE_CHUNK_BLOCKS as u64 / 2));
+
+        // Without a block cache each block request reads exactly its rows.
+        let plain = RowMapReader::open(counting.clone()).await.unwrap();
+        counting.take();
+        for (block, expected) in labels.iter().enumerate() {
+            assert_eq!(&plain.block_labels(block).await.unwrap(), expected);
+        }
+        assert_eq!(counting.take(), (num_blocks, total as usize));
+
+        // Without a block cache a run of adjacent blocks is read in one
+        // read, bounded to a chunk's worth of blocks, and a sparse request
+        // reads exactly its blocks: two blocks far apart cost two block
+        // reads, not the span between them.
+        let mut held = None;
+        assert_eq!(
+            &plain.block_labels_reusing(0, 0, &mut held).await.unwrap(),
+            &labels[0]
+        );
+        assert_eq!(
+            &plain.block_labels_reusing(99, 99, &mut held).await.unwrap(),
+            &labels[99]
+        );
+        assert_eq!(
+            counting.take(),
+            (2, 16),
+            "two touched blocks, two block reads"
+        );
+        let mut held = None;
+        for (block, expected) in labels.iter().enumerate().take(21).skip(5) {
+            assert_eq!(
+                &plain
+                    .block_labels_reusing(block, 20, &mut held)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(counting.take(), (1, 16 * 8), "blocks 5..=20 in one read");
+        let mut held = None;
+        for (block, expected) in labels.iter().enumerate() {
+            assert_eq!(
+                &plain
+                    .block_labels_reusing(block, num_blocks - 1, &mut held)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            counting.take(),
+            (num_chunks, total as usize),
+            "a whole-map request reads a chunk's worth of blocks at a time"
+        );
+        let mut swept = Vec::new();
+        plain
+            .sweep(0..total, |_, translated| {
+                swept.push(translated);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(swept, map.expected);
+        assert_eq!(counting.take(), (num_chunks, total as usize));
     }
 
     #[tokio::test]
