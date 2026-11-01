@@ -29,6 +29,7 @@ mod test {
     use tokio::sync::{Barrier, Mutex};
 
     use crate::dataset::builder::DatasetBuilder;
+    use crate::dataset::cleanup::{CleanupPolicyBuilder, cleanup_old_versions};
     use crate::{
         Dataset,
         dataset::{ReadParams, WriteMode, WriteParams},
@@ -540,6 +541,62 @@ mod test {
 
     #[cfg(not(windows))]
     #[tokio::test]
+    async fn restore_from_publishes_through_the_external_commit_handler() {
+        let external = Arc::new(TestExternalManifestStore::new());
+        let handler = Arc::new(ExternalManifestCommitHandler {
+            external_manifest_store: external.clone(),
+        });
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
+        let dir = TempStrDir::default();
+
+        Dataset::write(
+            data_gen.batch(10),
+            &dir,
+            Some(write_params(handler.clone())),
+        )
+        .await
+        .unwrap();
+        Dataset::write(
+            data_gen.batch(10),
+            &dir,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                commit_handler: Some(handler.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let latest = DatasetBuilder::from_uri(&dir)
+            .with_read_params(read_params(handler.clone()))
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(latest.version().version, 2);
+        let mut target = latest.checkout_version(1).await.unwrap();
+        target.restore_from(2).await.unwrap();
+        assert_eq!(target.version().version, 3);
+
+        let latest = external
+            .get_latest_version(target.base.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.0, 3);
+
+        let reopened = DatasetBuilder::from_uri(&dir)
+            .with_read_params(read_params(handler))
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(reopened.version().version, 3);
+        assert_eq!(reopened.count_rows(None).await.unwrap(), 10);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
     async fn test_concurrent_commits_are_okay() {
         const NUM_WRITERS: usize = 5;
         const CONTENDED_VERSION: u64 = 2;
@@ -765,6 +822,76 @@ mod test {
             })
             .collect::<Vec<_>>();
         assert!(unexpected_entries.is_empty(), "{:?}", unexpected_entries);
+    }
+
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn cleanup_preserves_staging_manifest_selected_by_external_store_fallback() {
+        let external_store = TestExternalManifestStore::new();
+        let manifest_records = external_store.store.clone();
+        let handler: Arc<dyn CommitHandler> = Arc::new(ExternalManifestCommitHandler {
+            external_manifest_store: Arc::new(external_store),
+        });
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
+        let dir = TempStrDir::default();
+        let dataset = Dataset::write(
+            data_gen.batch(10),
+            &dir,
+            Some(WriteParams {
+                commit_handler: Some(handler),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let canonical_manifest = dataset.manifest_location().path.clone();
+        let authoritative_staging_manifest =
+            Path::parse(format!("{}-{}", canonical_manifest, uuid::Uuid::new_v4())).unwrap();
+        let orphan_staging_manifest =
+            Path::parse(format!("{}-{}", canonical_manifest, uuid::Uuid::new_v4())).unwrap();
+        dataset
+            .object_store
+            .copy(&canonical_manifest, &authoritative_staging_manifest)
+            .await
+            .unwrap();
+        dataset
+            .object_store
+            .copy(&canonical_manifest, &orphan_staging_manifest)
+            .await
+            .unwrap();
+        manifest_records.lock().await.insert(
+            (dataset.base.to_string(), dataset.version().version),
+            authoritative_staging_manifest.to_string(),
+        );
+
+        cleanup_old_versions(
+            &dataset,
+            CleanupPolicyBuilder::default()
+                .before_timestamp(chrono::Utc::now())
+                .delete_unverified(true)
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            dataset
+                .object_store
+                .exists(&authoritative_staging_manifest)
+                .await
+                .unwrap(),
+            "cleanup deleted the manifest selected by the external store"
+        );
+        assert!(
+            !dataset
+                .object_store
+                .exists(&orphan_staging_manifest)
+                .await
+                .unwrap(),
+            "cleanup retained an unrecorded staging manifest"
+        );
     }
 
     /// S3's `CopyObject` API has a hard 5 GB cap on the source object size.

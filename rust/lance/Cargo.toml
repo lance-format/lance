@@ -34,6 +34,7 @@ lance-select = { workspace = true }
 lance-tokenizer = { workspace = true }
 lance-table = { workspace = true }
 lance-bitpacking = { workspace = true }
+blake3 = { workspace = true }
 arrow-arith = { workspace = true }
 arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
@@ -63,11 +64,13 @@ rustc-hash = "2.1"
 fst.workspace = true
 itertools.workspace = true
 moka.workspace = true
+num-traits.workspace = true
 object_store = { workspace = true }
 pin-project.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 roaring.workspace = true
+hex.workspace = true
 tokio.workspace = true
 url.workspace = true
 rand.workspace = true
@@ -117,6 +120,9 @@ all_asserts.workspace = true
 mock_instant.workspace = true
 lance-testing = { workspace = true }
 lance-io = { workspace = true, features = ["test-util"] }
+lance-index = { workspace = true, features = ["test-oracle"] }
+lance-arrow-scalar = { workspace = true }
+lance-arrow-stats = { workspace = true }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 env_logger.workspace = true
 tempfile.workspace = true
@@ -135,7 +141,16 @@ geoarrow-schema = { workspace = true }
 geo-types = { workspace = true }
 datafusion-substrait = { workspace = true }
 parquet = { workspace = true }
-reqwest = { workspace = true, features = ["rustls-tls"] }
+reqwest = { workspace = true, features = ["rustls"] }
+
+# Pins the ordering contract Lance inherits from Arrow, DataFusion and `half`.
+# Not part of the default test run: CI runs it from the `arrow-ordering-compat`
+# job when Cargo.lock changes an ordering-relevant crate or the fixtures
+# themselves change, and the clippy job lints it explicitly. Run by hand with
+# `cargo test -p lance --test arrow_ordering`.
+[[test]]
+name = "arrow_ordering"
+test = false
 
 [features]
 default = ["aws", "azure", "gcp", "oss", "huggingface", "tencent", "tos", "goosefs", "geo"]
@@ -199,6 +214,10 @@ name = "scan"
 harness = false
 
 [[bench]]
+name = "cdf"
+harness = false
+
+[[bench]]
 name = "s3_file_reader_diagnostics"
 harness = false
 
@@ -207,11 +226,19 @@ name = "count_pushdown"
 harness = false
 
 [[bench]]
+name = "stable_row_id_limit"
+harness = false
+
+[[bench]]
 name = "vector_index"
 harness = false
 
 [[bench]]
 name = "ivf_pq"
+harness = false
+
+[[bench]]
+name = "nullable_vector_training"
 harness = false
 
 [[bench]]
@@ -320,11 +347,19 @@ name = "manifest_commit"
 harness = false
 
 [[bench]]
+name = "rowid_spill"
+harness = false
+
+[[bench]]
 name = "concurrent_append"
 harness = false
 
 [[bench]]
 name = "hamming"
+harness = false
+
+[[bench]]
+name = "hamming_ivf_training"
 harness = false
 
 [lints]

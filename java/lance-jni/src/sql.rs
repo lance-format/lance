@@ -5,7 +5,7 @@ use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
 use crate::traits::FromJString;
 use crate::{Error, JNIEnvExt, RT, block_on};
-use arrow::ffi_stream::FFI_ArrowArrayStream;
+use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use jni::JNIEnv;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{JNI_TRUE, jboolean, jlong};
@@ -23,6 +23,8 @@ pub extern "system" fn Java_org_lance_SqlQuery_intoBatchRecords(
     with_row_id: jboolean,
     with_row_addr: jboolean,
     stream_addr: jlong,
+    extra_table_names: JObject,
+    extra_stream_addrs: JObject,
 ) {
     ok_or_throw_without_return!(
         env,
@@ -34,11 +36,14 @@ pub extern "system" fn Java_org_lance_SqlQuery_intoBatchRecords(
             with_row_id,
             with_row_addr,
             stream_addr,
+            extra_table_names,
+            extra_stream_addrs,
         )
         .map_err(|e| Error::input_error(e.to_string()))
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_into_batch_records(
     env: &mut JNIEnv,
     java_dataset: JObject,
@@ -47,6 +52,8 @@ fn inner_into_batch_records(
     with_row_id: jboolean,
     with_row_addr: jboolean,
     stream_addr: jlong,
+    extra_table_names: JObject,
+    extra_stream_addrs: JObject,
 ) -> Result<()> {
     let builder = sql_builder(
         env,
@@ -55,6 +62,8 @@ fn inner_into_batch_records(
         table_name,
         with_row_id,
         with_row_addr,
+        extra_table_names,
+        extra_stream_addrs,
     )?;
 
     let stream = block_on(async move {
@@ -69,6 +78,7 @@ fn inner_into_batch_records(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sql_builder(
     env: &mut JNIEnv,
     java_dataset: JObject,
@@ -76,9 +86,15 @@ fn sql_builder(
     table_name: JObject,
     with_row_id: jboolean,
     with_row_addr: jboolean,
+    extra_table_names: JObject,
+    extra_stream_addrs: JObject,
 ) -> Result<SqlQueryBuilder> {
     let sql_str = sql.extract(env)?;
     let table_str = env.get_string_opt(&table_name)?;
+    // Read every env-derived input before taking the dataset guard below, which holds a mutable borrow of `env`
+    // for its lifetime (a second `env` borrow while it is alive would not compile).
+    let names = env.get_strings(&extra_table_names)?;
+    let addrs = env.get_longs(&extra_stream_addrs)?;
 
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
@@ -91,6 +107,18 @@ fn sql_builder(
 
     if let Some(table) = table_str {
         builder = builder.table_name(table.as_str())
+    }
+
+    // Register each caller-supplied relation (parallel name/address lists, read above). Each stream was exported
+    // to a C-Data stream on the Java side; import it to RecordBatches and register it under its name.
+    for (name, addr) in names.into_iter().zip(addrs) {
+        let stream_ptr = addr as *mut FFI_ArrowArrayStream;
+        let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr)? };
+        let mut batches = Vec::new();
+        for batch in reader {
+            batches.push(batch.map_err(|e| Error::input_error(e.to_string()))?);
+        }
+        builder = builder.register_arrow(name.as_str(), batches)?;
     }
 
     Ok(builder)

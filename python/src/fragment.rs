@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::fmt::Write as _;
+use std::num::NonZero;
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
@@ -21,6 +22,7 @@ use arrow_array::RecordBatchReader;
 use futures::TryFutureExt;
 use lance::Error;
 use lance::dataset::fragment::FileFragment as LanceFragment;
+use lance::dataset::fragment::FragmentAddColumnsCleanup as LanceFragmentAddColumnsCleanup;
 use lance::dataset::scanner::{ColumnOrdering, MaterializationStyle};
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{InsertBuilder, NewColumnTransform, WriteParams};
@@ -33,7 +35,7 @@ use lance_table::format::{
 use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
 use pyo3::basic::CompareOp;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyList, PyTuple};
 use pyo3::{exceptions::*, types::PyDict};
 use pyo3::{intern, prelude::*};
 
@@ -43,15 +45,66 @@ use crate::schema::{LanceSchema, logical_schema_from_lance};
 use crate::utils::{PyLance, export_vec, extract_vec};
 use crate::{Dataset, Scanner, rt};
 
+type UpdateColumnsResult = (PyLance<Fragment>, Vec<u32>, Option<Vec<u8>>);
+
 #[pyclass(name = "_Fragment", module = "_lib", from_py_object)]
 #[derive(Clone)]
 pub struct FileFragment {
     fragment: LanceFragment,
 }
 
+#[pyclass(name = "FragmentAddColumnsCleanup", module = "_lib")]
+pub struct FragmentAddColumnsCleanup {
+    cleanup: Option<LanceFragmentAddColumnsCleanup>,
+}
+
+type PyFragmentAddColumnsResult = (PyLance<Fragment>, LanceSchema, FragmentAddColumnsCleanup);
+
+#[pymethods]
+impl FragmentAddColumnsCleanup {
+    /// Remove the files staged by a fragment-level add-columns operation.
+    ///
+    /// This is intentionally explicit: call it only after establishing that
+    /// the outer merge commit did not land.
+    fn cleanup(&mut self) -> PyResult<()> {
+        let Some(cleanup) = self.cleanup.take() else {
+            return Ok(());
+        };
+        rt().spawn(None, async move {
+            cleanup.cleanup().await;
+            Ok::<(), Error>(())
+        })?
+        .infer_error()
+    }
+}
+
 impl FileFragment {
     pub fn new(frag: LanceFragment) -> Self {
         Self { fragment: frag }
+    }
+
+    fn add_columns_with_cleanup_inner(
+        &self,
+        transforms: NewColumnTransform,
+        read_columns: Option<Vec<String>>,
+        batch_size: Option<u32>,
+    ) -> PyResult<PyFragmentAddColumnsResult> {
+        let fragment = self.fragment.clone();
+        let result = rt()
+            .spawn(None, async move {
+                fragment
+                    .add_columns_with_cleanup(transforms, read_columns, batch_size)
+                    .await
+            })?
+            .infer_error()?;
+
+        Ok((
+            PyLance(result.fragment),
+            LanceSchema(result.schema),
+            FragmentAddColumnsCleanup {
+                cleanup: Some(result.cleanup),
+            },
+        ))
     }
 }
 
@@ -74,7 +127,13 @@ impl FileFragment {
             .collect::<Vec<_>>()
             .join(", ");
         write!(s, "{}]", file_path).unwrap();
-        if let Some(deletion) = &self.fragment.metadata().deletion_file {
+        if let Some(deletion) = self
+            .fragment
+            .metadata()
+            .deletion_file
+            .as_ref()
+            .filter(|deletion| !deletion.is_inline())
+        {
             let path = deletion_file_path(&Default::default(), self.id() as u64, deletion);
             write!(s, ", deletion_file='{}'", path).unwrap();
         }
@@ -211,7 +270,7 @@ impl FileFragment {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None, use_scalar_index=None, io_buffer_size=None, late_materialization=None, include_deleted_rows=None, batch_size_bytes=None, strict_batch_size=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None, use_scalar_index=None, io_buffer_size=None, late_materialization=None, include_deleted_rows=None, batch_size_bytes=None, strict_batch_size=None, substrait_filter=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -231,6 +290,7 @@ impl FileFragment {
         include_deleted_rows: Option<bool>,
         batch_size_bytes: Option<u64>,
         strict_batch_size: Option<bool>,
+        substrait_filter: Option<Vec<u8>>,
     ) -> PyResult<Scanner> {
         let mut scanner = self_.fragment.scan();
 
@@ -257,9 +317,17 @@ impl FileFragment {
             scanner.batch_size(batch_size);
         }
         if let Some(f) = filter {
+            if substrait_filter.is_some() {
+                return Err(PyValueError::new_err(
+                    "cannot specify both a string filter and a substrait filter",
+                ));
+            }
             scanner
                 .filter(&f)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
+        }
+        if let Some(f) = substrait_filter {
+            scanner.filter_substrait(&f).infer_error()?;
         }
 
         scanner
@@ -343,17 +411,21 @@ impl FileFragment {
         batch_size: Option<u32>,
     ) -> PyResult<(PyLance<Fragment>, LanceSchema)> {
         let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
-
         let transforms = NewColumnTransform::Reader(Box::new(batches));
+        let (fragment, schema, _cleanup) =
+            self.add_columns_with_cleanup_inner(transforms, None, batch_size)?;
+        Ok((fragment, schema))
+    }
 
-        let fragment = self.fragment.clone();
-        let (fragment, schema) = rt()
-            .spawn(None, async move {
-                fragment.add_columns(transforms, None, batch_size).await
-            })?
-            .infer_error()?;
-
-        Ok((PyLance(fragment), LanceSchema(schema)))
+    #[pyo3(signature=(reader, batch_size=None))]
+    fn add_columns_from_reader_with_cleanup(
+        &mut self,
+        reader: &Bound<PyAny>,
+        batch_size: Option<u32>,
+    ) -> PyResult<PyFragmentAddColumnsResult> {
+        let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
+        let transforms = NewColumnTransform::Reader(Box::new(batches));
+        self.add_columns_with_cleanup_inner(transforms, None, batch_size)
     }
 
     #[pyo3(signature=(transforms, read_columns=None, batch_size=None))]
@@ -365,17 +437,21 @@ impl FileFragment {
         batch_size: Option<u32>,
     ) -> PyResult<(PyLance<Fragment>, LanceSchema)> {
         let transforms = transforms_from_python(py, transforms)?;
+        let (fragment, schema, _cleanup) =
+            self.add_columns_with_cleanup_inner(transforms, read_columns, batch_size)?;
+        Ok((fragment, schema))
+    }
 
-        let fragment = self.fragment.clone();
-        let (fragment, schema) = rt()
-            .spawn(None, async move {
-                fragment
-                    .add_columns(transforms, read_columns, batch_size)
-                    .await
-            })?
-            .infer_error()?;
-
-        Ok((PyLance(fragment), LanceSchema(schema)))
+    #[pyo3(signature=(transforms, read_columns=None, batch_size=None))]
+    fn add_columns_with_cleanup(
+        &mut self,
+        py: Python<'_>,
+        transforms: &Bound<'_, PyAny>,
+        read_columns: Option<Vec<String>>,
+        batch_size: Option<u32>,
+    ) -> PyResult<PyFragmentAddColumnsResult> {
+        let transforms = transforms_from_python(py, transforms)?;
+        self.add_columns_with_cleanup_inner(transforms, read_columns, batch_size)
     }
 
     fn merge(
@@ -383,14 +459,11 @@ impl FileFragment {
         reader: PyArrowType<ArrowArrayStreamReader>,
         left_on: String,
         right_on: String,
-        max_field_id: i32,
     ) -> PyResult<(PyLance<Fragment>, LanceSchema)> {
         let mut fragment = self.fragment.clone();
         let (fragment, schema) = rt()
             .spawn(None, async move {
-                fragment
-                    .merge_columns(reader.0, &left_on, &right_on, max_field_id)
-                    .await
+                fragment.merge_columns(reader.0, &left_on, &right_on).await
             })?
             .infer_error()?;
 
@@ -402,15 +475,34 @@ impl FileFragment {
         reader: PyArrowType<ArrowArrayStreamReader>,
         left_on: String,
         right_on: String,
-    ) -> PyResult<(PyLance<Fragment>, Vec<u32>)> {
+        with_offsets: bool,
+    ) -> PyResult<UpdateColumnsResult> {
         let mut fragment = self.fragment.clone();
-        let (updated_fragment, fields_modified) = rt()
+        let result = rt()
             .spawn(None, async move {
-                fragment.update_columns(reader.0, &left_on, &right_on).await
+                fragment
+                    .update_columns_with_offsets(reader.0, &left_on, &right_on)
+                    .await
             })?
             .infer_error()?;
 
-        Ok((PyLance(updated_fragment), fields_modified))
+        let matched_offsets = if with_offsets {
+            let mut buf = Vec::with_capacity(result.matched_offsets.serialized_size());
+            result
+                .matched_offsets
+                .serialize_into(&mut buf)
+                .map_err(|err| {
+                    PyIOError::new_err(format!("Failed to serialize matched row offsets: {err}"))
+                })?;
+            Some(buf)
+        } else {
+            None
+        };
+        Ok((
+            PyLance(result.fragment),
+            result.fields_modified,
+            matched_offsets,
+        ))
     }
 
     fn delete(&self, predicate: &str) -> PyResult<Option<Self>> {
@@ -478,6 +570,7 @@ impl FileFragment {
     fn deletion_file(&self) -> PyResult<Option<String>> {
         let deletion = self.fragment.metadata().deletion_file.clone();
         Ok(deletion
+            .filter(|d| !d.is_inline())
             .map(|d| deletion_file_path(&Default::default(), self.id() as u64, &d).to_string()))
     }
 
@@ -581,13 +674,16 @@ pub struct PyDeletionFile(pub DeletionFile);
 #[pymethods]
 impl PyDeletionFile {
     #[new]
+    #[pyo3(signature = (read_version, id, file_type, num_deleted_rows, base_id=None, inline=None))]
     fn new(
         read_version: u64,
         id: u64,
         file_type: &str,
         num_deleted_rows: usize,
         base_id: Option<u32>,
+        inline: Option<Vec<u8>>,
     ) -> PyResult<Self> {
+        let inline = inline.map(bytes::Bytes::from);
         let file_type = match file_type {
             "array" => DeletionFileType::Array,
             "bitmap" => DeletionFileType::Bitmap,
@@ -604,6 +700,7 @@ impl PyDeletionFile {
             file_type,
             num_deleted_rows: Some(num_deleted_rows),
             base_id,
+            inline,
         }))
     }
 
@@ -618,6 +715,14 @@ impl PyDeletionFile {
             slf.0.num_deleted_rows,
         )?;
         dict.set_item(intern!(slf.py(), "base_id"), slf.0.base_id)?;
+        // A list of ints rather than bytes, so the dict stays JSON-serializable.
+        let inline = match &slf.0.inline {
+            Some(bytes) => PyList::new(slf.py(), bytes.iter().copied())?
+                .into_any()
+                .unbind(),
+            None => slf.py().None(),
+        };
+        dict.set_item(intern!(slf.py(), "inline"), inline)?;
 
         Ok(dict)
     }
@@ -660,8 +765,19 @@ impl PyDeletionFile {
         &self.0.base_id
     }
 
+    /// The serialized deletion bitmap when it is stored in the manifest, else None.
+    #[getter]
+    fn inline(&self) -> Option<Vec<u8>> {
+        self.0.inline.as_ref().map(|bytes| bytes.to_vec())
+    }
+
+    /// The path of the deletion file, or None when the vector is stored inline
+    /// and no file exists.
     #[pyo3(signature = (fragment_id, base_uri=None))]
-    fn path(&self, fragment_id: u64, base_uri: Option<&str>) -> PyResult<String> {
+    fn path(&self, fragment_id: u64, base_uri: Option<&str>) -> PyResult<Option<String>> {
+        if self.0.is_inline() {
+            return Ok(None);
+        }
         let base_path = if let Some(base_uri) = base_uri {
             Path::from_url_path(base_uri).map_err(|e| {
                 PyValueError::new_err(format!("Invalid base URI: {}: {}", base_uri, e))
@@ -669,7 +785,9 @@ impl PyDeletionFile {
         } else {
             Path::default()
         };
-        Ok(deletion_file_path(&base_path, fragment_id, &self.0).to_string())
+        Ok(Some(
+            deletion_file_path(&base_path, fragment_id, &self.0).to_string(),
+        ))
     }
 
     pub fn json(&self) -> PyResult<String> {
@@ -874,6 +992,16 @@ impl FromPyObject<'_, '_> for PyLance<Fragment> {
             // fragments back (a manual Delete/Update/Merge commit). Sorting
             // newest-last is deferred to the manifest reload after commit.
             overlays: extract_vec::<DataOverlayFile>(&ob.getattr("overlays")?)?,
+            // Tolerate objects predating these attributes; absent means no
+            // clustering reference and no generic metadata.
+            clustering_id: match ob.getattr("clustering_id") {
+                Ok(value) => value.extract::<Option<u32>>()?,
+                Err(_) => None,
+            },
+            metadata: match ob.getattr("metadata") {
+                Ok(value) => value.extract()?,
+                Err(_) => Default::default(),
+            },
         }))
     }
 }
@@ -917,6 +1045,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             created_at_version_meta,
             last_updated_at_version_meta,
             overlays,
+            self.0.clustering_id,
+            self.0.metadata.clone(),
         ))
     }
 }
@@ -936,6 +1066,8 @@ impl FromPyObject<'_, '_> for PyLance<DataFile> {
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let file_size_bytes: Option<u64> = ob.getattr("file_size_bytes")?.extract()?;
         let file_size_bytes = CachedFileSize::new(file_size_bytes.unwrap_or(0));
+        let file_metadata_size_bytes: Option<u64> =
+            ob.getattr("file_metadata_size_bytes")?.extract()?;
         let fields: Vec<i32> = ob.getattr("fields")?.extract()?;
         let column_indices: Vec<i32> = ob.getattr("column_indices")?.extract()?;
         Ok(Self(DataFile {
@@ -945,6 +1077,7 @@ impl FromPyObject<'_, '_> for PyLance<DataFile> {
             file_major_version: ob.getattr("file_major_version")?.extract()?,
             file_minor_version: ob.getattr("file_minor_version")?.extract()?,
             file_size_bytes,
+            file_metadata_size_bytes: file_metadata_size_bytes.and_then(NonZero::new),
             base_id: ob.getattr("base_id")?.extract()?,
         }))
     }
@@ -970,6 +1103,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataFile> {
             self.0.file_minor_version,
             file_size_bytes,
             self.0.base_id,
+            self.0.file_metadata_size_bytes.map(NonZero::get),
         ))
     }
 }
