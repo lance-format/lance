@@ -2082,17 +2082,6 @@ impl ANNIvfSubIndexExec {
                     index.index_type()
                 )));
             }
-            let candidate_limit = query.k.checked_mul(factor as usize).ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "quantized refinement candidate count overflows: k={} factor={factor}",
-                    query.k
-                ))
-            })?;
-            let mut coarse_query = query.clone();
-            coarse_query.approx_mode = ApproxMode::Fast;
-            coarse_query.refine_factor = None;
-            coarse_query.lower_bound = None;
-            coarse_query.upper_bound = None;
             let candidate_prefilter: Arc<dyn PreFilter> = match &seg_mask {
                 Some(restriction) => Arc::new(RestrictedPreFilter {
                     inner: pre_filter,
@@ -2100,39 +2089,73 @@ impl ANNIvfSubIndexExec {
                 }),
                 None => pre_filter,
             };
-            let candidates = index
-                .search_in_partition_with_candidates(
-                    part_id,
-                    &coarse_query,
-                    candidate_prefilter,
-                    &metrics.index_metrics,
-                    candidate_limit,
-                )
-                .await
-                .map_err(|e| {
+            if query.lower_bound.is_some() || query.upper_bound.is_some() {
+                // Fast and Accurate scores use different scales. Let the
+                // existing Accurate range search choose candidates so bounds
+                // apply before top-k truncation.
+                let mut accurate_query = query.clone();
+                accurate_query.approx_mode = ApproxMode::Accurate;
+                accurate_query.refine_factor = None;
+                let batch = index
+                    .search_in_partition(
+                        part_id,
+                        &accurate_query,
+                        candidate_prefilter,
+                        &metrics.index_metrics,
+                    )
+                    .await
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "failed to search bounded quantized refinement candidates: {e}"
+                        ))
+                    })?;
+                restrict_to_segment(batch, seg_mask.as_deref())?
+            } else {
+                let candidate_limit = query.k.checked_mul(factor as usize).ok_or_else(|| {
                     DataFusionError::Execution(format!(
-                        "failed to discover quantized refinement candidates: {e}"
+                        "quantized refinement candidate count overflows: k={} factor={factor}",
+                        query.k
                     ))
                 })?;
-            let offsets = candidates
-                .candidates
-                .iter()
-                .map(|candidate| candidate.offset_in_partition)
-                .collect::<Vec<_>>();
-            let scored = index
-                .score_partition_candidates(part_id, &query, &offsets, &metrics.index_metrics)
-                .await
-                .map_err(|e| {
+                let mut coarse_query = query.clone();
+                coarse_query.approx_mode = ApproxMode::Fast;
+                coarse_query.refine_factor = None;
+                coarse_query.lower_bound = None;
+                coarse_query.upper_bound = None;
+                let candidates = index
+                    .search_in_partition_with_candidates(
+                        part_id,
+                        &coarse_query,
+                        candidate_prefilter,
+                        &metrics.index_metrics,
+                        candidate_limit,
+                    )
+                    .await
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "failed to discover quantized refinement candidates: {e}"
+                        ))
+                    })?;
+                let offsets = candidates
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.offset_in_partition)
+                    .collect::<Vec<_>>();
+                let scored = index
+                    .score_partition_candidates(part_id, &query, &offsets, &metrics.index_metrics)
+                    .await
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "failed to score quantized refinement candidates: {e}"
+                        ))
+                    })?;
+                let scored = restrict_to_segment(scored, seg_mask.as_deref())?;
+                quantized_top_k(&scored, &query).map_err(|e| {
                     DataFusionError::Execution(format!(
-                        "failed to score quantized refinement candidates: {e}"
+                        "failed to select quantized refinement results: {e}"
                     ))
-                })?;
-            let scored = restrict_to_segment(scored, seg_mask.as_deref())?;
-            quantized_top_k(&scored, &query).map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "failed to select quantized refinement results: {e}"
-                ))
-            })?
+                })?
+            }
         } else {
             let batch = index
                 .search_in_partition(part_id, &query, pre_filter, &metrics.index_metrics)

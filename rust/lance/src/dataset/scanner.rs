@@ -2686,11 +2686,14 @@ impl Scanner {
 
     /// Re-rank an over-fetched IVF_RQ candidate set with its multi-bit index data.
     ///
-    /// Unlike [`Self::refine`], this does not read original vectors from the dataset.
-    /// It first discovers `factor * k` candidates with one-bit RQ scores and then
-    /// re-ranks them with the index's most accurate stored RQ representation. If
-    /// exact refinement is also configured, the quantized stage emits enough
-    /// candidates for that exact stage.
+    /// Unlike [`Self::refine`], indexed candidates are re-ranked without reading
+    /// their original vectors. It first discovers `factor * k` candidates with
+    /// one-bit RQ scores and then re-ranks them with the index's most accurate
+    /// stored RQ representation. Unindexed fragments and stale overlay rows still
+    /// use flat fallback and may read original vectors. If exact refinement is also
+    /// configured, the quantized stage emits enough candidates for that exact stage.
+    /// When a distance range is set, the selected partitions use Accurate RQ search
+    /// directly so the range applies before top-k truncation.
     ///
     /// ```
     /// # use arrow_array::Float32Array;
@@ -21681,6 +21684,148 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .quantized_refine(2);
         let error = scanner.try_into_batch().await.unwrap_err();
         assert!(error.to_string().contains("requires an IVF_RQ flat index"));
+    }
+
+    #[tokio::test]
+    async fn test_quantized_refinement_applies_range_before_candidate_truncation() {
+        const DIM: usize = 32;
+        const ROWS: usize = 64;
+        let mut state = 0x1234_5678_u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((state >> 8) as f32 / (u32::MAX >> 8) as f32) * 2.0 - 1.0
+        };
+        let mut values = Vec::with_capacity(ROWS * DIM);
+        for _ in 0..ROWS {
+            let start = values.len();
+            values.extend((0..DIM).map(|_| next()));
+            let norm = values[start..]
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                .sqrt();
+            values[start..].iter_mut().for_each(|value| *value /= norm);
+        }
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM as i32)
+                .unwrap();
+        let batch = RecordBatch::try_from_iter([("vec", Arc::new(vectors) as ArrayRef)]).unwrap();
+        let tmp = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            &tmp,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut rq_params = RQBuildParams::with_rotation_type(4, RQRotationType::Fast);
+        let mut rotation = RabitQuantizer::new::<Float32Type>(4, DIM as i32)
+            .metadata_ref()
+            .clone();
+        for (index, signs) in rotation
+            .fast_rotation_signs
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            *signs = (index * 37 + 19) as u8;
+        }
+        rq_params.rotation = Some(rotation);
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::with_ivf_rq_params(
+                    DistanceType::L2,
+                    IvfBuildParams::new(1),
+                    rq_params,
+                ),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let mut query_state = 0x9e37_79b9_u32;
+        let mut query = Vec::with_capacity(DIM);
+        for _ in 0..DIM {
+            query_state = query_state
+                .wrapping_mul(1_664_525)
+                .wrapping_add(1_013_904_223);
+            query.push(((query_state >> 8) as f32 / (u32::MAX >> 8) as f32) * 2.0 - 1.0);
+        }
+        let norm = query.iter().map(|value| value * value).sum::<f32>().sqrt();
+        query.iter_mut().for_each(|value| *value /= norm);
+        let query = Float32Array::from(query);
+
+        let mut fast = dataset.scan();
+        fast.nearest("vec", &query, 2)
+            .unwrap()
+            .nprobes(1)
+            .approx_mode(ApproxMode::Fast)
+            .fast_search()
+            .with_row_id()
+            .project::<&str>(&[])
+            .unwrap();
+        let fast = fast.try_into_batch().await.unwrap();
+        let fast_ids = batch_row_ids(&fast);
+
+        let mut accurate = dataset.scan();
+        accurate
+            .nearest("vec", &query, 2)
+            .unwrap()
+            .nprobes(1)
+            .approx_mode(ApproxMode::Accurate)
+            .fast_search()
+            .with_row_id()
+            .project::<&str>(&[])
+            .unwrap();
+        let accurate = accurate.try_into_batch().await.unwrap();
+        let accurate_ids = batch_row_ids(&accurate);
+        let accurate_distances = accurate[DIST_COL]
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+
+        assert_eq!(fast_ids, vec![accurate_ids[1], accurate_ids[0]]);
+        assert!(accurate_distances[0] < accurate_distances[1]);
+
+        // The Fast winner is the farther Accurate candidate. With factor=1, a
+        // post-truncation upper bound would discard it without ever scoring the
+        // in-range candidate that the Fast pass ranked second.
+        let upper_bound = (accurate_distances[0] + accurate_distances[1]) / 2.0;
+        let mut accurate_range = dataset.scan();
+        accurate_range
+            .nearest("vec", &query, 1)
+            .unwrap()
+            .nprobes(1)
+            .approx_mode(ApproxMode::Accurate)
+            .distance_range(None, Some(upper_bound))
+            .fast_search()
+            .with_row_id()
+            .project::<&str>(&[])
+            .unwrap();
+        let accurate_range = accurate_range.try_into_batch().await.unwrap();
+
+        let mut quantized = dataset.scan();
+        quantized
+            .nearest("vec", &query, 1)
+            .unwrap()
+            .nprobes(1)
+            .quantized_refine(1)
+            .distance_range(None, Some(upper_bound))
+            .fast_search()
+            .with_row_id()
+            .project::<&str>(&[])
+            .unwrap();
+        let quantized = quantized.try_into_batch().await.unwrap();
+
+        assert_eq!(batch_row_ids(&quantized), batch_row_ids(&accurate_range));
+        assert_eq!(quantized.num_rows(), 1);
+        assert!(quantized[DIST_COL].as_primitive::<Float32Type>().value(0) < upper_bound);
     }
 
     #[tokio::test]
