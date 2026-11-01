@@ -316,10 +316,8 @@ fn merge_loaded_bm25_stats(
     ))))
 }
 
-/// Cap on concurrently in-flight per-segment statistics fetches during scorer
-/// preparation; mirrors the cross-column scorer's clamp so both fan-outs
-/// behave the same on datasets with very many segments.
-const MAX_CONCURRENT_SOURCE_LOADS: usize = 32;
+/// Cap on concurrent per-segment loads, shared with the cross-column scorer.
+pub(crate) const MAX_CONCURRENT_SOURCE_LOADS: usize = 32;
 
 /// Expand and score one indexed query leaf exactly once across all segments.
 ///
