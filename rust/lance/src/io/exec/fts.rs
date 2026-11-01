@@ -292,7 +292,7 @@ async fn open_fts_segment(
     column: &str,
     segment: &IndexMetadata,
     coverage: Option<(&SegmentCoverage, usize)>,
-    metrics: &IndexMetrics,
+    metrics: &dyn MetricsCollector,
 ) -> Result<Arc<InvertedIndex>> {
     let open = async {
         let index = dataset
@@ -335,7 +335,7 @@ async fn open_fts_segments(
     dataset: &Dataset,
     column: &str,
     segments: &[IndexMetadata],
-    metrics: &IndexMetrics,
+    metrics: &dyn MetricsCollector,
 ) -> Result<Vec<Arc<InvertedIndex>>> {
     let segment_refs = segments.iter().collect::<Vec<_>>();
     let coverage =
@@ -344,6 +344,25 @@ async fn open_fts_segments(
         let coverage = coverage.as_ref().map(|coverage| (coverage, index));
         open_fts_segment(dataset, column, segment, coverage, metrics)
     }))
+    .await
+}
+
+/// Open all committed FTS segments without resolving live-row coverage.
+///
+/// Global statistics describe the committed corpus rather than the rows currently stored
+/// in each segment's fragments, so resolving coverage would add deletion and row-id I/O
+/// without changing the result.
+pub(crate) async fn open_fts_segments_without_coverage(
+    dataset: &Dataset,
+    column: &str,
+    segments: &[IndexMetadata],
+    metrics: &dyn MetricsCollector,
+) -> Result<Vec<Arc<InvertedIndex>>> {
+    try_join_all(
+        segments
+            .iter()
+            .map(|segment| open_fts_segment(dataset, column, segment, None, metrics)),
+    )
     .await
 }
 
