@@ -13,7 +13,7 @@ use super::{
 };
 use crate::{
     decoder::{
-        DecodedArray, FilterExpression, LoadedPageShard, NextDecodeTask, PageEncoding,
+        DecodedArray, DrainLimit, FilterExpression, LoadedPageShard, NextDecodeTask, PageEncoding,
         ScheduledScanLine, SchedulerContext, StructuralDecodeArrayTask, StructuralFieldDecoder,
         StructuralFieldScheduler, StructuralSchedulingJob,
     },
@@ -338,6 +338,31 @@ impl StructuralStructDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralStructDecoder {
+    fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
+        self.children.iter().try_fold(
+            DrainLimit {
+                rows: num_rows,
+                bytes: 0,
+                dictionary_rows: None,
+            },
+            |limit, child| {
+                child
+                    .max_rows_to_drain(num_rows, byte_budget)
+                    .map(|child_limit| DrainLimit {
+                        rows: limit.rows.min(child_limit.rows),
+                        bytes: limit.bytes.max(child_limit.bytes),
+                        dictionary_rows: match (limit.dictionary_rows, child_limit.dictionary_rows)
+                        {
+                            (Some(current), Some(child)) => Some(current.min(child)),
+                            (Some(current), None) => Some(current),
+                            (None, Some(child)) => Some(child),
+                            (None, None) => None,
+                        },
+                    })
+            },
+        )
+    }
+
     fn accept_page(&mut self, mut child: LoadedPageShard) -> Result<()> {
         // children with empty path should not be delivered to this method
         let child_idx = child.path.pop_front().unwrap();
@@ -665,7 +690,8 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        Array, ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, StringArray, StructArray,
+        Array, ArrayRef, Float64Array, Int32Array, Int64Array, ListArray, NullArray, StringArray,
+        StructArray,
         builder::{Int32Builder, ListBuilder},
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -780,6 +806,28 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
+    async fn test_nullable_struct_with_null_typed_child() {
+        // A field that is null in every input row is inferred as the Null type, e.g.
+        // `pa.Table.from_pylist([{"s": {"a": 1, "b": None}}, {"s": None}])`.
+        let fields = Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Null, true),
+        ]);
+        let rows = StructArray::new(
+            fields,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), None, Some(3), Some(4)])),
+                Arc::new(NullArray::new(4)),
+            ],
+            Some(NullBuffer::from(vec![true, false, true, true])),
+        );
+
+        let test_cases = TestCases::default().with_structural_encodings();
+
+        check_round_trip_encoding_of_data(vec![Arc::new(rows)], &test_cases, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
     async fn test_simple_masked_nonempty_list() {
         // [[1, 2], [NULL], [4], [], NULL, NULL-STRUCT]
         //
@@ -835,6 +883,29 @@ mod tests {
         );
         check_round_trip_encoding_of_data(
             vec![Arc::new(struct_array)],
+            &TestCases::default().with_structural_encodings(),
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_struct_list_nulls_in_only_some_pages() {
+        // Two pages of STRUCT<LIST<INT32>>, only the second has null structs.  A batch that
+        // spans both must count the first page's struct validity per list, not per item.
+        let make_page = |nulls: Option<NullBuffer>| -> ArrayRef {
+            let list = ListArray::new(
+                Arc::new(Field::new("item", DataType::Int32, true)),
+                OffsetBuffer::from_lengths(std::iter::repeat_n(3, 1050)),
+                Arc::new(Int32Array::from_iter_values(0..3150)),
+                None,
+            );
+            let fields = Fields::from(vec![Field::new("l", list.data_type().clone(), true)]);
+            Arc::new(StructArray::new(fields, vec![Arc::new(list)], nulls))
+        };
+        let nulls = NullBuffer::from_iter((0..1050).map(|i| i % 7 != 0));
+        check_round_trip_encoding_of_data(
+            vec![make_page(None), make_page(Some(nulls))],
             &TestCases::default().with_structural_encodings(),
             HashMap::new(),
         )
@@ -1117,8 +1188,8 @@ mod tests {
         let list_array = Arc::new(list_builder.finish());
         let int_array = Arc::new(Int32Array::from_iter_values(0..10000));
         let fields = vec![
-            Field::new("", list_array.data_type().clone(), true),
-            Field::new("", int_array.data_type().clone(), true),
+            Field::new("list", list_array.data_type().clone(), true),
+            Field::new("scalar", int_array.data_type().clone(), true),
         ];
         let struct_array = Arc::new(StructArray::new(
             Fields::from(fields),
