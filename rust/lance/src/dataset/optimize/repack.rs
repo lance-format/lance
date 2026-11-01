@@ -9,7 +9,7 @@
 //! [`CompactionTaskKind::RepackColumns`] task reads some of the fragment's
 //! columns, writes them to new files, and commits the files as an
 //! `Operation::DataReplacement` with `data_change: false`: the fragment id,
-//! row addresses, overlays and index coverage are left as they are.
+//! row addresses, deletions, overlays and index coverage are left as they are.
 //!
 //! [`CompactionTaskKind::RepackColumns`]: super::CompactionTaskKind::RepackColumns
 
@@ -247,7 +247,7 @@ pub(super) async fn execute_repack(
         write_version,
     )?;
 
-    // Copy the stored values of every physical row, deleted ones included,
+    // Copy the base values of every physical row, deleted ones included,
     // as `data_change: false` requires. The overlays and the deletion file
     // stay on the fragment and keep applying to the new files.
     let mut base = fragment.clone();
