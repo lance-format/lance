@@ -16,6 +16,7 @@ use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use blob::LanceBlobFile;
 use chrono::{Duration, TimeDelta, Utc};
+use datafusion::common::{ParamValues, ScalarValue};
 use futures::{StreamExt, TryFutureExt};
 use lance_index::scalar::minhash_lsh::MinHashQuery;
 use lance_index::vector::bq::RQBuildParams;
@@ -23,7 +24,7 @@ use lance_index::vector::bq::storage::RabitQuantizationMetadata;
 use log::error;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
-use pyo3::types::{PyBytes, PyInt, PyList, PyString, PyTuple};
+use pyo3::types::{PyByteArray, PyBytes, PyInt, PyList, PySequence, PyString, PyTuple};
 use pyo3::{IntoPyObjectExt, prelude::*};
 use pyo3::{
     PyResult,
@@ -4444,6 +4445,62 @@ pub struct SqlQueryBuilder {
 
 #[pymethods]
 impl SqlQueryBuilder {
+    fn parameters(&self, parameters: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let py = parameters.py();
+        let pa = py.import("pyarrow")?;
+        let array_factory = pa.getattr("array")?;
+        let to_scalar = |value: Bound<'_, PyAny>| -> PyResult<ScalarValue> {
+            let array = array_factory.call1((PyList::new(py, [value])?,))?;
+            let array = make_array(ArrayData::from_pyarrow_bound(&array)?);
+            ScalarValue::try_from_array(array.as_ref(), 0)
+                .map_err(|err| PyValueError::new_err(err.to_string()))
+        };
+        let parameters: ParamValues = if let Ok(values) = parameters.cast::<PyDict>() {
+            values
+                .iter()
+                .map(|(name, value)| Ok((name.extract::<String>()?, to_scalar(value)?)))
+                .collect::<PyResult<HashMap<_, _>>>()?
+                .into()
+        } else if parameters.is_instance(&pa.getattr("RecordBatch")?)? {
+            let batch = RecordBatch::from_pyarrow_bound(parameters)?;
+            if batch.num_rows() != 1 {
+                return Err(PyValueError::new_err(format!(
+                    "SQL parameters RecordBatch must have exactly one row, got {}",
+                    batch.num_rows()
+                )));
+            }
+            let mut values = HashMap::with_capacity(batch.num_columns());
+            for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+                let value = ScalarValue::try_from_array(column.as_ref(), 0)
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                if values.insert(field.name().clone(), value).is_some() {
+                    return Err(PyValueError::new_err(format!(
+                        "SQL parameters RecordBatch has duplicate column name {:?}",
+                        field.name()
+                    )));
+                }
+            }
+            values.into()
+        } else if let Ok(values) = parameters.cast::<PySequence>()
+            && !parameters.is_instance_of::<PyString>()
+            && !parameters.is_instance_of::<PyBytes>()
+            && !parameters.is_instance_of::<PyByteArray>()
+        {
+            values
+                .try_iter()?
+                .map(|value| to_scalar(value?))
+                .collect::<PyResult<Vec<_>>>()?
+                .into()
+        } else {
+            return Err(PyTypeError::new_err(
+                "SQL parameters must be a sequence of values, a dict, or a single-row pyarrow.RecordBatch",
+            ));
+        };
+        Ok(Self {
+            builder: self.builder.clone().with_parameters(parameters),
+        })
+    }
+
     #[pyo3(signature = (table_name))]
     fn table_name(&self, table_name: &str) -> Self {
         Self {

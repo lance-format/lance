@@ -7487,6 +7487,125 @@ def test_dataset_sql(tmp_path: Path):
     assert pa.Table.from_batches(complex_result) == expected_complex
 
 
+@pytest.mark.parametrize("result_method", ["to_batch_records", "to_stream_reader"])
+@pytest.mark.parametrize("parameter_form", ["positional", "named", "record_batch"])
+@pytest.mark.parametrize("register_ids", [False, True])
+def test_dataset_sql_parameters(
+    tmp_path: Path, result_method, parameter_form, register_ids
+):
+    key = "O'Reilly' OR 1=1 -- $1"
+    table = pa.table({"id": [1, 2, 3, 4], "value": ["other", key, None, key]})
+    ds = lance.write_dataset(
+        table, tmp_path / "test", max_rows_per_file=2, max_rows_per_group=2
+    )
+    if parameter_form == "positional":
+        parameters = [2, key]
+        lower, value = "$1", "$2"
+    else:
+        parameters = {"lower": 2, "value": key}
+        if parameter_form == "record_batch":
+            parameters = pa.record_batch({name: [v] for name, v in parameters.items()})
+        lower, value = "$lower", "$value"
+    sql = (
+        f"SELECT id, {value} AS bound_value, '$1' AS literal FROM test "
+        f"WHERE id >= {lower} AND (value = {value} OR value = {value})"
+    )
+    if register_ids:
+        sql += f" AND id IN (SELECT id FROM ids WHERE id >= {lower})"
+    builder = ds.sql(sql + " ORDER BY id", parameters=parameters).table_name("test")
+    if register_ids:
+        builder.register_arrow("ids", pa.table({"id": [1, 4, 99]}))
+    query = builder.with_row_id().with_row_addr().batch_size(1).build()
+    result = pa.Table.from_batches(list(getattr(query, result_method)()))
+    expected_ids = [4] if register_ids else [2, 4]
+    assert result["id"].to_pylist() == expected_ids
+    assert result["bound_value"].to_pylist() == [key] * len(expected_ids)
+    assert result["literal"].to_pylist() == ["$1"] * len(expected_ids)
+    assert result["_rowid"].null_count == 0
+    assert result["_rowaddr"].null_count == 0
+
+
+def test_dataset_sql_parameters_count_and_replace(tmp_path: Path):
+    ds = lance.write_dataset(pa.table({"id": [1, 2, 3]}), tmp_path / "test")
+    builder = ds.sql("SELECT count(*) AS n FROM dataset WHERE id = $1", parameters=[1])
+    first = builder.build()
+    second = builder.parameters((99,)).build()
+    assert pa.Table.from_batches(first.to_batch_records()).to_pydict() == {"n": [1]}
+    assert pa.Table.from_batches(second.to_batch_records()).to_pydict() == {"n": [0]}
+    assert pa.Table.from_batches(first.to_batch_records()).to_pydict() == {"n": [1]}
+
+
+@pytest.mark.parametrize(
+    "value,arrow_type",
+    [
+        (None, pa.null()),
+        (True, pa.bool_()),
+        (3.5, pa.float64()),
+        (b"bytes", pa.binary()),
+        (date(2026, 1, 2), pa.date32()),
+        (pa.scalar(42, pa.int32()), pa.int32()),
+        (pa.scalar(None, pa.int64()), pa.int64()),
+        (pa.scalar("text", pa.large_string()), pa.large_string()),
+        (pa.scalar(b"bytes", pa.large_binary()), pa.large_binary()),
+    ],
+)
+def test_dataset_sql_parameter_types(tmp_path: Path, value, arrow_type):
+    ds = lance.write_dataset(pa.table({"id": [1]}), tmp_path / "test")
+    result = pa.Table.from_batches(
+        ds.sql("SELECT $1 AS value", parameters=[value]).build().to_batch_records()
+    )
+    assert result.column_names == ["value"]
+    assert result["value"].combine_chunks() == pa.array([value], type=arrow_type)
+
+
+def test_dataset_sql_null_parameter(tmp_path: Path):
+    ds = lance.write_dataset(pa.table({"id": [1, None]}), tmp_path / "test")
+    result = pa.Table.from_batches(
+        ds.sql("SELECT id FROM dataset WHERE id IS NOT DISTINCT FROM $1")
+        .parameters([None])
+        .build()
+        .to_batch_records()
+    )
+    assert result.to_pydict() == {"id": [None]}
+
+
+@pytest.mark.parametrize(
+    "sql,parameters,message",
+    [
+        ("SELECT id FROM dataset WHERE id = $1", None, "Placeholder.*not provided"),
+        ("SELECT $1", [], "No value found for placeholder with id \\$1"),
+        ("SELECT $missing", {}, "No value found for placeholder with name \\$missing"),
+        ("SELECT id + $1 FROM dataset", [True], "type"),
+    ],
+)
+def test_dataset_sql_invalid_bindings(tmp_path: Path, sql, parameters, message):
+    ds = lance.write_dataset(pa.table({"id": [1]}), tmp_path / "test")
+    with pytest.raises(ValueError, match=message):
+        ds.sql(sql, parameters=parameters).build().to_batch_records()
+
+
+@pytest.mark.parametrize("parameters", ["text", b"bytes", bytearray(b"bytes"), 1])
+def test_dataset_sql_invalid_parameter_container(tmp_path: Path, parameters):
+    ds = lance.write_dataset(pa.table({"id": [1]}), tmp_path / "test")
+    with pytest.raises(TypeError, match="SQL parameters must be"):
+        ds.sql("SELECT $1", parameters=parameters)
+
+
+@pytest.mark.parametrize("values", [[], [1, 2]])
+def test_dataset_sql_invalid_parameter_batch(tmp_path: Path, values):
+    ds = lance.write_dataset(pa.table({"id": [1]}), tmp_path / "test")
+    parameters = pa.record_batch({"value": values})
+    with pytest.raises(ValueError, match="must have exactly one row"):
+        ds.sql("SELECT $value", parameters=parameters)
+
+
+def test_dataset_sql_duplicate_parameter_names(tmp_path: Path):
+    ds = lance.write_dataset(pa.table({"id": [1]}), tmp_path / "test")
+    parameters = pa.record_batch([[1], [2]], names=["value", "value"])
+    with pytest.raises(ValueError, match='duplicate column name "value"'):
+        ds.sql("SELECT $value", parameters=parameters)
+
+
 @pytest.mark.parametrize("as_reader", [False, True], ids=["table", "reader"])
 def test_dataset_sql_register_arrow(tmp_path: Path, as_reader: bool):
     table = pa.table({"id": [1, 2, 3, 4, 5], "value": ["a", "b", "c", "d", "e"]})
