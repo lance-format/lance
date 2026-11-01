@@ -32,8 +32,7 @@ use crate::format::{
     overlay::DataOverlayFile,
 };
 use crate::format::{
-    apply_complete_clustering_definitions, merge_clustering_definitions,
-    refuse_key_fields_that_changed_identity,
+    apply_complete_clustering_definitions, refuse_key_fields_that_changed_identity,
 };
 use crate::io::{
     commit::CommitHandler,
@@ -255,19 +254,19 @@ impl Transaction {
         manifest.next_row_id = manifest.next_row_id.max(current_manifest.next_row_id);
         // So are clustering ids: rewinding would hand an old id to a new definition
         // while objects on other versions still mean the old one by it. The
-        // restored objects reference the historical definitions; the current ones
-        // are kept too, so every id this lineage has handed out stays defined.
+        // definitions themselves are the target's: a restore brings back that
+        // snapshot's definitions, specs, fragments and index segments as they
+        // were, and the current definitions go with the current objects that
+        // referenced them. Only the allocation history is kept, so the next
+        // definition continues above every id this lineage has handed out; a
+        // mark above every present definition is the normal state after a
+        // restore and is never read as a selection.
         manifest.max_clustering_id = manifest
             .max_clustering_id
             .max(current_manifest.max_clustering_id);
-        merge_clustering_definitions(&mut manifest.clustering, &current_manifest.clustering)
-            .map_err(|error| {
-                Error::invalid_input(format!("Cannot restore version {version}: {error}"))
-            })?;
         // A restore republishes objects that already existed, so their labels
         // are not new writes: an old label may outlive its definition and must
-        // not make the restore fail. The definition set itself is still merged
-        // and checked above.
+        // not make the restore fail.
         // Turning stable row ids off would revert `_rowid` to row addresses, whose
         // namespace overlaps the ids this table has already handed out.
         if current_manifest.uses_stable_row_ids() && !manifest.uses_stable_row_ids() {

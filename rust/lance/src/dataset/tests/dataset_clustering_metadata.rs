@@ -281,12 +281,16 @@ async fn append_commit_validates_fragment_references() {
     assert_eq!(appended.metadata, object_metadata("5"));
 }
 
+/// A restore brings back the target snapshot's definitions, specs, fragments
+/// and index segments as they were; the current definitions are not merged
+/// into them. Only the allocation mark is kept, so an id this lineage handed
+/// out is never handed out again: the next definition continues above the
+/// mark, which after a restore lies above every definition present.
 #[tokio::test]
-async fn restore_keeps_the_high_water_mark_and_merges_definitions() {
+async fn restore_keeps_the_high_water_mark_and_the_targets_definitions() {
     let dir = TempStrDir::default();
     let dataset = write_dataset(&dir).await; // version 1: nothing allocated
     let before_allocation = dataset.version().version;
-
     let dataset = commit_edited_manifest(&dataset, |manifest, _| {
         manifest.clustering = vec![definition(1)];
         manifest.max_clustering_id = 1;
@@ -297,7 +301,6 @@ async fn restore_keeps_the_high_water_mark_and_merges_definitions() {
     })
     .await;
     let first_definition = dataset.version().version;
-
     let dataset = commit_edited_manifest(&dataset, |manifest, _| {
         manifest.clustering.push(definition(2));
         manifest.max_clustering_id = 2;
@@ -306,10 +309,28 @@ async fn restore_keeps_the_high_water_mark_and_merges_definitions() {
             .insert("org.example.cluster.active_id".into(), "2".into());
     })
     .await;
-
-    // Restore to before any allocation: the historical selection comes back
-    // (none), the mark does not rewind, and every definition this lineage
-    // handed out stays defined.
+    // A new definition through the commit path, as a provider allocates one.
+    async fn allocate(dataset: &Dataset, id: u32) -> crate::Result<Dataset> {
+        let transaction = Transaction::new(
+            dataset.manifest().version,
+            Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            None,
+        );
+        let mut desired = dataset.manifest().clustering.clone();
+        desired.push(definition(id));
+        CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_clustering_definitions(desired)
+            .execute(transaction)
+            .await
+    }
+    // Restore to before any allocation: the target's metadata and definitions
+    // (none) come back, the fragment is unlabelled again, and the mark does
+    // not rewind.
     let mut restored = dataset.checkout_version(before_allocation).await.unwrap();
     restored.restore().await.unwrap();
     assert!(
@@ -319,62 +340,42 @@ async fn restore_keeps_the_high_water_mark_and_merges_definitions() {
             .contains_key("org.example.cluster.active_id")
     );
     assert_eq!(restored.manifest().max_clustering_id, 2);
-    assert_eq!(
-        restored.manifest().clustering,
-        vec![definition(1), definition(2)]
+    assert!(
+        restored.manifest().clustering.is_empty(),
+        "the current definitions are not merged into the restored snapshot"
     );
     assert_eq!(restored.fragments()[0].clustering_id, None);
     assert_ne!(
         restored.manifest().writer_feature_flags & FLAG_OBJECT_METADATA,
         0
     );
-
-    // Allocating again continues above the mark; id 1 and 2 are never reused.
-    let restored = commit_edited_manifest(&restored, |manifest, _| {
-        manifest.clustering.push(definition(3));
-        manifest.max_clustering_id = 3;
-    })
-    .await;
-    assert_eq!(restored.manifest().max_clustering_id, 3);
-
-    // Restore to the first definition's version: its selection and its
-    // fragment references come back, with the later definitions retained.
+    // Restore to the first definition's version: its definition, selection
+    // and fragment references come back as they were, the later definition
+    // does not, and the mark stays above them all.
     let mut restored = restored.checkout_version(first_definition).await.unwrap();
     restored.restore().await.unwrap();
     assert_eq!(
         restored.manifest().table_metadata["org.example.cluster.active_id"],
         "1"
     );
+    assert_eq!(restored.manifest().max_clustering_id, 2);
+    assert_eq!(restored.manifest().clustering, vec![definition(1)]);
+    assert_eq!(restored.fragments()[0].clustering_id, Some(1));
+    assert_eq!(restored.fragments()[0].metadata, object_metadata("3"));
+    // Allocation continues above the mark, not above the definitions present:
+    // the id handed out before the restore is refused, the next one lands.
+    let error = allocate(&restored, 2).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not continue max_clustering_id 2"),
+        "{error}"
+    );
+    let restored = allocate(&restored, 3).await.unwrap();
     assert_eq!(restored.manifest().max_clustering_id, 3);
     assert_eq!(
         restored.manifest().clustering,
-        vec![definition(1), definition(2), definition(3)]
-    );
-    assert_eq!(restored.fragments()[0].clustering_id, Some(1));
-    assert_eq!(restored.fragments()[0].metadata, object_metadata("3"));
-}
-
-#[tokio::test]
-async fn restore_rejects_a_definition_that_changed_meaning() {
-    let dir = TempStrDir::default();
-    let dataset = write_dataset(&dir).await;
-    let dataset = commit_edited_manifest(&dataset, |manifest, _| {
-        manifest.clustering = vec![definition(1)];
-        manifest.max_clustering_id = 1;
-    })
-    .await;
-    let original = dataset.version().version;
-    // Simulate a writer that redefined id 1 in place, which the contract forbids.
-    let dataset = commit_edited_manifest(&dataset, |manifest, _| {
-        manifest.clustering[0].provider = "org.example.other".into();
-    })
-    .await;
-
-    let mut restored = dataset.checkout_version(original).await.unwrap();
-    let error = restored.restore().await.unwrap_err();
-    assert!(
-        error.to_string().contains("differs between manifests"),
-        "{error}"
+        vec![definition(1), definition(3)]
     );
 }
 
@@ -1644,9 +1645,10 @@ async fn the_first_allocation_makes_earlier_versions_unrestorable_but_readable()
     restored.restore().await.unwrap();
     assert_eq!(
         ids(&restored),
-        vec![1, 2],
-        "restore keeps every allocated definition"
+        vec![1],
+        "restore brings back the target's definitions, not the later ones"
     );
+    assert_eq!(restored.manifest().max_clustering_id, 2, "the mark stays");
 }
 
 /// A build that does not know segment labels caches the index list with every
@@ -2674,15 +2676,16 @@ async fn restored_manifest_keeps_the_mark_for_later_submissions() {
 
     let mut restored = dataset.checkout_version(with_one).await.unwrap();
     restored.restore().await.unwrap();
-    // definitions merge and the mark never goes down; the provider keys are
-    // the restored version's
-    assert_eq!(ids(&restored), vec![1, 2]);
+    // the restored version's definitions and provider keys come back; the
+    // mark never goes down
+    assert_eq!(ids(&restored), vec![1]);
     assert_eq!(restored.manifest().max_clustering_id, 2);
     assert!(!restored.manifest().table_metadata.contains_key(ACTIVE_KEY));
 
-    // a list built from the pre-restore snapshot still describes the current
-    // definitions exactly, so the next allocation continues at 3
-    let dataset = commit(
+    // a list built from the pre-restore snapshot names a definition the
+    // table no longer has; it is refused rather than re-added under an id
+    // the lineage handed out before
+    let error = commit(
         &restored,
         submission(
             restored.manifest().version,
@@ -2691,7 +2694,24 @@ async fn restored_manifest_keeps_the_mark_for_later_submissions() {
         ),
     )
     .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not continue max_clustering_id 2"),
+        "{error}"
+    );
+    // a list built from the restored snapshot allocates above the mark
+    let dataset = commit(
+        &restored,
+        submission(
+            restored.manifest().version,
+            vec![definition(1), definition(3)],
+            vec![(ACTIVE_KEY.to_string(), Some("3".to_string()))],
+        ),
+    )
+    .await
     .unwrap();
-    assert_eq!(ids(&dataset), vec![1, 2, 3]);
+    assert_eq!(ids(&dataset), vec![1, 3]);
     assert_eq!(dataset.manifest().max_clustering_id, 3);
 }
