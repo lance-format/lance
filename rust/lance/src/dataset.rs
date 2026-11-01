@@ -2458,6 +2458,34 @@ impl Dataset {
         self.data_file_dir_for_base(data_file.base_id)
     }
 
+    /// Resolve the object store and complete object key of a manifest data file.
+    ///
+    /// Uses the file's registered base when present, including dataset-root bases
+    /// used by shallow clones. Otherwise uses this dataset's `data/` directory.
+    /// This does not read the file, so it also works for missing objects.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn inspect(dataset: &Dataset) -> Result<()> {
+    /// for fragment in dataset.iter_fragments() {
+    ///     for file in &fragment.files {
+    ///         let (store, path) = dataset.resolve_data_file_location(file).await?;
+    ///         let exists = store.exists(&path).await?;
+    /// #       let _ = exists;
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn resolve_data_file_location(
+        &self,
+        data_file: &DataFile,
+    ) -> Result<(Arc<ObjectStore>, Path)> {
+        let path = self.data_file_dir(data_file)?.join(data_file.path.as_str());
+        let store = self.object_store_for_data_file(data_file).await?;
+        Ok((store, path))
+    }
+
     /// Create a [`DataFile`] by reading metadata from an existing lance file.
     ///
     /// This reads the file's schema and version information, matches columns to
