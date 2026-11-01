@@ -3105,6 +3105,7 @@ async fn reserve_fragment_ids(
         default_commit_retry_timeout(),
         dataset.manifest_location.naming_scheme,
         None,
+        None,
     )
     .await?;
 
