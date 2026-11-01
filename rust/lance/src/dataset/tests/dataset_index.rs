@@ -8552,6 +8552,25 @@ async fn test_sql_contains_tokens() {
         ]),
     );
 
+    // A stop word in the query keeps its AND requirement: only rows whose raw
+    // tokens contain every query token, stop words included, may match.
+    let results = execute_sql(
+        "select * from foo where contains_tokens(text, 'a cat catch fish')",
+        "foo".to_string(),
+        Arc::new(dataset.clone()),
+    )
+    .await
+    .unwrap();
+
+    assert_results(
+        results,
+        &StringArray::from(vec![
+            "a cat catch a fish",
+            "a fish catch a cat",
+            "a white cat catch a big fish",
+        ]),
+    );
+
     // Verify plan, should not contain ScalarIndexQuery.
     let results = execute_sql(
         "explain select * from foo where contains_tokens(text, 'cat catch fish')",
@@ -8604,7 +8623,8 @@ async fn test_sql_contains_tokens() {
     let plan = format!("{:?}", results);
     assert_not_contains!(&plan, "ScalarIndexQuery");
 
-    // Test with suitable fts index
+    // Test with suitable fts index. Stop words must stay indexed for the index
+    // to answer an AND over every raw token.
     dataset
         .create_index(
             &["text"],
@@ -8612,7 +8632,8 @@ async fn test_sql_contains_tokens() {
             None,
             &InvertedIndexParams::default()
                 .max_token_length(None)
-                .stem(false),
+                .stem(false)
+                .remove_stop_words(false),
             true,
         )
         .await
@@ -8646,6 +8667,86 @@ async fn test_sql_contains_tokens() {
     .unwrap();
     let plan = format!("{:?}", results);
     assert_contains!(&plan, "ScalarIndexQuery");
+
+    // Stop-word queries must return the same rows through the index as they
+    // do without it.
+    let results = execute_sql(
+        "select * from foo where contains_tokens(text, 'a cat catch fish')",
+        "foo".to_string(),
+        Arc::new(dataset.clone()),
+    )
+    .await
+    .unwrap();
+
+    assert_results(
+        results,
+        &StringArray::from(vec![
+            "a cat catch a fish",
+            "a fish catch a cat",
+            "a white cat catch a big fish",
+        ]),
+    );
+
+    let results = execute_sql(
+        "select * from foo where contains_tokens(text, 'a')",
+        "foo".to_string(),
+        Arc::new(dataset.clone()),
+    )
+    .await
+    .unwrap();
+
+    assert_results(
+        results,
+        &StringArray::from(vec![
+            "a cat catch a fish",
+            "a fish catch a cat",
+            "a white cat catch a big fish",
+        ]),
+    );
+
+    // The default tokenizer removes stop words, so the index never holds a
+    // posting for 'a'. Such an index must not accelerate contains_tokens: the
+    // query has to fall back to the scan and still find every row.
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .max_token_length(None)
+                .stem(false),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let results = execute_sql(
+        "explain select * from foo where contains_tokens(text, 'a cat catch fish')",
+        "foo".to_string(),
+        Arc::new(dataset.clone()),
+    )
+    .await
+    .unwrap();
+    let plan = format!("{:?}", results);
+    assert_not_contains!(&plan, "ScalarIndexQuery");
+
+    let results = execute_sql(
+        "select * from foo where contains_tokens(text, 'a cat catch fish')",
+        "foo".to_string(),
+        Arc::new(dataset.clone()),
+    )
+    .await
+    .unwrap();
+
+    assert_results(
+        results,
+        &StringArray::from(vec![
+            "a cat catch a fish",
+            "a fish catch a cat",
+            "a white cat catch a big fish",
+        ]),
+    );
+
     assert_eq!(count_null_query_matches(dataset.clone()).await, 0);
 }
 
