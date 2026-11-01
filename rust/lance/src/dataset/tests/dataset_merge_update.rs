@@ -927,6 +927,7 @@ async fn test_datafile_replacement() {
         WriteDestination::Dataset(dataset.clone()),
         Operation::DataReplacement {
             replacements: vec![],
+            data_change: true,
         },
         Some(1),
         None,
@@ -956,6 +957,7 @@ async fn test_datafile_replacement() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![],
+            data_change: true,
         },
         Some(3),
         None,
@@ -1010,6 +1012,7 @@ async fn test_datafile_replacement() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            data_change: true,
         },
         Some(4),
         None,
@@ -1128,6 +1131,7 @@ async fn test_datafile_partial_replacement() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            data_change: true,
         },
         Some(3),
         None,
@@ -1190,6 +1194,7 @@ async fn test_datafile_partial_replacement() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            data_change: true,
         },
         Some(4),
         None,
@@ -1296,6 +1301,7 @@ async fn test_datafile_replacement_error() {
         WriteDestination::Dataset(Arc::new(dataset.clone())),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            data_change: true,
         },
         // read at the current version (after the Merge above)
         Some(dataset.manifest.version),
@@ -2861,6 +2867,7 @@ async fn test_data_replacement_advances_row_lineage() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            data_change: true,
         },
         Some(read_version),
         None,
@@ -2970,6 +2977,7 @@ async fn test_data_replacement_invalidates_index_bitmap() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            data_change: true,
         },
         Some(read_version),
         None,
@@ -3254,6 +3262,7 @@ async fn test_data_replacement_populates_invalidated_bitmap() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(0, new_data_file)],
+            data_change: true,
         },
         Some(read_version),
         None,
@@ -3373,6 +3382,7 @@ async fn test_fts_stale_entries_after_data_replacement() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(1, new_data_file)],
+            data_change: true,
         },
         Some(read_version),
         None,
@@ -3514,6 +3524,7 @@ async fn test_cross_column_fast_search_blocks_column_local_stale_postings() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(1, replacement_file)],
+            data_change: true,
         },
         Some(read_version),
         None,
@@ -3685,6 +3696,7 @@ async fn test_vector_index_after_data_replacement() {
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(frag1_id, new_data_file)],
+            data_change: true,
         },
         Some(read_version),
         None,

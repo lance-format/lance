@@ -8527,16 +8527,14 @@ mod tests {
             ..Default::default()
         };
         let task = CompactionTask {
-            task: TaskData {
-                fragments: dataset
+            task: TaskData::rewrite_fragments(
+                dataset
                     .fragments()
                     .iter()
                     .filter(|f| f.id < 101 || f.id >= 259)
                     .cloned()
                     .collect(),
-                output_clustering_id: None,
-                output_metadata: Default::default(),
-            },
+            ),
             read_version: dataset.version().version,
             options: options.clone(),
         };
