@@ -13,7 +13,9 @@
  */
 package org.lance.merge;
 
-import org.lance.memwal.MergedGeneration;
+import org.lance.DataStorageVersion;
+import org.lance.memwal.CompactedSsTable;
+import org.lance.memwal.MemWalIndexDetails;
 
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
@@ -39,7 +41,11 @@ public class MergeInsertParams {
   private long retryTimeoutMs = 30 * 1000;
   private boolean skipAutoCleanup = false;
   private boolean useIndex = true;
-  private List<MergedGeneration> markedGenerations = Collections.emptyList();
+  private Optional<DataStorageVersion> dataStorageVersion = Optional.empty();
+  private MergeWriteMode writeMode = MergeWriteMode.Auto;
+  private List<CompactedSsTable> compactedSstables = Collections.emptyList();
+  private Optional<String> memWalDirId = Optional.empty();
+  private SourceDedupeBehavior sourceDedupeBehavior = SourceDedupeBehavior.Fail;
 
   public MergeInsertParams(List<String> on) {
     this.on = on;
@@ -245,26 +251,111 @@ public class MergeInsertParams {
   }
 
   /**
-   * Mark MemWAL generations as merged into the base table.
+   * Set the exact data storage version for files written by this operation.
    *
-   * <p>Use this when the merge insert incorporates data from MemWAL flushed generations. It updates
-   * the MemWAL generation tracking to prevent the same generations from being merged again.
+   * <p>If omitted, the dataset's default write version is used without changing it. Release
+   * selectors are resolved by the engine. V1/V2 cross-family targets are rejected.
+   */
+  public MergeInsertParams withDataStorageVersion(DataStorageVersion version) {
+    this.dataStorageVersion = Optional.of(Preconditions.checkNotNull(version));
+    return this;
+  }
+
+  /**
+   * Selects how the merged rows are written.
    *
-   * @param generations the flushed generations being merged
+   * <p>Only has an effect on a partial-schema update (the source omits some dataset columns), where
+   * {@link MergeWriteMode#RewriteColumns} writes fewer bytes than {@link
+   * MergeWriteMode#RewriteRows} once the fraction of rows matched exceeds roughly the fraction of
+   * each row's bytes the source columns occupy: nearly always for a KB-scale update of a MB-per-row
+   * table, possibly never for a table of narrow columns.
+   *
+   * <p>Default is {@link MergeWriteMode#Auto}: the write mode is chosen by the engine, typically
+   * rewriting whole rows.
+   *
+   * @param writeMode How the merged rows are written.
    * @return This MergeInsertParams instance
    */
-  public MergeInsertParams markGenerationsAsMerged(List<MergedGeneration> generations) {
-    Preconditions.checkNotNull(generations, "generations must not be null");
-    this.markedGenerations = generations;
+  public MergeInsertParams withWriteMode(MergeWriteMode writeMode) {
+    Preconditions.checkNotNull(writeMode, "writeMode must not be null");
+    this.writeMode = writeMode;
     return this;
+  }
+
+  /**
+   * Control how duplicate source rows are handled.
+   *
+   * <p>Default is {@link SourceDedupeBehavior#Fail}, which errors only when multiple source rows
+   * match the <em>same target row</em> (an ambiguous update or delete). It does <b>not</b> reject
+   * duplicate join keys among unmatched rows — those are all inserted. Use {@link
+   * SourceDedupeBehavior#FirstSeen} to keep the first row for each join key and skip subsequent
+   * duplicates, including unmatched rows that would otherwise insert the same non-null key more
+   * than once.
+   *
+   * <p>Rows whose join keys contain NULL are never duplicates, because merge insert uses SQL
+   * equality where NULL does not equal NULL.
+   *
+   * <p>If the source contains duplicates and {@code FirstSeen} behavior doesn't match your needs,
+   * sort the source data before passing it to the merge insert operation.
+   *
+   * @param sourceDedupeBehavior The behavior to apply when duplicate source rows are found
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams withSourceDedupeBehavior(SourceDedupeBehavior sourceDedupeBehavior) {
+    Preconditions.checkNotNull(sourceDedupeBehavior);
+    this.sourceDedupeBehavior = sourceDedupeBehavior;
+    return this;
+  }
+
+  /**
+   * Mark MemWAL SSTables as compacted into the base table.
+   *
+   * <p>Use this when merge insert compacts MemWAL SSTables. It updates MemWAL compaction progress
+   * to prevent the same SSTables from being compacted again, in the same commit as the data.
+   *
+   * <p><b>For multi-pass compaction, call this only on the final successful data-changing pass.</b>
+   * Intermediate passes must not carry compaction progress. Lance cannot tell whether a caller has
+   * another pass planned, so it cannot enforce this: if a delete pass carried the marker and the
+   * process then died before the matching upsert, the recorded progress would claim rows were
+   * copied in that never were.
+   *
+   * <p>The commit fails if the table's MemWAL has since been disabled or replaced. Pass an empty
+   * {@code sstables} on the passes that record no progress, so they are checked too.
+   *
+   * @param dirId the {@link MemWalIndexDetails#dirId() dirId} of the MemWAL the SSTables belong to
+   * @param sstables the SSTables being compacted
+   * @return This MergeInsertParams instance
+   */
+  public MergeInsertParams markSstablesAsCompacted(String dirId, List<CompactedSsTable> sstables) {
+    Preconditions.checkNotNull(dirId, "dirId must not be null");
+    Preconditions.checkNotNull(sstables, "sstables must not be null");
+    this.memWalDirId = Optional.of(dirId);
+    this.compactedSstables = sstables;
+    return this;
+  }
+
+  /**
+   * Mark SSTables of a MemWAL without a {@code dirId} as compacted.
+   *
+   * @deprecated Use {@link #markSstablesAsCompacted(String, List)}, which names the MemWAL the
+   *     SSTables belong to.
+   */
+  @Deprecated
+  public MergeInsertParams markSstablesAsCompacted(List<CompactedSsTable> sstables) {
+    return markSstablesAsCompacted("", sstables);
   }
 
   public List<String> on() {
     return on;
   }
 
-  public List<MergedGeneration> markedGenerations() {
-    return markedGenerations;
+  public List<CompactedSsTable> getCompactedSstables() {
+    return compactedSstables;
+  }
+
+  /** The {@code dirId} passed to {@link #markSstablesAsCompacted(String, List)}, if any. */
+  public Optional<String> getMemWalDirId() {
+    return memWalDirId;
   }
 
   public WhenMatched whenMatched() {
@@ -319,6 +410,27 @@ public class MergeInsertParams {
     return useIndex;
   }
 
+  public SourceDedupeBehavior getSourceDedupeBehavior() {
+    return sourceDedupeBehavior;
+  }
+
+  public String sourceDedupeBehaviorValue() {
+    return sourceDedupeBehavior.toRustString();
+  }
+
+  /** Returns the version selector as its string value for the native layer. */
+  public Optional<String> getDataStorageVersion() {
+    return dataStorageVersion.map(DataStorageVersion::toRustString);
+  }
+
+  public MergeWriteMode writeMode() {
+    return writeMode;
+  }
+
+  public String writeModeValue() {
+    return writeMode.name();
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
@@ -337,7 +449,46 @@ public class MergeInsertParams {
         .add("retryTimeoutMs", retryTimeoutMs)
         .add("skipAutoCleanup", skipAutoCleanup)
         .add("useIndex", useIndex)
+        .add("sourceDedupeBehavior", sourceDedupeBehavior)
+        .add("dataStorageVersion", dataStorageVersion.orElse(null))
+        .add("writeMode", writeMode)
         .toString();
+  }
+
+  /**
+   * How a merge insert writes the merged rows.
+   *
+   * <p>The caller chooses rather than the engine because which mode writes fewer bytes depends on
+   * the fraction of each fragment's rows the source matches, which is only known once the join has
+   * run.
+   */
+  public enum MergeWriteMode {
+    /**
+     * Let the engine choose, typically rewriting whole rows. A partial-schema update whose join key
+     * carries a scalar index may instead patch columns on the indexed path that predates this enum.
+     */
+    Auto,
+
+    /**
+     * Delete the matched rows and write whole rows into new fragments. Cost scales with the number
+     * of matched rows.
+     *
+     * <p>For a partial-schema update this gives up the scalar-index probe on the join key, because
+     * the indexed path only ever patches columns.
+     */
+    RewriteRows,
+
+    /**
+     * Attach new data files holding the source columns to the fragments that already hold the
+     * matched rows, and tombstone the old versions of those columns. The omitted columns are
+     * neither read nor written, but the replacement column file covers every row of each fragment
+     * it touches, so the bytes written barely fall as fewer rows match.
+     *
+     * <p>Errors if the merge cannot be expressed this way: it must update matched rows only (no
+     * inserts, no matched deletes, no delete-by-source) with a source that omits at least one
+     * dataset column, carries at least one column besides the join key, and carries no blob column.
+     */
+    RewriteColumns,
   }
 
   public enum WhenMatched {
@@ -395,5 +546,37 @@ public class MergeInsertParams {
      * This can be used to replace a region of data with new data
      */
     DeleteIf,
+  }
+
+  /**
+   * Describes how to handle duplicate source rows.
+   *
+   * <p>If the source contains duplicates and {@code FirstSeen} behavior doesn't match your needs,
+   * sort the source data before passing it to the merge insert operation. Rows whose join keys
+   * contain NULL are not duplicates because merge insert uses SQL equality, where NULL does not
+   * equal NULL.
+   */
+  public enum SourceDedupeBehavior {
+    /** Fail if multiple source rows match the same target row (default). */
+    Fail("Fail"),
+
+    /**
+     * Keep the first row for each join key and skip subsequent rows.
+     *
+     * <p>This applies both to rows that match a target row and to unmatched rows that would
+     * otherwise insert the same non-null join key more than once.
+     */
+    FirstSeen("FirstSeen");
+
+    private final String rustValue;
+
+    SourceDedupeBehavior(String rustValue) {
+      this.rustValue = rustValue;
+    }
+
+    /** Returns the canonical string used by the native layer. */
+    public String toRustString() {
+      return rustValue;
+    }
   }
 }

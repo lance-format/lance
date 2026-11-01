@@ -74,7 +74,7 @@ impl FragmentSession {
         if row_offsets.len() > 1 && FileFragment::row_ids_contiguous(row_offsets) {
             let range =
                 (row_offsets[0] as usize)..(row_offsets[row_offsets.len() - 1] as usize + 1);
-            self.reader.legacy_read_range_as_batch(range).await
+            self.reader.read_range_as_batch(range).await
         } else {
             self.reader.take_as_batch(row_offsets, None).await
         }
@@ -89,7 +89,7 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::ROW_ADDR;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_encoding::version::LanceFileVersion;
+    use lance_file::version::LanceFileVersion;
     use rstest::rstest;
     use std::sync::Arc;
 

@@ -271,6 +271,52 @@ def test_simd_info():
 
 
 @pytest.mark.parametrize(
+    ("query", "options", "expected"),
+    [
+        ("the cats and dogs", {}, [("cat", 0), ("dog", 2)]),
+        (
+            "the skip alpha",
+            {"stem": False, "custom_stop_words": ["skip"]},
+            [("the", 0), ("alpha", 2)],
+        ),
+        (
+            "getUserName",
+            {"analyzer": "code", "split_identifiers": True},
+            [
+                ("getusername", 0),
+                ("get", 0),
+                ("user", 1),
+                ("name", 2),
+            ],
+        ),
+        (
+            "a::b",
+            {"analyzer": "code", "index_operators": True},
+            [("a", 0), ("::", 1), ("b", 2)],
+        ),
+    ],
+)
+def test_tokenize_fts_query(query, options, expected):
+    tokens = lance.tokenize(query, **options)
+    assert [(token.text, token.position) for token in tokens] == expected
+
+
+def test_tokenize_fts_query_validates_analyzer_options():
+    with pytest.raises(ValueError, match="code analyzer flags require analyzer='code'"):
+        lance.tokenize("getUserName", split_identifiers=True)
+
+    with pytest.raises(ValueError, match="unknown base tokenizer"):
+        lance.tokenize("hello", base_tokenizer="unknown")
+
+
+def test_tokenize_fts_query_can_disable_max_token_length():
+    long_token = "x" * 41
+    assert lance.tokenize(long_token, stem=False) == []
+    unlimited_tokens = lance.tokenize(long_token, max_token_length=None, stem=False)
+    assert [token.text for token in unlimited_tokens] == [long_token]
+
+
+@pytest.mark.parametrize(
     "row_param, column_name",
     [("with_row_id", "_rowid"), ("with_row_address", "_rowaddr")],
 )

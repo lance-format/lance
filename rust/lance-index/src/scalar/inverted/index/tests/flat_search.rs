@@ -1,0 +1,920 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+use super::*;
+
+#[rstest::rstest]
+#[case::bigrams(2, 2, 0)]
+#[case::mixed_lengths(1, 3, 0)]
+#[case::fuzzy_bigrams(2, 2, 1)]
+#[tokio::test]
+async fn test_ngram_phrase_preserves_positions_indexed_and_flat(
+    #[case] min_length: u32,
+    #[case] max_length: u32,
+    #[case] fuzziness: u32,
+    #[values(false, true)] is_prepared: bool,
+) {
+    let params = InvertedIndexParams::default()
+        .base_tokenizer("ngram".into())
+        .ngram_min_length(min_length)
+        .ngram_max_length(max_length)
+        .with_position(true)
+        .num_workers(1);
+    let batch = arrow_array::record_batch!(
+        ("doc", Utf8, vec![Some("abcd"), Some("zz"), None, Some("")]),
+        ("_rowid", UInt64, vec![1_u64, 2, 3, 4])
+    )
+    .unwrap();
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    InvertedIndexBuilder::new(params.clone())
+        .update(
+            Box::pin(RecordBatchStreamAdapter::new(
+                batch.schema(),
+                stream::iter(vec![Ok(batch.clone())]),
+            )),
+            store.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+    let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
+        .await
+        .unwrap();
+    let tokens = try_collect_query_tokens("abcd", &mut params.build().unwrap()).unwrap();
+    let search_params = Arc::new(
+        FtsSearchParams::new()
+            .with_phrase_slop(Some(0))
+            .with_fuzziness(Some(fuzziness)),
+    );
+    let (indexed_rows, _) = if is_prepared {
+        let prepared = crate::scalar::inverted::prepare_bm25_query(
+            std::slice::from_ref(&index),
+            tokens,
+            &search_params,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        index
+            .bm25_search_prepared(
+                Arc::new(prepared),
+                search_params,
+                Operator::And,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+            )
+            .await
+            .unwrap()
+    } else {
+        index
+            .bm25_search(
+                Arc::new(tokens),
+                search_params,
+                Operator::And,
+                Arc::new(NoFilter),
+                Arc::new(NoOpMetricsCollector),
+                None,
+            )
+            .await
+            .unwrap()
+    };
+    let flat_rows =
+        flat_full_text_search(&[&batch], "doc", "\"abcd\"", Some(params.build().unwrap())).unwrap();
+    let (result, _) = flat_bm25_search_stream_with_options_and_scorer(
+        Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            stream::iter(vec![Ok(batch.clone())]),
+        )),
+        "doc".into(),
+        "abcd".into(),
+        params.build().unwrap(),
+        None,
+        FlatBm25SearchOptions {
+            target_batch_size: 10,
+            elapsed_compute: None,
+            document_granularity: DocumentGranularity::Row,
+            operator: Operator::And,
+            boost: 1.0,
+            phrase_slop: Some(0),
+        },
+    )
+    .await
+    .unwrap();
+    let batches: Vec<_> = result.try_collect().await.unwrap();
+    let scored_flat_rows = batches
+        .iter()
+        .flat_map(|batch| batch[ROW_ID].as_primitive::<UInt64Type>().values())
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        (indexed_rows, flat_rows, scored_flat_rows),
+        (vec![1], vec![1], vec![1])
+    );
+}
+
+#[rstest::rstest]
+#[case::bigrams((2, 2), "abcd", 0, &[1, 6], &[1, 2, 3, 4, 6, 7])]
+#[case::mixed_lengths((1, 3), "abcd", 0, &[1], &[1, 2, 3, 4, 6, 7])]
+#[case::missing_ngram((2, 2), "abcde", 0, &[], &[1, 2, 3, 4, 6, 7])]
+#[case::repeated_ngram((2, 2), "abab", 0, &[7], &[1, 2, 6, 7])]
+#[case::fuzzy_bigrams((2, 2), "abxd", 1, &[1, 6], &[1, 2, 3, 4, 6, 7])]
+#[tokio::test]
+async fn test_ngram_match_requires_all_terms_indexed_and_flat(
+    #[case] ngram_lengths: (u32, u32),
+    #[case] query: &str,
+    #[case] fuzziness: u32,
+    #[case] expected_and: &[u64],
+    #[case] expected_or: &[u64],
+    #[values(false, true)] with_position: bool,
+    #[values(false, true)] is_prepared: bool,
+) {
+    let params = InvertedIndexParams::default()
+        .base_tokenizer("ngram".into())
+        .ngram_min_length(ngram_lengths.0)
+        .ngram_max_length(ngram_lengths.1)
+        .with_position(with_position)
+        .num_workers(1);
+    let batch = arrow_array::record_batch!(
+        (
+            "doc",
+            Utf8,
+            vec![
+                Some("abcd"),
+                Some("ab"),
+                Some("bc"),
+                Some("cd"),
+                Some("zz"),
+                Some("ab bc cd"),
+                Some("abab"),
+                None,
+                Some("")
+            ]
+        ),
+        ("_rowid", UInt64, (1..=9).collect::<Vec<u64>>())
+    )
+    .unwrap();
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    InvertedIndexBuilder::new(params.clone())
+        .update(
+            Box::pin(RecordBatchStreamAdapter::new(
+                batch.schema(),
+                stream::iter(vec![Ok(batch.clone())]),
+            )),
+            store.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+    let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
+        .await
+        .unwrap();
+    for (operator, expected) in [(Operator::And, expected_and), (Operator::Or, expected_or)] {
+        let tokens =
+            Arc::new(try_collect_query_tokens(query, &mut params.build().unwrap()).unwrap());
+        let search_params = Arc::new(
+            FtsSearchParams::new()
+                .with_limit(Some(10))
+                .with_fuzziness(Some(fuzziness)),
+        );
+        let (mut indexed_row_ids, _) = if is_prepared {
+            let prepared = crate::scalar::inverted::prepare_bm25_query(
+                std::slice::from_ref(&index),
+                tokens.as_ref().clone(),
+                &search_params,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            index
+                .bm25_search_prepared(
+                    Arc::new(prepared),
+                    search_params.clone(),
+                    operator,
+                    Arc::new(NoFilter),
+                    Arc::new(NoOpMetricsCollector),
+                )
+                .await
+                .unwrap()
+        } else {
+            index
+                .bm25_search(
+                    tokens.clone(),
+                    search_params.clone(),
+                    operator,
+                    Arc::new(NoFilter),
+                    Arc::new(NoOpMetricsCollector),
+                    None,
+                )
+                .await
+                .unwrap()
+        };
+        indexed_row_ids.sort_unstable();
+
+        let tokens = if fuzziness > 0 {
+            Arc::new(index.expand_fuzzy_tokens(&tokens, &search_params).unwrap())
+        } else {
+            tokens
+        };
+        let counted = tokenize_and_count(
+            stream::iter(vec![Ok(batch.clone())]),
+            params.build().unwrap(),
+            tokens.clone(),
+            0,
+            None,
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        let scorer = initialize_scorer(None, &tokens, &counted);
+        let result = flat_bm25_score(
+            &tokens,
+            &counted,
+            &scorer,
+            DocumentGranularity::Row,
+            operator,
+            1.0,
+            None,
+        )
+        .unwrap();
+        let mut flat_row_ids = result[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+        flat_row_ids.sort_unstable();
+        assert_eq!(
+            (indexed_row_ids.as_slice(), flat_row_ids.as_slice()),
+            (expected, expected),
+            "indexed and flat {operator:?}"
+        );
+    }
+}
+
+#[rstest::rstest]
+#[case::identifiers(
+    InvertedIndexParams::code().split_identifiers(true),
+    &["getUserName", "get_user_name", "get user name", "user name get", "getUserName getUserName"],
+    &[3, 3, 3, 3, 6]
+)]
+#[case::without_originals(
+    InvertedIndexParams::code().split_identifiers(true).preserve_original(false),
+    &["getUserName", "get_user_name", "get user name"],
+    &[3, 3, 3]
+)]
+#[case::filtered_subwords(
+    InvertedIndexParams::code().split_identifiers(true).remove_stop_words(true)
+        .custom_stop_words(Some(vec!["get".into(), "user".into(), "name".into()])),
+    &["get_user_name", "get_user_name keep"],
+    &[1, 2]
+)]
+#[case::filtered_original(
+    InvertedIndexParams::code().split_identifiers(true).max_token_length(Some(5)),
+    &["getUserName", "get_user_name"],
+    &[3, 3]
+)]
+#[case::filtered_leading_position(
+    InvertedIndexParams::code().split_identifiers(true).remove_stop_words(true)
+        .custom_stop_words(Some(vec!["get".into(), "get_user_name".into()])),
+    &["get_user_name", "get user name"],
+    &[2, 2]
+)]
+#[case::ngram(
+    InvertedIndexParams::default().base_tokenizer("ngram".into())
+        .ngram_min_length(2).ngram_max_length(2),
+    &["abcd", "abcdef"],
+    &[3, 5]
+)]
+#[tokio::test]
+async fn test_document_lengths_indexed_and_flat(
+    #[case] params: InvertedIndexParams,
+    #[case] docs: &[&str],
+    #[case] expected: &[u64],
+) {
+    let mut docs = docs.iter().copied().map(Some).collect::<Vec<_>>();
+    docs.extend([None, Some("")]);
+    let batch = arrow_array::record_batch!(
+        ("doc", Utf8, docs.clone()),
+        ("_rowid", UInt64, (0..docs.len() as u64).collect::<Vec<_>>())
+    )
+    .unwrap();
+    let query_tokens = Arc::new(Tokens::new(vec!["get".to_string()], DocType::Text));
+    let counted = tokenize_and_count(
+        stream::iter(vec![Ok(batch.clone())]),
+        params.build().unwrap(),
+        query_tokens.clone(),
+        0,
+        None,
+        0,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        counted[FLAT_ALL_TOKENS_COL]
+            .as_primitive::<UInt64Type>()
+            .values(),
+        expected
+    );
+    let total: u64 = expected.iter().sum();
+    let scorer = initialize_scorer(None, &query_tokens, &counted);
+    assert_eq!(scorer.total_tokens, total);
+    assert_eq!(scorer.num_docs(), expected.len());
+    assert_eq!(
+        scorer.avg_doc_length(),
+        total as f32 / expected.len() as f32
+    );
+
+    let (_, stats) = tokenize_and_blend_multi(
+        stream::iter(vec![Ok(batch.clone())]),
+        params.build().unwrap(),
+        query_tokens,
+        Arc::new(vec![0]),
+        Arc::new(vec![1.0]),
+        Arc::new(vec![Arc::new(lance_select::RowAddrMask::all_rows())]),
+        None,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats.total_tokens, vec![total]);
+
+    for with_position in [false, true] {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let mut builder =
+            InvertedIndexBuilder::new(params.clone().with_position(with_position).num_workers(1));
+        builder
+            .update(
+                Box::pin(RecordBatchStreamAdapter::new(
+                    batch.schema(),
+                    stream::iter(vec![Ok(batch.clone())]),
+                )),
+                store.as_ref(),
+                None,
+            )
+            .await
+            .unwrap();
+        let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let (tokens, num_docs, _) = index.bm25_stats_for_terms(&[], None).await.unwrap();
+        assert_eq!((tokens, num_docs), (total, expected.len()));
+    }
+}
+
+#[tokio::test]
+async fn flat_bm25_search_stream_with_metrics_records_elapsed_compute() {
+    use crate::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
+    use arrow_array::{StringArray, UInt64Array};
+    use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
+
+    // Tiny stream of one batch containing the query term in two rows.
+    let schema = Arc::new(Schema::new(vec![
+        ROW_ID_FIELD.clone(),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![0u64, 1, 2, 3])),
+            Arc::new(StringArray::from(vec![
+                "the quick brown fox",
+                "lazy dog sleeps",
+                "the brown fox jumps over",
+                "completely unrelated text",
+            ])),
+        ],
+    )
+    .unwrap();
+
+    let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+        schema.clone(),
+        stream::iter(vec![Ok(batch)]),
+    ));
+
+    let tokenizer: Box<dyn LanceTokenizer> = Box::new(TextTokenizer::new(
+        TextAnalyzer::builder(SimpleTokenizer::default()).build(),
+    ));
+
+    let elapsed_compute = Time::default();
+    let result_stream = flat_bm25_search_stream_with_metrics(
+        input,
+        "text".to_string(),
+        "fox".to_string(),
+        tokenizer,
+        None,
+        100,
+        Some(elapsed_compute.clone()),
+    )
+    .await
+    .unwrap();
+
+    let batches: Vec<_> = result_stream.try_collect().await.unwrap();
+    assert!(!batches.is_empty(), "expected at least one scored batch");
+
+    // Both phase 1 (tokenize_and_count's spawn_cpu) and phase 2 (sync
+    // scoring) call `add_duration` on the metric; verify the handle
+    // was actually populated.
+    assert!(
+        elapsed_compute.value() > 0,
+        "elapsed_compute should have been populated; got 0"
+    );
+}
+
+#[tokio::test]
+async fn flat_bm25_phrase_honors_positions_slop_and_repeated_terms() {
+    async fn search(query: &str, slop: u32) -> Vec<u64> {
+        let schema = Arc::new(Schema::new(vec![
+            ROW_ID_FIELD.clone(),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from_iter_values(0..5)),
+                Arc::new(StringArray::from(vec![
+                    "alpha beta",
+                    "alpha gap beta",
+                    "alpha gap gap beta",
+                    "alpha alpha beta",
+                    "beta alpha",
+                ])),
+            ],
+        )
+        .unwrap();
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Ok(batch)]),
+        ));
+        let tokenizer: Box<dyn LanceTokenizer> = Box::new(TextTokenizer::new(
+            TextAnalyzer::builder(SimpleTokenizer::default()).build(),
+        ));
+        let (stream, _) = flat_bm25_search_stream_with_options_and_scorer(
+            input,
+            "text".to_string(),
+            query.to_string(),
+            tokenizer,
+            None,
+            FlatBm25SearchOptions {
+                target_batch_size: 100,
+                elapsed_compute: None,
+                document_granularity: DocumentGranularity::Row,
+                operator: Operator::And,
+                boost: 1.0,
+                phrase_slop: Some(slop),
+            },
+        )
+        .await
+        .unwrap();
+        stream
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .iter()
+            .flat_map(|batch| batch[ROW_ID].as_primitive::<UInt64Type>().values())
+            .copied()
+            .collect()
+    }
+
+    assert_eq!(search("alpha beta", 0).await, vec![0, 3]);
+    assert_eq!(search("alpha beta", 1).await, vec![0, 1, 3]);
+    assert_eq!(search("alpha alpha", 0).await, vec![3]);
+}
+
+#[test]
+fn flat_full_text_search_supports_phrase_queries() {
+    let schema = Arc::new(Schema::new(vec![
+        ROW_ID_FIELD.clone(),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(UInt64Array::from_iter_values(0..4)),
+            Arc::new(StringArray::from(vec![
+                "alpha beta",
+                "alpha gap beta",
+                "alpha alpha beta",
+                "beta alpha",
+            ])),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(
+        flat_full_text_search(&[&batch], "text", "\"alpha beta\"", None).unwrap(),
+        vec![0, 2]
+    );
+    assert_eq!(
+        flat_full_text_search(&[&batch], "text", "\"alpha alpha\"", None).unwrap(),
+        vec![2]
+    );
+    assert!(!is_phrase_query("\""));
+}
+
+#[tokio::test]
+async fn flat_bm25_skips_zero_token_documents_from_corpus_stats() {
+    let schema = Arc::new(Schema::new(vec![
+        ROW_ID_FIELD.clone(),
+        Field::new("text", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(UInt64Array::from(vec![0_u64, 1, 2, 3, 4, 5])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some(""),
+                Some("   "),
+                Some("the"),
+                Some("overlength"),
+                None,
+                Some("hello"),
+            ])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let params = InvertedIndexParams::new("whitespace".to_string(), Language::English)
+        .remove_stop_words(true)
+        .stem(false)
+        .max_token_length(Some(6));
+    let query_tokens = Arc::new(Tokens::new(vec!["hello".to_string()], DocType::Text));
+
+    let counted_input = tokenize_and_count(
+        stream::iter(vec![Ok(batch)]),
+        params.build().unwrap(),
+        query_tokens.clone(),
+        1,
+        None,
+        0,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(counted_input.num_rows(), 1);
+    assert_eq!(
+        counted_input[ROW_ID].as_primitive::<UInt64Type>().values(),
+        &[5]
+    );
+    let scorer = initialize_scorer(None, query_tokens.as_ref(), &counted_input);
+    let expected_scorer = MemBM25Scorer::new(1, 1, HashMap::from([("hello".to_string(), 1)]));
+    assert_eq!(scorer.total_tokens, 1);
+    assert_eq!(scorer.num_docs(), 1);
+    assert_eq!(scorer.num_docs_containing_token("hello"), 1);
+    assert_eq!(scorer.avg_doc_length(), expected_scorer.avg_doc_length());
+    assert_eq!(
+        scorer.query_weight("hello"),
+        expected_scorer.query_weight("hello")
+    );
+}
+
+#[tokio::test]
+async fn flat_bm25_preserves_zero_token_list_element_documents() {
+    let coordinate_column = doc_index_storage_column(0);
+    let schema = Arc::new(Schema::new(vec![
+        ROW_ID_FIELD.clone(),
+        Field::new(&coordinate_column, DataType::UInt32, false),
+        Field::new("text", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(UInt64Array::from(vec![7_u64; 6])) as ArrayRef,
+            Arc::new(UInt32Array::from(vec![0, 1, 2, 3, 4, 5])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                None,
+                Some(""),
+                Some("   "),
+                Some("the"),
+                Some("overlength"),
+                Some("hello"),
+            ])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let params = InvertedIndexParams::new("whitespace".to_string(), Language::English)
+        .remove_stop_words(true)
+        .stem(false)
+        .max_token_length(Some(6));
+    let query_tokens = Arc::new(Tokens::new(vec!["hello".to_string()], DocType::Text));
+
+    let counted_input = tokenize_and_count(
+        stream::iter(vec![Ok(batch)]),
+        params.build().unwrap(),
+        query_tokens.clone(),
+        2,
+        None,
+        1,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(counted_input.num_rows(), 6);
+    assert_eq!(
+        counted_input[&coordinate_column]
+            .as_primitive::<UInt32Type>()
+            .values(),
+        &[0, 1, 2, 3, 4, 5]
+    );
+    let scorer = initialize_scorer(None, query_tokens.as_ref(), &counted_input);
+    assert_eq!(scorer.total_tokens, 1);
+    assert_eq!(scorer.num_docs(), 6);
+    assert_eq!(scorer.num_docs_containing_token("hello"), 1);
+}
+
+#[tokio::test]
+async fn flat_bm25_search_uses_full_document_length_for_normalization() {
+    let schema = Arc::new(Schema::new(vec![
+        ROW_ID_FIELD.clone(),
+        Field::new("text", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![0u64, 1])),
+            Arc::new(StringArray::from(vec![
+                "alpha",
+                "alpha filler filler filler filler filler filler filler filler filler",
+            ])),
+        ],
+    )
+    .unwrap();
+
+    let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+        schema.clone(),
+        stream::iter(vec![Ok(batch)]),
+    ));
+    let tokenizer: Box<dyn LanceTokenizer> = Box::new(TextTokenizer::new(
+        TextAnalyzer::builder(SimpleTokenizer::default()).build(),
+    ));
+
+    let result_stream = flat_bm25_search_stream_with_metrics(
+        input,
+        "text".to_string(),
+        "alpha".to_string(),
+        tokenizer,
+        None,
+        100,
+        None,
+    )
+    .await
+    .unwrap();
+    let batches: Vec<_> = result_stream.try_collect().await.unwrap();
+    let scored = arrow::compute::concat_batches(&FTS_SCHEMA, &batches).unwrap();
+    let row_ids = scored[ROW_ID].as_primitive::<UInt64Type>();
+    let scores = scored[SCORE_COL].as_primitive::<Float32Type>();
+
+    assert_eq!(row_ids.values(), &[0, 1]);
+    assert!(
+        scores.value(0) > scores.value(1),
+        "same term frequency should score shorter document higher; short={}, long={}",
+        scores.value(0),
+        scores.value(1)
+    );
+}
+
+#[tokio::test]
+async fn flat_bm25_search_treats_string_lists_as_row_documents() {
+    let mut docs_builder = GenericListBuilder::<i32, _>::new(GenericStringBuilder::<i32>::new());
+    docs_builder.values().append_value("alpha");
+    docs_builder.values().append_value("alpha beta");
+    docs_builder.append(true);
+    docs_builder.values().append_value("beta");
+    docs_builder.append(true);
+    docs_builder.append(true);
+    docs_builder.values().append_null();
+    docs_builder.append(true);
+    docs_builder.append(false);
+
+    let docs = Arc::new(docs_builder.finish()) as ArrayRef;
+    let schema = Arc::new(Schema::new(vec![
+        ROW_ID_FIELD.clone(),
+        Field::new("text", docs.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![0u64, 1, 2, 3, 4])) as ArrayRef,
+            docs,
+        ],
+    )
+    .unwrap();
+
+    let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+        schema.clone(),
+        stream::iter(vec![Ok(batch)]),
+    ));
+    let tokenizer: Box<dyn LanceTokenizer> = Box::new(TextTokenizer::new(
+        TextAnalyzer::builder(SimpleTokenizer::default()).build(),
+    ));
+
+    let result_stream = flat_bm25_search_stream_with_metrics(
+        input,
+        "text".to_string(),
+        "alpha".to_string(),
+        tokenizer,
+        None,
+        100,
+        None,
+    )
+    .await
+    .unwrap();
+    let batches: Vec<_> = result_stream.try_collect().await.unwrap();
+    let scored = arrow::compute::concat_batches(&FTS_SCHEMA, &batches).unwrap();
+    let row_ids = scored[ROW_ID].as_primitive::<UInt64Type>();
+
+    assert_eq!(row_ids.values(), &[0]);
+}
+
+#[tokio::test]
+async fn flat_bm25_search_code_and_uses_position_groups() {
+    let schema = Arc::new(Schema::new(vec![
+        ROW_ID_FIELD.clone(),
+        Field::new("code", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from(vec![0u64, 1, 2, 3])),
+            Arc::new(StringArray::from(vec![
+                "get user name",
+                "getUserName",
+                "get user",
+                "username",
+            ])),
+        ],
+    )
+    .unwrap();
+
+    let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+        schema.clone(),
+        stream::iter(vec![Ok(batch)]),
+    ));
+    let tokenizer = InvertedIndexParams::code()
+        .split_identifiers(true)
+        .build()
+        .unwrap();
+
+    let result_stream = flat_bm25_search_stream_with_metrics_and_operator(
+        input,
+        "code".to_string(),
+        "getUserName".to_string(),
+        tokenizer,
+        None,
+        100,
+        Operator::And,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let batches: Vec<_> = result_stream.try_collect().await.unwrap();
+    let scored = arrow::compute::concat_batches(&FTS_SCHEMA, &batches).unwrap();
+    let mut row_ids = scored[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec();
+    row_ids.sort_unstable();
+
+    assert_eq!(row_ids, vec![0, 1]);
+}
+
+#[rstest::rstest]
+#[case::camel_case("userName", 0, &[0, 1, 6])]
+#[case::whole_identifier("getUserName", 0, &[0, 1, 6])]
+#[case::snake_case("get_user_name", 0, &[0, 1, 6])]
+#[case::acronym("HttpRequest", 0, &[2])]
+#[case::digits("html2json", 0, &[3])]
+#[case::plain_words("user name", 0, &[0, 1, 6])]
+#[case::multiple_groups("getUser Name", 0, &[0, 1, 6])]
+#[case::slop("userName", 1, &[0, 1, 4, 6])]
+#[case::repeated_groups("getUserName getUserName", 0, &[6])]
+#[tokio::test]
+async fn flat_phrase_code_uses_position_groups(
+    #[case] query: &str,
+    #[case] slop: u32,
+    #[case] expected: &[u64],
+) {
+    let docs = [
+        Some("def getUserName(user_id): pass"),
+        Some("let x = get_user_name();"),
+        Some("class XMLHttpRequest {}"),
+        Some("parse_html2json(input)"),
+        Some("getUser gap name"),
+        Some("name user"),
+        Some("getUserName get_user_name"),
+        None,
+        Some(""),
+    ];
+    let batch = arrow_array::record_batch!(
+        ("_rowid", UInt64, (0..docs.len() as u64).collect::<Vec<_>>()),
+        ("code", Utf8, docs.to_vec())
+    )
+    .unwrap();
+    let mut tokenizer = InvertedIndexParams::code()
+        .split_identifiers(true)
+        .build()
+        .unwrap();
+    let query_tokens = try_collect_query_tokens(query, &mut tokenizer).unwrap();
+    let direct_matches = docs
+        .iter()
+        .enumerate()
+        .filter_map(|(row, doc)| {
+            doc.filter(|doc| {
+                document_matches_flat_query(doc, &mut tokenizer, &query_tokens, Some(slop)).unwrap()
+            })
+            .map(|_| row as u64)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(direct_matches, expected);
+
+    let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+        batch.schema(),
+        stream::iter(vec![Ok(batch)]),
+    ));
+    let (result_stream, _) = flat_bm25_search_stream_with_options_and_scorer(
+        input,
+        "code".to_string(),
+        query.to_string(),
+        tokenizer,
+        None,
+        FlatBm25SearchOptions {
+            target_batch_size: 100,
+            elapsed_compute: None,
+            document_granularity: DocumentGranularity::Row,
+            operator: Operator::And,
+            boost: 1.0,
+            phrase_slop: Some(slop),
+        },
+    )
+    .await
+    .unwrap();
+    let batches = result_stream.try_collect::<Vec<_>>().await.unwrap();
+    let scored = arrow::compute::concat_batches(&FTS_SCHEMA, &batches).unwrap();
+    assert_eq!(
+        scored[ROW_ID].as_primitive::<UInt64Type>().values(),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn flat_bm25_search_code_and_counts_repeated_subwords() {
+    let schema = Arc::new(Schema::new(vec![
+        ROW_ID_FIELD.clone(),
+        Field::new("code", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt64Array::from(vec![0u64, 1])),
+                Arc::new(StringArray::from(vec![
+                    "pub fn edge_flat_generic_return<T>() -> Result<T, EdgeFlatError> where T: TryFrom<String> { todo!() }",
+                    "pub fn edge_flat_generic_return<T>() -> Result<T> { todo!() }",
+                ])),
+            ],
+        )
+        .unwrap();
+
+    let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+        schema.clone(),
+        stream::iter(vec![Ok(batch)]),
+    ));
+    let tokenizer = InvertedIndexParams::code().build().unwrap();
+
+    let result_stream = flat_bm25_search_stream_with_metrics_and_operator(
+        input,
+        "code".to_string(),
+        "edge_flat_generic_return TryFrom EdgeFlatError Result".to_string(),
+        tokenizer,
+        None,
+        100,
+        Operator::And,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let batches: Vec<_> = result_stream.try_collect().await.unwrap();
+    let scored = arrow::compute::concat_batches(&FTS_SCHEMA, &batches).unwrap();
+    let row_ids = scored[ROW_ID].as_primitive::<UInt64Type>().values();
+
+    assert_eq!(row_ids, &[0]);
+}

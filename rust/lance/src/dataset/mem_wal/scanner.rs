@@ -5,8 +5,8 @@
 //!
 //! This module provides scanners that read from multiple data sources
 //! in an LSM tree architecture:
-//! - Base table (merged data)
-//! - Flushed MemTables (persisted but not yet merged)
+//! - Base table (compacted data)
+//! - SSTables (persisted but not yet compacted)
 //! - Active MemTable (in-memory buffer)
 //!
 //! The scanner handles deduplication by primary key, keeping the newest
@@ -41,11 +41,12 @@ mod builder;
 mod collector;
 mod data_source;
 pub mod exec;
-pub(crate) mod flushed_cache;
 mod fts_search;
+mod generation_read;
 mod planner;
 mod point_lookup;
 mod projection;
+pub(crate) mod sstable_cache;
 mod vector_search;
 
 pub use block_list::write_pk_sidecar;
@@ -53,13 +54,11 @@ pub use builder::LsmScanner;
 pub use collector::{
     ActiveMemTableRef, InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector,
 };
-pub use data_source::{
-    FlushedGeneration, FreshTierWatermark, LsmDataSource, LsmGeneration, ShardSnapshot,
-};
-pub use flushed_cache::{DatasetCache, FlushedMemTableCache, GenerationWarmer};
+pub use data_source::{FreshTierWatermark, LsmDataSource, LsmGeneration, ShardSnapshot, SsTable};
 pub use fts_search::{LsmFtsSearchPlanner, SCORE_COLUMN};
 pub use point_lookup::LsmPointLookupPlanner;
 pub use projection::DISTANCE_COLUMN;
+pub use sstable_cache::{DatasetCache, SsTableCache, SsTableWarmer};
 pub use vector_search::LsmVectorSearchPlanner;
 
 /// Parse a SQL filter expression against a MemWAL source schema.

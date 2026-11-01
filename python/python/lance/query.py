@@ -3,6 +3,7 @@
 
 
 import abc
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
@@ -14,12 +15,20 @@ class FullTextQueryType(Enum):
     MATCH_PHRASE = "match_phrase"
     BOOST = "boost"
     MULTI_MATCH = "multi_match"
+    COMBINED_FIELDS = "combined_fields"
     BOOLEAN = "boolean"
 
 
 class FullTextOperator(Enum):
     AND = "AND"
     OR = "OR"
+
+
+class DocumentGranularity(str, Enum):
+    """The unit treated as one full-text-search document."""
+
+    ROW = "row"
+    LIST_ELEMENT = "list_element"
 
 
 class Occur(Enum):
@@ -98,6 +107,7 @@ class MatchQuery(FullTextQuery):
         max_expansions: int = 50,
         operator: FullTextOperator = FullTextOperator.OR,
         prefix_length: int = 0,
+        document_granularity: Optional[DocumentGranularity] = None,
     ):
         """
         Match query for full-text search.
@@ -129,6 +139,10 @@ class MatchQuery(FullTextQuery):
         prefix_length : int, default 0
             The number of beginning characters being unchanged for fuzzy matching.
             This is useful to achieve prefix matching.
+        document_granularity : DocumentGranularity, optional
+            Explicitly select row or deepest-list-element documents. If omitted,
+            the indexed granularity is inferred. When both granularities are indexed
+            for the field, this must be specified. With no index, ``ROW`` is used.
         """
         self._inner = PyFullTextQuery.match_query(
             query,
@@ -138,6 +152,9 @@ class MatchQuery(FullTextQuery):
             max_expansions=max_expansions,
             operator=operator.value,
             prefix_length=prefix_length,
+            document_granularity=(
+                document_granularity.value if document_granularity is not None else None
+            ),
         )
 
     def query_type(self) -> FullTextQueryType:
@@ -145,7 +162,14 @@ class MatchQuery(FullTextQuery):
 
 
 class PhraseQuery(FullTextQuery):
-    def __init__(self, query: str, column: str, *, slop: int = 0):
+    def __init__(
+        self,
+        query: str,
+        column: str,
+        *,
+        slop: int = 0,
+        document_granularity: Optional[DocumentGranularity] = None,
+    ):
         """
         Phrase query for full-text search.
 
@@ -155,8 +179,21 @@ class PhraseQuery(FullTextQuery):
             The query string to match against.
         column : str
             The name of the column to match against.
+        slop : int, default 0
+            The maximum number of intervening positions permitted in the phrase.
+        document_granularity : DocumentGranularity, optional
+            Explicitly select row or deepest-list-element documents. If omitted,
+            the indexed granularity is inferred. When both granularities are indexed
+            for the field, this must be specified. With no index, ``ROW`` is used.
         """
-        self._inner = PyFullTextQuery.phrase_query(query, column, slop)
+        self._inner = PyFullTextQuery.phrase_query(
+            query,
+            column,
+            slop,
+            document_granularity=(
+                document_granularity.value if document_granularity is not None else None
+            ),
+        )
 
     def query_type(self) -> FullTextQueryType:
         return FullTextQueryType.MATCH_PHRASE
@@ -227,6 +264,65 @@ class MultiMatchQuery(FullTextQuery):
         return FullTextQueryType.MULTI_MATCH
 
 
+class CombinedFieldsQuery(FullTextQuery):
+    def __init__(
+        self,
+        query: str,
+        columns: list[str],
+        *,
+        boosts: Optional[list[float]] = None,
+        operator: FullTextOperator = FullTextOperator.OR,
+    ):
+        """
+        Combined-fields (BM25F) query for full-text search.
+
+        Unlike :class:`MultiMatchQuery`, which scores each column independently
+        and keeps the best field (Elasticsearch ``best_fields``), this query
+        treats the target columns as a single virtual field so that term
+        statistics are blended across fields (Elasticsearch ``combined_fields``
+        / Lucene ``CombinedFieldQuery``). This makes a term that is rare in one
+        field but common in another score consistently, and lets a single query
+        term match across fields (e.g. a first name in one column and a last
+        name in another).
+
+        Parameters
+        ----------
+        query : str
+            The query string to match against.
+        columns : list[str]
+            The list of columns combined into the virtual field.
+        boosts : list[float], optional
+            Per-column weights aligned with ``columns``. Each weight must be
+            ``>= 1`` (fractional weights allowed). If not provided, every column
+            defaults to ``1.0``.
+        operator : FullTextOperator, default OR
+            The operator applied across the virtual field. If ``AND``, every
+            term must appear in at least one column. If ``OR``, at least one
+            term must match.
+
+        Notes
+        -----
+        All target columns must share the same tokenizer/index configuration.
+
+        At least one target column needs an FTS index. Columns without an
+        index, and rows added since the last index build, are read from the
+        data and scored together with the indexed rows.
+
+        BM25F adds up each column's contribution for a whole row, so a column
+        indexed only with
+        ``document_granularity=DocumentGranularity.LIST_ELEMENT`` is rejected,
+        because its element coordinates have no counterpart in the other columns
+        and the result carries no ``_doc_index``. A column that has both indexes
+        uses the row one.
+        """
+        self._inner = PyFullTextQuery.combined_fields_query(
+            query, columns, boosts=boosts, operator=operator.value
+        )
+
+    def query_type(self) -> FullTextQueryType:
+        return FullTextQueryType.COMBINED_FIELDS
+
+
 class BooleanQuery(FullTextQuery):
     def __init__(self, queries: list[tuple[Occur, FullTextQuery]]):
         """
@@ -235,7 +331,9 @@ class BooleanQuery(FullTextQuery):
         Parameters
         ----------
         queries : list[tuple(Occur, FullTextQuery)]
-            The list of queries with their occurrence requirements.
+            The list of queries with their occurrence requirements. Every MUST
+            clause must match and contributes its score; matching SHOULD scores
+            are also added, while MUST_NOT clauses only exclude documents.
         """
         self._inner = PyFullTextQuery.boolean_query(
             [(occur.value, query.inner) for occur, query in queries]
@@ -243,3 +341,31 @@ class BooleanQuery(FullTextQuery):
 
     def query_type(self) -> FullTextQueryType:
         return FullTextQueryType.BOOLEAN
+
+
+@dataclass
+class MinHashQuery:
+    """A MinHash similarity search over a column with a MinHash LSH index.
+
+    Pass it as ``nearest`` to :meth:`LanceDataset.to_table` or
+    :meth:`LanceDataset.scanner`. The result carries a ``_distance`` column
+    equal to ``1 - estimated Jaccard similarity`` between the query text and
+    each row, ordered ascending; the number of rows is the scan ``limit``
+    (default 10).
+
+    Parameters
+    ----------
+    text : str
+        The query text. It is tokenized and shingled exactly like the indexed
+        rows, using the tokenizer stored in the index.
+    column : str
+        The column that has the MinHash LSH index.
+
+    Examples
+    --------
+    >>> ds.to_table(nearest=MinHashQuery("some near duplicate text", "text"),
+    ...             limit=10)  # doctest: +SKIP
+    """
+
+    text: str
+    column: str

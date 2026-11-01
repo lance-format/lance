@@ -1,0 +1,4 @@
+   id                      name  _distance
+0   2  blue trail running shoes     0.0156
+1   1         red running shoes     0.0312
+2   3      leather hiking boots     0.3281

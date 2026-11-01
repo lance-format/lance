@@ -77,6 +77,15 @@ impl Backoff {
     }
 }
 
+/// Upper bound on the number of retry slots.
+///
+/// Slots double each attempt to spread contending writers apart, but a hundred
+/// or so already exceeds any realistic number of concurrent committers, so
+/// further doubling only inflates the wait without reducing collisions. Capping
+/// the count also bounds a single backoff to `(MAX_SLOTS - 1) * unit` instead of
+/// letting it grow without limit as `attempt` climbs.
+const MAX_SLOTS: u32 = 128;
+
 /// SlotBackoff is a backoff strategy that randomly chooses a time slot to retry.
 ///
 /// This is useful when you have multiple tasks that can't overlap, and each
@@ -85,7 +94,7 @@ impl Backoff {
 /// The `unit` represents the time it takes to complete one attempt. Future attempts
 /// are divided into time slots, and a random slot is chosen for the retry. The number
 /// of slots increases exponentially with each attempt. Initially, there are 4 slots,
-/// then 8, then 16, and so on.
+/// then 8, then 16, and so on, up to a fixed cap.
 ///
 /// Example:
 /// Suppose you have 10 tasks that can't overlap, each taking 1 second. The tasks
@@ -138,10 +147,15 @@ impl SlotBackoff {
     }
 
     pub fn next_backoff(&mut self) -> Duration {
-        let num_slots = self.base.saturating_pow(self.attempt + self.starting_i);
+        let num_slots = self
+            .base
+            .saturating_pow(self.attempt.saturating_add(self.starting_i))
+            .min(MAX_SLOTS);
         let slot_i = self.rng.random_range(0..num_slots);
-        self.attempt += 1;
-        Duration::from_millis((slot_i * self.unit) as u64)
+        self.attempt = self.attempt.saturating_add(1);
+        // Widen before multiplying: `unit` is the first-attempt latency, which
+        // can be large enough that a `u32` slot * unit product would overflow.
+        Duration::from_millis(slot_i as u64 * self.unit as u64)
     }
 }
 
@@ -227,5 +241,51 @@ mod tests {
             );
             assert_eq!(backoff.attempt(), 3);
         }
+    }
+
+    #[test]
+    fn test_slot_backoff_high_attempt_is_bounded() {
+        // Without the slot cap the wait grows unbounded with `attempt`. The cap
+        // holds every backoff to `(MAX_SLOTS - 1) * unit`.
+        let unit = 100_000; // 100s first attempt
+        let mut backoff = SlotBackoff::default().with_unit(unit);
+        let max_backoff = Duration::from_millis((MAX_SLOTS - 1) as u64 * unit as u64);
+        for _ in 0..40 {
+            assert!(backoff.next_backoff() <= max_backoff);
+        }
+        assert_eq!(backoff.attempt(), 40);
+    }
+
+    #[test]
+    fn test_slot_backoff_large_unit_does_not_overflow() {
+        // With unit = u32::MAX, any slot >= 2 makes the old u32 `slot_i * unit`
+        // product overflow: a debug panic, or in release a wrap to a value that
+        // is no longer a multiple of unit. The u64 widening keeps every backoff
+        // an exact multiple of unit. Seed the RNG so the drawn slots — and thus
+        // this check — are deterministic rather than dependent on random draws.
+        let unit = u32::MAX;
+        let mut backoff = SlotBackoff::default().with_unit(unit);
+        backoff.rng = rand::rngs::SmallRng::seed_from_u64(0);
+        let mut saw_high_slot = false;
+        for _ in 0..64 {
+            let backoff_ms = backoff.next_backoff().as_millis();
+            // `slot_i * unit` is always a multiple of unit; a wrapped u32
+            // product is not.
+            assert_eq!(backoff_ms % unit as u128, 0, "{backoff_ms} wrapped");
+            saw_high_slot |= backoff_ms >= 2 * unit as u128;
+        }
+        assert!(saw_high_slot, "expected a slot >= 2 in 64 seeded draws");
+    }
+
+    #[test]
+    fn test_slot_backoff_attempt_saturates() {
+        // At u32::MAX the counter must stay put rather than panic (debug) or
+        // wrap to 0 (release), which would restart the low-slot distribution.
+        let mut backoff = SlotBackoff {
+            attempt: u32::MAX,
+            ..Default::default()
+        };
+        let _ = backoff.next_backoff();
+        assert_eq!(backoff.attempt(), u32::MAX);
     }
 }

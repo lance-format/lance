@@ -65,9 +65,11 @@ public class ShardWriter implements Closeable {
   public static ShardWriter create(Dataset dataset, String shardId, ShardWriterConfig config) {
     Preconditions.checkNotNull(dataset, "dataset must not be null");
     Preconditions.checkNotNull(shardId, "shardId must not be null");
-    ShardWriter writer = createNative(dataset, shardId, config);
-    writer.allocator = dataset.allocator();
-    return writer;
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      ShardWriter writer = createNative(dataset, shardId, config);
+      writer.allocator = dataset.allocator();
+      return writer;
+    }
   }
 
   static native ShardWriter createNative(Dataset dataset, String shardId, ShardWriterConfig config);
@@ -151,9 +153,8 @@ public class ShardWriter implements Closeable {
   /**
    * Create an LSM scanner that includes this writer's active MemTable.
    *
-   * <p>The scanner covers the base table, the given flushed generations, and the current active
-   * MemTable, providing read-your-writes consistency. This writer's own shard is included
-   * automatically.
+   * <p>The scanner covers the base table, the given SSTables, and the current active MemTable,
+   * providing read-your-writes consistency. This writer's own shard is included automatically.
    *
    * @param shardSnapshots snapshots of other shards to include
    * @return an LSM scanner

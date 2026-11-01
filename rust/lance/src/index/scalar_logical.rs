@@ -4,15 +4,22 @@
 //! Query-time logical views over scalar index segments.
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index::scalar::RowAddrTranslator;
 use std::any::Any;
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
+use futures::StreamExt;
 use futures::future::try_join_all;
+use futures::stream::{self, BoxStream};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use lance_index::metrics::MetricsCollector;
-use lance_index::scalar::{AnyQuery, CreatedIndex, ScalarIndex, SearchResult, UpdateCriteria};
+use lance_index::scalar::{
+    AnyQuery, CreatedIndex, ScalarIndex, SearchOptions, SearchResult, UpdateCriteria,
+};
 use lance_index::{Index, IndexType};
 use lance_select::NullableRowAddrSet;
 use lance_table::format::IndexMetadata;
@@ -21,6 +28,7 @@ use serde_json::json;
 
 use crate::dataset::Dataset;
 use crate::index::scalar::fetch_index_details;
+use crate::index::segment_coverage::{SegmentCoverage, SegmentRowDomain};
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 
 /// Query-time view that exposes several physical scalar index segments as a single [`ScalarIndex`].
@@ -30,11 +38,16 @@ use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 /// the segments into a `LogicalScalarIndex` so the scanner can treat them as one index: queries
 /// are fanned out to every segment in parallel and the row-address results are unioned together.
 ///
-/// All segments must share the same [`IndexType`]; mixing types is rejected at construction.
+/// All segments must share the same [`IndexType`] and result row domain; mixing either is
+/// rejected at construction.
 /// Per-segment [`SearchResult`] precision is preserved when combining: a union of `Exact`
 /// results stays `Exact`, a union containing `AtMost` results yields `AtMost`, and a union
 /// containing `AtLeast` results yields `AtLeast`. Combining `AtMost` and `AtLeast` segments in
 /// the same query is not supported.
+///
+/// Under stable row ids each segment's row-id hits (and lookup matches) are restricted to
+/// the live rows currently stored in its own fragments before the results are combined (see
+/// `SegmentCoverage`).
 ///
 /// This is a read-only wrapper. [`ScalarIndex::remap`] and [`ScalarIndex::update`] both return
 /// an error — callers must rebuild the index to consolidate segments before mutating it.
@@ -44,21 +57,25 @@ pub struct LogicalScalarIndex {
     column: String,
     index_type: IndexType,
     segments: Vec<Arc<dyn ScalarIndex>>,
+    coverage: Option<SegmentCoverage>,
 }
 
 impl LogicalScalarIndex {
     /// Merge several already-opened segments of one scalar index into a single
     /// searchable [`ScalarIndex`].
     ///
+    /// Under stable row ids every segment must carry a fragment bitmap (see `SegmentCoverage`).
+    ///
     /// Used internally by `open_named_scalar_index`, and exposed so a
     /// distributed query engine can open an explicit subset of a scalar
     /// index's segments and present them as one index.
-    pub fn try_new(
+    pub async fn try_new(
+        dataset: &Dataset,
         name: String,
         column: String,
-        segments: Vec<Arc<dyn ScalarIndex>>,
+        segments: Vec<(IndexMetadata, Arc<dyn ScalarIndex>)>,
     ) -> Result<Self> {
-        let Some(first) = segments.first() else {
+        let Some((_, first)) = segments.first() else {
             return Err(Error::invalid_input(format!(
                 "LogicalScalarIndex '{}' on column '{}' must contain at least one segment",
                 name, column
@@ -67,19 +84,40 @@ impl LogicalScalarIndex {
         let index_type = first.index_type();
         if segments
             .iter()
-            .any(|segment| segment.index_type() != index_type)
+            .any(|(_, segment)| segment.index_type() != index_type)
         {
             return Err(Error::invalid_input(format!(
                 "LogicalScalarIndex '{}' on column '{}' mixes scalar index types",
                 name, column
             )));
         }
+        if segments.iter().any(|(_, segment)| {
+            segment.results_are_row_addresses() != first.results_are_row_addresses()
+        }) {
+            return Err(Error::invalid_input(format!(
+                "LogicalScalarIndex '{}' on column '{}' mixes row-ID and row-address segments; \
+                 rebuild every segment in one commit",
+                name, column
+            )));
+        }
+
+        let row_domain = if first.results_are_row_addresses() {
+            SegmentRowDomain::RowAddress
+        } else {
+            SegmentRowDomain::RowId
+        };
+        let metadata = segments
+            .iter()
+            .map(|(metadata, _)| metadata)
+            .collect::<Vec<_>>();
+        let coverage = SegmentCoverage::resolve(dataset, &metadata, row_domain).await?;
 
         Ok(Self {
             name,
             column,
             index_type,
-            segments,
+            segments: segments.into_iter().map(|(_, segment)| segment).collect(),
+            coverage,
         })
     }
 }
@@ -89,6 +127,10 @@ impl DeepSizeOf for LogicalScalarIndex {
         self.name.deep_size_of_children(context)
             + self.column.deep_size_of_children(context)
             + self.segments.deep_size_of_children(context)
+            + self
+                .coverage
+                .as_ref()
+                .map_or(0, |coverage| coverage.deep_size_of_children(context))
     }
 }
 
@@ -142,18 +184,51 @@ impl ScalarIndex for LogicalScalarIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        let results = try_join_all(
-            self.segments
-                .iter()
-                .map(|segment| segment.search(query, metrics)),
-        )
+        self.search_with_options(query, SearchOptions::default(), metrics)
+            .await
+    }
+
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        let results = try_join_all(self.segments.iter().enumerate().map(
+            |(i, segment)| async move {
+                let result = segment.search_with_options(query, options, metrics).await?;
+                match &self.coverage {
+                    Some(coverage) => coverage.restrict(i, result).await,
+                    None => Ok(result),
+                }
+            },
+        ))
         .await?;
         combine_search_results(results)
     }
 
+    fn lookup<'a>(
+        &'a self,
+        keys: ArrayRef,
+        metrics: &'a dyn MetricsCollector,
+    ) -> Result<BoxStream<'a, Result<RecordBatch>>> {
+        let segments = self
+            .segments
+            .iter()
+            .enumerate()
+            .map(|(i, segment)| {
+                let matches = segment.lookup(keys.clone(), metrics)?;
+                Ok(match &self.coverage {
+                    Some(coverage) => coverage.restrict_lookup(i, matches),
+                    None => matches,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(stream::select_all(segments).boxed())
+    }
+
     fn results_are_row_addresses(&self) -> bool {
-        // All segments of a logical index share the same underlying index type,
-        // so they agree on the result domain.
+        // Construction validates that every segment uses this result domain.
         self.segments[0].results_are_row_addresses()
     }
 
@@ -164,6 +239,17 @@ impl ScalarIndex for LogicalScalarIndex {
     async fn remap(
         &self,
         _mapping: &RowAddrRemap,
+        _dest_store: &dyn lance_index::scalar::IndexStore,
+    ) -> Result<CreatedIndex> {
+        Err(Error::invalid_input(format!(
+            "LogicalScalarIndex '{}' is a query-time wrapper and does not support remap; rebuild the index to consolidate segments before remapping",
+            self.name
+        )))
+    }
+
+    async fn remap_streaming(
+        &self,
+        _translator: &RowAddrTranslator,
         _dest_store: &dyn lance_index::scalar::IndexStore,
     ) -> Result<CreatedIndex> {
         Err(Error::invalid_input(format!(
@@ -329,7 +415,33 @@ pub async fn open_named_scalar_index(
     index_name: &str,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
-    let indices = load_named_scalar_segments(dataset, column, index_name).await?;
+    open_scalar_index_segments(dataset, column, index_name, None, None, metrics).await
+}
+
+/// Open selected scalar index segments whose coverage intersects `fragments`.
+///
+/// A `None` scope preserves the unscoped behavior for that dimension. UUID selection happens
+/// before any segment is opened.
+pub async fn open_scalar_index_segments(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+    fragments: Option<&RoaringBitmap>,
+    segment_uuids: Option<&HashSet<uuid::Uuid>>,
+    metrics: &dyn MetricsCollector,
+) -> Result<Arc<dyn ScalarIndex>> {
+    let mut indices = load_named_scalar_segments(dataset, column, index_name).await?;
+    if let Some(segment_uuids) = segment_uuids {
+        indices.retain(|index| segment_uuids.contains(&index.uuid));
+    }
+    if let Some(fragments) = fragments {
+        indices.retain(|index| {
+            index
+                .fragment_bitmap
+                .as_ref()
+                .is_none_or(|coverage| coverage.intersection_len(fragments) > 0)
+        });
+    }
     match indices.len() {
         0 => Err(Error::internal(format!(
             "Scanner created plan for index query on index {} for column {} but no usable index exists with that name",
@@ -348,11 +460,15 @@ pub async fn open_named_scalar_index(
             }))
             .await?;
 
-            Ok(Arc::new(LogicalScalarIndex::try_new(
-                index_name.to_string(),
-                column.to_string(),
-                segments,
-            )?) as Arc<dyn ScalarIndex>)
+            Ok(Arc::new(
+                LogicalScalarIndex::try_new(
+                    dataset,
+                    index_name.to_string(),
+                    column.to_string(),
+                    indices.into_iter().zip(segments).collect(),
+                )
+                .await?,
+            ) as Arc<dyn ScalarIndex>)
         }
     }
 }
@@ -362,24 +478,134 @@ mod tests {
     use std::collections::BTreeSet;
     use std::ops::Bound;
 
-    use arrow::datatypes::Int32Type;
+    use arrow::array::AsArray;
+    use arrow::datatypes::{Int32Type, UInt32Type, UInt64Type};
     use datafusion::scalar::ScalarValue;
+    use futures::TryStreamExt;
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_datagen::array;
+    use lance_datagen::{ArrayGeneratorExt, array};
     use lance_index::IndexType;
     use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::bitmap::BITMAP_LOOKUP_NAME;
-    use lance_index::scalar::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
+    use lance_index::scalar::lookup_schema;
+    use lance_index::scalar::{
+        BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchOptions, SearchResult,
+    };
+    use lance_select::{RowAddrTreeMap, RowSetOps};
+    use rstest::rstest;
 
     use crate::Dataset;
+    use crate::dataset::UpdateBuilder;
     use crate::dataset::WriteParams;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::write::WriteMode;
     use crate::index::create::CreateIndexBuilder;
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
 
     use super::*;
+
+    #[rstest::rstest]
+    #[case::legacy_first(false)]
+    #[case::address_first(true)]
+    #[tokio::test]
+    async fn test_staged_btree_row_domains_reject_mixed_logical_view(#[case] reverse: bool) {
+        let dir = copy_test_data_to_tmp("v14.0.0-beta.15/stable_row_id_btree.lance").unwrap();
+        let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        let legacy = dataset.load_indices_by_name("value_idx").await.unwrap();
+        let legacy = legacy
+            .iter()
+            .find(|segment| segment.fragment_bitmap.as_ref().unwrap().contains(0))
+            .unwrap();
+        let legacy_index = dataset
+            .open_scalar_index("value", &legacy.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(!legacy_index.results_are_row_addresses());
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let mut current = Vec::with_capacity(2);
+        for fragment_id in [0, 1] {
+            current.push(
+                dataset
+                    .create_index_builder(&["value"], IndexType::BTree, &params)
+                    .name("value_idx".into())
+                    .replace(true)
+                    .fragments(vec![fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("value_idx", "value", current.clone())
+            .await
+            .unwrap();
+        let current_index = dataset
+            .open_scalar_index("value", &current[1].uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(current_index.results_are_row_addresses());
+
+        let mut segments = vec![
+            (legacy.clone(), legacy_index),
+            (current[1].clone(), current_index),
+        ];
+        if reverse {
+            segments.reverse();
+        }
+        let error =
+            LogicalScalarIndex::try_new(&dataset, "value_idx".into(), "value".into(), segments)
+                .await
+                .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("mixes row-ID and row-address"));
+    }
+
+    /// A legacy row-id segment still maps a value to a row that an update moved
+    /// out of its fragments, keeping its stable row id. Lookup, like search, must
+    /// not report that row for its old value.
+    #[tokio::test]
+    async fn test_lookup_drops_rows_moved_out_of_legacy_row_id_segments() {
+        let dir = copy_test_data_to_tmp("v14.0.0-beta.15/stable_row_id_btree.lance").unwrap();
+        let dataset = Dataset::open(&dir.path_str()).await.unwrap();
+        let dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("value = 9")
+            .unwrap()
+            .set("value", "100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+
+        let logical =
+            open_named_scalar_index(&dataset, "value", "value_idx", &NoOpMetricsCollector)
+                .await
+                .unwrap();
+        assert!(!logical.results_are_row_addresses());
+        let keys = Arc::new(arrow_array::Int32Array::from(vec![9, 10]));
+        let batches: Vec<RecordBatch> = logical
+            .lookup(keys, &NoOpMetricsCollector)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let key_indices = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<UInt32Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(key_indices, vec![1]);
+    }
 
     #[tokio::test]
     async fn test_open_named_scalar_index_uses_all_zonemap_segments() {
@@ -432,7 +658,10 @@ mod tests {
     async fn test_open_named_scalar_index_uses_all_btree_segments() {
         let test_dir = TempStrDir::default();
         let dataset = lance_datagen::gen_batch()
-            .col("value", array::step::<Int32Type>())
+            .col(
+                "value",
+                array::fill::<Int32Type>(7).with_nulls(&[true, false, true, true]),
+            )
             .into_dataset(
                 test_dir.as_str(),
                 FragmentCount::from(4),
@@ -464,6 +693,20 @@ mod tests {
         let committed = dataset.load_indices_by_name("value_btree").await.unwrap();
         assert_eq!(committed.len(), fragments.len());
 
+        let target_fragment = fragments[1].id() as u32;
+        let scope = RoaringBitmap::from_iter([target_fragment]);
+        let scoped = open_scalar_index_segments(
+            &dataset,
+            "value",
+            "value_btree",
+            Some(&scope),
+            None,
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        assert_eq!(scoped.calculate_included_frags().await.unwrap(), scope);
+
         let logical =
             open_named_scalar_index(&dataset, "value", "value_btree", &NoOpMetricsCollector)
                 .await
@@ -474,11 +717,77 @@ mod tests {
             dataset.fragment_bitmap.as_ref().clone()
         );
 
+        let query = SargableQuery::Equals(ScalarValue::Int32(Some(99)));
+        let tracked = logical.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let SearchResult::Exact(tracked) = tracked else {
+            panic!("BTree search should be exact");
+        };
+        assert!(tracked.true_rows().is_empty());
+        assert!(!tracked.null_rows().is_empty());
+
+        let untracked = logical
+            .search_with_options(
+                &query,
+                SearchOptions::default().with_track_nulls(false),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(untracked, SearchResult::exact(RowAddrTreeMap::default()));
+
         let combined_bitmap = scalar_index_fragment_bitmap(&dataset, "value", "value_btree")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(combined_bitmap, dataset.fragment_bitmap.as_ref().clone());
+    }
+
+    #[tokio::test]
+    async fn test_open_scalar_index_segments_keeps_partial_overlap() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_dataset(
+                test_dir.as_str(),
+                FragmentCount::from(4),
+                FragmentRowCount::from(16),
+            )
+            .await
+            .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let fragments = dataset.get_fragments();
+        let mut segments = Vec::with_capacity(2);
+        for pair in fragments.chunks(2) {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::BTree, &params)
+                    .name("value_btree_pairs".to_string())
+                    .fragments(pair.iter().map(|fragment| fragment.id() as u32).collect())
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("value_btree_pairs", "value", segments)
+            .await
+            .unwrap();
+
+        let target_fragment = fragments[1].id() as u32;
+        let scoped = open_scalar_index_segments(
+            &dataset,
+            "value",
+            "value_btree_pairs",
+            Some(&RoaringBitmap::from_iter([target_fragment])),
+            None,
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            scoped.calculate_included_frags().await.unwrap(),
+            RoaringBitmap::from_iter([fragments[0].id() as u32, target_fragment])
+        );
     }
 
     #[tokio::test]
@@ -546,6 +855,95 @@ mod tests {
         assert_eq!(
             searched_fragments.into_iter().collect::<BTreeSet<_>>(),
             BTreeSet::from([1, 2])
+        );
+    }
+
+    #[rstest]
+    #[case::btree(IndexType::BTree, BuiltinIndexType::BTree)]
+    #[case::bitmap(IndexType::Bitmap, BuiltinIndexType::Bitmap)]
+    #[tokio::test]
+    async fn test_segmented_lookup(
+        #[case] index_type: IndexType,
+        #[case] builtin: BuiltinIndexType,
+    ) {
+        let test_dir = TempStrDir::default();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_dataset(
+                test_dir.as_str(),
+                FragmentCount::from(4),
+                FragmentRowCount::from(16),
+            )
+            .await
+            .unwrap();
+        let params = ScalarIndexParams::for_builtin(builtin);
+        let mut segments = Vec::new();
+        for fragment in dataset.get_fragments() {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["value"], index_type, &params)
+                    .name("value_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("value_idx", "value", segments)
+            .await
+            .unwrap();
+        let logical =
+            open_named_scalar_index(&dataset, "value", "value_idx", &NoOpMetricsCollector)
+                .await
+                .unwrap();
+
+        // Keys resolve in whichever segment covers them; one absent.
+        let keys = Arc::new(arrow_array::Int32Array::from(vec![20, 43, 99, 20, 0]));
+        let batches: Vec<RecordBatch> = logical
+            .lookup(keys, &NoOpMetricsCollector)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut pairs = Vec::new();
+        for batch in &batches {
+            assert_eq!(
+                batch.schema(),
+                lookup_schema(logical.results_are_row_addresses())
+            );
+            pairs.extend(
+                batch
+                    .column(0)
+                    .as_primitive::<UInt32Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .zip(
+                        batch
+                            .column(1)
+                            .as_primitive::<UInt64Type>()
+                            .values()
+                            .iter()
+                            .copied(),
+                    ),
+            );
+        }
+        pairs.sort_unstable();
+        let addr = |value: u32| u64::from(RowAddress::new_from_parts(value / 16, value % 16));
+        assert_eq!(
+            pairs,
+            vec![(0, addr(20)), (1, addr(43)), (3, addr(20)), (4, addr(0))]
+        );
+
+        // A segment's error surfaces before any stream is returned.
+        let wrong_type = Arc::new(arrow_array::Int64Array::from(vec![20]));
+        let err = logical
+            .lookup(wrong_type, &NoOpMetricsCollector)
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("lookup keys have type Int64"),
+            "{err}"
         );
     }
 
@@ -1496,6 +1894,224 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ngram_segment_merge_rebuilds_after_deferred_compaction() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "text",
+            arrow_schema::DataType::Utf8,
+            true,
+        )]));
+        let make_batch = |values| {
+            arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::StringArray::from(values))],
+            )
+            .unwrap()
+        };
+        let reader = arrow_array::RecordBatchIterator::new(
+            vec![Ok(make_batch(vec![Some("alpha needle"), None]))],
+            schema.clone(),
+        );
+        Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let appended = arrow_array::RecordBatchIterator::new(
+            vec![Ok(make_batch(vec![
+                Some("beta needle"),
+                Some("gamma stack"),
+            ]))],
+            schema.clone(),
+        );
+        let mut dataset = Dataset::write(
+            appended,
+            test_dir.as_str(),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
+        let mut segments = Vec::new();
+        for fragment in dataset.get_fragments() {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::NGram, &params)
+                    .name("text_ngram".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let source_version = segments[0].dataset_version;
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::NGram,
+                Some("compaction_guard".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 10,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(metrics.fragments_removed > 0 && metrics.fragments_added > 0);
+        assert!(dataset.version().version > source_version);
+
+        let direct_commit_err = dataset
+            .commit_existing_index_segments("text_ngram_direct", "text", segments.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            direct_commit_err
+                .to_string()
+                .contains("must be rebuilt or merged")
+        );
+
+        let rebuild_version = dataset.version().version;
+        let merged = dataset
+            .merge_existing_index_segments(segments)
+            .await
+            .unwrap();
+        assert_eq!(merged.dataset_version, rebuild_version);
+        dataset
+            .commit_existing_index_segments("text_ngram", "text", vec![merged])
+            .await
+            .unwrap();
+
+        let committed = dataset.load_indices_by_name("text_ngram").await.unwrap();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].dataset_version, rebuild_version);
+        assert_eq!(
+            committed[0].fragment_bitmap.as_ref().unwrap(),
+            dataset.fragment_bitmap.as_ref()
+        );
+
+        let logical =
+            open_named_scalar_index(&dataset, "text", "text_ngram", &NoOpMetricsCollector)
+                .await
+                .unwrap();
+        let result = logical
+            .search(
+                &lance_index::scalar::TextQuery::StringContains("needle".to_string()),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let row_addrs = match result {
+            SearchResult::AtMost(row_addrs) => row_addrs,
+            other => panic!("expected AtMost result from ngram, got {other:?}"),
+        };
+        assert_eq!(row_addrs.true_rows().row_addrs().unwrap().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_ngram_segment_merge_rejects_retired_coverage_without_remap() {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "text",
+            arrow_schema::DataType::Utf8,
+            true,
+        )]));
+        let make_batch = |values| {
+            arrow_array::RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(arrow_array::StringArray::from(values))],
+            )
+            .unwrap()
+        };
+        let reader = arrow_array::RecordBatchIterator::new(
+            vec![Ok(make_batch(vec!["alpha", "beta"]))],
+            schema.clone(),
+        );
+        Dataset::write(
+            reader,
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let appended = arrow_array::RecordBatchIterator::new(
+            vec![Ok(make_batch(vec!["gamma", "delta"]))],
+            schema,
+        );
+        let mut dataset = Dataset::write(
+            appended,
+            test_dir.as_str(),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::NGram);
+        let mut segments = Vec::new();
+        for fragment in dataset.get_fragments() {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::NGram, &params)
+                    .name("text_ngram".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 10,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let direct_err = dataset
+            .commit_existing_index_segments("text_ngram", "text", segments.clone())
+            .await
+            .unwrap_err();
+        assert!(direct_err.to_string().contains("must be rebuilt or merged"));
+
+        let merge_err = dataset
+            .merge_existing_index_segments(segments)
+            .await
+            .unwrap_err();
+        assert!(
+            merge_err
+                .to_string()
+                .contains("no applicable fragment-reuse mapping is available")
+        );
+    }
+
+    #[tokio::test]
     async fn test_fmindex_merge_single_segment_passthrough() {
         let test_dir = TempStrDir::default();
 
@@ -1677,5 +2293,199 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1]
         );
+    }
+
+    /// Legacy storage counts through MaterializeIndexExec. Deleting the unselected
+    /// segment directory must still leave the selected segment countable.
+    #[tokio::test]
+    async fn legacy_storage_count_opens_only_selected_segment() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_dataset_with_params(
+                test_dir.as_str(),
+                FragmentCount::from(2),
+                FragmentRowCount::from(4),
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    data_storage_version: Some(lance_file::version::LanceFileVersion::Legacy),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.manifest.data_storage_format.lance_file_format(),
+            lance_file::version::ConcreteFileVersion::V1
+        );
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let fragment_ids: Vec<u32> = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect();
+        let mut segments = Vec::new();
+        for fragment_id in &fragment_ids {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["i"], IndexType::BTree, &params)
+                    .name("i_idx".to_string())
+                    .fragments(vec![*fragment_id])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("i_idx", "i", segments)
+            .await
+            .unwrap();
+        let committed = dataset.load_indices_by_name("i_idx").await.unwrap();
+        let selected = committed[0].uuid;
+        let omitted = committed[1].uuid;
+        assert_eq!(
+            dataset
+                .count_indexed_rows("i_idx", "i >= 0", Some(&[selected]), None)
+                .await
+                .unwrap(),
+            4
+        );
+
+        let omitted_dir = std::path::Path::new(test_dir.as_str())
+            .join("_indices")
+            .join(omitted.to_string());
+        assert!(omitted_dir.is_dir(), "{}", omitted_dir.display());
+        std::fs::remove_dir_all(&omitted_dir).unwrap();
+        drop(dataset);
+
+        let dataset = Dataset::open(test_dir.as_str()).await.unwrap();
+        assert_eq!(
+            dataset
+                .count_indexed_rows("i_idx", "i >= 0", Some(&[selected]), None)
+                .await
+                .unwrap(),
+            4
+        );
+        dataset
+            .count_indexed_rows("i_idx", "i >= 0", Some(&[omitted]), None)
+            .await
+            .unwrap_err();
+    }
+
+    /// Rows matching `filter`; asserts the plan uses the scalar index iff `use_index`.
+    async fn count(dataset: &Dataset, filter: &str, use_index: bool) -> usize {
+        let mut scan = dataset.scan();
+        scan.project(&["id"])
+            .unwrap()
+            .use_scalar_index(use_index)
+            .filter(filter)
+            .unwrap();
+        let plan = scan.explain_plan(true).await.unwrap();
+        assert_eq!(plan.contains("ScalarIndexQuery"), use_index, "{plan}");
+        scan.try_into_batch().await.unwrap().num_rows()
+    }
+
+    /// An update moves the row with `id = 0` to a new fragment (keeping its row id) and an
+    /// append-only optimize gives that fragment its own segment, so the old segment still
+    /// maps `id = 0` to the moved row. That stale posting must not be reported. On a
+    /// stable-row-id dataset, Bitmap, BTree and zone map hits are all row addresses, so none
+    /// of them must be restricted by the row-id mask.
+    #[rstest]
+    #[case::bitmap(IndexType::Bitmap, BuiltinIndexType::Bitmap, true)]
+    #[case::btree(IndexType::BTree, BuiltinIndexType::BTree, true)]
+    #[case::zone_map(IndexType::ZoneMap, BuiltinIndexType::ZoneMap, true)]
+    #[tokio::test]
+    async fn stale_posting_after_update_with_stable_row_ids(
+        #[case] index_type: IndexType,
+        #[case] builtin: BuiltinIndexType,
+        #[case] row_addresses: bool,
+    ) {
+        let dir = TempStrDir::default();
+        let batch =
+            arrow_array::record_batch!(("id", UInt32, (0..256u32).collect::<Vec<_>>())).unwrap();
+        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let params = WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, dir.as_str(), Some(params))
+            .await
+            .unwrap();
+        let index_params = ScalarIndexParams::for_builtin(builtin);
+        dataset
+            .create_index(
+                &["id"],
+                index_type,
+                Some("id_idx".into()),
+                &index_params,
+                true,
+            )
+            .await
+            .unwrap();
+        let segments = dataset.load_indices_by_name("id_idx").await.unwrap();
+        assert_eq!(segments[0].results_are_row_addrs(), row_addresses);
+        assert_eq!(count(&dataset, "id = 0", true).await, 1);
+
+        let mut dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id = 0")
+            .unwrap()
+            .set("id", "1000")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset
+            .as_ref()
+            .clone();
+        assert_eq!(count(&dataset, "id = 0", true).await, 0);
+
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.load_indices_by_name("id_idx").await.unwrap().len(),
+            2
+        );
+
+        assert_eq!(count(&dataset, "id = 0", false).await, 0);
+        assert_eq!(count(&dataset, "id = 1000", true).await, 1);
+        assert_eq!(count(&dataset, "id = 0", true).await, 0);
+
+        // Lookup leaves deletions to the caller, so with row-address hits the
+        // stale posting comes back only as the deleted old copy of the row.
+        if index_type != IndexType::ZoneMap {
+            let logical = open_named_scalar_index(&dataset, "id", "id_idx", &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            assert!(logical.results_are_row_addresses());
+            let keys = Arc::new(arrow_array::UInt32Array::from(vec![0, 1000]));
+            let batches: Vec<RecordBatch> = logical
+                .lookup(keys, &NoOpMetricsCollector)
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let mut matches = Vec::new();
+            for batch in &batches {
+                let key_indices = batch.column(0).as_primitive::<UInt32Type>();
+                let rows = batch.column(1).as_primitive::<UInt64Type>();
+                for (key_index, row) in key_indices.values().iter().zip(rows.values()) {
+                    let row = RowAddress::from(*row);
+                    let deleted = dataset
+                        .get_fragment(row.fragment_id() as usize)
+                        .unwrap()
+                        .get_deletion_vector()
+                        .await
+                        .unwrap()
+                        .is_some_and(|deletions| deletions.contains(row.row_offset()));
+                    matches.push((*key_index, deleted));
+                }
+            }
+            matches.sort_unstable();
+            assert_eq!(matches, vec![(0, true), (1, false)]);
+        }
     }
 }

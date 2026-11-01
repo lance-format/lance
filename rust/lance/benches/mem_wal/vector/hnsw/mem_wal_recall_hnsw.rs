@@ -15,7 +15,6 @@
 //!       truth) vs HNSW top-k via `MemTableScanner::nearest`.
 //!     * Recall@k = |brute ∩ hnsw| / k aggregated over queries.
 
-#![recursion_limit = "256"]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::sync::Arc;
@@ -275,7 +274,7 @@ fn make_batch(start_id: i64, vectors: &[f32], schema: Arc<ArrowSchema>) -> Recor
 }
 
 fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
-    DistanceType::Cosine.func()(a, b)
+    DistanceType::Cosine.try_func().unwrap()(a, b)
 }
 
 fn brute_force_top_k(corpus: &[f32], n: usize, query: &[f32], k: usize) -> Vec<(f32, i64)> {
@@ -355,7 +354,7 @@ async fn run_checkpoint(
     let temp = tempfile::tempdir().map_err(|e| lance_core::Error::io(format!("tempdir: {}", e)))?;
     // When BENCH_URI_BASE is set, write to a persistent path and flush the
     // MemTable to an on-disk generation (instead of querying the active
-    // MemTable), printing the flushed generation's dataset path for a
+    // MemTable), printing the SSTable's dataset path for a
     // downstream direct-read benchmark.
     let flush_base = std::env::var("BENCH_URI_BASE").ok();
     let local_dir = flush_base.as_ref().map(|b| format!("{}/cp_{}", b, cp));
@@ -440,18 +439,23 @@ async fn run_checkpoint(
     use std::io::Write;
     std::io::stdout().flush().ok();
 
-    // Flush mode: seal the active MemTable to a persistent on-disk generation
+    // Flush mode: freeze the active MemTable to a persistent on-disk generation
     // (single-partition IVF_HNSW_SQ at the base dataset's storage version) and
     // print its dataset path. Validates we can flush cp=100k/500k/1M.
     if let Some(dir) = &local_dir {
-        let seal_start = Instant::now();
-        writer.force_seal_active().await?;
+        let freeze_start = Instant::now();
+        writer.force_freeze_active().await?;
         let mut waited = 0u64;
         let gen_path = loop {
             if let Some(m) = writer.manifest().await?
-                && let Some(fg) = m.flushed_generations.last()
+                && let Some(sstable) = m.sstables.last()
             {
-                break format!("{}/_mem_wal/{}/{}", dir, shard_id.as_hyphenated(), fg.path);
+                break format!(
+                    "{}/_mem_wal/{}/{}",
+                    dir,
+                    shard_id.as_hyphenated(),
+                    sstable.path
+                );
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
             waited += 1;
@@ -466,16 +470,16 @@ async fn run_checkpoint(
             }
         };
         println!(
-            "FLUSHED_OK cp={} id_offset={} flush_s={:.2} path={}",
+            "SSTABLE_OK cp={} id_offset={} flush_s={:.2} path={}",
             cp,
             id_offset,
-            seal_start.elapsed().as_secs_f64(),
+            freeze_start.elapsed().as_secs_f64(),
             gen_path
         );
         std::io::stdout().flush().ok();
         writer.close().await?;
 
-        // Item 4: open the flushed generation directly from its dataset path and
+        // Item 4: open the SSTable directly from its dataset path and
         // benchmark its on-disk IVF_HNSW_SQ read in Rust (single-thread per-query
         // latency + recall vs brute force), sweeping ef. nprobes=1 (single part).
         let gen_uri = format!("file://{}", gen_path);
@@ -525,7 +529,7 @@ async fn run_checkpoint(
             let p99_q = lat[lat.len() * 99 / 100];
             let mean_recall = recall_sum / num_queries as f64;
             println!(
-                "FLUSHED_READ cp={} ef={} mean_recall={:.4} median_us={} p99_us={}",
+                "SSTABLE_READ cp={} ef={} mean_recall={:.4} median_us={} p99_us={}",
                 cp, ef, mean_recall, median_q, p99_q
             );
             std::io::stdout().flush().ok();
@@ -536,13 +540,13 @@ async fn run_checkpoint(
 
         // Raw-index path: call VectorIndex::search() directly (partition-find +
         // HNSW+SQ search, returns _rowid/_distance) bypassing the DataFusion
-        // scanner/take/projection. The RAW_READ vs FLUSHED_READ latency delta at
+        // scanner/take/projection. The RAW_READ vs SSTABLE_READ latency delta at
         // matched ef isolates the DataFusion per-query overhead from the actual
         // index search cost.
         let idx_metas = gen_ds.load_indices_by_name(VECTOR_INDEX_NAME).await?;
         let uuid = idx_metas
             .first()
-            .ok_or_else(|| lance_core::Error::io("flushed gen has no vector index".to_string()))?
+            .ok_or_else(|| lance_core::Error::io("SSTable has no vector index".to_string()))?
             .uuid;
         let vidx = gen_ds
             .open_vector_index(VECTOR_COL, &uuid, &NoOpMetricsCollector)
@@ -584,6 +588,7 @@ async fn run_checkpoint(
                     upper_bound: None,
                     minimum_nprobes: 1,
                     maximum_nprobes: Some(1),
+                    search_effort: 0.5,
                     ef: Some(ef),
                     refine_factor: None,
                     metric_type: Some(DistanceType::Cosine),
@@ -594,7 +599,7 @@ async fn run_checkpoint(
                 };
                 // IVFIndex::search is intentionally unimplemented (top-level does
                 // partition-aware search); replicate the ANN exec node: pick the
-                // closest partition then search it. Single-partition flushed gen.
+                // closest partition then search it. Single-partition SSTable.
                 let t = Instant::now();
                 let (parts, _) = vidx.find_partitions(&query)?;
                 let pid = parts.value(0) as usize;

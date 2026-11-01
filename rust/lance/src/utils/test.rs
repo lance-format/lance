@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use lance_core::utils::tempfile::{TempDir, TempStrDir};
 
@@ -12,7 +13,12 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
 use lance_datagen::{BatchCount, BatchGeneratorBuilder, ByteCount, RowCount};
 use lance_file::version::LanceFileVersion;
-use lance_table::format::Fragment;
+use lance_table::format::pb::transaction::Operation as PbOperation;
+use lance_table::format::{Fragment, Transaction as TableTransaction};
+use lance_table::io::commit::{
+    CommitError, CommitHandler, ConditionalPutCommitHandler, ManifestLocation,
+    ManifestNamingScheme, ManifestWriter,
+};
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
 
@@ -21,7 +27,9 @@ use crate::dataset::WriteParams;
 use crate::dataset::fragment::write::FragmentCreateBuilder;
 use crate::dataset::transaction::Operation;
 
+pub mod covering;
 mod failing_store;
+pub mod serializing_cache;
 mod throttle_store;
 
 pub use failing_store::FailingProxyStore;
@@ -249,6 +257,8 @@ impl TestDatasetGenerator {
             physical_rows: Some(batch.num_rows()),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 }
@@ -525,6 +535,90 @@ pub async fn assert_plan_node_equals(
     assert_string_matches(&raw_plan_desc, raw_expected)
 }
 
+/// Fragment reuse versions over fragments no dataset has, to size a stored history
+/// without compacting that much data.
+pub fn padding_reuse_versions(count: u64) -> Vec<lance_index::frag_reuse::FragReuseVersion> {
+    use lance_index::frag_reuse::{FragDigest, FragReuseGroup, FragReuseVersion};
+    let digest = |id: u64| FragDigest {
+        id,
+        physical_rows: 4,
+        num_deleted_rows: 0,
+    };
+    (0..count)
+        .map(|i| {
+            let old_id = 1_000 + i;
+            let mut changed_row_addrs = Vec::new();
+            roaring::RoaringTreemap::from_iter((old_id << 32)..(old_id << 32) + 4)
+                .serialize_into(&mut changed_row_addrs)
+                .unwrap();
+            FragReuseVersion {
+                dataset_version: 1,
+                groups: vec![FragReuseGroup {
+                    changed_row_addrs,
+                    old_frags: vec![digest(old_id)],
+                    new_frags: vec![digest(100_000 + i)],
+                }],
+            }
+        })
+        .collect()
+}
+
+/// Commits `count` padding versions as the dataset's fragment reuse history.
+pub async fn commit_padding_reuse_history(
+    dataset: &mut Dataset,
+    count: usize,
+) -> lance_table::format::IndexMetadata {
+    use crate::index::frag_reuse::build_frag_reuse_index_metadata;
+    let details = lance_index::frag_reuse::FragReuseIndexDetails {
+        versions: padding_reuse_versions(count as u64),
+    };
+    let new_fragments = (0..count as u32).map(|i| 100_000 + i).collect();
+    let entry = build_frag_reuse_index_metadata(dataset, None, details, new_fragments)
+        .await
+        .unwrap();
+    dataset
+        .apply_commit(
+            crate::dataset::transaction::Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![entry.clone()],
+                    removed_indices: vec![],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    entry
+}
+
+/// The most padding versions whose details still fit inline.
+pub fn inline_padding_capacity() -> usize {
+    use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
+    use prost::Message;
+    let versions = padding_reuse_versions(5_000);
+    let fits = |count: usize| {
+        InlineContent::from(&lance_index::frag_reuse::FragReuseIndexDetails {
+            versions: versions[..count].to_vec(),
+        })
+        .encoded_len()
+            <= 204_800
+    };
+    let (mut low, mut high) = (0, versions.len());
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        if fits(mid) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    assert!(low < versions.len());
+    low
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -633,17 +727,8 @@ mod tests {
                 .flat_map(|file| file.fields.iter())
                 .cloned()
                 .collect::<Vec<_>>();
-            let mut field_ids = schema
-                .fields_pre_order()
-                .filter_map(|f| {
-                    if data_storage_version < LanceFileVersion::V2_1 || f.children.is_empty() {
-                        Some(f.id)
-                    } else {
-                        // In 2.1+, struct / list fields don't have their own column
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
+            let (mut field_ids, _) =
+                lance_file::versions::data_file_columns(data_storage_version.resolve(), &schema);
             field_ids_frags.sort_unstable();
             field_ids.sort_unstable();
             assert_eq!(field_ids_frags, field_ids);
@@ -727,6 +812,412 @@ mod tests {
     impl<'a> From<&'a TempStrDir> for WriteDestination<'a> {
         fn from(value: &'a TempStrDir) -> Self {
             WriteDestination::Uri(value.as_str())
+        }
+    }
+}
+
+/// How [`AmbiguousCommitHandler`] should treat the next commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmbiguousFailure {
+    /// Apply the commit (the manifest lands), then report a conflict — the
+    /// store equivalent of a successful conditional PUT whose response was
+    /// lost and whose internal retry saw "already exists".
+    LandAndConflict,
+    /// Apply the commit, then report an I/O error.
+    LandAndError,
+    /// Do not apply the commit; report an I/O error.
+    FailOutright,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AmbiguousFailureTarget {
+    Any,
+    Rewrite,
+    ReserveFragments,
+}
+
+/// A commit handler for tests that can make a commit physically land while
+/// reporting a failure, and can make commit-outcome verification unavailable.
+///
+/// Delegates real work to [`ConditionalPutCommitHandler`].
+#[derive(Debug)]
+pub struct AmbiguousCommitHandler {
+    /// Failure to inject into the next commit; taken (reset to `None`) when
+    /// the commit runs.
+    fail_next_commit: Mutex<Option<(AmbiguousFailure, AmbiguousFailureTarget)>>,
+    /// When set, version resolution fails, making commit-outcome verification
+    /// impossible.
+    pub fail_resolve: AtomicBool,
+    /// Number of upcoming resolution calls that should return NotFound.
+    resolve_not_found_remaining: AtomicUsize,
+    /// Whether a persistent NotFound proves that the requested version is
+    /// absent. Tests can disable this to model an eventually visible resolver.
+    not_found_is_definitive: AtomicBool,
+    /// Number of version resolutions requested (a proxy for how often commit
+    /// verification ran).
+    resolve_calls: AtomicUsize,
+}
+
+impl Default for AmbiguousCommitHandler {
+    fn default() -> Self {
+        Self {
+            fail_next_commit: Mutex::new(None),
+            fail_resolve: AtomicBool::new(false),
+            resolve_not_found_remaining: AtomicUsize::new(0),
+            not_found_is_definitive: AtomicBool::new(true),
+            resolve_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl AmbiguousCommitHandler {
+    pub fn fail_next(&self, failure: AmbiguousFailure) {
+        *self.fail_next_commit.lock().unwrap() = Some((failure, AmbiguousFailureTarget::Any));
+    }
+
+    /// Arm the failure for the next Rewrite commit only.
+    pub fn fail_next_rewrite(&self, failure: AmbiguousFailure) {
+        *self.fail_next_commit.lock().unwrap() = Some((failure, AmbiguousFailureTarget::Rewrite));
+    }
+
+    /// Arm the failure for the next ReserveFragments commit only.
+    pub fn fail_next_reserve(&self, failure: AmbiguousFailure) {
+        *self.fail_next_commit.lock().unwrap() =
+            Some((failure, AmbiguousFailureTarget::ReserveFragments));
+    }
+
+    pub fn fail_next_resolves_with_not_found(&self, count: usize) {
+        self.resolve_not_found_remaining
+            .store(count, Ordering::SeqCst);
+        self.not_found_is_definitive.store(false, Ordering::SeqCst);
+    }
+
+    pub fn resolve_calls(&self) -> usize {
+        self.resolve_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl CommitHandler for AmbiguousCommitHandler {
+    fn is_version_not_found_definitive(&self) -> bool {
+        self.not_found_is_definitive.load(Ordering::SeqCst)
+    }
+
+    fn propagate_commit_error_after_success(&self) -> bool {
+        false
+    }
+
+    async fn commit(
+        &self,
+        manifest: &mut lance_table::format::Manifest,
+        indices: Option<Vec<lance_table::format::IndexMetadata>>,
+        base_path: &object_store::path::Path,
+        object_store: &lance_io::object_store::ObjectStore,
+        manifest_writer: ManifestWriter,
+        naming_scheme: ManifestNamingScheme,
+        transaction: Option<TableTransaction>,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        let operation = transaction
+            .as_ref()
+            .and_then(|t| t.as_pb().operation.as_ref())
+            .map(|operation| match operation {
+                PbOperation::Rewrite(_) => AmbiguousFailureTarget::Rewrite,
+                PbOperation::ReserveFragments(_) => AmbiguousFailureTarget::ReserveFragments,
+                _ => AmbiguousFailureTarget::Any,
+            });
+        let failure = {
+            let mut armed = self.fail_next_commit.lock().unwrap();
+            let matches_target = armed.as_ref().is_some_and(|(_, target)| {
+                *target == AmbiguousFailureTarget::Any || operation == Some(*target)
+            });
+            matches_target.then(|| armed.take().unwrap().0)
+        };
+        match failure {
+            None => {
+                ConditionalPutCommitHandler
+                    .commit(
+                        manifest,
+                        indices,
+                        base_path,
+                        object_store,
+                        manifest_writer,
+                        naming_scheme,
+                        transaction,
+                    )
+                    .await
+            }
+            Some(AmbiguousFailure::LandAndConflict) => {
+                ConditionalPutCommitHandler
+                    .commit(
+                        manifest,
+                        indices,
+                        base_path,
+                        object_store,
+                        manifest_writer,
+                        naming_scheme,
+                        transaction,
+                    )
+                    .await?;
+                Err(CommitError::CommitConflict)
+            }
+            Some(AmbiguousFailure::LandAndError) => {
+                ConditionalPutCommitHandler
+                    .commit(
+                        manifest,
+                        indices,
+                        base_path,
+                        object_store,
+                        manifest_writer,
+                        naming_scheme,
+                        transaction,
+                    )
+                    .await?;
+                Err(CommitError::OtherError(lance_core::Error::io(
+                    "simulated ambiguous commit failure",
+                )))
+            }
+            Some(AmbiguousFailure::FailOutright) => Err(CommitError::OtherError(
+                lance_core::Error::io("simulated outright commit failure"),
+            )),
+        }
+    }
+
+    async fn resolve_version_location(
+        &self,
+        base_path: &object_store::path::Path,
+        version: u64,
+        object_store: &dyn object_store::ObjectStore,
+    ) -> lance_core::Result<ManifestLocation> {
+        self.resolve_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_resolve.load(Ordering::SeqCst) {
+            return Err(lance_core::Error::io("simulated verification outage"));
+        }
+        let mut remaining = self.resolve_not_found_remaining.load(Ordering::SeqCst);
+        while remaining > 0 {
+            match self.resolve_not_found_remaining.compare_exchange_weak(
+                remaining,
+                remaining - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return Err(lance_core::Error::not_found(
+                        "simulated temporarily invisible manifest",
+                    ));
+                }
+                Err(actual) => remaining = actual,
+            }
+        }
+        ConditionalPutCommitHandler
+            .resolve_version_location(base_path, version, object_store)
+            .await
+    }
+}
+
+/// One uncommitted scalar index segment per named fragment.
+pub async fn stage_index_segments(
+    dataset: &mut Dataset,
+    column: &str,
+    index_type: lance_index::IndexType,
+    params: &lance_index::scalar::ScalarIndexParams,
+    name: &str,
+    fragment_ids: Vec<u32>,
+) -> Vec<lance_table::format::IndexMetadata> {
+    use crate::index::DatasetIndexExt;
+
+    let mut staged = Vec::with_capacity(fragment_ids.len());
+    for fragment_id in fragment_ids {
+        staged.push(
+            dataset
+                .create_index_builder(&[column], index_type, params)
+                .name(name.to_string())
+                .fragments(vec![fragment_id])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    staged
+}
+
+/// Rewrites the fragments `fragment_ids` names into two through one
+/// distributed compaction task, deferring the index remap, so that the
+/// fragment reuse history records both outputs as produced from every one of
+/// them. Returns the outputs' ids.
+pub async fn compact_into_two(dataset: &mut Dataset, fragment_ids: &[u64]) -> Vec<u64> {
+    use crate::dataset::index::DatasetIndexRemapperOptions;
+    use crate::dataset::optimize::{
+        CompactionOptions, CompactionTask, TaskData, commit_compaction,
+    };
+
+    let ids_before = dataset
+        .manifest
+        .fragments
+        .iter()
+        .map(|fragment| fragment.id)
+        .collect::<Vec<_>>();
+    let fragments = dataset
+        .manifest
+        .fragments
+        .iter()
+        .filter(|fragment| fragment_ids.contains(&fragment.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let rows = fragments
+        .iter()
+        .map(|fragment| fragment.physical_rows.unwrap())
+        .sum::<usize>();
+    let options = CompactionOptions {
+        target_rows_per_fragment: rows.div_ceil(2),
+        defer_index_remap: true,
+        ..Default::default()
+    };
+    let task = CompactionTask {
+        task: TaskData {
+            fragments,
+            output_clustering_id: None,
+            output_metadata: Default::default(),
+        },
+        read_version: dataset.manifest.version,
+        options: options.clone(),
+    };
+    let rewrite = task.execute(dataset).await.unwrap();
+    assert_eq!(rewrite.new_fragments.len(), 2);
+    commit_compaction(
+        dataset,
+        vec![rewrite],
+        Arc::new(DatasetIndexRemapperOptions::default()),
+        &options,
+    )
+    .await
+    .unwrap();
+    dataset
+        .manifest
+        .fragments
+        .iter()
+        .map(|fragment| fragment.id)
+        .filter(|id| !ids_before.contains(id))
+        .collect()
+}
+
+/// Geometry fixtures shared by the RTree tests.
+#[cfg(feature = "geo")]
+pub mod geo {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use geo_types::line_string;
+    use geoarrow_array::GeoArrowArray;
+    use lance_index::IndexType;
+    use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+    use lance_table::format::IndexMetadata;
+
+    use crate::Dataset;
+    use crate::dataset::WriteParams;
+    use crate::dataset::optimize::CompactionOptions;
+    use crate::index::DatasetIndexExt;
+    use geoarrow_array::builder::LineStringBuilder;
+    use geoarrow_schema::{Dimension, LineStringType};
+
+    pub fn line_string_type() -> LineStringType {
+        LineStringType::new(Dimension::XY, Default::default())
+    }
+
+    /// `rows` diagonal line segments starting at `first`, each one distinct.
+    pub fn line_strings(first: i32, rows: i32) -> ArrayRef {
+        let mut builder = LineStringBuilder::new(line_string_type());
+        for row in 0..rows {
+            let x = (first + row) as f64;
+            builder
+                .push_line_string(Some(&line_string![(x: x, y: x), (x: x + 1.0, y: x + 1.0)]))
+                .unwrap();
+        }
+        builder.finish().to_array_ref()
+    }
+
+    /// `id` and `geometry` batches, one per fragment.
+    pub fn batches(rows_per_fragment: i32, fragments: i32) -> (Arc<ArrowSchema>, Vec<RecordBatch>) {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            line_string_type().to_field("geometry", true),
+        ]));
+        let batches = (0..fragments)
+            .map(|fragment| {
+                let first = fragment * rows_per_fragment;
+                let ids = Int32Array::from_iter_values(first..first + rows_per_fragment);
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(ids), line_strings(first, rows_per_fragment)],
+                )
+                .unwrap()
+            })
+            .collect();
+        (schema, batches)
+    }
+
+    /// Geometry fragments with a committed RTree index, so a deferred
+    /// compaction writes a reuse mapping.
+    pub async fn dataset_with_committed_rtree_index(
+        uri: &str,
+        rows_per_fragment: i32,
+        fragments: i32,
+    ) -> (Dataset, ScalarIndexParams) {
+        let (schema, batches) = batches(rows_per_fragment, fragments);
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(
+            reader,
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: rows_per_fragment as usize,
+                enable_stable_row_ids: false,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), fragments as usize);
+
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::RTree);
+        dataset
+            .create_index(
+                &["geometry"],
+                IndexType::RTree,
+                Some("committed_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        (dataset, params)
+    }
+
+    /// One uncommitted RTree segment per named fragment over `geometry`.
+    pub async fn stage_rtree_segments(
+        dataset: &mut Dataset,
+        params: &ScalarIndexParams,
+        fragment_ids: Vec<u32>,
+    ) -> Vec<IndexMetadata> {
+        super::stage_index_segments(
+            dataset,
+            "geometry",
+            IndexType::RTree,
+            params,
+            "geometry_idx",
+            fragment_ids,
+        )
+        .await
+    }
+
+    /// A compaction with deferred index remap.
+    pub fn deferred_compaction(
+        rows_per_fragment: i32,
+        fragments_per_group: i32,
+    ) -> CompactionOptions {
+        CompactionOptions {
+            target_rows_per_fragment: (rows_per_fragment * fragments_per_group) as usize,
+            defer_index_remap: true,
+            ..Default::default()
         }
     }
 }

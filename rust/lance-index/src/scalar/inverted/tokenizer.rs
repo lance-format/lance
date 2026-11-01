@@ -19,6 +19,7 @@ use jieba::JiebaTokenizerBuilder;
 use lindera::LinderaTokenizerBuilder;
 
 use crate::pbold;
+use crate::pbold::inverted_index_details::DocumentGranularity as PbDocumentGranularity;
 use crate::scalar::inverted::tokenizer::document_tokenizer::{
     JsonTokenizer, LanceTokenizer, TextTokenizer,
 };
@@ -44,9 +45,71 @@ pub const DEFAULT_BLOCK_SIZE: usize = 128;
 pub const VALID_BLOCK_SIZES: [usize; 2] = [128, 256];
 const LANCE_FTS_FORMAT_VERSION_ENV_KEY: &str = "LANCE_FTS_FORMAT_VERSION";
 
+/// The unit treated as one logical full-text-search document.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentGranularity {
+    /// All text selected from one dataset row belongs to one document.
+    #[default]
+    Row,
+    /// Each element of the deepest list on the field path is one document.
+    ListElement,
+}
+
+impl DocumentGranularity {
+    /// Whether results identify a list element within the dataset row.
+    pub fn is_list_element(self) -> bool {
+        self == Self::ListElement
+    }
+}
+
+impl TryFrom<&str> for DocumentGranularity {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "row" => Ok(Self::Row),
+            "list_element" => Ok(Self::ListElement),
+            _ => Err(Error::invalid_input(format!(
+                "unknown FTS document granularity '{value}'; expected 'row' or 'list_element'"
+            ))),
+        }
+    }
+}
+
+impl TryFrom<i32> for DocumentGranularity {
+    type Error = Error;
+
+    fn try_from(value: i32) -> Result<Self> {
+        match PbDocumentGranularity::try_from(value) {
+            Ok(PbDocumentGranularity::Row) => Ok(Self::Row),
+            Ok(PbDocumentGranularity::ListElement) => Ok(Self::ListElement),
+            Err(_) => Err(Error::invalid_input(format!(
+                "unknown FTS document granularity value {value}"
+            ))),
+        }
+    }
+}
+
+impl From<DocumentGranularity> for PbDocumentGranularity {
+    fn from(value: DocumentGranularity) -> Self {
+        match value {
+            DocumentGranularity::Row => Self::Row,
+            DocumentGranularity::ListElement => Self::ListElement,
+        }
+    }
+}
+
 /// Tokenizer configs
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct InvertedIndexParams {
+    /// The logical document boundary used while creating an index.
+    ///
+    /// This is persisted in `InvertedIndexDetails`, not in the tokenizer
+    /// params stored inside the physical index. Creation JSON adds it back
+    /// explicitly in [`Self::to_training_json`].
+    #[serde(default, skip_serializing)]
+    pub(crate) document_granularity: DocumentGranularity,
     /// Document-level tokenizer.
     ///
     /// This decides how Lance extracts searchable text from the stored value:
@@ -177,6 +240,7 @@ pub struct InvertedIndexParams {
 struct RawInvertedIndexParams {
     // Input-only preset expanded before constructing normalized params.
     analyzer: Option<String>,
+    document_granularity: Option<DocumentGranularity>,
     lance_tokenizer: Option<String>,
     base_tokenizer: Option<String>,
     language: Option<Language>,
@@ -271,11 +335,14 @@ impl RawInvertedIndexParams {
             _ => unreachable!("analyzer is normalized above"),
         };
 
+        if let Some(document_granularity) = self.document_granularity {
+            params.document_granularity = document_granularity;
+        }
         if let Some(lance_tokenizer) = self.lance_tokenizer {
             params.lance_tokenizer = Some(lance_tokenizer);
         }
         if let Some(base_tokenizer) = self.base_tokenizer {
-            params.base_tokenizer = base_tokenizer;
+            params = params.base_tokenizer(base_tokenizer);
         }
         if let Some(language) = self.language {
             params.language = language;
@@ -358,6 +425,8 @@ impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
                     index_operators: params.index_operators,
                 },
             ),
+            document_granularity: PbDocumentGranularity::from(params.document_granularity) as i32,
+            posting_format_version: Some(params.resolved_format_version().index_version()),
         })
     }
 }
@@ -372,13 +441,18 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             ));
         }
         if details.base_tokenizer.is_none() && details.language.is_empty() {
-            let params = Self {
+            let mut params = Self {
                 block_size: match details.block_size {
                     Some(block_size) => validate_block_size(block_size as usize)?,
                     None => LEGACY_BLOCK_SIZE,
                 },
                 ..Self::default()
             };
+            params.document_granularity = details.document_granularity.try_into()?;
+            params.format_version = details
+                .posting_format_version
+                .map(|version| resolve_fts_format_version(Some(&version.to_string())))
+                .transpose()?;
             return Ok(params);
         }
 
@@ -419,6 +493,11 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             }
             params.index_operators = code_config.index_operators;
         }
+        params.document_granularity = details.document_granularity.try_into()?;
+        params.format_version = details
+            .posting_format_version
+            .map(|version| resolve_fts_format_version(Some(&version.to_string())))
+            .transpose()?;
         params.validate()?;
         Ok(params)
     }
@@ -554,6 +633,7 @@ impl InvertedIndexParams {
     /// Default to `English`.
     pub fn new(base_tokenizer: String, language: Language) -> Self {
         let mut params = Self {
+            document_granularity: DocumentGranularity::Row,
             lance_tokenizer: None,
             base_tokenizer,
             language,
@@ -576,8 +656,10 @@ impl InvertedIndexParams {
             num_workers: None,
             format_version: None,
         };
-        if params.base_tokenizer == "code" {
-            params.apply_code_defaults();
+        match params.base_tokenizer.as_str() {
+            "code" => params.apply_code_defaults(),
+            "ngram" => params.apply_ngram_defaults(),
+            _ => {}
         }
         params
     }
@@ -604,6 +686,12 @@ impl InvertedIndexParams {
         self.stem = false;
         self.remove_stop_words = false;
         self.index_operators = false;
+    }
+
+    fn apply_ngram_defaults(&mut self) {
+        self.base_tokenizer = "ngram".to_string();
+        self.stem = false;
+        self.remove_stop_words = false;
     }
 
     /// Create parameters for the code analyzer profile.
@@ -645,14 +733,86 @@ impl InvertedIndexParams {
         Ok(self)
     }
 
+    /// Whether `self` and `other` tokenize text identically.
+    ///
+    /// Compares only the fields that affect how documents are turned into tokens
+    /// (tokenizer, language, casing, stemming, stop words, n-gram bounds,
+    /// code-analyzer splitting, ...). Storage/layout and build-time fields
+    /// (`with_position`, `block_size`, worker/memory/format settings) are ignored:
+    /// two columns can differ there yet still be safe to combine in a
+    /// `combined_fields` (BM25F) query. Used by cross-field FTS validation.
+    pub(crate) fn same_tokenization(&self, other: &Self) -> bool {
+        // Destructure exhaustively so that adding a new field forces an explicit
+        // decision here about whether it affects tokenization.
+        let Self {
+            lance_tokenizer,
+            base_tokenizer,
+            language,
+            max_token_length,
+            lower_case,
+            stem,
+            remove_stop_words,
+            custom_stop_words,
+            ascii_folding,
+            min_ngram_length,
+            max_ngram_length,
+            prefix_only,
+            // Code-analyzer tokenization options: change the emitted token stream.
+            split_identifiers,
+            split_on_numerics,
+            preserve_original,
+            index_operators,
+            // Not tokenization-affecting (storage/layout/build-time only):
+            with_position: _,
+            block_size: _,
+            memory_limit_mb: _,
+            num_workers: _,
+            format_version: _,
+            // Decides what a document is, not how its text is tokenized. Cross-field
+            // FTS checks it separately because it needs a different answer: the
+            // blend is per row, so a list-element index is rejected outright rather
+            // than merely required to match its siblings.
+            document_granularity: _,
+        } = self;
+        lance_tokenizer == &other.lance_tokenizer
+            && base_tokenizer == &other.base_tokenizer
+            && language == &other.language
+            && max_token_length == &other.max_token_length
+            && lower_case == &other.lower_case
+            && stem == &other.stem
+            && remove_stop_words == &other.remove_stop_words
+            && custom_stop_words == &other.custom_stop_words
+            && ascii_folding == &other.ascii_folding
+            && min_ngram_length == &other.min_ngram_length
+            && max_ngram_length == &other.max_ngram_length
+            && prefix_only == &other.prefix_only
+            && split_identifiers == &other.split_identifiers
+            && split_on_numerics == &other.split_on_numerics
+            && preserve_original == &other.preserve_original
+            && index_operators == &other.index_operators
+    }
+
     pub fn lance_tokenizer(mut self, lance_tokenizer: String) -> Self {
         self.lance_tokenizer = Some(lance_tokenizer);
         self
     }
 
+    /// Set the logical FTS document boundary.
+    pub fn document_granularity(mut self, document_granularity: DocumentGranularity) -> Self {
+        self.document_granularity = document_granularity;
+        self
+    }
+
+    /// Return the logical FTS document boundary.
+    pub fn get_document_granularity(&self) -> DocumentGranularity {
+        self.document_granularity
+    }
+
     /// Set the lexical tokenizer implementation.
     ///
-    /// Setting this to `"code"` selects the code analyzer defaults.
+    /// Setting this to `"code"` selects the code analyzer defaults. Setting
+    /// this to `"ngram"` disables stemming and stop-word removal by default so
+    /// all substring tokens remain searchable.
     ///
     /// # Examples
     ///
@@ -666,8 +826,10 @@ impl InvertedIndexParams {
     /// ```
     pub fn base_tokenizer(mut self, base_tokenizer: String) -> Self {
         self.base_tokenizer = base_tokenizer;
-        if self.base_tokenizer == "code" {
-            self.apply_code_defaults();
+        match self.base_tokenizer.as_str() {
+            "code" => self.apply_code_defaults(),
+            "ngram" => self.apply_ngram_defaults(),
+            _ => {}
         }
         self
     }
@@ -856,9 +1018,22 @@ impl InvertedIndexParams {
         Ok(())
     }
 
+    /// Serialize user-visible params, including logical index identity fields.
+    pub(crate) fn to_details_json(&self) -> serde_json::Result<serde_json::Value> {
+        let mut value = serde_json::to_value(self)?;
+        let object = value
+            .as_object_mut()
+            .expect("inverted index params should serialize to a JSON object");
+        object.insert(
+            "document_granularity".to_string(),
+            serde_json::to_value(self.document_granularity)?,
+        );
+        Ok(value)
+    }
+
     /// Serialize params for the build/training path, including build-only fields.
     pub fn to_training_json(&self) -> serde_json::Result<serde_json::Value> {
-        let mut value = serde_json::to_value(self)?;
+        let mut value = self.to_details_json()?;
         let object = value
             .as_object_mut()
             .expect("inverted index params should serialize to a JSON object");
@@ -887,17 +1062,11 @@ impl InvertedIndexParams {
     /// override and current creation defaults for omitted fields.
     pub(crate) fn from_training_json(params: &str) -> Result<Self> {
         let supplied = serde_json::from_str::<serde_json::Value>(params)?;
-        let mut value = serde_json::to_value(Self::default())?;
-
-        let supplied = supplied.as_object().ok_or_else(|| {
+        supplied.as_object().ok_or_else(|| {
             Error::invalid_input("FTS inverted index params must be a JSON object".to_string())
         })?;
-        let object = value
-            .as_object_mut()
-            .expect("inverted index params should serialize to a JSON object");
-        object.extend(supplied.clone());
 
-        let mut params: Self = serde_json::from_value(value)?;
+        let mut params: Self = serde_json::from_value(supplied)?;
         let default_format_version = params.resolved_format_version();
         params.format_version = Some(resolve_creation_format_version(
             params.format_version,
@@ -927,10 +1096,15 @@ impl InvertedIndexParams {
         }
         let tokenizer = builder.build();
 
-        match self.lance_tokenizer {
-            Some(ref t) if t == "text" => Ok(Box::new(TextTokenizer::new(tokenizer))),
-            Some(ref t) if t == "json" => Ok(Box::new(JsonTokenizer::new(tokenizer))),
-            None => Ok(Box::new(TextTokenizer::new(tokenizer))),
+        match self.lance_tokenizer.as_deref() {
+            Some("text") | None => {
+                let mut tokenizer = TextTokenizer::new(tokenizer);
+                tokenizer.discount_overlaps =
+                    self.base_tokenizer == "code" && self.split_identifiers;
+                tokenizer.has_independent_query_tokens = self.base_tokenizer == "ngram";
+                Ok(Box::new(tokenizer))
+            }
+            Some("json") => Ok(Box::new(JsonTokenizer::new(tokenizer))),
             _ => Err(Error::invalid_input(format!(
                 "unknown lance tokenizer {}",
                 self.lance_tokenizer.as_ref().unwrap()
@@ -984,10 +1158,11 @@ impl InvertedIndexParams {
                 }
                 Ok(builder)
             }
-            "icu" => Ok(TextAnalyzer::builder(IcuTokenizer::default()).dynamic()),
-            "icu/split" => {
-                Ok(TextAnalyzer::builder(IcuTokenizer::default().with_simple_split()).dynamic())
-            }
+            "icu" => Ok(TextAnalyzer::builder(IcuTokenizer::default().into_streaming()).dynamic()),
+            "icu/split" => Ok(TextAnalyzer::builder(
+                IcuTokenizer::default().with_simple_split().into_streaming(),
+            )
+            .dynamic()),
             "ngram" => {
                 let tokenizer = NgramTokenizer::new(
                     self.min_ngram_length as usize,
@@ -1040,23 +1215,42 @@ pub fn language_model_home() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use crate::pbold;
+    use crate::pbold::inverted_index_details::DocumentGranularity as PbDocumentGranularity;
 
-    use super::{InvertedIndexParams, InvertedListFormatVersion, Language};
+    use super::{DocumentGranularity, InvertedIndexParams, InvertedListFormatVersion};
     use lance_core::Error;
-    use lance_tokenizer::TokenStream;
+    use lance_tokenizer::{Language, TokenStream};
     use rstest::rstest;
     use serde_json::json;
 
     #[test]
-    fn test_build_only_fields_are_not_serialized() {
+    fn test_physical_params_omit_creation_only_fields() {
         let params = InvertedIndexParams::default()
+            .document_granularity(DocumentGranularity::ListElement)
             .memory_limit_mb(4096)
             .num_workers(7)
             .format_version(InvertedListFormatVersion::V1);
         let json = serde_json::to_value(&params).unwrap();
+        assert!(json.get("document_granularity").is_none());
         assert!(json.get("memory_limit").is_none());
         assert!(json.get("num_workers").is_none());
         assert!(json.get("format_version").is_none());
+    }
+
+    #[test]
+    fn test_same_tokenization_ignores_storage_only_fields() {
+        let base = InvertedIndexParams::new("simple".to_string(), Language::English);
+
+        // Storage/layout-only differences keep the same tokenization.
+        assert!(base.same_tokenization(&base.clone().with_position(true)));
+
+        // Tokenizer-affecting differences are detected.
+        assert!(!base.same_tokenization(&base.clone().stem(!base.stem)));
+        assert!(!base.same_tokenization(&base.clone().lower_case(!base.lower_case)));
+        assert!(!base.same_tokenization(&InvertedIndexParams::new(
+            "whitespace".to_string(),
+            Language::English,
+        )));
     }
 
     #[test]
@@ -1087,12 +1281,17 @@ mod tests {
     }
 
     #[test]
-    fn test_training_json_serializes_build_only_fields() {
+    fn test_training_json_serializes_creation_fields() {
         let params = InvertedIndexParams::default()
+            .document_granularity(DocumentGranularity::ListElement)
             .memory_limit_mb(4096)
             .num_workers(3)
             .format_version(InvertedListFormatVersion::V1);
         let json = params.to_training_json().unwrap();
+        assert_eq!(
+            json.get("document_granularity"),
+            Some(&serde_json::Value::from("list_element"))
+        );
         assert_eq!(
             json.get("memory_limit"),
             Some(&serde_json::Value::from(4096))
@@ -1137,6 +1336,28 @@ mod tests {
         assert!(!params.stem);
         assert!(!params.remove_stop_words);
         assert!(!params.index_operators);
+    }
+
+    #[test]
+    fn test_ngram_tokenizer_resolves_substring_safe_defaults() {
+        let params =
+            InvertedIndexParams::from_training_json(r#"{"base_tokenizer":"ngram"}"#).unwrap();
+        assert!(!params.stem);
+        assert!(!params.remove_stop_words);
+
+        let mut tokenizer = params.build().unwrap();
+        let mut stream = tokenizer.token_stream_for_search("the");
+        assert_eq!(stream.next().unwrap().text, "the");
+        assert!(stream.next().is_none());
+
+        let explicit_filters: InvertedIndexParams = serde_json::from_value(json!({
+            "base_tokenizer": "ngram",
+            "stem": true,
+            "remove_stop_words": true
+        }))
+        .unwrap();
+        assert!(explicit_filters.stem);
+        assert!(explicit_filters.remove_stop_words);
     }
 
     #[test]
@@ -1293,7 +1514,8 @@ mod tests {
         let params = InvertedIndexParams::code()
             .with_position(true)
             .index_operators(true)
-            .preserve_original(false);
+            .preserve_original(false)
+            .format_version(InvertedListFormatVersion::V3);
         let details = crate::pbold::InvertedIndexDetails::try_from(&params).unwrap();
         let code_config = details.code_config.as_ref().unwrap();
         assert_eq!(code_config.split_on_numerics, Some(true));
@@ -1444,9 +1666,29 @@ mod tests {
             prefix_only: false,
             block_size: None,
             code_config: None,
+            document_granularity: PbDocumentGranularity::Row as i32,
+            posting_format_version: None,
         };
         let params = InvertedIndexParams::try_from(&old_details).unwrap();
         assert_eq!(params.block_size, 128);
+        assert_eq!(params.get_document_granularity(), DocumentGranularity::Row);
+    }
+
+    #[test]
+    fn test_document_granularity_details_conversion() {
+        let params =
+            InvertedIndexParams::default().document_granularity(DocumentGranularity::ListElement);
+        let details = pbold::InvertedIndexDetails::try_from(&params).unwrap();
+        assert_eq!(details.posting_format_version, Some(2));
+        assert_eq!(
+            details.document_granularity,
+            PbDocumentGranularity::ListElement as i32
+        );
+        let roundtrip = InvertedIndexParams::try_from(&details).unwrap();
+        assert_eq!(
+            roundtrip.get_document_granularity(),
+            DocumentGranularity::ListElement
+        );
     }
 
     #[rstest]
@@ -1596,7 +1838,7 @@ mod tests {
         );
     }
 
-    // Common Chinese function words/particles (了 是 在 的 和 有 我) are the
+    // Common Chinese function words/particles (了 是 在 的 有 我) are the
     // highest-frequency Chinese tokens; like the English pronouns they must be
     // removed by the ICU `all()` stop-word path so they don't build huge
     // posting lists. Real content words (英语 = "English", 数据 = "data") must
@@ -1615,7 +1857,7 @@ mod tests {
         let mut stream = tokenizer.token_stream_for_search("我 在 有 了 是 的 和 英语 数据");
         let tokens: Vec<String> =
             std::iter::from_fn(|| stream.next().map(|t| t.text.clone())).collect();
-        let stop = ["我", "在", "有", "了", "是", "的", "和"];
+        let stop = ["我", "在", "有", "了", "是", "的"];
         let leaked: Vec<&String> = tokens
             .iter()
             .filter(|t| stop.contains(&t.as_str()))
@@ -1624,10 +1866,93 @@ mod tests {
             leaked.is_empty(),
             "common Chinese stop words leaked through the icu pipeline: {leaked:?} (all tokens: {tokens:?})"
         );
+        // 和 also denotes a Japanese sum, so the language-blind union retains it.
+        assert!(
+            tokens.iter().any(|token| token == "和"),
+            "Han content word 和 was dropped: {tokens:?}"
+        );
         // The real content words must still be indexed.
         assert!(
             tokens.iter().any(|t| t == "英语"),
             "content word 英语 was dropped: {tokens:?}"
         );
+    }
+
+    #[rstest]
+    #[case::retrieved_data("取得したデータを全部表示", &["取得", "全部", "表示"])]
+    #[case::start_processing("以上の場合は処理を開始する", &["以上", "場合", "処理", "開始"])]
+    #[case::change_settings("以下の方法で設定を変更", &["以下", "方法", "設定", "変更"])]
+    #[case::read_book("本を読む", &["本"])]
+    #[case::morning_run("朝に走る", &["朝"])]
+    #[case::have_business("用がある", &["用"])]
+    #[case::end_of_earth("地の果て", &["地"])]
+    #[case::bring_forward("前面に出す", &["前面"])]
+    #[case::enough_time("十分な時間がある", &["十分"])]
+    #[case::large_amount("大量のデータ", &["大量"])]
+    #[case::move_sideways("左右に動く", &["左右"])]
+    #[case::last_day("最後の日", &["最後"])]
+    #[case::many_opinions("多数の意見", &["多数"])]
+    #[case::agree("意見が一致した", &["一致"])]
+    #[case::introduce_self("自己紹介をする", &["自己"])]
+    #[case::very_many("非常に多い", &["非常"])]
+    #[case::own_land("土地を所有する", &["所有"])]
+    #[case::all_users("从数据库获取所有用户信息并返回结果", &["所有", "结果"])]
+    #[case::no_permission("没有权限", &["没有", "权限"])]
+    #[case::not_an_error("不是错误", &["不是", "错误"])]
+    #[case::feed_cat("他喂猫", &["喂", "猫"])]
+    #[case::cough("他咳了一夜", &["咳"])]
+    #[case::vomit("呕了两次", &["呕", "两次"])]
+    #[case::tell_lie("嘘をつく", &["嘘", "つく"])]
+    #[case::benefit("得をする", &["得"])]
+    #[case::passing_grade("可か不可か", &["可", "不可"])]
+    #[case::military_general("将を討つ", &["将", "討つ"])]
+    #[case::clothing_counter("三着の服", &["三", "着", "服"])]
+    #[case::place("所が変わる", &["所", "変わる"])]
+    #[case::reason("由を尋ねる", &["由", "尋ねる"])]
+    #[case::rank("等を上げる", &["等", "上げる"])]
+    #[case::return_home("うちに帰る", &["うち", "帰る"])]
+    #[case::time("ときが来た", &["とき"])]
+    #[case::choose_place("ところを選ぶ", &["ところ", "選ぶ"])]
+    #[case::emphasis("特に安い商品", &["特に", "安い", "商品"])]
+    #[case::objects("欲しいもの", &["欲しい", "もの"])]
+    #[case::boyfriend("彼ができる", &["彼", "できる"])]
+    #[case::girlfriend("彼女ができる", &["彼女", "できる"])]
+    #[case::restriction("読み取りのみ", &["読み取り", "のみ"])]
+    #[case::chinese_prohibition("别执行删除", &["别", "执行", "删除"])]
+    #[case::japanese_prohibition("実行するな", &["実行", "な"])]
+    #[case::japanese_negative("できん", &["でき", "ん"])]
+    #[case::ants("ありの巣", &["あり", "巣"])]
+    #[case::cage("鳥をおりに入れる", &["鳥", "おり", "入れる"])]
+    #[case::noun_particle_combination("もののかたち", &["ものの", "かたち"])]
+    #[case::cause("因を探る", &["因", "探る"])]
+    #[case::picture_kanji("絵をかく", &["絵", "かく"])]
+    #[case::tree_kanji("木に登る", &["木", "登る"])]
+    #[case::poem_kanji("詩を読む", &["詩", "読む"])]
+    fn test_icu_keeps_cjk_content_words(
+        #[case] text: &str,
+        #[case] content_words: &[&str],
+        #[values("icu", "icu/split")] base_tokenizer: &str,
+        #[values(false, true)] stem: bool,
+    ) {
+        let mut tokenizer = InvertedIndexParams::default()
+            .base_tokenizer(base_tokenizer.to_string())
+            .stem(stem)
+            .build()
+            .unwrap();
+        let mut stream = tokenizer.token_stream_for_search(text);
+        let tokens: Vec<String> =
+            std::iter::from_fn(|| stream.next().map(|token| token.text.clone())).collect();
+        for word in content_words {
+            assert!(
+                tokens.iter().any(|token| token == word),
+                "content word {word} was filtered from {text}: {tokens:?}"
+            );
+        }
+        for particle in ["の", "を", "は"] {
+            assert!(
+                !tokens.iter().any(|token| token == particle),
+                "function particle {particle} was retained: {tokens:?}"
+            );
+        }
     }
 }

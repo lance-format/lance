@@ -8,8 +8,8 @@ use itertools::Itertools;
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
-use lance_file::previous::{
-    reader::FileReader as PreviousFileReader, writer::FileWriter as PreviousFileWriter,
+use lance_file::versions::v1::{
+    reader::FileReader as V1FileReader, writer::FileWriter as V1FileWriter,
 };
 use lance_io::{traits::WriteExt, utils::read_message};
 use lance_linalg::distance::DistanceType;
@@ -146,7 +146,7 @@ impl IvfModel {
         start..end
     }
 
-    pub async fn load(reader: &PreviousFileReader) -> Result<Self> {
+    pub async fn load(reader: &V1FileReader) -> Result<Self> {
         let schema = reader.schema();
         let meta_str = schema
             .metadata
@@ -167,7 +167,7 @@ impl IvfModel {
     }
 
     /// Write the IVF metadata to the lance file.
-    pub async fn write(&self, writer: &mut PreviousFileWriter<ManifestDescribing>) -> Result<()> {
+    pub async fn write(&self, writer: &mut V1FileWriter<ManifestDescribing>) -> Result<()> {
         let pb = PbIvf::try_from(self)?;
         let pos = writer.object_writer.write_protobuf(&pb).await?;
         let ivf_metadata = IvfMetadata { pb_position: pos };
@@ -205,6 +205,13 @@ impl TryFrom<PbIvf> for IvfModel {
         } else if !proto.centroids.is_empty() {
             // For backward-compatibility
             debug!("Ivf: loading IVF centroids from index format v1");
+            if proto.lengths.is_empty() {
+                return Err(Error::corrupt_file_named(
+                    "ivf metadata",
+                    "v1 IVF centroids are present but no partition lengths are, \
+                     so the centroid dimension cannot be derived",
+                ));
+            }
             let f32_centroids = Float32Array::from(proto.centroids.clone());
             let dimension = f32_centroids.len() / proto.lengths.len();
             Some(FixedSizeListArray::try_new_from_values(
@@ -232,7 +239,16 @@ impl TryFrom<PbIvf> for IvfModel {
                 .collect_vec(),
             _ => proto.offsets.iter().map(|x| *x as usize).collect(),
         };
-        assert_eq!(offsets.len(), proto.lengths.len());
+        if offsets.len() != proto.lengths.len() {
+            return Err(Error::corrupt_file_named(
+                "ivf metadata",
+                format!(
+                    "{} partition offsets do not match {} partition lengths",
+                    offsets.len(),
+                    proto.lengths.len()
+                ),
+            ));
+        }
         Ok(Self {
             centroids,
             offsets,
@@ -274,6 +290,65 @@ mod tests {
         assert_eq!(ivf.row_range(1), 20..70);
     }
 
+    /// A corrupt or foreign index file can carry mismatched offsets and
+    /// lengths. `assert_eq!` survives release builds, so the parse boundary
+    /// aborted the process instead of reporting the file.
+    #[test]
+    fn test_ivf_model_rejects_mismatched_proto_lengths() {
+        let proto = pb::Ivf {
+            lengths: vec![1, 2, 3],
+            offsets: vec![0, 3],
+            ..Default::default()
+        };
+        let error = IvfModel::try_from(proto).unwrap_err();
+        assert!(
+            matches!(error, Error::CorruptFile { .. }),
+            "expected CorruptFile, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("2 partition offsets") && message.contains("3 partition lengths"),
+            "the error must give both counts: {message}"
+        );
+    }
+
+    /// The v1 branch derives the centroid dimension by dividing by the number
+    /// of partition lengths, so a damaged file with centroids and no lengths
+    /// used to divide by zero. Integer division by zero is not compiled out,
+    /// so this had to be a check rather than an assert.
+    #[test]
+    fn test_ivf_model_rejects_v1_centroids_without_lengths() {
+        let proto = pb::Ivf {
+            centroids: vec![1.0, 2.0, 3.0, 4.0],
+            lengths: vec![],
+            offsets: vec![],
+            ..Default::default()
+        };
+        let error = IvfModel::try_from(proto).unwrap_err();
+        assert!(
+            matches!(error, Error::CorruptFile { .. }),
+            "expected CorruptFile, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("cannot be derived"),
+            "the error must say why the dimension is unknown: {error}"
+        );
+    }
+
+    /// An empty offsets vector is the normal v3 shape: the offsets are derived
+    /// by scanning the lengths, so the mismatch check must not fire there.
+    #[test]
+    fn test_ivf_model_derives_offsets_from_lengths() {
+        let proto = pb::Ivf {
+            lengths: vec![1, 2, 3],
+            offsets: vec![],
+            ..Default::default()
+        };
+        let ivf = IvfModel::try_from(proto).unwrap();
+        assert_eq!(ivf.offsets, vec![0, 1, 3]);
+        assert_eq!(ivf.lengths, vec![1, 2, 3]);
+    }
+
     #[tokio::test]
     async fn test_write_and_load() {
         let mut ivf = IvfModel::empty();
@@ -286,14 +361,10 @@ mod tests {
         let schema = Schema::try_from(&arrow_schema).unwrap();
 
         {
-            let mut writer = PreviousFileWriter::try_new(
-                &object_store,
-                &path,
-                schema.clone(),
-                &Default::default(),
-            )
-            .await
-            .unwrap();
+            let mut writer =
+                V1FileWriter::try_new(&object_store, &path, schema.clone(), &Default::default())
+                    .await
+                    .unwrap();
             // Write some dummy data
             let batch = RecordBatch::try_new(
                 Arc::new(arrow_schema),
@@ -305,7 +376,7 @@ mod tests {
             writer.finish().await.unwrap();
         }
 
-        let reader = PreviousFileReader::try_new_self_described(&object_store, &path, None)
+        let reader = V1FileReader::try_new_self_described(&object_store, &path, None)
             .await
             .unwrap();
         assert!(reader.schema().metadata.contains_key(IVF_METADATA_KEY));

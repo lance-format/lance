@@ -17,8 +17,9 @@ import shutil
 import struct
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import pytest
 from packaging.version import InvalidVersion, Version
@@ -43,12 +44,49 @@ def _venv_lock(lock_path: Path):
                 fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+_PIP_INSTALL_ATTEMPTS = 3
+_PIP_RETRY_BACKOFF_SECONDS = 2.0
+
+
+def _pip_install(python: Union[str, Path], args: list[str]) -> None:
+    """Run ``pip install`` with output captured, retrying transient failures.
+
+    pip installs hit the network (PyPI / fury.io) and a single flaky download
+    should not fail a whole test run, so retry a bounded number of times with a
+    short backoff. On final failure raise an error that includes pip's
+    stdout/stderr, which a bare CalledProcessError from ``capture_output=True``
+    would hide from the test log.
+    """
+    cmd = [str(python), "-m", "pip", "install", "--quiet", *args]
+    for attempt in range(1, _PIP_INSTALL_ATTEMPTS + 1):
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            return
+        except subprocess.CalledProcessError as exc:  # noqa: PERF203
+            if attempt == _PIP_INSTALL_ATTEMPTS:
+                raise RuntimeError(
+                    f"pip install failed after {attempt} attempts "
+                    f"(exit status {exc.returncode}): {cmd}\n"
+                    f"stdout:\n{exc.stdout}\n"
+                    f"stderr:\n{exc.stderr}"
+                ) from exc
+            time.sleep(_PIP_RETRY_BACKOFF_SECONDS * attempt)
+
+
 NAMESPACE_0_6_DEPENDENCY = "lance-namespace<0.7"
 NAMESPACE_0_7_DEPENDENCY = "lance-namespace>=0.7.2,<0.8"
 NAMESPACE_0_8_DEPENDENCY = "lance-namespace>=0.8.0,<0.9"
+NAMESPACE_0_11_DEPENDENCY = "lance-namespace>=0.11.1,<0.12"
+NAMESPACE_0_13_DEPENDENCY = "lance-namespace>=0.13.0,<0.14"
 
 
 def _lance_namespace_dependency(pylance_version: str) -> str:
+    # 12.0.0b5 is the last release published while pylance still pinned
+    # lance-namespace <0.9; releases cut after that carry the 0.11 range.
+    if Version(pylance_version) >= Version("14.0.0b10"):
+        return NAMESPACE_0_13_DEPENDENCY
+    if Version(pylance_version) > Version("12.0.0b5"):
+        return NAMESPACE_0_11_DEPENDENCY
     if Version(pylance_version) >= Version("7.2.0b5"):
         return NAMESPACE_0_8_DEPENDENCY
     if Version(pylance_version) >= Version("6.0.0b0"):
@@ -221,20 +259,12 @@ class VenvExecutor:
         self._created = True
 
     def _install_wheel(self, wheel: str):
-        subprocess.run(
-            [str(self.python_path), "-m", "pip", "install", "--quiet", wheel, "pytest"],
-            check=True,
-            capture_output=True,
-        )
+        _pip_install(self.python_path, [wheel, "pytest"])
 
     def _install_release_wheel(self):
-        subprocess.run(
+        _pip_install(
+            self.python_path,
             [
-                str(self.python_path),
-                "-m",
-                "pip",
-                "install",
-                "--quiet",
                 "--pre",
                 "--extra-index-url",
                 "https://pypi.fury.io/lance-format/",
@@ -248,8 +278,6 @@ class VenvExecutor:
                 _lance_namespace_dependency(self.version),
                 "pytest",
             ],
-            check=True,
-            capture_output=True,
         )
 
     def _build_from_source(self):
@@ -272,11 +300,7 @@ class VenvExecutor:
                 check=True,
                 capture_output=True,
             )
-        subprocess.run(
-            [py, "-m", "pip", "install", "--quiet", "maturin", "pytest", "pyarrow"],
-            check=True,
-            capture_output=True,
-        )
+        _pip_install(py, ["maturin", "pytest", "pyarrow"])
         wheels = src / "target" / "compat-wheels"
         subprocess.run(
             [
@@ -296,11 +320,7 @@ class VenvExecutor:
             capture_output=True,
         )
         wheel = next(wheels.glob("pylance-*.whl"))
-        subprocess.run(
-            [py, "-m", "pip", "install", "--quiet", str(wheel)],
-            check=True,
-            capture_output=True,
-        )
+        _pip_install(py, [str(wheel)])
 
     def _ensure_subprocess(self):
         """Ensure the persistent subprocess is running."""
@@ -330,6 +350,20 @@ class VenvExecutor:
             stderr=self._stderr_file,
             env=env,
         )
+
+    def _recent_stderr(self, max_lines: int = 200) -> str:
+        """Return the tail of the runner's captured stderr, if any.
+
+        A method running in the venv cannot use plain `print()` -- stdout is
+        the binary RPC channel back to this process -- but `print(...,
+        file=sys.stderr)` is safe, and this is what surfaces it.
+        """
+        try:
+            text = self._stderr_path.read_text()
+        except (OSError, AttributeError):
+            return ""
+        lines = [line for line in text.splitlines() if line.strip()]
+        return "\n".join(lines[-max_lines:])
 
     def _last_panic(self) -> str:
         """Pull the panic message from the runner's captured stderr, if any."""
@@ -413,6 +447,14 @@ class VenvExecutor:
 
         # Ensure subprocess is running
         self._ensure_subprocess()
+        # Marks the pickled snapshot sent below as executing inside the old
+        # venv, so a test's _running_in_old_venv read there is reliable
+        # regardless of what lance.__version__ happens to report (see the
+        # flag's docstring on UpgradeDowngradeTest). Reset right after on our
+        # own `obj` reference so a later bare call on the same object (the
+        # current build's own check_read/check_write in the upgrade/downgrade
+        # round trip) does not inherit it.
+        obj._running_in_old_venv = True
         try:
             # Send request: (obj, method_name, env_overrides)
             self._send_message((obj, method_name, env_overrides or {}))
@@ -429,6 +471,9 @@ class VenvExecutor:
                     f"{response['exception_type']}: {response['exception_msg']}\n"
                     f"\nTraceback from venv:\n{response['traceback']}"
                 )
+                stderr_tail = self._recent_stderr()
+                if stderr_tail:
+                    error_msg += f"\n\nRecent stderr from venv:\n{stderr_tail}"
                 raise RuntimeError(error_msg)
 
         except (BrokenPipeError, EOFError, struct.error) as e:
@@ -443,6 +488,9 @@ class VenvExecutor:
             panic = self._last_panic()
             detail = panic or f"subprocess communication failed: {e}"
             raise RuntimeError(f"Lance {self.version} (exit={returncode}): {detail}")
+
+        finally:
+            obj._running_in_old_venv = False
 
     def cleanup(self):
         """Remove the virtual environment directory and terminate subprocess."""

@@ -19,6 +19,19 @@ from geoarrow.rust.core import (
 )
 
 
+def _query_point_ids(dataset: lance.LanceDataset, wkt: str) -> list[int]:
+    sql = f"""
+          SELECT id, point
+          FROM dataset
+          WHERE St_Intersects(point, ST_GeomFromText('{wkt}'))
+          """
+    return [
+        value
+        for batch in dataset.sql(sql).build().to_batch_records()
+        for value in batch.column("id").to_pylist()
+    ]
+
+
 def test_geo_types(tmp_path: Path):
     uri = str(tmp_path / "test_geo_types.lance")
     # Points
@@ -153,3 +166,363 @@ def test_rtree_index(tmp_path: Path):
     table_with_index = query(ds, has_index=True)
 
     assert table_with_index == table_without_index
+
+
+def test_rtree_segment_merge_and_commit(tmp_path: Path):
+    num_points = 120
+    points_2d = points(
+        [
+            np.arange(num_points, dtype=np.float64),
+            np.arange(num_points, dtype=np.float64),
+        ]
+    )
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field(point("xy")).with_name("point"),
+        ]
+    )
+    table = pa.Table.from_arrays(
+        [np.arange(num_points, dtype=np.int64), points_2d], schema=schema
+    )
+    ds = lance.write_dataset(
+        table,
+        str(tmp_path / "segmented_rtree.lance"),
+        max_rows_per_file=40,
+    )
+    fragments = ds.get_fragments()
+    assert len(fragments) == 3
+    segments = [
+        ds.create_index_uncommitted(
+            column="point",
+            index_type="RTREE",
+            name="point_rtree",
+            fragment_ids=[fragment.fragment_id],
+        )
+        for fragment in fragments
+    ]
+
+    merged = ds.merge_existing_index_segments(segments)
+    assert set(merged.fragment_ids) == {fragment.fragment_id for fragment in fragments}
+    ds = ds.commit_existing_index_segments("point_rtree", "point", [merged])
+
+    sql = """
+          SELECT id, point
+          FROM dataset
+          WHERE St_Intersects(point, ST_GeomFromText('LINESTRING (10 10, 110 110)'))
+          """
+    indexed = pa.Table.from_batches(ds.sql(sql).build().to_batch_records())
+    assert indexed["id"].to_pylist() == list(range(10, 111))
+    explain = (
+        pa.Table.from_batches(
+            ds.sql("EXPLAIN ANALYZE " + sql).build().to_batch_records()
+        )
+        .to_pandas()
+        .to_string()
+    )
+    assert "ScalarIndexQuery" in explain
+
+
+def test_staged_rtree_after_rewrite_columns(tmp_path: Path):
+    uri = str(tmp_path / "stale_rtree.lance")
+    point_type = point("xy")
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field(point_type).with_name("point"),
+        ]
+    )
+    dataset = lance.write_dataset(
+        pa.Table.from_arrays(
+            [
+                pa.array([0, 1], type=pa.int64()),
+                points([np.array([0.0, 1.0]), np.array([0.0, 1.0])]),
+            ],
+            schema=schema,
+        ),
+        uri,
+    )
+    segment = dataset.create_index_uncommitted(
+        column="point",
+        index_type="RTREE",
+        name="point_rtree",
+        fragment_ids=[0],
+    )
+
+    update_schema = pa.schema(
+        [
+            pa.field("_rowid", pa.uint64()),
+            pa.field(point_type).with_name("point"),
+        ]
+    )
+    update = pa.Table.from_arrays(
+        [
+            pa.array([0], type=pa.uint64()),
+            points([np.array([10.0]), np.array([10.0])]),
+        ],
+        schema=update_schema,
+    )
+    fragment, fields = dataset.get_fragment(0).update_columns(update)
+    updated = lance.LanceDataset.commit(
+        uri,
+        lance.LanceOperation.Update(
+            updated_fragments=[fragment],
+            fields_modified=fields,
+        ),
+        read_version=dataset.version,
+    )
+
+    assert _query_point_ids(updated, "POINT (10 10)") == [0]
+    committed = dataset.commit_existing_index_segments(
+        "point_rtree",
+        "point",
+        [segment],
+    )
+    assert committed.describe_indices()[0].segments[0].fragment_ids == set()
+    assert _query_point_ids(committed, "POINT (10 10)") == [0]
+
+
+def test_rtree_rejects_distributed_uuid_reuse(tmp_path: Path):
+    uri = str(tmp_path / "uuid_reuse.lance")
+    num_points = 120
+    point_type = point("xy")
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field(point_type).with_name("point"),
+        ]
+    )
+    dataset = lance.write_dataset(
+        pa.Table.from_arrays(
+            [
+                pa.array(range(num_points), type=pa.int64()),
+                points(
+                    [
+                        np.arange(num_points, dtype=np.float64),
+                        np.arange(num_points, dtype=np.float64),
+                    ]
+                ),
+            ],
+            schema=schema,
+        ),
+        uri,
+        max_rows_per_file=40,
+    )
+    dataset.create_scalar_index("point", "RTREE")
+    index_uuid = dataset.describe_indices()[0].segments[0].uuid
+
+    with pytest.raises(
+        ValueError,
+        match="index_uuid is no longer accepted for RTree distributed index builds",
+    ):
+        dataset.create_index_uncommitted(
+            column="point",
+            index_type="RTREE",
+            name="point_rtree_reuse",
+            fragment_ids=[0],
+            index_uuid=index_uuid,
+        )
+
+    assert _query_point_ids(
+        lance.dataset(uri),
+        "LINESTRING (100 100, 110 110)",
+    ) == list(range(100, 111))
+
+
+def test_rtree_merge_all_deleted_stable_row_ids(tmp_path: Path):
+    uri = str(tmp_path / "all_deleted.lance")
+    point_type = point("xy")
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field(point_type).with_name("point"),
+        ]
+    )
+    dataset = lance.write_dataset(
+        pa.Table.from_arrays(
+            [
+                pa.array([0, 1], type=pa.int64()),
+                points([np.array([0.0, 1.0]), np.array([0.0, 1.0])]),
+            ],
+            schema=schema,
+        ),
+        uri,
+        enable_stable_row_ids=True,
+    )
+    segment = dataset.create_index_uncommitted(
+        column="point",
+        index_type="RTREE",
+        name="point_rtree",
+        fragment_ids=[0],
+    )
+
+    dataset.delete("true")
+    merged = dataset.merge_existing_index_segments([segment])
+    assert merged.fragment_ids == set()
+    committed = dataset.commit_existing_index_segments(
+        "point_rtree",
+        "point",
+        [merged],
+    )
+    assert _query_point_ids(committed, "POINT (0 0)") == []
+
+
+def test_rtree_merge_preserves_newer_fragment_coverage(tmp_path: Path):
+    uri = str(tmp_path / "mixed_versions.lance")
+    point_type = point("xy")
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field(point_type).with_name("point"),
+        ]
+    )
+
+    def batch(start: int, stop: int) -> pa.Table:
+        values = np.arange(start, stop, dtype=np.float64)
+        return pa.Table.from_arrays(
+            [
+                pa.array(range(start, stop), type=pa.int64()),
+                points([values, values]),
+            ],
+            schema=schema,
+        )
+
+    dataset = lance.write_dataset(batch(0, 40), uri)
+    first = dataset.create_index_uncommitted(
+        column="point",
+        index_type="RTREE",
+        name="point_rtree",
+        fragment_ids=[0],
+    )
+    dataset = lance.write_dataset(batch(40, 80), uri, mode="append")
+    second = dataset.create_index_uncommitted(
+        column="point",
+        index_type="RTREE",
+        name="point_rtree",
+        fragment_ids=[1],
+    )
+
+    merged = dataset.merge_existing_index_segments([first, second])
+    assert merged.fragment_ids == {0, 1}
+    assert merged.dataset_version == dataset.version
+
+    update_schema = pa.schema(
+        [
+            pa.field("_rowid", pa.uint64()),
+            pa.field(point_type).with_name("point"),
+        ]
+    )
+    update = pa.Table.from_arrays(
+        [
+            pa.array([1 << 32], type=pa.uint64()),
+            points([np.array([100.0]), np.array([100.0])]),
+        ],
+        schema=update_schema,
+    )
+    fragment, fields = dataset.get_fragment(1).update_columns(update)
+    dataset = lance.LanceDataset.commit(
+        uri,
+        lance.LanceOperation.Update(
+            updated_fragments=[fragment],
+            fields_modified=fields,
+        ),
+        read_version=dataset.version,
+    )
+
+    committed = dataset.commit_existing_index_segments(
+        "point_rtree",
+        "point",
+        [merged],
+    )
+    assert committed.describe_indices()[0].segments[0].fragment_ids == {0}
+    assert _query_point_ids(
+        committed,
+        "POINT (100 100)",
+    ) == [40]
+
+
+# The square (0 0)-(4 4) as a constant geometry.
+REGION = "ST_GeomFromText('POLYGON ((0 0, 4 0, 4 4, 0 4, 0 0))')"
+
+
+def _points_around_region(tmp_path: Path, has_index: bool) -> lance.LanceDataset:
+    # Points inside (ids 0, 1), on the boundary of (2, 3) and outside (4, 5) REGION.
+    xs = np.array([1.0, 2.0, 0.0, 4.0, 5.0, -1.0])
+    ys = np.array([1.0, 3.0, 2.0, 4.0, 5.0, 2.0])
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64()),
+            pa.field(point("xy")).with_name("geom"),
+            pa.field("label", pa.string()),
+        ]
+    )
+    table = pa.Table.from_arrays(
+        [
+            pa.array(range(len(xs)), type=pa.int64()),
+            points([xs, ys]),
+            pa.array(["original"] * len(xs)),
+        ],
+        schema=schema,
+    )
+    ds = lance.write_dataset(table, str(tmp_path / "points.lance"), max_rows_per_file=3)
+    if has_index:
+        ds.create_scalar_index("geom", "RTREE")
+    return ds
+
+
+def _ids(ds: lance.LanceDataset, filter: str) -> list[int]:
+    return sorted(ds.to_table(columns=["id"], filter=filter)["id"].to_pylist())
+
+
+@pytest.mark.parametrize("has_index", [False, True])
+@pytest.mark.parametrize(
+    ("constant_first", "column_first", "expected"),
+    [
+        ("ST_Contains({r}, geom)", "ST_Within(geom, {r})", [0, 1]),
+        ("ST_Within({r}, geom)", "ST_Contains(geom, {r})", []),
+        ("ST_Covers({r}, geom)", "ST_CoveredBy(geom, {r})", [0, 1, 2, 3]),
+        ("ST_CoveredBy({r}, geom)", "ST_Covers(geom, {r})", []),
+    ],
+)
+def test_constant_first_spatial_predicates(
+    tmp_path: Path,
+    has_index: bool,
+    constant_first: str,
+    column_first: str,
+    expected: list[int],
+):
+    ds = _points_around_region(tmp_path, has_index)
+    constant_first = constant_first.format(r=REGION)
+    column_first = column_first.format(r=REGION)
+
+    assert _ids(ds, constant_first) == expected
+    assert _ids(ds, column_first) == expected
+    sql = f"SELECT id FROM dataset WHERE {constant_first} ORDER BY id"
+    assert [
+        value
+        for batch in ds.sql(sql).build().to_batch_records()
+        for value in batch.column("id").to_pylist()
+    ] == expected
+    plan = ds.scanner(filter=constant_first).explain_plan(True)
+    assert ("ScalarIndexQuery" in plan) == has_index
+
+
+@pytest.mark.parametrize("has_index", [False, True])
+def test_constant_first_spatial_writes(tmp_path: Path, has_index: bool):
+    ds = _points_around_region(tmp_path, has_index)
+
+    ds.update({"label": "'inside'"}, where=f"ST_Contains({REGION}, geom)")
+    assert _ids(ds, "label = 'inside'") == [0, 1]
+
+    # Deleting the points outside the region must keep the points inside it.
+    ds.delete(f"NOT ST_Contains({REGION}, geom)")
+    assert _ids(ds, "true") == [0, 1]
+
+
+def test_null_constant_geometry(tmp_path: Path):
+    ds = _points_around_region(tmp_path, has_index=False)
+    null_geometry = "ST_GeomFromText(CAST(NULL AS VARCHAR))"
+
+    assert _ids(ds, f"ST_Contains({null_geometry}, geom)") == []
+    ds.delete(f"NOT ST_Contains({null_geometry}, geom)")
+    assert ds.count_rows() == 6

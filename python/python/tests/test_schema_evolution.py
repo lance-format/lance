@@ -15,6 +15,7 @@ import pyarrow.compute as pc
 import pytest
 from lance import LanceDataset
 from lance.file import LanceFileReader, LanceFileWriter
+from lance.fragment import write_fragments
 
 
 def test_drop_columns(tmp_path: Path):
@@ -443,6 +444,57 @@ def test_merge_columns(tmp_path: Path):
     )
 
 
+def test_merge_columns_cleanup_after_outer_commit_failure(tmp_path: Path):
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(
+        pa.table({"a": range(100)}), base_dir, max_rows_per_file=25
+    )
+    read_version = dataset.version
+    fragments = dataset.get_fragments()
+    assert len(fragments) == 4
+
+    def data_files() -> set[Path]:
+        return {
+            path.relative_to(base_dir)
+            for path in (base_dir / "data").rglob("*")
+            if path.is_file()
+        }
+
+    def dataset_files() -> set[Path]:
+        return {
+            path.relative_to(base_dir) for path in base_dir.rglob("*") if path.is_file()
+        }
+
+    files_before_staging = data_files()
+    staged_fragment, staged_schema, cleanup = fragments[0].merge_columns(
+        {"staged": "a * 2"}, return_cleanup=True
+    )
+    staged_files = data_files() - files_before_staging
+    assert staged_files
+
+    # Preserve every fragment in the outer Merge while replacing the one that
+    # carries the staged column data.
+    merged_fragments = [staged_fragment]
+    merged_fragments.extend(fragment.metadata for fragment in fragments[1:])
+
+    # A concurrent Delete updates the same fragment without changing field ids,
+    # so the staged Merge based on read_version conflicts before it can land.
+    dataset.delete("a = 0")
+    files_before_cleanup = data_files()
+    dataset_files_before_cleanup = dataset_files()
+    with pytest.raises(Exception, match="conflict"):
+        lance.LanceDataset.commit(
+            base_dir,
+            lance.LanceOperation.Merge(merged_fragments, staged_schema),
+            read_version=read_version,
+        )
+
+    cleanup.cleanup()
+    assert data_files() == files_before_cleanup - staged_files
+    assert dataset_files() == dataset_files_before_cleanup - staged_files
+    assert files_before_staging <= data_files()
+
+
 def test_merge_columns_from_reader(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -573,3 +625,56 @@ def test_add_cols_all_null_with_sql(tmp_path: Path):
             "b": pa.int32(),
         }
     )
+
+
+def test_merge_nullability_assertion(tmp_path: Path):
+    tbl = pa.table({"value": pa.array([1, 2], pa.int32())})
+    lance.write_dataset(tbl, tmp_path)
+    written_at = lance.dataset(tmp_path).version
+
+    # Stage an append against the original schema, then add a non-nullable
+    # column. The merge claims non-null, and reading it back must preserve
+    # the claim, or recommitting it would silently drop the barrier.
+    fragments = write_fragments(
+        pa.table({"value": pa.array([7], pa.int32())}), tmp_path, mode="append"
+    )
+    lance.dataset(tmp_path).add_columns({"one": "1"})
+    txn = lance.dataset(tmp_path).read_transaction(2)
+    assert txn is not None
+    assert txn.operation.preserves_nullability is False
+
+    # The stale append omits the required column, so its rows would read as
+    # null under the merged schema; the claim refuses it.
+    op = lance.LanceOperation.Append(fragments)
+    with pytest.raises(Exception, match="preempted"):
+        lance.LanceDataset.commit(tmp_path, op, read_version=written_at)
+
+    # A nullable add preserves nullability and skips the barrier.
+    lance.dataset(tmp_path).add_columns({"copied": "value"})
+    txn = lance.dataset(tmp_path).read_transaction(3)
+    assert txn is not None
+    assert txn.operation.preserves_nullability is True
+
+
+def test_project_nullability_assertion_round_trips(tmp_path: Path):
+    tbl = pa.table({"value": pa.array([1, 2], pa.int32())})
+    lance.write_dataset(tbl, tmp_path)
+    lance.dataset(tmp_path).alter_columns({"path": "value", "nullable": False})
+
+    # Reading the tightening back must preserve the claim, or recommitting it
+    # would silently drop the concurrency barrier.
+    txn = lance.dataset(tmp_path).read_transaction(2)
+    assert txn is not None
+    assert txn.operation.preserves_nullability is False
+
+    # A Python-built non-assertion must reach the barrier: race an append.
+    written_at = lance.dataset(tmp_path).version
+    appended = lance.write_dataset(
+        pa.table({"value": pa.array([7], pa.int32())}), tmp_path, mode="append"
+    )
+    assert appended.version > written_at
+    relax = lance.LanceOperation.Project(
+        schema=txn.operation.schema, preserves_nullability=False
+    )
+    with pytest.raises(Exception, match="preempted"):
+        lance.LanceDataset.commit(tmp_path, relax, read_version=written_at)

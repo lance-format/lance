@@ -1,0 +1,45 @@
+[package]
+name = "lance-datafusion-exec"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "DataFusion execution utilities for Lance that do not depend on the datafusion crate"
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+arrow = { workspace = true, features = ["ffi"] }
+arrow-array = { workspace = true, features = ["ffi"] }
+arrow-schema.workspace = true
+async-trait.workspace = true
+datafusion-common.workspace = true
+datafusion-execution.workspace = true
+datafusion-expr.workspace = true
+datafusion-functions.workspace = true
+datafusion-physical-expr.workspace = true
+datafusion-physical-plan.workspace = true
+futures.workspace = true
+half.workspace = true
+lance-arrow.workspace = true
+lance-core = { workspace = true, features = ["datafusion"] }
+lance-datagen = { workspace = true, optional = true }
+lance-jsonb.workspace = true
+log.workspace = true
+pin-project.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+arrow-select.workspace = true
+lance-datagen.workspace = true
+rstest.workspace = true
+
+[features]
+datagen = ["dep:lance-datagen"]
+
+[lints]
+workspace = true

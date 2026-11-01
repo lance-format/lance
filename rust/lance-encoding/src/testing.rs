@@ -6,7 +6,7 @@ use std::{cmp::Ordering, collections::HashMap, ops::Range, sync::Arc};
 use crate::{
     decoder::DecoderConfig,
     encodings::physical::block::CompressionScheme,
-    format::pb21::{
+    format::metadata::{
         BufferCompression, CompressiveEncoding, PageLayout, compressive_encoding::Compression,
     },
 };
@@ -21,26 +21,371 @@ use futures::{FutureExt, StreamExt, future::BoxFuture};
 use log::{debug, info, trace};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-use lance_core::{Result, utils::bit::pad_bytes};
+use lance_core::{Error, Result, datatypes::Field as LanceField, utils::bit::pad_bytes};
 use lance_datagen::{ArrayGenerator, RowCount, Seed, array, gen_batch};
 
+use crate::compression::PerValueGeneralCompression;
+use crate::compression::try_packed_struct_per_value;
 use crate::{
     EncodingsIo,
     buffer::LanceBuffer,
+    compression::{
+        BlockCompressor, CompressionStrategy, field_metadata_params, finalize_miniblock_compressor,
+        reject_packed_struct_per_value, try_bitpacking_block, try_bitpacking_miniblock,
+        try_byte_stream_split_miniblock, try_child_rle_miniblock,
+        try_fixed_packed_struct_miniblock, try_fixed_u8_rle_block, try_fixed_u8_rle_miniblock,
+        try_general_block, try_raw_block, try_raw_fixed_size_list_miniblock,
+        try_raw_fixed_width_miniblock, try_raw_per_value, try_uncompressed_fixed_width_miniblock,
+        try_variable_rle_block, try_variable_width_miniblock,
+        try_variable_width_miniblock_with_generic_offsets, try_variable_width_per_value,
+    },
+    compression_config::{CompressionFieldParams, CompressionParams},
+    data::DataBlock,
     decoder::{
         ColumnInfo, DecodeBatchScheduler, DecoderMessage, DecoderPlugins, FilterExpression,
         PageInfo, create_decode_stream,
     },
     encoder::{
         ColumnIndexSequence, EncodedColumn, EncodedPage, EncodingOptions, FieldEncoder,
-        MIN_PAGE_BUFFER_ALIGNMENT, OutOfLineBuffers, default_encoding_strategy,
+        FieldEncodingContext, FieldEncodingStrategy, MIN_PAGE_BUFFER_ALIGNMENT, OutOfLineBuffers,
+        structural::{
+            PrimitiveFieldEncoding, PrimitivePageEncoding, try_create_binary_blob, try_create_list,
+            try_create_map, try_create_struct, try_create_structural_blob,
+            try_create_structural_fixed_size_list,
+        },
     },
+    encodings::logical::primitive::{fullzip::PerValueCompressor, miniblock::MiniBlockCompressor},
     repdef::RepDefBuilder,
-    version::LanceFileVersion,
 };
 
 const MAX_PAGE_BYTES: u64 = 32 * 1024 * 1024;
 const TEST_ALIGNMENT: usize = MIN_PAGE_BUFFER_ALIGNMENT as usize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestEncoding {
+    Array,
+    StructuralU16,
+    StructuralU32,
+    StructuralSparse,
+}
+
+impl TestEncoding {
+    fn all() -> impl Iterator<Item = Self> {
+        [
+            Self::Array,
+            Self::StructuralU16,
+            Self::StructuralU32,
+            Self::StructuralSparse,
+        ]
+        .into_iter()
+    }
+
+    fn is_structural(self) -> bool {
+        self != Self::Array
+    }
+}
+
+impl std::fmt::Display for TestEncoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Array => write!(f, "array"),
+            Self::StructuralU16 => write!(f, "structural-u16"),
+            Self::StructuralU32 => write!(f, "structural-u32"),
+            Self::StructuralSparse => write!(f, "structural-sparse"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TestCompressionStrategy {
+    encoding: TestEncoding,
+    params: CompressionParams,
+}
+
+impl TestCompressionStrategy {
+    fn field_params(&self, field: &LanceField) -> CompressionFieldParams {
+        let mut params = self
+            .params
+            .get_field_params(&field.name, &field.data_type());
+        let mut metadata = field_metadata_params(field);
+        if self.encoding == TestEncoding::StructuralU16
+            && metadata
+                .minichunk_size
+                .is_some_and(|size| size >= 32 * 1024)
+        {
+            metadata.minichunk_size = None;
+        }
+        params.merge(&metadata);
+        params
+    }
+}
+
+impl CompressionStrategy for TestCompressionStrategy {
+    fn create_miniblock_compressor(
+        &self,
+        field: &LanceField,
+        data: &DataBlock,
+    ) -> Result<Box<dyn MiniBlockCompressor>> {
+        let params = self.field_params(field);
+        let compressor =
+            if let Some(compressor) = try_uncompressed_fixed_width_miniblock(data, &params) {
+                compressor
+            } else if let Some(compressor) = try_byte_stream_split_miniblock(data, &params) {
+                compressor
+            } else if let Some(compressor) = match self.encoding {
+                TestEncoding::StructuralSparse => try_child_rle_miniblock(data, &params),
+                TestEncoding::Array | TestEncoding::StructuralU16 | TestEncoding::StructuralU32 => {
+                    try_fixed_u8_rle_miniblock(data, &params)
+                }
+            } {
+                compressor
+            } else if let Some(compressor) = try_bitpacking_miniblock(data) {
+                compressor
+            } else if let Some(compressor) = try_raw_fixed_width_miniblock(data) {
+                compressor
+            } else if let Some(compressor) = if self.encoding == TestEncoding::StructuralSparse {
+                try_variable_width_miniblock_with_generic_offsets(field, data, &params)?
+            } else {
+                try_variable_width_miniblock(field, data, &params)?
+            } {
+                compressor
+            } else if let Some(compressor) = try_fixed_packed_struct_miniblock(data)? {
+                compressor
+            } else if let Some(compressor) = try_raw_fixed_size_list_miniblock(data) {
+                compressor
+            } else {
+                return Err(lance_core::Error::not_supported_source(
+                    format!(
+                        "Mini-block compression not yet supported for block type {}",
+                        data.name()
+                    )
+                    .into(),
+                ));
+            };
+        finalize_miniblock_compressor(data, compressor, &params)
+    }
+
+    fn create_per_value(
+        &self,
+        field: &LanceField,
+        data: &DataBlock,
+    ) -> Result<Box<dyn PerValueCompressor>> {
+        let params = self.field_params(field);
+        if self.encoding == TestEncoding::StructuralSparse
+            && let Some(compressor) =
+                crate::compression::try_tensor_per_value(field, data, &params)?
+        {
+            return Ok(compressor);
+        }
+        if let Some(compressor) = try_raw_per_value(data) {
+            return Ok(compressor);
+        }
+        let packed = match self.encoding {
+            TestEncoding::Array | TestEncoding::StructuralU16 => {
+                reject_packed_struct_per_value(field, data)?
+            }
+            TestEncoding::StructuralU32 | TestEncoding::StructuralSparse => {
+                try_packed_struct_per_value(Arc::new(self.clone()), field, data)?
+            }
+        };
+        if let Some(compressor) = packed {
+            return Ok(compressor);
+        }
+        let general_compression = if self.encoding == TestEncoding::StructuralSparse {
+            PerValueGeneralCompression::Any
+        } else {
+            PerValueGeneralCompression::ZstdOnly
+        };
+        if let Some(compressor) =
+            try_variable_width_per_value(field, data, &params, general_compression)?
+        {
+            return Ok(compressor);
+        }
+        Err(lance_core::Error::not_supported_source(
+            format!(
+                "Per-value compression not yet supported for block type {}",
+                data.name()
+            )
+            .into(),
+        ))
+    }
+
+    fn create_block_compressor(
+        &self,
+        field: &LanceField,
+        data: &DataBlock,
+    ) -> Result<Box<dyn BlockCompressor>> {
+        let params = self.field_params(field);
+        if self.encoding == TestEncoding::StructuralSparse
+            && let Some(compressor) = crate::compression::try_fixed_size_list_block(data, &params)?
+        {
+            return Ok(compressor);
+        }
+        let rle = match self.encoding {
+            TestEncoding::Array | TestEncoding::StructuralU16 => None,
+            TestEncoding::StructuralU32 => try_fixed_u8_rle_block(data, &params)?,
+            TestEncoding::StructuralSparse => try_variable_rle_block(data, &params)?,
+        };
+        if let Some(compressor) = rle {
+            return Ok(compressor);
+        }
+        if let Some(compressor) = try_bitpacking_block(data) {
+            return Ok(compressor);
+        }
+        if matches!(
+            self.encoding,
+            TestEncoding::StructuralU32 | TestEncoding::StructuralSparse
+        ) && let Some(compressor) = try_general_block(data, &params)?
+        {
+            return Ok(compressor);
+        }
+        if let Some(compressor) = try_raw_block(data) {
+            return Ok(compressor);
+        }
+        Err(lance_core::Error::not_supported_source(
+            format!(
+                "Block compression not yet supported for block type {}",
+                data.name()
+            )
+            .into(),
+        ))
+    }
+}
+
+pub fn test_compression_strategy(
+    encoding: TestEncoding,
+    params: CompressionParams,
+) -> Arc<dyn CompressionStrategy> {
+    Arc::new(TestCompressionStrategy { encoding, params })
+}
+
+#[derive(Debug)]
+struct TestFieldEncodingStrategy {
+    encoding: TestEncoding,
+    primitive: PrimitiveFieldEncoding,
+}
+
+impl FieldEncodingStrategy for TestFieldEncodingStrategy {
+    fn create_field_encoder(
+        &self,
+        field: &LanceField,
+        column_index: &mut ColumnIndexSequence,
+        context: &FieldEncodingContext<'_>,
+    ) -> Result<Box<dyn FieldEncoder>> {
+        if self.encoding == TestEncoding::StructuralSparse
+            && field.is_blob()
+            && matches!(field.data_type(), DataType::Binary | DataType::LargeBinary)
+        {
+            return Err(Error::invalid_input(
+                "Lance 2.3 does not write Blob v1 pages; use a Blob v2 descriptor struct",
+            ));
+        }
+        if let Some(encoder) =
+            try_create_binary_blob(&self.primitive, field, column_index, context)?
+        {
+            return Ok(encoder);
+        }
+        if self.encoding != TestEncoding::StructuralU16
+            && let Some(encoder) =
+                try_create_structural_blob(&self.primitive, field, column_index, context)?
+        {
+            return Ok(encoder);
+        }
+        if field.is_blob() {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Blob encoding is not available for field '{}' with data type {}",
+                    field.name,
+                    field.data_type()
+                )
+                .into(),
+            ));
+        }
+        if self.encoding != TestEncoding::StructuralU16 {
+            if let Some(encoder) = try_create_map(field, column_index, context)? {
+                return Ok(encoder);
+            }
+            if let Some(encoder) =
+                try_create_structural_fixed_size_list(field, column_index, context)?
+            {
+                return Ok(encoder);
+            }
+        }
+        if let Some(encoder) = self.primitive.try_create(field, column_index, context)? {
+            return Ok(encoder);
+        }
+        if self.encoding == TestEncoding::StructuralU16 {
+            if matches!(
+                field.data_type(),
+                DataType::FixedSizeList(item, _)
+                    if matches!(item.data_type(), DataType::Struct(_))
+            ) {
+                return Err(Error::not_supported_source(
+                    "FixedSizeList<Struct> is not enabled by the selected file format".into(),
+                ));
+            }
+            if matches!(field.data_type(), DataType::Map(_, _)) {
+                return Err(Error::not_supported_source(
+                    "Map data type is not enabled by the selected file format".into(),
+                ));
+            }
+        }
+        if let Some(encoder) = try_create_list(field, column_index, context)? {
+            return Ok(encoder);
+        }
+        if let Some(encoder) = try_create_struct(field, column_index, context)? {
+            return Ok(encoder);
+        }
+        Err(Error::not_supported_source(
+            format!(
+                "{} has no field encoding for '{}' with data type {}",
+                self.encoding,
+                field.name,
+                field.data_type()
+            )
+            .into(),
+        ))
+    }
+}
+
+pub fn test_encoding_strategy(encoding: TestEncoding) -> Box<dyn FieldEncodingStrategy> {
+    if encoding == TestEncoding::Array {
+        return Box::new(crate::array_encoding::ArrayFieldEncodingStrategy::new());
+    }
+
+    let compression = test_compression_strategy(encoding, CompressionParams::default());
+    let page_encodings = match encoding {
+        TestEncoding::StructuralU16 => vec![
+            PrimitivePageEncoding::reject_sparse(),
+            PrimitivePageEncoding::dense_u16(compression),
+        ],
+        TestEncoding::StructuralU32 => vec![
+            PrimitivePageEncoding::reject_sparse(),
+            PrimitivePageEncoding::constant(),
+            PrimitivePageEncoding::dense_u32(compression),
+        ],
+        TestEncoding::StructuralSparse => vec![PrimitivePageEncoding::planar(compression)],
+        TestEncoding::Array => unreachable!(),
+    };
+    Box::new(TestFieldEncodingStrategy {
+        encoding,
+        primitive: PrimitiveFieldEncoding::new(page_encodings),
+    })
+}
+
+pub fn create_test_field_encoder(
+    strategy: &dyn FieldEncodingStrategy,
+    field: &lance_core::datatypes::Field,
+    column_index: &mut ColumnIndexSequence,
+    options: &EncodingOptions,
+) -> Result<Box<dyn FieldEncoder>> {
+    let context = FieldEncodingContext {
+        strategy,
+        options,
+        root_field_metadata: &field.metadata,
+    };
+    strategy.create_field_encoder(field, column_index, &context)
+}
 
 #[derive(Debug)]
 pub(crate) struct SimulatedScheduler {
@@ -179,6 +524,9 @@ async fn test_decode(
     expected: Option<Arc<dyn Array>>,
     io: Arc<dyn EncodingsIo>,
     is_structural_encoding: bool,
+    // The rows this read will schedule, used to exercise range-scoped page
+    // initialization.  `None` initializes every page (the eager path).
+    requested_ranges: Option<Arc<[Range<u64>]>>,
     schedule_fn: impl FnOnce(
         DecodeBatchScheduler,
         UnboundedSender<Result<DecoderMessage>>,
@@ -189,7 +537,7 @@ async fn test_decode(
         128 * 1024 * 1024,
     ));
     let column_indices = column_indices_from_schema(schema, is_structural_encoding);
-    let decode_scheduler = DecodeBatchScheduler::try_new(
+    let decode_scheduler = DecodeBatchScheduler::try_new_with_ranges(
         &lance_schema,
         &column_indices,
         column_infos,
@@ -198,6 +546,7 @@ async fn test_decode(
         Arc::<DecoderPlugins>::default(),
         io,
         cache,
+        requested_ranges.as_deref(),
         &FilterExpression::no_filter(),
         &DecoderConfig::default(),
     )
@@ -295,6 +644,27 @@ pub async fn check_basic_random(field: Field) {
     check_specific_random(field, TestCases::basic()).await;
 }
 
+/// Runs one independently schedulable slice of [`check_basic_random`].
+///
+/// The complete matrix is the Cartesian product of all encodings, page sizes,
+/// and slicing modes.  Keeping these axes outside the helper lets expensive
+/// data types preserve the full matrix without concentrating it in one test.
+pub async fn check_basic_random_case(
+    field: Field,
+    encoding: TestEncoding,
+    page_size: u64,
+    use_slicing: bool,
+) {
+    check_specific_random(
+        field,
+        TestCases::basic()
+            .with_encoding(encoding)
+            .with_page_sizes(vec![page_size])
+            .with_slicing_modes([use_slicing]),
+    )
+    .await;
+}
+
 pub async fn check_specific_random(field: Field, test_cases: TestCases) {
     let array_generator_provider = RandomArrayGeneratorProvider {
         field: field.clone(),
@@ -342,24 +712,22 @@ pub async fn check_round_trip_encoding_generated(
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in test_cases.page_sizes.iter().copied() {
         debug!("Testing random data with a page size of {}", page_size);
-        let encoder_factory = |version: LanceFileVersion| {
-            let encoding_strategy = default_encoding_strategy(version);
+        let encoder_factory = |encoding: TestEncoding| {
+            let encoding_strategy = test_encoding_strategy(encoding);
             let mut column_index_seq = ColumnIndexSequence::default();
             let encoding_options = EncodingOptions {
                 max_page_bytes: MAX_PAGE_BYTES,
                 cache_bytes_per_column: page_size,
                 keep_original_array: true,
                 buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
-                version,
             };
-            encoding_strategy
-                .create_field_encoder(
-                    encoding_strategy.as_ref(),
-                    &lance_field,
-                    &mut column_index_seq,
-                    &encoding_options,
-                )
-                .unwrap()
+            create_test_field_encoder(
+                encoding_strategy.as_ref(),
+                &lance_field,
+                &mut column_index_seq,
+                &encoding_options,
+            )
+            .unwrap()
         };
 
         check_round_trip_random(
@@ -372,9 +740,9 @@ pub async fn check_round_trip_encoding_generated(
     }
 }
 
-fn supports_nulls(data_type: &DataType, version: LanceFileVersion) -> bool {
+fn supports_nulls(data_type: &DataType, encoding: TestEncoding) -> bool {
     if let DataType::Struct(fields) = data_type {
-        if version == LanceFileVersion::V2_0 {
+        if encoding == TestEncoding::Array {
             // 2.0 doesn't support nullability for structs
             false
         } else if fields.is_empty() {
@@ -389,7 +757,7 @@ fn supports_nulls(data_type: &DataType, version: LanceFileVersion) -> bool {
     }
 }
 
-type EncodingVerificationFn = dyn Fn(&[EncodedColumn], &LanceFileVersion);
+type EncodingVerificationFn = dyn Fn(&[EncodedColumn], &TestEncoding);
 
 // The default will just test the full read
 #[derive(Clone)]
@@ -400,8 +768,9 @@ pub struct TestCases {
     skip_validation: bool,
     max_page_size: Option<u64>,
     page_sizes: Vec<u64>,
-    min_file_version: Option<LanceFileVersion>,
-    max_file_version: Option<LanceFileVersion>,
+    slicing_modes: Vec<bool>,
+    ingest_batch_counts: Vec<u32>,
+    encodings: Vec<TestEncoding>,
     verify_encoding: Option<Arc<EncodingVerificationFn>>,
     expected_encoding: Option<Vec<String>>,
 }
@@ -415,8 +784,9 @@ impl Default for TestCases {
             skip_validation: false,
             max_page_size: None,
             page_sizes: vec![4096, 1024 * 1024],
-            min_file_version: None,
-            max_file_version: None,
+            slicing_modes: vec![false, true],
+            ingest_batch_counts: vec![1, 5, 10],
+            encodings: TestEncoding::all().collect(),
             verify_encoding: None,
             expected_encoding: None,
         }
@@ -459,18 +829,55 @@ impl TestCases {
         self
     }
 
-    pub fn with_min_file_version(mut self, version: LanceFileVersion) -> Self {
-        self.min_file_version = Some(version);
+    pub fn with_encoding(mut self, encoding: TestEncoding) -> Self {
+        self.encodings = vec![encoding];
         self
     }
 
-    pub fn with_max_file_version(mut self, version: LanceFileVersion) -> Self {
-        self.max_file_version = Some(version);
+    pub fn with_encodings(mut self, encodings: impl IntoIterator<Item = TestEncoding>) -> Self {
+        self.encodings = encodings.into_iter().collect();
         self
+    }
+
+    pub fn with_structural_encodings(self) -> Self {
+        self.with_encodings([
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+            TestEncoding::StructuralSparse,
+        ])
+    }
+
+    pub fn with_u32_structural_encodings(self) -> Self {
+        self.with_encodings([TestEncoding::StructuralU32, TestEncoding::StructuralSparse])
+    }
+
+    pub fn with_dense_encodings(self) -> Self {
+        self.with_encodings([
+            TestEncoding::Array,
+            TestEncoding::StructuralU16,
+            TestEncoding::StructuralU32,
+        ])
+    }
+
+    pub fn with_array_and_u16_encodings(self) -> Self {
+        self.with_encodings([TestEncoding::Array, TestEncoding::StructuralU16])
     }
 
     pub fn with_page_sizes(mut self, page_sizes: Vec<u64>) -> Self {
         self.page_sizes = page_sizes;
+        self
+    }
+
+    pub fn with_slicing_modes(mut self, slicing_modes: impl IntoIterator<Item = bool>) -> Self {
+        self.slicing_modes = slicing_modes.into_iter().collect();
+        self
+    }
+
+    pub fn with_ingest_batch_counts(
+        mut self,
+        ingest_batch_counts: impl IntoIterator<Item = u32>,
+    ) -> Self {
+        self.ingest_batch_counts = ingest_batch_counts.into_iter().collect();
         self
     }
 
@@ -483,22 +890,8 @@ impl TestCases {
         self.max_page_size.unwrap_or(MAX_PAGE_BYTES)
     }
 
-    fn get_versions(&self) -> Vec<LanceFileVersion> {
-        LanceFileVersion::iter_non_legacy()
-            .filter(|v| {
-                if let Some(min_file_version) = &self.min_file_version
-                    && v < min_file_version
-                {
-                    return false;
-                }
-                if let Some(max_file_version) = &self.max_file_version
-                    && v > max_file_version
-                {
-                    return false;
-                }
-                true
-            })
-            .collect()
+    fn encodings(&self) -> impl Iterator<Item = TestEncoding> + '_ {
+        self.encodings.iter().copied()
     }
 
     pub fn with_verify_encoding(mut self, verify_encoding: Arc<EncodingVerificationFn>) -> Self {
@@ -506,9 +899,9 @@ impl TestCases {
         self
     }
 
-    fn verify_encoding(&self, encoding: &[EncodedColumn], version: &LanceFileVersion) {
+    fn verify_encoding(&self, columns: &[EncodedColumn], encoding: &TestEncoding) {
         if let Some(verify_encoding) = self.verify_encoding.as_ref() {
-            verify_encoding(encoding, version);
+            verify_encoding(columns, encoding);
         }
     }
 
@@ -545,6 +938,10 @@ fn tag(e: &Compression) -> &'static str {
         FixedSizeList(_) => "fixed_size_list",
         PackedStruct(_) => "packed_struct",
         VariablePackedStruct(_) => "variable_packed_struct",
+        Range(_) => "range",
+        Delta(_) => "delta",
+        AxisDelta(_) => "axis_delta",
+        Alp(_) => "alp",
     }
 }
 
@@ -638,7 +1035,7 @@ pub fn extract_array_encoding_chain(enc: &CompressiveEncoding) -> Vec<String> {
 
 fn collect_page_encoding(layout: &PageLayout, actual_chain: &mut Vec<String>) -> Result<()> {
     // Extract encodings from the page layout
-    use crate::format::pb21::page_layout::Layout;
+    use crate::format::metadata::page_layout::Layout;
     if let Some(ref layout_type) = layout.layout {
         match layout_type {
             Layout::MiniBlockLayout(mini_block) => {
@@ -664,11 +1061,6 @@ fn collect_page_encoding(layout: &PageLayout, actual_chain: &mut Vec<String>) ->
             Layout::BlobLayout(blob) => {
                 if let Some(inner_layout) = &blob.inner_layout {
                     collect_page_encoding(inner_layout.as_ref(), actual_chain)?
-                }
-            }
-            Layout::SparseLayout(sparse) => {
-                if let Some(value_compression) = &sparse.value_compression {
-                    actual_chain.extend(extract_array_encoding_chain(value_compression));
                 }
             }
         }
@@ -697,15 +1089,42 @@ fn verify_page_encoding(
             // (and rep/def compression is not currently described in the page layout).
             if actual_chain.is_empty()
                 && page.data.is_empty()
-                && let Some(crate::format::pb21::page_layout::Layout::ConstantLayout(cl)) =
+                && let Some(crate::format::metadata::page_layout::Layout::ConstantLayout(cl)) =
                     layout.layout.as_ref()
                 && cl.inline_value.is_none()
             {
                 return Ok(());
             }
         }
+        PageEncoding::Planar(layout) => {
+            use crate::format::pb23::value_plane::Codec;
+            match layout.values.as_ref().and_then(|v| v.codec.as_ref()) {
+                Some(Codec::Chunked(v)) => {
+                    if v.dictionary.is_some() {
+                        actual_chain.push("dictionary".to_string());
+                    }
+                    if let Some(c) = &v.compression {
+                        actual_chain.extend(extract_array_encoding_chain(c));
+                    }
+                }
+                Some(Codec::Zipped(v)) => {
+                    if let Some(c) = &v.compression {
+                        actual_chain.extend(extract_array_encoding_chain(c));
+                    }
+                }
+                Some(Codec::Indexed(v)) => {
+                    actual_chain.push("indexed".to_string());
+                    actual_chain.push("dictionary".to_string());
+                    if let Some(c) = &v.indices {
+                        actual_chain.extend(extract_array_encoding_chain(c));
+                    }
+                }
+                Some(Codec::Constant(_)) | Some(Codec::None(_)) => return Ok(()),
+                None => return Err(Error::invalid_input("Missing planar value plane")),
+            }
+        }
         PageEncoding::Legacy(_) => {
-            // We don't need to care about legacy.
+            // We don't need to care about the v2.0 array encoding.
         }
     }
 
@@ -748,28 +1167,26 @@ pub async fn check_round_trip_encoding_of_data_with_expected(
     let mut field = Field::new("", example_data.data_type().clone(), true);
     field = field.with_metadata(metadata);
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
-    for file_version in test_cases.get_versions() {
+    for encoding in test_cases.encodings() {
         for page_size in test_cases.page_sizes.iter() {
-            let encoding_strategy = default_encoding_strategy(file_version);
+            let encoding_strategy = test_encoding_strategy(encoding);
             let mut column_index_seq = ColumnIndexSequence::default();
             let encoding_options = EncodingOptions {
                 cache_bytes_per_column: *page_size,
                 max_page_bytes: test_cases.get_max_page_size(),
                 keep_original_array: true,
                 buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
-                version: file_version,
             };
-            let encoder = encoding_strategy
-                .create_field_encoder(
-                    encoding_strategy.as_ref(),
-                    &lance_field,
-                    &mut column_index_seq,
-                    &encoding_options,
-                )
-                .unwrap();
+            let encoder = create_test_field_encoder(
+                encoding_strategy.as_ref(),
+                &lance_field,
+                &mut column_index_seq,
+                &encoding_options,
+            )
+            .unwrap();
             info!(
-                "Testing round trip encoding of data with file version {} and page size {}",
-                file_version, page_size
+                "Testing round trip encoding of data with test encoding {} and page size {}",
+                encoding, page_size
             );
             check_round_trip_encoding_inner(
                 encoder,
@@ -777,7 +1194,7 @@ pub async fn check_round_trip_encoding_of_data_with_expected(
                 data.clone(),
                 expected_override.clone(),
                 test_cases,
-                file_version,
+                encoding,
             )
             .await
         }
@@ -850,7 +1267,7 @@ async fn check_round_trip_encoding_inner(
     data: Vec<Arc<dyn Array>>,
     expected_override: Option<Arc<dyn Array>>,
     test_cases: &TestCases,
-    file_version: LanceFileVersion,
+    encoding: TestEncoding,
 ) {
     let mut writer = SimulatedWriter::new(encoder.num_columns());
 
@@ -891,7 +1308,7 @@ async fn check_round_trip_encoding_inner(
             log_page(&encoded_page);
 
             // For V2.1, verify encoding in the page if expected
-            if file_version >= LanceFileVersion::V2_1
+            if encoding.is_structural()
                 && let Some(ref expected) = test_cases.expected_encoding
             {
                 verify_page_encoding(&encoded_page, expected, encoded_page.column_idx as usize)
@@ -913,7 +1330,7 @@ async fn check_round_trip_encoding_inner(
         log_page(&encoded_page);
 
         // For V2.1, verify encoding in the page if expected
-        if file_version >= LanceFileVersion::V2_1
+        if encoding.is_structural()
             && let Some(ref expected) = test_cases.expected_encoding
         {
             verify_page_encoding(&encoded_page, expected, encoded_page.column_idx as usize)
@@ -925,7 +1342,7 @@ async fn check_round_trip_encoding_inner(
 
     let mut external_buffers = writer.new_external_buffers();
     let encoded_columns = encoder.finish(&mut external_buffers).await.unwrap();
-    test_cases.verify_encoding(&encoded_columns, &file_version);
+    test_cases.verify_encoding(&encoded_columns, &encoding);
     for buffer in external_buffers.take_buffers() {
         writer.write_lance_buffer(buffer);
     }
@@ -957,7 +1374,10 @@ async fn check_round_trip_encoding_inner(
     let scheduler = Arc::new(SimulatedScheduler::new(encoded_data)) as Arc<dyn EncodingsIo>;
 
     let num_rows = data.iter().map(|arr| arr.len() as u64).sum::<u64>();
-    let concat_data = if test_cases.skip_validation {
+    // The caller can supply the expected array; in that case skip deriving it,
+    // because building it here may itself fail (e.g. `concat` on dictionaries
+    // that Arrow's lossy merge cannot combine).
+    let concat_data = if test_cases.skip_validation || expected_override.is_some() {
         None
     } else if let Some(DataType::Struct(_)) = data.first().map(|datum| datum.data_type()) {
         // TODO(tsaucer) When arrow upgrades to 56, remove this if statement
@@ -968,7 +1388,7 @@ async fn check_round_trip_encoding_inner(
         let mut mutable = MutableArrayData::with_capacities(array_data, false, capacities);
 
         for (i, a) in data.iter().enumerate() {
-            mutable.extend(i, 0, a.len())
+            mutable.try_extend(i, 0, a.len()).unwrap();
         }
 
         Some(make_array(mutable.freeze()))
@@ -978,7 +1398,7 @@ async fn check_round_trip_encoding_inner(
 
     let expected_data = expected_override.clone().or_else(|| concat_data.clone());
 
-    let is_structural_encoding = file_version >= LanceFileVersion::V2_1;
+    let is_structural_encoding = encoding.is_structural();
 
     let decode_field = if is_structural_encoding {
         let mut lance_field = lance_core::datatypes::Field::try_from(field).unwrap();
@@ -1008,6 +1428,8 @@ async fn check_round_trip_encoding_inner(
         expected_data.clone(),
         scheduler_copy.clone(),
         is_structural_encoding,
+        // Full scan exercises the eager (initialize-everything) path.
+        None,
         |mut decode_scheduler, tx| {
             async move {
                 decode_scheduler.schedule_range(
@@ -1031,6 +1453,9 @@ async fn check_round_trip_encoding_inner(
             .map(|arr| arr.slice(range.start as usize, num_rows as usize));
         let scheduler = scheduler.clone();
         let range = range.clone();
+        // Range reads exercise the range-scoped (lazy) path: only the pages this
+        // contiguous range overlaps should be initialized.
+        let requested_ranges = Some(Arc::<[Range<u64>]>::from(vec![range.clone()]));
         test_decode(
             num_rows,
             test_cases.batch_size,
@@ -1039,6 +1464,7 @@ async fn check_round_trip_encoding_inner(
             expected,
             scheduler.clone(),
             is_structural_encoding,
+            requested_ranges,
             |mut decode_scheduler, tx| {
                 async move {
                     decode_scheduler.schedule_range(
@@ -1087,6 +1513,11 @@ async fn check_round_trip_encoding_inner(
 
         let scheduler = scheduler.clone();
         let indices = indices.clone();
+        // Take reads exercise the lazy path with scattered rows. One range per
+        // index is a superset of the pages `schedule_take` later touches.
+        let requested_ranges = Some(Arc::<[Range<u64>]>::from(
+            indices.iter().map(|&i| i..i + 1).collect::<Vec<_>>(),
+        ));
         test_decode(
             num_rows,
             test_cases.batch_size,
@@ -1095,6 +1526,7 @@ async fn check_round_trip_encoding_inner(
             expected,
             scheduler.clone(),
             is_structural_encoding,
+            requested_ranges,
             |mut decode_scheduler, tx| {
                 async move {
                     decode_scheduler.schedule_take(
@@ -1118,20 +1550,20 @@ const NUM_RANDOM_ROWS: u32 = 10000;
 ///
 /// To test specific test cases use the
 async fn check_round_trip_random(
-    encoder_factory: impl Fn(LanceFileVersion) -> Box<dyn FieldEncoder>,
+    encoder_factory: impl Fn(TestEncoding) -> Box<dyn FieldEncoder>,
     field: Field,
     array_generator_provider: Box<dyn ArrayGeneratorProvider>,
     test_cases: &TestCases,
 ) {
     for null_rate in [None, Some(0.5), Some(1.0)] {
-        for use_slicing in [false, true] {
-            for file_version in test_cases.get_versions() {
+        for use_slicing in test_cases.slicing_modes.iter().copied() {
+            for encoding in test_cases.encodings() {
                 if null_rate != Some(1.0) && matches!(field.data_type(), DataType::Null) {
                     continue;
                 }
 
                 let field = if null_rate.is_some() {
-                    if !supports_nulls(field.data_type(), file_version) {
+                    if !supports_nulls(field.data_type(), encoding) {
                         continue;
                     }
                     field.clone().with_nullable(true)
@@ -1139,7 +1571,7 @@ async fn check_round_trip_random(
                     field.clone().with_nullable(false)
                 };
 
-                for num_ingest_batches in [1, 5, 10] {
+                for num_ingest_batches in test_cases.ingest_batch_counts.iter().copied() {
                     let rows_per_batch = NUM_RANDOM_ROWS / num_ingest_batches;
                     let mut data = Vec::new();
 
@@ -1189,8 +1621,8 @@ async fn check_round_trip_random(
                     }
 
                     info!(
-                        "Testing version {} with {} rows divided across {} batches for {} rows per batch with null_rate={:?} and use_slicing={}",
-                        file_version,
+                        "Testing encoding {} with {} rows divided across {} batches for {} rows per batch with null_rate={:?} and use_slicing={}",
+                        encoding,
                         NUM_RANDOM_ROWS,
                         num_ingest_batches,
                         rows_per_batch,
@@ -1198,12 +1630,12 @@ async fn check_round_trip_random(
                         use_slicing
                     );
                     check_round_trip_encoding_inner(
-                        encoder_factory(file_version),
+                        encoder_factory(encoding),
                         &field,
                         data,
                         None,
                         test_cases,
-                        file_version,
+                        encoding,
                     )
                     .await
                 }

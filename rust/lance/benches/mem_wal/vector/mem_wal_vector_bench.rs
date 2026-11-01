@@ -6,7 +6,7 @@
 //!
 //! Uses real embeddings from the `lance-format/fineweb-edu` HuggingFace
 //! dataset (384-dim) with an IVF-RQ index on the base table, then ingests
-//! additional rows through ShardWriter to populate flushed generations and
+//! additional rows through ShardWriter to populate SSTables and
 //! an active memtable.
 //!
 //! Three phases, selected with `--phase`:
@@ -102,7 +102,7 @@ struct Args {
     uri: String,
     base_rows: usize,
     max_memtable_rows: usize,
-    flushed_generations: usize,
+    sstables: usize,
     batch_rows: usize,
     queries: usize,
     k: usize,
@@ -120,7 +120,7 @@ impl Default for Args {
             uri: String::new(),
             base_rows: 1_000_000,
             max_memtable_rows: 100_000,
-            flushed_generations: 2,
+            sstables: 2,
             batch_rows: 1_000,
             queries: 100,
             k: 10,
@@ -166,7 +166,7 @@ fn parse_args() -> Result<Args> {
             }
             "--base-rows" => args.base_rows = parse_val(&flag, &value)?,
             "--max-memtable-rows" => args.max_memtable_rows = parse_val(&flag, &value)?,
-            "--flushed-generations" => args.flushed_generations = parse_val(&flag, &value)?,
+            "--sstables" => args.sstables = parse_val(&flag, &value)?,
             "--batch-rows" => args.batch_rows = parse_val(&flag, &value)?,
             "--queries" => args.queries = parse_val(&flag, &value)?,
             "--k" => args.k = parse_val(&flag, &value)?,
@@ -534,11 +534,11 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
         Duration::from_millis(500)
     };
 
-    // Ingest N flushed generations + 1 active (50% full)
-    let num_flushed_target = args.flushed_generations;
+    // Ingest N SSTables + 1 active (50% full)
+    let num_sstable_target = args.sstables;
     let active_rows = args.max_memtable_rows / 2;
-    let total_memtable_rows = num_flushed_target * args.max_memtable_rows + active_rows;
-    let mut gen_sizes: Vec<usize> = (0..num_flushed_target)
+    let total_memtable_rows = num_sstable_target * args.max_memtable_rows + active_rows;
+    let mut gen_sizes: Vec<usize> = (0..num_sstable_target)
         .map(|_| args.max_memtable_rows)
         .collect();
     gen_sizes.push(active_rows);
@@ -615,14 +615,14 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
             gen_rows,
             ingest_start.elapsed().as_secs_f64(),
         );
-        if gen_idx < num_flushed_target {
+        if gen_idx < num_sstable_target {
             tokio::time::sleep(flush_wait).await;
         }
     }
     println!(
-        "ingested {} total memtable rows ({} flushed + active) in {:.1}s",
+        "ingested {} total memtable rows ({} SSTables + active) in {:.1}s",
         total_memtable_rows,
-        num_flushed_target,
+        num_sstable_target,
         ingest_start.elapsed().as_secs_f64(),
     );
 
@@ -632,17 +632,14 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
     let mut shard_snapshot = ShardSnapshot::new(shard_id);
     if let Some(ref m) = manifest {
         shard_snapshot = shard_snapshot.with_current_generation(m.current_generation);
-        for fg in &m.flushed_generations {
-            shard_snapshot = shard_snapshot.with_flushed_generation(fg.generation, fg.path.clone());
+        for sstable in &m.sstables {
+            shard_snapshot = shard_snapshot.with_sstable(sstable.generation, sstable.path.clone());
         }
     }
-    let num_flushed = manifest
-        .as_ref()
-        .map(|m| m.flushed_generations.len())
-        .unwrap_or(0);
+    let num_sstables = manifest.as_ref().map(|m| m.sstables.len()).unwrap_or(0);
     println!(
-        "manifest: {} flushed generations, current_generation={}",
-        num_flushed,
+        "manifest: {} SSTables, current_generation={}",
+        num_sstables,
         manifest.as_ref().map(|m| m.current_generation).unwrap_or(0)
     );
 
@@ -760,7 +757,7 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
         "phase": "search",
         "base_rows": args.base_rows,
         "max_memtable_rows": args.max_memtable_rows,
-        "flushed_generations": num_flushed,
+        "sstables": num_sstables,
         "active_rows": active_rows,
         "vector_dim": VECTOR_DIM,
         "k": args.k,

@@ -6,8 +6,8 @@ use arrow_array::{Int32Array, RecordBatch, UInt64Array};
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::scalar::ScalarValue;
+use datafusion_common::ScalarValue;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use itertools::Itertools;
 use lance_core::ROW_ADDR;
@@ -90,7 +90,7 @@ fn bench_zonemap(c: &mut Criterion) {
         .measurement_time(Duration::from_secs(10));
     let details = prost_types::Any::from_msg(&pbold::ZoneMapIndexDetails::default()).unwrap();
     let index = rt
-        .block_on(ZoneMapIndexPlugin.load_index(store, &details, None, &LanceCache::no_cache()))
+        .block_on(ZoneMapIndexPlugin.load_index(store, &details, 0, None, &LanceCache::no_cache()))
         .unwrap();
     group.bench_function(format!("zonemap_search({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {

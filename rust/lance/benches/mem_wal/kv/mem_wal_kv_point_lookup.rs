@@ -43,8 +43,7 @@ use datafusion::common::ScalarValue;
 use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
 use lance::dataset::mem_wal::scanner::{
-    FlushedMemTableCache, InMemoryMemTableRef, LsmDataSourceCollector, LsmPointLookupPlanner,
-    ShardSnapshot,
+    InMemoryMemTableRef, LsmDataSourceCollector, LsmPointLookupPlanner, ShardSnapshot, SsTableCache,
 };
 use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriterConfig};
 use lance::dataset::{Dataset, WriteParams};
@@ -145,10 +144,9 @@ fn build_queries(rows: usize, queries: usize, miss_ratio: f64, seed: u64) -> Vec
 /// watermark, pick the newest matching row position, and slice that one row
 /// out of the BatchStore. Returns `None` if the key isn't present/visible.
 ///
-/// This mirrors what `BTreeIndexExec` does internally, minus the plan/stream
-/// machinery — it is the lower bound on how fast the current MemTable index
-/// can answer a point lookup. Single-active-memtable only (the bench never
-/// flushes), `KEY_COL` BTree assumed present.
+/// A lower bound on a MemTable point lookup's latency, with no plan or
+/// stream. Single-active-memtable only (the bench never flushes); `KEY_COL`
+/// must have a B-tree.
 fn fast_lookup(active: &InMemoryMemTableRef, key: i64, key_type: KeyType) -> Option<RecordBatch> {
     use arrow_array::Array;
 
@@ -422,7 +420,7 @@ enum LanceReadMode {
     Plan,
     /// Probe the active MemTable's BTree index directly and materialize the
     /// row from the BatchStore, bypassing DataFusion. Single-active-memtable
-    /// fast path (no flushed generations); misses fall through as "not found".
+    /// fast path (no SSTables); misses fall through as "not found".
     Fast,
     /// Call the production `LsmPointLookupPlanner::lookup` API, which uses the
     /// direct BTree fast path internally and falls back to the plan path for
@@ -492,27 +490,27 @@ impl KeyType {
 }
 
 /// Where the data under test lives. `Active` = the in-memory active MemTable
-/// (never flushed). `Flushed` = an on-disk flushed generation (a Lance data
+/// (never flushed). `SsTable` = an on-disk SSTable (a Lance data
 /// file + on-disk BTree index, read via the indexed-scan path) vs a single
 /// RocksDB SST on disk.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Storage {
     Active,
-    Flushed,
+    SsTable,
 }
 
 impl Storage {
     fn parse(v: &str) -> std::result::Result<Self, String> {
         match v {
             "active" => Ok(Self::Active),
-            "flushed" => Ok(Self::Flushed),
-            _ => Err(format!("unknown storage '{v}', expected active|flushed")),
+            "sstable" => Ok(Self::SsTable),
+            _ => Err(format!("unknown storage '{v}', expected active|sstable")),
         }
     }
     fn as_str(self) -> &'static str {
         match self {
             Self::Active => "active",
-            Self::Flushed => "flushed",
+            Self::SsTable => "sstable",
         }
     }
 }
@@ -553,7 +551,7 @@ struct Args {
     engine: Engine,
     key_type: KeyType,
     storage: Storage,
-    /// Number of flushed generations below the single active MemTable (Lance) /
+    /// Number of SSTables below the single active MemTable (Lance) /
     /// immutable SSTs below the active memtable (RocksDB). 0 = the existing
     /// single-tier behavior. >0 builds a full LSM: rows are split into
     /// `generations+1` parts, the first `generations` are flushed to on-disk
@@ -574,12 +572,12 @@ struct Args {
     /// the caches and hit NVMe. Caps the RocksDB write buffer + uses a small
     /// block cache + compacts to one SST, and drops the OS page cache before
     /// the read phase (both engines). Use with a `--rows`×`--value-size` larger
-    /// than RAM. Only affects the `--storage flushed` path.
+    /// than RAM. Only affects the `--storage sstable` path.
     cold: bool,
-    /// Prewarm all flushed generations (open + warm indexes) into the dataset
+    /// Prewarm all SSTables (open + warm indexes) into the dataset
     /// session before the read phase, via `DatasetMemWalExt::prewarm_mem_wal`.
     /// Default on. `--prewarm false` disables it to measure the lazy-warm
-    /// baseline (the flushed cache is still set, so each generation is opened
+    /// baseline (the SSTable cache is still set, so each generation is opened
     /// on its first gen-key lookup instead of up front). Only affects the Lance
     /// `--storage active` LSM path.
     prewarm: bool,
@@ -775,7 +773,7 @@ async fn run_lance(
 
     // No-flush config: every *memtable*-flush threshold is set above the
     // dataset so the single active MemTable holds all rows (no generation is
-    // sealed to disk). Read visibility is gated on the WAL durability
+    // frozen to disk). Read visibility is gated on the WAL durability
     // watermark (`max_visible_batch_position`), which only advances on a WAL
     // flush — so we use `durable_write=true`: each put flushes its batch to
     // the WAL and awaits, which both populates the maintained BTree and
@@ -802,7 +800,7 @@ async fn run_lance(
     let writer = dataset.mem_wal_writer(shard_id, config).await?;
 
     // --- write phase ---
-    // LSM: split rows into `generations+1` parts; seal+flush after each of the
+    // LSM: split rows into `generations+1` parts; freeze+flush after each of the
     // first `generations` parts (each becomes an on-disk generation) and leave
     // the last part in the active MemTable.
     let gens = args.generations;
@@ -828,12 +826,12 @@ async fn run_lance(
             lo = hi;
         }
         if g < gens {
-            writer.force_seal_active().await?;
+            writer.force_freeze_active().await?;
             for _ in 0..600 {
                 let n = writer
                     .manifest()
                     .await?
-                    .map(|m| m.flushed_generations.len())
+                    .map(|m| m.sstables.len())
                     .unwrap_or(0);
                 if n > g {
                     break;
@@ -849,10 +847,10 @@ async fn run_lance(
     let n_gens = writer
         .manifest()
         .await?
-        .map(|m| m.flushed_generations.len())
+        .map(|m| m.sstables.len())
         .unwrap_or(0);
     println!(
-        "[lance] wrote {} rows in {:.2}s = {:.0} rows/s (cpu {:.2}s, flushed_gens={n_gens}+active)",
+        "[lance] wrote {} rows in {:.2}s = {:.0} rows/s (cpu {:.2}s, sstables={n_gens}+active)",
         args.rows, write_s, write_rows_per_s, write_cpu_s
     );
 
@@ -862,8 +860,8 @@ async fn run_lance(
     let mut shard_snapshot = ShardSnapshot::new(shard_id);
     if let Some(ref m) = manifest {
         shard_snapshot = shard_snapshot.with_current_generation(m.current_generation);
-        for fg in &m.flushed_generations {
-            shard_snapshot = shard_snapshot.with_flushed_generation(fg.generation, fg.path.clone());
+        for sstable in &m.sstables {
+            shard_snapshot = shard_snapshot.with_sstable(sstable.generation, sstable.path.clone());
         }
     }
     // Keep a handle to the active MemTable for the direct fast path before
@@ -871,22 +869,23 @@ async fn run_lance(
     let active = Arc::new(in_memory_refs.active.clone());
     let collector = LsmDataSourceCollector::new(dataset.clone(), vec![shard_snapshot.clone()])
         .with_in_memory_memtables(shard_id, in_memory_refs);
-    // Thread the dataset session + a flushed-dataset cache into the planner, and
-    // prewarm every flushed generation (open + warm its indexes) up front via
+    // Thread the dataset session + an SSTable cache into the planner, and
+    // prewarm every SSTable (open + warm its indexes) up front via
     // the general MemWAL API, so gen-key lookups never re-open a generation per
     // query (the equivalent of RocksDB keeping its DB + SSTs resident). Without
     // this, each plan-path lookup pays a fresh manifest read + Dataset open — a
     // fixed per-lookup cost independent of generation count.
-    let flushed_cache = Arc::new(FlushedMemTableCache::new((gens as u64).max(1)));
+    let sstable_cache = Arc::new(SsTableCache::new((gens as u64).max(1)));
     if args.prewarm {
         dataset
-            .prewarm_mem_wal(std::slice::from_ref(&shard_snapshot), Some(&flushed_cache))
+            .prewarm_mem_wal(std::slice::from_ref(&shard_snapshot), Some(&sstable_cache))
             .await?;
     }
     let planner = Arc::new(
         LsmPointLookupPlanner::new(collector, vec![KEY_COL.to_string()], arrow_schema)
+            .unwrap()
             .with_session(dataset.session())
-            .with_flushed_cache(flushed_cache),
+            .with_sstable_cache(sstable_cache),
     );
 
     // Warmup + correctness: a hit key must resolve to exactly one row under
@@ -1205,7 +1204,7 @@ async fn run_lance(
 }
 
 // ----------------------------------------------------------------------
-// Lance flushed (on-disk) engine
+// Lance SSTable (on-disk) engine
 // ----------------------------------------------------------------------
 
 /// Drop the OS page cache so subsequent reads hit storage (cold). Best-effort:
@@ -1220,7 +1219,7 @@ fn drop_page_cache() {
 /// One indexed point lookup via the **DataFusion** path: `scan().filter("id =
 /// key")` parses + plans + executes a query per lookup (uses the on-disk BTree
 /// index). Returns the matched row count.
-async fn flushed_probe(dataset: &Dataset, key: i64) -> Result<usize> {
+async fn sstable_probe(dataset: &Dataset, key: i64) -> Result<usize> {
     use futures::StreamExt;
     let mut scanner = dataset.scan();
     scanner.filter(&format!("{KEY_COL} = {key}"))?;
@@ -1234,8 +1233,8 @@ async fn flushed_probe(dataset: &Dataset, key: i64) -> Result<usize> {
 
 /// One point lookup via the **direct** path: search the on-disk BTree scalar
 /// index for the row id, then `take` that row — bypassing DataFusion plan
-/// construction. Diagnostic for how much of the flushed read cost is the plan.
-async fn flushed_probe_direct(
+/// construction. Diagnostic for how much of the SSTable read cost is the plan.
+async fn sstable_probe_direct(
     dataset: &Dataset,
     scalar_index: &Arc<dyn lance_index::scalar::ScalarIndex>,
     key: i64,
@@ -1256,25 +1255,25 @@ async fn flushed_probe_direct(
     Ok(batch.num_rows())
 }
 
-/// Dispatch a flushed point lookup: `direct` = on-disk BTree index search + take
+/// Dispatch an SSTable point lookup: `direct` = on-disk BTree index search + take
 /// (no DataFusion); otherwise the DataFusion `scan().filter()` path.
-async fn flushed_lookup(
+async fn sstable_lookup(
     dataset: &Dataset,
     scalar_index: &Arc<dyn lance_index::scalar::ScalarIndex>,
     key: i64,
     direct: bool,
 ) -> Result<usize> {
     if direct {
-        flushed_probe_direct(dataset, scalar_index, key).await
+        sstable_probe_direct(dataset, scalar_index, key).await
     } else {
-        flushed_probe(dataset, key).await
+        sstable_probe(dataset, key).await
     }
 }
 
-/// Batched flushed lookup over a chunk of keys: `direct` searches the index for
+/// Batched SSTable lookup over a chunk of keys: `direct` searches the index for
 /// each key then issues one `take_rows` for all; otherwise one DataFusion scan
 /// with `id IN (...)`. Returns the total matched row count.
-async fn flushed_batch(
+async fn sstable_batch(
     dataset: &Dataset,
     scalar_index: &Arc<dyn lance_index::scalar::ScalarIndex>,
     keys: &[i64],
@@ -1320,11 +1319,11 @@ async fn flushed_batch(
     }
 }
 
-/// Flushed Lance: write all rows as one on-disk Lance dataset with a BTree
+/// SSTable Lance: write all rows as one on-disk Lance dataset with a BTree
 /// scalar index — the exact artifact a MemTable flush emits (forward-written
 /// data file + on-disk BTree index) — then point-lookup through the indexed
 /// scan path. Int keys only (the SQL filter literal is the integer).
-async fn run_lance_flushed(
+async fn run_lance_sstable(
     args: &Args,
     insert_order: &[i64],
     queries: &[(i64, bool)],
@@ -1332,12 +1331,12 @@ async fn run_lance_flushed(
     assert_eq!(
         args.key_type,
         KeyType::Int,
-        "flushed mode currently supports --key-type int only"
+        "sstable mode currently supports --key-type int only"
     );
     let sampler = RssSampler::start();
     let key_type = args.key_type;
     let schema = make_schema(key_type);
-    let uri = format!("{}/lance_flushed", args.uri.trim_end_matches('/'));
+    let uri = format!("{}/lance_sstable", args.uri.trim_end_matches('/'));
     let _ = std::fs::remove_dir_all(&uri);
 
     // --- write + flush: build the on-disk data file + BTree index ---
@@ -1378,13 +1377,13 @@ async fn run_lance_flushed(
             .iter()
             .find(|i| i.name == BTREE_INDEX_NAME)
             .map(|i| i.uuid.to_string())
-            .ok_or_else(|| lance_core::Error::internal("flushed: btree index not found"))?;
+            .ok_or_else(|| lance_core::Error::internal("sstable: btree index not found"))?;
         dataset
             .open_scalar_index(KEY_COL, &uuid, &NoOpMetricsCollector)
             .await?
     };
     println!(
-        "[lance] flushed read path = {}",
+        "[lance] sstable read path = {}",
         if direct {
             "direct btree-index search + take"
         } else {
@@ -1394,8 +1393,8 @@ async fn run_lance_flushed(
 
     // warmup + correctness: a hit resolves to exactly one row via the index.
     if let Some((probe, _)) = queries.iter().find(|(_, h)| *h) {
-        let n = flushed_lookup(&dataset, &scalar_index, *probe, direct).await?;
-        assert_eq!(n, 1, "flushed warmup lookup for key {probe} returned {n}");
+        let n = sstable_lookup(&dataset, &scalar_index, *probe, direct).await?;
+        assert_eq!(n, 1, "sstable warmup lookup for key {probe} returned {n}");
     }
 
     // Cold mode: drop the OS page cache so reads hit NVMe (data > RAM assumed).
@@ -1404,7 +1403,7 @@ async fn run_lance_flushed(
         println!("[lance] dropped page cache (cold reads from NVMe)");
     }
 
-    // --- batch-get path: gather `batch_get` keys per call from the flushed gen ---
+    // --- batch-get path: gather `batch_get` keys per call from the SSTable ---
     if args.batch_get > 0 {
         let bg = args.batch_get;
         let hit_keys: Vec<i64> = queries
@@ -1418,7 +1417,7 @@ async fn run_lance_flushed(
         let t = Instant::now();
         for chunk in hit_keys.chunks(bg) {
             let t0 = Instant::now();
-            found_total += flushed_batch(&dataset, &scalar_index, chunk, direct).await?;
+            found_total += sstable_batch(&dataset, &scalar_index, chunk, direct).await?;
             latencies_us.push(t0.elapsed().as_nanos() as f64 / 1000.0);
         }
         let read_qps_1t = hit_keys.len() as f64 / t.elapsed().as_secs_f64().max(1e-9);
@@ -1438,7 +1437,7 @@ async fn run_lance_flushed(
                     let chunks: Vec<&[i64]> = keys.chunks(bg).collect();
                     let mut i = shard;
                     while i < chunks.len() {
-                        let _ = flushed_batch(&dataset, &si, chunks[i], direct).await;
+                        let _ = sstable_batch(&dataset, &si, chunks[i], direct).await;
                         i += threads;
                     }
                 }));
@@ -1455,7 +1454,7 @@ async fn run_lance_flushed(
             args.threads, stats.p50_us, stats.p99_us
         );
         return Ok(EngineResult {
-            engine: "lance-flushed-batch",
+            engine: "lance-sstable-batch",
             write_rows_per_s,
             write_cpu_s,
             read_p50_us: stats.p50_us,
@@ -1480,7 +1479,7 @@ async fn run_lance_flushed(
     let t_read = Instant::now();
     for &(key, expect_hit) in queries {
         let t0 = Instant::now();
-        let n = flushed_lookup(&dataset, &scalar_index, key, direct).await?;
+        let n = sstable_lookup(&dataset, &scalar_index, key, direct).await?;
         latencies_us.push(t0.elapsed().as_nanos() as f64 / 1000.0);
         if expect_hit {
             assert_eq!(n, 1, "expected hit for key {key}, got {n}");
@@ -1510,7 +1509,7 @@ async fn run_lance_flushed(
             handles.push(tokio::spawn(async move {
                 let mut i = shard;
                 while i < keys.len() {
-                    let _ = flushed_lookup(&dataset, &scalar_index, keys[i], direct).await;
+                    let _ = sstable_lookup(&dataset, &scalar_index, keys[i], direct).await;
                     i += threads;
                 }
             }));
@@ -1535,7 +1534,7 @@ async fn run_lance_flushed(
     );
 
     Ok(EngineResult {
-        engine: "lance-flushed",
+        engine: "lance-sstable",
         write_rows_per_s,
         write_cpu_s,
         read_p50_us: stats.p50_us,
@@ -1584,7 +1583,7 @@ fn run_rocksdb(args: &Args, insert_order: &[i64], queries: &[(i64, bool)]) -> Re
     opts.set_min_write_buffer_number_to_merge(2);
     opts.set_disable_auto_compactions(true);
     opts.set_db_write_buffer_size(write_buf);
-    // Block cache for the `--storage flushed` SST reads. Warm: large enough to
+    // Block cache for the `--storage sstable` SST reads. Warm: large enough to
     // hold the SST index/filter + hot data blocks. Cold: small (128MB) so data
     // blocks miss the cache and reads go to NVMe (index/filter stay in memory).
     {
@@ -1653,17 +1652,17 @@ fn run_rocksdb(args: &Args, insert_order: &[i64], queries: &[(i64, bool)]) -> Re
         write_buf >> 20
     );
 
-    // Single-tier `--storage flushed` (no extra generations): flush the active
+    // Single-tier `--storage sstable` (no extra generations): flush the active
     // to one SST (compact to one if cold). With generations>0 the per-chunk
     // flushes already produced N separate L0 SSTs + the active memtable.
-    if gens == 0 && args.storage == Storage::Flushed {
+    if gens == 0 && args.storage == Storage::SsTable {
         db.flush()
             .map_err(|e| lance_core::Error::io(format!("rocksdb flush: {e}")))?;
         if args.cold {
             db.compact_range::<&[u8], &[u8]>(None, None);
         }
     }
-    if args.storage == Storage::Flushed || gens > 0 {
+    if args.storage == Storage::SsTable || gens > 0 {
         let n_sst = db
             .property_int_value("rocksdb.num-files-at-level0")
             .ok()
@@ -1938,7 +1937,7 @@ async fn run(args: Args) -> Result<()> {
     if matches!(args.engine, Engine::Lance | Engine::Both) {
         let res = match args.storage {
             Storage::Active => run_lance(&args, &insert_order, &queries).await?,
-            Storage::Flushed => run_lance_flushed(&args, &insert_order, &queries).await?,
+            Storage::SsTable => run_lance_sstable(&args, &insert_order, &queries).await?,
         };
         results.push(res);
     }

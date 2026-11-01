@@ -4,12 +4,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use lance_core::cache::{CacheBackend, CacheKeyIterator, LanceCache};
+use lance_core::cache::{CacheBackend, LanceCache, QuickCacheBackend, QuickCacheShardPolicy};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_io::object_store::ObjectStoreRegistry;
 use lance_io::spill::{LocalSpillStore, SpillStore};
+
+pub use lance_index::vector::storage::{OriginLatencyClass, ResidentColumnsSetting};
+
+use crate::index::vector::ivf::v2::rabit_scan::RabitScanFactory;
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::session::caches::GlobalMetadataCache;
@@ -17,9 +21,27 @@ use crate::session::index_caches::GlobalIndexCache;
 
 use self::index_extension::IndexExtension;
 
+/// Automatic index caches favor one shared budget because they commonly hold
+/// a small number of large, unequal partition entries.
+const AUTOMATIC_INDEX_CACHE_SHARD_POLICY: QuickCacheShardPolicy = QuickCacheShardPolicy::Single;
+
 pub(crate) mod caches;
 pub mod index_caches;
 pub(crate) mod index_extension;
+
+/// Cache selection for one session cache tier.
+#[derive(Clone, Debug)]
+pub enum CacheSpec {
+    /// Use the Lance-level default capacity for the tier.
+    Default,
+    /// Use the default in-memory backend with this weighted-entry capacity.
+    ///
+    /// This is not an RSS limit: active queries and in-progress loaders can
+    /// retain memory in addition to resident cache entries.
+    Size(usize),
+    /// Use an already constructed backend.
+    Backend(Arc<dyn CacheBackend>),
+}
 
 /// A user session holds the runtime state for a [`crate::Dataset`]
 ///
@@ -56,6 +78,18 @@ pub struct Session {
     store_registry: Arc<ObjectStoreRegistry>,
 
     spill_store: Arc<dyn SpillStore>,
+
+    /// The origin latency class the process declares for the IVF_RQ indexes
+    /// this session opens; see [`Self::with_index_origin_latency`]. `None`
+    /// leaves each index the class of its object store.
+    index_origin_latency: Option<OriginLatencyClass>,
+
+    /// Whether the IVF_RQ indexes this session opens keep their small columns
+    /// resident; see [`Self::with_index_resident_columns`].
+    index_resident_columns: ResidentColumnsSetting,
+
+    /// Optional runtime strategy, rebound for each opened index.
+    pub(crate) rabit_scan_factory: Option<Arc<dyn RabitScanFactory>>,
 }
 
 impl DeepSizeOf for Session {
@@ -86,6 +120,9 @@ impl std::fmt::Debug for Session {
                 "index_extensions",
                 &self.index_extensions.keys().collect::<Vec<_>>(),
             )
+            .field("index_origin_latency", &self.index_origin_latency)
+            .field("index_resident_columns", &self.index_resident_columns)
+            .field("has_rabit_scan_factory", &self.rabit_scan_factory.is_some())
             .finish()
     }
 }
@@ -95,8 +132,11 @@ impl Session {
     ///
     /// Parameters:
     ///
-    /// - ***index_cache_size***: the size of the index cache.
-    /// - ***metadata_cache_size***: the size of the metadata cache.
+    /// - ***index_cache_size***: the weighted-entry budget of the index cache,
+    ///   backed by a single-shard [`QuickCacheBackend`]. The budget is shared
+    ///   by all indices in the session and is not a process RSS limit.
+    /// - ***metadata_cache_size***: the size of the metadata cache, backed by
+    ///   [`QuickCacheBackend`].
     /// - ***store_registry***: the object store registry to use when opening
     ///   datasets. This determines which schemes are available, and also allows
     ///   re-using object stores.
@@ -106,18 +146,27 @@ impl Session {
         store_registry: Arc<ObjectStoreRegistry>,
     ) -> Self {
         Self {
-            index_cache: GlobalIndexCache(LanceCache::with_capacity(index_cache_size)),
-            metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(metadata_cache_size)),
+            index_cache: GlobalIndexCache(Self::build_automatic_quick_cache(
+                index_cache_size,
+                AUTOMATIC_INDEX_CACHE_SHARD_POLICY,
+            )),
+            metadata_cache: GlobalMetadataCache(Self::build_automatic_quick_cache(
+                metadata_cache_size,
+                QuickCacheShardPolicy::Recommended,
+            )),
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
+            index_origin_latency: None,
+            index_resident_columns: ResidentColumnsSetting::Auto,
+            rabit_scan_factory: None,
         }
     }
 
     /// Create a session with a custom index cache backend.
     ///
     /// The provided backend will be used for caching index data. The metadata
-    /// cache will use the default Moka-based backend with the given capacity.
+    /// cache uses a [`QuickCacheBackend`] with the given capacity.
     pub fn with_index_cache_backend(
         index_cache_backend: Arc<dyn CacheBackend>,
         metadata_cache_size: usize,
@@ -125,10 +174,16 @@ impl Session {
     ) -> Self {
         Self {
             index_cache: GlobalIndexCache(LanceCache::with_backend(index_cache_backend)),
-            metadata_cache: GlobalMetadataCache(LanceCache::with_capacity(metadata_cache_size)),
+            metadata_cache: GlobalMetadataCache(Self::build_automatic_quick_cache(
+                metadata_cache_size,
+                QuickCacheShardPolicy::Recommended,
+            )),
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
+            index_origin_latency: None,
+            index_resident_columns: ResidentColumnsSetting::Auto,
+            rabit_scan_factory: None,
         }
     }
 
@@ -149,12 +204,168 @@ impl Session {
         self
     }
 
+    /// Declare the origin latency class of the IVF_RQ indexes this session
+    /// opens: how slow reads are that no Lance cache tier serves. `None` (the
+    /// default) leaves each index the class of its object store, high for a
+    /// cloud object store and low for local files and memory.
+    ///
+    /// Declare it when the object store is wrapped in something the store's
+    /// scheme does not show, such as a local page cache that also caches index
+    /// files in front of a cloud object store (declare
+    /// [`OriginLatencyClass::Low`]). The class sets reader policies that trade
+    /// bytes or background work for fewer origin requests; results do not
+    /// depend on it. Other index types ignore it, and `LANCE_RQ_ORIGIN_LATENCY`
+    /// set to `low` or `high` overrides it.
+    ///
+    /// ```rust,no_run
+    /// # use lance::session::{OriginLatencyClass, Session};
+    /// let session =
+    ///     Session::default().with_index_origin_latency(Some(OriginLatencyClass::Low));
+    /// assert_eq!(session.index_origin_latency(), Some(OriginLatencyClass::Low));
+    /// ```
+    pub fn with_index_origin_latency(mut self, class: Option<OriginLatencyClass>) -> Self {
+        self.index_origin_latency = class;
+        self
+    }
+
+    /// The origin latency class this session declares for the IVF_RQ indexes
+    /// it opens, `None` when it declares none; see
+    /// [`Self::with_index_origin_latency`].
+    pub fn index_origin_latency(&self) -> Option<OriginLatencyClass> {
+        self.index_origin_latency
+    }
+
+    /// Set whether the IVF_RQ indexes this session opens keep the small
+    /// columns of their storage files (row ids and factors) resident in a
+    /// store charged in the index cache, so that reads fetch only the code
+    /// columns from the files. [`ResidentColumnsSetting::Auto`] (the default)
+    /// keeps them when the store's charge fits the cache entry limit,
+    /// whatever the origin;
+    /// [`ResidentColumnsSetting::On`] keeps them always and
+    /// [`ResidentColumnsSetting::Off`] never. Each index resolves the setting
+    /// when it opens; results do not depend on it. Other index types ignore
+    /// it, and `LANCE_RQ_RESIDENT_COLUMNS` set to `on` or `off` overrides it.
+    ///
+    /// ```rust,no_run
+    /// # use lance::session::{ResidentColumnsSetting, Session};
+    /// let session =
+    ///     Session::default().with_index_resident_columns(ResidentColumnsSetting::Off);
+    /// assert_eq!(session.index_resident_columns(), ResidentColumnsSetting::Off);
+    /// ```
+    pub fn with_index_resident_columns(mut self, setting: ResidentColumnsSetting) -> Self {
+        self.index_resident_columns = setting;
+        self
+    }
+
+    /// Whether the IVF_RQ indexes this session opens keep their small
+    /// columns resident, [`ResidentColumnsSetting::Auto`] unless set; see
+    /// [`Self::with_index_resident_columns`].
+    pub fn index_resident_columns(&self) -> ResidentColumnsSetting {
+        self.index_resident_columns
+    }
+
+    /// Install a runtime scan strategy for native RaBitQ indices
+    /// with current plane storage, including reconstruction from cached metadata.
+    /// Without a factory, queries use Lance's built-in full scan.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use lance::session::Session;
+    /// use lance::index::vector::ivf::v2::rabit_scan::RabitScanFactory;
+    /// fn configured(factory: Arc<dyn RabitScanFactory>) -> Session {
+    ///     Session::default().with_rabit_scan_factory(factory)
+    /// }
+    /// ```
+    pub fn with_rabit_scan_factory(mut self, factory: Arc<dyn RabitScanFactory>) -> Self {
+        self.rabit_scan_factory = Some(factory);
+        self
+    }
+
     /// Return a reference to the session's spill store.
     ///
     /// Callers use this to obtain reclaimable scratch space for intermediate
     /// state that overflows memory (e.g. index builders).
     pub fn spill_store(&self) -> &dyn SpillStore {
         &*self.spill_store
+    }
+
+    /// Create a session with custom backends for both caches.
+    ///
+    /// Each [`CacheSpec`] controls one tier. [`CacheSpec::Default`] uses that
+    /// tier's Lance-level default capacity, [`CacheSpec::Size`] uses the
+    /// default in-memory backend with an explicit weighted-entry budget, and
+    /// [`CacheSpec::Backend`] uses a caller-provided backend. This keeps size
+    /// and backend selection mutually exclusive.
+    ///
+    /// This is the recommended constructor when a caller has already resolved
+    /// backend selection through
+    /// [`build_from_config`](lance_core::cache::build_from_config) or
+    /// [`build_from_uri`](lance_core::cache::build_from_uri) — the resulting
+    /// `Arc<dyn CacheBackend>` can be plugged in for either or both caches.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lance::session::{CacheSpec, Session};
+    /// # use lance_core::cache::build_from_uri;
+    /// # fn example() -> lance_core::Result<()> {
+    /// let index_backend = build_from_uri("moka://?capacity=1048576")?;
+    /// let session = Session::with_cache_backends(
+    ///     CacheSpec::Backend(index_backend),
+    ///     CacheSpec::Default,
+    ///     Default::default(),
+    /// );
+    /// # let _ = session;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_cache_backends(
+        index_cache: CacheSpec,
+        metadata_cache: CacheSpec,
+        store_registry: Arc<ObjectStoreRegistry>,
+    ) -> Self {
+        let index_cache = Self::build_cache(
+            index_cache,
+            DEFAULT_INDEX_CACHE_SIZE,
+            AUTOMATIC_INDEX_CACHE_SHARD_POLICY,
+        );
+        let metadata_cache = Self::build_cache(
+            metadata_cache,
+            DEFAULT_METADATA_CACHE_SIZE,
+            QuickCacheShardPolicy::Recommended,
+        );
+        Self {
+            index_cache: GlobalIndexCache(index_cache),
+            metadata_cache: GlobalMetadataCache(metadata_cache),
+            index_extensions: HashMap::new(),
+            store_registry,
+            spill_store: Arc::new(LocalSpillStore::default()),
+            index_origin_latency: None,
+            index_resident_columns: ResidentColumnsSetting::Auto,
+            rabit_scan_factory: None,
+        }
+    }
+
+    fn build_cache(
+        spec: CacheSpec,
+        default_size: usize,
+        shard_policy: QuickCacheShardPolicy,
+    ) -> LanceCache {
+        match spec {
+            CacheSpec::Default => Self::build_automatic_quick_cache(default_size, shard_policy),
+            CacheSpec::Size(size) => Self::build_automatic_quick_cache(size, shard_policy),
+            CacheSpec::Backend(backend) => LanceCache::with_backend(backend),
+        }
+    }
+
+    fn build_automatic_quick_cache(
+        capacity: usize,
+        shard_policy: QuickCacheShardPolicy,
+    ) -> LanceCache {
+        LanceCache::with_backend(Arc::new(QuickCacheBackend::with_shard_policy(
+            capacity,
+            shard_policy,
+        )))
     }
 
     /// Register a new index extension.
@@ -239,44 +450,6 @@ impl Session {
     pub async fn index_cache_stats(&self) -> lance_core::cache::CacheStats {
         self.index_cache.0.stats().await
     }
-
-    /// Return an iterator over keys currently held by the index cache.
-    ///
-    /// Returns `None` when the index cache backend does not support key
-    /// inventory.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use lance::session::Session;
-    /// # async fn example() {
-    /// let session = Session::default();
-    /// let keys = session.index_cache_keys().await;
-    /// assert!(keys.is_some());
-    /// # }
-    /// ```
-    pub async fn index_cache_keys(&self) -> Option<CacheKeyIterator<'_>> {
-        self.index_cache.0.keys().await
-    }
-
-    /// Return an iterator over keys currently held by the metadata cache.
-    ///
-    /// Returns `None` when the metadata cache backend does not support key
-    /// inventory.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use lance::session::Session;
-    /// # async fn example() {
-    /// let session = Session::default();
-    /// let keys = session.metadata_cache_keys().await;
-    /// assert!(keys.is_some());
-    /// # }
-    /// ```
-    pub async fn metadata_cache_keys(&self) -> Option<CacheKeyIterator<'_>> {
-        self.metadata_cache.0.keys().await
-    }
 }
 
 impl Default for Session {
@@ -293,6 +466,7 @@ impl Default for Session {
 mod tests {
     use super::*;
     use lance_core::cache::{CacheKey, UnsizedCacheKey};
+    use lance_core::deepsize::Context;
     use lance_index::vector::VectorIndex;
     use std::borrow::Cow;
     use tokio::io::AsyncWriteExt;
@@ -306,7 +480,7 @@ mod tests {
         }
 
         fn type_name() -> &'static str {
-            "TestVec"
+            "Test"
         }
     }
 
@@ -319,6 +493,50 @@ mod tests {
 
         fn type_name() -> &'static str {
             "TestUnsized"
+        }
+    }
+
+    struct DeclaredWeight(usize);
+
+    impl DeepSizeOf for DeclaredWeight {
+        fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+            self.0
+        }
+    }
+
+    struct WeightedKey(u64);
+
+    impl CacheKey for WeightedKey {
+        type ValueType = DeclaredWeight;
+
+        fn key(&self) -> Cow<'_, str> {
+            self.0.to_string().into()
+        }
+
+        fn type_name() -> &'static str {
+            "DeclaredWeight"
+        }
+    }
+
+    async fn assert_fitting_working_set_is_resident(session: &Session, gibibytes: &[usize]) {
+        for (index, gibibytes) in gibibytes.iter().copied().enumerate() {
+            session
+                .index_cache
+                .insert_with_key(
+                    &WeightedKey(index as u64),
+                    Arc::new(DeclaredWeight(gibibytes << 30)),
+                )
+                .await;
+        }
+        for index in 0..gibibytes.len() {
+            assert!(
+                session
+                    .index_cache
+                    .get_with_key(&WeightedKey(index as u64))
+                    .await
+                    .is_some(),
+                "entry {index} should remain resident"
+            );
         }
     }
 
@@ -335,40 +553,110 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_session_cache_keys() {
-        let session = Session::new(10_000, 10_000, Default::default());
+    async fn automatic_index_caches_use_one_shared_weight_budget() {
+        assert_eq!(
+            AUTOMATIC_INDEX_CACHE_SHARD_POLICY,
+            QuickCacheShardPolicy::Single
+        );
+
+        let session = Session::new(8 << 30, 0, Default::default());
+        assert_fitting_working_set_is_resident(&session, &[3, 2, 2]).await;
+
+        let session = Session::with_cache_backends(
+            CacheSpec::Size(8 << 30),
+            CacheSpec::Size(0),
+            Default::default(),
+        );
+        assert_fitting_working_set_is_resident(&session, &[3, 2, 2]).await;
+
+        let session = Session::with_cache_backends(
+            CacheSpec::Default,
+            CacheSpec::Size(0),
+            Default::default(),
+        );
+        assert_fitting_working_set_is_resident(&session, &[2, 1, 1]).await;
+
+        let session = Session::default();
+        let shared_session = session.clone();
+        session
+            .index_cache
+            .insert_with_key(&TestKey("shared-session"), Arc::new(vec![7]))
+            .await;
+        assert!(
+            shared_session
+                .index_cache
+                .get_with_key(&TestKey("shared-session"))
+                .await
+                .is_some()
+        );
+    }
+
+    /// `with_cache_backends` should honor whichever tier the caller
+    /// provided a backend for and fall back to that tier's default on the
+    /// other tier.
+    #[tokio::test]
+    async fn test_with_cache_backends_uses_provided_and_default() {
+        use lance_core::cache::build_from_uri;
+
+        let index_backend = build_from_uri("moka://?capacity=1048576").unwrap();
+        let session = Session::with_cache_backends(
+            CacheSpec::Backend(index_backend),
+            CacheSpec::Default,
+            Default::default(),
+        );
+
+        let value = Arc::new(vec![1, 2, 3]);
+        session
+            .index_cache
+            .insert_with_key(&TestKey("injected-index-backend"), value.clone())
+            .await;
+        assert_eq!(
+            session
+                .index_cache
+                .get_with_key(&TestKey("injected-index-backend"))
+                .await
+                .as_deref(),
+            Some(value.as_ref())
+        );
+        // Metadata cache fell back to a size-based default. We can only
+        // sanity-check that the session was constructed without panicking.
+        let stats = session.metadata_cache.0.stats().await;
+        assert_eq!(stats.num_entries, 0);
+    }
+
+    #[tokio::test]
+    async fn test_with_cache_backends_uses_explicit_size() {
+        let session = Session::with_cache_backends(
+            CacheSpec::Size(0),
+            CacheSpec::Size(2048),
+            Default::default(),
+        );
 
         session
             .index_cache
-            .insert_with_key(&TestKey("index-key"), Arc::new(vec![1]))
+            .insert_with_key(&TestKey("disabled-index-cache"), Arc::new(vec![1, 2, 3]))
             .await;
+        assert!(
+            session
+                .index_cache
+                .get_with_key(&TestKey("disabled-index-cache"))
+                .await
+                .is_none()
+        );
+
         session
             .metadata_cache
             .0
-            .insert_with_key(&TestKey("metadata-key"), Arc::new(vec![2]))
+            .insert_with_key(&TestKey("metadata-cache"), Arc::new(vec![4, 5, 6]))
             .await;
-
-        let index_keys = session
-            .index_cache_keys()
-            .await
-            .unwrap()
-            .collect::<Vec<_>>();
-        assert_eq!(index_keys.len(), 1);
-        assert_eq!(index_keys[0].prefix(), "");
-        assert_eq!(index_keys[0].key(), "index-key");
-        assert_eq!(index_keys[0].type_name(), "TestVec");
-
-        let metadata_keys = session
-            .metadata_cache_keys()
-            .await
-            .unwrap()
-            .collect::<Vec<_>>();
-        assert_eq!(metadata_keys.len(), 1);
-        assert_eq!(metadata_keys[0].prefix(), "");
-        assert_eq!(metadata_keys[0].key(), "metadata-key");
-        assert_eq!(metadata_keys[0].type_name(), "TestVec");
-
-        assert_ne!(index_keys, metadata_keys);
+        assert!(
+            session
+                .metadata_cache
+                .0
+                .get_with_key(&TestKey("metadata-cache"))
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -380,6 +668,90 @@ mod tests {
         lance_io::traits::Writer::shutdown(writer.as_mut())
             .await
             .unwrap();
+    }
+
+    /// A session declares no origin latency class unless built with one,
+    /// whichever constructor built it; its clones keep the class, and its
+    /// debug output shows it.
+    #[test]
+    fn test_index_origin_latency_hint() {
+        let sessions = [
+            Session::default(),
+            Session::new(0, 0, Default::default()),
+            Session::with_index_cache_backend(
+                Arc::new(QuickCacheBackend::with_capacity(0)),
+                0,
+                Default::default(),
+            ),
+            Session::with_cache_backends(
+                CacheSpec::Default,
+                CacheSpec::Default,
+                Default::default(),
+            ),
+        ];
+        for session in sessions {
+            assert_eq!(session.index_origin_latency(), None);
+            assert!(
+                format!("{session:?}").contains("index_origin_latency: None"),
+                "{session:?}"
+            );
+            for class in [OriginLatencyClass::Low, OriginLatencyClass::High] {
+                let hinted = session.clone().with_index_origin_latency(Some(class));
+                assert_eq!(hinted.index_origin_latency(), Some(class));
+                assert_eq!(hinted.clone().index_origin_latency(), Some(class));
+                assert!(
+                    format!("{hinted:?}")
+                        .contains(&format!("index_origin_latency: Some({class:?})")),
+                    "{hinted:?}"
+                );
+                let cleared = hinted.with_index_origin_latency(None);
+                assert_eq!(cleared.index_origin_latency(), None);
+            }
+        }
+    }
+
+    /// A session leaves IVF_RQ residency to `auto` unless built with a
+    /// setting, whichever constructor built it; its clones keep the
+    /// setting, and its debug output shows it.
+    #[test]
+    fn test_index_resident_columns_setting() {
+        let sessions = [
+            Session::default(),
+            Session::new(0, 0, Default::default()),
+            Session::with_index_cache_backend(
+                Arc::new(QuickCacheBackend::with_capacity(0)),
+                0,
+                Default::default(),
+            ),
+            Session::with_cache_backends(
+                CacheSpec::Default,
+                CacheSpec::Default,
+                Default::default(),
+            ),
+        ];
+        for session in sessions {
+            assert_eq!(
+                session.index_resident_columns(),
+                ResidentColumnsSetting::Auto
+            );
+            assert!(
+                format!("{session:?}").contains("index_resident_columns: Auto"),
+                "{session:?}"
+            );
+            for setting in [
+                ResidentColumnsSetting::On,
+                ResidentColumnsSetting::Off,
+                ResidentColumnsSetting::Auto,
+            ] {
+                let set = session.clone().with_index_resident_columns(setting);
+                assert_eq!(set.index_resident_columns(), setting);
+                assert_eq!(set.clone().index_resident_columns(), setting);
+                assert!(
+                    format!("{set:?}").contains(&format!("index_resident_columns: {setting:?}")),
+                    "{set:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

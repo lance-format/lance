@@ -106,6 +106,7 @@ test_data/venv
 **/*.profraw
 *.lance
 !test_data/**/*.lance
+!rust/lance-file/test_data/**/*.lance
 
 # Pytest benchmarks
 .benchmarks/

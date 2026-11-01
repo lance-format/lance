@@ -1,23 +1,44 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, sync::Arc};
+pub mod gate;
+pub mod ledger;
+pub mod lineage;
+pub mod metadata;
+
+use std::{collections::HashMap, io::Cursor, sync::Arc};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, UInt64Array};
 use lance_core::deepsize::{Context, DeepSizeOf};
+use lance_core::utils::row_addr_remap::{GroupInputWithLayout, RowAddrRemap};
 use lance_core::{Error, Result};
 use lance_select::RowAddrTreeMap;
+use prost::Name;
 use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::format::pb::fragment_reuse_index_details::InlineContent;
-use crate::format::{ExternalFile, Fragment, pb};
+use crate::format::{ExternalFile, Fragment, IndexMetadata, pb};
 
 pub const FRAG_REUSE_INDEX_NAME: &str = "__lance_frag_reuse";
 pub const FRAG_REUSE_DETAILS_FILE_NAME: &str = "details.binpb";
+
+/// Whether `index` is the fragment reuse index itself, not a user index that
+/// borrows its name.
+pub fn is_frag_reuse_index_entry(index: &IndexMetadata) -> bool {
+    index.name == FRAG_REUSE_INDEX_NAME
+        && index.index_details.as_ref().is_some_and(|details| {
+            details
+                .type_url
+                .rsplit_once('/')
+                .is_some_and(|(_, type_name)| {
+                    type_name.eq_ignore_ascii_case(&pb::FragmentReuseIndexDetails::full_name())
+                })
+        })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct FragDigest {
@@ -168,7 +189,10 @@ impl From<&FragReuseIndexDetails> for InlineContent {
             details.versions.iter().map(|m| m.into()).collect();
         // sort from oldest to latest version
         versions.sort_by_key(|v| v.dataset_version);
-        Self { versions }
+        Self {
+            legacy_versions: versions,
+            transitions: Vec::new(),
+        }
     }
 }
 
@@ -178,7 +202,7 @@ impl TryFrom<InlineContent> for FragReuseIndexDetails {
     fn try_from(content: InlineContent) -> Result<Self> {
         Ok(Self {
             versions: content
-                .versions
+                .legacy_versions
                 .into_iter()
                 .map(|m| m.try_into())
                 .collect::<Result<Vec<_>>>()?,
@@ -196,9 +220,11 @@ impl FragReuseIndexDetails {
     }
 }
 
-/// An index that stores row ID maps.
-/// A row ID map describes the mapping from old row address to new address after compactions.
-/// Each version contains the mapping for one round of compaction.
+/// An index that stores materialized row ID maps.
+///
+/// This type is retained for API and serde compatibility. Dataset loading uses
+/// [`CompactFragReuseIndex`] so persisted FRI details are not expanded into a
+/// hash-map entry for every affected row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FragReuseIndex {
     pub uuid: Uuid,
@@ -225,18 +251,162 @@ impl FragReuseIndex {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.row_id_maps.iter().all(HashMap::is_empty)
+    }
+
     pub fn remap_row_id(&self, row_id: u64) -> Option<u64> {
-        let mut mapped_value = Some(row_id);
-        for row_id_map in self.row_id_maps.iter() {
-            if mapped_value.is_some() {
-                mapped_value = row_id_map
-                    .get(&mapped_value.unwrap())
-                    .copied()
-                    .unwrap_or(mapped_value);
+        let mut mapped = Some(row_id);
+        for row_id_map in &self.row_id_maps {
+            if let Some(current) = mapped {
+                mapped = row_id_map.get(&current).copied().unwrap_or(mapped);
             }
         }
+        mapped
+    }
 
-        mapped_value
+    pub fn remap_row_ids_in_place(&self, row_ids: &mut [Option<u64>]) {
+        for row_id_map in &self.row_id_maps {
+            for row_id in row_ids.iter_mut() {
+                if let Some(current) = *row_id
+                    && let Some(mapped) = row_id_map.get(&current)
+                {
+                    *row_id = *mapped;
+                }
+            }
+        }
+    }
+
+    pub fn remap_row_addrs_tree_map(&self, row_addrs: &RowAddrTreeMap) -> RowAddrTreeMap {
+        RowAddrTreeMap::from_iter(
+            row_addrs
+                .row_addrs()
+                .unwrap()
+                .filter_map(|addr| self.remap_row_id(u64::from(addr))),
+        )
+    }
+
+    pub fn remap_row_ids_roaring_tree_map(&self, row_ids: &RoaringTreemap) -> RoaringTreemap {
+        RoaringTreemap::from_iter(row_ids.iter().filter_map(|addr| self.remap_row_id(addr)))
+    }
+
+    pub fn remap_row_ids_record_batch(
+        &self,
+        batch: RecordBatch,
+        row_id_idx: usize,
+    ) -> Result<RecordBatch> {
+        remap_row_ids_record_batch(batch, row_id_idx, |row_ids| {
+            self.remap_row_ids_in_place(row_ids)
+        })
+    }
+
+    pub fn remap_row_ids_array(&self, array: ArrayRef) -> PrimitiveArray<UInt64Type> {
+        remap_row_ids_array(array, |row_ids| self.remap_row_ids_in_place(row_ids))
+    }
+
+    pub fn remap_fragment_bitmap(&self, fragment_bitmap: &mut RoaringBitmap) -> Result<()> {
+        remap_fragment_bitmap(&self.details, fragment_bitmap)
+    }
+}
+
+/// A compact row-address remap chain for deferred compactions.
+///
+/// Each FRI version retains rewritten-row bitmaps and fragment layouts. Queries
+/// use bitmap rank plus the ordered new-fragment ranges instead of storing one
+/// hash-map entry per affected row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactFragReuseIndex {
+    pub uuid: Uuid,
+    row_addr_remap: RowAddrRemap,
+    pub details: FragReuseIndexDetails,
+}
+
+impl DeepSizeOf for CompactFragReuseIndex {
+    fn deep_size_of_children(&self, cx: &mut Context) -> usize {
+        self.row_addr_remap.deep_size_of_children(cx) + self.details.deep_size_of_children(cx)
+    }
+}
+
+impl CompactFragReuseIndex {
+    #[doc(hidden)]
+    pub fn from_row_id_maps(
+        uuid: Uuid,
+        row_id_maps: Vec<HashMap<u64, Option<u64>>>,
+        details: FragReuseIndexDetails,
+    ) -> Self {
+        Self {
+            uuid,
+            row_addr_remap: RowAddrRemap::chained(
+                row_id_maps.into_iter().map(RowAddrRemap::direct),
+            ),
+            details,
+        }
+    }
+
+    /// Build a queryable index directly from serialized FRI details without
+    /// expanding each affected row into a hash map.
+    pub fn try_new(uuid: Uuid, details: FragReuseIndexDetails) -> Result<Self> {
+        let mut version_remaps = Vec::with_capacity(details.versions.len());
+        for (version_idx, version) in details.versions.iter().enumerate() {
+            let mut groups = Vec::with_capacity(version.groups.len());
+            for (group_idx, group) in version.groups.iter().enumerate() {
+                let changed_row_addrs = RoaringTreemap::deserialize_from(Cursor::new(
+                    &group.changed_row_addrs,
+                ))
+                .map_err(|error| {
+                    Error::index(format!(
+                        "failed to deserialize changed row addresses for FRI version {version_idx}, group {group_idx}: {error}"
+                    ))
+                })?;
+                let old_frags = group
+                    .old_frags
+                    .iter()
+                    .map(|frag| fragment_layout(frag, "old", version_idx, group_idx))
+                    .collect::<Result<Vec<_>>>()?;
+                let new_frags = group
+                    .new_frags
+                    .iter()
+                    .map(|frag| fragment_layout(frag, "new", version_idx, group_idx))
+                    .collect::<Result<Vec<_>>>()?;
+                groups.push(GroupInputWithLayout {
+                    rewritten_old_row_addrs: changed_row_addrs,
+                    old_frags,
+                    new_frags,
+                });
+            }
+            let remap = RowAddrRemap::compact_with_layout(groups).map_err(|error| {
+                Error::index(format!(
+                    "failed to build compact remap for FRI version {version_idx}: {error}"
+                ))
+            })?;
+            version_remaps.push(remap);
+        }
+
+        Ok(Self {
+            uuid,
+            row_addr_remap: RowAddrRemap::chained(version_remaps),
+            details,
+        })
+    }
+
+    /// The ordered remap chain used by index and transaction remapping paths.
+    pub fn row_addr_remap(&self) -> &RowAddrRemap {
+        &self.row_addr_remap
+    }
+
+    /// Returns whether the index contains no row-address remapping.
+    pub fn is_empty(&self) -> bool {
+        self.row_addr_remap.is_empty()
+    }
+
+    pub fn remap_row_id(&self, row_id: u64) -> Option<u64> {
+        self.row_addr_remap.get(row_id).unwrap_or(Some(row_id))
+    }
+
+    /// Apply all FRI versions to row addresses in place. `None` values remain
+    /// deleted and missing mappings pass through unchanged.
+    pub fn remap_row_ids_in_place(&self, row_ids: &mut [Option<u64>]) {
+        self.row_addr_remap.remap_in_place(row_ids);
     }
 
     pub fn remap_row_addrs_tree_map(&self, row_addrs: &RowAddrTreeMap) -> RowAddrTreeMap {
@@ -260,98 +430,308 @@ impl FragReuseIndex {
         batch: RecordBatch,
         row_id_idx: usize,
     ) -> Result<RecordBatch> {
-        assert_eq!(batch.schema().fields().len(), 2);
-        let other_column_idx = 1 - row_id_idx;
-        let row_ids = batch.column(row_id_idx).as_primitive::<UInt64Type>();
-        let (val_indices, new_row_ids): (Vec<u64>, Vec<u64>) = row_ids
-            .values()
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, old_id)| {
-                self.remap_row_id(*old_id)
-                    .map(|new_id| (idx as u64, new_id))
-            })
-            .unzip();
-        let new_val_indices = UInt64Array::from_iter_values(val_indices);
-        let new_vals =
-            arrow::compute::take(batch.column(other_column_idx), &new_val_indices, None)?;
-
-        let mut batch_data: Vec<(usize, ArrayRef)> = vec![
-            (
-                row_id_idx,
-                Arc::new(UInt64Array::from_iter_values(new_row_ids)) as ArrayRef,
-            ),
-            (other_column_idx, Arc::new(new_vals)),
-        ];
-        batch_data.sort_by_key(|(i, _)| *i);
-        Ok(RecordBatch::try_new(
-            batch.schema(),
-            batch_data.into_iter().map(|(_, item)| item).collect(),
-        )?)
+        remap_row_ids_record_batch(batch, row_id_idx, |row_ids| {
+            self.remap_row_ids_in_place(row_ids)
+        })
     }
 
     pub fn remap_row_ids_array(&self, array: ArrayRef) -> PrimitiveArray<UInt64Type> {
-        let primitive_array = array
-            .as_any()
-            .downcast_ref::<PrimitiveArray<UInt64Type>>()
-            .expect("expected row IDs to be uint64 array");
-        (0..primitive_array.len())
-            .map(|i| {
-                if primitive_array.is_null(i) {
-                    None
-                } else {
-                    self.remap_row_id(primitive_array.value(i))
-                }
-            })
-            .collect()
+        remap_row_ids_array(array, |row_ids| self.remap_row_ids_in_place(row_ids))
     }
 
     pub fn remap_fragment_bitmap(&self, fragment_bitmap: &mut RoaringBitmap) -> Result<()> {
-        for version in self.details.versions.iter() {
-            for group in version.groups.iter() {
-                let mut removed = 0;
-                for old_frag in group.old_frags.iter() {
-                    if fragment_bitmap.remove(old_frag.id as u32) {
-                        removed += 1;
-                    }
-                }
+        remap_fragment_bitmap(&self.details, fragment_bitmap)
+    }
+}
 
-                if removed > 0 {
-                    if removed != group.old_frags.len() {
-                        // Straddle: the index covered only part of this rewrite
-                        // group. Caused by the bug fixed in
-                        // <https://github.com/lance-format/lance/pull/6610>.
-                        // We've already removed the indexed old_frags from the
-                        // bitmap above; deliberately do NOT insert new_frags,
-                        // since the merged fragment also contains rows that
-                        // were never indexed. Affected rows fall through to
-                        // flat scan until the next optimize_indices. The fix
-                        // is persisted on the next write via build_manifest.
-                        tracing::warn!(
-                            "Healing straddling fragment-reuse rewrite group in index bitmap: \
+fn remap_row_ids_record_batch(
+    batch: RecordBatch,
+    row_id_idx: usize,
+    remap: impl FnOnce(&mut [Option<u64>]),
+) -> Result<RecordBatch> {
+    assert_eq!(batch.schema().fields().len(), 2);
+    let other_column_idx = 1 - row_id_idx;
+    let row_ids = batch.column(row_id_idx).as_primitive::<UInt64Type>();
+    let mut remapped_row_ids = row_ids
+        .values()
+        .iter()
+        .copied()
+        .map(Some)
+        .collect::<Vec<_>>();
+    remap(&mut remapped_row_ids);
+    let (val_indices, new_row_ids): (Vec<u64>, Vec<u64>) = remapped_row_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, new_id)| new_id.map(|new_id| (idx as u64, new_id)))
+        .unzip();
+    let new_val_indices = UInt64Array::from_iter_values(val_indices);
+    let new_vals = arrow::compute::take(batch.column(other_column_idx), &new_val_indices, None)?;
+
+    let mut batch_data: Vec<(usize, ArrayRef)> = vec![
+        (
+            row_id_idx,
+            Arc::new(UInt64Array::from_iter_values(new_row_ids)) as ArrayRef,
+        ),
+        (other_column_idx, Arc::new(new_vals)),
+    ];
+    batch_data.sort_by_key(|(i, _)| *i);
+    Ok(RecordBatch::try_new(
+        batch.schema(),
+        batch_data.into_iter().map(|(_, item)| item).collect(),
+    )?)
+}
+
+fn remap_row_ids_array(
+    array: ArrayRef,
+    remap: impl FnOnce(&mut [Option<u64>]),
+) -> PrimitiveArray<UInt64Type> {
+    let primitive_array = array
+        .as_any()
+        .downcast_ref::<PrimitiveArray<UInt64Type>>()
+        .expect("expected row IDs to be uint64 array");
+    let mut remapped = (0..primitive_array.len())
+        .map(|i| {
+            if primitive_array.is_null(i) {
+                None
+            } else {
+                Some(primitive_array.value(i))
+            }
+        })
+        .collect::<Vec<_>>();
+    remap(&mut remapped);
+    PrimitiveArray::from(remapped)
+}
+
+fn remap_fragment_bitmap(
+    details: &FragReuseIndexDetails,
+    fragment_bitmap: &mut RoaringBitmap,
+) -> Result<()> {
+    for version in details.versions.iter() {
+        for group in version.groups.iter() {
+            let mut removed = 0;
+            for old_frag in group.old_frags.iter() {
+                if fragment_bitmap.remove(old_frag.id as u32) {
+                    removed += 1;
+                }
+            }
+
+            if removed > 0 {
+                if removed != group.old_frags.len() {
+                    // Straddle: the index covered only part of this rewrite
+                    // group. Caused by the bug fixed in
+                    // <https://github.com/lance-format/lance/pull/6610>.
+                    // We've already removed the indexed old_frags from the
+                    // bitmap above; deliberately do NOT insert new_frags,
+                    // since the merged fragment also contains rows that
+                    // were never indexed. Affected rows fall through to
+                    // flat scan until the next optimize_indices. The fix
+                    // is persisted on the next write via build_manifest.
+                    tracing::warn!(
+                        "Healing straddling fragment-reuse rewrite group in index bitmap: \
                              group {:?} was only partially indexed ({} of {} old fragments). \
                              Affected rows will use flat scan until the next optimize_indices.",
-                            group.old_frags,
-                            removed,
-                            group.old_frags.len(),
-                        );
-                        continue;
-                    }
+                        group.old_frags,
+                        removed,
+                        group.old_frags.len(),
+                    );
+                    continue;
+                }
 
-                    for new_frag in group.new_frags.iter() {
-                        fragment_bitmap.insert(new_frag.id as u32);
-                    }
+                for new_frag in group.new_frags.iter() {
+                    fragment_bitmap.insert(new_frag.id as u32);
                 }
             }
         }
-        Ok(())
     }
+    Ok(())
+}
+
+fn fragment_layout(
+    frag: &FragDigest,
+    role: &str,
+    version_idx: usize,
+    group_idx: usize,
+) -> Result<(u32, u32)> {
+    let fragment_id = u32::try_from(frag.id).map_err(|_| {
+        Error::index(format!(
+            "FRI version {version_idx}, group {group_idx} has {role} fragment id {} outside the row-address range",
+            frag.id
+        ))
+    })?;
+    let physical_rows = u32::try_from(frag.physical_rows).map_err(|_| {
+        Error::index(format!(
+            "FRI version {version_idx}, group {group_idx} has {role} fragment {fragment_id} with physical_rows={} outside the row-address range",
+            frag.physical_rows
+        ))
+    })?;
+    Ok((fragment_id, physical_rows))
 }
 
 #[cfg(test)]
 mod tests {
 
     use super::*;
+    use rstest::rstest;
+
+    fn addr(fragment_id: u32, offset: u32) -> u64 {
+        u64::from(lance_core::utils::address::RowAddress::new_from_parts(
+            fragment_id,
+            offset,
+        ))
+    }
+
+    fn serialize_changed(addrs: impl IntoIterator<Item = u64>) -> Vec<u8> {
+        let changed = RoaringTreemap::from_iter(addrs);
+        let mut bytes = Vec::with_capacity(changed.serialized_size());
+        changed.serialize_into(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn digest(id: u64, physical_rows: usize) -> FragDigest {
+        FragDigest {
+            id,
+            physical_rows,
+            num_deleted_rows: 0,
+        }
+    }
+
+    #[test]
+    fn test_compact_fri_tristate_one_to_many_and_chain() {
+        let details = FragReuseIndexDetails {
+            versions: vec![
+                FragReuseVersion {
+                    dataset_version: 1,
+                    groups: vec![
+                        // One old fragment is split into two new fragments.
+                        FragReuseGroup {
+                            changed_row_addrs: serialize_changed([
+                                addr(1, 0),
+                                addr(1, 2),
+                                addr(1, 3),
+                            ]),
+                            old_frags: vec![digest(1, 4)],
+                            new_frags: vec![digest(10, 1), digest(11, 2)],
+                        },
+                        // A separate rewrite group deletes an entire fragment.
+                        FragReuseGroup {
+                            changed_row_addrs: serialize_changed([]),
+                            old_frags: vec![digest(3, 2)],
+                            new_frags: vec![],
+                        },
+                    ],
+                },
+                FragReuseVersion {
+                    dataset_version: 2,
+                    groups: vec![FragReuseGroup {
+                        changed_row_addrs: serialize_changed([addr(10, 0), addr(11, 1)]),
+                        old_frags: vec![digest(10, 1), digest(11, 2)],
+                        new_frags: vec![digest(20, 2)],
+                    }],
+                },
+            ],
+        };
+        let details = FragReuseIndexDetails::try_from(InlineContent::from(&details)).unwrap();
+        let fri = CompactFragReuseIndex::try_new(Uuid::new_v4(), details).unwrap();
+
+        // Surviving rows follow both versions in oldest-to-newest order.
+        assert_eq!(fri.remap_row_id(addr(1, 0)), Some(addr(20, 0)));
+        assert_eq!(fri.remap_row_id(addr(1, 3)), Some(addr(20, 1)));
+        // Deletes can happen in either the first or a later version.
+        assert_eq!(fri.remap_row_id(addr(1, 1)), None);
+        assert_eq!(fri.remap_row_id(addr(1, 2)), None);
+        assert_eq!(fri.remap_row_id(addr(3, 0)), None);
+        // Uncovered fragments and out-of-range offsets retain the existing
+        // missing-map pass-through semantics.
+        assert_eq!(fri.remap_row_id(addr(2, 0)), Some(addr(2, 0)));
+        assert_eq!(fri.remap_row_id(addr(1, 4)), Some(addr(1, 4)));
+
+        let mut batch = vec![
+            Some(addr(1, 0)),
+            Some(addr(1, 1)),
+            Some(addr(1, 2)),
+            Some(addr(1, 3)),
+            Some(addr(2, 0)),
+            None,
+        ];
+        fri.remap_row_ids_in_place(&mut batch);
+        assert_eq!(
+            batch,
+            vec![
+                Some(addr(20, 0)),
+                None,
+                None,
+                Some(addr(20, 1)),
+                Some(addr(2, 0)),
+                None,
+            ]
+        );
+    }
+
+    #[rstest]
+    #[case::garbage(vec![1, 2, 3])]
+    // A plausible length prefix followed by a truncated body, so the failure happens inside
+    // treemap parsing rather than on the first read.
+    #[case::truncated_body([4u64.to_le_bytes().as_slice(), &[0xff; 6]].concat())]
+    fn test_compact_fri_rejects_invalid_changed_row_bitmap(#[case] changed_row_addrs: Vec<u8>) {
+        let details = FragReuseIndexDetails {
+            versions: vec![FragReuseVersion {
+                dataset_version: 1,
+                groups: vec![FragReuseGroup {
+                    changed_row_addrs,
+                    old_frags: vec![digest(1, 1)],
+                    new_frags: vec![digest(2, 1)],
+                }],
+            }],
+        };
+        let error = CompactFragReuseIndex::try_new(Uuid::new_v4(), details).unwrap_err();
+        assert!(matches!(error, Error::Index { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("failed to deserialize changed row addresses for FRI version 0, group 0"),
+            "{error}"
+        );
+    }
+
+    #[rstest]
+    #[case::unknown_fragment(
+        vec![addr(2, 0)],
+        vec![digest(1, 1)],
+        "from fragments [2] not in its old fragments"
+    )]
+    #[case::offset_out_of_range(
+        vec![addr(1, 1)],
+        vec![digest(1, 1)],
+        "row offset outside old fragment 1 with physical_rows=1"
+    )]
+    #[case::duplicate_old_fragment(
+        vec![addr(1, 0)],
+        vec![digest(1, 1), digest(1, 1)],
+        "old fragment 1 more than once"
+    )]
+    fn test_compact_fri_preserves_layout_validation(
+        #[case] changed_addrs: Vec<u64>,
+        #[case] old_frags: Vec<FragDigest>,
+        #[case] expected_message: &str,
+    ) {
+        let details = FragReuseIndexDetails {
+            versions: vec![FragReuseVersion {
+                dataset_version: 1,
+                groups: vec![FragReuseGroup {
+                    changed_row_addrs: serialize_changed(changed_addrs),
+                    old_frags,
+                    new_frags: vec![digest(10, 1)],
+                }],
+            }],
+        };
+
+        let error = CompactFragReuseIndex::try_new(Uuid::new_v4(), details).unwrap_err();
+        assert!(matches!(error, Error::Index { .. }));
+        let message = error.to_string();
+        assert!(message.contains("FRI version 0"), "{message}");
+        assert!(message.contains("rewrite group 0"), "{message}");
+        assert!(message.contains(expected_message), "{message}");
+    }
 
     #[tokio::test]
     async fn test_serialize_deserialize_index_details() {
@@ -475,6 +855,242 @@ mod tests {
                 physical_rows: 1,
                 num_deleted_rows: 0,
             }]
+        );
+    }
+
+    /// One rewrite group. `rewritten` is `(old_frag, offset)` in any order: the treemap sorts
+    /// and run-optimizes it, which is what compaction writes.
+    fn group(
+        rewritten: impl IntoIterator<Item = (u32, u32)>,
+        old_frags: Vec<FragDigest>,
+        new_frags: Vec<FragDigest>,
+    ) -> FragReuseGroup {
+        let mut addrs = RoaringTreemap::from_iter(
+            rewritten
+                .into_iter()
+                .map(|(frag, offset)| addr(frag, offset)),
+        );
+        addrs.optimize();
+        let mut changed_row_addrs = Vec::with_capacity(addrs.serialized_size());
+        addrs.serialize_into(&mut changed_row_addrs).unwrap();
+        FragReuseGroup {
+            changed_row_addrs,
+            old_frags,
+            new_frags,
+        }
+    }
+
+    /// One version per inner vec, numbered from 1 in order.
+    fn details(versions: Vec<Vec<FragReuseGroup>>) -> FragReuseIndexDetails {
+        FragReuseIndexDetails {
+            versions: versions
+                .into_iter()
+                .enumerate()
+                .map(|(i, groups)| FragReuseVersion {
+                    dataset_version: i as u64 + 1,
+                    groups,
+                })
+                .collect(),
+        }
+    }
+
+    fn open(details: FragReuseIndexDetails) -> CompactFragReuseIndex {
+        CompactFragReuseIndex::try_new(Uuid::new_v4(), details).expect("index should open")
+    }
+
+    #[test]
+    fn test_compact_fri_maps_moved_deleted_and_untouched() {
+        let index = open(details(vec![vec![group(
+            [(0, 0), (0, 2)],
+            vec![digest(0, 3)],
+            vec![digest(10, 2)],
+        )]]));
+
+        // Moved, in read order.
+        assert_eq!(index.remap_row_id(addr(0, 0)), Some(addr(10, 0)));
+        assert_eq!(index.remap_row_id(addr(0, 2)), Some(addr(10, 1)));
+        // Offset 1 was deleted before compaction: gone, not unchanged.
+        assert_eq!(index.remap_row_id(addr(0, 1)), None);
+        // A fragment no group covers is left alone.
+        assert_eq!(index.remap_row_id(addr(9, 0)), Some(addr(9, 0)));
+        // The output address is not remapped again.
+        assert_eq!(index.remap_row_id(addr(10, 0)), Some(addr(10, 0)));
+        // Past the fragment's recorded row count there was no row to rewrite or delete, so
+        // the address is not the remap's to answer and passes through unchanged.
+        assert_eq!(index.remap_row_id(addr(0, 3)), Some(addr(0, 3)));
+        assert_eq!(index.remap_row_id(addr(0, 99)), Some(addr(0, 99)));
+    }
+
+    #[test]
+    fn test_compact_fri_pairs_rows_in_read_order_not_address_order() {
+        // `old_frags` records the order compaction read the fragments, and rows are paired
+        // positionally in that order rather than by address. The two coincide in practice,
+        // since the manifest keeps its fragment list id-sorted, so this input is not
+        // reachable from any current writer. It is pinned because it records which pairing
+        // is the correct one, and would catch a regression if that invariant stopped holding.
+        let index = open(details(vec![vec![group(
+            [(4, 0), (4, 1), (3, 0), (3, 1)],
+            vec![digest(4, 2), digest(3, 2)],
+            vec![digest(10, 4)],
+        )]]));
+
+        assert_eq!(index.remap_row_id(addr(4, 0)), Some(addr(10, 0)));
+        assert_eq!(index.remap_row_id(addr(4, 1)), Some(addr(10, 1)));
+        assert_eq!(index.remap_row_id(addr(3, 0)), Some(addr(10, 2)));
+        assert_eq!(index.remap_row_id(addr(3, 1)), Some(addr(10, 3)));
+    }
+
+    #[test]
+    fn test_compact_fri_handles_large_run_optimized_bitmaps() {
+        // Real payloads span fragments of up to `max_rows_per_file` and are run-optimized
+        // before serializing, so the offsets land in run and bitmap containers rather than
+        // the small array containers every other test here uses. This is what exercises the
+        // rank lookup on those container types.
+        const ROWS: u32 = 200_000;
+        let holes = [7u32, 65_535, 65_536, 131_072];
+        let kept: Vec<u32> = (0..ROWS).filter(|o| !holes.contains(o)).collect();
+        let index = open(details(vec![vec![group(
+            kept.iter().map(|&o| (0u32, o)),
+            vec![digest(0, ROWS as usize)],
+            vec![digest(10, kept.len())],
+        )]]));
+
+        // Every kept offset shifts down by the number of holes below it.
+        for probe in [0u32, 6, 8, 65_534, 65_537, 131_073, ROWS - 1] {
+            let rank = probe - holes.iter().filter(|&&h| h < probe).count() as u32;
+            assert_eq!(
+                index.remap_row_id(addr(0, probe)),
+                Some(addr(10, rank)),
+                "offset {probe}"
+            );
+        }
+        for hole in holes {
+            assert_eq!(index.remap_row_id(addr(0, hole)), None, "hole {hole}");
+        }
+    }
+
+    #[test]
+    fn test_compact_fri_resolves_across_many_new_fragments() {
+        // A task whose output exceeds `max_rows_per_file` rolls into several fragments. With
+        // only one or two ranges the search for the destination fragment never lands
+        // strictly inside the list, so a mid-list off-by-one would go unnoticed.
+        let new: Vec<FragDigest> = (10..15).map(|id| digest(id, 3)).collect();
+        let index = open(details(vec![vec![group(
+            (0..15u32).map(|o| (0u32, o)),
+            vec![digest(0, 15)],
+            new,
+        )]]));
+
+        for offset in 0..15u32 {
+            let expected = addr(10 + offset / 3, offset % 3);
+            assert_eq!(
+                index.remap_row_id(addr(0, offset)),
+                Some(expected),
+                "{offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compact_fri_skips_emptied_fragment_without_shifting_later_ones() {
+        // The emptied fragment sits between two live ones. If its rows were charged to the
+        // running position, frag 1's rows would land two slots late.
+        let index = open(details(vec![vec![group(
+            [(0, 0), (0, 1), (1, 0), (1, 1)],
+            vec![digest(0, 2), digest(7, 2), digest(1, 2)],
+            vec![digest(10, 4)],
+        )]]));
+
+        assert_eq!(index.remap_row_id(addr(0, 0)), Some(addr(10, 0)));
+        assert_eq!(index.remap_row_id(addr(0, 1)), Some(addr(10, 1)));
+        assert_eq!(index.remap_row_id(addr(1, 0)), Some(addr(10, 2)));
+        assert_eq!(index.remap_row_id(addr(1, 1)), Some(addr(10, 3)));
+        // The emptied fragment is covered, so its addresses are deleted rather than kept.
+        assert_eq!(index.remap_row_id(addr(7, 0)), None);
+        assert_eq!(index.remap_row_id(addr(7, 1)), None);
+        // A fragment outside the group is still untouched.
+        assert_eq!(index.remap_row_id(addr(8, 0)), Some(addr(8, 0)));
+    }
+
+    #[test]
+    fn test_compact_fri_composes_a_deep_chain() {
+        // Version i rewrites fragment i into fragment i+1, so a row entering at (0,0) must
+        // arrive at (32,0) having passed through every link.
+        const VERSIONS: u32 = 32;
+        let chain = (0..VERSIONS)
+            .map(|i| {
+                vec![group(
+                    [(i, 0)],
+                    vec![digest(i as u64, 1)],
+                    vec![digest(i as u64 + 1, 1)],
+                )]
+            })
+            .collect();
+        let index = open(details(chain));
+
+        assert_eq!(index.remap_row_id(addr(0, 0)), Some(addr(VERSIONS, 0)));
+        // Entering midway walks only the remaining links.
+        assert_eq!(
+            index.remap_row_id(addr(VERSIONS / 2, 0)),
+            Some(addr(VERSIONS, 0))
+        );
+    }
+
+    #[test]
+    fn test_compact_fri_deletion_mid_chain_is_terminal() {
+        // v1 moves (0,0) -> (10,0); v2 covers frag 10 and keeps nothing, so the row dies.
+        // v3 also covers frag 10 and would move it on, so a walk that failed to stop would
+        // resurrect the row at (30,0) rather than merely passing a stale address along.
+        let index = open(details(vec![
+            vec![group([(0, 0)], vec![digest(0, 1)], vec![digest(10, 1)])],
+            vec![group([], vec![digest(10, 1)], vec![])],
+            vec![group([(10, 0)], vec![digest(10, 1)], vec![digest(30, 1)])],
+        ]));
+
+        assert_eq!(index.remap_row_id(addr(0, 0)), None);
+        // Entering at the intermediate address still dies in v2, before v3 is consulted.
+        assert_eq!(index.remap_row_id(addr(10, 0)), None);
+    }
+
+    #[test]
+    fn test_compact_fri_keeps_groups_in_one_version_independent() {
+        // One compaction commits several rewrite groups. They share a version, so they
+        // collapse into a single remap step, and each group's positions restart.
+        let index = open(details(vec![vec![
+            group([(0, 0), (0, 1)], vec![digest(0, 2)], vec![digest(10, 2)]),
+            group([(1, 0), (1, 1)], vec![digest(1, 2)], vec![digest(11, 2)]),
+        ]]));
+
+        assert_eq!(index.remap_row_id(addr(0, 1)), Some(addr(10, 1)));
+        // Group 2's first row starts at its own new fragment, not offset 2 of frag 10.
+        assert_eq!(index.remap_row_id(addr(1, 0)), Some(addr(11, 0)));
+        assert_eq!(index.remap_row_id(addr(1, 1)), Some(addr(11, 1)));
+    }
+
+    #[rstest]
+    #[case::no_versions(vec![])]
+    #[case::version_without_groups(vec![vec![]])]
+    fn test_compact_fri_with_nothing_to_remap(#[case] versions: Vec<Vec<FragReuseGroup>>) {
+        let index = open(details(versions));
+        assert!(index.is_empty());
+        assert_eq!(index.remap_row_id(addr(0, 0)), Some(addr(0, 0)));
+    }
+
+    #[rstest]
+    // Rewritten rows and new-fragment rows must match exactly, or positions are unsound.
+    #[case::too_few_new_rows(vec![(0, 0), (0, 1)], vec![digest(0, 2)], vec![digest(10, 1)])]
+    #[case::too_many_new_rows(vec![(0, 0)], vec![digest(0, 1)], vec![digest(10, 2)])]
+    fn test_compact_fri_rejects_row_count_mismatch(
+        #[case] rewritten: Vec<(u32, u32)>,
+        #[case] old_frags: Vec<FragDigest>,
+        #[case] new_frags: Vec<FragDigest>,
+    ) {
+        let details = details(vec![vec![group(rewritten, old_frags, new_frags)]]);
+        let error = CompactFragReuseIndex::try_new(Uuid::new_v4(), details)
+            .expect_err("inconsistent details should be rejected");
+        assert!(
+            error.to_string().contains("old rows"),
+            "expected the row-count validation, got: {error}"
         );
     }
 }

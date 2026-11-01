@@ -12,7 +12,7 @@
 //!
 //! Any form of compression can be used since we are compressing and decompressing
 //! entire chunks.
-use crate::{buffer::LanceBuffer, data::DataBlock, format::pb21::CompressiveEncoding};
+use crate::{buffer::LanceBuffer, data::DataBlock, format::metadata::CompressiveEncoding};
 
 use lance_core::Result;
 
@@ -52,6 +52,41 @@ pub struct MiniBlockCompressed {
     pub chunks: Vec<MiniBlockChunk>,
     /// The number of values in the entire page
     pub num_values: u64,
+}
+
+/// Per-page framing details that can affect a mini-block compressor's choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MiniBlockCompressionContext {
+    common_chunk_buffers: u64,
+    support_large_chunk: bool,
+    allow_generic_offsets: bool,
+}
+
+impl MiniBlockCompressionContext {
+    /// Creates the framing context supplied by the owning mini-block page.
+    pub fn new(
+        common_chunk_buffers: u64,
+        support_large_chunk: bool,
+        allow_generic_offsets: bool,
+    ) -> Self {
+        Self {
+            common_chunk_buffers,
+            support_large_chunk,
+            allow_generic_offsets,
+        }
+    }
+
+    pub(crate) fn chunk_header_bytes(self, value_buffers: u64) -> u64 {
+        let value_buffer_size_bytes = if self.support_large_chunk { 4 } else { 2 };
+        2_u64
+            .saturating_add(self.common_chunk_buffers.saturating_mul(2))
+            .saturating_add(value_buffers.saturating_mul(value_buffer_size_bytes))
+            .next_multiple_of(8)
+    }
+
+    pub(crate) fn allows_generic_offsets(self) -> bool {
+        self.allow_generic_offsets
+    }
 }
 
 /// Describes the size of a mini-block chunk of data
@@ -113,7 +148,11 @@ pub trait MiniBlockCompressor: std::fmt::Debug + Send + Sync {
     ///
     /// This method also returns a description of the encoding applied that will be
     /// used at decode time to read the data.
-    fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)>;
+    fn compress(
+        &self,
+        context: MiniBlockCompressionContext,
+        page: DataBlock,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)>;
 }
 
 #[cfg(test)]

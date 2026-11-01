@@ -49,7 +49,7 @@ use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery, PySearchFilt
 use env_logger::{Builder, Env};
 use file::{
     LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
-    LanceFileStatistics, LanceFileWriter, LancePageMetadata, stable_version,
+    LanceFileStatistics, LanceFileWriteSummary, LanceFileWriter, LancePageMetadata, stable_version,
 };
 use log::Level;
 use pyo3::exceptions::PyIOError;
@@ -58,10 +58,10 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
 use scanner::ScanStatistics;
 use session::Session;
-use std::ffi::CString;
 use std::ptr::NonNull;
 
 pub(crate) mod arrow;
+pub(crate) mod bitmap;
 pub(crate) mod blob;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
@@ -71,11 +71,14 @@ pub(crate) mod error;
 pub(crate) mod executor;
 pub(crate) mod file;
 pub(crate) mod fragment;
+pub(crate) mod fts;
 pub(crate) mod indices;
 pub(crate) mod mem_wal;
 pub(crate) mod namespace;
+pub(crate) mod object_store;
 pub(crate) mod otel;
 pub(crate) mod reader;
+pub(crate) mod rowids;
 pub(crate) mod scanner;
 pub(crate) mod schema;
 pub(crate) mod session;
@@ -92,14 +95,19 @@ pub use crate::tracing::{TraceGuard, trace_to_chrome};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
 pub use dataset::Dataset;
+pub use dataset::serialize_row_addrs;
 pub use dataset::write_dataset;
-use fragment::{FileFragment, PyDeletionFile, PyRowDatasetVersionMeta, PyRowIdMeta};
+use fragment::{
+    FileFragment, FragmentAddColumnsCleanup, PyDeletionFile, PyRowDatasetVersionMeta, PyRowIdMeta,
+};
 pub use indices::register_indices;
 pub use reader::LanceReader;
+use rowids::{PyRowIdSequence, PyRowIdSequenceIterator};
 pub use scanner::Scanner;
 
 use crate::blob::{
-    PyBlobDescriptor, PyBlobDescriptorArrayBuilder, PyDedicatedBlobWriter, PyPackedBlobWriter,
+    PyBlobDescriptor, PyBlobDescriptorArrayBuilder, PyDedicatedBlobWriter, PyManagedBlobWriter,
+    PyPackedBlobWriter,
 };
 use crate::executor::BackgroundExecutor;
 
@@ -132,11 +140,13 @@ static EXECUTOR_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
 static ATFORK_INSTALLED: atomic::AtomicBool = atomic::AtomicBool::new(false);
 
-pub fn rt() -> &'static mut BackgroundExecutor {
+pub fn rt() -> &'static BackgroundExecutor {
     loop {
         let ptr = BACKGROUND_EXECUTOR.load(Ordering::SeqCst);
         if !ptr.is_null() {
-            return unsafe { &mut *ptr };
+            // SAFETY: installed executors are leaked and remain valid for the
+            // process lifetime. BackgroundExecutor uses shared access only.
+            return unsafe { &*ptr };
         }
         if !EXECUTOR_INSTALLED.fetch_or(true, Ordering::SeqCst) {
             break;
@@ -148,7 +158,8 @@ pub fn rt() -> &'static mut BackgroundExecutor {
     }
     let new_ptr = Box::into_raw(Box::new(create_background_executor()));
     BACKGROUND_EXECUTOR.store(new_ptr, Ordering::SeqCst);
-    unsafe { &mut *new_ptr }
+    // SAFETY: the executor is leaked and all of its operations take `&self`.
+    unsafe { &*new_ptr }
 }
 
 /// After a fork() operation, force re-creation of the BackgroundExecutor. Note: this function
@@ -257,17 +268,22 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Dataset>()?;
     m.add_class::<DatasetBasePath>()?;
     m.add_class::<FileFragment>()?;
+    m.add_class::<FragmentAddColumnsCleanup>()?;
     m.add_class::<PyDeletionFile>()?;
     m.add_class::<PyRowIdMeta>()?;
+    m.add_class::<PyRowIdSequence>()?;
+    m.add_class::<PyRowIdSequenceIterator>()?;
     m.add_class::<PyRowDatasetVersionMeta>()?;
     m.add_class::<MergeInsertBuilder>()?;
     m.add_class::<LanceBlobFile>()?;
     m.add_class::<PyBlobDescriptor>()?;
     m.add_class::<PyBlobDescriptorArrayBuilder>()?;
     m.add_class::<PyPackedBlobWriter>()?;
+    m.add_class::<PyManagedBlobWriter>()?;
     m.add_class::<PyDedicatedBlobWriter>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
+    m.add_class::<LanceFileWriteSummary>()?;
     m.add_class::<LanceFileSession>()?;
     m.add_class::<LanceFileMetadata>()?;
     m.add_class::<LanceFileStatistics>()?;
@@ -289,9 +305,14 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCompactionMetrics>()?;
     m.add_class::<ScanStatistics>()?;
     m.add_class::<Session>()?;
+    m.add_class::<object_store::PyObjectStoreProvider>()?;
+    m.add_class::<object_store::PyObjectStoreRegistry>()?;
     m.add_class::<PyTraceEvent>()?;
     m.add_class::<TraceGuard>()?;
+    m.add_class::<fts::FtsToken>()?;
     m.add_class::<schema::LanceSchema>()?;
+    m.add_class::<bitmap::PyBitmap>()?;
+    m.add_class::<bitmap::PyBitmapIter>()?;
     m.add_class::<PyFullTextQuery>()?;
     m.add_class::<PySearchFilter>()?;
     m.add_class::<namespace::PyDirectoryNamespace>()?;
@@ -299,7 +320,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<namespace::PyRestAdapter>()?;
     m.add_class::<storage_options::PyStorageOptionsAccessor>()?;
     // MemWAL classes
-    m.add_class::<mem_wal::PyMergedGeneration>()?;
+    m.add_class::<mem_wal::PyCompactedSsTable>()?;
     m.add_class::<mem_wal::PyShardSnapshot>()?;
     m.add_class::<mem_wal::PyShardWriter>()?;
     m.add_class::<mem_wal::PyLsmScanner>()?;
@@ -310,6 +331,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(mem_wal::py_write_pk_sidecar))?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
+    m.add_wrapped(wrap_pyfunction!(serialize_row_addrs))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments_transaction))?;
     m.add_wrapped(wrap_pyfunction!(schema_to_json))?;
@@ -319,6 +341,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add_wrapped(wrap_pyfunction!(capture_trace_events))?;
     m.add_wrapped(wrap_pyfunction!(shutdown_tracing))?;
+    m.add_wrapped(wrap_pyfunction!(fts::tokenize))?;
     // OpenTelemetry metrics bridge
     m.add_class::<otel::PyMetricPoint>()?;
     m.add_class::<otel::PyMetricDescription>()?;
@@ -469,7 +492,6 @@ impl FFILanceTableProvider {
         py: Python<'py>,
         session: Bound<PyAny>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
-        let name = CString::new("datafusion_table_provider").unwrap();
         let a_lance_table_provider = Arc::new(LanceTableProvider::new(
             self.dataset.clone(),
             self.with_row_id,
@@ -483,7 +505,7 @@ impl FFILanceTableProvider {
             rt().get_runtime_handle(),
             codec,
         );
-        PyCapsule::new(py, ffi_provider, Some(name.clone()))
+        PyCapsule::new_with_value(py, ffi_provider, c"datafusion_table_provider")
     }
 }
 
@@ -502,4 +524,16 @@ fn ffi_logical_codec_from_pycapsule(obj: Bound<PyAny>) -> PyResult<FFI_LogicalEx
     let codec = unsafe { data.as_ref() };
 
     Ok(codec.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn background_executor_is_a_shared_singleton() {
+        let first: &'static BackgroundExecutor = rt();
+        let second: &'static BackgroundExecutor = rt();
+        assert!(std::ptr::eq(first, second));
+    }
 }

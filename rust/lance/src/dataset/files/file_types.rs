@@ -31,3 +31,47 @@ impl From<FileType> for i8 {
         file_type as Self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow_array::{Array, StringArray, cast::AsArray};
+
+    use crate::dataset::files::arrow::FILE_TYPE_DICT_ARRAY;
+
+    const ALL: [FileType; 5] = [
+        FileType::Manifest,
+        FileType::DataFile,
+        FileType::DeletionFile,
+        FileType::TransactionFile,
+        FileType::IndexFile,
+    ];
+
+    /// The discriminants double as dictionary keys for the `tracked_files`
+    /// output, so reordering either list would silently mislabel every row.
+    #[test]
+    fn test_discriminants_index_into_the_dictionary() {
+        let dict: &StringArray = FILE_TYPE_DICT_ARRAY.as_string();
+        assert_eq!(
+            dict.len(),
+            ALL.len(),
+            "every variant needs a dictionary slot"
+        );
+
+        for file_type in ALL {
+            let key = i8::from(file_type);
+            assert_eq!(
+                dict.value(key as usize),
+                file_type.to_string(),
+                "{file_type:?} has key {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_discriminants_are_contiguous_from_zero() {
+        let keys: Vec<i8> = ALL.iter().copied().map(i8::from).collect();
+        assert_eq!(keys, (0..ALL.len() as i8).collect::<Vec<_>>());
+    }
+}

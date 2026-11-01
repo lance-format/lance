@@ -13,6 +13,7 @@
  */
 package org.lance;
 
+import org.lance.file.FileWriteOptions;
 import org.lance.namespace.LanceNamespace;
 import org.lance.schema.LanceSchema;
 
@@ -51,6 +52,7 @@ public class WriteFragmentBuilder {
   private WriteParams.Builder writeParamsBuilder;
   private LanceNamespace namespaceClient;
   private List<String> tableId;
+  private Session session;
 
   WriteFragmentBuilder() {}
 
@@ -186,6 +188,19 @@ public class WriteFragmentBuilder {
   }
 
   /**
+   * Set a session to reuse across operations.
+   *
+   * <p>The session holds shared caches (metadata and index) and the object store registry.
+   *
+   * @param session the session to share
+   * @return this builder
+   */
+  public WriteFragmentBuilder session(Session session) {
+    this.session = session;
+    return this;
+  }
+
+  /**
    * Set the maximum number of rows per file.
    *
    * @param maxRowsPerFile maximum rows per file
@@ -218,6 +233,18 @@ public class WriteFragmentBuilder {
   public WriteFragmentBuilder maxBytesPerFile(long maxBytesPerFile) {
     ensureWriteParamsBuilder();
     this.writeParamsBuilder.withMaxBytesPerFile(maxBytesPerFile);
+    return this;
+  }
+
+  /**
+   * Set options for configuring the current-format file writer.
+   *
+   * @param fileWriteOptions file writer options
+   * @return this builder
+   */
+  public WriteFragmentBuilder fileWriteOptions(FileWriteOptions fileWriteOptions) {
+    ensureWriteParamsBuilder();
+    this.writeParamsBuilder.withFileWriteOptions(fileWriteOptions);
     return this;
   }
 
@@ -302,7 +329,8 @@ public class WriteFragmentBuilder {
           finalWriteParams,
           namespaceClient,
           tableId,
-          schema);
+          schema,
+          session);
     } else {
       return Fragment.create(
           datasetUri,
@@ -311,7 +339,8 @@ public class WriteFragmentBuilder {
           finalWriteParams,
           namespaceClient,
           tableId,
-          schema);
+          schema,
+          session);
     }
   }
 

@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use lance_index::metrics::NoOpMetricsCollector;
-use lance_index::scalar::bloomfilter::{BloomFilterIndex, MAX_BINARY_VALUE_BUFFER_LEN};
+use lance_index::scalar::bloomfilter::BloomFilterIndex;
 use lance_index::scalar::index_files_to_table;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::IndexMetadata;
@@ -17,6 +17,7 @@ use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
+    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -34,21 +35,6 @@ pub(in crate::index) async fn merge_segments(
         .map(|segment| segment.dataset_version)
         .min()
         .unwrap_or(dataset.manifest.version);
-    if segments.iter().all(|segment| segment.files.is_some()) {
-        let total_size = segments
-            .iter()
-            .filter_map(IndexMetadata::total_size_bytes)
-            .try_fold(0u64, u64::checked_add)
-            .ok_or_else(|| Error::invalid_input("BloomFilter segment sizes overflowed u64"))?;
-        if total_size > MAX_BINARY_VALUE_BUFFER_LEN {
-            return Err(Error::invalid_input(format!(
-                "BloomFilter segment files total {total_size} bytes, exceeding the Arrow \
-                 BinaryArray merge limit of {MAX_BINARY_VALUE_BUFFER_LEN} bytes; merge fewer \
-                 segments at a time"
-            )));
-        }
-    }
-
     let mut fragment_bitmap = RoaringBitmap::new();
     let dataset_fragments = dataset.fragment_bitmap.as_ref();
     let fragment_filters = segments
@@ -73,8 +59,15 @@ pub(in crate::index) async fn merge_segments(
         if effective.is_empty() && !(fragment_bitmap.is_empty() && position == 0) {
             continue;
         }
-        let scalar_index =
-            super::open_scalar_index(dataset, &field_path, segment, &NoOpMetricsCollector).await?;
+        let scalar_index = super::open_scalar_index_with_plan(
+            dataset,
+            &field_path,
+            segment,
+            staged.and_then(|plans| plans.get(&segment.uuid)),
+            crate::index::frag_reuse::OpenPurpose::Maintenance,
+            &NoOpMetricsCollector,
+        )
+        .await?;
         scalar_indices.push((segment.uuid, scalar_index, effective));
     }
 
@@ -101,7 +94,6 @@ pub(in crate::index) async fn merge_segments(
 
     Ok(IndexMetadata {
         uuid: new_uuid,
-        fields: vec![field_id],
         dataset_version,
         fragment_bitmap: Some(fragment_bitmap),
         index_details: Some(Arc::new(created_index.index_details)),
@@ -109,6 +101,8 @@ pub(in crate::index) async fn merge_segments(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(index_files_to_table(created_index.files)),
+        clustering_id: None,
+        metadata: Default::default(),
         ..segments[0].clone()
     })
 }

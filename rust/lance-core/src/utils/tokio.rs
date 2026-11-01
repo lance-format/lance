@@ -21,8 +21,8 @@ pub fn get_num_compute_intensive_cpus() -> usize {
 }
 
 fn calculate_num_compute_intensive_cpus() -> usize {
-    if let Ok(user_specified) = std::env::var("LANCE_CPU_THREADS") {
-        return user_specified.parse().unwrap();
+    if let Ok(raw) = std::env::var("LANCE_CPU_THREADS") {
+        return parse_env_usize("LANCE_CPU_THREADS", &raw, 1).unwrap_or_else(|e| panic!("{e}"));
     }
 
     let cpus = num_cpus::get();
@@ -42,12 +42,38 @@ fn calculate_num_compute_intensive_cpus() -> usize {
     num_cpus::get() - *IO_CORE_RESERVATION
 }
 
-pub static IO_CORE_RESERVATION: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var("LANCE_IO_CORE_RESERVATION")
-        .unwrap_or("2".to_string())
+/// Parse an integer environment variable, rejecting values below `min`.
+///
+/// The error names the variable, so a bad value is diagnosable instead of
+/// surfacing as a bare `ParseIntError` or, for `LANCE_CPU_THREADS=0`, a panic
+/// deep inside tokio's `max_blocking_threads`.
+fn parse_env_usize(name: &str, raw: &str, min: usize) -> Result<usize, String> {
+    let value: usize = raw
+        .trim()
         .parse()
-        .unwrap()
-});
+        .map_err(|e| format!("environment variable {name} must be an integer, got {raw:?}: {e}"))?;
+    if value < min {
+        return Err(format!(
+            "environment variable {name} must be at least {min}, got {value}"
+        ));
+    }
+    Ok(value)
+}
+
+/// Number of CPU cores held back for I/O and control tasks.
+///
+/// Overridable via the `LANCE_IO_CORE_RESERVATION` environment variable;
+/// defaults to `2` when unset. `0` is allowed (reserve nothing);
+/// [`get_num_compute_intensive_cpus`] subtracts this from the core count to
+/// size the compute pool. A non-integer value panics on first access with an
+/// error naming the variable.
+pub static IO_CORE_RESERVATION: LazyLock<usize> =
+    LazyLock::new(|| match std::env::var("LANCE_IO_CORE_RESERVATION") {
+        Ok(raw) => {
+            parse_env_usize("LANCE_IO_CORE_RESERVATION", &raw, 0).unwrap_or_else(|e| panic!("{e}"))
+        }
+        Err(_) => 2,
+    });
 
 fn create_runtime() -> Runtime {
     Builder::new_multi_thread()
@@ -158,13 +184,89 @@ pub fn spawn_cpu<
 >(
     func: F,
 ) -> impl Future<Output = std::result::Result<R, E>> {
-    let (send, recv) = tokio::sync::oneshot::channel();
     // Propagate the current span into the task
     let span = Span::current();
-    global_cpu_runtime().spawn_blocking(move || {
+    let handle = global_cpu_runtime().spawn_blocking(move || {
         let _span_guard = span.enter();
-        let result = func();
-        let _ = send.send(result);
+        func()
     });
-    recv.map(|res| res.unwrap())
+    // Awaited through the join handle, not a result channel: a panic in `func`
+    // arrives as a `JoinError` still carrying its payload, so resuming it
+    // re-raises the original panic in the caller. Reporting the closure's
+    // outcome over a channel instead loses that -- the sender drops unsent and
+    // every panic in any `spawn_cpu` closure surfaces identically as an opaque
+    // `RecvError`, pointing here rather than at the fault.
+    handle.map(|res| match res {
+        Ok(result) => result,
+        Err(join_error) => match join_error.try_into_panic() {
+            Ok(panic) => std::panic::resume_unwind(panic),
+            // The CPU runtime outlives every caller, so its tasks are not
+            // cancelled out from under one.
+            Err(join_error) => panic!("spawn_cpu task failed: {join_error}"),
+        },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A panic in the closure must reach the caller intact.
+    ///
+    /// Reporting the closure's outcome over a channel loses it: the sender
+    /// drops unsent and the caller can only see an opaque receive error, so
+    /// every panic in every `spawn_cpu` closure looks the same.
+    #[tokio::test]
+    async fn spawn_cpu_reraises_the_closure_panic() {
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let joined = tokio::spawn(async {
+            spawn_cpu(|| -> std::result::Result<(), std::io::Error> {
+                panic!("the original message")
+            })
+            .await
+        })
+        .await;
+        std::panic::set_hook(hook);
+
+        let payload = joined
+            .expect_err("the closure's panic propagates to the caller")
+            .into_panic();
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .expect("the original payload survives");
+        assert_eq!(message, "the original message");
+    }
+
+    // The env vars feed process-global `LazyLock`s that read once and are read
+    // in parallel by other tests, so the pure parser is tested directly rather
+    // than by mutating the environment.
+
+    #[test]
+    fn parses_valid_value_and_trims_surrounding_whitespace() {
+        assert_eq!(parse_env_usize("VAR", "8", 1).unwrap(), 8);
+        assert_eq!(parse_env_usize("VAR", " 8 ", 1).unwrap(), 8);
+    }
+
+    #[test]
+    fn rejects_non_integer_naming_the_variable() {
+        let err = parse_env_usize("LANCE_CPU_THREADS", "abc", 1).unwrap_err();
+        assert!(err.contains("LANCE_CPU_THREADS"), "{err}");
+        assert!(err.contains("must be an integer"), "{err}");
+    }
+
+    #[test]
+    fn rejects_value_below_minimum() {
+        // LANCE_CPU_THREADS=0 parses fine but would panic in tokio's
+        // max_blocking_threads(0); the minimum stops it at the boundary.
+        let err = parse_env_usize("LANCE_CPU_THREADS", "0", 1).unwrap_err();
+        assert!(err.contains("at least 1"), "{err}");
+    }
+
+    #[test]
+    fn allows_zero_when_minimum_is_zero() {
+        // LANCE_IO_CORE_RESERVATION=0 is valid: no cores reserved for IO.
+        assert_eq!(parse_env_usize("VAR", "0", 0).unwrap(), 0);
+    }
 }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lance_core::Result;
-use lance_select::RowAddrMask;
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 
 /// A trait to be implemented by anything supplying a prefilter row addr mask
 ///
@@ -36,10 +36,40 @@ pub trait PreFilter: Send + Sync {
     /// If the filter is empty.
     fn is_empty(&self) -> bool;
 
+    /// Whether partition-local row coverage is needed to determine if this filter
+    /// can be replaced by [`NoFilter`].
+    ///
+    /// Most filters cannot make this proof and must not make an IVF search
+    /// enumerate a partition's row addresses just to call [`Self::is_empty_for`].
+    fn needs_partition_row_ids(&self) -> bool {
+        false
+    }
+
+    /// Whether this filter selects every row in a known partition.
+    ///
+    /// Callers must first call [`Self::wait_for_ready`]. Implementations that
+    /// cannot prove partition-local emptiness fall back to the global answer.
+    fn is_empty_for(&self, _rows: &RowAddrTreeMap) -> bool {
+        self.is_empty()
+    }
+
     /// Get the row addr mask for this prefilter
     ///
     /// This method must be called after `wait_for_ready`
     fn mask(&self) -> Arc<RowAddrMask>;
+
+    /// Whether the loaded filter proves that no row at all can pass it.
+    ///
+    /// This is the opposite end of the scale from [`Self::is_empty`], which
+    /// says the filter restricts nothing. It is true only once the mask is
+    /// known to be an empty allow list, so it must be read after
+    /// `wait_for_ready`; before that, and for a block list of any size, it
+    /// is false. Index searches use it to skip candidate scoring for a
+    /// segment whose own mask selects nothing, so implementations answer
+    /// from their stored mask without scanning it.
+    fn selects_nothing(&self) -> bool {
+        false
+    }
 
     /// Check whether a slice of row ids should be included in a query.
     ///

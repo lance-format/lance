@@ -297,7 +297,7 @@ def test_blob_api(tmp_path: Path):
     tbl = pa.Table.from_arrays([ints, vals], schema=schema)
 
     uri = tmp_path / "data.lance"
-    dataset = lance.write_dataset(tbl, uri)
+    dataset = lance.write_dataset(tbl, uri, data_storage_version="2.1")
 
     torch_ds = LanceDataset(
         uri, batch_size=4, dataset_options={"version": dataset.version}

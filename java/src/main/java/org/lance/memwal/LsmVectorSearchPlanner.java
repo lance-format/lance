@@ -44,7 +44,7 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
 
   /**
    * @param dataset the base dataset
-   * @param shardSnapshots shard snapshots specifying the flushed generations to include
+   * @param shardSnapshots shard snapshots specifying the SSTables to include
    * @param vectorColumn name of the {@code FixedSizeList<float32>} vector column
    */
   public LsmVectorSearchPlanner(
@@ -54,7 +54,7 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
 
   /**
    * @param dataset the base dataset
-   * @param shardSnapshots shard snapshots specifying the flushed generations to include
+   * @param shardSnapshots shard snapshots specifying the SSTables to include
    * @param vectorColumn name of the {@code FixedSizeList<float32>} vector column
    * @param pkColumns primary key column names; inferred from schema metadata when {@code null}
    * @param distanceType distance metric, one of {@code "l2"}, {@code "cosine"}, {@code "dot"},
@@ -71,7 +71,7 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
 
   /**
    * @param dataset the base dataset
-   * @param shardSnapshots shard snapshots specifying the flushed generations to include
+   * @param shardSnapshots shard snapshots specifying the SSTables to include
    * @param vectorColumn name of the {@code FixedSizeList<float32>} vector column
    * @param pkColumns primary key column names; inferred from schema metadata when {@code null}
    * @param distanceType distance metric, one of {@code "l2"}, {@code "cosine"}, {@code "dot"},
@@ -90,13 +90,15 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
     Preconditions.checkNotNull(shardSnapshots, "shardSnapshots must not be null");
     Preconditions.checkNotNull(vectorColumn, "vectorColumn must not be null");
     this.allocator = dataset.allocator();
-    nativeCreate(
-        dataset,
-        shardSnapshots,
-        vectorColumn,
-        Optional.ofNullable(pkColumns),
-        Optional.ofNullable(distanceType),
-        Optional.ofNullable(filter));
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      nativeCreate(
+          dataset,
+          shardSnapshots,
+          vectorColumn,
+          Optional.ofNullable(pkColumns),
+          Optional.ofNullable(distanceType),
+          Optional.ofNullable(filter));
+    }
   }
 
   private native void nativeCreate(
@@ -115,9 +117,8 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
    * @param nprobes number of IVF partitions to probe
    * @param columns columns to project; pass {@code null} to return all columns plus {@code
    *     _distance}
-   * @param refineBaseTable when true, the base-table arm re-ranks candidates with exact distances
-   *     (refine factor 1). Useful when the base table uses an approximate index (IVF-PQ).
-   *     Auto-enabled whenever stale filtering is on (see {@code overfetchFactor}).
+   * @param refineBaseTable when true, the base-table and SSTable arms re-rank candidates with exact
+   *     distances. Auto-enabled when a newer generation blocks the base table.
    * @param overfetchFactor over-fetch multiple for sources with rows superseded by newer
    *     generations. Must be at least {@code 1.0}:
    *     <ul>
@@ -175,7 +176,8 @@ public class LsmVectorSearchPlanner implements AutoCloseable {
    * @param nprobes number of IVF partitions to probe
    * @param columns columns to project; pass {@code null} to return all columns plus {@code
    *     _distance}
-   * @param refineBaseTable when true, the base-table arm re-ranks candidates with exact distances.
+   * @param refineBaseTable when true, the base-table and SSTable arms re-rank candidates with exact
+   *     distances.
    * @return an executable plan
    */
   public ExecutionPlan planSearch(

@@ -7,13 +7,14 @@ Tests for DirectoryNamespace implementation.
 This module tests the DirectoryNamespace class which provides a directory-based
 namespace implementation for organizing Lance tables and nested namespaces.
 
-These tests mirror the Rust tests in rust/lance-namespace-impls/src/dir.rs
+These tests mirror the Rust tests in rust/lance-namespace-impls/src/dir/tests/
 
 Additionally, tests are parameterized to run with both the native DirectoryNamespace
 and a CustomNamespace wrapper to verify Python-Rust binding works correctly for
 custom namespace implementations.
 """
 
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -27,6 +28,7 @@ import pytest
 from lance.namespace import LanceNamespace
 from lance_namespace import (
     CountTableRowsRequest,
+    CountTableRowsResponse,
     CreateNamespaceRequest,
     CreateNamespaceResponse,
     CreateTableBranchRequest,
@@ -67,10 +69,13 @@ from lance_namespace import (
     ListTableVersionsRequest,
     ListTableVersionsResponse,
     NamespaceExistsRequest,
+    NamespaceExistsResponse,
     QueryTableRequest,
+    QueryTableResponse,
     RegisterTableRequest,
     RegisterTableResponse,
     TableExistsRequest,
+    TableExistsResponse,
     connect,
 )
 from lance_namespace.errors import (
@@ -107,7 +112,9 @@ class CustomNamespace(LanceNamespace):
     ) -> DescribeNamespaceResponse:
         return self._inner.describe_namespace(request)
 
-    def namespace_exists(self, request: NamespaceExistsRequest) -> None:
+    def namespace_exists(
+        self, request: NamespaceExistsRequest
+    ) -> NamespaceExistsResponse:
         return self._inner.namespace_exists(request)
 
     def drop_namespace(self, request: DropNamespaceRequest) -> DropNamespaceResponse:
@@ -127,7 +134,7 @@ class CustomNamespace(LanceNamespace):
     def describe_table(self, request: DescribeTableRequest) -> DescribeTableResponse:
         return self._inner.describe_table(request)
 
-    def table_exists(self, request: TableExistsRequest) -> None:
+    def table_exists(self, request: TableExistsRequest) -> TableExistsResponse:
         return self._inner.table_exists(request)
 
     def drop_table(self, request: DropTableRequest) -> DropTableResponse:
@@ -184,7 +191,9 @@ class CustomNamespace(LanceNamespace):
     ) -> ListTableIndicesResponse:
         return self._inner.list_table_indices(request)
 
-    def count_table_rows(self, request: CountTableRowsRequest) -> int:
+    def count_table_rows(
+        self, request: CountTableRowsRequest
+    ) -> CountTableRowsResponse:
         return self._inner.count_table_rows(request)
 
     def insert_into_table(
@@ -192,7 +201,7 @@ class CustomNamespace(LanceNamespace):
     ) -> InsertIntoTableResponse:
         return self._inner.insert_into_table(request, request_data)
 
-    def query_table(self, request) -> bytes:
+    def query_table(self, request) -> QueryTableResponse:
         # Accept both QueryTableRequest and dict, like DirectoryNamespace does
         if hasattr(request, "model_dump"):
             request = request.model_dump()
@@ -1416,7 +1425,7 @@ class TestDataManipulation:
 
         # Count rows
         count_req = CountTableRowsRequest(id=["workspace", "test_table"])
-        count = temp_ns_client.count_table_rows(count_req)
+        count = temp_ns_client.count_table_rows(count_req).count
         assert count == 3
 
     def test_count_table_rows_with_filter(self, temp_ns_client):
@@ -1434,7 +1443,7 @@ class TestDataManipulation:
         count_req = CountTableRowsRequest(
             id=["workspace", "test_table"], predicate="age > 28"
         )
-        count = temp_ns_client.count_table_rows(count_req)
+        count = temp_ns_client.count_table_rows(count_req).count
         assert count == 2  # Alice (30) and Charlie (35)
 
     def test_insert_into_table(self, temp_ns_client):
@@ -1461,10 +1470,12 @@ class TestDataManipulation:
         )
         response = temp_ns_client.insert_into_table(insert_req, new_ipc_data)
         assert response is not None
+        assert response.num_inserted_rows == 2
+        assert response.version == 2
 
         # Verify row count increased
         count_req = CountTableRowsRequest(id=["workspace", "test_table"])
-        count = temp_ns_client.count_table_rows(count_req)
+        count = temp_ns_client.count_table_rows(count_req).count
         assert count == 5
 
     def test_query_table(self, temp_ns_client):
@@ -1480,7 +1491,7 @@ class TestDataManipulation:
 
         # Query table with empty vector (for non-vector queries)
         query_req = QueryTableRequest(id=["workspace", "test_table"], k=10, vector={})
-        result_bytes = temp_ns_client.query_table(query_req)
+        result_bytes = temp_ns_client.query_table(query_req).data
         assert result_bytes is not None
         assert len(result_bytes) > 0
 
@@ -1506,7 +1517,7 @@ class TestDataManipulation:
         query_req = QueryTableRequest(
             id=["workspace", "test_table"], filter="age >= 30", k=10, vector={}
         )
-        result_bytes = temp_ns_client.query_table(query_req)
+        result_bytes = temp_ns_client.query_table(query_req).data
         reader = pa.ipc.open_file(pa.BufferReader(result_bytes))
         result_table = reader.read_all()
         assert result_table.num_rows == 2  # Alice and Charlie
@@ -1688,3 +1699,16 @@ class TestIndexOperations:
         assert len(list_response.indexes) == 1
         assert list_response.indexes[0].index_name == "vector_idx"
         assert list_response.indexes[0].columns == ["vector"]
+
+
+def test_import_lance_does_not_load_namespace_client():
+    # The generated REST client is expensive to import and only needed when a
+    # namespace is actually used, so `import lance` must not pull it in.
+    code = (
+        "import sys, lance; "
+        "assert 'lance_namespace' not in sys.modules, sorted(sys.modules); "
+        "assert 'lance.namespace' not in sys.modules; "
+        "lance.LanceNamespace; lance.DescribeTableRequest; "
+        "assert 'lance_namespace' in sys.modules"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)

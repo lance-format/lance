@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::blob::{PyDedicatedBlobWriter, PyPackedBlobWriter};
+use crate::blob::{PyDedicatedBlobWriter, PyManagedBlobWriter, PyPackedBlobWriter};
 use crate::namespace::extract_namespace_arc;
 use crate::{error::PythonErrorExt, rt};
 use arrow::pyarrow::PyArrowType;
@@ -21,15 +21,15 @@ use arrow_schema::Schema as ArrowSchema;
 use bytes::Bytes;
 use futures::stream::StreamExt;
 use lance::io::{ObjectStore, RecordBatchStream};
+use lance_arrow::json::convert_json_columns;
 use lance_core::cache::LanceCache;
 use lance_core::utils::path::LancePathExt;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{
     BufferDescriptor, CachedFileMetadata, FileReader, FileReaderOptions, FileStatistics,
-    ReaderProjection,
 };
 use lance_file::writer::{FileWriter, FileWriterOptions};
-use lance_file::{LanceEncodingsIo, version::LanceFileVersion};
+use lance_file::{LanceEncodingsIo, version::LanceFileVersion, versions as file_versions};
 use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, ObjectStoreParams};
 use lance_io::{
     ReadBatchParams,
@@ -226,7 +226,27 @@ impl LanceFileMetadata {
 #[pymethods]
 impl LanceFileMetadata {
     pub fn __repr__(&self) -> PyResult<String> {
-        serde_yaml::to_string(self).map_err(|err| PyRuntimeError::new_err(err.to_string()))
+        yaml_serde::to_string(self).map_err(|err| PyRuntimeError::new_err(err.to_string()))
+    }
+}
+
+/// Summary of a completed Lance file write
+#[pyclass(get_all, skip_from_py_object)]
+#[derive(Clone, Debug, Serialize)]
+pub struct LanceFileWriteSummary {
+    /// The number of rows written to the file
+    pub num_rows: u64,
+    /// The final size of the file, in bytes
+    pub size_bytes: u64,
+}
+
+#[pymethods]
+impl LanceFileWriteSummary {
+    fn __repr__(&self) -> String {
+        format!(
+            "FileWriteSummary(num_rows={}, size_bytes={})",
+            self.num_rows, self.size_bytes
+        )
     }
 }
 
@@ -275,21 +295,23 @@ impl LanceFileWriter {
         max_page_bytes: Option<u64>,
     ) -> PyResult<Self> {
         let object_writer = object_store.create(&path).await.infer_error()?;
+        let version = version
+            .map(|value| value.parse::<LanceFileVersion>())
+            .transpose()
+            .infer_error()?
+            .unwrap_or_default()
+            .resolve();
         let options = FileWriterOptions {
             data_cache_bytes,
             keep_original_array,
             max_page_bytes,
-            format_version: version
-                .map(|v| v.parse::<LanceFileVersion>())
-                .transpose()
-                .infer_error()?,
-            ..Default::default()
         };
         let inner = if let Some(schema) = schema {
             let lance_schema = lance_core::datatypes::Schema::try_from(&schema.0).infer_error()?;
-            FileWriter::try_new(object_writer, lance_schema, options).infer_error()
+            file_versions::create_writer(version, object_writer, lance_schema, options)
+                .infer_error()
         } else {
-            Ok(FileWriter::new_lazy(object_writer, options))
+            file_versions::create_lazy_writer(version, object_writer, options).infer_error()
         }?;
         Ok(Self {
             inner: Arc::new(Mutex::new(Box::new(inner))),
@@ -341,17 +363,27 @@ impl LanceFileWriter {
     }
 
     pub fn write_batch(&self, batch: PyArrowType<RecordBatch>) -> PyResult<()> {
+        let batch = convert_json_columns(&batch.0)
+            .map_err(lance_core::Error::from)
+            .infer_error()?;
         rt().block_on(None, async {
-            self.inner.lock().await.write_batch(&batch.0).await
+            self.inner.lock().await.write_batch(&batch).await
         })?
         .infer_error()
     }
 
-    pub fn finish(&self) -> PyResult<u64> {
-        rt().block_on(None, async {
-            self.inner.lock().await.finish().await.map(|s| s.num_rows)
-        })?
-        .infer_error()
+    /// Finish the file and return the row count and the final file size
+    ///
+    /// The size is reported by the object writer once the file has been closed
+    /// and so it is accurate for object stores as well as local filesystems.
+    pub fn finish(&self) -> PyResult<LanceFileWriteSummary> {
+        let summary = rt()
+            .block_on(None, async { self.inner.lock().await.finish().await })?
+            .infer_error()?;
+        Ok(LanceFileWriteSummary {
+            num_rows: summary.num_rows,
+            size_bytes: summary.size_bytes,
+        })
     }
 
     pub fn add_global_buffer(&self, bytes: Vec<u8>) -> PyResult<u32> {
@@ -521,6 +553,26 @@ impl LanceFileSession {
                 version,
                 keep_original_array,
                 max_page_bytes,
+            ),
+        )?
+    }
+
+    /// Create an independently addressed packed object under this session's base.
+    ///
+    /// Open the session at the table root, or at a registered base's root and
+    /// pass its ``base_id``. Finish the upload before writing its descriptors
+    /// with ``lance.write_dataset`` and schema metadata
+    /// ``lance.blob.managed=true``. Reuse descriptors with
+    /// ``BlobDescriptorArrayBuilder.append`` to share payloads across rows and
+    /// fragments. This does not register bases or commit a dataset version.
+    #[pyo3(signature=(*, base_id=None))]
+    pub fn open_managed_blob_writer(&self, base_id: Option<u32>) -> PyResult<PyManagedBlobWriter> {
+        rt().block_on(
+            None,
+            PyManagedBlobWriter::try_new(
+                self.object_store.clone(),
+                self.base_path.clone(),
+                base_id,
             ),
         )?
     }
@@ -817,7 +869,7 @@ impl LanceFileReader {
         let mut base_projection = None;
         if let Some(columns) = columns {
             base_projection = Some(
-                ReaderProjection::from_column_names(
+                file_versions::reader_projection_from_column_names(
                     file_metadata.version(),
                     &file_metadata.file_schema,
                     &columns.iter().map(|s| s.as_str()).collect::<Vec<&str>>(),

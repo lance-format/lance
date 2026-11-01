@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 use std::mem;
 
-use rust_stemmers::Algorithm;
+use frostem::Algorithm;
 use serde::{Deserialize, Serialize};
 
 use crate::{Token, TokenFilter, TokenStream, Tokenizer};
@@ -101,7 +101,7 @@ impl<T: Tokenizer> Tokenizer for StemmerFilter<T> {
     fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
         StemmerTokenStream {
             tail: self.inner.token_stream(text),
-            stemmer: rust_stemmers::Stemmer::create(self.stemmer_algorithm),
+            stemmer: frostem::Stemmer::new(self.stemmer_algorithm),
             buffer: String::new(),
         }
     }
@@ -109,7 +109,7 @@ impl<T: Tokenizer> Tokenizer for StemmerFilter<T> {
 
 pub struct StemmerTokenStream<T> {
     tail: T,
-    stemmer: rust_stemmers::Stemmer,
+    stemmer: frostem::Stemmer,
     buffer: String,
 }
 
@@ -137,5 +137,21 @@ impl<T: TokenStream> TokenStream for StemmerTokenStream<T> {
 
     fn token_mut(&mut self) -> &mut Token {
         self.tail.token_mut()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Language, RawTokenizer, Stemmer, TextAnalyzer, TokenStream};
+
+    #[test]
+    fn test_greek_stemmer_handles_multibyte_suffixes() {
+        let mut analyzer = TextAnalyzer::builder(RawTokenizer::default())
+            .filter(Stemmer::new(Language::Greek))
+            .build();
+        let mut stream = analyzer.token_stream("αντιθετε");
+
+        assert!(stream.advance());
+        assert_eq!(stream.token().text, "ανετ");
     }
 }

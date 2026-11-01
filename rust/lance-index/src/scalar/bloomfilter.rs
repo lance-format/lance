@@ -16,11 +16,14 @@ use crate::scalar::{
     BloomFilterQuery, BuiltinIndexType, CreatedIndex, IndexFile, ScalarIndexParams, UpdateCriteria,
 };
 use arrow_array::{Array, UInt64Array};
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use futures::TryStreamExt;
 use lance_arrow_stats::StatisticsAccumulator;
 use lance_core::utils::bloomfilter::as_bytes;
 use lance_core::utils::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::RowAddrTranslator;
+use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_async};
 use lance_select::RowAddrTreeMap;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
@@ -28,7 +31,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion_execution::SendableRecordBatchStream;
 use std::sync::Arc;
 
 use crate::scalar::{
@@ -49,8 +52,12 @@ const BLOOMFILTER_FILENAME: &str = "bloomfilter.lance";
 const BLOOMFILTER_ITEM_META_KEY: &str = "bloomfilter_item";
 const NULL_BITMAP_META_KEY: &str = "null_bitmap";
 const BLOOMFILTER_PROBABILITY_META_KEY: &str = "bloomfilter_probability";
+/// Upper bound on the total serialized bytes packed into a single bloom filter
+/// `BinaryArray`. Its offsets are `i32`, so the concatenated payload cannot exceed
+/// `i32::MAX`. We reserve a 1 MiB margin below that hard limit so per-row Arrow
+/// bookkeeping (offset and validity buffers) cannot push a batch over the edge.
+const MAX_BLOOMFILTER_ARRAY_LENGTH: usize = i32::MAX as usize - 1024 * 1024;
 const BLOOMFILTER_INDEX_VERSION: u32 = 0;
-pub const MAX_BINARY_VALUE_BUFFER_LEN: u64 = i32::MAX as u64;
 
 #[derive(Debug, Clone)]
 struct BloomFilterStatistics {
@@ -87,7 +94,11 @@ pub struct BloomFilterIndex {
     probability: f64,
     // Exact set of null row addresses; None for older indices without this bitmap.
     null_rows: Option<RowAddrTreeMap>,
+    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
+    /// `batch_remapper`; both `None` means no translation is needed.
     frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    /// Asynchronous batch remapper (tagged histories).
+    batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
 }
 
 impl DeepSizeOf for BloomFilterIndex {
@@ -100,12 +111,33 @@ impl BloomFilterIndex {
     async fn load(
         store: Arc<dyn IndexStore>,
         fri: Option<Arc<dyn RowIdRemapper>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        Self::load_with_max_array_length(store, fri, index_cache, MAX_BLOOMFILTER_ARRAY_LENGTH)
+            .await
+    }
+
+    /// Additive sibling of [`Self::load`] for mappings that require
+    /// asynchronous batch row-ID translation.
+    async fn load_with_remapping(
+        store: Arc<dyn IndexStore>,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
+        let mut index = Self::load(store, None, index_cache).await?.as_ref().clone();
+        index.batch_remapper = remapping;
+        debug_assert!(index.frag_reuse_index.is_none() || index.batch_remapper.is_none());
+        Ok(Arc::new(index))
+    }
+
+    async fn load_with_max_array_length(
+        store: Arc<dyn IndexStore>,
+        fri: Option<Arc<dyn RowIdRemapper>>,
         _index_cache: &LanceCache,
+        max_array_length: usize,
     ) -> Result<Arc<Self>> {
         let index_file = store.open_index_file(BLOOMFILTER_FILENAME).await?;
-        let bloom_data = index_file
-            .read_range(0..index_file.num_rows(), None)
-            .await?;
         let file_schema = index_file.schema();
 
         let number_of_items: u64 = file_schema
@@ -130,30 +162,58 @@ impl BloomFilterIndex {
             None
         };
 
-        Ok(Arc::new(Self::try_from_serialized(
-            bloom_data,
+        let read_batch_size =
+            Self::read_batch_size(number_of_items, probability, max_array_length)?;
+
+        let mut zones = Vec::with_capacity(index_file.num_rows());
+        for start in (0..index_file.num_rows()).step_by(read_batch_size) {
+            let end = (start + read_batch_size).min(index_file.num_rows());
+            let mut bloom_data = index_file
+                .read_range_stream(start..end, None, 4096, 2)
+                .await?;
+            while let Some(batch) = bloom_data.try_next().await? {
+                zones.extend(Self::try_from_serialized(batch, max_array_length)?);
+            }
+        }
+
+        Ok(Arc::new(Self {
+            zones,
             number_of_items,
             probability,
             null_rows,
-            fri,
-        )?))
+            frag_reuse_index: fri,
+            batch_remapper: None,
+        }))
+    }
+
+    fn read_batch_size(
+        number_of_items: u64,
+        probability: f64,
+        max_array_length: usize,
+    ) -> Result<usize> {
+        // Bloom filters are stored in an Arrow BinaryArray, whose offsets are i32.
+        // The serialized filter size is fixed by the index parameters, so bound
+        // reads by total serialized bytes instead of row count alone.
+        let params = BloomFilterIndexBuilderParams {
+            number_of_items,
+            probability,
+        };
+        let filter_size = BloomFilterProcessor::build_filter(&params)?.size_bytes();
+        if filter_size > max_array_length {
+            return Err(Error::invalid_input(format!(
+                "Serialized bloom filter size {} exceeds max supported batch bytes {}",
+                filter_size, max_array_length
+            )));
+        }
+        Ok((max_array_length / filter_size).max(1))
     }
 
     fn try_from_serialized(
         data: RecordBatch,
-        number_of_items: u64,
-        probability: f64,
-        null_rows: Option<RowAddrTreeMap>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    ) -> Result<Self> {
+        max_array_length: usize,
+    ) -> Result<Vec<BloomFilterStatistics>> {
         if data.num_rows() == 0 {
-            return Ok(Self {
-                zones: Vec::new(),
-                number_of_items,
-                probability,
-                null_rows,
-                frag_reuse_index,
-            });
+            return Ok(Vec::new());
         }
 
         let fragment_id_col = data
@@ -194,6 +254,18 @@ impl BloomFilterIndex {
                 Error::invalid_input("BloomFilterIndex: 'bloom_filter_data' column is not Binary")
             })?;
 
+        // Enforce the i32-offset cap on read, symmetric to the write side. A batch this
+        // large means the read chunking was bypassed; reject it before it overflows the
+        // BinaryArray offsets instead of panicking deep inside Arrow.
+        let offsets = bloom_filter_data_col.value_offsets();
+        let batch_bytes = (offsets[offsets.len() - 1] - offsets[0]) as usize;
+        if batch_bytes > max_array_length {
+            return Err(Error::invalid_input(format!(
+                "Serialized bloom filter batch size {} exceeds max supported batch bytes {}",
+                batch_bytes, max_array_length
+            )));
+        }
+
         let has_null_col = data
             .column_by_name("has_null")
             .ok_or_else(|| Error::invalid_input("BloomFilterIndex: missing 'has_null' column"))?
@@ -213,7 +285,6 @@ impl BloomFilterIndex {
                 Vec::new()
             };
 
-            // Convert bytes back to Sbbf
             let bloom_filter = Sbbf::new(&bloom_filter_bytes).map_err(|e| {
                 Error::invalid_input(format!("Failed to deserialize bloom filter: {:?}", e))
             })?;
@@ -229,13 +300,7 @@ impl BloomFilterIndex {
             });
         }
 
-        Ok(Self {
-            zones: blocks,
-            number_of_items,
-            probability,
-            null_rows,
-            frag_reuse_index,
-        })
+        Ok(blocks)
     }
 
     fn evaluate_block_against_query(
@@ -440,14 +505,41 @@ impl ScalarIndex for BloomFilterIndex {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<BloomFilterQuery>().unwrap();
-        if let BloomFilterQuery::IsNull() = query
+        let result = if let BloomFilterQuery::IsNull() = query
             && let Some(null_rows) = &self.null_rows
         {
-            return Ok(SearchResult::exact(null_rows.clone()));
-        }
+            SearchResult::exact(null_rows.clone())
+        } else {
+            search_zones(&self.zones, metrics, |block| {
+                self.evaluate_block_against_query(block, query)
+            })?
+        };
 
-        search_zones(&self.zones, metrics, |block| {
-            self.evaluate_block_against_query(block, query)
+        let (selected, nulls) = if let Some(remapper) = &self.frag_reuse_index {
+            // Legacy synchronous remapping path.
+            (
+                remapper.remap_row_addrs_tree_map(result.row_addrs().selected_rows()),
+                remapper.remap_row_addrs_tree_map(result.row_addrs().null_rows()),
+            )
+        } else if let Some(remapper) = &self.batch_remapper {
+            // Tagged asynchronous path.
+            (
+                remap_row_addrs_tree_map_async(
+                    remapper.as_ref(),
+                    result.row_addrs().selected_rows(),
+                )
+                .await?,
+                remap_row_addrs_tree_map_async(remapper.as_ref(), result.row_addrs().null_rows())
+                    .await?,
+            )
+        } else {
+            return Ok(result);
+        };
+
+        Ok(match result {
+            SearchResult::Exact(_) => SearchResult::exact(selected).with_nulls(nulls),
+            SearchResult::AtMost(_) => SearchResult::at_most(selected).with_nulls(nulls),
+            SearchResult::AtLeast(_) => SearchResult::at_least(selected).with_nulls(nulls),
         })
     }
 
@@ -464,6 +556,17 @@ impl ScalarIndex for BloomFilterIndex {
         _mapping: &RowAddrRemap,
         _dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
+        Err(Error::invalid_input_source(
+            "BloomFilter does not support remap".into(),
+        ))
+    }
+
+    async fn remap_streaming(
+        &self,
+        _translator: &RowAddrTranslator,
+        _dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        // No mapping to materialize for an index that cannot be remapped.
         Err(Error::invalid_input_source(
             "BloomFilter does not support remap".into(),
         ))
@@ -569,19 +672,6 @@ fn remap_zone(
     zones
 }
 
-fn checked_merged_payload_size(current: u64, additional: usize) -> Result<u64> {
-    let total = current
-        .checked_add(additional as u64)
-        .ok_or_else(|| Error::invalid_input("merged BloomFilter payload size overflowed u64"))?;
-    if total > MAX_BINARY_VALUE_BUFFER_LEN {
-        return Err(Error::invalid_input(format!(
-            "merged BloomFilter payload is {total} bytes, exceeding the Arrow BinaryArray limit \
-             of {MAX_BINARY_VALUE_BUFFER_LEN} bytes; merge fewer segments at a time"
-        )));
-    }
-    Ok(total)
-}
-
 /// Merge caller-selected BloomFilter segments into one self-contained segment.
 pub async fn merge_bloomfilter_indices(
     source_indices: &[(&BloomFilterIndex, &RoaringBitmap)],
@@ -602,8 +692,12 @@ pub async fn merge_bloomfilter_indices(
     let mut blocks = Vec::new();
     let mut merged_null_rows = RowAddrTreeMap::new();
     let mut has_missing_null_bitmap = false;
-    let mut serialized_bytes = 0u64;
     for (source, fragment_filter) in source_indices {
+        if source.batch_remapper.is_some() {
+            return Err(Error::not_supported(
+                "this index maintenance operation does not support asynchronous row-ID remapping",
+            ));
+        }
         if fragment_filter.is_empty() {
             continue;
         }
@@ -625,14 +719,10 @@ pub async fn merge_bloomfilter_indices(
                 |remapper| remap_zone(block, remapper),
             )
         });
-        for block in source_zones.filter(|block| {
+        blocks.extend(source_zones.filter(|block| {
             u32::try_from(block.bound.fragment_id)
                 .is_ok_and(|fragment_id| fragment_filter.contains(fragment_id))
-        }) {
-            serialized_bytes =
-                checked_merged_payload_size(serialized_bytes, block.bloom_filter.to_bytes().len())?;
-            blocks.push(block);
-        }
+        }));
         match &source.null_rows {
             Some(null_rows) => {
                 let mut filtered = source.frag_reuse_index.as_deref().map_or_else(
@@ -668,6 +758,17 @@ fn default_number_of_items() -> u64 {
 fn default_probability() -> f64 {
     *DEFAULT_PROBABILITY
 }
+
+/// Schema of the per-zone bloom filter statistics batch.
+static BLOOMFILTER_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("fragment_id", DataType::UInt64, false),
+        Field::new("zone_start", DataType::UInt64, false),
+        Field::new("zone_length", DataType::UInt64, false),
+        Field::new("has_null", DataType::Boolean, false),
+        Field::new("bloom_filter_data", DataType::Binary, false),
+    ]))
+});
 
 // NumberOfItems: 8192 + Probability: 0.00057(1 in 1754) -> NumberOfBytes: 16384(16KiB) + 8 SALT values
 // reference: https://hur.st/bloomfilter/?n=8192&p=&m=16KiB&k=8
@@ -752,47 +853,26 @@ impl BloomFilterIndexBuilder {
         Ok(())
     }
 
-    fn bloomfilter_stats_as_batch(&self) -> Result<RecordBatch> {
-        let fragment_ids =
-            UInt64Array::from_iter_values(self.blocks.iter().map(|block| block.bound.fragment_id));
-
-        let zone_starts =
-            UInt64Array::from_iter_values(self.blocks.iter().map(|block| block.bound.start));
-
-        let zone_lengths = UInt64Array::from_iter_values(
-            self.blocks.iter().map(|block| block.bound.length as u64),
-        );
-
-        let has_nulls = arrow_array::BooleanArray::from(
-            self.blocks
-                .iter()
-                .map(|block| block.has_null)
-                .collect::<Vec<bool>>(),
-        );
-
-        // Convert bloom filters to binary data for serialization
-        let bloom_filter_data = if self.blocks.is_empty() {
+    fn bloomfilter_stats_as_batch(
+        fragment_ids: Vec<u64>,
+        zone_starts: Vec<u64>,
+        zone_lengths: Vec<u64>,
+        has_nulls: Vec<bool>,
+        binary_data: Vec<Vec<u8>>,
+    ) -> Result<RecordBatch> {
+        let fragment_ids = UInt64Array::from(fragment_ids);
+        let zone_starts = UInt64Array::from(zone_starts);
+        let zone_lengths = UInt64Array::from(zone_lengths);
+        let has_nulls = arrow_array::BooleanArray::from(has_nulls);
+        let bloom_filter_data = if binary_data.is_empty() {
             Arc::new(arrow_array::BinaryArray::new_null(0)) as ArrayRef
         } else {
-            let binary_data: Vec<Vec<u8>> = self
-                .blocks
-                .iter()
-                .map(|block| block.bloom_filter.to_bytes())
-                .collect();
             let binary_refs: Vec<Option<&[u8]>> = binary_data
                 .iter()
                 .map(|bytes| Some(bytes.as_slice()))
                 .collect();
             Arc::new(arrow_array::BinaryArray::from_opt_vec(binary_refs)) as ArrayRef
         };
-
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
-            Field::new("fragment_id", DataType::UInt64, false),
-            Field::new("zone_start", DataType::UInt64, false),
-            Field::new("zone_length", DataType::UInt64, false),
-            Field::new("has_null", DataType::Boolean, false),
-            Field::new("bloom_filter_data", DataType::Binary, false),
-        ]));
 
         let columns: Vec<ArrayRef> = vec![
             Arc::new(fragment_ids) as ArrayRef,
@@ -802,13 +882,27 @@ impl BloomFilterIndexBuilder {
             bloom_filter_data,
         ];
 
-        Ok(RecordBatch::try_new(schema, columns)?)
+        Ok(RecordBatch::try_new(BLOOMFILTER_SCHEMA.clone(), columns)?)
     }
 
+    /// Serialize the trained bloom filter zone statistics into an index file in
+    /// `index_store`, returning the resulting [`IndexFile`]s.
+    ///
+    /// Zones are flushed as one or more record batches, each bounded by
+    /// `MAX_BLOOMFILTER_ARRAY_LENGTH` serialized bytes so the underlying Arrow
+    /// `BinaryArray` never overflows its `i32` offsets. Any optional null-row bitmap
+    /// is persisted as a global buffer on the same [`IndexFile`] via [`IndexStore`].
     pub async fn write_index(self, index_store: &dyn IndexStore) -> Result<Vec<IndexFile>> {
-        let record_batch = self.bloomfilter_stats_as_batch()?;
+        self.write_index_with_max_array_length(index_store, MAX_BLOOMFILTER_ARRAY_LENGTH)
+            .await
+    }
 
-        let mut file_schema = record_batch.schema().as_ref().clone();
+    async fn write_index_with_max_array_length(
+        self,
+        index_store: &dyn IndexStore,
+        max_array_length: usize,
+    ) -> Result<Vec<IndexFile>> {
+        let mut file_schema = BLOOMFILTER_SCHEMA.as_ref().clone();
         file_schema.metadata.insert(
             BLOOMFILTER_ITEM_META_KEY.to_string(),
             self.params.number_of_items.to_string(),
@@ -818,28 +912,130 @@ impl BloomFilterIndexBuilder {
             self.params.probability.to_string(),
         );
 
-        let mut index_file = index_store
+        let index_file = index_store
             .new_index_file(BLOOMFILTER_FILENAME, Arc::new(file_schema))
             .await?;
-        index_file.write_record_batch(record_batch).await?;
 
-        let bloomfilter_file = if let Some(null_rows) = self.null_rows {
+        let mut writer = BloomFilterBatchWriter::new(index_file, max_array_length);
+        for block in self.blocks {
+            writer.emit(block).await?;
+        }
+        let bloomfilter_file = writer.finish(self.null_rows).await?;
+        Ok(vec![bloomfilter_file])
+    }
+}
+
+/// Buffers serialized bloom filter zone statistics and flushes them as record batches
+/// to the index file, respecting the `max_array_length` limit.
+struct BloomFilterBatchWriter {
+    file: Box<dyn super::IndexWriter>,
+    max_array_length: usize,
+    fragment_ids: Vec<u64>,
+    zone_starts: Vec<u64>,
+    zone_lengths: Vec<u64>,
+    has_nulls: Vec<bool>,
+    bloom_filter_data: Vec<Vec<u8>>,
+    current_bytes: usize,
+    has_written: bool,
+}
+
+impl BloomFilterBatchWriter {
+    fn new(file: Box<dyn super::IndexWriter>, max_array_length: usize) -> Self {
+        Self {
+            file,
+            max_array_length,
+            fragment_ids: Vec::new(),
+            zone_starts: Vec::new(),
+            zone_lengths: Vec::new(),
+            has_nulls: Vec::new(),
+            bloom_filter_data: Vec::new(),
+            current_bytes: 0,
+            has_written: false,
+        }
+    }
+
+    async fn emit(&mut self, block: BloomFilterStatistics) -> Result<()> {
+        let serialized_filter = block.bloom_filter.to_bytes();
+        let serialized_len = serialized_filter.len();
+
+        if serialized_len > self.max_array_length {
+            return Err(Error::invalid_input(format!(
+                "Serialized bloom filter size {} exceeds max supported batch bytes {}",
+                serialized_len, self.max_array_length
+            )));
+        }
+
+        let next_bytes = self
+            .current_bytes
+            .checked_add(serialized_len)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Bloom filter batch size overflow when adding {} bytes to {} bytes",
+                    serialized_len, self.current_bytes
+                ))
+            })?;
+
+        if !self.bloom_filter_data.is_empty() && next_bytes > self.max_array_length {
+            self.flush().await?;
+        }
+
+        self.fragment_ids.push(block.bound.fragment_id);
+        self.zone_starts.push(block.bound.start);
+        self.zone_lengths.push(block.bound.length as u64);
+        self.has_nulls.push(block.has_null);
+        self.bloom_filter_data.push(serialized_filter);
+        self.current_bytes += serialized_len;
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        if self.bloom_filter_data.is_empty() {
+            return Ok(());
+        }
+
+        let batch = BloomFilterIndexBuilder::bloomfilter_stats_as_batch(
+            std::mem::take(&mut self.fragment_ids),
+            std::mem::take(&mut self.zone_starts),
+            std::mem::take(&mut self.zone_lengths),
+            std::mem::take(&mut self.has_nulls),
+            std::mem::take(&mut self.bloom_filter_data),
+        )?;
+        self.file.write_record_batch(batch).await?;
+        self.current_bytes = 0;
+        self.has_written = true;
+        Ok(())
+    }
+
+    async fn finish(mut self, null_rows: Option<RowAddrTreeMap>) -> Result<IndexFile> {
+        self.flush().await?;
+        if !self.has_written {
+            self.file
+                .write_record_batch(BloomFilterIndexBuilder::bloomfilter_stats_as_batch(
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )?)
+                .await?;
+        }
+
+        if let Some(null_rows) = null_rows {
             let mut null_bitmap_bytes = Vec::with_capacity(null_rows.serialized_size());
             null_rows.serialize_into(&mut null_bitmap_bytes)?;
-            let null_bitmap_idx = index_file
+            let null_bitmap_idx = self
+                .file
                 .add_global_buffer(bytes::Bytes::from(null_bitmap_bytes))
                 .await?;
-            index_file
+            self.file
                 .finish_with_metadata(HashMap::from([(
                     NULL_BITMAP_META_KEY.to_string(),
                     null_bitmap_idx.to_string(),
                 )]))
-                .await?
+                .await
         } else {
-            index_file.finish_with_metadata(HashMap::new()).await?
-        };
-
-        Ok(vec![bloomfilter_file])
+            self.file.finish_with_metadata(HashMap::new()).await
+        }
     }
 }
 
@@ -1277,6 +1473,10 @@ impl BasicTrainer for BloomFilterIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BloomFilterIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(false)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -1309,11 +1509,30 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         _index_details: &prost_types::Any,
+        _index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         Ok(
             BloomFilterIndex::load(index_store, frag_reuse_index, cache).await?
+                as Arc<dyn ScalarIndex>,
+        )
+    }
+
+    fn supports_batch_row_id_remapping(&self) -> bool {
+        true
+    }
+
+    async fn load_index_with_remapping(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _index_details: &prost_types::Any,
+        _index_version: u32,
+        frag_reuse_index: Option<Arc<dyn BatchRowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        Ok(
+            BloomFilterIndex::load_with_remapping(index_store, frag_reuse_index, cache).await?
                 as Arc<dyn ScalarIndex>,
         )
     }
@@ -1362,36 +1581,27 @@ mod tests {
     use crate::scalar::bloomfilter::BloomFilterIndexPlugin;
     use arrow_array::{RecordBatch, UInt64Array, record_batch};
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::execution::SendableRecordBatchStream;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
+    use datafusion_execution::SendableRecordBatchStream;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{StreamExt, stream};
-    use lance_core::{ROW_ADDR, cache::LanceCache, utils::tempfile::TempObjDir};
+    use lance_core::{Error, ROW_ADDR, cache::LanceCache, utils::tempfile::TempObjDir};
     use lance_io::object_store::ObjectStore;
     use lance_select::RowAddrTreeMap;
 
     use crate::scalar::{
         BloomFilterQuery, IndexStore, ScalarIndex, SearchResult,
         bloomfilter::{
-            BloomFilterIndex, BloomFilterIndexBuilderParams, MAX_BINARY_VALUE_BUFFER_LEN,
-            checked_merged_payload_size, merge_bloomfilter_indices,
+            BloomFilterIndex, BloomFilterIndexBuilder, BloomFilterIndexBuilderParams,
+            merge_bloomfilter_indices,
         },
         lance_format::LanceIndexStore,
     };
+    use lance_core::utils::bloomfilter::sbbf::Sbbf;
 
     use crate::Index; // Import Index trait to access calculate_included_frags
     use crate::metrics::NoOpMetricsCollector;
     use roaring::RoaringBitmap; // Import RoaringBitmap for the test
-
-    #[test]
-    fn test_checked_merged_payload_size_rejects_binary_overflow() {
-        assert_eq!(
-            checked_merged_payload_size(MAX_BINARY_VALUE_BUFFER_LEN - 1, 1).unwrap(),
-            MAX_BINARY_VALUE_BUFFER_LEN
-        );
-        let err = checked_merged_payload_size(MAX_BINARY_VALUE_BUFFER_LEN, 1).unwrap_err();
-        assert!(err.to_string().contains("Arrow BinaryArray limit"));
-    }
 
     // Adds a _rowaddr column emulating each batch as a new fragment
     fn add_row_addr(stream: SendableRecordBatchStream) -> SendableRecordBatchStream {
@@ -2347,6 +2557,187 @@ mod tests {
             }
             _ => panic!("Expected AtMost search result from bloomfilter"),
         }
+    }
+
+    #[test]
+    fn test_bloomfilter_read_batch_size_is_byte_bounded() {
+        let number_of_items = 1;
+        let probability = 0.25;
+        let max_test_batch_bytes = 48;
+        let filter_bytes = Sbbf::with_ndv_fpp(number_of_items, probability)
+            .unwrap()
+            .to_bytes();
+
+        assert!(filter_bytes.len() <= max_test_batch_bytes);
+        assert!(filter_bytes.len() * 2 > max_test_batch_bytes);
+
+        assert_eq!(
+            BloomFilterIndex::read_batch_size(number_of_items, probability, max_test_batch_bytes,)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_bloomfilter_read_batch_size_rejects_oversized_filter() {
+        let number_of_items = 1;
+        let probability = 0.25;
+        let filter_bytes = Sbbf::with_ndv_fpp(number_of_items, probability)
+            .unwrap()
+            .to_bytes();
+
+        let error =
+            BloomFilterIndex::read_batch_size(number_of_items, probability, filter_bytes.len() - 1)
+                .unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "unexpected error variant: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds max supported batch bytes"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bloomfilter_chunked_write_and_load() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let row_count = 5_000;
+        // Sprinkle nulls at known positions (none of which are asserted individually
+        // below) so the chunked write must carry a non-empty null-row bitmap through
+        // multiple flushes and reload it correctly via add_global_buffer.
+        let expected_null_count = (0..row_count).filter(|&i| i % 100 == 50).count();
+        let values = (0..row_count)
+            .map(|i| (i % 100 != 50).then_some(i))
+            .collect::<Vec<_>>();
+        let data = record_batch!((VALUE_COLUMN_NAME, Int32, values)).unwrap();
+        let schema = data.schema();
+        let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+        let data_stream = add_row_addr(data_stream);
+
+        let mut builder =
+            BloomFilterIndexBuilder::try_new(BloomFilterIndexBuilderParams::new(1, 0.25)).unwrap();
+        builder.train(data_stream).await.unwrap();
+        assert_eq!(builder.blocks.len(), row_count as usize);
+
+        // Small byte limit forces the writer to emit many on-disk batches and the
+        // reader to chunk its reads. The total payload is far larger than the limit,
+        // so a load that concatenated everything into one BinaryArray would trip the
+        // read-side cap; a correctly chunked load must still succeed.
+        let max_array_length = 64;
+        let filter_bytes = Sbbf::with_ndv_fpp(1, 0.25).unwrap().size_bytes();
+        assert!(filter_bytes * row_count as usize > max_array_length);
+
+        builder
+            .write_index_with_max_array_length(test_store.as_ref(), max_array_length)
+            .await
+            .unwrap();
+
+        let index = BloomFilterIndex::load_with_max_array_length(
+            test_store.clone(),
+            None,
+            &LanceCache::no_cache(),
+            max_array_length,
+        )
+        .await
+        .expect("Failed to load chunked BloomFilterIndex");
+
+        assert_eq!(index.zones.len(), row_count as usize);
+        assert_eq!(index.zones[0].bound.start, 0);
+        assert_eq!(index.zones[4096].bound.start, 4096);
+        assert_eq!(index.zones[4999].bound.start, 4999);
+        assert_eq!(index.zones[4999].bound.length, 1);
+        assert!(!index.zones[4096].bloom_filter.to_bytes().is_empty());
+
+        // The null-row bitmap is stored as a global buffer, independent of the chunked
+        // zone batches. Verify it survives the multi-flush write and reloads intact.
+        let null_rows = index
+            .null_rows
+            .as_ref()
+            .expect("chunked write must preserve the null-row bitmap");
+        let loaded_null_count = null_rows
+            .row_addrs()
+            .map(|addrs| addrs.count())
+            .unwrap_or(0);
+        assert_eq!(loaded_null_count, expected_null_count);
+    }
+
+    #[tokio::test]
+    async fn test_bloomfilter_load_rejects_unchunked_oversized_read() {
+        // Guards the read-side invariant directly: a batch whose concatenated filter
+        // payload exceeds the cap must be rejected rather than building an oversized
+        // BinaryArray. This is what protects `load` if its chunking ever regresses.
+        let filter_bytes = Sbbf::with_ndv_fpp(1, 0.25).unwrap().to_bytes();
+        let batch = BloomFilterIndexBuilder::bloomfilter_stats_as_batch(
+            vec![0, 0],
+            vec![0, 1],
+            vec![1, 1],
+            vec![false, false],
+            vec![filter_bytes.clone(), filter_bytes.clone()],
+        )
+        .unwrap();
+
+        // One filter fits, two together do not.
+        let max_array_length = filter_bytes.len();
+        let error = BloomFilterIndex::try_from_serialized(batch, max_array_length).unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "unexpected error variant: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds max supported batch bytes"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bloomfilter_chunked_write_rejects_oversized_filter() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let data = record_batch!((VALUE_COLUMN_NAME, Int32, [0])).unwrap();
+        let schema = data.schema();
+        let data_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ));
+        let data_stream = add_row_addr(data_stream);
+
+        let mut builder =
+            BloomFilterIndexBuilder::try_new(BloomFilterIndexBuilderParams::new(1, 0.25)).unwrap();
+        builder.train(data_stream).await.unwrap();
+
+        let error = builder
+            .write_index_with_max_array_length(test_store.as_ref(), 16)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "unexpected error variant: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds max supported batch bytes 16"),
+            "unexpected error: {error}"
+        );
     }
 
     // Writes a bloomfilter file in the legacy format (no null bitmap global buffer),

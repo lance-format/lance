@@ -34,7 +34,7 @@ impl DeepSizeOf for MemWalIndexHandle {
 #[derive(Serialize)]
 struct MemWalStatistics {
     num_shards: u32,
-    num_merged_generations: usize,
+    num_compacted_sstables: usize,
     num_shard_specs: usize,
     num_maintained_indexes: usize,
     num_index_catchup_entries: usize,
@@ -53,7 +53,7 @@ impl Index for MemWalIndexHandle {
     fn statistics(&self) -> Result<serde_json::Value> {
         let stats = MemWalStatistics {
             num_shards: self.0.details.num_shards,
-            num_merged_generations: self.0.details.merged_generations.len(),
+            num_compacted_sstables: self.0.details.compacted_sstables.len(),
             num_shard_specs: self.0.details.sharding_specs.len(),
             num_maintained_indexes: self.0.details.maintained_indexes.len(),
             num_index_catchup_entries: self.0.details.index_catchup.len(),

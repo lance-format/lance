@@ -8,6 +8,7 @@ use futures::{FutureExt, TryFutureExt, future::BoxFuture};
 
 use lance_core::Result;
 
+mod array_encoding;
 pub mod buffer;
 pub mod compression;
 pub mod compression_config;
@@ -17,13 +18,11 @@ pub mod decoder;
 pub mod encoder;
 pub mod encodings;
 pub mod format;
-pub mod previous;
 pub mod repdef;
 pub mod statistics;
 #[cfg(test)]
 pub mod testing;
 pub mod utils;
-pub mod version;
 
 // We can definitely add support for big-endian machines someday.  However, it's not a priority and
 // would involve extensive testing (probably through emulation) to ensure that the encodings are
@@ -100,6 +99,29 @@ pub trait EncodingsIo: std::fmt::Debug + Send + Sync {
         &self,
         _stats: Arc<dyn lance_core::utils::io_stats::IoStatsRecorder>,
     ) -> Option<Arc<dyn EncodingsIo>> {
+        None
+    }
+
+    /// Returns a version of this I/O service that merges the ranges of a
+    /// request that are at most `gap` bytes apart into one read, in place of
+    /// its own coalescing rule. Every range still receives exactly its bytes,
+    /// so decoded data is unchanged; only the number and size of the reads
+    /// differ.
+    ///
+    /// Returns `None` if this implementation does not coalesce requests (e.g.
+    /// in-memory or test schedulers), in which case the caller should fall
+    /// back to using self.
+    fn with_coalesce_gap(&self, _gap: u64) -> Option<Arc<dyn EncodingsIo>> {
+        None
+    }
+
+    /// How many bytes the scan behind this I/O service reads ahead of the
+    /// decoder before it waits for the decoder to consume them (the scan's
+    /// `io_buffer_size`): `Some(0)` if it never waits, and `None` if this
+    /// implementation has no such budget. A service from
+    /// [`Self::with_bypass_backpressure`] reports the same budget, although its
+    /// own reads never wait on it.
+    fn io_buffer_size(&self) -> Option<u64> {
         None
     }
 }

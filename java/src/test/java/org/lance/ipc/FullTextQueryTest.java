@@ -13,6 +13,8 @@
  */
 package org.lance.ipc;
 
+import org.lance.DocumentGranularity;
+
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
@@ -39,6 +41,7 @@ public class FullTextQueryTest {
     assertEquals(50, q.getMaxExpansions());
     assertEquals(FullTextQuery.Operator.OR, q.getOperator());
     assertEquals(0, q.getPrefixLength());
+    assertEquals(Optional.empty(), q.getDocumentGranularity());
   }
 
   @Test
@@ -46,7 +49,14 @@ public class FullTextQueryTest {
     FullTextQuery.MatchQuery q =
         (FullTextQuery.MatchQuery)
             FullTextQuery.match(
-                "hello", "title", 2.0f, Optional.of(1), 10, FullTextQuery.Operator.AND, 3);
+                "hello",
+                "title",
+                2.0f,
+                Optional.of(1),
+                10,
+                FullTextQuery.Operator.AND,
+                3,
+                DocumentGranularity.LIST_ELEMENT);
 
     assertEquals(FullTextQuery.Type.MATCH, q.getType());
     assertEquals("hello", q.getQueryText());
@@ -56,6 +66,7 @@ public class FullTextQueryTest {
     assertEquals(10, q.getMaxExpansions());
     assertEquals(FullTextQuery.Operator.AND, q.getOperator());
     assertEquals(3, q.getPrefixLength());
+    assertEquals(Optional.of(DocumentGranularity.LIST_ELEMENT), q.getDocumentGranularity());
   }
 
   @Test
@@ -67,17 +78,20 @@ public class FullTextQueryTest {
     assertEquals("exact match", q.getQueryText());
     assertEquals("content", q.getColumn());
     assertEquals(0, q.getSlop());
+    assertEquals(Optional.empty(), q.getDocumentGranularity());
   }
 
   @Test
   void testPhraseQueryCustomSlop() {
     FullTextQuery.PhraseQuery q =
-        (FullTextQuery.PhraseQuery) FullTextQuery.phrase("ordered terms", "content", 2);
+        (FullTextQuery.PhraseQuery)
+            FullTextQuery.phrase("ordered terms", "content", 2, DocumentGranularity.LIST_ELEMENT);
 
     assertEquals(FullTextQuery.Type.MATCH_PHRASE, q.getType());
     assertEquals("ordered terms", q.getQueryText());
     assertEquals("content", q.getColumn());
     assertEquals(2, q.getSlop());
+    assertEquals(Optional.of(DocumentGranularity.LIST_ELEMENT), q.getDocumentGranularity());
   }
 
   @Test
@@ -315,6 +329,101 @@ public class FullTextQueryTest {
             Arrays.asList(1.0f, 0.5f),
             FullTextQuery.Operator.OR);
     assertFalse(a.equals(b), "MultiMatchQuery instances with different boosts must not be equal");
+  }
+
+  @Test
+  void testCombinedFieldsWithoutBoosts() {
+    FullTextQuery.CombinedFieldsQuery q =
+        (FullTextQuery.CombinedFieldsQuery)
+            FullTextQuery.combinedFields("hello", Arrays.asList("title", "body"));
+
+    assertEquals(FullTextQuery.Type.COMBINED_FIELDS, q.getType());
+    assertEquals("hello", q.getQueryText());
+    assertEquals(Arrays.asList("title", "body"), q.getColumns());
+    assertFalse(q.getBoosts().isPresent());
+    assertEquals(FullTextQuery.Operator.OR, q.getOperator());
+  }
+
+  @Test
+  void testCombinedFieldsWithBoosts() {
+    FullTextQuery.CombinedFieldsQuery q =
+        (FullTextQuery.CombinedFieldsQuery)
+            FullTextQuery.combinedFields(
+                "hello",
+                Arrays.asList("title", "body"),
+                Arrays.asList(2.0f, 1.0f),
+                FullTextQuery.Operator.AND);
+
+    assertEquals(FullTextQuery.Type.COMBINED_FIELDS, q.getType());
+    assertTrue(q.getBoosts().isPresent());
+    assertEquals(2, q.getBoosts().get().size());
+    assertEquals(2.0f, q.getBoosts().get().get(0));
+    assertEquals(1.0f, q.getBoosts().get().get(1));
+    assertEquals(FullTextQuery.Operator.AND, q.getOperator());
+    assertNotNull(q.toString());
+  }
+
+  @Test
+  void testCombinedFieldsQueryEquality() {
+    FullTextQuery a = FullTextQuery.combinedFields("hello", Arrays.asList("title", "body"));
+    FullTextQuery b = FullTextQuery.combinedFields("hello", Arrays.asList("title", "body"));
+    assertEquals(a, b, "Two CombinedFieldsQuery instances with the same fields must be equal");
+    assertEquals(a.hashCode(), b.hashCode());
+  }
+
+  @Test
+  void testCombinedFieldsQueryInequalityDifferentOperator() {
+    FullTextQuery a =
+        FullTextQuery.combinedFields(
+            "hello", Arrays.asList("title", "body"), null, FullTextQuery.Operator.AND);
+    FullTextQuery b =
+        FullTextQuery.combinedFields(
+            "hello", Arrays.asList("title", "body"), null, FullTextQuery.Operator.OR);
+    assertFalse(
+        a.equals(b), "CombinedFieldsQuery instances with different operator must not be equal");
+  }
+
+  @Test
+  void testCombinedFieldsQueryInequalityDifferentBoosts() {
+    FullTextQuery a =
+        FullTextQuery.combinedFields(
+            "hello",
+            Arrays.asList("title", "body"),
+            Arrays.asList(2.0f, 1.0f),
+            FullTextQuery.Operator.OR);
+    FullTextQuery b =
+        FullTextQuery.combinedFields(
+            "hello",
+            Arrays.asList("title", "body"),
+            Arrays.asList(1.0f, 1.0f),
+            FullTextQuery.Operator.OR);
+    assertFalse(
+        a.equals(b), "CombinedFieldsQuery instances with different boosts must not be equal");
+  }
+
+  @Test
+  void testCombinedFieldsNotEqualMultiMatch() {
+    FullTextQuery combined = FullTextQuery.combinedFields("hello", Arrays.asList("title", "body"));
+    FullTextQuery multi = FullTextQuery.multiMatch("hello", Arrays.asList("title", "body"));
+    assertFalse(
+        combined.equals(multi),
+        "CombinedFieldsQuery and MultiMatchQuery must not be equal even with same fields");
+  }
+
+  @Test
+  void testCombinedFieldsBoostsDefensivelyCopied() {
+    java.util.List<Float> boosts = new java.util.ArrayList<>(Arrays.asList(2.0f, 1.0f));
+    FullTextQuery.CombinedFieldsQuery q =
+        (FullTextQuery.CombinedFieldsQuery)
+            FullTextQuery.combinedFields(
+                "hello", Arrays.asList("title", "body"), boosts, FullTextQuery.Operator.OR);
+
+    // Mutating the caller-provided list must not change the stored query.
+    boosts.set(0, 9.0f);
+    boosts.clear();
+
+    assertTrue(q.getBoosts().isPresent());
+    assertEquals(Arrays.asList(2.0f, 1.0f), q.getBoosts().get());
   }
 
   @Test

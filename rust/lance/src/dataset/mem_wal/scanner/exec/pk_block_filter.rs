@@ -5,7 +5,7 @@
 //!
 //! Drops a row when any newer generation's membership ([`GenMembership`])
 //! contains its primary key — in-memory generations probe their PK index by
-//! value, flushed generations probe their on-disk PK BTree. Each generation is
+//! value, SSTables probe their on-disk PK BTree. Each generation is
 //! probed once per batch (see the perf note below). Used both as the KNN
 //! post-filter (vector search, with over-fetch) and the cross-generation scan
 //! filter (`k = 0`).
@@ -22,7 +22,7 @@
 //! `BTreeIndex::contains_keys` (one page pass, no per-key `SearchResult`
 //! allocation); the in-memory arm maps a sync PK lookup over the keys. Probes
 //! are not disk-bound in steady state: the opened index and its (small,
-//! memtable-sized) pages are held by the injected `FlushedMemTableCache` /
+//! memtable-sized) pages are held by the injected `SsTableCache` /
 //! `LanceCache`, so after the first touch every probe is memory-resident.
 //! Already-blocked rows are dropped from the key set before probing older
 //! generations, preserving the per-row short-circuit.
@@ -36,9 +36,11 @@ use arrow::compute::filter_record_batch;
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::SchemaRef;
 use datafusion::common::ScalarValue;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
     SendableRecordBatchStream,
@@ -120,6 +122,13 @@ impl ExecutionPlan for PkBlockFilterExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -180,8 +189,8 @@ struct PkBlockFilterStream {
     warned: bool,
 }
 
-/// Keep only the rows no newer-gen membership contains. Async because flushed
-/// generations are probed against their on-disk PK BTree.
+/// Keep only the rows no newer-gen membership contains. Async because SSTables
+/// are probed against their on-disk PK BTree.
 async fn filter_batch(batch: RecordBatch, config: Arc<FilterConfig>) -> DFResult<RecordBatch> {
     let FilterConfig {
         pk_columns,

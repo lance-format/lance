@@ -10,9 +10,10 @@ use super::IVFIndex;
 use crate::dataset::ROW_ID;
 use crate::index::vector::pq::{PQIndex, build_pq_storage};
 use arrow::compute::concat;
-use arrow_array::UInt64Array;
 use arrow_array::{
-    Array, FixedSizeListArray, RecordBatch, UInt32Array, cast::AsArray, types::UInt64Type,
+    Array, FixedSizeListArray, PrimitiveArray, RecordBatch, UInt32Array, UInt64Array,
+    cast::AsArray,
+    types::{ArrowPrimitiveType, UInt8Type, UInt64Type},
 };
 use futures::stream::Peekable;
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -22,8 +23,8 @@ use lance_core::datatypes::Schema;
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
-use lance_file::previous::reader::FileReader as PreviousFileReader;
-use lance_file::previous::writer::FileWriter as PreviousFileWriter;
+use lance_file::versions::v1::reader::FileReader as V1FileReader;
+use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::hnsw::{HnswMetadata, builder::HnswBuildParams};
@@ -34,7 +35,6 @@ use lance_index::vector::quantizer::{Quantization, Quantizer};
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_index::vector::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 use lance_io::ReadBatchParams;
-use lance_io::encodings::plain::PlainEncoder;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Writer;
 use lance_linalg::distance::{DistanceType, MetricType};
@@ -42,6 +42,7 @@ use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
@@ -50,6 +51,75 @@ use crate::Result;
 // TODO: make it configurable, limit by the number of CPU cores & memory
 static HNSW_PARTITIONS_BUILD_PARALLEL: LazyLock<usize> =
     LazyLock::new(get_num_compute_intensive_cpus);
+
+async fn write_primitive_values<T: ArrowPrimitiveType>(
+    writer: &mut dyn Writer,
+    array: &PrimitiveArray<T>,
+) -> Result<()> {
+    let data = array.to_data();
+    let byte_width = std::mem::size_of::<T::Native>();
+    let start = array.offset() * byte_width;
+    let end = start + array.len() * byte_width;
+    writer
+        .write_all(&data.buffers()[0].as_slice()[start..end])
+        .await?;
+    Ok(())
+}
+
+async fn write_pq_codes(writer: &mut dyn Writer, arrays: &[&dyn Array]) -> Result<()> {
+    for array in arrays {
+        // Loaded legacy partitions expose transposed codes as flat UInt8 arrays,
+        // while newly shuffled partitions supply FixedSizeList<UInt8>.
+        if let Some(values) = array.as_any().downcast_ref::<PrimitiveArray<UInt8Type>>() {
+            write_primitive_values(writer, values).await?;
+        } else if let Some(codes) = array.as_any().downcast_ref::<FixedSizeListArray>() {
+            let value_offset = codes.value_offset(0) as usize;
+            let value_len = codes.len() * codes.value_length() as usize;
+            let values = codes.values().slice(value_offset, value_len);
+            let values = values
+                .as_any()
+                .downcast_ref::<PrimitiveArray<UInt8Type>>()
+                .ok_or_else(|| {
+                    Error::index(format!(
+                        "legacy IVF PQ code values must be UInt8, found {}",
+                        values.data_type()
+                    ))
+                })?;
+            write_primitive_values(writer, values).await?;
+        } else {
+            return Err(Error::index(format!(
+                "legacy IVF PQ codes must be UInt8 or FixedSizeList<UInt8>, found {}",
+                array.data_type()
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn write_row_ids(writer: &mut dyn Writer, arrays: &[&dyn Array]) -> Result<()> {
+    for array in arrays {
+        let row_ids = array
+            .as_any()
+            .downcast_ref::<PrimitiveArray<UInt64Type>>()
+            .ok_or_else(|| {
+                Error::index(format!(
+                    "legacy IVF row ids must be UInt64, found {}",
+                    array.data_type()
+                ))
+            })?;
+        write_primitive_values(writer, row_ids).await?;
+    }
+    Ok(())
+}
+
+pub(super) async fn write_pq_partition_payload(
+    writer: &mut dyn Writer,
+    pq_codes: &[&dyn Array],
+    row_ids: &[&dyn Array],
+) -> Result<()> {
+    write_pq_codes(writer, pq_codes).await?;
+    write_row_ids(writer, row_ids).await
+}
 
 /// Merge streams with the same partition id and collect PQ codes and row IDs.
 async fn merge_streams(
@@ -222,10 +292,8 @@ pub(super) async fn write_pq_partitions(
         ivf.add_partition_with_offset(writer.tell().await?, total_records as u32);
         if total_records > 0 {
             let pq_refs = pq_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-            PlainEncoder::write(writer, &pq_refs).await?;
-
             let row_ids_refs = row_id_array.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
-            PlainEncoder::write(writer, row_ids_refs.as_slice()).await?;
+            write_pq_partition_payload(writer, &pq_refs, &row_ids_refs).await?;
         }
         log::info!(
             "Wrote partition {} in {} ms",
@@ -242,8 +310,8 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
     column: &str,
     distance_type: DistanceType,
     hnsw_params: &HnswBuildParams,
-    writer: &mut PreviousFileWriter<ManifestDescribing>,
-    mut auxiliary_writer: Option<&mut PreviousFileWriter<ManifestDescribing>>,
+    writer: &mut V1FileWriter<ManifestDescribing>,
+    mut auxiliary_writer: Option<&mut V1FileWriter<ManifestDescribing>>,
     ivf: &mut IvfModel,
     quantizer: Quantizer,
     streams: Option<Vec<impl Stream<Item = Result<RecordBatch>>>>,
@@ -338,7 +406,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
             }
 
             let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
-            let part_writer = PreviousFileWriter::<ManifestDescribing>::try_new(
+            let part_writer = V1FileWriter::<ManifestDescribing>::try_new(
                 &object_store,
                 part_file,
                 Schema::try_from(writer.schema())?,
@@ -348,7 +416,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
             let aux_part_writer = match auxiliary_writer.as_ref() {
                 Some(writer) => Some(
-                    PreviousFileWriter::<ManifestDescribing>::try_new(
+                    V1FileWriter::<ManifestDescribing>::try_new(
                         &object_store,
                         aux_part_file,
                         Schema::try_from(writer.schema())?,
@@ -410,7 +478,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
             let (part_file, aux_part_file) = (&part_files[part_id], &aux_part_files[part_id]);
             let part_reader =
-                PreviousFileReader::try_new_self_described(&object_store, part_file, None).await?;
+                V1FileReader::try_new_self_described(&object_store, part_file, None).await?;
 
             let batches = futures::stream::iter(0..part_reader.num_batches())
                 .map(|batch_id| {
@@ -434,7 +502,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
             if let Some(aux_writer) = auxiliary_writer.as_mut() {
                 let aux_part_reader =
-                    PreviousFileReader::try_new_self_described(&object_store, aux_part_file, None)
+                    V1FileReader::try_new_self_described(&object_store, aux_part_file, None)
                         .await?;
 
                 let batches = futures::stream::iter(0..aux_part_reader.num_batches())
@@ -514,8 +582,8 @@ async fn build_hnsw_quantization_partition(
     column: &str,
     metric_type: MetricType,
     hnsw_params: Arc<HnswBuildParams>,
-    writer: PreviousFileWriter<ManifestDescribing>,
-    aux_writer: Option<PreviousFileWriter<ManifestDescribing>>,
+    writer: V1FileWriter<ManifestDescribing>,
+    aux_writer: Option<V1FileWriter<ManifestDescribing>>,
     quantizer: Quantizer,
     row_ids_array: Vec<Arc<dyn Array>>,
     code_array: Vec<Arc<dyn Array>>,
@@ -579,7 +647,7 @@ async fn build_and_write_hnsw(
     vectors: Arc<dyn Array>,
     params: HnswBuildParams,
     distance_type: DistanceType,
-    mut writer: PreviousFileWriter<ManifestDescribing>,
+    mut writer: V1FileWriter<ManifestDescribing>,
 ) -> Result<usize> {
     let batch = params.build(vectors, distance_type).await?.to_batch()?;
     let metadata = batch.schema_ref().metadata().clone();
@@ -592,7 +660,7 @@ async fn build_and_write_pq_storage(
     row_ids: Arc<dyn Array>,
     code_array: Vec<Arc<dyn Array>>,
     pq: ProductQuantizer,
-    mut writer: PreviousFileWriter<ManifestDescribing>,
+    mut writer: V1FileWriter<ManifestDescribing>,
 ) -> Result<()> {
     let storage = spawn_cpu(move || build_pq_storage(metric_type, row_ids, code_array, pq)).await?;
 
@@ -611,14 +679,44 @@ mod tests {
     use crate::Dataset;
     use crate::index::vector::ivf::v2;
     use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams};
-    use arrow_array::RecordBatchIterator;
+    use arrow_array::{RecordBatchIterator, UInt8Array};
     use arrow_schema::{Field, Schema};
-    use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::utils::tempfile::{TempObjFile, TempStrDir};
     use lance_index::IndexType;
     use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
     use lance_testing::datagen::generate_random_array;
+
+    #[tokio::test]
+    async fn pq_partition_payload_preserves_sliced_values() {
+        let codes =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from_iter_values(0..6), 2).unwrap();
+        let codes = codes.slice(1, 2);
+        let flat_codes = UInt8Array::from_iter_values(6..9).slice(1, 2);
+        let row_ids = UInt64Array::from_iter_values([10, 11, 12]).slice(1, 2);
+        let flat_row_id = UInt64Array::from_iter_values([13]);
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = object_store.create(&path).await.unwrap();
+        write_pq_partition_payload(
+            writer.as_mut(),
+            &[&codes as &dyn Array, &flat_codes as &dyn Array],
+            &[&row_ids as &dyn Array, &flat_row_id as &dyn Array],
+        )
+        .await
+        .unwrap();
+        Writer::shutdown(&mut writer).await.unwrap();
+
+        let reader = object_store.open(&path).await.unwrap();
+        let bytes = reader.get_range(0..30).await.unwrap();
+        let mut expected = vec![2, 3, 4, 5, 7, 8];
+        expected.extend_from_slice(&11_u64.to_le_bytes());
+        expected.extend_from_slice(&12_u64.to_le_bytes());
+        expected.extend_from_slice(&13_u64.to_le_bytes());
+        assert_eq!(bytes.as_ref(), expected);
+    }
 
     #[tokio::test]
     async fn test_merge_multiple_indices() {
@@ -817,8 +915,8 @@ mod tests {
     /// IVF_HNSW_* builds.
     ///
     /// The OS temp dir is process-global, so an in-process check can't attribute a
-    /// leak to our own build. Instead we run the build in a child process with
-    /// `TMPDIR` pointed at an isolated dir we own, then assert nothing survives.
+    /// leak to our own build. Instead we run the build in a child process with its
+    /// temp dir pointed at an isolated dir we own, then assert nothing survives.
     #[test]
     fn test_hnsw_pq_scratch_dir_is_not_leaked() {
         // Isolated temp root for the child. Owned here so it -- and anything the
@@ -828,7 +926,13 @@ mod tests {
         let child_test = "index::vector::ivf::io::tests::build_legacy_hnsw_pq_in_child_process";
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([child_test, "--exact", "--ignored", "--nocapture"])
+            // `std::env::temp_dir()` reads `TMPDIR` on POSIX and `TMP`/`TEMP` on
+            // Windows. Set all three, and let the child confirm the redirect took
+            // effect: a child staging into the real temp dir would leave the scan
+            // below looking at an empty directory and passing for the wrong reason.
             .env("TMPDIR", isolated_root.as_ref())
+            .env("TMP", isolated_root.as_ref())
+            .env("TEMP", isolated_root.as_ref())
             .env("LANCE_HNSW_LEAK_TEST_ROOT", isolated_root.as_ref())
             .output()
             .expect("failed to spawn child test process");
@@ -839,8 +943,18 @@ mod tests {
             String::from_utf8_lossy(&output.stderr),
         );
 
-        // Each build stages its partitions in one `.tmp*` dir directly under TMPDIR.
-        // Every guard removes its dir when it drops, so none should survive.
+        // A filter that matches nothing also exits 0, so confirm the child did the
+        // work instead of reporting a clean scan of an untouched directory.
+        assert!(
+            isolated_root.join("dataset").is_dir(),
+            "the child process did not run the build; filter was {child_test:?}\n\
+             --- child stdout ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+
+        // Each build stages its partitions in one `.tmp*` dir directly under the
+        // child's temp dir. Every guard removes its dir when it drops, so none
+        // should survive.
         let leaked: Vec<PathBuf> = std::fs::read_dir(&isolated_root)
             .expect("read isolated temp root")
             .flatten()
@@ -857,7 +971,9 @@ mod tests {
         assert!(
             leaked.is_empty(),
             "legacy IVF_HNSW_PQ build leaked {} scratch director{} under the temp dir; \
-             the TempStdDir guard should remove each one when it drops: {:?}",
+             the TempStdDir guard should remove each one when it drops: {:?}. `.tmp` is \
+             tempfile's default prefix, so one of these may belong to another tempfile \
+             user rather than to that guard.",
             leaked.len(),
             if leaked.len() == 1 { "y" } else { "ies" },
             leaked,
@@ -865,9 +981,9 @@ mod tests {
     }
 
     /// Child half of [`test_hnsw_pq_scratch_dir_is_not_leaked`]. Ignored so it only
-    /// runs when the parent spawns it with `TMPDIR` and `LANCE_HNSW_LEAK_TEST_ROOT`
-    /// pointed at an isolated dir. Builds a few legacy IVF_HNSW_PQ indices; the
-    /// parent does the leak detection.
+    /// runs when the parent spawns it with the temp-dir env vars and
+    /// `LANCE_HNSW_LEAK_TEST_ROOT` pointed at an isolated dir. Builds a few legacy
+    /// IVF_HNSW_PQ indices; the parent does the leak detection.
     #[tokio::test]
     #[ignore = "spawned as a child process by test_hnsw_pq_scratch_dir_is_not_leaked"]
     async fn build_legacy_hnsw_pq_in_child_process() {
@@ -877,10 +993,28 @@ mod tests {
             return;
         };
 
-        const DIM: usize = 32;
-        const ROWS: usize = 1024;
-        const NLIST: usize = 4;
-        const NUM_BUILDS: usize = 3;
+        // The parent can only scan the directory it owns, so if its temp-dir env
+        // vars did not take effect the scan is vacuous and passes no matter what
+        // the build does. Fail here instead of reporting a clean run.
+        let temp_dir = std::env::temp_dir();
+        let canonical = |path: &std::path::Path| {
+            path.canonicalize()
+                .unwrap_or_else(|e| panic!("cannot canonicalize {path:?}: {e}"))
+        };
+        assert_eq!(
+            canonical(&temp_dir),
+            canonical(std::path::Path::new(&root)),
+            "the temp dir was not redirected to the isolated root; temp_dir() is \
+             {temp_dir:?}, root is {root:?}. On Windows 11 and Server 2022 and newer, \
+             `std::env::temp_dir` goes through `GetTempPath2`, which ignores TMP and \
+             TEMP for a process running as SYSTEM; older Windows falls back to \
+             `GetTempPathW`, which honors them.",
+        );
+
+        const DIM: usize = 8;
+        const ROWS: usize = 256;
+        const NLIST: usize = 2;
+        const NUM_BUILDS: usize = 2;
 
         // Keep the dataset out of the temp dir's `.tmp*` namespace so the parent
         // never confuses it with a leaked scratch directory.
@@ -898,6 +1032,24 @@ mod tests {
             .await
             .unwrap();
 
+        let ivf_params = IvfBuildParams {
+            num_partitions: Some(NLIST),
+            max_iters: 2,
+            sample_rate: 2,
+            ..Default::default()
+        };
+        let hnsw_params = HnswBuildParams::default()
+            .max_level(2)
+            .num_edges(4)
+            .ef_construction(16);
+        let pq_params = PQBuildParams {
+            num_sub_vectors: 2,
+            num_bits: 8,
+            max_iters: 2,
+            sample_rate: 2,
+            ..Default::default()
+        };
+
         for _ in 0..NUM_BUILDS {
             crate::index::vector::ivf::build_ivf_hnsw_pq_index(
                 &ds,
@@ -905,9 +1057,9 @@ mod tests {
                 "idx",
                 uuid::Uuid::new_v4(),
                 MetricType::L2,
-                &IvfBuildParams::new(NLIST),
-                &HnswBuildParams::default(),
-                &PQBuildParams::new(4, 8),
+                &ivf_params,
+                &hnsw_params,
+                &pq_params,
             )
             .await
             .unwrap();

@@ -14,6 +14,7 @@
 package org.lance;
 
 import org.lance.delta.DatasetDelta;
+import org.lance.delta.DatasetDeltaBuilder;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
@@ -183,6 +184,103 @@ public class DeltaTest {
           DatasetDelta delta = ds2.delta(1L, 2L);
           List<Transaction> txs = delta.listTransactions();
           Assertions.assertEquals(1, txs.size(), "delta v1..v2 should contain exactly one txn");
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testGetDeletedRowIds(@TempDir Path tempDir) throws IOException {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      String uri = tempDir.resolve("delta_demo_delete").toString();
+      Schema schema =
+          new Schema(
+              Arrays.asList(
+                  Field.notNullable(
+                      "id", new org.apache.arrow.vector.types.pojo.ArrowType.Int(32, true)),
+                  Field.nullable(
+                      "val", org.apache.arrow.vector.types.pojo.ArrowType.Utf8.INSTANCE)));
+
+      // v1: create with three rows, keeping stable row ids so deletions are reportable.
+      byte[] batch1 =
+          writeBatch(allocator, schema, new int[] {1, 2, 3}, new String[] {"a", "b", "c"});
+      try (ArrowStreamReader reader1 =
+              new ArrowStreamReader(new ByteArrayReadableSeekableByteChannel(batch1), allocator);
+          ArrowArrayStream stream1 = ArrowArrayStream.allocateNew(allocator)) {
+        Data.exportArrayStream(allocator, reader1, stream1);
+        Dataset.write().stream(stream1)
+            .uri(uri)
+            .mode(WriteParams.WriteMode.CREATE)
+            .enableStableRowIds(true)
+            .execute()
+            .close();
+      }
+
+      // v2: delete one row.
+      try (Dataset ds = Dataset.open(uri, allocator)) {
+        ds.delete("id = 2");
+      }
+
+      try (Dataset ds2 = Dataset.open(uri, allocator)) {
+        DatasetDelta delta = ds2.delta(1L);
+        try (ArrowReader deleted = delta.getDeletedRowIds()) {
+          int total = 0;
+          while (deleted.loadNextBatch()) {
+            VectorSchemaRoot outRoot = deleted.getVectorSchemaRoot();
+            List<String> names =
+                outRoot.getSchema().getFields().stream()
+                    .map(Field::getName)
+                    .collect(Collectors.toList());
+            Assertions.assertEquals(Arrays.asList("_rowid"), names);
+            total += outRoot.getRowCount();
+          }
+          Assertions.assertEquals(1, total, "exactly one row was deleted");
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testBuilderRejectsInvalidVersionSelection(@TempDir Path tempDir) throws IOException {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      String uri = tempDir.resolve("delta_conflicting_selection").toString();
+      Schema schema =
+          new Schema(
+              Arrays.asList(
+                  Field.notNullable(
+                      "id", new org.apache.arrow.vector.types.pojo.ArrowType.Int(32, true)),
+                  Field.nullable(
+                      "val", org.apache.arrow.vector.types.pojo.ArrowType.Utf8.INSTANCE)));
+      byte[] batch = writeBatch(allocator, schema, new int[] {1, 2}, new String[] {"a", "b"});
+      try (ArrowStreamReader reader =
+              new ArrowStreamReader(new ByteArrayReadableSeekableByteChannel(batch), allocator);
+          ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+        Data.exportArrayStream(allocator, reader, stream);
+        try (Dataset ds =
+            Dataset.write().stream(stream).uri(uri).mode(WriteParams.WriteMode.CREATE).execute()) {
+          // A range set together with comparedAgainstVersion must be rejected, not
+          // silently dropped in favour of the comparison.
+          IllegalArgumentException conflicting =
+              Assertions.assertThrows(
+                  IllegalArgumentException.class,
+                  () ->
+                      new DatasetDeltaBuilder(ds)
+                          .comparedAgainstVersion(1L)
+                          .withBeginVersion(1L)
+                          .withEndVersion(1L)
+                          .build());
+          Assertions.assertTrue(
+              conflicting.getMessage().contains("Cannot combine compared_against_version"),
+              conflicting.getMessage());
+          IllegalArgumentException halfRange =
+              Assertions.assertThrows(
+                  IllegalArgumentException.class,
+                  () -> new DatasetDeltaBuilder(ds).withBeginVersion(1L).build());
+          Assertions.assertTrue(
+              halfRange
+                  .getMessage()
+                  .contains("Must specify both with_begin_version and with_end_version"),
+              halfRange.getMessage());
         }
       }
     }

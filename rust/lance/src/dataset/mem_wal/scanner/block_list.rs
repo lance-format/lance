@@ -5,7 +5,7 @@
 //!
 //! A generation's membership is a [`GenMembership`]: in-memory generations
 //! (active / frozen) are probed by value against their maintained primary-key
-//! index (no per-query set), while flushed generations are probed against their
+//! index (no per-query set), while SSTables are probed against their
 //! standalone on-disk PK BTree (the sidecar written at flush, opened by path).
 //! Probing is batched — [`GenMembership::contains_keys`] tests a whole batch of
 //! keys per generation in one pass. Each source gets a `Vec<GenMembership>` of
@@ -32,17 +32,16 @@ use lance_index::scalar::{
 use uuid::Uuid;
 
 use super::data_source::{FreshTierWatermark, LsmDataSource, LsmGeneration};
-use super::flushed_cache::{DatasetCache, open_flushed_dataset};
+use super::sstable_cache::{DatasetCache, open_sstable};
 use crate::dataset::mem_wal::index::encode_pk_tuple;
 use crate::dataset::mem_wal::util::PK_INDEX_DIR;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
-/// Default-plugin registry, used only to load the standalone PK BTree by its
-/// `BTreeIndexDetails` type. Built once.
+/// Use the dataset registry when opening the standalone primary-key BTree.
 static PK_BTREE_REGISTRY: LazyLock<Arc<IndexPluginRegistry>> =
-    LazyLock::new(IndexPluginRegistry::with_default_plugins);
+    LazyLock::new(|| crate::index::scalar::SCALAR_INDEX_PLUGIN_REGISTRY.clone());
 
 /// One newer generation's PK membership, used to decide whether it shadows an
 /// older source's row.
@@ -55,7 +54,7 @@ pub enum GenMembership {
         /// Inclusive visible row watermark; `None` when no rows are visible.
         max_visible_row: Option<u64>,
     },
-    /// Probe the flushed generation's standalone on-disk PK BTree.
+    /// Probe the SSTable's standalone on-disk PK BTree.
     OnDisk(Arc<dyn ScalarIndex>),
 }
 
@@ -111,7 +110,7 @@ impl GenMembership {
     }
 
     /// Whether this generation has no (visible) membership — used to skip adding
-    /// an empty blocked set. A flushed generation always has rows (flush rejects
+    /// an empty blocked set. An SSTable always has rows (flush rejects
     /// an empty memtable), so it is never empty.
     fn is_empty(&self) -> bool {
         match self {
@@ -159,7 +158,7 @@ pub async fn compute_source_block_lists(
     sources: &[LsmDataSource],
     session: Option<&Arc<Session>>,
     store_params: Option<&ObjectStoreParams>,
-    flushed_cache: Option<&Arc<dyn DatasetCache>>,
+    sstable_cache: Option<&Arc<dyn DatasetCache>>,
 ) -> Result<SourceBlockLists> {
     // Membership per non-base source, grouped by shard (generations are
     // per-shard, so supersession is within-shard only).
@@ -167,7 +166,7 @@ pub async fn compute_source_block_lists(
     let mut has_base = false;
     // Flushed PK-BTree opens are cold S3 reads; overlap them with
     // `try_join_all`. Order is irrelevant — gens are sorted per-shard below.
-    let mut flushed_loads = Vec::new();
+    let mut sstable_loads = Vec::new();
     for source in sources {
         match source {
             LsmDataSource::BaseTable { .. } => has_base = true,
@@ -176,26 +175,28 @@ pub async fn compute_source_block_lists(
                 index_store,
                 shard_id,
                 generation,
+                visible_batch_count,
                 ..
             } => {
-                let membership = in_memory_membership(batch_store, index_store);
+                let membership =
+                    in_memory_membership(batch_store, index_store, *visible_batch_count);
                 by_shard
                     .entry(*shard_id)
                     .or_default()
                     .push((*generation, membership));
             }
-            LsmDataSource::FlushedMemTable {
+            LsmDataSource::SsTable {
                 path,
                 shard_id,
                 generation,
                 ..
-            } => flushed_loads.push(async move {
-                let index = open_pk_index(path, session, store_params, flushed_cache).await?;
+            } => sstable_loads.push(async move {
+                let index = open_pk_index(path, session, store_params, sstable_cache).await?;
                 Ok::<_, Error>((*shard_id, *generation, GenMembership::OnDisk(index)))
             }),
         }
     }
-    for (shard_id, generation, membership) in futures::future::try_join_all(flushed_loads).await? {
+    for (shard_id, generation, membership) in futures::future::try_join_all(sstable_loads).await? {
         by_shard
             .entry(shard_id)
             .or_default()
@@ -227,7 +228,7 @@ pub async fn compute_source_block_lists(
 
 /// The fresh-tier block-list: one [`GenMembership`] per generation that shadows
 /// the base table — active + frozen memtables (probed against their index) and
-/// flushed generations (probed against their on-disk PK BTree). A base/external
+/// SSTables (probed against their on-disk PK BTree). A base/external
 /// reader can test any PK against these (via [`GenMembership::contains`]) to
 /// decide whether the fresh tier shadows it. The base source, if present, is
 /// skipped (it is what gets shadowed).
@@ -241,14 +242,14 @@ pub async fn fresh_tier_block_list(
     sources: &[LsmDataSource],
     session: Option<&Arc<Session>>,
     store_params: Option<&ObjectStoreParams>,
-    flushed_cache: Option<&Arc<dyn DatasetCache>>,
+    sstable_cache: Option<&Arc<dyn DatasetCache>>,
     watermarks: Option<&HashMap<Uuid, FreshTierWatermark>>,
 ) -> Result<Vec<GenMembership>> {
     // Membership per source, in source order (`None` = skipped). Flushed
     // PK-BTree opens are cold S3 reads, so collect them tagged with their slot
     // and overlap with `try_join_all` rather than opening one at a time.
     let mut slots: Vec<Option<GenMembership>> = Vec::with_capacity(sources.len());
-    let mut flushed_loads = Vec::new();
+    let mut sstable_loads = Vec::new();
     for source in sources {
         match source {
             LsmDataSource::BaseTable { .. } => slots.push(None),
@@ -257,10 +258,15 @@ pub async fn fresh_tier_block_list(
                 index_store,
                 shard_id,
                 generation,
+                visible_batch_count,
                 ..
             } => {
                 let membership = match watermarks.and_then(|m| m.get(shard_id)) {
-                    None => Some(in_memory_membership(batch_store, index_store)),
+                    None => Some(in_memory_membership(
+                        batch_store,
+                        index_store,
+                        *visible_batch_count,
+                    )),
                     Some(watermark) => {
                         let g = generation.as_u64();
                         if g > watermark.active_generation {
@@ -275,13 +281,17 @@ pub async fn fresh_tier_block_list(
                             ))
                         } else {
                             // Lower (frozen) generations are immutable — include all.
-                            Some(in_memory_membership(batch_store, index_store))
+                            Some(in_memory_membership(
+                                batch_store,
+                                index_store,
+                                *visible_batch_count,
+                            ))
                         }
                     }
                 };
                 slots.push(membership);
             }
-            LsmDataSource::FlushedMemTable {
+            LsmDataSource::SsTable {
                 path,
                 shard_id,
                 generation,
@@ -301,16 +311,16 @@ pub async fn fresh_tier_block_list(
                 } else {
                     let slot = slots.len();
                     slots.push(None);
-                    flushed_loads.push(async move {
+                    sstable_loads.push(async move {
                         let index =
-                            open_pk_index(path, session, store_params, flushed_cache).await?;
+                            open_pk_index(path, session, store_params, sstable_cache).await?;
                         Ok::<_, Error>((slot, GenMembership::OnDisk(index)))
                     });
                 }
             }
         }
     }
-    for (slot, membership) in futures::future::try_join_all(flushed_loads).await? {
+    for (slot, membership) in futures::future::try_join_all(sstable_loads).await? {
         slots[slot] = Some(membership);
     }
     Ok(slots
@@ -321,14 +331,16 @@ pub async fn fresh_tier_block_list(
 }
 
 /// Cross-source membership of an in-memory (active / frozen) memtable: a
-/// snapshot-bounded probe of its maintained primary-key index. A memtable
-/// without a primary-key index can't be probed, so it blocks nothing — the
-/// production vector-search path always enables the index.
+/// probe of its maintained primary-key index, bounded to the source's
+/// `visible_batch_count` snapshot. A memtable without a primary-key index can't be
+/// probed, so it blocks nothing — the production vector-search path always
+/// enables the index.
 fn in_memory_membership(
     batch_store: &Arc<BatchStore>,
     index_store: &Arc<IndexStore>,
+    visible_batch_count: usize,
 ) -> GenMembership {
-    let max_visible_row = batch_store.max_visible_row(index_store.visible_count());
+    let max_visible_row = batch_store.max_visible_row(visible_batch_count);
     GenMembership::InMemory {
         index_store: index_store.clone(),
         max_visible_row,
@@ -356,11 +368,11 @@ fn bounded_in_memory_membership(
     }
 }
 
-/// Open the standalone PK BTree at `{flushed gen}/_pk_index` for one flushed
-/// generation. Reuses the flushed dataset's (session-configured) object store
+/// Open the standalone PK BTree at `{SSTable gen}/_pk_index` for one
+/// SSTable. Reuses the SSTable dataset's (session-configured) object store
 /// and **its index cache**, then loads the sidecar directly by path through the
 /// BTree plugin — it is not a manifest index. The opened index and its pages
-/// are cached in the session's index cache (keyed by the immutable flushed
+/// are cached in the session's index cache (keyed by the immutable SSTable
 /// path), so repeated probes reuse them with no separate cache path and no
 /// upfront scan; concurrent first-opens may each load before the cache fills.
 /// A stable cache UUID for a non-manifest index identified only by its path.
@@ -385,12 +397,12 @@ async fn open_pk_index(
     path: &str,
     session: Option<&Arc<Session>>,
     store_params: Option<&ObjectStoreParams>,
-    flushed_cache: Option<&Arc<dyn DatasetCache>>,
+    sstable_cache: Option<&Arc<dyn DatasetCache>>,
 ) -> Result<Arc<dyn ScalarIndex>> {
-    let dataset = open_flushed_dataset(path, session, store_params, flushed_cache, None).await?;
-    // Namespace the session index cache by the (immutable) flushed path so this
+    let dataset = open_sstable(path, session, store_params, sstable_cache, None).await?;
+    // Namespace the session index cache by the (immutable) SSTable path so this
     // sidecar's pages live alongside every other index instead of a bespoke
-    // cache. `fri_uuid` is None — flushed generations carry no fragment-reuse.
+    // cache. `fri_uuid` is None — SSTables carry no fragment-reuse.
     let index_cache = dataset.index_cache.for_index(&path_cache_uuid(path), None);
     let index_dir = dataset.base.clone().join(PK_INDEX_DIR);
     let store: Arc<dyn ScalarIndexStore> = Arc::new(LanceIndexStore::new(
@@ -410,19 +422,27 @@ async fn open_pk_index(
     let details = prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default())
         .map_err(|e| Error::io(e.to_string()))?;
     let index = plugin
-        .load_index(store, &details, None, &index_cache)
+        .load_index(
+            store.clone(),
+            &details,
+            lance_index::scalar::btree::BTREE_INDEX_VERSION,
+            None,
+            &index_cache,
+        )
         .await?;
-    plugin.put_in_cache(&index_cache, index.clone()).await?;
+    plugin
+        .put_in_cache(store, &index_cache, index.clone())
+        .await?;
     Ok(index)
 }
 
-/// Write a flushed generation's standalone PK sidecar at `{uri}/_pk_index` from
+/// Write an SSTable's standalone PK sidecar at `{uri}/_pk_index` from
 /// `batches`, mirroring what flush does in production. `pk_columns` are the
 /// primary-key column names (field ids are synthesized by position — `insert`
 /// resolves columns by name). A no-op when no batch carries the PK columns.
 ///
 /// Used by Rust scanner tests and by the Python test-support binding to stage
-/// faithful flushed generations (a flushed dataset alone, with no sidecar, is
+/// faithful SSTables (an SSTable dataset alone, with no sidecar, is
 /// not a state production ever produces).
 pub async fn write_pk_sidecar(
     uri: &str,
@@ -497,6 +517,7 @@ mod tests {
             index.insert_with_batch_position(&b, off, Some(bp)).unwrap();
         }
         LsmDataSource::ActiveMemTable {
+            visible_batch_count: index.visible_count(),
             batch_store: Arc::new(store),
             index_store: Arc::new(index),
             schema: id_batch(&[1]).schema(),
@@ -669,6 +690,7 @@ mod tests {
             .insert_with_batch_position(&b1, off1, None) // index updated, watermark unchanged
             .unwrap();
         let g2 = LsmDataSource::ActiveMemTable {
+            visible_batch_count: g2_index.visible_count(),
             batch_store: Arc::new(g2_store),
             index_store: Arc::new(g2_index),
             schema,
@@ -766,32 +788,95 @@ mod tests {
         assert!(!blocks(&sets, 100).await); // gen 3 — after the snapshot
     }
 
-    /// A flushed generation at or above the active generation was produced by a
+    /// Regression: a row indexed twice in the memtable (WAL replay re-indexes
+    /// batches the flusher already indexed) used to produce a PK sidecar page
+    /// with a repeated row id. Loading that page builds a `RoaringBitmap` via
+    /// `from_sorted_iter`, which rejects the repeat, so every probe of the
+    /// generation failed with "from_sorted_iter called with non-sorted input"
+    /// and any LSM scan over the store returned 500 (observed in production:
+    /// one 2-row generation broke reads of a 54k-row store for weeks).
+    #[tokio::test]
+    async fn sidecar_from_doubly_indexed_memtable_is_probeable() {
+        use crate::dataset::mem_wal::util::pk_index_path;
+        use crate::dataset::{Dataset, WriteParams};
+        use arrow_array::{RecordBatchIterator, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use lance_core::cache::LanceCache;
+        use lance_index::scalar::btree::train_btree_index;
+        use lance_index::scalar::lance_format::LanceIndexStore;
+        use lance_io::object_store::ObjectStore;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["item:a", "item:b"]))],
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = format!("{}/gen2", tmp.path().to_str().unwrap());
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], schema.clone());
+        Dataset::write(reader, &path, Some(WriteParams::default()))
+            .await
+            .unwrap();
+
+        // Index the same batch twice at the same offset, as the flusher +
+        // a replay would, then train the sidecar from that index.
+        let mut index = IndexStore::new();
+        index.enable_pk_index(&[("id".to_string(), 0)]);
+        index.insert(&batch, 0).unwrap();
+        index.insert(&batch, 0).unwrap();
+        let training = index.pk_training_batches(8192).unwrap();
+        let (object_store, base_path) = ObjectStore::from_uri(&path).await.unwrap();
+        let store = LanceIndexStore::new(
+            object_store,
+            pk_index_path(&base_path),
+            Arc::new(LanceCache::no_cache()),
+        );
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            training[0].schema(),
+            futures::stream::iter(training.into_iter().map(Ok)),
+        ));
+        train_btree_index(stream, &store, 8192, None, None)
+            .await
+            .unwrap();
+
+        let membership =
+            GenMembership::OnDisk(open_pk_index(&path, None, None, None).await.unwrap());
+        let keys: Vec<ScalarValue> = ["item:a", "item:b", "item:zzz"]
+            .iter()
+            .map(|k| ScalarValue::Utf8(Some(k.to_string())))
+            .collect();
+        let hits = membership.contains_keys(&keys).await.unwrap();
+        assert_eq!(hits, vec![true, true, false]);
+    }
+
+    /// An SSTable at or above the active generation was produced by a
     /// flush after the snapshot and is excluded; one strictly below it is
     /// immutable and included.
     #[tokio::test]
-    async fn fresh_tier_watermark_excludes_flushed_at_or_above_active() {
+    async fn fresh_tier_watermark_excludes_sstables_at_or_above_active() {
         use crate::dataset::mem_wal::scanner::data_source::FreshTierWatermark;
         use crate::dataset::{Dataset, WriteParams};
         use arrow_array::RecordBatchIterator;
         use std::collections::HashMap;
 
-        // A flushed generation 2 holding pk=5, staged as a flushed dataset with
+        // An SSTable 2 holding pk=5, staged as an SSTable dataset with
         // its standalone PK sidecar (what the on-disk membership probes).
-        let flushed_batch = id_batch(&[5]);
-        let schema = flushed_batch.schema();
+        let sstable_batch = id_batch(&[5]);
+        let schema = sstable_batch.schema();
         let tmp = tempfile::tempdir().unwrap();
         let path = format!("{}/gen2", tmp.path().to_str().unwrap());
-        let reader = RecordBatchIterator::new(vec![Ok(flushed_batch.clone())], schema.clone());
+        let reader = RecordBatchIterator::new(vec![Ok(sstable_batch.clone())], schema.clone());
         Dataset::write(reader, &path, Some(WriteParams::default()))
             .await
             .unwrap();
-        write_pk_sidecar(&path, &[flushed_batch], &["id"])
+        write_pk_sidecar(&path, &[sstable_batch], &["id"])
             .await
             .unwrap();
 
         let shard = Uuid::new_v4();
-        let sources = vec![LsmDataSource::FlushedMemTable {
+        let sources = vec![LsmDataSource::SsTable {
             path,
             shard_id: shard,
             generation: LsmGeneration::memtable(2),
