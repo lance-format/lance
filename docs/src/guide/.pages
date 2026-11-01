@@ -4,6 +4,7 @@ nav:
   - Data Evolution: data_evolution.md
   - Stable Row IDs and Lineage: row_ids.md
   - Blob API: blob.md
+  - Portable Blob References: blob_references.md
   - JSON Support: json.md
   - Tags and Branches: tags_and_branches.md
   - Indexing and Search:
