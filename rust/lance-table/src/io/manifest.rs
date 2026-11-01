@@ -472,13 +472,18 @@ async fn write_manifest_message(writer: &mut dyn Writer, manifest: &mut Manifest
     Ok(pos)
 }
 
-/// Write manifest to an open file.
+/// Write manifest to an open file. A fragment layout readers reject is refused
+/// before any byte is written, including records beside a tree descriptor,
+/// which encoding would drop.
 pub async fn write_manifest(
     writer: &mut dyn Writer,
     manifest: &mut Manifest,
     indices: Option<Vec<IndexMetadata>>,
     transaction: Option<Transaction>,
 ) -> Result<usize> {
+    manifest
+        .validate_stored_fragment_layout()
+        .map_err(|message| Error::invalid_input(format!("Cannot write manifest. {message}")))?;
     match manifest.data_storage_format.version {
         ConcreteFileVersion::V1 => {
             write_schema_dictionaries(writer, &mut manifest.schema).await?;
@@ -518,9 +523,9 @@ mod test {
     use arrow_array::{Int32Array, RecordBatch};
     use std::collections::HashMap;
 
-    use crate::feature_flags::{FLAG_OBJECT_METADATA, FLAG_STABLE_ROW_IDS};
+    use crate::feature_flags::{FLAG_FRAGMENT_TREE, FLAG_OBJECT_METADATA, FLAG_STABLE_ROW_IDS};
     use crate::format::ClusteringDefinition;
-    use crate::format::SelfDescribingFileReader;
+    use crate::format::{Fragment, SelfDescribingFileReader};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::deepsize::DeepSizeOf;
     use lance_file::format::{MAGIC, MAJOR_VERSION, MINOR_VERSION};
@@ -666,6 +671,108 @@ mod test {
         assert!(manifest.index_section.is_none());
         let roundtripped_manifest = read_manifest(&store, &path, None).await.unwrap();
         assert!(roundtripped_manifest.index_section.is_none());
+    }
+
+    /// The fragment layout of a manifest handed to the writer.
+    #[derive(Clone, Copy, Debug)]
+    enum FragmentLayout {
+        /// Records without a descriptor or tree bits, as a flat version is stored.
+        Flat,
+        /// A descriptor and both tree bits without records, as a tree version is stored.
+        StoredTree,
+        /// Records beside a descriptor, which encoding would drop.
+        RecordsBesideDescriptor,
+        /// A descriptor that neither feature word marks.
+        DescriptorWithoutFlags,
+        /// Both tree bits without a descriptor, as a successor of a tree has.
+        FlagsWithoutDescriptor,
+    }
+
+    impl FragmentLayout {
+        /// Manifest version 7 in this layout.
+        fn manifest(self) -> Manifest {
+            let (has_descriptor, tree_flags, record_count) = match self {
+                Self::Flat => (false, 0, 2),
+                Self::StoredTree => (true, FLAG_FRAGMENT_TREE, 0),
+                Self::RecordsBesideDescriptor => (true, FLAG_FRAGMENT_TREE, 2),
+                Self::DescriptorWithoutFlags => (true, 0, 0),
+                Self::FlagsWithoutDescriptor => (false, FLAG_FRAGMENT_TREE, 2),
+            };
+            let mut manifest = Manifest::new(
+                Schema::default(),
+                Arc::new((0..record_count).map(Fragment::new).collect()),
+                DataStorageFormat::default(),
+                HashMap::new(),
+            );
+            manifest.version = 7;
+            manifest.fragment_tree = has_descriptor.then(|| {
+                Arc::new(pb::FragmentTree {
+                    next_action_sequence: 3,
+                    ..Default::default()
+                })
+            });
+            manifest.reader_feature_flags = tree_flags;
+            manifest.writer_feature_flags = tree_flags;
+            manifest
+        }
+    }
+
+    #[rstest]
+    #[case::flat(FragmentLayout::Flat)]
+    #[case::stored_tree(FragmentLayout::StoredTree)]
+    #[tokio::test]
+    async fn write_manifest_writes_layouts_readers_accept(#[case] layout: FragmentLayout) {
+        let store = ObjectStore::memory();
+        let path = Path::from("_versions/7.manifest");
+        let mut manifest = layout.manifest();
+        let mut writer = store.create(&path).await.unwrap();
+
+        let pos = write_manifest(writer.as_mut(), &mut manifest, None, None)
+            .await
+            .unwrap();
+        writer
+            .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+            .await
+            .unwrap();
+        Writer::shutdown(writer.as_mut()).await.unwrap();
+
+        assert_eq!(read_manifest(&store, &path, None).await.unwrap(), manifest);
+    }
+
+    /// Readers reject these layouts, and encoding drops records beside a
+    /// descriptor, so the writer refuses them before writing a byte.
+    #[rstest]
+    #[case::records_beside_a_descriptor(
+        FragmentLayout::RecordsBesideDescriptor,
+        "descriptor=true, reader_flag=true, writer_flag=true, records=2"
+    )]
+    #[case::descriptor_without_flags(
+        FragmentLayout::DescriptorWithoutFlags,
+        "descriptor=true, reader_flag=false, writer_flag=false, records=0"
+    )]
+    #[case::flags_without_a_descriptor(
+        FragmentLayout::FlagsWithoutDescriptor,
+        "descriptor=false, reader_flag=true, writer_flag=true, records=2"
+    )]
+    #[tokio::test]
+    async fn write_manifest_refuses_layouts_readers_reject(
+        #[case] layout: FragmentLayout,
+        #[case] expected: &str,
+    ) {
+        let store = ObjectStore::memory();
+        let path = Path::from("_versions/7.manifest");
+        let mut manifest = layout.manifest();
+        let mut writer = store.create(&path).await.unwrap();
+
+        let error = write_manifest(writer.as_mut(), &mut manifest, None, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("Manifest version 7 "), "{message}");
+        assert!(message.contains(expected), "{message}");
+        assert_eq!(writer.tell().await.unwrap(), 0);
     }
 
     #[tokio::test]
