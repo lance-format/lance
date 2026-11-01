@@ -2384,25 +2384,21 @@ fn visit_predicate_equality(
     index_info: &dyn IndexInformationProvider,
     depth: usize,
 ) -> Result<Option<IndexedExpression>> {
-    let Some(left) = visit_node(&expr.left, index_info, depth + 1)? else {
+    let (Some(left), Some(right)) = (
+        visit_node(&expr.left, index_info, depth + 1)?,
+        visit_node(&expr.right, index_info, depth + 1)?,
+    ) else {
         return Ok(None);
     };
-    let Some(right) = visit_node(&expr.right, index_info, depth + 1)? else {
+    let (Some(not_left), Some(not_right)) = (left.clone().maybe_not(), right.clone().maybe_not())
+    else {
         return Ok(None);
     };
-    let expand = || {
-        let (not_left, not_right) = (left.clone().maybe_not()?, right.clone().maybe_not()?);
-        if expr.op == Operator::Eq {
-            left.clone()
-                .and(right.clone())
-                .maybe_or(not_left.and(not_right), expr)
-        } else {
-            left.clone()
-                .and(not_right)
-                .maybe_or(not_left.and(right.clone()), expr)
-        }
-    };
-    Ok(expand())
+    Ok(if expr.op == Operator::Eq {
+        left.and(right).maybe_or(not_left.and(not_right), expr)
+    } else {
+        left.and(not_right).maybe_or(not_left.and(right), expr)
+    })
 }
 
 /// The plain column that `predicate` is NULL exactly where, when it only
@@ -2473,16 +2469,10 @@ fn visit_is_truth_value(
     let Some((column, _, query_parser)) = maybe_indexed_column(column, index_info) else {
         return Ok(None);
     };
-    let matches = if matches!(predicate, Expr::Column(_)) {
-        visit_is_bool(predicate, index_info, value)
-    } else {
-        visit_node(predicate, index_info, depth + 1)?.and_then(|matches| {
-            if value {
-                Some(matches)
-            } else {
-                matches.maybe_not()
-            }
-        })
+    let matches = match predicate {
+        Expr::Column(_) => visit_is_bool(predicate, index_info, value),
+        _ if value => visit_node(predicate, index_info, depth + 1)?,
+        _ => visit_node(predicate, index_info, depth + 1)?.and_then(IndexedExpression::maybe_not),
     };
     let Some(matches) = matches else {
         return Ok(None);
@@ -2507,20 +2497,10 @@ fn visit_distinct_from(
     depth: usize,
 ) -> Result<Option<IndexedExpression>> {
     let is_distinct = expr.op == Operator::IsDistinctFrom;
-    let Some((_, column_type, _)) = maybe_indexed_column(&expr.left, index_info) else {
-        return Ok(None);
-    };
-    let Some(literal) = maybe_scalar(&expr.right, &column_type) else {
-        return Ok(None);
-    };
-    if literal.is_null() {
+    if matches!(expr.right.as_ref(), Expr::Literal(value, _) if value.is_null()) {
         return Ok(visit_is_null(&expr.left, index_info, is_distinct));
     }
-    let equals = Expr::BinaryExpr(BinaryExpr::new(
-        expr.left.clone(),
-        Operator::Eq,
-        expr.right.clone(),
-    ));
+    let equals = (*expr.left).clone().eq((*expr.right).clone());
     let is_true = visit_is_truth_value(&equals, true, index_info, depth)?;
     Ok(if is_distinct {
         is_true.and_then(IndexedExpression::maybe_not)
