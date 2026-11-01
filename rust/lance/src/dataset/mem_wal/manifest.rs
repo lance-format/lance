@@ -1104,7 +1104,8 @@ mod tests {
     async fn test_adaptive_scan_ignores_legacy_batch_size_and_recovers_stale_hint() {
         let (store, base_path, _temp_dir) = create_local_store().await;
         let shard_id = Uuid::new_v4();
-        let manifest_store = ShardManifestStore::new(store.clone(), &base_path, shard_id, 2);
+        let manifest_store =
+            ShardManifestStore::new(store.clone(), &base_path, "scan-tests", shard_id, 2);
 
         for version in 1..=3 {
             manifest_store
@@ -1115,7 +1116,8 @@ mod tests {
         manifest_store.write_version_hint(1).await;
         assert_eq!(manifest_store.read_version_hint().await, Some(1));
 
-        let zero_batch_reader = ShardManifestStore::new(store, &base_path, shard_id, 0);
+        let zero_batch_reader =
+            ShardManifestStore::new(store, &base_path, "scan-tests", shard_id, 0);
         let latest = zero_batch_reader.refresh_latest().await.unwrap().unwrap();
         assert_eq!(latest.version, 3);
     }
@@ -1177,7 +1179,8 @@ mod tests {
         let shard_id = Uuid::new_v4();
 
         // Setup goes through the plain store so only the cold scan is tallied.
-        let writer = ShardManifestStore::new_adaptive(store.clone(), &base_path, shard_id);
+        let writer =
+            ShardManifestStore::new_adaptive(store.clone(), &base_path, "scan-tests", shard_id);
         for version in 1..=tip {
             writer
                 .write(&create_test_manifest(shard_id, version, 1))
@@ -1204,7 +1207,8 @@ mod tests {
         );
         let mut proxied = (*store).clone();
         proxied.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy));
-        let reader = ShardManifestStore::new_adaptive(Arc::new(proxied), &base_path, shard_id);
+        let reader =
+            ShardManifestStore::new_adaptive(Arc::new(proxied), &base_path, "scan-tests", shard_id);
 
         let latest = reader.refresh_latest().await.unwrap().unwrap();
         assert_eq!(latest.version, tip, "the scan must still find the tip");
