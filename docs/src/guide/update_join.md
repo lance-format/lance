@@ -195,7 +195,9 @@ The strategy changes execution characteristics, not the logical update operation
 - Rows without a match retain their existing values.
 - The RHS must contain the join column and at least one existing fragment column to update.
 - Left and right join-key types must match.
-- The join column itself is not updated.
+- `right_on` is removed from the replacement payload, so it cannot be updated.
+- When `left_on` and `right_on` are different, a replacement column named `left_on` is allowed
+  and updates the left join key.
 - Reserved metadata columns such as `_rowid` and `_rowaddr` cannot be replacement columns.
 - An empty RHS is a no-op and does not run either join algorithm.
 

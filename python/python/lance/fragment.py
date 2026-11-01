@@ -1070,9 +1070,13 @@ class LanceFragment(pa.dataset.Fragment):
         Notes
         -----
         - The columns to update must already exist in the fragment
-        - The join column (left_on/right_on) will not be updated
+        - ``right_on`` is removed from the replacement payload and cannot be updated
+        - When ``left_on`` and ``right_on`` differ, a replacement column named
+          ``left_on`` can update the left join key
         - Metadata columns (_rowid, _rowaddr) cannot be updated
         - Large update inputs may use temporary spill storage
+        - If the right side contains duplicate join keys, which matching row is
+          selected is undefined
         - This is a low-level API; for most use cases, use Dataset.update() instead
         """
         if right_on is None:

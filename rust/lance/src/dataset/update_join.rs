@@ -17,7 +17,7 @@ use arrow_schema::{
     ArrowError, DataType, Field as ArrowField, FieldRef, Schema as ArrowSchema, SchemaRef,
     SortOptions,
 };
-use datafusion::common::{JoinType, NullEquality};
+use datafusion::common::{JoinType, NullEquality, config::ConfigNonZeroUsize};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricValue};
@@ -708,7 +708,7 @@ async fn run_hash_update(
         batches.into_iter().map(Ok),
         right_schema,
     ));
-    let joiner = Arc::new(HashJoiner::try_new(reader, right_on).await?);
+    let joiner = Arc::new(HashJoiner::try_new_allow_duplicates(reader, right_on).await?);
 
     let mut read_columns = write_schema
         .fields
@@ -725,7 +725,7 @@ async fn run_hash_update(
     let mut updater = fragment
         .updater(
             Some(&read_columns),
-            Some((write_schema, fragment.schema().clone())),
+            Some((write_schema.clone(), fragment.schema().clone())),
             None,
             blob_context.blob_handling.clone(),
         )
@@ -767,7 +767,7 @@ async fn run_hash_update(
     }
 
     let updated_fragment = updater.finish().await?;
-    finalize_update(updated_fragment, matched_offsets)
+    finalize_update(updated_fragment, matched_offsets, &write_schema)
 }
 
 async fn run_external_update(
@@ -798,15 +798,6 @@ async fn run_external_update(
     }
     let input_batch_cap = external_input_batch_cap(pool_size);
     let materialization_memory_limit = pool_size / MATERIALIZATION_POOL_FRACTION;
-    let input_batch_cap_u64 = u64::try_from(input_batch_cap).unwrap_or(u64::MAX);
-    let temp_directory_limit = execution_options.max_temp_directory_size();
-    if temp_directory_limit < input_batch_cap_u64 {
-        return Err(DataFusionError::ResourcesExhausted(format!(
-            "Temporary disk limit for a large update is {temp_directory_limit} bytes, but at least \
-             one capped input batch ({input_batch_cap_u64} bytes) of spill storage is required"
-        ))
-        .into());
-    }
 
     let session = session_context.unwrap_or_else(|| new_session_context(&execution_options));
     let mut state = session.state();
@@ -815,7 +806,12 @@ async fn run_external_update(
         .options_mut()
         .execution
         .sort_spill_reservation_bytes = sort_spill_reservation_bytes;
-    state.config_mut().options_mut().execution.batch_size = execution_batch_size;
+    state.config_mut().options_mut().execution.batch_size =
+        ConfigNonZeroUsize::try_new(execution_batch_size).map_err(|_| {
+            Error::invalid_input(format!(
+                "UpdateColumnsOptions.execution_batch_size must be greater than zero, got {execution_batch_size}"
+            ))
+        })?;
     let task_context = state.task_ctx();
 
     let right_schema = right_stream.schema();
@@ -945,6 +941,7 @@ async fn run_external_update(
         right_payloads.read()?,
         &rhs_row_id_name,
         payload_schema,
+        materialization_memory_limit,
     )?;
     let unsorted_patches = Arc::new(OneShotExec::new(patches)) as Arc<dyn ExecutionPlan>;
     let sorted_patches = sort_by_column(unsorted_patches, ROW_ADDR, input_batch_cap)?;
@@ -965,7 +962,7 @@ async fn run_external_update(
     let mut updater = fragment
         .updater(
             Some(&update_projection),
-            Some((write_schema, fragment.schema().clone())),
+            Some((write_schema.clone(), fragment.schema().clone())),
             Some(u32::try_from(execution_batch_size).map_err(|_| {
                 Error::invalid_input(format!(
                     "UpdateColumnsOptions.execution_batch_size exceeds u32: {execution_batch_size}"
@@ -1039,7 +1036,7 @@ async fn run_external_update(
     }
 
     let updated_fragment = updater.finish().await?;
-    finalize_update(updated_fragment, matched_offsets)
+    finalize_update(updated_fragment, matched_offsets, &write_schema)
 }
 
 fn external_input_batch_cap(pool_size: usize) -> usize {
@@ -1439,6 +1436,7 @@ fn fragment_id(fragment: &FileFragment) -> Result<u32> {
 fn finalize_update(
     mut updated_fragment: Fragment,
     matched_offsets: RoaringBitmap,
+    write_schema: &Schema,
 ) -> Result<FragmentUpdateColumnsResult> {
     let updated_fields = updated_fragment
         .files
@@ -1463,9 +1461,12 @@ fn finalize_update(
     updated_fragment
         .files
         .retain(|data_file| data_file.fields.iter().any(|field| *field != -2));
-    let fields_modified = updated_fields
-        .iter()
-        .filter_map(|field| u32::try_from(*field).ok())
+    // An index can target a logical parent (such as a geometry or list) that is
+    // absent from the physical file's field IDs. Report the full write schema so
+    // commit conflict resolution invalidates those indices too.
+    let fields_modified = write_schema
+        .fields_pre_order()
+        .filter_map(|field| u32::try_from(field.id).ok())
         .collect();
     Ok(FragmentUpdateColumnsResult {
         fragment: updated_fragment,
@@ -2080,6 +2081,7 @@ mod tests {
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(crate::dataset::transaction::UpdateMode::RewriteColumns),
                 inserted_rows_filter: None,
+                mem_wal_dir_id: None,
                 updated_fragment_offsets: Some(
                     crate::dataset::transaction::UpdatedFragmentOffsets(HashMap::from([(
                         fragment_id,
@@ -2652,13 +2654,66 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(error, Error::IO { .. }));
-        assert!(error.to_string().contains("Temporary disk limit"));
+        assert!(
+            matches!(error, Error::Arrow { .. }),
+            "unexpected low-disk error: {error:?}"
+        );
+        assert!(error.to_string().contains("exceeded the allowable limit"));
         assert_eq!(fragment.metadata(), &original_metadata);
         let progress = low_disk_session
             .runtime_env()
             .disk_manager
             .spilling_progress();
+        assert_eq!(progress.active_files_count, 0);
+        assert_eq!(progress.current_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn test_external_update_small_input_accepts_low_temp_limit() {
+        const MIB: u64 = 1024 * 1024;
+
+        let input = record_batch!(("key", Int32, [1, 2]), ("value", Int32, [10, 20])).unwrap();
+        let test_dir = TempStrDir::default();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(input.clone())], input.schema()),
+            test_dir.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+        let update = record_batch!(("key", Int32, [1]), ("value", Int32, [100])).unwrap();
+        let execution_options = LanceExecutionOptions {
+            use_spilling: true,
+            mem_pool_size: Some(8 * MIB),
+            max_temp_directory_size: Some(1),
+            batch_size: Some(EXECUTION_BATCH_SIZE),
+            target_partition: Some(1),
+            ..Default::default()
+        };
+        let session = new_session_context(&execution_options);
+        let mut fragment = dataset.get_fragment(0).unwrap();
+        let result = update_columns_with_options(
+            &mut fragment,
+            reader(update.schema(), vec![Ok(update)]),
+            "key",
+            "key",
+            UpdateColumnsOptions {
+                execution_options,
+                strategy: UpdateJoinStrategy::SortMerge,
+                session_context: Some(session.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.matched_offsets.iter().collect::<Vec<_>>(), vec![0]);
+        let updated_fragment = FileFragment::new(Arc::new(dataset), result.fragment);
+        let batch = updated_fragment.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch.column_by_name("value").unwrap().as_ref(),
+            &Int32Array::from(vec![100, 20])
+        );
+        let progress = session.runtime_env().disk_manager.spilling_progress();
         assert_eq!(progress.active_files_count, 0);
         assert_eq!(progress.current_bytes, 0);
     }

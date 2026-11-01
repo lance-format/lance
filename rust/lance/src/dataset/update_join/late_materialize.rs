@@ -14,6 +14,8 @@ use futures::{StreamExt, stream};
 use lance_arrow::interleave_batches;
 use lance_core::ROW_ADDR;
 
+use crate::io::exec::take::batch::array_size;
+
 pub(super) fn unique_column_name(schema: &SchemaRef, base: &str) -> String {
     let contains = |name: &str| schema.fields().iter().any(|field| field.name() == name);
     if !contains(base) {
@@ -85,6 +87,7 @@ pub(super) fn materialize_payloads(
     payloads: SendableRecordBatchStream,
     row_id_name: &str,
     payload_schema: SchemaRef,
+    max_batch_bytes: usize,
 ) -> DataFusionResult<SendableRecordBatchStream> {
     let mapping_schema = mappings.schema();
     let address_index = mapping_schema.index_of(ROW_ADDR)?;
@@ -116,23 +119,22 @@ pub(super) fn materialize_payloads(
         mapping_row_id_index,
         payload_row_id_index,
         payload_indices,
+        max_batch_bytes,
         current_payload: None,
+        current_payload_row_sizes: Vec::new(),
         current_payload_position: 0,
         current_payload_batch_id: 0,
         previous_mapping_row_id: None,
         previous_payload_row_id: None,
+        current_mapping: None,
+        current_mapping_position: 0,
+        chunk: PayloadChunk::default(),
+        pending_output: None,
     };
     let output = stream::try_unfold(state, |mut state| async move {
-        loop {
-            let Some(mapping) = state.mappings.next().await else {
-                return Ok(None);
-            };
-            let mapping = mapping?;
-            if mapping.num_rows() == 0 {
-                continue;
-            }
-            let batch = state.materialize_mapping(mapping).await?;
-            return Ok(Some((batch, state)));
+        match state.next_output().await? {
+            Some(batch) => Ok(Some((batch, state))),
+            None => Ok(None),
         }
     });
     Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -169,103 +171,246 @@ struct PayloadMaterializationState {
     mapping_row_id_index: usize,
     payload_row_id_index: usize,
     payload_indices: Vec<usize>,
+    max_batch_bytes: usize,
     current_payload: Option<RecordBatch>,
+    current_payload_row_sizes: Vec<usize>,
     current_payload_position: usize,
     current_payload_batch_id: u64,
     previous_mapping_row_id: Option<u64>,
     previous_payload_row_id: Option<u64>,
+    current_mapping: Option<RecordBatch>,
+    current_mapping_position: usize,
+    chunk: PayloadChunk,
+    pending_output: Option<RecordBatch>,
+}
+
+#[derive(Default)]
+struct PayloadChunk {
+    mapping_start: usize,
+    source_batches: Vec<RecordBatch>,
+    source_indices: Vec<(usize, usize)>,
+    source_batch_bytes: usize,
+    output_bytes: usize,
+    local_source: Option<(u64, usize)>,
+}
+
+impl PayloadChunk {
+    fn is_empty(&self) -> bool {
+        self.source_indices.is_empty()
+    }
 }
 
 impl PayloadMaterializationState {
-    async fn materialize_mapping(&mut self, mapping: RecordBatch) -> DataFusionResult<RecordBatch> {
-        let mapping_row_ids = mapping
-            .column(self.mapping_row_id_index)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| {
-                DataFusionError::Execution(
-                    "Late materialization mapping row IDs are not UInt64".to_string(),
-                )
+    async fn next_output(&mut self) -> DataFusionResult<Option<RecordBatch>> {
+        loop {
+            if let Some(batch) = self.pending_output.take() {
+                return Ok(Some(batch));
+            }
+
+            if self.current_mapping.is_some() {
+                let mapping_rows = self
+                    .current_mapping
+                    .as_ref()
+                    .map(RecordBatch::num_rows)
+                    .unwrap_or(0);
+                if self.current_mapping_position < mapping_rows {
+                    self.add_current_mapping_row().await?;
+                    continue;
+                }
+
+                if !self.chunk.is_empty() {
+                    let batch = self.flush_chunk()?;
+                    self.current_mapping = None;
+                    self.current_mapping_position = 0;
+                    return Ok(Some(batch));
+                }
+                self.current_mapping = None;
+                self.current_mapping_position = 0;
+                continue;
+            }
+
+            let Some(mapping) = self.mappings.next().await else {
+                return Ok(None);
+            };
+            let mapping = mapping?;
+            if mapping.num_rows() == 0 {
+                continue;
+            }
+            self.current_mapping = Some(mapping);
+            self.current_mapping_position = 0;
+            self.chunk = PayloadChunk::default();
+        }
+    }
+
+    async fn add_current_mapping_row(&mut self) -> DataFusionResult<()> {
+        let row_index = self.current_mapping_position;
+        let row_id = {
+            let mapping = self.current_mapping.as_ref().ok_or_else(|| {
+                DataFusionError::Internal("Missing update mapping batch".to_string())
             })?;
-        let mut requested_row_ids = Vec::with_capacity(mapping.num_rows());
-        for row_index in 0..mapping.num_rows() {
+            let mapping_row_ids = mapping
+                .column(self.mapping_row_id_index)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "Late materialization mapping row IDs are not UInt64".to_string(),
+                    )
+                })?;
             if mapping_row_ids.is_null(row_index) {
                 return Err(DataFusionError::Execution(format!(
                     "Late materialization mapping row ID is null at row {row_index}"
                 )));
             }
-            let row_id = mapping_row_ids.value(row_index);
-            if let Some(previous) = self.previous_mapping_row_id
-                && row_id < previous
-            {
+            mapping_row_ids.value(row_index)
+        };
+        if let Some(previous) = self.previous_mapping_row_id
+            && row_id < previous
+        {
+            return Err(DataFusionError::Execution(format!(
+                "Late materialization mapping row IDs are out of order: {row_id} follows {previous}"
+            )));
+        }
+        self.previous_mapping_row_id = Some(row_id);
+
+        let (payload_batch_id, payload_position, row_size) =
+            self.locate_payload_row(row_id).await?;
+        let output_bytes = row_size
+            .checked_add(std::mem::size_of::<u64>())
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Update payload row size for RHS row ID {row_id} overflowed"
+                ))
+            })?;
+        if output_bytes > self.max_batch_bytes {
+            return Err(DataFusionError::ResourcesExhausted(format!(
+                "Update payload row for RHS row ID {row_id} requires {output_bytes} bytes, \
+                 exceeding the materialization batch budget of {} bytes",
+                self.max_batch_bytes
+            )));
+        }
+
+        let (new_source_bytes, source_index) = match self.chunk.local_source {
+            Some((batch_id, source_index)) if batch_id == payload_batch_id => (0, source_index),
+            _ => {
+                let payload = self.current_payload.as_ref().ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "Update payload batch disappeared during materialization".to_string(),
+                    )
+                })?;
+                let projected = payload.project(&self.payload_indices)?;
+                // A projected payload batch is the smallest retainable unit. It
+                // may exceed the per-chunk source budget when it is a slice that
+                // shares a larger buffer, so allow one such batch and flush
+                // before retaining another.
+                let bytes = projected.get_array_memory_size();
+                self.chunk.source_batches.push(projected);
+                let source_index = self.chunk.source_batches.len() - 1;
+                self.chunk.source_batch_bytes = self.chunk.source_batch_bytes.saturating_add(bytes);
+                self.chunk.local_source = Some((payload_batch_id, source_index));
+                (bytes, source_index)
+            }
+        };
+
+        if !self.chunk.is_empty()
+            && (self.chunk.output_bytes.saturating_add(output_bytes) > self.max_batch_bytes
+                || (new_source_bytes > 0
+                    && self
+                        .chunk
+                        .source_batch_bytes
+                        .saturating_add(new_source_bytes)
+                        > self.max_batch_bytes))
+        {
+            self.pending_output = Some(self.flush_chunk()?);
+            return Ok(());
+        }
+
+        self.chunk
+            .source_indices
+            .push((source_index, payload_position));
+        self.chunk.output_bytes = self.chunk.output_bytes.saturating_add(output_bytes);
+        self.current_mapping_position += 1;
+        Ok(())
+    }
+
+    async fn locate_payload_row(
+        &mut self,
+        requested_row_id: u64,
+    ) -> DataFusionResult<(u64, usize, usize)> {
+        loop {
+            if self.current_payload.is_none() {
+                self.load_next_payload().await?;
+            }
+            let Some(payload) = self.current_payload.as_ref() else {
                 return Err(DataFusionError::Execution(format!(
-                    "Late materialization mapping row IDs are out of order: {row_id} follows {previous}"
+                    "Late materialization payload ended before RHS row ID {requested_row_id}"
+                )));
+            };
+            let payload = payload.clone();
+            let payload_row_ids = payload
+                .column(self.payload_row_id_index)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "Late materialization payload row IDs are not UInt64".to_string(),
+                    )
+                })?;
+            while self.current_payload_position < payload.num_rows()
+                && payload_row_ids.value(self.current_payload_position) < requested_row_id
+            {
+                self.current_payload_position += 1;
+            }
+            if self.current_payload_position == payload.num_rows() {
+                self.current_payload = None;
+                self.current_payload_position = 0;
+                continue;
+            }
+
+            let payload_row_id = payload_row_ids.value(self.current_payload_position);
+            if payload_row_id != requested_row_id {
+                return Err(DataFusionError::Execution(format!(
+                    "Late materialization payload is missing RHS row ID {requested_row_id}; next row ID is {payload_row_id}"
                 )));
             }
-            self.previous_mapping_row_id = Some(row_id);
-            requested_row_ids.push(row_id);
+            let position = self.current_payload_position;
+            let row_size = if self.current_payload_row_sizes[position] == 0 {
+                let size = payload_row_size(&payload, position)?;
+                self.current_payload_row_sizes[position] = size;
+                size
+            } else {
+                self.current_payload_row_sizes[position]
+            };
+            return Ok((self.current_payload_batch_id, position, row_size));
         }
+    }
 
-        let mut source_batches = Vec::new();
-        let mut source_indices = Vec::with_capacity(requested_row_ids.len());
-        let mut local_source = None;
-        for requested_row_id in requested_row_ids {
-            loop {
-                if self.current_payload.is_none() {
-                    self.load_next_payload().await?;
-                }
-                let Some(payload) = self.current_payload.as_ref() else {
-                    return Err(DataFusionError::Execution(format!(
-                        "Late materialization payload ended before RHS row ID {requested_row_id}"
-                    )));
-                };
-                let payload_row_ids = payload
-                    .column(self.payload_row_id_index)
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| {
-                        DataFusionError::Execution(
-                            "Late materialization payload row IDs are not UInt64".to_string(),
-                        )
-                    })?;
-                while self.current_payload_position < payload.num_rows()
-                    && payload_row_ids.value(self.current_payload_position) < requested_row_id
-                {
-                    self.current_payload_position += 1;
-                }
-                if self.current_payload_position == payload.num_rows() {
-                    self.current_payload = None;
-                    self.current_payload_position = 0;
-                    continue;
-                }
-
-                let payload_row_id = payload_row_ids.value(self.current_payload_position);
-                if payload_row_id != requested_row_id {
-                    return Err(DataFusionError::Execution(format!(
-                        "Late materialization payload is missing RHS row ID {requested_row_id}; next row ID is {payload_row_id}"
-                    )));
-                }
-                let source_index = match local_source {
-                    Some((batch_id, source_index)) if batch_id == self.current_payload_batch_id => {
-                        source_index
-                    }
-                    _ => {
-                        source_batches.push(payload.project(&self.payload_indices)?);
-                        let source_index = source_batches.len() - 1;
-                        local_source = Some((self.current_payload_batch_id, source_index));
-                        source_index
-                    }
-                };
-                source_indices.push((source_index, self.current_payload_position));
-                break;
-            }
+    fn flush_chunk(&mut self) -> DataFusionResult<RecordBatch> {
+        let mapping_end = self.current_mapping_position;
+        let mapping_start = self.chunk.mapping_start;
+        if mapping_start >= mapping_end {
+            return Err(DataFusionError::Internal(format!(
+                "Cannot materialize an empty update payload chunk: start={mapping_start}, end={mapping_end}"
+            )));
         }
-
-        let payload = interleave_batches(&source_batches, &source_indices)?;
+        let addresses = self
+            .current_mapping
+            .as_ref()
+            .ok_or_else(|| {
+                DataFusionError::Internal("Missing update mapping batch during flush".to_string())
+            })?
+            .column(self.address_index)
+            .slice(mapping_start, mapping_end - mapping_start);
+        let payload = interleave_batches(&self.chunk.source_batches, &self.chunk.source_indices)?;
         let mut columns = Vec::with_capacity(payload.num_columns() + 1);
-        columns.push(mapping.column(self.address_index).clone());
+        columns.push(addresses);
         columns.extend(payload.columns().iter().cloned());
-        Ok(RecordBatch::try_new(self.output_schema.clone(), columns)?)
+        let batch = RecordBatch::try_new(self.output_schema.clone(), columns)?;
+        self.chunk = PayloadChunk {
+            mapping_start: mapping_end,
+            ..Default::default()
+        };
+        Ok(batch)
     }
 
     async fn load_next_payload(&mut self) -> DataFusionResult<()> {
@@ -312,6 +457,7 @@ impl PayloadMaterializationState {
                             .to_string(),
                     )
                 })?;
+            self.current_payload_row_sizes = vec![0; payload.num_rows()];
             self.current_payload = Some(payload);
             self.current_payload_position = 0;
             return Ok(());
@@ -319,10 +465,18 @@ impl PayloadMaterializationState {
     }
 }
 
+fn payload_row_size(batch: &RecordBatch, row: usize) -> DataFusionResult<usize> {
+    batch.columns().iter().try_fold(0usize, |total, column| {
+        let size = array_size(&column.slice(row, 1))?;
+        Ok(total.saturating_add(size.max(1)))
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use arrow_array::{Int32Array, record_batch};
+    use arrow_array::{FixedSizeListArray, Int32Array, Int64Array, record_batch};
     use futures::TryStreamExt;
+    use lance_core::utils::address::RowAddress;
 
     use super::*;
 
@@ -395,6 +549,7 @@ mod tests {
             batches(payload_first.schema(), vec![payload_first, payload_second]),
             "row_id",
             payload_schema,
+            usize::MAX,
         )
         .unwrap()
         .try_collect::<Vec<_>>()
@@ -425,11 +580,173 @@ mod tests {
             batches(payload.schema(), vec![payload]),
             "row_id",
             payload_schema,
+            usize::MAX,
         )
         .unwrap()
         .try_collect::<Vec<_>>()
         .await
         .unwrap_err();
         assert!(error.to_string().contains("ended before RHS row ID 1"));
+    }
+
+    fn wide_payload_batch(row_ids: &[u64], values: i64) -> RecordBatch {
+        const WIDTH: i32 = 32;
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new(
+                "payload",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Int64, false)),
+                    WIDTH,
+                ),
+                false,
+            ),
+            Field::new("row_id", DataType::UInt64, false),
+        ]));
+        let values = Int64Array::from_iter_values(std::iter::repeat_n(
+            values,
+            row_ids.len() * WIDTH as usize,
+        ));
+        let payload = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Int64, false)),
+            WIDTH,
+            Arc::new(values),
+            None,
+        )
+        .unwrap();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(payload),
+                Arc::new(UInt64Array::from(row_ids.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn mapping_batch(row_ids: &[u64]) -> RecordBatch {
+        let addresses = (0..row_ids.len() as u64)
+            .map(|offset| {
+                u64::from(RowAddress::new_from_parts(
+                    7,
+                    u32::try_from(offset).unwrap(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        record_batch!(
+            (ROW_ADDR, UInt64, addresses),
+            ("row_id", UInt64, row_ids.to_vec())
+        )
+        .unwrap()
+    }
+
+    fn payload_schema() -> SchemaRef {
+        Arc::new(ArrowSchema::new(vec![Field::new(
+            "payload",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int64, false)), 32),
+            false,
+        )]))
+    }
+
+    fn logical_batch_size(batch: &RecordBatch) -> usize {
+        batch
+            .columns()
+            .iter()
+            .map(|column| array_size(column.as_ref()).unwrap())
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn test_materialization_bounds_repeated_wide_rows() {
+        const MAX_BYTES: usize = 1024;
+        let payload = wide_payload_batch(&[0], 7);
+        let mapping = mapping_batch(&[0; 16]);
+        let output = materialize_payloads(
+            batches(mapping.schema(), vec![mapping]),
+            batches(payload.schema(), vec![payload]),
+            "row_id",
+            payload_schema(),
+            MAX_BYTES,
+        )
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert!(output.len() > 1, "repeated wide payloads must be split");
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 16);
+        for batch in &output {
+            let bytes = logical_batch_size(batch);
+            assert!(
+                bytes <= MAX_BYTES,
+                "output batch uses {bytes} logical bytes, expected at most {MAX_BYTES}"
+            );
+            let addresses = batch
+                .column_by_name(ROW_ADDR)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            assert!(addresses.iter().all(|address| address.is_some()));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_materialization_bounds_sparse_source_batches() {
+        const MAX_BYTES: usize = 32 * 1024;
+        const PAYLOAD_ROWS: usize = 100;
+        const BATCHES: usize = 10;
+        let payload_batches = (0..BATCHES)
+            .map(|batch_index| {
+                let start = (batch_index * PAYLOAD_ROWS) as u64;
+                wide_payload_batch(&(start..start + PAYLOAD_ROWS as u64).collect::<Vec<_>>(), 9)
+            })
+            .collect::<Vec<_>>();
+        let mapping = mapping_batch(
+            &(0..BATCHES)
+                .map(|batch_index| (batch_index * PAYLOAD_ROWS) as u64)
+                .collect::<Vec<_>>(),
+        );
+        let output = materialize_payloads(
+            batches(mapping.schema(), vec![mapping]),
+            batches(payload_batches[0].schema(), payload_batches),
+            "row_id",
+            payload_schema(),
+            MAX_BYTES,
+        )
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+        assert_eq!(
+            output.len(),
+            BATCHES,
+            "each sparse source batch must be released before retaining the next"
+        );
+        assert!(output.iter().all(|batch| batch.num_rows() == 1));
+    }
+
+    #[tokio::test]
+    async fn test_materialization_rejects_indivisible_row_over_budget() {
+        const MAX_BYTES: usize = 128;
+        let payload = wide_payload_batch(&[0], 11);
+        let mapping = mapping_batch(&[0]);
+        let error = materialize_payloads(
+            batches(mapping.schema(), vec![mapping]),
+            batches(payload.schema(), vec![payload]),
+            "row_id",
+            payload_schema(),
+            MAX_BYTES,
+        )
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("requires"));
+        assert!(
+            error
+                .to_string()
+                .contains("exceeding the materialization batch budget")
+        );
     }
 }

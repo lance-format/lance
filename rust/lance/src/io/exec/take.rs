@@ -47,7 +47,7 @@ use crate::index::prefilter::DatasetPreFilter;
 
 use super::utils::{IoMetrics, estimated_bytes_per_row, estimated_total_byte_size};
 
-mod batch;
+pub(crate) mod batch;
 
 #[derive(Debug, Clone)]
 struct TakeStreamMetrics {
