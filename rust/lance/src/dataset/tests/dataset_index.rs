@@ -8705,7 +8705,15 @@ async fn test_existing_ngram_index_with_positions_keeps_working(
     let reader = RecordBatchIterator::new(vec![Ok(rows.clone())], rows.schema());
     let mut target = Dataset::write(reader, &target_dir, None).await.unwrap();
     target.initialize_indices(&dataset).await.unwrap();
-    assert_eq!(target.load_indices().await.unwrap().len(), 1);
+    let copied = target.load_indices().await.unwrap();
+    assert_eq!(copied.len(), 1);
+    let copied_params = load_scalar_segment_params(&target, &copied[0])
+        .await
+        .unwrap();
+    let copied_params: serde_json::Value =
+        serde_json::from_str(copied_params.params.as_deref().unwrap()).unwrap();
+    assert_eq!(copied_params["base_tokenizer"], "ngram");
+    assert_eq!(copied_params["with_position"], true);
 
     // Creating such an index anew is rejected.
     let params = InvertedIndexParams::default()

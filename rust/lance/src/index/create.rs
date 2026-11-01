@@ -87,8 +87,8 @@ pub struct CreateIndexBuilder<'a> {
     progress: Arc<dyn IndexBuildProgress>,
     /// Transaction properties to store with this commit.
     transaction_properties: Option<Arc<HashMap<String, String>>>,
-    /// The parameters come from an existing index, which may carry settings a
-    /// new index is refused, see [`InvertedIndexParams::validate_for_creation`].
+    /// The parameters come from an existing index, so settings refused for a new
+    /// index (see [`InvertedIndexParams::validate_for_creation`]) are accepted.
     is_copy_of_existing: bool,
 }
 
@@ -116,7 +116,8 @@ impl<'a> CreateIndexBuilder<'a> {
         }
     }
 
-    /// Mark the parameters as copied from an existing index.
+    /// Mark the parameters as copied from an existing index, skipping the checks
+    /// only new indexes must pass.
     pub(crate) fn copy_of_existing(mut self) -> Self {
         self.is_copy_of_existing = true;
         self
