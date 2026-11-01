@@ -48,15 +48,22 @@ fn struct_data_block_to_fixed_width_data_block(
     let mut output = Vec::with_capacity(data_size as usize);
     let num_values = struct_data_block.children[0].num_values();
 
+    // Borrow each child's bytes once rather than slicing a buffer per value
+    let children = struct_data_block
+        .children
+        .iter()
+        .zip(bits_per_values)
+        .map(|(child, bits)| {
+            (
+                child.as_fixed_width_ref().unwrap().data.as_ref(),
+                (bits / 8) as usize,
+            )
+        })
+        .collect::<Vec<_>>();
     for i in 0..num_values as usize {
-        for (j, child) in struct_data_block.children.iter().enumerate() {
-            let bytes_per_value = (bits_per_values[j] / 8) as usize;
-            let this_data = child
-                .as_fixed_width_ref()
-                .unwrap()
-                .data
-                .slice_with_length(bytes_per_value * i, bytes_per_value);
-            output.extend_from_slice(&this_data);
+        for &(data, bytes_per_value) in &children {
+            let start = bytes_per_value * i;
+            output.extend_from_slice(&data[start..start + bytes_per_value]);
         }
     }
 
@@ -185,6 +192,7 @@ impl MiniBlockDecompressor for PackedStructFixedWidthMiniBlockDecompressor {
             prefix_sum[i + 1] = prefix_sum[i] + bytes_per_values[i];
         }
 
+        let bytes = encoded_data_block.data.as_ref();
         let mut children_data_block = vec![];
         for i in 0..self.bits_per_values.len() {
             let child_buf_size = bytes_per_values[i] * num_values as usize;
@@ -192,12 +200,8 @@ impl MiniBlockDecompressor for PackedStructFixedWidthMiniBlockDecompressor {
 
             for j in 0..num_values as usize {
                 // the start of the data at this row is `j * encoded_bytes_per_row`, and the offset for this field is `prefix_sum[i]`, this field has length `bytes_per_values[i]`.
-                let this_value = encoded_data_block.data.slice_with_length(
-                    prefix_sum[i] + (j * encoded_bytes_per_row),
-                    bytes_per_values[i],
-                );
-
-                child_buf.extend_from_slice(&this_value);
+                let start = prefix_sum[i] + (j * encoded_bytes_per_row);
+                child_buf.extend_from_slice(&bytes[start..start + bytes_per_values[i]]);
             }
 
             let child = DataBlock::FixedWidth(FixedWidthDataBlock {
