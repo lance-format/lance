@@ -53,6 +53,10 @@ public class SqlQuery {
    * close it afterwards (typically via try-with-resources), as with {@code MergeInsert}. May be
    * called multiple times to register multiple tables.
    *
+   * <p>The stream is fully materialized in memory before the query executes, so callers must keep
+   * the input bounded to available memory. For streaming or out-of-core relations, use a custom
+   * table provider through the Rust API instead of this Arrow convenience method.
+   *
    * <p>{@code name} is parsed as a SQL identifier, so an unquoted name is lowercased ({@code IDs}
    * registers the table {@code ids}) while a quoted one keeps its case ({@code "IDs"} registers the
    * table {@code IDs}). If two names resolve to the same table, the later registration replaces the
@@ -103,7 +107,8 @@ public class SqlQuery {
               + "Arrow relations is single-use because the registered streams are consumed. "
               + "Build a new query and re-register them.");
     }
-    try (ArrowArrayStream s = ArrowArrayStream.allocateNew(dataset.allocator())) {
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock();
+        ArrowArrayStream s = ArrowArrayStream.allocateNew(dataset.allocator())) {
       // A query with registered streams is one-shot: the native call below consumes them. Mark it
       // consumed just before that call, so a failed output-stream allocation does not brick a
       // retry.

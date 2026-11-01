@@ -16,6 +16,18 @@ use geoarrow_schema::{BoxType, Dimension};
 use lance_core::error::ArrowResult;
 use serde::{Deserialize, Serialize};
 
+/// Returns whether a rectangle has inverted bounds and therefore no extent.
+///
+/// ```
+/// # use lance_geo::bbox::{BoundingBox, is_empty_rect};
+/// assert!(is_empty_rect(&BoundingBox::new()));
+/// ```
+pub fn is_empty_rect(rect: &impl RectTrait<T = f64>) -> bool {
+    let min = rect.min();
+    let max = rect.max();
+    min.x() > max.x() || min.y() > max.y()
+}
+
 /// Inspired by <https://github.com/geoarrow/geoarrow-rs>
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct BoundingBox {
@@ -97,14 +109,13 @@ impl BoundingBox {
     }
 
     pub fn add_rect(&mut self, rect: &impl RectTrait<T = f64>) {
-        let min = rect.min();
-        let max = rect.max();
-
         // Empty bounding boxes use inverted bounds, so they are the identity for a union.
-        if min.x() > max.x() || min.y() > max.y() {
+        if is_empty_rect(rect) {
             return;
         }
 
+        let min = rect.min();
+        let max = rect.max();
         self.add_coord(&min);
         self.add_coord(&max);
     }

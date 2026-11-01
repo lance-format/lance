@@ -7,7 +7,6 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{ErrorKind, Read, SeekFrom};
 use std::ops::Range;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 // TODO: Clean up windows/unix stuff
@@ -42,10 +41,36 @@ pub fn to_local_path(path: &Path) -> String {
     }
 }
 
+/// Create a local writer's parent directory and persist any newly created path components.
+pub(crate) fn create_dir_all_durable(parent: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let first_existing = parent.ancestors().find(|path| path.exists());
+
+    std::fs::create_dir_all(parent)?;
+
+    #[cfg(unix)]
+    if let Some(first_existing) = first_existing.filter(|path| *path != parent) {
+        let mut directory = parent;
+        loop {
+            File::open(directory)?.sync_all()?;
+            if directory == first_existing {
+                break;
+            }
+            directory = directory.parent().ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "cannot find parent of newly created directory {}",
+                    directory.display()
+                ))
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Recursively remove a directory, specified by [`object_store::path::Path`].
 pub fn remove_dir_all(path: &Path) -> Result<()> {
-    let local_path = to_local_path(path);
-    std::fs::remove_dir_all(local_path).map_err(|err| match err.kind() {
+    std::fs::remove_dir_all(to_local_path(path)).map_err(|err| match err.kind() {
         ErrorKind::NotFound => Error::not_found(path.to_string()),
         _ => Error::from(err),
     })?;
@@ -59,7 +84,7 @@ pub(crate) fn remove_empty_dirs(
     verified_dirs: &HashSet<Path>,
     unmodified_since: Option<DateTime<Utc>>,
 ) -> Result<()> {
-    let root_path = PathBuf::from(to_local_path(root));
+    let root_path = std::path::PathBuf::from(to_local_path(root));
     let root_metadata = match std::fs::symlink_metadata(&root_path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),

@@ -34,155 +34,29 @@
 //! deleted row is simply dropped along with the row. This matches the spec with no
 //! special casing.
 
-use std::collections::{BTreeSet, HashMap};
+pub mod writer;
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
+use arrow_buffer::{NullBuffer, NullBufferBuilder};
 use arrow_select::interleave::interleave;
 use futures::StreamExt;
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 
-use lance_table::format::overlay::DataOverlayFile;
-use lance_table::format::{DataFile, Fragment, IndexMetadata};
+use lance_table::format::DataFile;
 use lance_table::utils::stream::ReadBatchFut;
 
 use crate::dataset::fragment::{FileFragment, FragReadConfig, GenericFileReader};
 
-/// The physical offsets within a fragment whose value for an indexed field may be
-/// stale relative to an index built at `index_version`, and so must be excluded
-/// from that index's results and re-evaluated against current values on the flat
-/// path.
-///
-/// The set is the union, over every overlay whose `committed_version` is newer
-/// than `index_version`, of that overlay's coverage **restricted to the indexed
-/// fields**. The restriction makes exclusion field-aware: an overlay that touches
-/// only non-indexed fields contributes nothing. An overlay whose
-/// `committed_version <= index_version` is already incorporated by the index and
-/// is ignored.
-pub fn overlay_exclusion_offsets(
-    overlays: &[DataOverlayFile],
-    indexed_field_ids: &[i32],
-    index_version: u64,
-    schema: &Schema,
-) -> Result<RoaringBitmap> {
-    let mut excluded = RoaringBitmap::new();
-    for overlay in overlays {
-        if overlay.committed_version <= index_version {
-            continue;
-        }
-        for (field_pos, field_id) in overlay.data_file.fields.iter().enumerate() {
-            let overlay_ancestry = schema.field_ancestry_by_id(*field_id);
-            let affects_index = indexed_field_ids.iter().any(|indexed_field_id| {
-                indexed_field_id == field_id
-                    || overlay_ancestry.as_ref().is_some_and(|ancestry| {
-                        ancestry
-                            .iter()
-                            .any(|ancestor| ancestor.id == *indexed_field_id)
-                    })
-                    || schema
-                        .field_ancestry_by_id(*indexed_field_id)
-                        .is_some_and(|ancestry| {
-                            ancestry.iter().any(|ancestor| ancestor.id == *field_id)
-                        })
-            });
-            if affects_index {
-                excluded |= &*overlay.coverage_for_field(field_pos)?;
-            }
-        }
-    }
-    Ok(excluded)
-}
-
-// Stale row offsets contributed by one fragment's overlays for a given index version.
-// Applies a cheap version gate first: if every overlay predates the segment it is already
-// incorporated by the index, so there is nothing stale and the field/bitmap work is skipped.
-fn stale_offsets_for_fragment(
-    fragment: &Fragment,
-    fields: &[i32],
-    index_version: u64,
-    schema: &Schema,
-) -> Result<RoaringBitmap> {
-    if fragment
-        .overlays
-        .iter()
-        .all(|o| o.committed_version <= index_version)
-    {
-        return Ok(RoaringBitmap::new());
-    }
-    overlay_exclusion_offsets(&fragment.overlays, fields, index_version, schema)
-}
-
-// A missing `fragment_bitmap` means the index predates fragment-bitmap tracking; treat it as
-// covering every fragment (matching `DatasetPreFilter::new`) so overlay-stale rows can't slip
-// through unmasked. Only skip fragments explicitly absent from a present bitmap.
-fn covers_fragment(coverage: Option<&RoaringBitmap>, frag_id: u32) -> bool {
-    coverage.is_none_or(|c| c.contains(frag_id))
-}
-
-/// Index by fragment id the fragments that carry at least one overlay. Overlays are rare, so
-/// this is empty on the common path, letting callers skip index loading entirely; when non-empty
-/// it bounds the stale-collection loops to `O(overlaid fragments)`.
-pub fn overlaid_fragments(fragments: &[Fragment]) -> HashMap<u32, &Fragment> {
-    fragments
-        .iter()
-        .filter(|f| !f.overlays.is_empty())
-        .map(|f| (f.id as u32, f))
-        .collect()
-}
-
-/// Insert into `stale` the ids of fragments covered by `segment` whose index entries may be
-/// stale because an overlay committed after the segment was built touches a field the segment
-/// indexes. Field-aware and version-gated via [`overlay_exclusion_offsets`].
-///
-/// `overlaid_frags` holds only the fragments that actually carry overlays (rare), so the loop is
-/// `O(overlaid_frags)` rather than `O(fragments the segment covers)`.
-pub fn collect_overlay_stale_frags(
-    segment: &IndexMetadata,
-    overlaid_frags: &HashMap<u32, &Fragment>,
-    stale: &mut RoaringBitmap,
-    schema: &Schema,
-) -> Result<()> {
-    let coverage = segment.fragment_bitmap.as_ref();
-    for (&frag_id, fragment) in overlaid_frags {
-        if stale.contains(frag_id) || !covers_fragment(coverage, frag_id) {
-            continue;
-        }
-        if !stale_offsets_for_fragment(fragment, &segment.fields, segment.dataset_version, schema)?
-            .is_empty()
-        {
-            stale.insert(frag_id);
-        }
-    }
-    Ok(())
-}
-
-/// Compute exactly which row offsets within each covered fragment are stale and accumulate them
-/// into `stale` (fragment_id → stale row offsets).
-///
-/// Used by the scalar and vector paths to block only the affected rows from index results and
-/// re-evaluate only those rows on the flat path, keeping overhead proportional to the number of
-/// overlaid rows rather than the whole fragment size.
-pub fn collect_overlay_stale_rows_for_segment(
-    segment: &IndexMetadata,
-    overlaid_frags: &HashMap<u32, &Fragment>,
-    stale: &mut HashMap<u32, RoaringBitmap>,
-    schema: &Schema,
-) -> Result<()> {
-    let coverage = segment.fragment_bitmap.as_ref();
-    for (&frag_id, fragment) in overlaid_frags {
-        if !covers_fragment(coverage, frag_id) {
-            continue;
-        }
-        let excluded =
-            stale_offsets_for_fragment(fragment, &segment.fields, segment.dataset_version, schema)?;
-        if !excluded.is_empty() {
-            *stale.entry(frag_id).or_default() |= &excluded;
-        }
-    }
-    Ok(())
-}
+// Deciding which rows an overlay makes stale needs only fragment and index metadata,
+// so it lives at the table layer; this module resolves the reads that consume it.
+pub use lance_table::format::overlay::staleness::{
+    collect_overlay_stale_frags, collect_overlay_stale_rows_for_segment, overlaid_fragments,
+};
 
 /// The plan for merging one field's overlays into one batch: which source (base or
 /// a particular overlay) supplies each output row, and which overlay values must be
@@ -412,9 +286,11 @@ fn assemble_overlay_column(
     interleave(&sources, &routing.indices).map_err(Error::from)
 }
 
-/// One overlay's contribution to one projected atomic field, with its file reader opened.
+/// One overlay's contribution to one relevant atomic field, with its file reader opened.
 #[derive(Debug, Clone)]
 struct LoadedAtomicFieldOverlay {
+    /// Index of this overlay in the planner's newest-first file list. Lower is newer.
+    file: usize,
     /// The `offset_in_frag` cells this overlay covers for the atomic field.
     coverage: Arc<RoaringBitmap>,
     /// Reader over the overlay data file, projected to the covered atomic fields; shared
@@ -422,10 +298,11 @@ struct LoadedAtomicFieldOverlay {
     reader: Arc<dyn GenericFileReader>,
 }
 
-/// The overlays that apply to a single projected atomic field — a per-row field an overlay
-/// can replace as a unit (a primitive leaf, or a whole list/map field; structs are
-/// recursed through, not treated as atomic fields). Ordered newest-first, with readers opened
-/// and pruned to a specific read. Produced by [`resolve_overlays`] and consumed by
+/// The overlays that apply to a single relevant atomic field — either a projected
+/// value or an unprojected descendant that can supply projected struct validity.
+/// An atomic field is a primitive leaf or a whole list/map field; structs are
+/// recursed through. Ordered newest-first, with readers opened and pruned to a
+/// specific read. Produced by [`resolve_overlays`] and consumed by
 /// [`merge_overlay_batch`].
 #[derive(Debug, Clone)]
 pub struct LoadedAtomicField {
@@ -436,23 +313,44 @@ pub struct LoadedAtomicField {
     /// field *is* the top-level column). Drives descending to, and splicing back, the
     /// atomic field.
     ancestor_ids: Vec<i32>,
+    /// Paths from `top_field` to each struct ancestor of the atomic field. The
+    /// fetched array carries these ancestors' validity alongside the leaf value.
+    struct_ancestor_ids: Vec<Vec<i32>>,
     /// Projection of exactly the atomic field (its ancestor path pruned to the atomic
     /// field subtree), used to fetch the atomic field's values from the overlay file.
     fetch_projection: Arc<Schema>,
+    /// Whether this atomic field is part of the output projection. Unprojected
+    /// descendants are still loaded when they can supply a projected struct
+    /// ancestor's validity, but their values are not merged into the output.
+    is_value_projected: bool,
     overlays_newest_first: Vec<LoadedAtomicFieldOverlay>,
 }
+
+struct FetchedAtomicField {
+    top_level: ArrayRef,
+    value: ArrayRef,
+}
+
+struct StructValidityCandidates {
+    top_field: Arc<Field>,
+    ancestor_ids: Vec<i32>,
+    /// Per output row, the newest overlay file and the validity it supplies.
+    rows: Vec<Option<(usize, bool)>>,
+}
+
+type StructValidityMap = BTreeMap<(i32, Vec<i32>), StructValidityCandidates>;
 
 /// One overlay file that may contribute to a read, before it is opened. Opened
 /// lazily by [`resolve_overlays`], and only if the read actually touches it.
 #[derive(Debug, Clone)]
 struct PlannedOverlayFile {
     data_file: DataFile,
-    /// The covered ∩ projected atomic fields to project when the file is opened, so a single
-    /// reader serves every atomic field the file contributes to.
+    /// The covered relevant atomic fields to project when the file is opened, so a
+    /// single reader serves every value or validity contribution from the file.
     open_projection: Arc<Schema>,
 }
 
-/// One overlay's contribution to one projected atomic field, before the file is opened.
+/// One overlay's contribution to one relevant atomic field, before the file is opened.
 #[derive(Debug, Clone)]
 struct PlannedAtomicFieldOverlay {
     /// Index into [`OverlayReadPlanner::files`] of the file that supplies the value.
@@ -460,14 +358,22 @@ struct PlannedAtomicFieldOverlay {
     coverage: Arc<RoaringBitmap>,
 }
 
-/// The overlays that apply to a single projected atomic field, ordered newest-first, before
-/// any file is opened.
+/// The overlays that apply to a single relevant atomic field, ordered newest-first,
+/// before any file is opened.
 #[derive(Debug, Clone)]
 struct PlannedAtomicField {
     top_field: Arc<Field>,
     ancestor_ids: Vec<i32>,
+    struct_ancestor_ids: Vec<Vec<i32>>,
     fetch_projection: Arc<Schema>,
+    is_value_projected: bool,
     overlays_newest_first: Vec<PlannedAtomicFieldOverlay>,
+}
+
+struct EnumeratedAtomicField<'a> {
+    field: &'a Field,
+    ancestor_ids: Vec<i32>,
+    struct_ancestor_ids: Vec<Vec<i32>>,
 }
 
 /// A fragment's overlay-resolution plan for a projection, derived from coverage
@@ -481,7 +387,7 @@ pub struct OverlayReadPlanner {
 }
 
 impl OverlayReadPlanner {
-    /// True when no projected atomic field has any overlay, so there is nothing to resolve.
+    /// True when no overlay affects any projected value or struct validity.
     pub fn is_empty(&self) -> bool {
         self.atomic_fields.is_empty()
     }
@@ -502,9 +408,10 @@ impl OverlayReadPlanner {
 /// structural encoding records only leaves), so an overlay contributes to a projected
 /// atomic field when any id in its `data_file.fields` falls in that atomic field's leaf
 /// set. At merge time the atomic field's value is fetched and spliced into its output
-/// column, so an overlay on a sub-field never disturbs the column's other leaves. Each
-/// contributing overlay *file* appears once in `files`, shared by every atomic field it
-/// covers.
+/// column, so an overlay on a sub-field never disturbs the column's other leaves. The
+/// fetched struct spine is retained so validity at every struct ancestor is resolved
+/// from the newest overlay covering any descendant field. Each contributing overlay
+/// *file* appears once in `files`, shared by every atomic field it covers.
 pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<OverlayReadPlanner> {
     let overlays = &fragment.metadata.overlays;
     debug_assert!(
@@ -514,27 +421,58 @@ pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<Ove
         "overlays must be sorted newest-last (see sort_overlays_newest_last)"
     );
 
-    // The projection's atomic fields, and a leaf-id -> atomic-field-index map so an
+    // The relevant atomic fields, and a leaf-id -> atomic-field-index map so an
     // overlay's stored leaf ids resolve to the atomic field they belong to in O(1).
+    // Besides projected values, this includes unprojected descendants of projected
+    // struct ancestors because any of their overlays can supply those ancestors'
+    // shared validity.
     struct AtomicFieldInfo<'a> {
         top_field: &'a Field,
         ancestor_ids: Vec<i32>,
+        struct_ancestor_ids: Vec<Vec<i32>>,
         atomic_field_id: i32,
+        is_value_projected: bool,
     }
+    let full_schema = fragment.schema();
     let mut atomic_field_infos: Vec<AtomicFieldInfo> = Vec::new();
     let mut leaf_to_atomic_field: HashMap<i32, usize> = HashMap::new();
-    for top in &projection.fields {
-        for (atomic_field, ancestor_ids) in enumerate_atomic_fields(top) {
+    for projected_top in &projection.fields {
+        let Some(full_top) = full_schema.field_by_id(projected_top.id) else {
+            // Synthetic/system fields cannot be targeted by data overlays.
+            continue;
+        };
+        let projected_atomic_fields = enumerate_atomic_fields(projected_top);
+        let projected_atomic_ids: BTreeSet<i32> = projected_atomic_fields
+            .iter()
+            .map(|atomic_field| atomic_field.field.id)
+            .collect();
+        let projected_struct_ancestor_ids: BTreeSet<Vec<i32>> = projected_atomic_fields
+            .iter()
+            .flat_map(|atomic_field| atomic_field.struct_ancestor_ids.iter().cloned())
+            .collect();
+
+        for atomic_field in enumerate_atomic_fields(full_top) {
+            let is_value_projected = projected_atomic_ids.contains(&atomic_field.field.id);
+            let struct_ancestor_ids: Vec<Vec<i32>> = atomic_field
+                .struct_ancestor_ids
+                .into_iter()
+                .filter(|path| projected_struct_ancestor_ids.contains(path))
+                .collect();
+            if !is_value_projected && struct_ancestor_ids.is_empty() {
+                continue;
+            }
             let idx = atomic_field_infos.len();
             let mut value_leaf_ids = Vec::new();
-            collect_leaf_ids(atomic_field, &mut value_leaf_ids);
+            collect_leaf_ids(atomic_field.field, &mut value_leaf_ids);
             for leaf in value_leaf_ids {
                 leaf_to_atomic_field.insert(leaf, idx);
             }
             atomic_field_infos.push(AtomicFieldInfo {
-                top_field: top,
-                ancestor_ids,
-                atomic_field_id: atomic_field.id,
+                top_field: projected_top,
+                ancestor_ids: atomic_field.ancestor_ids,
+                struct_ancestor_ids,
+                atomic_field_id: atomic_field.field.id,
+                is_value_projected,
             });
         }
     }
@@ -564,7 +502,7 @@ pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<Ove
             .collect();
         files.push(PlannedOverlayFile {
             data_file: overlay.data_file.clone(),
-            open_projection: Arc::new(projection.project_by_ids(&covered_ids, true)),
+            open_projection: Arc::new(full_schema.project_by_ids(&covered_ids, true)),
         });
         for (atomic_field_idx, field_pos) in covered {
             atomic_field_overlays[atomic_field_idx].push(PlannedAtomicFieldOverlay {
@@ -574,7 +512,7 @@ pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<Ove
         }
     }
 
-    // Emit one PlannedAtomicField per projected atomic field that has overlays, in
+    // Emit one PlannedAtomicField per relevant atomic field that has overlays, in
     // atomic field order.
     let mut atomic_fields = Vec::new();
     for (idx, info) in atomic_field_infos.iter().enumerate() {
@@ -585,7 +523,9 @@ pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<Ove
         atomic_fields.push(PlannedAtomicField {
             top_field: Arc::new(info.top_field.clone()),
             ancestor_ids: info.ancestor_ids.clone(),
-            fetch_projection: Arc::new(projection.project_by_ids(&[info.atomic_field_id], true)),
+            struct_ancestor_ids: info.struct_ancestor_ids.clone(),
+            fetch_projection: Arc::new(full_schema.project_by_ids(&[info.atomic_field_id], true)),
+            is_value_projected: info.is_value_projected,
             overlays_newest_first,
         });
     }
@@ -599,21 +539,33 @@ pub fn plan_overlays(fragment: &FileFragment, projection: &Schema) -> Result<Ove
 /// the top-level field down to it. Structs are recursed through; a primitive leaf or a
 /// whole list/map field is an atomic field (values are one-per-row). A top-level primitive or
 /// list yields a single atomic field with an empty path.
-fn enumerate_atomic_fields(top: &Field) -> Vec<(&Field, Vec<i32>)> {
-    fn recurse<'a>(field: &'a Field, path: &mut Vec<i32>, out: &mut Vec<(&'a Field, Vec<i32>)>) {
+fn enumerate_atomic_fields(top: &Field) -> Vec<EnumeratedAtomicField<'_>> {
+    fn recurse<'a>(
+        field: &'a Field,
+        path: &mut Vec<i32>,
+        struct_ancestor_ids: &mut Vec<Vec<i32>>,
+        out: &mut Vec<EnumeratedAtomicField<'a>>,
+    ) {
         if field.logical_type.is_struct() {
+            struct_ancestor_ids.push(path.clone());
             for child in &field.children {
                 path.push(child.id);
-                recurse(child, path, out);
+                recurse(child, path, struct_ancestor_ids, out);
                 path.pop();
             }
+            struct_ancestor_ids.pop();
         } else {
-            out.push((field, path.clone()));
+            out.push(EnumeratedAtomicField {
+                field,
+                ancestor_ids: path.clone(),
+                struct_ancestor_ids: struct_ancestor_ids.clone(),
+            });
         }
     }
     let mut out = Vec::new();
     let mut path = Vec::new();
-    recurse(top, &mut path, &mut out);
+    let mut struct_ancestor_ids = Vec::new();
+    recurse(top, &mut path, &mut struct_ancestor_ids, &mut out);
     out
 }
 
@@ -702,6 +654,154 @@ fn splice_by_ids(
     )?))
 }
 
+/// Replace only the validity of the struct at `ancestor_ids`, preserving its
+/// children and the rest of the top-level column.
+fn replace_struct_nulls_by_ids(
+    array: &ArrayRef,
+    field: &Field,
+    ancestor_ids: &[i32],
+    nulls: Option<NullBuffer>,
+) -> Result<ArrayRef> {
+    let target = descend_by_ids(array, field, ancestor_ids)?;
+    let structs = target
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "overlay validity replacement expected a struct under '{}'",
+                field.name
+            ))
+        })?;
+    let len = structs.len();
+    let (fields, children, _) = structs.clone().into_parts();
+    let replacement: ArrayRef = Arc::new(StructArray::try_new_with_length(
+        fields, children, nulls, len,
+    )?);
+    splice_by_ids(array, field, ancestor_ids, replacement)
+}
+
+/// Record the struct validity carried alongside one atomic field's fetched values.
+/// A struct ancestor may receive candidates from several independently overlaid
+/// children, so the planner's global file order selects the newest one per row.
+fn collect_struct_validity_candidates(
+    plan: &LoadedAtomicField,
+    routing: &OverlayRouting,
+    fetched: &[FetchedAtomicField],
+    struct_validities: &mut StructValidityMap,
+) -> Result<()> {
+    for ancestor_ids in &plan.struct_ancestor_ids {
+        let candidates = struct_validities
+            .entry((plan.top_field.id, ancestor_ids.clone()))
+            .or_insert_with(|| StructValidityCandidates {
+                top_field: plan.top_field.clone(),
+                ancestor_ids: ancestor_ids.clone(),
+                rows: vec![None; routing.indices.len()],
+            });
+        if candidates.rows.len() != routing.indices.len() {
+            return Err(Error::invalid_input(format!(
+                "overlay validity routing for '{}' has {} rows, expected {}",
+                plan.top_field.name,
+                routing.indices.len(),
+                candidates.rows.len()
+            )));
+        }
+        let fetched_structs = fetched
+            .iter()
+            .map(|fetched| {
+                descend_by_ids(
+                    &fetched.top_level,
+                    &plan.fetch_projection.fields[0],
+                    ancestor_ids,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (offset_in_batch, &(source, position)) in routing.indices.iter().enumerate() {
+            let Some(overlay_pos) = source.checked_sub(1) else {
+                continue;
+            };
+            let overlay = plan.overlays_newest_first.get(overlay_pos).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "overlay routing selected source {source}, but field '{}' has {} overlays",
+                    plan.top_field.name,
+                    plan.overlays_newest_first.len()
+                ))
+            })?;
+            let current_file = candidates.rows[offset_in_batch].map(|(file, _)| file);
+            if current_file.is_none_or(|file| overlay.file < file) {
+                let fetched_struct = fetched_structs
+                    .get(overlay_pos)
+                    .and_then(|array| array.as_any().downcast_ref::<StructArray>())
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "overlay validity source expected a struct under '{}'",
+                            plan.top_field.name
+                        ))
+                    })?;
+                if position >= fetched_struct.len() {
+                    return Err(Error::invalid_input(format!(
+                        "overlay validity source for '{}' has {} rows, but routing selected row {}",
+                        plan.top_field.name,
+                        fetched_struct.len(),
+                        position
+                    )));
+                }
+                candidates.rows[offset_in_batch] =
+                    Some((overlay.file, fetched_struct.is_valid(position)));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rebuild every affected struct ancestor with its resolved per-row validity.
+fn apply_struct_validities(
+    schema: &arrow_schema::Schema,
+    columns: &mut [ArrayRef],
+    struct_validities: StructValidityMap,
+) -> Result<()> {
+    for candidates in struct_validities.into_values() {
+        let Some(idx) = schema.index_of(&candidates.top_field.name).ok() else {
+            continue;
+        };
+        let target = descend_by_ids(
+            &columns[idx],
+            &candidates.top_field,
+            &candidates.ancestor_ids,
+        )?;
+        let structs = target
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "overlay validity target expected a struct under '{}'",
+                    candidates.top_field.name
+                ))
+            })?;
+        if structs.len() != candidates.rows.len() {
+            return Err(Error::invalid_input(format!(
+                "overlay validity target '{}' has {} rows, expected {}",
+                candidates.top_field.name,
+                structs.len(),
+                candidates.rows.len()
+            )));
+        }
+        let mut nulls = NullBufferBuilder::new(candidates.rows.len());
+        for (offset_in_batch, candidate) in candidates.rows.into_iter().enumerate() {
+            nulls.append(candidate.map_or_else(
+                || structs.is_valid(offset_in_batch),
+                |(_, is_valid)| is_valid,
+            ));
+        }
+        columns[idx] = replace_struct_nulls_by_ids(
+            &columns[idx],
+            &candidates.top_field,
+            &candidates.ancestor_ids,
+            nulls.finish(),
+        )?;
+    }
+    Ok(())
+}
+
 /// Open the overlay readers a specific read needs and return the per-field plans to
 /// merge, pruned to that read.
 ///
@@ -762,6 +862,7 @@ pub async fn resolve_overlays(
                 continue; // pruned: coverage disjoint from the read
             };
             overlays_newest_first.push(LoadedAtomicFieldOverlay {
+                file: overlay.file,
                 coverage: overlay.coverage.clone(),
                 reader: reader.clone(),
             });
@@ -770,7 +871,9 @@ pub async fn resolve_overlays(
             plans.push(LoadedAtomicField {
                 top_field: atomic_field.top_field.clone(),
                 ancestor_ids: atomic_field.ancestor_ids.clone(),
+                struct_ancestor_ids: atomic_field.struct_ancestor_ids.clone(),
                 fetch_projection: atomic_field.fetch_projection.clone(),
+                is_value_projected: atomic_field.is_value_projected,
                 overlays_newest_first,
             });
         }
@@ -793,10 +896,11 @@ fn read_offsets_bitmap(offsets_in_frag: &[u32]) -> RoaringBitmap {
     bitmap
 }
 
-/// Resolve overlays for one base batch: route each projected atomic field against the batch's
-/// `offsets_in_frag`, fetch only the overlay values the batch needs (concurrently with
-/// the base read), assemble the merged atomic field, and splice it into its output column.
-/// AtomicFields with no covered rows, and columns with no plan, pass through.
+/// Resolve overlays for one base batch: route each relevant atomic field against the
+/// batch's `offsets_in_frag`, fetch only the overlay values the batch needs
+/// (concurrently with the base read), and collect projected struct validity. For a
+/// projected value, assemble the merged atomic field and splice it into its output
+/// column. Atomic fields with no covered rows, and columns with no plan, pass through.
 pub async fn merge_overlay_batch(
     base: ReadBatchFut,
     offsets_in_frag: &[u32],
@@ -812,9 +916,8 @@ pub async fn merge_overlay_batch(
         if !routing.any_overlay {
             return Ok::<_, Error>((plan, None));
         }
-        // Fetch each overlay's values and descend to the atomic field array. The fetch is
-        // projected to the atomic field's ancestor path, so the fetched column is the pruned
-        // top-level column; `descend_by_ids` walks it down to the atomic field.
+        // Retain the pruned top-level column because it carries every struct
+        // ancestor's validity alongside the atomic field value.
         let atomic_field = &plan.fetch_projection.fields[0];
         let fetched = futures::future::try_join_all(
             plan.overlays_newest_first
@@ -827,7 +930,11 @@ pub async fn merge_overlay_batch(
                         offsets_in_overlay,
                     )
                     .await?;
-                    descend_by_ids(&column, atomic_field, &plan.ancestor_ids)
+                    let value = descend_by_ids(&column, atomic_field, &plan.ancestor_ids)?;
+                    Ok::<_, Error>(FetchedAtomicField {
+                        top_level: column,
+                        value,
+                    })
                 }),
         )
         .await?;
@@ -839,6 +946,7 @@ pub async fn merge_overlay_batch(
 
     let schema = batch.schema();
     let mut columns = batch.columns().to_vec();
+    let mut struct_validities = StructValidityMap::new();
     for (plan, work) in resolved {
         let Some((routing, fetched)) = work else {
             continue;
@@ -847,8 +955,17 @@ pub async fn merge_overlay_batch(
             // The plan's column is not in this batch's projection; skip it.
             continue;
         };
+        collect_struct_validity_candidates(plan, &routing, &fetched, &mut struct_validities)?;
+        if !plan.is_value_projected {
+            continue;
+        }
         let base_atomic_field = descend_by_ids(&columns[idx], &plan.top_field, &plan.ancestor_ids)?;
-        let merged_atomic_field = assemble_overlay_column(&base_atomic_field, &routing, &fetched)?;
+        let fetched_values: Vec<ArrayRef> = fetched
+            .iter()
+            .map(|fetched| fetched.value.clone())
+            .collect();
+        let merged_atomic_field =
+            assemble_overlay_column(&base_atomic_field, &routing, &fetched_values)?;
         columns[idx] = splice_by_ids(
             &columns[idx],
             &plan.top_field,
@@ -856,6 +973,10 @@ pub async fn merge_overlay_batch(
             merged_atomic_field,
         )?;
     }
+
+    // Child values resolve independently, but a struct cell has one shared
+    // validity, selected from the newest overlay contributing any descendant.
+    apply_struct_validities(schema.as_ref(), &mut columns, struct_validities)?;
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
@@ -894,7 +1015,6 @@ async fn fetch_overlay_values(
 mod tests {
     use super::*;
     use arrow_array::{Int32Array, StringArray, UInt32Array};
-    use lance_table::format::overlay::OverlayCoverage;
     use std::sync::Arc;
 
     fn i32_array(values: impl IntoIterator<Item = Option<i32>>) -> ArrayRef {
@@ -903,19 +1023,6 @@ mod tests {
 
     fn bitmap(offsets: impl IntoIterator<Item = u32>) -> RoaringBitmap {
         RoaringBitmap::from_iter(offsets)
-    }
-
-    fn flat_test_schema() -> Schema {
-        use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-
-        let mut schema = Schema::try_from(&ArrowSchema::new(
-            (0..5)
-                .map(|id| ArrowField::new(format!("field_{id}"), DataType::Int32, true))
-                .collect::<Vec<_>>(),
-        ))
-        .unwrap();
-        schema.set_field_id(None);
-        schema
     }
 
     /// Physical offsets for a contiguous range `[start, start + len)`.
@@ -1210,224 +1317,5 @@ mod tests {
         assert!(!spliced.is_null(0));
         assert!(spliced.is_null(1));
         assert!(!spliced.is_null(2));
-    }
-
-    /// A dense overlay covering `offsets` for `field_ids`, committed at `version`.
-    fn dense_overlay(
-        field_ids: Vec<i32>,
-        offsets: impl IntoIterator<Item = u32>,
-        version: u64,
-    ) -> lance_table::format::overlay::DataOverlayFile {
-        DataOverlayFile {
-            data_file: DataFile::new_legacy_from_fields("o.lance", field_ids, None),
-            coverage: OverlayCoverage::dense(bitmap(offsets)),
-            committed_version: version,
-        }
-    }
-
-    #[test]
-    fn test_exclusion_offsets_version_gate() {
-        let schema = flat_test_schema();
-        // index built at version 5; only overlays committed > 5 are excluded.
-        let overlays = vec![
-            dense_overlay(vec![3], [0, 1], 4),
-            dense_overlay(vec![3], [2, 7], 6),
-        ];
-        let excluded = overlay_exclusion_offsets(&overlays, &[3], 5, &schema).unwrap();
-        assert_eq!(excluded, bitmap([2, 7]));
-        // An overlay exactly at the index version is already incorporated.
-        let overlays = vec![dense_overlay(vec![3], [9], 5)];
-        assert!(
-            overlay_exclusion_offsets(&overlays, &[3], 5, &schema)
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn test_exclusion_offsets_is_field_aware() {
-        let schema = flat_test_schema();
-        // An overlay touching only an unrelated field excludes nothing.
-        let overlays = vec![dense_overlay(vec![2], [0, 1, 2], 9)];
-        assert!(
-            overlay_exclusion_offsets(&overlays, &[3], 1, &schema)
-                .unwrap()
-                .is_empty()
-        );
-        // The union spans only the indexed fields the overlay actually carries.
-        let overlays = vec![dense_overlay(vec![2, 3], [4], 9)];
-        assert_eq!(
-            overlay_exclusion_offsets(&overlays, &[3], 1, &schema).unwrap(),
-            bitmap([4])
-        );
-    }
-
-    #[test]
-    fn test_exclusion_offsets_matches_nested_fields() {
-        let (schema, _) = nested_struct();
-        let outer = &schema.fields[0];
-        let middle = &outer.children[0];
-        let a = &middle.children[0];
-        let b = &middle.children[1];
-
-        let overlays = vec![dense_overlay(vec![a.id], [1], 9)];
-        assert_eq!(
-            overlay_exclusion_offsets(&overlays, &[outer.id], 1, &schema).unwrap(),
-            bitmap([1])
-        );
-        assert!(
-            overlay_exclusion_offsets(&overlays, &[b.id], 1, &schema)
-                .unwrap()
-                .is_empty()
-        );
-
-        let overlays = vec![dense_overlay(vec![middle.id], [2], 9)];
-        assert_eq!(
-            overlay_exclusion_offsets(&overlays, &[a.id], 1, &schema).unwrap(),
-            bitmap([2])
-        );
-    }
-
-    #[test]
-    fn test_exclusion_offsets_sparse_per_field() {
-        let schema = flat_test_schema();
-        // Sparse overlay: field 2 covers {2,3}, field 4 covers {1}.
-        let overlay = DataOverlayFile {
-            data_file: DataFile::new_legacy_from_fields("o.lance", vec![2, 4], None),
-            coverage: OverlayCoverage::sparse(vec![bitmap([2, 3]), bitmap([1])]),
-            committed_version: 9,
-        };
-        let overlays = vec![overlay];
-        // Only the bitmap for the indexed field (4) contributes.
-        assert_eq!(
-            overlay_exclusion_offsets(&overlays, &[4], 1, &schema).unwrap(),
-            bitmap([1])
-        );
-        assert_eq!(
-            overlay_exclusion_offsets(&overlays, &[2], 1, &schema).unwrap(),
-            bitmap([2, 3])
-        );
-    }
-
-    #[test]
-    fn test_exclusion_offsets_unions_multiple_overlays() {
-        let schema = flat_test_schema();
-        let overlays = vec![
-            dense_overlay(vec![3], [1], 6),
-            dense_overlay(vec![3], [4, 5], 7),
-        ];
-        assert_eq!(
-            overlay_exclusion_offsets(&overlays, &[3], 1, &schema).unwrap(),
-            bitmap([1, 4, 5])
-        );
-    }
-
-    /// An index segment covering `fields`, built at `dataset_version`, with the given
-    /// fragment coverage (`None` = legacy index predating fragment-bitmap tracking).
-    fn segment(
-        fields: Vec<i32>,
-        dataset_version: u64,
-        fragment_bitmap: Option<RoaringBitmap>,
-    ) -> IndexMetadata {
-        IndexMetadata {
-            uuid: uuid::Uuid::new_v4(),
-            name: "idx".into(),
-            fields,
-            dataset_version,
-            fragment_bitmap,
-            index_details: None,
-            index_version: 0,
-            created_at: None,
-            base_id: None,
-            files: None,
-        }
-    }
-
-    fn fragment_with_overlay(id: u64, overlay: DataOverlayFile) -> Fragment {
-        let mut fragment = Fragment::new(id);
-        fragment.overlays.push(overlay);
-        fragment
-    }
-
-    #[test]
-    fn test_collect_frags_missing_bitmap_covers_all() {
-        let schema = flat_test_schema();
-        let fragment = fragment_with_overlay(3, dense_overlay(vec![3], [1, 2], 9));
-        let overlaid: HashMap<u32, &Fragment> = HashMap::from([(3u32, &fragment)]);
-
-        let mut stale = RoaringBitmap::new();
-        collect_overlay_stale_frags(&segment(vec![3], 1, None), &overlaid, &mut stale, &schema)
-            .unwrap();
-        assert_eq!(stale, bitmap([3]), "missing bitmap must cover fragment 3");
-
-        let mut stale = RoaringBitmap::new();
-        collect_overlay_stale_frags(
-            &segment(vec![3], 1, Some(bitmap([0]))),
-            &overlaid,
-            &mut stale,
-            &schema,
-        )
-        .unwrap();
-        assert!(
-            stale.is_empty(),
-            "fragment absent from bitmap is not covered"
-        );
-
-        let mut stale = RoaringBitmap::new();
-        collect_overlay_stale_frags(
-            &segment(vec![3], 1, Some(bitmap([3]))),
-            &overlaid,
-            &mut stale,
-            &schema,
-        )
-        .unwrap();
-        assert_eq!(stale, bitmap([3]));
-    }
-
-    #[test]
-    fn test_collect_rows_missing_bitmap_covers_all() {
-        let schema = flat_test_schema();
-        // Same covers-all guarantee at row-level granularity.
-        let fragment = fragment_with_overlay(3, dense_overlay(vec![3], [1, 2], 9));
-        let overlaid: HashMap<u32, &Fragment> = HashMap::from([(3u32, &fragment)]);
-
-        let mut stale = HashMap::new();
-        collect_overlay_stale_rows_for_segment(
-            &segment(vec![3], 1, None),
-            &overlaid,
-            &mut stale,
-            &schema,
-        )
-        .unwrap();
-        assert_eq!(
-            stale.get(&3),
-            Some(&bitmap([1, 2])),
-            "missing bitmap must cover fragment 3"
-        );
-
-        // A present bitmap that excludes fragment 3 yields no stale rows.
-        let mut stale = HashMap::new();
-        collect_overlay_stale_rows_for_segment(
-            &segment(vec![3], 1, Some(bitmap([0]))),
-            &overlaid,
-            &mut stale,
-            &schema,
-        )
-        .unwrap();
-        assert!(
-            stale.is_empty(),
-            "fragment absent from bitmap contributes no rows"
-        );
-
-        // A present bitmap that includes fragment 3 contributes its stale rows.
-        let mut stale = HashMap::new();
-        collect_overlay_stale_rows_for_segment(
-            &segment(vec![3], 1, Some(bitmap([3]))),
-            &overlaid,
-            &mut stale,
-            &schema,
-        )
-        .unwrap();
-        assert_eq!(stale.get(&3), Some(&bitmap([1, 2])));
     }
 }

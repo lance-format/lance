@@ -8,15 +8,16 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
+use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::reader::{FileReader as CurrentFileReader, FileReaderOptions};
+use lance_file::LanceEncodingsIo;
+use lance_file::reader::{CachedFileMetadata, FileReader as CurrentFileReader, FileReaderOptions};
 use lance_file::version::ConcreteFileVersion;
-use lance_file::version::LanceFileVersion;
-use lance_file::versions;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
+use lance_file::versions::{self, OpenedFileReader};
 use lance_file::writer as current_writer;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
@@ -28,6 +29,39 @@ use std::cmp::min;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::{any::Any, sync::Arc};
+
+/// Cache key for the decoded metadata (footer, schema, column metadata) of an
+/// index file.
+///
+/// Index files are immutable and live under a per-index-uuid directory, so the
+/// full object path uniquely identifies the file contents and is safe to cache
+/// by. Caching the metadata lets repeated opens of the same file (for example a
+/// BTree page-cache miss, which re-opens the pages file) skip the tail read(s)
+/// against object storage entirely.
+#[derive(Debug)]
+struct IndexFileMetadataKey<'a> {
+    path: &'a Path,
+}
+
+impl CacheKey for IndexFileMetadataKey<'_> {
+    type ValueType = CachedFileMetadata;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        self.path.as_ref().into()
+    }
+
+    fn type_name() -> &'static str {
+        "IndexFileMetadata"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.lance-format.index-file-metadata-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_str(self.path.as_ref());
+    }
+}
 
 /// An index store that serializes scalar indices using the lance format
 ///
@@ -42,8 +76,10 @@ pub struct LanceIndexStore {
     scheduler: Arc<ScanScheduler>,
     /// Cached file sizes (filename -> size in bytes)
     /// When set, used to avoid HEAD calls when opening files
-    file_sizes: HashMap<String, u64>,
-    format_version: LanceFileVersion,
+    // Partition priority views share this immutable map. Cloning all file names
+    // for every partition would make request rebinding quadratic in partitions.
+    file_sizes: Arc<HashMap<String, u64>>,
+    format_version: ConcreteFileVersion,
     /// Base I/O priority for all requests this store submits to `scheduler`.
     io_priority: u64,
 }
@@ -70,7 +106,7 @@ impl LanceIndexStore {
             object_store,
             index_dir,
             metadata_cache,
-            LanceFileVersion::V2_0,
+            ConcreteFileVersion::V2_0,
         )
     }
 
@@ -79,7 +115,7 @@ impl LanceIndexStore {
         object_store: Arc<ObjectStore>,
         index_dir: Path,
         metadata_cache: Arc<LanceCache>,
-        format_version: LanceFileVersion,
+        format_version: ConcreteFileVersion,
     ) -> Self {
         let scheduler = ScanScheduler::new(
             object_store.clone(),
@@ -90,7 +126,7 @@ impl LanceIndexStore {
             index_dir,
             metadata_cache,
             scheduler,
-            file_sizes: HashMap::new(),
+            file_sizes: Arc::default(),
             format_version,
             io_priority: 0,
         }
@@ -101,7 +137,7 @@ impl LanceIndexStore {
     /// The map should contain relative paths (e.g., "index.idx") as keys
     /// and file sizes in bytes as values.
     pub fn with_file_sizes(mut self, file_sizes: HashMap<String, u64>) -> Self {
-        self.file_sizes = file_sizes;
+        self.file_sizes = Arc::new(file_sizes);
         self
     }
 
@@ -192,6 +228,39 @@ impl IndexReader for V1IndexReader {
         self.0.read_range(range, &projection).await
     }
 
+    /// V1 files are organised in row groups, so a "batch" is a row group and
+    /// `batch_size` is ignored; the row groups are read in order, `batch_readahead`
+    /// at a time.
+    async fn read_record_batch_stream(
+        self: Arc<Self>,
+        _batch_size: u64,
+        batch_readahead: u32,
+    ) -> Result<Pin<Box<dyn lance_io::stream::RecordBatchStream>>> {
+        let num_batches = self.0.num_batches() as i32;
+        let schema: Arc<Schema> = Arc::new(self.0.schema().into());
+        let stream = futures::stream::iter(0..num_batches)
+            .map(move |n| {
+                let reader = self.clone();
+                async move {
+                    reader
+                        .0
+                        .read_batch(n, ReadBatchParams::RangeFull, reader.0.schema())
+                        .await
+                }
+            })
+            .buffered(batch_readahead.max(1) as usize);
+        Ok(Box::pin(lance_io::stream::RecordBatchStreamAdapter::new(
+            schema, stream,
+        )))
+    }
+
+    fn guarantees_byte_splitting(&self) -> bool {
+        // A batch is exactly one row group, and the V1 format bounds the
+        // offsets inside a row group, so a batch never merges rows into one
+        // oversized offset array.
+        true
+    }
+
     async fn num_batches(&self, _batch_size: u64) -> u32 {
         self.0.num_batches() as u32
     }
@@ -208,13 +277,58 @@ impl IndexReader for V1IndexReader {
 /// Newtype wrapper to allow implementing IndexReader for CurrentFileReader (a foreign type)
 struct CurrentIndexReader(CurrentFileReader);
 
+impl CurrentIndexReader {
+    /// Row range covered by batch `offset`, clamped to the end of the file.
+    fn batch_bounds(&self, offset: u64, batch_size: u64) -> (usize, usize) {
+        let num_rows = self.0.num_rows();
+        let start = (offset * batch_size).min(num_rows);
+        let end = (start + batch_size).min(num_rows);
+        (start as usize, end as usize)
+    }
+}
+
 #[async_trait]
 impl IndexReader for CurrentIndexReader {
     async fn read_record_batch(&self, offset: u64, batch_size: u64) -> Result<RecordBatch> {
-        let start = offset * batch_size;
-        let end = start + batch_size;
-        let end = end.min(self.0.num_rows());
-        self.read_range(start as usize..end as usize, None).await
+        let (start, end) = self.batch_bounds(offset, batch_size);
+        self.read_range(start..end, None).await
+    }
+
+    /// Fold every requested batch into one [`Self::read_ranges`] call.
+    ///
+    /// Batch N occupies rows `[N * batch_size, (N + 1) * batch_size)`, so a set
+    /// of batch numbers maps directly onto a set of row ranges, and `read_ranges`
+    /// already merges adjacent and nearby ranges into shared requests.  A range
+    /// query that touches thousands of consecutive batches therefore becomes a
+    /// handful of large reads rather than one request per batch.
+    async fn read_record_batches(
+        &self,
+        batch_numbers: &[u64],
+        batch_size: u64,
+    ) -> Result<Vec<RecordBatch>> {
+        if batch_numbers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ranges = batch_numbers
+            .iter()
+            .map(|n| {
+                let (start, end) = self.batch_bounds(*n, batch_size);
+                start..end
+            })
+            .collect::<Vec<_>>();
+        let merged = self.read_ranges(&ranges, None).await?;
+        // `read_ranges` returns the rows in the order the ranges were given, so
+        // the batches come back out as consecutive slices of the merged batch.
+        let mut offset = 0;
+        Ok(ranges
+            .iter()
+            .map(|range| {
+                let len = range.end - range.start;
+                let batch = merged.slice(offset, len);
+                offset += len;
+                batch
+            })
+            .collect())
     }
 
     async fn read_global_buffer(&self, n: u32) -> Result<Bytes> {
@@ -346,6 +460,8 @@ impl IndexReader for CurrentIndexReader {
         &self,
         range: std::ops::Range<usize>,
         projection: Option<&[&str]>,
+        batch_size: u64,
+        batch_readahead: u32,
     ) -> Result<Pin<Box<dyn lance_io::stream::RecordBatchStream>>> {
         if range.is_empty() {
             return Ok(Box::pin(lance_io::stream::RecordBatchStreamAdapter::new(
@@ -365,15 +481,38 @@ impl IndexReader for CurrentIndexReader {
                 self.0.metadata().version(),
             )
         };
+        // The v2 decoder emits exactly `batch_size` rows per batch for a range read
+        // (only the final batch is shorter), so the stream is page-aligned with
+        // `read_record_batch` when the range starts on a page boundary.
+        let batch_size = u32::try_from(batch_size.max(1)).unwrap_or(u32::MAX);
         self.0
             .read_stream_projected(
                 ReadBatchParams::Range(range),
-                4096,
-                2,
+                batch_size,
+                batch_readahead.max(1),
                 projection,
                 FilterExpression::no_filter(),
             )
             .await
+    }
+
+    /// One sequential read of the whole file, chunked into `batch_size` rows so
+    /// batch `n` of the stream equals `read_record_batch(n, batch_size)`.
+    async fn read_record_batch_stream(
+        self: Arc<Self>,
+        batch_size: u64,
+        batch_readahead: u32,
+    ) -> Result<Pin<Box<dyn lance_io::stream::RecordBatchStream>>> {
+        let num_rows = CurrentFileReader::num_rows(&self.0) as usize;
+        self.read_range_stream(0..num_rows, None, batch_size, batch_readahead)
+            .await
+    }
+
+    fn guarantees_byte_splitting(&self) -> bool {
+        // The V2.0 decoder splits a batch before its i32 offsets overflow
+        // (#9225). The V2.1+ structural decoder drains by row count alone, so
+        // a multi-row batch of huge rows can overflow inside one batch.
+        self.0.metadata().version() == ConcreteFileVersion::V2_0
     }
 
     // V2 format has removed the row group concept,
@@ -407,6 +546,13 @@ impl IndexStore for LanceIndexStore {
         Arc::new(self.clone())
     }
 
+    fn is_same_storage_binding(&self, other: &dyn IndexStore) -> bool {
+        other.as_any().downcast_ref::<Self>().is_some_and(|other| {
+            Arc::ptr_eq(&self.object_store, &other.object_store)
+                && self.index_dir == other.index_dir
+        })
+    }
+
     fn io_parallelism(&self) -> usize {
         self.object_store.io_parallelism()
     }
@@ -420,7 +566,7 @@ impl IndexStore for LanceIndexStore {
         let schema = schema.as_ref().try_into()?;
         let writer = self.object_store.create(&path).await?;
         let writer = versions::create_writer(
-            ConcreteFileVersion::from(self.format_version),
+            self.format_version,
             writer,
             schema,
             current_writer::FileWriterOptions::default(),
@@ -440,6 +586,21 @@ impl IndexStore for LanceIndexStore {
         })
     }
 
+    fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+        // Unlike `with_io_priority`, this cannot share `scheduler`: the budget belongs to the
+        // scheduler. The object store underneath is still shared.
+        Arc::new(Self {
+            scheduler: ScanScheduler::new(
+                self.object_store.clone(),
+                SchedulerConfig {
+                    io_buffer_size_bytes: bytes,
+                    ..SchedulerConfig::max_bandwidth(&self.object_store)
+                },
+            ),
+            ..self.clone()
+        })
+    }
+
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
         let path = self.index_file_path(name)?;
         // Use cached file size if available, otherwise unknown (requires HEAD call)
@@ -452,30 +613,53 @@ impl IndexStore for LanceIndexStore {
             .scheduler
             .open_file_with_priority(&path, self.io_priority, &cached_size)
             .await?;
-        match CurrentFileReader::try_open(
+        let options = FileReaderOptions::default();
+        let metadata_key = IndexFileMetadataKey { path: &path };
+
+        // Fast path: the file's metadata was decoded by an earlier open of this
+        // same (immutable) file. Build the reader from it directly so that no
+        // footer/schema/column-metadata bytes are fetched again.
+        if let Some(metadata) = self.metadata_cache.get_with_key(&metadata_key).await {
+            let io = Arc::new(
+                LanceEncodingsIo::new(file_scheduler).with_read_chunk_size(options.read_chunk_size),
+            );
+            let reader = CurrentFileReader::try_open_with_file_metadata(
+                io,
+                path,
+                None,
+                Arc::<DecoderPlugins>::default(),
+                metadata,
+                &self.metadata_cache,
+                options,
+            )
+            .await?;
+            return Ok(Arc::new(CurrentIndexReader(reader)));
+        }
+
+        match versions::open_self_described_reader(
             file_scheduler,
-            None,
             Arc::<DecoderPlugins>::default(),
             &self.metadata_cache,
-            FileReaderOptions::default(),
+            options,
         )
-        .await
+        .await?
         {
-            Ok(reader) => Ok(Arc::new(CurrentIndexReader(reader))),
-            Err(e) => {
-                // If the error is a version conflict we can try to read the file with v1 reader
-                if let Error::VersionConflict { .. } = e {
-                    let path = self.index_file_path(name)?;
-                    let file_reader = V1FileReader::try_new_self_described(
-                        &self.object_store,
-                        &path,
-                        Some(&self.metadata_cache),
-                    )
-                    .await?;
-                    Ok(Arc::new(V1IndexReader(file_reader)))
-                } else {
-                    Err(e)
-                }
+            OpenedFileReader::V1 { .. } => {
+                // Legacy files are not cached; they are opened through the v1
+                // reader which has its own (manifest-based) metadata handling.
+                let reader = V1FileReader::try_new_self_described(
+                    &self.object_store,
+                    &path,
+                    Some(&self.metadata_cache),
+                )
+                .await?;
+                Ok(Arc::new(V1IndexReader(reader)))
+            }
+            OpenedFileReader::Current(reader) => {
+                self.metadata_cache
+                    .insert_with_key(&metadata_key, reader.metadata().clone())
+                    .await;
+                Ok(Arc::new(CurrentIndexReader(reader)))
             }
         }
     }
@@ -492,21 +676,16 @@ impl IndexStore for LanceIndexStore {
     ) -> Result<IndexFile> {
         let path = self.index_file_path(name)?;
 
-        let other_store = dest_store.as_any().downcast_ref::<Self>();
-        match other_store {
-            Some(dest_store) if dest_store.object_store.scheme() == self.object_store.scheme() => {
-                // If both this store and the destination are lance stores we can use object_store's copy
-                // This does blindly assume that both stores are using the same underlying object_store
-                // but there is no easy way to verify this and it happens to always be true at the moment
+        match dest_store.as_any().downcast_ref::<Self>() {
+            Some(dest_store) => {
                 let dest_path = dest_store.index_file_path(new_name)?;
-                self.object_store.copy(&path, &dest_path).await?;
-                let size_bytes = match self.file_sizes.get(name) {
-                    Some(size_bytes) => *size_bytes,
-                    None => self.object_store.size(&path).await?,
-                };
+                let result = self
+                    .object_store
+                    .copy_bulk(&path, &dest_store.object_store, &dest_path)
+                    .await?;
                 Ok(IndexFile {
                     path: new_name.to_string(),
-                    size_bytes,
+                    size_bytes: result.size as u64,
                 })
             }
             _ => {
@@ -528,15 +707,14 @@ impl IndexStore for LanceIndexStore {
     async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<IndexFile> {
         let path = self.index_file_path(name)?;
         let new_path = self.index_file_path(new_name)?;
-        self.object_store.copy(&path, &new_path).await?;
+        let result = self
+            .object_store
+            .copy_bulk(&path, &self.object_store, &new_path)
+            .await?;
         self.object_store.delete(&path).await?;
-        let size_bytes = match self.file_sizes.get(name) {
-            Some(size_bytes) => *size_bytes,
-            None => self.object_store.size(&new_path).await?,
-        };
         Ok(IndexFile {
             path: new_name.to_string(),
-            size_bytes,
+            size_bytes: result.size as u64,
         })
     }
 
@@ -577,17 +755,17 @@ mod tests {
     use super::*;
     use arrow::{buffer::ScalarBuffer, datatypes::UInt8Type};
     use arrow_array::{
-        ListArray, RecordBatchIterator, RecordBatchReader, StringArray, UInt64Array,
+        Int32Array, ListArray, RecordBatchIterator, RecordBatchReader, StringArray, UInt64Array,
         cast::AsArray,
         types::{Int32Type, UInt64Type},
     };
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field, TimeUnit};
     use arrow_select::take::TakeOptions;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::FutureExt;
-    use lance_core::ROW_ID;
+    use lance_core::ROW_ADDR;
     use lance_core::utils::row_addr_remap::RowAddrRemap;
     use lance_core::utils::tempfile::TempDir;
     use lance_datagen::{ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_batch};
@@ -654,6 +832,172 @@ mod tests {
         );
     }
 
+    /// Build a concrete store over `tempdir` so tests can reach the object store's
+    /// IO counters and the store's scheduler.
+    fn concrete_test_store(tempdir: &TempDir) -> (Arc<ObjectStore>, LanceIndexStore) {
+        let test_path = tempdir.obj_path();
+        let (object_store, test_path) = ObjectStore::from_uri(test_path.as_ref())
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        let cache = Arc::new(lance_core::cache::LanceCache::with_capacity(
+            128 * 1024 * 1024,
+        ));
+        let store = LanceIndexStore::new(object_store.clone(), test_path, cache);
+        (object_store, store)
+    }
+
+    async fn write_int_index_file(store: &dyn IndexStore, name: &str) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "values",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..1000))],
+        )
+        .unwrap();
+        let mut writer = store.new_index_file(name, schema).await.unwrap();
+        writer.write_record_batch(batch.clone()).await.unwrap();
+        writer.finish().await.unwrap();
+        batch
+    }
+
+    #[tokio::test]
+    async fn test_open_index_file_reuses_cached_metadata() {
+        const FILE_NAME: &str = "pages.lance";
+        let tempdir = TempDir::default();
+        let (object_store, store) = concrete_test_store(&tempdir);
+        let expected = write_int_index_file(&store, FILE_NAME).await;
+
+        // Provide the file size (as the manifest does in production) so that no
+        // HEAD request is needed and the only I/O left is the metadata read.
+        let file_sizes = store
+            .list_files_with_sizes()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.path, f.size_bytes))
+            .collect::<HashMap<_, _>>();
+        let store = store.with_file_sizes(file_sizes);
+
+        // Cold open: the footer/schema/column metadata must be read from storage.
+        let _ = object_store.io_stats_incremental();
+        let sched_before = store.scheduler.stats();
+        let first = store.open_index_file(FILE_NAME).await.unwrap();
+        let cold_stats = object_store.io_stats_incremental();
+        let sched_after = store.scheduler.stats();
+        assert!(
+            cold_stats.read_iops > 0,
+            "cold open should read the file tail, got {:?}",
+            cold_stats
+        );
+        assert!(sched_after.iops > sched_before.iops);
+        assert_eq!(first.num_rows(), 1000);
+
+        // Warm open through the same store: the cached metadata must be reused
+        // and no bytes fetched at all.
+        let sched_before = store.scheduler.stats();
+        let second = store.open_index_file(FILE_NAME).await.unwrap();
+        let warm_stats = object_store.io_stats_incremental();
+        let sched_after = store.scheduler.stats();
+        assert_eq!(
+            warm_stats.read_iops, 0,
+            "warm open must not issue reads, got {:?}",
+            warm_stats
+        );
+        assert_eq!(warm_stats.read_bytes, 0);
+        assert_eq!(sched_after.iops, sched_before.iops);
+        assert_eq!(sched_after.bytes_read, sched_before.bytes_read);
+
+        // The reader built from cached metadata still describes and reads the
+        // file correctly.
+        assert_eq!(second.num_rows(), 1000);
+        assert_eq!(
+            &ArrowSchema::from(second.schema()),
+            expected.schema().as_ref()
+        );
+        let batch = second.read_range(0..1000, None).await.unwrap();
+        assert_eq!(batch, expected);
+        let batch = second.read_range(10..20, Some(&["values"])).await.unwrap();
+        assert_eq!(batch, expected.slice(10, 10));
+        let batch = second.read_record_batch(0, 1000).await.unwrap();
+        assert_eq!(batch, expected);
+
+        // Priority views are cheap clones sharing the same cache, so they must
+        // also open without I/O.
+        let prioritized = store.with_io_priority(7);
+        let _ = object_store.io_stats_incremental();
+        let third = prioritized.open_index_file(FILE_NAME).await.unwrap();
+        let prio_stats = object_store.io_stats_incremental();
+        assert_eq!(
+            prio_stats.read_iops, 0,
+            "priority clone must share the metadata cache, got {:?}",
+            prio_stats
+        );
+        assert_eq!(third.num_rows(), 1000);
+
+        // A store with a fresh cache over the same directory has to read the
+        // metadata again, proving the savings come from the cache.
+        let (object_store2, store2) = concrete_test_store(&tempdir);
+        let _ = object_store2.io_stats_incremental();
+        let fresh = store2.open_index_file(FILE_NAME).await.unwrap();
+        let fresh_stats = object_store2.io_stats_incremental();
+        assert!(fresh_stats.read_iops > 0, "got {:?}", fresh_stats);
+        assert_eq!(fresh.num_rows(), 1000);
+    }
+
+    #[tokio::test]
+    async fn test_index_file_metadata_cache_is_keyed_by_full_path() {
+        // Two different files in the same store must not share cached metadata.
+        let tempdir = TempDir::default();
+        let (object_store, store) = concrete_test_store(&tempdir);
+        let _small = write_int_index_file(&store, "a.lance").await;
+
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "other",
+            DataType::Utf8,
+            false,
+        )]));
+        let big = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from_iter_values(
+                (0..5).map(|i| format!("row-{i}")),
+            ))],
+        )
+        .unwrap();
+        let mut writer = store.new_index_file("b.lance", schema).await.unwrap();
+        writer.write_record_batch(big.clone()).await.unwrap();
+        writer.finish().await.unwrap();
+        let file_sizes = store
+            .list_files_with_sizes()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.path, f.size_bytes))
+            .collect::<HashMap<_, _>>();
+        let store = store.with_file_sizes(file_sizes);
+
+        // Warm the cache with a.lance, then open b.lance: it must be read from
+        // storage and describe b's schema, not a's.
+        store.open_index_file("a.lance").await.unwrap();
+        let _ = object_store.io_stats_incremental();
+        let b = store.open_index_file("b.lance").await.unwrap();
+        let stats = object_store.io_stats_incremental();
+        assert!(stats.read_iops > 0, "got {:?}", stats);
+        assert_eq!(b.num_rows(), 5);
+        assert_eq!(&ArrowSchema::from(b.schema()), big.schema().as_ref());
+        assert_eq!(b.read_range(0..5, None).await.unwrap(), big);
+
+        // And now b is cached too.
+        let _ = object_store.io_stats_incremental();
+        let b2 = store.open_index_file("b.lance").await.unwrap();
+        let stats = object_store.io_stats_incremental();
+        assert_eq!(stats.read_iops, 0, "got {:?}", stats);
+        assert_eq!(b2.read_range(0..5, None).await.unwrap(), big);
+    }
+
     async fn train_index(
         index_store: &Arc<dyn IndexStore>,
         data: impl RecordBatchReader + Send + Sync + 'static,
@@ -666,7 +1010,7 @@ mod tests {
         };
         let params = serde_json::to_string(&params).unwrap();
         let btree_plugin = BTreeIndexPlugin;
-        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        let data = lance_datafusion_exec::utils::reader_to_stream(Box::new(data));
         let request = btree_plugin
             .new_training_request(
                 &params,
@@ -722,13 +1066,14 @@ mod tests {
         let index_store = test_store(&tempdir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_index(&index_store, data, None).await;
         let index = BTreeIndexPlugin
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                crate::scalar::btree::BTREE_INDEX_VERSION,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -787,13 +1132,14 @@ mod tests {
         let index_store = test_store(&index_dir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_index(&index_store, data, None).await;
         let index = BTreeIndexPlugin
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                crate::scalar::btree::BTREE_INDEX_VERSION,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -805,14 +1151,14 @@ mod tests {
                 VALUE_COLUMN_NAME,
                 array::step_custom::<Int32Type>(4096 * 100, 1),
             )
-            .col(ROW_ID, array::step_custom::<UInt64Type>(4096 * 100, 1))
+            .col(ROW_ADDR, array::step_custom::<UInt64Type>(4096 * 100, 1))
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
 
         let updated_index_dir = TempDir::default();
         let updated_index_store = test_store(&updated_index_dir);
         index
             .update(
-                lance_datafusion::utils::reader_to_stream(Box::new(data)),
+                lance_datafusion_exec::utils::reader_to_stream(Box::new(data)),
                 updated_index_store.as_ref(),
                 None,
             )
@@ -822,6 +1168,7 @@ mod tests {
             .load_index(
                 updated_index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                crate::scalar::btree::BTREE_INDEX_VERSION,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -873,21 +1220,24 @@ mod tests {
                 VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![0, 1, 4, 5]),
             )
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
+            .col(ROW_ADDR, array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
             .into_batch_rows(RowCount::from(4));
         let batch_two = gen_batch()
             .col(
                 VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![10, 11, 11, 15]),
             )
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
+            .col(ROW_ADDR, array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
             .into_batch_rows(RowCount::from(4));
         let batch_three = gen_batch()
             .col(
                 VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![15, 15, 15, 15]),
             )
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![400, 500, 600, 700]))
+            .col(
+                ROW_ADDR,
+                array::cycle::<UInt64Type>(vec![400, 500, 600, 700]),
+            )
             .into_batch_rows(RowCount::from(4));
         let batch_four = gen_batch()
             .col(
@@ -895,14 +1245,14 @@ mod tests {
                 array::cycle::<Int32Type>(vec![15, 16, 20, 20]),
             )
             .col(
-                ROW_ID,
+                ROW_ADDR,
                 array::cycle::<UInt64Type>(vec![4000, 5000, 6000, 7000]),
             )
             .into_batch_rows(RowCount::from(4));
         let batches = vec![batch_one, batch_two, batch_three, batch_four];
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
         train_index(&index_store, data, Some(4)).await;
@@ -910,6 +1260,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                crate::scalar::btree::BTREE_INDEX_VERSION,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1091,89 +1442,87 @@ mod tests {
         .await;
     }
 
+    #[rstest::rstest]
+    #[case::boolean(DataType::Boolean)]
+    #[case::int32(DataType::Int32)]
+    #[case::utf8(DataType::Utf8)]
+    #[case::float32(DataType::Float32)]
+    #[case::date32(DataType::Date32)]
+    #[case::timestamp(DataType::Timestamp(TimeUnit::Nanosecond, None))]
+    #[case::date64(DataType::Date64)]
+    #[case::time64(DataType::Time64(TimeUnit::Nanosecond))]
+    #[case::time32(DataType::Time32(TimeUnit::Second))]
+    #[case::fixed_size_binary(DataType::FixedSizeBinary(16))]
+    #[case::duration_second(DataType::Duration(TimeUnit::Second))]
+    #[case::duration_millisecond(DataType::Duration(TimeUnit::Millisecond))]
+    #[case::duration_microsecond(DataType::Duration(TimeUnit::Microsecond))]
+    #[case::duration_nanosecond(DataType::Duration(TimeUnit::Nanosecond))]
     #[tokio::test]
-    async fn test_btree_types() {
-        for data_type in &[
-            DataType::Boolean,
-            DataType::Int32,
-            DataType::Utf8,
-            DataType::Float32,
-            DataType::Date32,
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            DataType::Date64,
-            DataType::Date32,
-            DataType::Time64(TimeUnit::Nanosecond),
-            DataType::Time32(TimeUnit::Second),
-            DataType::FixedSizeBinary(16),
-            // Not supported today, error from datafusion:
-            // Min/max accumulator not implemented for Duration(Nanosecond)
-            // DataType::Duration(TimeUnit::Nanosecond),
-        ] {
-            let tempdir = TempDir::default();
-            let index_store = test_store(&tempdir);
-            let data: RecordBatch = gen_batch()
-                .col(VALUE_COLUMN_NAME, array::rand_type(data_type))
-                .col(ROW_ID, array::step::<UInt64Type>())
-                .into_batch_rows(RowCount::from(4096 * 3))
-                .unwrap();
-
-            let sample_value = ScalarValue::try_from_array(data.column(0), 0).unwrap();
-            let sample_row_id = data.column(1).as_primitive::<UInt64Type>().value(0);
-
-            let sort_indices = arrow::compute::sort_to_indices(data.column(0), None, None).unwrap();
-            let sorted_values = arrow_select::take::take(
-                data.column(0),
-                &sort_indices,
-                Some(TakeOptions {
-                    check_bounds: false,
-                }),
-            )
+    async fn test_btree_types(#[case] data_type: DataType) {
+        let tempdir = TempDir::default();
+        let index_store = test_store(&tempdir);
+        let data: RecordBatch = gen_batch()
+            .col(VALUE_COLUMN_NAME, array::rand_type(&data_type))
+            .col(ROW_ADDR, array::step::<UInt64Type>())
+            .into_batch_rows(RowCount::from(4096 * 3))
             .unwrap();
-            let sorted_row_ids = arrow_select::take::take(
-                data.column(1),
-                &sort_indices,
-                Some(TakeOptions {
-                    check_bounds: false,
-                }),
+
+        let sample_value = ScalarValue::try_from_array(data.column(0), 0).unwrap();
+        let sample_row_id = data.column(1).as_primitive::<UInt64Type>().value(0);
+
+        let sort_indices = arrow::compute::sort_to_indices(data.column(0), None, None).unwrap();
+        let sorted_values = arrow_select::take::take(
+            data.column(0),
+            &sort_indices,
+            Some(TakeOptions {
+                check_bounds: false,
+            }),
+        )
+        .unwrap();
+        let sorted_row_ids = arrow_select::take::take(
+            data.column(1),
+            &sort_indices,
+            Some(TakeOptions {
+                check_bounds: false,
+            }),
+        )
+        .unwrap();
+        let sorted_batch =
+            RecordBatch::try_new(data.schema(), vec![sorted_values, sorted_row_ids]).unwrap();
+
+        let batch_one = sorted_batch.slice(0, 4096);
+        let batch_two = sorted_batch.slice(4096, 4096);
+        let batch_three = sorted_batch.slice(8192, 4096);
+        let training_data = RecordBatchIterator::new(
+            vec![batch_one, batch_two, batch_three].into_iter().map(Ok),
+            data.schema(),
+        );
+
+        train_index(&index_store, training_data, None).await;
+        let index = BTreeIndexPlugin
+            .load_index(
+                index_store,
+                &default_details::<pbold::BTreeIndexDetails>(),
+                crate::scalar::btree::BTREE_INDEX_VERSION,
+                None,
+                &LanceCache::no_cache(),
             )
+            .await
             .unwrap();
-            let sorted_batch =
-                RecordBatch::try_new(data.schema().clone(), vec![sorted_values, sorted_row_ids])
-                    .unwrap();
 
-            let batch_one = sorted_batch.slice(0, 4096);
-            let batch_two = sorted_batch.slice(4096, 4096);
-            let batch_three = sorted_batch.slice(8192, 4096);
-            let training_data = RecordBatchIterator::new(
-                vec![batch_one, batch_two, batch_three].into_iter().map(Ok),
-                data.schema().clone(),
-            );
+        let result = index
+            .search(&SargableQuery::Equals(sample_value), &NoOpMetricsCollector)
+            .await
+            .unwrap();
 
-            train_index(&index_store, training_data, None).await;
-            let index = BTreeIndexPlugin
-                .load_index(
-                    index_store,
-                    &default_details::<pbold::BTreeIndexDetails>(),
-                    None,
-                    &LanceCache::no_cache(),
-                )
-                .await
-                .unwrap();
+        assert!(result.is_exact());
+        let row_addrs = result.row_addrs().true_rows();
 
-            let result = index
-                .search(&SargableQuery::Equals(sample_value), &NoOpMetricsCollector)
-                .await
-                .unwrap();
-
-            assert!(result.is_exact());
-            let row_addrs = result.row_addrs().true_rows();
-
-            // The random data may have had duplicates so there might be more than 1 result
-            // but even for boolean we shouldn't match the entire thing
-            assert!(!row_addrs.is_empty());
-            assert!(row_addrs.len().unwrap() < data.num_rows() as u64);
-            assert!(row_addrs.contains(sample_row_id));
-        }
+        // The random data may have had duplicates so there might be more than 1 result
+        // but even for boolean we shouldn't match the entire thing
+        assert!(!row_addrs.is_empty());
+        assert!(row_addrs.len().unwrap() < data.num_rows() as u64);
+        assert!(row_addrs.contains(sample_row_id));
     }
 
     #[tokio::test]
@@ -1185,7 +1534,7 @@ mod tests {
                 VALUE_COLUMN_NAME,
                 array::rand_utf8(ByteCount::from(0), false).with_nulls(&[true]),
             )
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_batch_rows(RowCount::from(4096));
         assert_eq!(
             batch.as_ref().unwrap()[VALUE_COLUMN_NAME].null_count(),
@@ -1194,10 +1543,10 @@ mod tests {
         let batches = vec![batch];
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
-        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        let data = lance_datafusion_exec::utils::reader_to_stream(Box::new(data));
 
         train_btree_index(
             data,
@@ -1213,6 +1562,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::BTreeIndexDetails>(),
+                crate::scalar::btree::BTREE_INDEX_VERSION,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1292,7 +1642,7 @@ mod tests {
 
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
 
         let batch1 = RecordBatch::try_new(
@@ -1321,7 +1671,7 @@ mod tests {
         let data = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
         train_bitmap(&index_store, data).await;
 
-        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -1360,10 +1710,10 @@ mod tests {
         let index_store = test_store(&tempdir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -1427,21 +1777,24 @@ mod tests {
                 VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![0, 1, 4, 5]),
             )
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
+            .col(ROW_ADDR, array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
             .into_batch_rows(RowCount::from(4));
         let batch_two = gen_batch()
             .col(
                 VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![10, 11, 11, 15]),
             )
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
+            .col(ROW_ADDR, array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
             .into_batch_rows(RowCount::from(4));
         let batch_three = gen_batch()
             .col(
                 VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![15, 15, 15, 15]),
             )
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![400, 500, 600, 700]))
+            .col(
+                ROW_ADDR,
+                array::cycle::<UInt64Type>(vec![400, 500, 600, 700]),
+            )
             .into_batch_rows(RowCount::from(4));
         let batch_four = gen_batch()
             .col(
@@ -1449,18 +1802,18 @@ mod tests {
                 array::cycle::<Int32Type>(vec![15, 16, 20, 20]),
             )
             .col(
-                ROW_ID,
+                ROW_ADDR,
                 array::cycle::<UInt64Type>(vec![4000, 5000, 6000, 7000]),
             )
             .into_batch_rows(RowCount::from(4));
         let batches = vec![batch_one, batch_two, batch_three, batch_four];
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -1645,31 +1998,32 @@ mod tests {
         let index_store = test_store(&index_dir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step_custom::<Int32Type>(4096, 1))
-            .col(ROW_ID, array::step_custom::<UInt64Type>(4096, 1))
+            .col(ROW_ADDR, array::step_custom::<UInt64Type>(4096, 1))
             .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
 
         let updated_index_dir = TempDir::default();
         let updated_index_store = test_store(&updated_index_dir);
         index
             .update(
-                lance_datafusion::utils::reader_to_stream(Box::new(data)),
+                lance_datafusion_exec::utils::reader_to_stream(Box::new(data)),
                 updated_index_store.as_ref(),
                 None,
             )
             .await
             .unwrap();
-        let updated_index = BitmapIndex::load(updated_index_store, None, &LanceCache::no_cache())
-            .await
-            .unwrap();
+        let updated_index =
+            BitmapIndex::load(updated_index_store, None, &LanceCache::no_cache(), true)
+                .await
+                .unwrap();
 
         let result = updated_index
             .search(
@@ -1691,10 +2045,10 @@ mod tests {
         let index_store = test_store(&index_dir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(50), BatchCount::from(1));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -1717,7 +2071,7 @@ mod tests {
             .remap(&RowAddrRemap::direct(mapping), remapped_store.as_ref())
             .await
             .unwrap();
-        let remapped_index = BitmapIndex::load(remapped_store, None, &LanceCache::no_cache())
+        let remapped_index = BitmapIndex::load(remapped_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -1763,7 +2117,7 @@ mod tests {
         index_store: &Arc<dyn IndexStore>,
         data: impl RecordBatchReader + Send + Sync + 'static,
     ) {
-        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        let data = lance_datafusion_exec::utils::reader_to_stream(Box::new(data));
         let request = LabelListIndexPlugin
             .new_training_request(
                 "{}",
@@ -1799,7 +2153,7 @@ mod tests {
                     false,
                 )))),
             )
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_batch_rows(RowCount::from(40960))
             .unwrap();
 
@@ -1820,6 +2174,7 @@ mod tests {
                     .load_index(
                         index_store,
                         &default_details::<pbold::LabelListIndexDetails>(),
+                        0,
                         None,
                         &LanceCache::no_cache(),
                     )
@@ -1914,7 +2269,7 @@ mod tests {
                 DataType::List(Arc::new(Field::new("item", DataType::UInt8, true))),
                 true,
             ),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -1929,6 +2284,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::LabelListIndexDetails>(),
+                0,
                 None,
                 &LanceCache::no_cache(),
             )
@@ -1975,13 +2331,13 @@ mod tests {
         let row_ids = UInt64Array::from(vec![0, 2]);
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::UInt8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values), Arc::new(row_ids)])
             .unwrap();
 
         BitmapIndexPlugin::train_bitmap_index(
-            lance_datafusion::utils::reader_to_stream(Box::new(RecordBatchIterator::new(
+            lance_datafusion_exec::utils::reader_to_stream(Box::new(RecordBatchIterator::new(
                 vec![Ok(batch)],
                 schema,
             ))),
@@ -1994,6 +2350,7 @@ mod tests {
             .load_index(
                 index_store,
                 &default_details::<pbold::LabelListIndexDetails>(),
+                0,
                 None,
                 &LanceCache::no_cache(),
             )

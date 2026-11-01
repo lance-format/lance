@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::{Error, Result, datatypes::Field};
+use lance_encoding::compression::PerValueGeneralCompression;
 use lance_encoding::{
     compression::{
         BlockCompressor, CompressionStrategy, field_metadata_params, finalize_miniblock_compressor,
@@ -14,7 +15,6 @@ use lance_encoding::{
     compression_config::{CompressionFieldParams, CompressionParams},
     data::DataBlock,
     encodings::logical::primitive::{fullzip::PerValueCompressor, miniblock::MiniBlockCompressor},
-    format::pb21::CompressiveEncoding,
 };
 
 #[derive(Debug, Clone)]
@@ -95,7 +95,12 @@ impl CompressionStrategy for Strategy {
         if let Some(compressor) = reject_packed_struct_per_value(field, data)? {
             return Ok(compressor);
         }
-        if let Some(compressor) = try_variable_width_per_value(field, data, &params)? {
+        if let Some(compressor) = try_variable_width_per_value(
+            field,
+            data,
+            &params,
+            PerValueGeneralCompression::ZstdOnly,
+        )? {
             return Ok(compressor);
         }
         Err(Error::not_supported_source(
@@ -111,7 +116,7 @@ impl CompressionStrategy for Strategy {
         &self,
         field: &Field,
         data: &DataBlock,
-    ) -> Result<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
+    ) -> Result<Box<dyn BlockCompressor>> {
         let _params = self.field_params(field);
         if let Some(compressor) = try_bitpacking_block(data) {
             return Ok(compressor);

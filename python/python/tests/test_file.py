@@ -40,6 +40,26 @@ def test_write_no_schema(tmp_path):
     assert reader.read_all().to_table() == pa.table({"a": [1, 2, 3]})
 
 
+def test_write_arrow_json_no_schema(tmp_path):
+    path = tmp_path / "foo.lance"
+    json_type = pa.json_()
+    json_values = pa.ExtensionArray.from_storage(
+        json_type, pa.array(['{"a":1}', '{"b":2}'], pa.string())
+    )
+    table = pa.table({"json": json_values})
+
+    with LanceFileWriter(str(path), version="2.1") as writer:
+        writer.write_batch(table)
+
+    reader = LanceFileReader(str(path))
+    result = reader.read_all().to_table()
+    assert result.num_rows == table.num_rows
+    assert result.schema.field("json").type == pa.large_binary()
+    assert (
+        result.schema.field("json").metadata[b"ARROW:extension:name"] == b"lance.json"
+    )
+
+
 def test_no_schema_no_data(tmp_path):
     path = tmp_path / "foo.lance"
     with pytest.raises(
@@ -482,18 +502,27 @@ def test_write_read_additional_schema_metadata(tmp_path):
 
 
 def test_writer_maintains_order(tmp_path):
-    # 100Ki strings, each string is a couple of KiBs
-    big_strings = [f"{i}" * 1024 for i in range(100 * 1024)]
-    table = pa.table({"big_strings": big_strings})
+    row_ids = list(range(8))
+    payloads = ["0123456789abcdef" * (64 * 1024)] + [
+        f"page-{row_id}" for row_id in row_ids[1:]
+    ]
+    table = pa.table({"payload": payloads, "row_id": row_ids})
+    path = tmp_path / "ordered-pages.lance"
 
-    for i in range(4):
-        path = tmp_path / f"foo-{i}.lance"
-        with LanceFileWriter(str(path)) as writer:
-            writer.write_batch(table)
+    # Before #2836, the seven cheap pages could finish encoding before the
+    # expensive first page and be written out of order.
+    with LanceFileWriter(
+        str(path),
+        table.schema,
+        version="2.0",
+        data_cache_bytes=1,
+        max_page_bytes=64 * 1024,
+    ) as writer:
+        writer.write_batch(table)
 
-        reader = LanceFileReader(str(path))
-        result = reader.read_all().to_table()
-        assert result == table
+    reader = LanceFileReader(str(path))
+    assert [len(column.pages) for column in reader.metadata().columns] == [8, 1]
+    assert reader.read_all().to_table() == table
 
 
 def test_compression(tmp_path):

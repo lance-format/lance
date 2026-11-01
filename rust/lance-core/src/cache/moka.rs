@@ -48,8 +48,8 @@ fn entry_weight(key: &InternalCacheKey, size_bytes: usize, weight_unit: usize) -
 
 /// Default [`CacheBackend`] backed by a [moka](https://crates.io/crates/moka) cache.
 ///
-/// Provides weighted-capacity eviction and concurrent-load deduplication
-/// via moka's built-in `optionally_get_with`.
+/// Nonzero capacities provide weighted eviction and concurrent-load deduplication.
+/// A zero capacity invokes each loader independently without caching.
 pub struct MokaCacheBackend {
     cache: moka::future::Cache<InternalCacheKey, MokaCacheEntry>,
     capacity: usize,
@@ -105,6 +105,16 @@ impl MokaCacheBackend {
 
 #[async_trait]
 impl CacheBackend for MokaCacheBackend {
+    async fn get_resident(&self, key: &InternalCacheKey) -> Option<CacheEntry> {
+        self.cache.get(key).await.map(|r| r.entry)
+    }
+
+    /// Moka does not count `contains_key` as a read: the entry's popularity
+    /// estimate and recency order stay unchanged.
+    async fn peek_resident(&self, key: &InternalCacheKey) -> bool {
+        self.cache.contains_key(key)
+    }
+
     async fn get(&self, key: &InternalCacheKey, _codec: Option<CacheCodec>) -> Option<CacheEntry> {
         self.cache.get(key).await.map(|r| r.entry)
     }
@@ -127,6 +137,11 @@ impl CacheBackend for MokaCacheBackend {
         loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
         _codec: Option<CacheCodec>,
     ) -> Result<(CacheEntry, bool)> {
+        // Avoid Moka's single-flight waiters when nothing can be cached.
+        if self.capacity == 0 {
+            return loader.await.map(|(entry, _)| (entry, false));
+        }
+
         // Track whether the loader actually ran (= cache miss).
         let was_miss = Arc::new(AtomicBool::new(false));
         let was_miss_clone = was_miss.clone();
@@ -136,7 +151,7 @@ impl CacheBackend for MokaCacheBackend {
             loader
                 .await
                 .map(|(entry, size_bytes)| MokaCacheEntry { entry, size_bytes })
-                .map_err(CloneableError)
+                .map_err(CloneableError::new)
         };
 
         let owned_key = *key;
@@ -145,7 +160,7 @@ impl CacheBackend for MokaCacheBackend {
                 let was_cached = !was_miss.load(Ordering::Relaxed);
                 Ok((record.entry, was_cached))
             }
-            Err(error) => Err(Arc::unwrap_or_clone(error).0),
+            Err(error) => Err(Arc::unwrap_or_clone(error).into_inner()),
         }
     }
 
@@ -162,6 +177,10 @@ impl CacheBackend for MokaCacheBackend {
     async fn size_bytes(&self) -> usize {
         self.cache.run_pending_tasks().await;
         self.weighted_size_bytes()
+    }
+
+    fn capacity_bytes(&self) -> Option<usize> {
+        Some(self.capacity)
     }
 
     fn approx_num_entries(&self) -> usize {
@@ -193,13 +212,86 @@ impl CacheBackend for MokaCacheBackend {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::pin;
+
+    use futures::{FutureExt, poll};
+    use tokio::sync::oneshot;
+
     use super::*;
+
+    #[rstest::rstest]
+    #[case::zero_capacity_success(MokaCacheBackend::with_capacity(0), false)]
+    #[case::zero_capacity_error(MokaCacheBackend::with_capacity(0), true)]
+    #[case::no_cache_success(MokaCacheBackend::no_cache(), false)]
+    #[case::no_cache_error(MokaCacheBackend::no_cache(), true)]
+    #[tokio::test]
+    async fn zero_capacity_loaders_run_independently(
+        #[case] backend: MokaCacheBackend,
+        #[case] loader_fails: bool,
+    ) {
+        let key = InternalCacheKey::from_bytes([0; 16]);
+        let first_entry: CacheEntry = Arc::new(1_u64);
+        let second_entry: CacheEntry = Arc::new(2_u64);
+        let (release_tx, release_rx) = oneshot::channel();
+        let entry = first_entry.clone();
+        let mut first = pin!(backend.get_or_insert(
+            &key,
+            Box::pin(async move {
+                release_rx.await.unwrap();
+                Ok((entry, 8))
+            }),
+            None,
+        ));
+        assert!(poll!(first.as_mut()).is_pending());
+
+        let entry = second_entry.clone();
+        let second = backend
+            .get_or_insert(
+                &key,
+                Box::pin(async move {
+                    if loader_fails {
+                        Err(crate::Error::invalid_input("independent loader failed"))
+                    } else {
+                        Ok((entry, 8))
+                    }
+                }),
+                None,
+            )
+            .now_or_never()
+            .expect("a disabled cache must not wait for another loader on the same key");
+        if loader_fails {
+            let error = second.unwrap_err();
+            assert!(matches!(&error, crate::Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("independent loader failed"));
+        } else {
+            let (entry, was_cached) = second.unwrap();
+            assert!(Arc::ptr_eq(&entry, &second_entry));
+            assert!(!was_cached);
+        }
+
+        release_tx.send(()).unwrap();
+        let (entry, was_cached) = first.await.unwrap();
+        assert!(Arc::ptr_eq(&entry, &first_entry));
+        assert!(!was_cached);
+        assert!(backend.get(&key, None).await.is_none());
+        assert_eq!(backend.num_entries().await, 0);
+        assert_eq!(backend.size_bytes().await, 0);
+    }
 
     #[test]
     fn entry_weights_are_exact_at_byte_granularity() {
         let key = InternalCacheKey::from_bytes([0; 16]);
         assert_eq!(weight_unit(4096), 1);
         assert_eq!(entry_weight(&key, 7, 1), 23);
+    }
+
+    #[test]
+    fn capacity_bytes_reports_configured_capacity() {
+        assert_eq!(
+            MokaCacheBackend::with_capacity(4096).capacity_bytes(),
+            Some(4096)
+        );
+        assert_eq!(MokaCacheBackend::no_cache().capacity_bytes(), Some(0));
     }
 
     #[tokio::test]

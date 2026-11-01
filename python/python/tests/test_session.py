@@ -40,6 +40,41 @@ def test_share_session(tmp_path: Path):
     assert ds1.to_table() == ds2.to_table()
 
 
+def test_fragment_write_with_session(tmp_path: Path):
+    from lance.fragment import LanceFragment, write_fragments
+
+    data = pa.table({"a": range(10), "b": [str(i) for i in range(10)]})
+    ds = lance.write_dataset(data, tmp_path)
+    # Drop a column so the surviving field id is non-trivial (!= 0). Appends
+    # that infer the schema must pick up this field id from the dataset.
+    ds.drop_columns(["a"])
+    field_id = ds.lance_schema.field_case_insensitive("b").id()
+    assert field_id != 0
+
+    session = ds.session()
+    size_before = session.size_bytes()
+
+    append_data = pa.table({"b": ["x", "y"]})
+    fragments = write_fragments(
+        append_data, str(tmp_path), mode="append", session=session
+    )
+    assert len(fragments) == 1
+    assert fragments[0].files[0].fields == [field_id]
+
+    fragment = LanceFragment.create(
+        str(tmp_path), append_data, mode="append", session=session
+    )
+    assert fragment.files[0].fields == [field_id]
+
+    # The manifest loads for schema inference went through the shared session.
+    assert session.size_bytes() > size_before
+
+    # A LanceDataset destination always uses its own session; a different
+    # explicit session is rejected.
+    with pytest.raises(ValueError, match="not the destination dataset's own session"):
+        write_fragments(append_data, ds, mode="append", session=lance.Session())
+
+
 def test_cache_backend_uri_config():
     session = lance.Session(index_cache_backend="moka://?capacity=1048576")
 

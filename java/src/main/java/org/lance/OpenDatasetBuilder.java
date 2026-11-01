@@ -236,7 +236,9 @@ public class OpenDatasetBuilder {
             .setIndexCacheSizeBytes(options.getIndexCacheSizeBytes())
             .setMetadataCacheSizeBytes(options.getMetadataCacheSizeBytes());
 
+    options.getSession().ifPresent(optionsBuilder::setSession);
     options.getVersion().ifPresent(optionsBuilder::setVersion);
+    options.getRef().ifPresent(optionsBuilder::setRef);
     options.getBlockSize().ifPresent(optionsBuilder::setBlockSize);
     options.getSerializedManifest().ifPresent(optionsBuilder::setSerializedManifest);
     optionsBuilder.setBaseStoreParams(baseStoreParams);

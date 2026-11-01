@@ -602,6 +602,7 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                                 let default_config = ShardWriterConfig::default();
                                 let config = ShardWriterConfig {
                                     shard_id,
+                                    dir_id: String::new(),
                                     shard_spec_id: 0,
                                     max_wal_persist_retries: 3,
                                     wal_persist_retry_base_delay: std::time::Duration::from_millis(
@@ -627,8 +628,14 @@ fn bench_lance_memwal_write(c: &mut Criterion) {
                                     enable_memtable,
                                     hnsw_params: default_config.hnsw_params,
                                     warmer: None,
+                                    observer: None,
                                     store_params: default_config.store_params,
                                     session: default_config.session,
+                                    mem_index_registry: default_config.mem_index_registry,
+                                    index_overrides: default_config.index_overrides,
+                                    // Measure the built-in per-shard valve, not
+                                    // an injected policy.
+                                    backpressure: None,
                                 };
 
                                 // Get writer through Dataset API (index configs loaded automatically)

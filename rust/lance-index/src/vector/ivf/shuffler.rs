@@ -12,6 +12,7 @@
 //! 2. shuffling into memory is fast but we should add disk buffer to support bigger datasets
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -34,7 +35,6 @@ use lance_core::{Error, ROW_ID, Result, datatypes::Schema};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::reader::{FileReader as Lancev2FileReader, FileReaderOptions};
 use lance_file::version::ConcreteFileVersion;
-use lance_file::version::LanceFileVersion;
 use lance_file::versions;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
@@ -255,9 +255,7 @@ pub async fn shuffle_dataset(
     let shuffler = if let Some((path, buffers)) = precomputed_shuffle_buffers {
         info!("Precomputed shuffle files provided, skip calculation of IVF partition.");
         let mut shuffler = IvfShuffler::try_new(num_partitions, Some(path), true, None)?;
-        unsafe {
-            shuffler.set_unsorted_buffers(&buffers);
-        }
+        shuffler.set_unsorted_buffers(&buffers);
 
         shuffler
     } else {
@@ -380,9 +378,7 @@ pub async fn shuffle_vectors(
         Some(shuffle_output_root_filename.to_string()),
     )?;
 
-    unsafe {
-        shuffler.set_unsorted_buffers(&unsorted_filenames);
-    }
+    shuffler.set_unsorted_buffers(&unsorted_filenames);
 
     let partition_files = shuffler
         .write_partitioned_shuffles(shuffle_partition_batches, shuffle_partition_concurrency)
@@ -408,7 +404,7 @@ pub struct IvfShuffler {
 
     shuffle_output_root_filename: String,
 
-    format_version: LanceFileVersion,
+    format_version: ConcreteFileVersion,
 }
 
 /// Represents a range of batches in a file that should be shuffled
@@ -419,6 +415,35 @@ struct ShuffleInput {
     start: usize,
     // the end index of the batch in the file
     end: usize,
+}
+
+/// Count one batch's partition ids into `partition_sizes`. The ids can come
+/// from a precomputed partitions file or shuffle buffer, so an id past
+/// `num_partitions` is an input error, not an index panic in the counting task.
+fn count_partition_ids(
+    part_ids: &UInt32Array,
+    num_partitions: u32,
+    partition_sizes: &mut [u64],
+) -> Result<()> {
+    for &part_id in part_ids.values() {
+        let Some(size) = partition_sizes.get_mut(part_id as usize) else {
+            return Err(Error::invalid_input(format!(
+                "precomputed partition id {part_id} is out of range [0, {num_partitions})"
+            )));
+        };
+        *size += 1;
+    }
+    Ok(())
+}
+
+/// Translate a batch range into the row range to read from a v2 unsorted buffer.
+///
+/// The last batch of a file is partial whenever the row count is not a multiple of
+/// [`SHUFFLE_BATCH_SIZE`], so the end has to be clamped: `ReadBatchParams::Range`
+/// rejects a range that runs past the file (`valid_given_len` requires `end <= len`).
+fn shuffle_row_range(reader: &Lancev2FileReader, start: usize, end: usize) -> Range<usize> {
+    let num_rows = reader.metadata().num_rows as usize;
+    (start * SHUFFLE_BATCH_SIZE)..std::cmp::min(end * SHUFFLE_BATCH_SIZE, num_rows)
 }
 
 impl IvfShuffler {
@@ -448,21 +473,17 @@ impl IvfShuffler {
             unsorted_buffers: vec![],
             is_legacy,
             shuffle_output_root_filename,
-            format_version: LanceFileVersion::V2_0,
+            format_version: ConcreteFileVersion::V2_0,
         })
     }
 
-    pub fn with_format_version(mut self, format_version: LanceFileVersion) -> Self {
+    pub fn with_format_version(mut self, format_version: ConcreteFileVersion) -> Self {
         self.format_version = format_version;
         self
     }
 
     /// Set the unsorted buffers to be shuffled.
-    ///
-    /// # Safety
-    ///
-    /// user must ensure the buffers are valid.
-    pub unsafe fn set_unsorted_buffers(&mut self, unsorted_buffers: &[impl ToString]) {
+    pub fn set_unsorted_buffers(&mut self, unsorted_buffers: &[impl ToString]) {
         self.unsorted_buffers = unsorted_buffers.iter().map(|x| x.to_string()).collect();
     }
 
@@ -515,9 +536,7 @@ impl IvfShuffler {
 
         file_writer.finish().await?;
 
-        unsafe {
-            self.set_unsorted_buffers(&[UNSORTED_BUFFER]);
-        }
+        self.set_unsorted_buffers(&[UNSORTED_BUFFER]);
 
         Ok(())
     }
@@ -548,7 +567,12 @@ impl IvfShuffler {
                     FileReaderOptions::default(),
                 )
                 .await?;
-                let num_batches = reader.metadata().num_rows / (SHUFFLE_BATCH_SIZE as u64);
+                // A trailing partial batch still holds rows, so round up. The two
+                // readers below clamp their range to `num_rows` to stay inside the file.
+                let num_batches = reader
+                    .metadata()
+                    .num_rows
+                    .div_ceil(SHUFFLE_BATCH_SIZE as u64);
                 total_batches.push(num_batches as usize);
             }
         }
@@ -590,9 +614,7 @@ impl IvfShuffler {
                         .column_by_name(PART_ID_COLUMN)
                         .expect("Partition ID column not found")
                         .as_primitive();
-                    part_ids.values().iter().for_each(|part_id| {
-                        partition_sizes[*part_id as usize] += 1;
-                    });
+                    count_partition_ids(part_ids, self.num_partitions, &mut partition_sizes)?;
                 }
             } else {
                 let file = scheduler
@@ -608,9 +630,7 @@ impl IvfShuffler {
                 .await?;
                 let mut stream = reader
                     .read_stream(
-                        lance_io::ReadBatchParams::Range(
-                            (start * SHUFFLE_BATCH_SIZE)..(end * SHUFFLE_BATCH_SIZE),
-                        ),
+                        lance_io::ReadBatchParams::Range(shuffle_row_range(&reader, start, end)),
                         SHUFFLE_BATCH_SIZE as u32,
                         16,
                         FilterExpression::no_filter(),
@@ -624,9 +644,7 @@ impl IvfShuffler {
                         .column_by_name(PART_ID_COLUMN)
                         .expect("Partition ID column not found")
                         .as_primitive();
-                    part_ids.values().iter().for_each(|part_id| {
-                        partition_sizes[*part_id as usize] += 1;
-                    });
+                    count_partition_ids(part_ids, self.num_partitions, &mut partition_sizes)?;
                 }
             }
         }
@@ -683,9 +701,7 @@ impl IvfShuffler {
                 .await?;
                 reader
                     .read_stream(
-                        lance_io::ReadBatchParams::Range(
-                            (start * SHUFFLE_BATCH_SIZE)..(end * SHUFFLE_BATCH_SIZE),
-                        ),
+                        lance_io::ReadBatchParams::Range(shuffle_row_range(&reader, start, end)),
                         SHUFFLE_BATCH_SIZE as u32,
                         16,
                         FilterExpression::no_filter(),
@@ -808,7 +824,7 @@ impl IvfShuffler {
                     )]));
                     let lance_schema = Schema::try_from(sorted_file_schema.as_ref())?;
                     let mut file_writer = versions::create_writer(
-                        ConcreteFileVersion::from(this.format_version),
+                        this.format_version,
                         writer,
                         lance_schema,
                         FileWriterOptions::default(),
@@ -976,6 +992,14 @@ mod test {
         (stream, shuffler)
     }
 
+    #[tokio::test]
+    async fn test_missing_unsorted_buffer_returns_error() {
+        let mut shuffler = IvfShuffler::try_new(1, None, false, None).unwrap();
+        shuffler.set_unsorted_buffers(&["missing.lance"]);
+
+        shuffler.total_batches().await.unwrap_err();
+    }
+
     fn check_batch(batch: RecordBatch, idx: usize, num_rows: usize) {
         let row_ids = batch
             .column_by_name(ROW_ID)
@@ -1003,6 +1027,46 @@ mod test {
         for v in pq_codes.values() {
             assert_eq!(*v, idx as u8);
         }
+    }
+
+    /// Partition ids come from the caller's buffers, so one past the shuffler's
+    /// partition count is an input error in both buffer formats.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_shuffler_rejects_out_of_range_partition_ids(#[values(false, true)] legacy: bool) {
+        // Four rows with partition ids 0..4, shuffled into two partitions.
+        let (dir_path, _temp_dir) = get_temp_dir().unwrap();
+        let mut shuffler = IvfShuffler::try_new(2, Some(dir_path.clone()), legacy, None).unwrap();
+        if legacy {
+            let schema = make_schema(32);
+            let codes = FixedSizeListArray::try_new_from_values(
+                Arc::new(UInt8Array::from_iter_values(0..128)) as Arc<dyn Array>,
+                32,
+            )
+            .unwrap();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt64Array::from_iter_values(0..4)),
+                    Arc::new(UInt32Array::from_iter_values(0..4)),
+                    Arc::new(codes),
+                ],
+            )
+            .unwrap();
+            let stream =
+                RecordBatchStreamAdapter::new(schema, stream::once(async move { Ok(batch) }));
+            shuffler.write_unsorted_stream(stream).await.unwrap();
+        } else {
+            write_v2_unsorted_buffer(&dir_path, "unsorted.lance", 4, 4, 32).await;
+            shuffler.set_unsorted_buffers(&["unsorted.lance"]);
+        }
+        let err = shuffler.write_partitioned_shuffles(2, 1).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("precomputed partition id 2 is out of range [0, 2)"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -1088,7 +1152,7 @@ mod test {
         shuffler.write_unsorted_stream(stream).await.unwrap();
 
         // set the same buffer twice we should get double the data
-        unsafe { shuffler.set_unsorted_buffers(&[UNSORTED_BUFFER, UNSORTED_BUFFER]) }
+        shuffler.set_unsorted_buffers(&[UNSORTED_BUFFER, UNSORTED_BUFFER]);
 
         let partition_files = shuffler.write_partitioned_shuffles(200, 1).await.unwrap();
 
@@ -1118,7 +1182,7 @@ mod test {
         shuffler.write_unsorted_stream(stream).await.unwrap();
 
         // set the same buffer twice we should get double the data
-        unsafe { shuffler.set_unsorted_buffers(&[UNSORTED_BUFFER, UNSORTED_BUFFER]) }
+        shuffler.set_unsorted_buffers(&[UNSORTED_BUFFER, UNSORTED_BUFFER]);
 
         let partition_files = shuffler.write_partitioned_shuffles(1, 32).await.unwrap();
         assert_eq!(partition_files.len(), 200);
@@ -1274,6 +1338,94 @@ mod test {
             "auto-created shuffler temp dir should be removed once the IvfShuffler and \
              its returned streams are dropped, but it still exists: {:?}",
             temp_dir_path,
+        );
+    }
+
+    /// Write a v2 unsorted buffer holding `num_rows` rows, the shape
+    /// `shuffle_vectors` receives from a caller that transformed the vectors itself.
+    async fn write_v2_unsorted_buffer(
+        dir_path: &Path,
+        filename: &str,
+        num_rows: usize,
+        num_partitions: u32,
+        pq_dim: u32,
+    ) {
+        let schema = make_schema(pq_dim);
+        let writer = ObjectStore::local()
+            .create(&dir_path.clone().join(filename))
+            .await
+            .unwrap();
+        let mut file_writer = versions::create_writer(
+            ConcreteFileVersion::V2_0,
+            writer,
+            Schema::try_from(schema.as_ref()).unwrap(),
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        let row_ids = Arc::new(UInt64Array::from_iter_values(0..num_rows as u64));
+        let part_ids = Arc::new(UInt32Array::from_iter_values(
+            (0..num_rows).map(|i| (i % num_partitions as usize) as u32),
+        ));
+        let values = Arc::new(UInt8Array::from_iter_values(
+            (0..num_rows * pq_dim as usize).map(|i| i as u8),
+        ));
+        let pq_codes = Arc::new(
+            FixedSizeListArray::try_new_from_values(values as Arc<dyn Array>, pq_dim as i32)
+                .unwrap(),
+        );
+        let batch = RecordBatch::try_new(schema, vec![row_ids, part_ids, pq_codes]).unwrap();
+
+        file_writer.write_batch(&batch).await.unwrap();
+        file_writer.finish().await.unwrap();
+    }
+
+    /// `total_batches` used to divide the row count by `SHUFFLE_BATCH_SIZE`, so a
+    /// v2 buffer whose length is not a multiple of it lost the trailing rows, and one
+    /// shorter than a single batch produced no output at all while the caller went on
+    /// to commit an index claiming to cover every fragment.
+    #[rstest::rstest]
+    #[case::partial_trailing_batch(SHUFFLE_BATCH_SIZE * 2 + 7)]
+    #[case::shorter_than_one_batch(300)]
+    #[case::exact_multiple(SHUFFLE_BATCH_SIZE * 2)]
+    #[test_log::test(tokio::test(flavor = "multi_thread"))]
+    async fn test_v2_shuffle_keeps_every_row(#[case] num_rows: usize) {
+        const NUM_PARTITIONS: u32 = 4;
+        const PQ_DIM: u32 = 32;
+        const UNSORTED: &str = "unsorted_v2.lance";
+
+        let (dir_path, _temp_dir) = get_temp_dir().unwrap();
+        write_v2_unsorted_buffer(&dir_path, UNSORTED, num_rows, NUM_PARTITIONS, PQ_DIM).await;
+
+        let mut shuffler =
+            IvfShuffler::try_new(NUM_PARTITIONS, Some(dir_path.clone()), false, None).unwrap();
+        shuffler.set_unsorted_buffers(&[UNSORTED]);
+
+        let partition_files = shuffler
+            .write_partitioned_shuffles(SHUFFLE_BATCH_SIZE * 10, 1)
+            .await
+            .unwrap();
+        assert!(
+            !partition_files.is_empty(),
+            "{num_rows} rows produced no shuffle output"
+        );
+
+        let mut result_streams =
+            IvfShuffler::load_partitioned_shuffles(&shuffler.output_dir, partition_files)
+                .await
+                .unwrap();
+
+        let mut shuffled_rows = 0;
+        result_streams.reverse();
+        while let Some(mut stream) = result_streams.pop() {
+            while let Some(batch) = stream.next().await {
+                shuffled_rows += batch.unwrap().num_rows();
+            }
+        }
+
+        assert_eq!(
+            shuffled_rows, num_rows,
+            "shuffle dropped rows from the trailing batch"
         );
     }
 }

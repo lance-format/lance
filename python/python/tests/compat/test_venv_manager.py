@@ -18,6 +18,11 @@ from .venv_manager import _lance_namespace_dependency, _pip_install
         ("6.0.0", "lance-namespace>=0.7.2,<0.8"),
         ("7.2.0b5", "lance-namespace>=0.8.0,<0.9"),
         ("7.2.0", "lance-namespace>=0.8.0,<0.9"),
+        ("12.0.0b5", "lance-namespace>=0.8.0,<0.9"),
+        ("12.0.0b6", "lance-namespace>=0.11.1,<0.12"),
+        ("12.0.0", "lance-namespace>=0.11.1,<0.12"),
+        ("14.0.0b9", "lance-namespace>=0.11.1,<0.12"),
+        ("14.0.0b10", "lance-namespace>=0.13.0,<0.14"),
     ],
 )
 def test_lance_namespace_dependency(version: str, expected: str):

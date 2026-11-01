@@ -14,7 +14,7 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use roaring::RoaringBitmap;
 
 use super::overlay::{collect_overlay_stale_frags, overlaid_fragments};
-use super::{Dataset, fragment::FileFragment};
+use super::{Dataset, fragment::FileFragment, versions};
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 
 /// Statistics about a single field in the dataset
@@ -53,32 +53,12 @@ impl DatasetStatisticsExt for Dataset {
                     },
                 )
             }));
-        if !self.is_legacy_storage() {
-            let scan_scheduler = ScanScheduler::new(
-                self.object_store.clone(),
-                SchedulerConfig::max_bandwidth(self.object_store.as_ref()),
-            );
-            let schema = self.schema().clone();
-            let dataset = self.clone();
-            let fragments = self.fragments().as_ref().clone();
-            futures::stream::iter(fragments)
-                .map(|fragment| {
-                    let file_fragment = FileFragment::new(dataset.clone(), fragment);
-                    let schema = schema.clone();
-                    let scan_scheduler = scan_scheduler.clone();
-                    async move { file_fragment.storage_stats(&schema, scan_scheduler).await }
-                })
-                .buffer_unordered(self.object_store.io_parallelism())
-                .try_for_each(|fragment_stats| {
-                    for (field_id, bytes) in fragment_stats {
-                        if let Some(stats) = field_stats.get_mut(&field_id) {
-                            stats.bytes_on_disk += bytes;
-                        }
-                    }
-                    futures::future::ready(Ok(()))
-                })
-                .await?;
-        }
+        versions::collect_data_stats(
+            self.manifest().data_storage_format.lance_file_format(),
+            self,
+            &mut field_stats,
+        )
+        .await?;
         let field_stats = field_ids
             .into_iter()
             .map(|id| field_stats.remove(&(id as u32)).unwrap())
@@ -87,6 +67,35 @@ impl DatasetStatisticsExt for Dataset {
             fields: field_stats,
         })
     }
+}
+
+pub(super) async fn collect_current_data_stats(
+    dataset: &Arc<Dataset>,
+    field_stats: &mut HashMap<u32, FieldStatistics>,
+) -> Result<()> {
+    let scan_scheduler = ScanScheduler::new(
+        dataset.object_store.clone(),
+        SchedulerConfig::max_bandwidth(dataset.object_store.as_ref()),
+    );
+    let schema = dataset.schema().clone();
+    let fragments = dataset.fragments().as_ref().clone();
+    futures::stream::iter(fragments)
+        .map(|fragment| {
+            let file_fragment = FileFragment::new(dataset.clone(), fragment);
+            let schema = schema.clone();
+            let scan_scheduler = scan_scheduler.clone();
+            async move { file_fragment.storage_stats(&schema, scan_scheduler).await }
+        })
+        .buffer_unordered(dataset.object_store.io_parallelism())
+        .try_for_each(|fragment_stats| {
+            for (field_id, bytes) in fragment_stats {
+                if let Some(stats) = field_stats.get_mut(&field_id) {
+                    stats.bytes_on_disk += bytes;
+                }
+            }
+            futures::future::ready(Ok(()))
+        })
+        .await
 }
 
 /// A read-only handle for cheap, index-derived statistics about a [`Dataset`].
@@ -136,7 +145,12 @@ impl<'a> DatasetStatistics<'a> {
         let indices = dataset.load_indices().await?;
         let segments: Vec<_> = indices
             .iter()
-            .filter(|idx| matches!(idx.fields.as_slice(), [only] if *only == field_id))
+            .filter(|idx| {
+                // A covered index still answers for its keyed column; only
+                // the keyed prefix decides whether this index matches, not
+                // the full `fields` vector including carried columns.
+                idx.keyed_field() == Some(field_id)
+            })
             .filter(|idx| {
                 idx.index_details
                     .as_ref()
