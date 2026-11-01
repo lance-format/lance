@@ -31,6 +31,8 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -78,12 +80,37 @@ public class UpdateTest {
     allocator.close();
   }
 
-  @Test
-  public void testUpdateAllRows() {
-    UpdateResult result = dataset.update(new UpdateParams(ImmutableMap.of("name", "'updated'")));
+  @ParameterizedTest
+  @EnumSource(DataStorageVersion.class)
+  public void testUpdateAllRows(DataStorageVersion version) {
+    if (version == DataStorageVersion.LEGACY) {
+      IllegalArgumentException error =
+          Assertions.assertThrows(
+              IllegalArgumentException.class,
+              () ->
+                  dataset.update(
+                      new UpdateParams(ImmutableMap.of("name", "'updated'"))
+                          .withDataStorageVersion(version)));
+      Assertions.assertTrue(error.getMessage().contains("V1 and V2"));
+      return;
+    }
+    String exactVersion =
+        version == DataStorageVersion.STABLE
+            ? "2.2"
+            : version == DataStorageVersion.NEXT ? "2.3" : version.toRustString();
+    UpdateResult result =
+        dataset.update(
+            new UpdateParams(ImmutableMap.of("name", "'updated'")).withDataStorageVersion(version));
 
     Assertions.assertEquals(ROW_COUNT, result.getNumRowsUpdated());
     try (Dataset newDataset = result.getDataset()) {
+      Assertions.assertTrue(
+          newDataset.getFragments().stream()
+              .flatMap(fragment -> fragment.metadata().getFiles().stream())
+              .allMatch(
+                  file ->
+                      exactVersion.equals(
+                          file.getFileMajorVersion() + "." + file.getFileMinorVersion())));
       List<String> names = readNames(newDataset);
       Assertions.assertEquals(ROW_COUNT, names.size());
       for (String name : names) {

@@ -4,6 +4,8 @@
 //! Utilities for byte (not bit) packing for situations where saving a few
 //! bits is less important than simplicity and speed.
 
+use lance_core::{Error, Result};
+
 pub struct U8BytePacker {
     data: Vec<u8>,
 }
@@ -15,8 +17,8 @@ impl U8BytePacker {
         }
     }
 
-    fn append(&mut self, value: u64) {
-        self.data.push(value as u8);
+    fn append(&mut self, value: u8) {
+        self.data.push(value);
     }
 }
 
@@ -31,8 +33,8 @@ impl U16BytePacker {
         }
     }
 
-    fn append(&mut self, value: u64) {
-        self.data.extend_from_slice(&(value as u16).to_le_bytes());
+    fn append(&mut self, value: u16) {
+        self.data.extend_from_slice(&value.to_le_bytes());
     }
 }
 
@@ -47,8 +49,8 @@ impl U32BytePacker {
         }
     }
 
-    fn append(&mut self, value: u64) {
-        self.data.extend_from_slice(&(value as u32).to_le_bytes());
+    fn append(&mut self, value: u32) {
+        self.data.extend_from_slice(&value.to_le_bytes());
     }
 }
 
@@ -105,16 +107,48 @@ impl BytepackedIntegerEncoder {
 
     /// Append a value to the encoder.
     ///
-    /// # Safety
+    /// # Errors
     ///
-    /// This function is unsafe because it doesn't check for overflow.  If the
-    /// value is too large to fit in the chosen integer type, it will be silently
-    /// truncated.
-    pub unsafe fn append(&mut self, value: u64) {
+    /// Returns an error if `value` does not fit in the width selected at
+    /// construction time.
+    pub fn append(&mut self, value: u64) -> Result<()> {
         match self {
-            Self::U8(packer) => packer.append(value),
-            Self::U16(packer) => packer.append(value),
-            Self::U32(packer) => packer.append(value),
+            Self::U8(_) if value > u8::MAX as u64 => {
+                return Err(Error::invalid_input(format!(
+                    "value {value} does not fit in bytepacked u8"
+                )));
+            }
+            Self::U16(_) if value > u16::MAX as u64 => {
+                return Err(Error::invalid_input(format!(
+                    "value {value} does not fit in bytepacked u16"
+                )));
+            }
+            Self::U32(_) if value > u32::MAX as u64 => {
+                return Err(Error::invalid_input(format!(
+                    "value {value} does not fit in bytepacked u32"
+                )));
+            }
+            _ => {}
+        }
+        self.append_trusted(value);
+        Ok(())
+    }
+
+    /// Append a value whose range is guaranteed by the caller's construction.
+    pub(crate) fn append_trusted(&mut self, value: u64) {
+        match self {
+            Self::U8(packer) => {
+                debug_assert!(u8::try_from(value).is_ok());
+                packer.append(value as u8);
+            }
+            Self::U16(packer) => {
+                debug_assert!(u16::try_from(value).is_ok());
+                packer.append(value as u16);
+            }
+            Self::U32(packer) => {
+                debug_assert!(u32::try_from(value).is_ok());
+                packer.append(value as u32);
+            }
             Self::U64(packer) => packer.append(value),
             Self::Zero => {}
         }
@@ -197,11 +231,9 @@ mod tests {
     fn test_bytepacked_integer_encoder() {
         // Fits in u8
         let mut encoder = BytepackedIntegerEncoder::with_capacity(10, 100);
-        unsafe {
-            encoder.append(50);
-            encoder.append(20);
-            encoder.append(30);
-        }
+        encoder.append(50).unwrap();
+        encoder.append(20).unwrap();
+        encoder.append(30).unwrap();
         let data = encoder.into_data();
         assert_eq!(data, vec![50, 20, 30]);
 
@@ -212,11 +244,9 @@ mod tests {
 
         // Requires u16
         let mut encoder = BytepackedIntegerEncoder::with_capacity(10, 1000);
-        unsafe {
-            encoder.append(500);
-            encoder.append(200);
-            encoder.append(300);
-        }
+        encoder.append(500).unwrap();
+        encoder.append(200).unwrap();
+        encoder.append(300).unwrap();
         let data = encoder.into_data();
         assert_eq!(data, vec![244, 1, 200, 0, 44, 1]);
 
@@ -227,11 +257,9 @@ mod tests {
 
         // Requires u32
         let mut encoder = BytepackedIntegerEncoder::with_capacity(10, 1000000);
-        unsafe {
-            encoder.append(500000);
-            encoder.append(200000);
-            encoder.append(300000);
-        }
+        encoder.append(500000).unwrap();
+        encoder.append(200000).unwrap();
+        encoder.append(300000).unwrap();
         let data = encoder.into_data();
         assert_eq!(data, vec![32, 161, 7, 0, 64, 13, 3, 0, 224, 147, 4, 0]);
 
@@ -242,11 +270,9 @@ mod tests {
 
         // Requires u64
         let mut encoder = BytepackedIntegerEncoder::with_capacity(10, 0x10000000000);
-        unsafe {
-            encoder.append(0x5000000000);
-            encoder.append(0x2000000000);
-            encoder.append(0x3000000000);
-        }
+        encoder.append(0x5000000000).unwrap();
+        encoder.append(0x2000000000).unwrap();
+        encoder.append(0x3000000000).unwrap();
         let data = encoder.into_data();
         assert_eq!(
             data,
@@ -259,5 +285,22 @@ mod tests {
             ByteUnpacker::new(data, 8).collect::<Vec<_>>(),
             vec![0x5000000000, 0x2000000000, 0x3000000000]
         );
+    }
+
+    #[test]
+    fn test_bytepacked_integer_encoder_rejects_overflow() {
+        for (max_value, invalid_value, expected_width) in [
+            (u8::MAX as u64, u8::MAX as u64 + 1, "u8"),
+            (u16::MAX as u64, u16::MAX as u64 + 1, "u16"),
+            (u32::MAX as u64, u32::MAX as u64 + 1, "u32"),
+        ] {
+            let mut encoder = BytepackedIntegerEncoder::with_capacity(1, max_value);
+            let error = encoder.append(invalid_value).unwrap_err();
+            assert!(error.to_string().contains(expected_width), "{error}");
+        }
+
+        let mut disabled = BytepackedIntegerEncoder::with_capacity(1, 0);
+        disabled.append(u64::MAX).unwrap();
+        assert!(disabled.into_data().is_empty());
     }
 }

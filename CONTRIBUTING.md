@@ -1,7 +1,7 @@
 # Guide for New Contributors
 
 This is a guide for new contributors to the Lance project.
-Even if you have no previous experience with python, rust, and open source, you can still make an non-trivial
+Even if you have no previous experience with python, rust, and open source, you can still make a non-trivial
 impact by helping us improve documentation, examples, and more.
 For experienced developers, the issues you can work on run the gamut from warm-ups to serious challenges in python and rust.
 
@@ -11,7 +11,7 @@ If you have any questions, please join our [Discord](https://discord.gg/zMM32dvN
 
 1. Join our Discord and say hi
 2. Setup your development environment
-3. Pick an issue to work on. See https://github.com/lancedb/lance/contribute for good first issues.
+3. Pick an issue to work on. See https://github.com/lance-format/lance/contribute for good first issues.
 4. Have fun!
 
 ## Development Environment
@@ -20,22 +20,28 @@ Currently Lance is implemented in Rust and comes with a Python wrapper. So you'l
 
 1. Install Rust: https://www.rust-lang.org/tools/install
 2. Install Python 3.10+: https://www.python.org/downloads/
-3. Install protoctol buffers: https://grpc.io/docs/protoc-installation/ (make sure you have version 3.20 or higher)
+3. Install protocol buffers: https://grpc.io/docs/protoc-installation/ (make sure you have version 3.20 or higher)
 4. Install commit hooks:
     a. Install pre-commit: https://pre-commit.com/#install
     b. Run `pre-commit install` in the root of the repo
 
-## x86_64 CPU compatibility
+## Building for legacy x86_64 hosts (pre-Haswell)
 
-The default workspace build targets `x86-64-v2` (SSE4.2), so binaries can run on pre-Haswell silicon that does not support AVX2. Runtime SIMD dispatch in `lance-linalg::distance` picks the appropriate tier (scalar / AVX / AVX+FMA / AVX2+FMA / AVX-512) based on the host. From Python, use `lance.simd_info()` to verify which tier was selected.
+The default workspace build targets `haswell` (AVX2 + FMA + F16C), matching the published wheels. To build a binary that runs on pre-Haswell silicon (Sandy Bridge / Ivy Bridge / Westmere on Intel, Bulldozer / Piledriver / Steamroller on AMD — i.e. CPUs without AVX2), set the baseline yourself at build time:
+
+```sh
+RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release
+```
+
+Runtime SIMD dispatch in `lance-linalg::distance` will then pick the appropriate tier (scalar / AVX / AVX+FMA / AVX2+FMA / AVX-512) based on the host. From Python, use `lance.simd_info()` to verify which tier was selected.
 
 ## Sample Workflow
 
 1. Fork the repo
-2. Pick [Github issue](https://github.com/lancedb/lance/issues)
+2. Pick [Github issue](https://github.com/lance-format/lance/issues)
 3. Create a branch for the issue
 4. Make your changes
-5. Create a pull request from your fork to lancedb/lance
+5. Create a pull request from your fork to lance-format/lance
 6. Get feedback and iterate
 7. Merge!
 8. Go back to step 2

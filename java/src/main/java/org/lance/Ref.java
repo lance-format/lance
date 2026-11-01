@@ -41,21 +41,33 @@ public class Ref {
     return tagName;
   }
 
+  /** Creates a reference to a specific version on the default branch. */
   public static Ref ofMain(long versionNumber) {
     Preconditions.checkArgument(versionNumber > 0, "versionNumber must be greater than 0");
     return new Ref(Optional.of(versionNumber), Optional.empty(), Optional.empty());
   }
 
+  /** Creates a reference to the latest version on the default branch. */
   public static Ref ofMain() {
     return new Ref(Optional.empty(), Optional.empty(), Optional.empty());
   }
 
+  /**
+   * Creates a reference to the latest version on a branch.
+   *
+   * <p>In reference contexts, {@code "main"} is an alias for the default branch.
+   */
   public static Ref ofBranch(String branchName) {
     Preconditions.checkArgument(
         branchName != null && !branchName.isEmpty(), "branchName must not be empty");
     return new Ref(Optional.empty(), Optional.of(branchName), Optional.empty());
   }
 
+  /**
+   * Creates a reference to a specific version on a branch.
+   *
+   * <p>In reference contexts, {@code "main"} is an alias for the default branch.
+   */
   public static Ref ofBranch(String branchName, long versionNumber) {
     Preconditions.checkArgument(
         branchName != null && !branchName.isEmpty(), "branchName must not be empty");

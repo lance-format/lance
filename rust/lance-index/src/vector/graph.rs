@@ -303,8 +303,8 @@ macro_rules! beam_search_loop {
         $visited:ident,
         $k:expr,
         $dist_calc:expr,
-        $prefetch_distance:expr,
         $accepts_result:expr,
+        $comparisons:ident,
         |$current:ident, $process_neighbor:ident| $visit_neighbors:block
     ) => {{
         while !$candidates.is_empty() {
@@ -321,6 +321,7 @@ macro_rules! beam_search_loop {
                 }
                 $visited.insert(neighbor);
                 let dist: OrderedFloat = $dist_calc.distance(neighbor).into();
+                $comparisons += 1;
                 // Algorithm 2 refreshes the furthest result after every
                 // update to W, including updates made by an earlier neighbor
                 // of this same expanded node.
@@ -342,13 +343,14 @@ macro_rules! greedy_search_loop {
         $current:ident,
         $closest_dist:ident,
         $dist_calc:expr,
-        $prefetch_distance:expr,
+        $comparisons:ident,
         |$process_neighbor:ident| $visit_neighbors:block
     ) => {{
         loop {
             let mut next = None;
             let $process_neighbor = |neighbor: u32| {
                 let dist = $dist_calc.distance(neighbor);
+                $comparisons += 1;
                 if dist < $closest_dist {
                     $closest_dist = dist;
                     next = Some(neighbor);
@@ -384,7 +386,8 @@ macro_rules! greedy_search_loop {
 ///
 /// Returns
 /// -------
-/// A descending sorted list of ``(dist, node_id)`` pairs.
+/// A descending sorted list of ``(dist, node_id)`` pairs, and the number of
+/// distances computed while producing it.
 ///
 /// WARNING: Internal API,  API stability is not guaranteed
 ///
@@ -397,13 +400,14 @@ pub fn beam_search(
     bitset: Option<&Visited>,
     prefetch_distance: Option<usize>,
     visited: &mut Visited,
-) -> Vec<OrderedNode> {
+) -> (Vec<OrderedNode>, usize) {
     let k = params.ef;
     let mut candidates = BinaryHeap::with_capacity(k);
     visited.insert(ep.id);
     candidates.push(Reverse(ep.clone()));
 
     let mut results = BinaryHeap::with_capacity(k);
+    let mut comparisons = 0;
     let no_filter =
         bitset.is_none() && params.lower_bound.is_none() && params.upper_bound.is_none();
 
@@ -416,8 +420,8 @@ pub fn beam_search(
             visited,
             k,
             dist_calc,
-            prefetch_distance,
             accepts_result,
+            comparisons,
             |current, process_neighbor| {
                 let neighbors = graph.neighbors(current.id);
                 process_neighbors_with_look_ahead(
@@ -428,7 +432,7 @@ pub fn beam_search(
                 );
             }
         );
-        return results.into_sorted_vec();
+        return (results.into_sorted_vec(), comparisons);
     }
 
     // add range search support
@@ -455,8 +459,8 @@ pub fn beam_search(
         visited,
         k,
         dist_calc,
-        prefetch_distance,
         accepts_result,
+        comparisons,
         |current, process_neighbor| {
             let neighbors = graph.neighbors(current.id);
             process_neighbors_with_look_ahead(
@@ -467,9 +471,11 @@ pub fn beam_search(
             );
         }
     );
-    results.into_sorted_vec()
+    (results.into_sorted_vec(), comparisons)
 }
 
+/// Like [beam_search] but over a [BorrowingGraph]. Also returns the number of
+/// distances computed.
 pub fn beam_search_borrowed(
     graph: &impl BorrowingGraph,
     ep: &OrderedNode,
@@ -478,13 +484,14 @@ pub fn beam_search_borrowed(
     bitset: Option<&Visited>,
     prefetch_distance: Option<usize>,
     visited: &mut Visited,
-) -> Vec<OrderedNode> {
+) -> (Vec<OrderedNode>, usize) {
     let k = params.ef;
     let mut candidates = BinaryHeap::with_capacity(k);
     visited.insert(ep.id);
     candidates.push(Reverse(ep.clone()));
 
     let mut results = BinaryHeap::with_capacity(k);
+    let mut comparisons = 0;
     let no_filter =
         bitset.is_none() && params.lower_bound.is_none() && params.upper_bound.is_none();
 
@@ -497,8 +504,8 @@ pub fn beam_search_borrowed(
             visited,
             k,
             dist_calc,
-            prefetch_distance,
             accepts_result,
+            comparisons,
             |current, process_neighbor| {
                 let neighbors = graph.neighbors(current.id);
                 process_neighbors_with_look_ahead(
@@ -509,7 +516,7 @@ pub fn beam_search_borrowed(
                 );
             }
         );
-        return results.into_sorted_vec();
+        return (results.into_sorted_vec(), comparisons);
     }
 
     let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
@@ -535,8 +542,8 @@ pub fn beam_search_borrowed(
         visited,
         k,
         dist_calc,
-        prefetch_distance,
         accepts_result,
+        comparisons,
         |current, process_neighbor| {
             let neighbors = graph.neighbors(current.id);
             process_neighbors_with_look_ahead(
@@ -547,7 +554,7 @@ pub fn beam_search_borrowed(
             );
         }
     );
-    results.into_sorted_vec()
+    (results.into_sorted_vec(), comparisons)
 }
 
 /// Number of mask-passing nodes used to seed [beam_search_acorn]'s frontier.
@@ -565,6 +572,8 @@ const ACORN_BRIDGE_BUDGET_FACTOR: usize = 4;
 /// starts from the entry point plus mask-sampled seeds. May return fewer than
 /// `min(ef, passing)` results if the budget runs out, so callers needing a
 /// guarantee must check the count.
+///
+/// Also returns the number of distances computed.
 #[allow(clippy::too_many_arguments)]
 pub fn beam_search_acorn(
     graph: &impl BorrowingGraph,
@@ -575,7 +584,7 @@ pub fn beam_search_acorn(
     prefetch_distance: Option<usize>,
     visited: &mut Visited,
     expanded: &mut Visited,
-) -> Vec<OrderedNode> {
+) -> (Vec<OrderedNode>, usize) {
     let ef = params.ef;
     let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
     let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
@@ -589,6 +598,7 @@ pub fn beam_search_acorn(
     // deduped against `expanded` at pop rather than at push
     let mut waypoints: VecDeque<u32> = VecDeque::new();
     let mut bridge_budget = ACORN_BRIDGE_BUDGET_FACTOR * ef;
+    let mut comparisons = 0;
 
     // the entry point seeds the traversal even if it fails the mask
     visited.insert(ep.id);
@@ -605,6 +615,7 @@ pub fn beam_search_acorn(
         }
         visited.insert(seed);
         let dist: OrderedFloat = dist_calc.distance(seed).into();
+        comparisons += 1;
         if dist >= lower_bound && dist < upper_bound {
             push_result(&mut results, (dist, seed).into(), ef);
         }
@@ -633,6 +644,7 @@ pub fn beam_search_acorn(
                         if !visited.contains(neighbor) {
                             visited.insert(neighbor);
                             let dist: OrderedFloat = dist_calc.distance(neighbor).into();
+                            comparisons += 1;
                             if dist >= lower_bound && dist < upper_bound {
                                 push_result(&mut results, (dist, neighbor).into(), ef);
                             }
@@ -682,6 +694,7 @@ pub fn beam_search_acorn(
             &passing,
             |node| {
                 let dist: OrderedFloat = dist_calc.distance(node).into();
+                comparisons += 1;
                 if dist <= furthest_distance(&results) || results.len() < ef {
                     if dist >= lower_bound && dist < upper_bound {
                         push_result(&mut results, (dist, node).into(), ef);
@@ -693,7 +706,7 @@ pub fn beam_search_acorn(
             dist_calc,
         );
     }
-    results.into_sorted_vec()
+    (results.into_sorted_vec(), comparisons)
 }
 
 /// Greedy search over a graph
@@ -711,7 +724,7 @@ pub fn beam_search_acorn(
 ///
 /// Returns
 /// -------
-/// A ``(dist, node_id)`` pair.
+/// A ``(dist, node_id)`` pair, and the number of distances computed.
 ///
 /// WARNING: Internal API,  API stability is not guaranteed
 pub fn greedy_search(
@@ -719,14 +732,15 @@ pub fn greedy_search(
     start: OrderedNode,
     dist_calc: &impl DistCalculator,
     prefetch_distance: Option<usize>,
-) -> OrderedNode {
+) -> (OrderedNode, usize) {
     let mut current = start.id;
     let mut closest_dist = start.dist.0;
+    let mut comparisons = 0;
     greedy_search_loop!(
         current,
         closest_dist,
         dist_calc,
-        prefetch_distance,
+        comparisons,
         |process_neighbor| {
             let neighbors = graph.neighbors(current);
             process_neighbors_with_look_ahead(
@@ -737,22 +751,25 @@ pub fn greedy_search(
             );
         }
     );
-    OrderedNode::new(current, closest_dist.into())
+    (OrderedNode::new(current, closest_dist.into()), comparisons)
 }
 
+/// Like [greedy_search] but over a [BorrowingGraph]. Also returns the number
+/// of distances computed.
 pub fn greedy_search_borrowed(
     graph: &impl BorrowingGraph,
     start: OrderedNode,
     dist_calc: &impl DistCalculator,
     prefetch_distance: Option<usize>,
-) -> OrderedNode {
+) -> (OrderedNode, usize) {
     let mut current = start.id;
     let mut closest_dist = start.dist.0;
+    let mut comparisons = 0;
     greedy_search_loop!(
         current,
         closest_dist,
         dist_calc,
-        prefetch_distance,
+        comparisons,
         |process_neighbor| {
             let neighbors = graph.neighbors(current);
             process_neighbors_with_look_ahead(
@@ -763,7 +780,7 @@ pub fn greedy_search_borrowed(
             );
         }
     );
-    OrderedNode::new(current, closest_dist.into())
+    (OrderedNode::new(current, closest_dist.into()), comparisons)
 }
 
 #[cfg(test)]
@@ -838,7 +855,7 @@ mod tests {
         let entry = OrderedNode::new(0, distances[0].into());
         let mut visited_generator = VisitedGenerator::new(graph.len());
 
-        let results = beam_search_borrowed(
+        let (results, _) = beam_search_borrowed(
             &graph,
             &entry,
             &params,
@@ -892,7 +909,7 @@ mod tests {
 
         let mut acorn_visited_generator = VisitedGenerator::new(graph.len());
         let mut acorn_expanded_generator = VisitedGenerator::new(graph.len());
-        let acorn_results = beam_search_acorn(
+        let (acorn_results, _) = beam_search_acorn(
             &graph,
             &entry,
             &params,
@@ -904,7 +921,7 @@ mod tests {
         );
 
         let mut basic_visited_generator = VisitedGenerator::new(graph.len());
-        let basic_results = beam_search_borrowed(
+        let (basic_results, _) = beam_search_borrowed(
             &graph,
             &entry,
             &params,

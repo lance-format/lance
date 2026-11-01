@@ -6,7 +6,7 @@
 use arrow::array::{AsArray, ListBuilder, UInt32Builder};
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, UInt32Type};
-use arrow_array::{ArrayRef, Float32Array, ListArray, RecordBatch, UInt64Array};
+use arrow_array::{Array, ArrayRef, Float32Array, ListArray, RecordBatch, UInt64Array};
 use crossbeam_queue::ArrayQueue;
 use itertools::Itertools;
 use lance_core::deepsize::DeepSizeOf;
@@ -71,7 +71,7 @@ pub(crate) fn random_level_with<R: Rng + ?Sized>(params: &HnswBuildParams, rng: 
 }
 
 /// Parameters of building HNSW index
-#[derive(Debug, Clone, Serialize, Deserialize, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, DeepSizeOf)]
 pub struct HnswBuildParams {
     /// Maximum number of levels in the graph.
     pub max_level: u16,
@@ -307,6 +307,36 @@ impl HNSW {
         }
     }
 
+    /// Refuse a graph whose nodes outrun the vectors behind them.
+    ///
+    /// Node ids are row numbers into `storage`, so a graph with more nodes than
+    /// storage has rows holds ids no vector backs. Scoring one indexes past the
+    /// storage buffer and panics, which takes the worker rather than the query,
+    /// and the entry point is scored before any traversal decision -- so this has
+    /// to run first.
+    ///
+    /// Only that direction is refused. Storage with rows the graph never reached
+    /// is safe and common: those rows are simply unreachable by traversal, and a
+    /// sparse-prefilter search still brute-forces them.
+    ///
+    /// Written before the export bounded the pair, such an index cannot be
+    /// searched at all -- the vectors are not on disk -- so it is refused with a
+    /// message naming it rather than left to fault.
+    fn ensure_storage_covers_graph(&self, storage: &impl VectorStore) -> Result<()> {
+        let nodes = self.len();
+        let rows = storage.len();
+        if nodes > rows {
+            return Err(Error::index(format!(
+                "HNSW graph has {nodes} nodes but its vector storage has {rows} \
+                 rows, so {} node(s) have no vector to score; the index predates \
+                 the export bound and has to be rebuilt",
+                nodes - rows
+            )));
+        }
+        Ok(())
+    }
+
+    /// Returns the top-`k` results and the number of distances computed.
     #[allow(clippy::too_many_arguments)]
     pub fn search_inner(
         &self,
@@ -317,7 +347,8 @@ impl HNSW {
         visited_generator: &mut VisitedGenerator,
         storage: &impl VectorStore,
         prefetch_distance: Option<usize>,
-    ) -> Result<Vec<OrderedNode>> {
+    ) -> Result<(Vec<OrderedNode>, usize)> {
+        self.ensure_storage_covers_graph(storage)?;
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let entry = self.inner.entry_point;
         let ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
@@ -327,7 +358,7 @@ impl HNSW {
         // generic over those view types so the loop is single-sourced:
         // each backend supplies a per-level view closure and a
         // bottom-level view.
-        let result = match &self.inner.graph {
+        let (result, comparisons) = match &self.inner.graph {
             HnswGraph::Built(nodes) => {
                 let nodes = nodes.as_slice();
                 self.run_search(
@@ -359,7 +390,8 @@ impl HNSW {
                 )
             }
         };
-        Ok(result)
+        // the entry point distance is computed above, outside the traversal
+        Ok((result, comparisons + 1))
     }
 
     /// Drives the shared HNSW query path over backend-specific graph
@@ -382,7 +414,7 @@ impl HNSW {
         dist_calc: &impl DistCalculator,
         make_level: impl Fn(u16) -> L,
         bottom: B,
-    ) -> Vec<OrderedNode>
+    ) -> (Vec<OrderedNode>, usize)
     where
         L: BorrowingGraph,
         B: BorrowingGraph,
@@ -393,17 +425,20 @@ impl HNSW {
         // minimum, which costs extra distance computations and measurably
         // hurts recall at low ef (https://github.com/lance-format/lance/issues/5208).
         let mut ep = ep;
+        let mut comparisons = 0;
         for level in (1..self.max_level()).rev() {
             let cur_level = make_level(level);
-            ep = greedy_search_borrowed(
+            let (next, level_comparisons) = greedy_search_borrowed(
                 &cur_level,
                 ep,
                 dist_calc,
                 self.inner.params.prefetch_distance,
             );
+            ep = next;
+            comparisons += level_comparisons;
         }
         let mut visited = visited_generator.generate(storage_len);
-        beam_search_borrowed(
+        let (results, beam_comparisons) = beam_search_borrowed(
             &bottom,
             &ep,
             params,
@@ -411,12 +446,15 @@ impl HNSW {
             bitset,
             prefetch_distance,
             &mut visited,
+        );
+        comparisons += beam_comparisons;
+        (
+            results.into_iter().take(k).collect::<Vec<OrderedNode>>(),
+            comparisons,
         )
-        .into_iter()
-        .take(k)
-        .collect::<Vec<OrderedNode>>()
     }
 
+    /// Returns the top-`k` results and the number of distances computed.
     #[instrument(level = "debug", skip(self, query, bitset, storage))]
     pub fn search_basic(
         &self,
@@ -425,7 +463,7 @@ impl HNSW {
         params: &HnswQueryParams,
         bitset: Option<Visited>,
         storage: &impl VectorStore,
-    ) -> Result<Vec<OrderedNode>> {
+    ) -> Result<(Vec<OrderedNode>, usize)> {
         let mut visited_generator = self
             .inner
             .visited_generator_queue
@@ -438,7 +476,7 @@ impl HNSW {
             bitset,
             &mut visited_generator,
             storage,
-            Some(2),
+            self.inner.params.prefetch_distance,
         );
 
         match self.inner.visited_generator_queue.push(visited_generator) {
@@ -453,6 +491,8 @@ impl HNSW {
 
     /// Like [Self::search_basic] but the bottom level runs
     /// [beam_search_acorn], which only scores mask-passing nodes.
+    ///
+    /// Also returns the number of distances computed.
     pub fn search_acorn(
         &self,
         query: ArrayRef,
@@ -460,7 +500,7 @@ impl HNSW {
         params: &HnswQueryParams,
         bitset: &Visited,
         storage: &impl VectorStore,
-    ) -> Result<Vec<OrderedNode>> {
+    ) -> Result<(Vec<OrderedNode>, usize)> {
         let mut visited_generator = self
             .inner
             .visited_generator_queue
@@ -480,7 +520,7 @@ impl HNSW {
             &mut visited_generator,
             &mut expanded_generator,
             storage,
-            Some(2),
+            self.inner.params.prefetch_distance,
         );
 
         // if the queue is full, we just don't push it back, so ignore the error here
@@ -500,12 +540,13 @@ impl HNSW {
         expanded_generator: &mut VisitedGenerator,
         storage: &impl VectorStore,
         prefetch_distance: Option<usize>,
-    ) -> Result<Vec<OrderedNode>> {
+    ) -> Result<(Vec<OrderedNode>, usize)> {
+        self.ensure_storage_covers_graph(storage)?;
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let entry = self.inner.entry_point;
         let ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
 
-        let result = match &self.inner.graph {
+        let (result, comparisons) = match &self.inner.graph {
             HnswGraph::Built(nodes) => {
                 let nodes = nodes.as_slice();
                 self.run_search_acorn(
@@ -537,7 +578,8 @@ impl HNSW {
                 )
             }
         };
-        Ok(result.into_iter().take(k).collect())
+        // the entry point distance is computed above, outside the traversal
+        Ok((result.into_iter().take(k).collect(), comparisons + 1))
     }
 
     /// [Self::run_search] for the ACORN traversal: same level descent, but
@@ -555,7 +597,7 @@ impl HNSW {
         dist_calc: &impl DistCalculator,
         make_level: impl Fn(u16) -> L,
         bottom: B,
-    ) -> Vec<OrderedNode>
+    ) -> (Vec<OrderedNode>, usize)
     where
         L: BorrowingGraph,
         B: BorrowingGraph,
@@ -563,18 +605,21 @@ impl HNSW {
         // Same level descent as [Self::run_search]: greedy stops at level 1
         // (see the comment there); level 0 is left to the beam below.
         let mut ep = ep;
+        let mut comparisons = 0;
         for level in (1..self.max_level()).rev() {
             let cur_level = make_level(level);
-            ep = greedy_search_borrowed(
+            let (next, level_comparisons) = greedy_search_borrowed(
                 &cur_level,
                 ep,
                 dist_calc,
                 self.inner.params.prefetch_distance,
             );
+            ep = next;
+            comparisons += level_comparisons;
         }
         let mut visited = visited_generator.generate(storage_len);
         let mut expanded = expanded_generator.generate(storage_len);
-        beam_search_acorn(
+        let (results, beam_comparisons) = beam_search_acorn(
             &bottom,
             &ep,
             params,
@@ -583,7 +628,8 @@ impl HNSW {
             prefetch_distance,
             &mut visited,
             &mut expanded,
-        )
+        );
+        (results, comparisons + beam_comparisons)
     }
 
     #[instrument(level = "debug", skip(self, storage, query, prefilter_bitset))]
@@ -594,9 +640,11 @@ impl HNSW {
         k: usize,
         prefilter_bitset: Visited,
         params: &HnswQueryParams,
-    ) -> Vec<OrderedNode> {
+    ) -> (Vec<OrderedNode>, usize) {
         let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
         let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
+        // every set bit gets exactly one distance on both branches below
+        let comparisons = prefilter_bitset.count_ones();
 
         let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let mut heap = BinaryHeap::<OrderedNode>::with_capacity(k);
@@ -622,7 +670,7 @@ impl HNSW {
                     }
 
                     let dist: OrderedFloat = dist_calc.distance(node_id).into();
-                    if dist <= lower_bound || dist > upper_bound {
+                    if dist < lower_bound || dist >= upper_bound {
                         continue;
                     }
                     if heap.len() < k {
@@ -636,7 +684,7 @@ impl HNSW {
             _ => {
                 for node_id in prefilter_bitset.iter_ones().map(|i| i as u32) {
                     let dist: OrderedFloat = dist_calc.distance(node_id).into();
-                    if dist <= lower_bound || dist > upper_bound {
+                    if dist < lower_bound || dist >= upper_bound {
                         continue;
                     }
                     if heap.len() < k {
@@ -648,7 +696,7 @@ impl HNSW {
                 }
             }
         };
-        heap.into_sorted_vec()
+        (heap.into_sorted_vec(), comparisons)
     }
 
     /// Returns the metadata of this [`HNSW`].
@@ -806,7 +854,7 @@ impl HnswBuilder {
         // ```
         for level in (target_level + 1..=entry_level).rev() {
             let cur_level = HnswLevelView::new(level, nodes);
-            ep = greedy_search(&cur_level, ep, &dist_calc, self.params.prefetch_distance);
+            ep = greedy_search(&cur_level, ep, &dist_calc, self.params.prefetch_distance).0;
         }
 
         let mut pruned_neighbors_per_level: Vec<Vec<_>> =
@@ -872,6 +920,23 @@ impl HnswBuilder {
             self.params.prefetch_distance,
             &mut visited,
         )
+        .0
+    }
+
+    /// Give every node an inbound path from the entry point on level 0.
+    ///
+    /// See [`connect_stranded_level0`]. Called after the parallel insert.
+    /// Remap repair calls that function on the repaired level-0 edges.
+    fn connect_stranded_nodes(&self, storage: &impl VectorStore) {
+        let mut level0 = BuilderLevel0 {
+            nodes: self.nodes.as_slice(),
+        };
+        connect_stranded_level0(
+            &mut level0,
+            self.entry_point,
+            self.params.ef_construction,
+            storage,
+        );
     }
 
     fn prune(
@@ -892,6 +957,205 @@ impl HnswBuilder {
             select_neighbors_heuristic_owned(storage, level_neighbors, max_connections);
         builder_node.update_from_ranked_neighbors(level);
     }
+}
+
+/// Level-0 graph [`connect_stranded_level0`] reads and extends.
+///
+/// `neighbors` returns the list search walks. `ranked` returns those edges
+/// with distances. `link` appends one edge and does not drop a neighbor.
+pub(crate) trait Level0Links {
+    fn len(&self) -> usize;
+    fn neighbors(&self, id: u32) -> Arc<Vec<u32>>;
+    fn ranked(&self, id: u32) -> Vec<OrderedNode>;
+    fn link(&mut self, anchor: OrderedNode, node: u32);
+}
+
+struct BuilderLevel0<'a> {
+    nodes: &'a [RwLock<GraphBuilderNode>],
+}
+
+impl Level0Links for BuilderLevel0<'_> {
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn neighbors(&self, id: u32) -> Arc<Vec<u32>> {
+        self.nodes[id as usize].read().unwrap().level_neighbors[0].clone()
+    }
+
+    fn ranked(&self, id: u32) -> Vec<OrderedNode> {
+        self.nodes[id as usize]
+            .read()
+            .unwrap()
+            .level_neighbors_ranked[0]
+            .clone()
+    }
+
+    fn link(&mut self, anchor: OrderedNode, node: u32) {
+        let mut anchor_node = self.nodes[anchor.id as usize].write().unwrap();
+        anchor_node.add_neighbor(node, anchor.dist, 0);
+        anchor_node.update_from_ranked_neighbors(0);
+    }
+}
+
+/// Give every node an inbound path from the entry point on level 0.
+///
+/// A query only ever enumerates level 0, so a node without a level-0 path
+/// from the entry point can never be returned by a graph traversal.
+/// Parallel insertion cannot rule that out: a node picks its neighbors
+/// from the graph it searched, and by the time its reciprocal edges are
+/// written those neighbors may have filled up with closer nodes and pruned
+/// it straight back out, leaving it with no inbound edge at all. A node
+/// inserted while the graph was still nearly empty is the usual victim:
+/// its only neighbors are the first few hubs, and hubs fill up first.
+/// Nothing inserted afterwards can rediscover such a node, since discovery
+/// only happens by traversal. Remap repair can open the same hole when it
+/// trims a reciprocal edge that was a node's only inbound link.
+///
+/// The level-0 graph is walked once from the entry point, and every stranded
+/// node is linked from a reachable node near it. The work is bounded
+/// explicitly, because degenerate data (many identical vectors) can strand
+/// most of the graph and an unbounded per-node search would then cost more
+/// than the build itself:
+///
+/// - The audit and the bookkeeping are `O(N + E)`: a stranded node is
+///   anchored on its nearest reachable out-neighbor, and a node whose
+///   out-neighbors are all stranded waits until one of them is linked.
+/// - The anchor is refined by a greedy walk over reachable nodes of at
+///   most `ef_construction` hops, so a node costs at most
+///   `ef_construction * 2 * m` distance computations.
+/// - Every node anchors at most one stranded node, so a level-0 list never
+///   exceeds `2 * m + 1`. Once the candidates near a node are all taken, it
+///   chains onto the most recently linked node instead, which has room by
+///   construction.
+///
+/// The anchor is allowed that one extra edge rather than evicting a
+/// neighbor, which could strand that neighbor in turn.
+pub(crate) fn connect_stranded_level0<G: Level0Links, S: VectorStore>(
+    graph: &mut G,
+    entry_point: u32,
+    ef_construction: usize,
+    storage: &S,
+) {
+    let n = graph.len();
+    let mut reachable = vec![false; n];
+    mark_level0_reachable(graph, entry_point, &mut reachable);
+
+    let stranded: Vec<u32> = (0..n as u32)
+        .filter(|node| !reachable[*node as usize])
+        .collect();
+    if stranded.is_empty() {
+        return;
+    }
+
+    // Stranded nodes keyed by the stranded out-neighbors they wait on.
+    let mut waiting_on: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &node in &stranded {
+        for &neighbor in graph.neighbors(node).iter() {
+            if !reachable[neighbor as usize] {
+                waiting_on.entry(neighbor).or_default().push(node);
+            }
+        }
+    }
+
+    let mut anchored = vec![false; n];
+    // The most recently linked node that has not anchored anything yet.
+    let mut chain_tail: Option<u32> = None;
+    let mut isolated = Vec::new();
+    let mut ready: VecDeque<u32> = stranded.iter().copied().collect();
+    while let Some(node) = ready.pop_front() {
+        if reachable[node as usize] {
+            continue;
+        }
+        let dist_calc = storage.dist_calculator_from_id(node);
+        let mut candidates: Vec<OrderedNode> = graph
+            .ranked(node)
+            .into_iter()
+            .filter(|neighbor| reachable[neighbor.id as usize])
+            .collect();
+        let Some(nearest) = candidates.iter().min().cloned() else {
+            isolated.push(node);
+            continue;
+        };
+
+        // Walk toward the node over reachable nodes only; the walk is
+        // capped so that it cannot degenerate into a graph-wide search.
+        let mut closest = nearest.clone();
+        for _ in 0..ef_construction {
+            let step = graph
+                .neighbors(closest.id)
+                .iter()
+                .filter(|neighbor| reachable[**neighbor as usize])
+                .map(|&neighbor| OrderedNode::new(neighbor, dist_calc.distance(neighbor).into()))
+                .min();
+            match step {
+                Some(step) if step.dist < closest.dist => closest = step,
+                _ => break,
+            }
+        }
+
+        candidates.sort_unstable();
+        let anchor = std::iter::once(closest)
+            .chain(candidates)
+            .find(|candidate| !anchored[candidate.id as usize])
+            .or_else(|| {
+                chain_tail.map(|tail| OrderedNode::new(tail, dist_calc.distance(tail).into()))
+            })
+            .unwrap_or(nearest);
+        graph.link(anchor.clone(), node);
+        anchored[anchor.id as usize] = true;
+        chain_tail = Some(node);
+        for newly_reachable in mark_level0_reachable(graph, node, &mut reachable) {
+            if let Some(waiting) = waiting_on.remove(&newly_reachable) {
+                ready.extend(waiting);
+            }
+        }
+    }
+
+    // Nodes whose out-edges never lead back to the entry point have no
+    // nearby anchor to offer; chain them onto the last linked node.
+    for node in isolated {
+        if reachable[node as usize] {
+            continue;
+        }
+        let anchor = chain_tail.unwrap_or(entry_point);
+        let anchor = OrderedNode::new(anchor, storage.dist_between(anchor, node).into());
+        graph.link(anchor.clone(), node);
+        anchored[anchor.id as usize] = true;
+        chain_tail = Some(node);
+        mark_level0_reachable(graph, node, &mut reachable);
+    }
+
+    log::debug!(
+        "Linked {} HNSW node(s) that had no level-0 path from the entry point",
+        stranded.len()
+    );
+}
+
+/// Marks everything the walk reaches from `start` and returns the nodes that
+/// were not reachable before.
+fn mark_level0_reachable<G: Level0Links>(
+    graph: &G,
+    start: u32,
+    reachable: &mut [bool],
+) -> Vec<u32> {
+    let mut newly_reachable = Vec::new();
+    if reachable[start as usize] {
+        return newly_reachable;
+    }
+    let mut queue = VecDeque::new();
+    reachable[start as usize] = true;
+    queue.push_back(start);
+    while let Some(current) = queue.pop_front() {
+        newly_reachable.push(current);
+        for &neighbor in graph.neighbors(current).iter() {
+            if !reachable[neighbor as usize] {
+                reachable[neighbor as usize] = true;
+                queue.push_back(neighbor);
+            }
+        }
+    }
+    newly_reachable
 }
 
 // View of a level in HNSW graph.
@@ -998,6 +1262,60 @@ enum LevelLookup {
     Sparse(HashMap<u32, u32>),
 }
 
+/// Drop neighbor ids that name no node in this graph.
+///
+/// A writer that read adjacency live while snapshotting a node count could
+/// persist edges past its own node count, and those indices are already on
+/// disk. Traversal scores a neighbor id before it is ever looked up as a node,
+/// so a guard at the lookup is too late -- the id has to be gone before search
+/// begins.
+///
+/// Returns the original array untouched when every id is in domain, which is
+/// the only case that matters for cost: the ids stay zero-copy views of the
+/// loaded batch and nothing is allocated. `to_batch()` still returns the
+/// retained batch verbatim, so a filtered edge is dropped for this reader
+/// without rewriting what is on disk.
+fn neighbors_within_domain(neighbors: &ListArray, node_count: usize) -> (ListArray, usize) {
+    // Ids are `u32` on the wire, so a node count past `u32::MAX` cannot be
+    // addressed by one; clamping keeps every id in domain rather than wrapping.
+    let node_count = u32::try_from(node_count).unwrap_or(u32::MAX);
+    let values = neighbors.values().as_primitive::<UInt32Type>();
+    // Each level is a slice of the concatenated batch and `values()` hands back
+    // the whole child array regardless, so bound the scan to this array's own
+    // offset window. Scanning all of it would count another level's ids, put a
+    // clean level on the rebuild path, and report a count that is not this
+    // level's.
+    let offsets = neighbors.offsets();
+    let start = offsets[0] as usize;
+    let end = offsets[offsets.len() - 1] as usize;
+    let dropped = values.values()[start..end]
+        .iter()
+        .filter(|&&id| id >= node_count)
+        .count();
+    if dropped == 0 {
+        return (neighbors.clone(), 0);
+    }
+
+    let mut builder = ListBuilder::with_capacity(UInt32Builder::new(), neighbors.len());
+    for row in 0..neighbors.len() {
+        if neighbors.is_null(row) {
+            builder.append_null();
+            continue;
+        }
+        let row_ids = neighbors.value(row);
+        let row_ids = row_ids.as_primitive::<UInt32Type>();
+        builder.append_value(
+            row_ids
+                .values()
+                .iter()
+                .copied()
+                .filter(|&id| id < node_count)
+                .map(Some),
+        );
+    }
+    (builder.finish(), dropped)
+}
+
 /// A search-only HNSW graph backed directly by the Arrow buffers of the
 /// on-disk `RecordBatch`.
 ///
@@ -1019,6 +1337,10 @@ struct LoadedHnswGraph {
     level_lookup: Vec<LevelLookup>,
     /// Number of nodes present at each level (`level_count[0]` == total).
     level_count: Vec<usize>,
+    /// Bytes in `level_neighbors` that are *not* views into `batch`, from a
+    /// level rebuilt to drop out-of-domain ids. Zero for a clean index, which
+    /// keeps every level zero-copy.
+    owned_neighbor_bytes: usize,
 }
 
 impl DeepSizeOf for LoadedHnswGraph {
@@ -1028,7 +1350,11 @@ impl DeepSizeOf for LoadedHnswGraph {
         // `vector/flat/storage.rs`). The upper-level `level_lookup` maps are
         // sized to the geometrically-shrinking node counts above level 0 --
         // negligible next to the batch and not separately accounted here.
-        self.batch.get_array_memory_size()
+        //
+        // A level rebuilt to drop out-of-domain ids owns its buffers instead,
+        // so those bytes are counted on top: they are real and the cache sizes
+        // itself from this number.
+        self.batch.get_array_memory_size() + self.owned_neighbor_bytes
     }
 }
 
@@ -1038,6 +1364,14 @@ impl LoadedHnswGraph {
     #[inline]
     fn neighbors_at(&self, level: usize, key: u32) -> &[u32] {
         let row = match &self.level_lookup[level] {
+            // `Dense` means row == id, so an id at or beyond the level's row
+            // count addresses nothing. The writers now bound what they emit to
+            // the prefix they publish, but indices written before that are
+            // already on disk, and following such an edge panicked the search
+            // instead of degrading it. Treat it exactly like an absent node: no
+            // neighbors, so greedy search stays put and descends, losing one
+            // edge rather than the whole query.
+            LevelLookup::Dense if key as usize >= self.level_count[level] => return &[],
             LevelLookup::Dense => key as usize,
             LevelLookup::Sparse(id_to_row) => match id_to_row.get(&key) {
                 Some(&row) => row as usize,
@@ -1150,6 +1484,9 @@ impl DeepSizeOf for HnswGraph {
     }
 }
 
+/// Lower bound for the search-time `ef` when the caller does not set one.
+pub const DEFAULT_MIN_EF: usize = 256;
+
 #[derive(Debug, Clone, Copy)]
 pub struct HnswQueryParams {
     pub ef: usize,
@@ -1163,7 +1500,7 @@ impl From<&Query> for HnswQueryParams {
     fn from(query: &Query) -> Self {
         let k = query.k * query.refine_factor.unwrap_or(1) as usize;
         Self {
-            ef: query.ef.unwrap_or(k + k / 2),
+            ef: query.ef.unwrap_or_else(|| (k + k / 2).max(DEFAULT_MIN_EF)),
             lower_bound: query.lower_bound,
             upper_bound: query.upper_bound,
             dist_q_c: query.dist_q_c,
@@ -1175,6 +1512,17 @@ impl From<&Query> for HnswQueryParams {
 impl IvfSubIndex for HNSW {
     type BuildParams = HnswBuildParams;
     type QueryParams = HnswQueryParams;
+
+    fn empty_partition_metadata(build_params: Option<&Self::BuildParams>) -> Option<String> {
+        let params = build_params.cloned().unwrap_or_default();
+        let max_level = params.max_level;
+        let metadata = HnswMetadata {
+            entry_point: 0,
+            params,
+            level_offsets: vec![0; max_level as usize + 1],
+        };
+        Some(serde_json::to_string(&metadata).expect("valid HnswMetadata always serializes"))
+    }
 
     fn load(data: RecordBatch) -> Result<Self>
     where
@@ -1215,10 +1563,18 @@ impl IvfSubIndex for HNSW {
         // need it, and `to_batch()` returns the retained `data` verbatim.
         let mut level_neighbors = Vec::with_capacity(level_batches.len());
         let mut level_lookup = Vec::with_capacity(level_batches.len());
+        let mut dropped_edges = 0usize;
+        let mut owned_neighbor_bytes = 0usize;
         for (level, batch) in level_batches.iter().enumerate() {
             // `.clone()` on an Arrow array bumps a refcount; buffers stay
             // shared with `data` (zero copy).
             let neighbors = batch[NEIGHBORS_COL].as_list::<i32>().clone();
+            let (neighbors, dropped) = neighbors_within_domain(&neighbors, level_count[0]);
+            if dropped > 0 {
+                // Rebuilt, so it no longer borrows `batch`; see `DeepSizeOf`.
+                owned_neighbor_bytes += neighbors.get_array_memory_size();
+            }
+            dropped_edges += dropped;
             let ids = batch[VECTOR_ID_COL].as_primitive::<UInt32Type>();
             if level == 0 {
                 // `to_batch` writes every node at level 0 exactly once in
@@ -1259,6 +1615,17 @@ impl IvfSubIndex for HNSW {
             level_neighbors.push(neighbors);
         }
 
+        if dropped_edges > 0 {
+            // Dropped, not rejected: an edge to a node this graph does not hold
+            // costs one edge, where refusing the batch costs every query over
+            // it. The entry point below is refused instead, because search
+            // cannot start without it.
+            log::warn!(
+                "HNSW batch carried {dropped_edges} neighbor id(s) outside its                  {} nodes; dropping them for this reader",
+                level_count[0]
+            );
+        }
+
         // `entry_point` is read from untrusted metadata and indexes the `Dense`
         // level-0 lookup directly; an out-of-range value would read past the
         // level-0 neighbor buffer during search. Validate it under the same
@@ -1286,6 +1653,7 @@ impl IvfSubIndex for HNSW {
             level_neighbors,
             level_lookup,
             level_count: level_count.clone(),
+            owned_neighbor_bytes,
         };
         let inner = HnswCore {
             params: hnsw_metadata.params,
@@ -1327,7 +1695,7 @@ impl IvfSubIndex for HNSW {
         Some(&[VECTOR_ID_COL, NEIGHBORS_COL])
     }
 
-    #[instrument(level = "debug", skip(self, query, storage, prefilter, _metrics))]
+    #[instrument(level = "debug", skip(self, query, storage, prefilter, metrics))]
     fn search(
         &self,
         query: ArrayRef,
@@ -1335,7 +1703,7 @@ impl IvfSubIndex for HNSW {
         params: Self::QueryParams,
         storage: &impl VectorStore,
         prefilter: Arc<dyn PreFilter>,
-        _metrics: &dyn MetricsCollector,
+        metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         if params.ef < k {
             return Err(Error::index(
@@ -1353,7 +1721,7 @@ impl IvfSubIndex for HNSW {
             .visited_generator_queue
             .pop()
             .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
-        let results = if prefilter.is_empty() {
+        let (results, comparisons) = if prefilter.is_empty() {
             self.search_basic(query, k, &params, None, storage)?
         } else {
             // the bitset must be moved into a callee on every path so its
@@ -1372,22 +1740,26 @@ impl IvfSubIndex for HNSW {
                 // few matching rows: brute force is cheaper and exact
                 self.flat_search(storage, query, k, prefilter_bitset, &params)
             } else if params.use_acorn {
-                let acorn_results =
+                let (acorn_results, acorn_comparisons) =
                     self.search_acorn(query.clone(), k, &params, &prefilter_bitset, storage)?;
                 // under-delivery means the budget ran out on a fragmented
                 // mask, except range-bounded queries which return short
                 // legitimately
                 let bounded = params.lower_bound.is_some() || params.upper_bound.is_some();
                 if !bounded && acorn_results.len() < k.min(remained) {
-                    self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?
+                    // the abandoned ACORN traversal still cost its distances
+                    let (results, basic_comparisons) =
+                        self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?;
+                    (results, acorn_comparisons + basic_comparisons)
                 } else {
                     drop(prefilter_bitset);
-                    acorn_results
+                    (acorn_results, acorn_comparisons)
                 }
             } else {
                 self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?
             }
         };
+        metrics.record_comparisons(comparisons);
         // if the queue is full, we just don't push it back, so ignore the error here
         let _ = self.inner.visited_generator_queue.push(prefilter_generator);
 
@@ -1444,6 +1816,7 @@ impl IvfSubIndex for HNSW {
             );
 
         assert_eq!(builder.level_count[0].load(Ordering::Relaxed), len);
+        builder.connect_stranded_nodes(storage);
         Ok(builder.finish())
     }
 
@@ -1538,21 +1911,25 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Float32Type;
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt32Array,
     };
-    use arrow_schema::Schema;
+    use arrow_schema::{Schema, SchemaRef};
+    use async_trait::async_trait;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::{Error, deepsize::DeepSizeOf};
+    use lance_core::{Error, Result, deepsize::DeepSizeOf};
     use lance_file::versions::v1::{
         reader::FileReader as V1FileReader,
         writer::{FileWriter as V1FileWriter, FileWriterOptions as V1FileWriterOptions},
     };
     use lance_io::object_store::ObjectStore;
     use lance_linalg::distance::DistanceType;
+    use lance_select::{RowAddrMask, RowAddrTreeMap};
     use lance_table::format::SelfDescribingFileReader;
     use lance_table::io::manifest::ManifestDescribing;
-    use lance_testing::datagen::generate_random_array;
+    use lance_testing::datagen::{generate_random_array, generate_random_array_with_seed};
     use object_store::path::Path;
     use rand::{Rng, SeedableRng, rngs::SmallRng};
     use rstest::rstest;
@@ -1561,15 +1938,18 @@ mod tests {
         HNSW_LEVEL_RNG_SEED, HNSW_METADATA_KEY, HnswBuilder, HnswGraph, ImmutableHnswBottomView,
         ImmutableHnswLevelView, MIN_HNSW_M, random_level_with,
     };
+    use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
+    use crate::prefilter::{NoFilter, PreFilter};
+    use crate::vector::Query;
     use crate::vector::graph::builder::GraphBuilderNode;
     use crate::vector::storage::{DistCalculator, VectorStore};
     use crate::vector::v3::subindex::IvfSubIndex;
     use crate::vector::{
-        flat::storage::{FlatBinStorage, FlatFloatStorage},
+        flat::storage::{FlatBinStorage, FlatFloatDistanceCalc, FlatFloatStorage},
         graph::{DISTS_FIELD, NEIGHBORS_FIELD, OrderedNode, VisitedGenerator},
         hnsw::{
             HNSW, HnswMetadata, VECTOR_ID_FIELD,
-            builder::{HnswBuildParams, HnswQueryParams},
+            builder::{DEFAULT_MIN_EF, HnswBuildParams, HnswQueryParams},
         },
     };
 
@@ -1581,6 +1961,29 @@ mod tests {
         );
         let schema = batch.schema().as_ref().clone().with_metadata(metadata);
         RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec()).unwrap()
+    }
+
+    struct MaskPreFilter {
+        mask: Arc<RowAddrMask>,
+    }
+
+    #[async_trait]
+    impl PreFilter for MaskPreFilter {
+        async fn wait_for_ready(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_empty(&self) -> bool {
+            false
+        }
+
+        fn mask(&self) -> Arc<RowAddrMask> {
+            self.mask.clone()
+        }
+
+        fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+            self.mask.selected_indices(row_ids)
+        }
     }
 
     #[tokio::test]
@@ -1637,10 +2040,10 @@ mod tests {
             dist_q_c: 0.0,
             use_acorn: false,
         };
-        let builder_results = builder
+        let (builder_results, _) = builder
             .search_basic(query.clone(), k, &params, None, store.as_ref())
             .unwrap();
-        let loaded_results = loaded_hnsw
+        let (loaded_results, _) = loaded_hnsw
             .search_basic(query, k, &params, None, store.as_ref())
             .unwrap();
         assert_eq!(builder_results, loaded_results);
@@ -1699,10 +2102,10 @@ mod tests {
             dist_q_c: 0.0,
             use_acorn: false,
         };
-        let builder_results = builder
+        let (builder_results, _) = builder
             .search_basic(query.clone(), k, &params, None, store.as_ref())
             .unwrap();
-        let loaded_results = loaded_hnsw
+        let (loaded_results, _) = loaded_hnsw
             .search_basic(query, k, &params, None, store.as_ref())
             .unwrap();
         assert_eq!(builder_results, loaded_results);
@@ -1761,9 +2164,186 @@ mod tests {
         );
     }
 
-    /// The lowest accepted construction settings retain a useful graph, but
-    /// do not promise full reachability. This seeded floor makes that quality
-    /// trade-off explicit and guards against catastrophic fragmentation.
+    /// Every node must have a level-0 path from the entry point, which is what
+    /// [HnswBuilder::connect_stranded_nodes] guarantees after a build.
+    fn assert_all_reachable_on_level0(hnsw: &HNSW) {
+        let nodes = hnsw.nodes().unwrap();
+        let mut reachable = vec![false; nodes.len()];
+        let mut queue = std::collections::VecDeque::from([hnsw.metadata().entry_point]);
+        reachable[hnsw.metadata().entry_point as usize] = true;
+        while let Some(current) = queue.pop_front() {
+            for &neighbor in nodes[current as usize].bottom_neighbors.iter() {
+                if !reachable[neighbor as usize] {
+                    reachable[neighbor as usize] = true;
+                    queue.push_back(neighbor);
+                }
+            }
+        }
+        let stranded: Vec<usize> = (0..nodes.len()).filter(|id| !reachable[*id]).collect();
+        assert!(
+            stranded.is_empty(),
+            "nodes {stranded:?} are unreachable from the entry point on level 0"
+        );
+    }
+
+    /// Every level-0 list stays within `2 * m` plus the one edge a repair may
+    /// add, which is what bounds the degree of repaired graphs.
+    fn assert_level0_degree_bound(hnsw: &HNSW, m: usize) {
+        for (id, node) in hnsw.nodes().unwrap().iter().enumerate() {
+            let degree = node.level_neighbors[0].len();
+            assert!(
+                degree <= 2 * m + 1,
+                "node {id} has {degree} level-0 neighbors, more than 2 * {m} + 1"
+            );
+        }
+    }
+
+    /// A node that parallel construction left without any inbound level-0
+    /// edge is linked from a reachable node near it: its nearest reachable
+    /// out-neighbor, refined by walking toward the node. A full anchor takes
+    /// the one extra edge. Nodes that only become reachable through a repaired
+    /// node need no link of their own, and a node whose out-edges all lead to
+    /// stranded nodes waits for one of them to be linked, or is chained onto
+    /// the last repaired node when none ever is.
+    #[test]
+    fn test_connect_stranded_nodes_links_from_nearby_reachable_node() {
+        // Points on a line at x = id, except node 4 sits at 4.5 so that node 2
+        // is strictly the nearest reachable node to node 3.
+        let mut xs: Vec<f32> = (0..16).map(|id| id as f32).collect();
+        xs[4] = 4.5;
+        let values = Float32Array::from(xs.into_iter().flat_map(|x| [x, 0.0]).collect::<Vec<_>>());
+        let fsl = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let store = FlatFloatStorage::new(fsl, DistanceType::L2);
+        let params = HnswBuildParams::default()
+            .num_edges(MIN_HNSW_M)
+            .max_level(1);
+        let builder = HnswBuilder::with_params(params, &store);
+        assert_eq!(builder.entry_point, 0);
+        let set_neighbors = |id: u32, neighbors: &[u32]| {
+            let mut node = builder.nodes[id as usize].write().unwrap();
+            for &neighbor in neighbors {
+                node.add_neighbor(neighbor, store.dist_between(id, neighbor).into(), 0);
+            }
+            node.update_from_ranked_neighbors(0);
+        };
+        // Reachable: 0, 1, 2 and 4..=9. Node 2 is full (2 * MIN_HNSW_M edges).
+        set_neighbors(0, &[1]);
+        set_neighbors(1, &[0, 2]);
+        set_neighbors(2, &[1, 0, 4, 5, 6, 7, 8, 9]);
+        for id in 4..=9 {
+            set_neighbors(id, &[2]);
+        }
+        // Stranded, nearest reachable node is the full node 2.
+        set_neighbors(3, &[2]);
+        // Stranded pair: 10 is anchored on 9, 11 is reached through 10.
+        set_neighbors(10, &[9, 11]);
+        set_neighbors(11, &[10]);
+        // Stranded, only out-neighbor is 9, but walking from 9 reaches 11.
+        set_neighbors(12, &[9]);
+        // Stranded pair whose out-edges never lead back to the entry point.
+        set_neighbors(13, &[14]);
+        set_neighbors(14, &[13]);
+        // Stranded, only out-neighbor is the entry point, far away.
+        set_neighbors(15, &[0]);
+
+        builder.connect_stranded_nodes(&store);
+
+        let hnsw = builder.finish();
+        assert_all_reachable_on_level0(&hnsw);
+        assert_level0_degree_bound(&hnsw, MIN_HNSW_M);
+        let nodes = hnsw.nodes().unwrap();
+        let level0 = |id: usize| nodes[id].level_neighbors[0].as_slice().to_vec();
+        let inbound = |id: u32| -> Vec<usize> {
+            (0..nodes.len())
+                .filter(|other| nodes[*other].level_neighbors[0].contains(&id))
+                .collect()
+        };
+        // 3: the full node 2 takes the extra edge.
+        assert_eq!(level0(2), vec![1, 0, 4, 5, 6, 7, 8, 9, 3]);
+        // 10: anchored on 9; 11 becomes reachable through 10 with no new edge.
+        assert_eq!(level0(9), vec![2, 10]);
+        assert_eq!(inbound(11), vec![10]);
+        // 12: the walk from 9 continues through 10 to 11.
+        assert_eq!(level0(11), vec![10, 12]);
+        // 15: the walk from the entry point ends at 12, the closest reachable node.
+        assert_eq!(level0(12), vec![9, 15]);
+        // 13: never reachable through its own edges, chained onto the last
+        // repaired node; 14 becomes reachable through 13 with no new edge.
+        assert_eq!(level0(15), vec![0, 13]);
+        assert_eq!(inbound(14), vec![13]);
+    }
+
+    /// Every node anchors at most one stranded node. When the nodes near a
+    /// stranded node have all anchored one already, it chains onto the most
+    /// recently repaired node instead of growing an anchor further.
+    #[test]
+    fn test_connect_stranded_nodes_anchors_each_node_once() {
+        let values = Float32Array::from(vec![
+            0.0, 0.0, // entry point
+            1.0, 0.0, // reachable
+            0.0, 5.0, // stranded, anchored on 0
+            5.0, 0.0, // stranded, anchored on 1
+            0.0, -5.0, // stranded, 0 is the closest node but already an anchor
+        ]);
+        let fsl = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let store = FlatFloatStorage::new(fsl, DistanceType::L2);
+        let params = HnswBuildParams::default()
+            .num_edges(MIN_HNSW_M)
+            .max_level(1);
+        let builder = HnswBuilder::with_params(params, &store);
+        assert_eq!(builder.entry_point, 0);
+        let set_neighbors = |id: u32, neighbors: &[u32]| {
+            let mut node = builder.nodes[id as usize].write().unwrap();
+            for &neighbor in neighbors {
+                node.add_neighbor(neighbor, store.dist_between(id, neighbor).into(), 0);
+            }
+            node.update_from_ranked_neighbors(0);
+        };
+        set_neighbors(0, &[1]);
+        set_neighbors(1, &[0]);
+        for id in 2..=4 {
+            set_neighbors(id, &[0]);
+        }
+
+        builder.connect_stranded_nodes(&store);
+
+        let hnsw = builder.finish();
+        assert_all_reachable_on_level0(&hnsw);
+        let nodes = hnsw.nodes().unwrap();
+        assert_eq!(*nodes[0].level_neighbors[0], vec![1, 2]);
+        assert_eq!(*nodes[1].level_neighbors[0], vec![0, 3]);
+        assert_eq!(*nodes[3].level_neighbors[0], vec![0, 4]);
+    }
+
+    /// Identical or nearly identical vectors strand most of the graph, since
+    /// pruning keeps the same few ids everywhere. The repair still has to
+    /// finish in linear time and keep every level-0 list within `2 * m + 1`.
+    #[rstest]
+    #[case::identical(1)]
+    #[case::few_distinct(3)]
+    fn test_degenerate_vectors_stay_reachable_within_degree_bound(#[case] distinct: usize) {
+        const TOTAL: usize = 2000;
+        let values = Float32Array::from(
+            (0..TOTAL)
+                .flat_map(|id| [(id % distinct) as f32, 0.0])
+                .collect::<Vec<_>>(),
+        );
+        let fsl = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        let store = FlatFloatStorage::new(fsl, DistanceType::L2);
+        let hnsw = HNSW::index_vectors(
+            &store,
+            HnswBuildParams::default()
+                .num_edges(MIN_HNSW_M)
+                .ef_construction(MIN_HNSW_M),
+        )
+        .unwrap();
+        assert_all_reachable_on_level0(&hnsw);
+        assert_level0_degree_bound(&hnsw, MIN_HNSW_M);
+    }
+
+    /// The lowest accepted construction settings keep every node reachable on
+    /// level 0, and the greedy descent still lands close enough for a full
+    /// enumeration to cover nearly all of them.
     #[test]
     fn test_minimum_params_reachability() {
         const DIM: usize = 32;
@@ -1783,7 +2363,8 @@ mod tests {
                 .ef_construction(MIN_HNSW_M),
         )
         .unwrap();
-        let results = hnsw
+        assert_all_reachable_on_level0(&hnsw);
+        let (results, _) = hnsw
             .search_basic(
                 vectors.value(0),
                 TOTAL,
@@ -1917,10 +2498,10 @@ mod tests {
         };
         let query = fsl.value(0);
 
-        let builder_results = builder
+        let (builder_results, _) = builder
             .search_basic(query.clone(), k, &params, None, store.as_ref())
             .unwrap();
-        let loaded_results = loaded
+        let (loaded_results, _) = loaded
             .search_basic(query.clone(), k, &params, None, store.as_ref())
             .unwrap();
         assert_eq!(builder_results, loaded_results);
@@ -2017,7 +2598,7 @@ mod tests {
         let ep = OrderedNode::new(0, dist_calc.distance(0).into());
         let mut visited_generator = VisitedGenerator::new(N);
 
-        let results = hnsw.run_search(
+        let (results, _) = hnsw.run_search(
             ep.clone(),
             3,
             &query_params,
@@ -2047,7 +2628,7 @@ mod tests {
         }
         let mut expanded_generator = VisitedGenerator::new(N);
         calls.store(0, Ordering::Relaxed);
-        let results = hnsw.run_search_acorn(
+        let (results, _) = hnsw.run_search_acorn(
             ep,
             &query_params,
             &mask,
@@ -2128,7 +2709,7 @@ mod tests {
             for id in (0..TOTAL as u32).step_by(2) {
                 bitset.insert(id);
             }
-            let results = hnsw
+            let (results, _) = hnsw
                 .search_acorn(query.clone(), k, &params, &bitset, store.as_ref())
                 .unwrap();
             assert_eq!(results.len(), k);
@@ -2141,7 +2722,7 @@ mod tests {
         }
         assert_eq!(all_results[0], all_results[1]);
 
-        // default ef (k + k/2) and a deletion-style mask (all but a few rows)
+        // the pre-floor default and a deletion-style mask
         let default_ef_params = HnswQueryParams {
             ef: k + k / 2,
             ..params
@@ -2156,7 +2737,7 @@ mod tests {
                 brute_force_topk_masked(store.as_ref(), query.clone(), k, passes)
                     .into_iter()
                     .collect();
-            let results = builder
+            let (results, _) = builder
                 .search_acorn(
                     query.clone(),
                     k,
@@ -2173,41 +2754,121 @@ mod tests {
         }
     }
 
+    fn masked_prefilter(allowed: Vec<u64>) -> Arc<dyn PreFilter> {
+        Arc::new(MaskPreFilter {
+            mask: Arc::new(lance_select::RowAddrMask::from_allowed(
+                lance_select::RowAddrTreeMap::from_iter(allowed),
+            )),
+        })
+    }
+
+    /// Counts the distances a search actually computes, so a reported metric
+    /// can be checked against an independent oracle instead of a bound.
+    /// Prefetches are forwarded uncounted: they compute no distance, and the
+    /// default `prefetch_distance` keeps that path live.
+    #[derive(Clone)]
+    struct CountingStorage {
+        inner: FlatFloatStorage,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingStorage {
+        fn new(inner: FlatFloatStorage) -> Self {
+            Self {
+                inner,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        /// Distances computed since the previous call.
+        fn take(&self) -> usize {
+            self.calls.swap(0, Ordering::Relaxed)
+        }
+    }
+
+    struct CountingDistCalc<'a> {
+        inner: FlatFloatDistanceCalc<'a>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl DistCalculator for CountingDistCalc<'_> {
+        fn distance(&self, id: u32) -> f32 {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.distance(id)
+        }
+
+        fn distance_all(&self, k_hint: usize) -> Vec<f32> {
+            let dists = self.inner.distance_all(k_hint);
+            self.calls.fetch_add(dists.len(), Ordering::Relaxed);
+            dists
+        }
+
+        fn prefetch(&self, id: u32) {
+            self.inner.prefetch(id);
+        }
+    }
+
+    impl VectorStore for CountingStorage {
+        type DistanceCalculator<'a> = CountingDistCalc<'a>;
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn schema(&self) -> &SchemaRef {
+            self.inner.schema()
+        }
+
+        fn to_batches(&self) -> lance_core::Result<impl Iterator<Item = RecordBatch> + Send> {
+            self.inner.to_batches()
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn distance_type(&self) -> DistanceType {
+            self.inner.distance_type()
+        }
+
+        fn row_id(&self, id: u32) -> u64 {
+            self.inner.row_id(id)
+        }
+
+        fn row_ids(&self) -> impl Iterator<Item = &u64> {
+            self.inner.row_ids()
+        }
+
+        fn append_batch(
+            &self,
+            batch: RecordBatch,
+            vector_column: &str,
+        ) -> lance_core::Result<Self> {
+            Ok(Self {
+                inner: self.inner.append_batch(batch, vector_column)?,
+                calls: self.calls.clone(),
+            })
+        }
+
+        fn dist_calculator(&self, query: ArrayRef, dist_q_c: f32) -> Self::DistanceCalculator<'_> {
+            CountingDistCalc {
+                inner: self.inner.dist_calculator(query, dist_q_c),
+                calls: self.calls.clone(),
+            }
+        }
+
+        fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
+            CountingDistCalc {
+                inner: self.inner.dist_calculator_from_id(id),
+                calls: self.calls.clone(),
+            }
+        }
+    }
+
     /// Dispatch: dense prefilters take the graph traversal, sparse ones the
     /// exact flat scan, and both return only mask-passing row ids.
     #[tokio::test]
     async fn test_subindex_prefilter_dispatch() {
-        use arrow_array::cast::AsArray;
-        use async_trait::async_trait;
-        use lance_core::Result;
-        use lance_select::{RowAddrMask, RowAddrTreeMap};
-
-        use crate::metrics::NoOpMetricsCollector;
-        use crate::prefilter::PreFilter;
-
-        struct MaskPreFilter {
-            mask: Arc<RowAddrMask>,
-        }
-
-        #[async_trait]
-        impl PreFilter for MaskPreFilter {
-            async fn wait_for_ready(&self) -> Result<()> {
-                Ok(())
-            }
-            fn is_empty(&self) -> bool {
-                false
-            }
-            fn mask(&self) -> Arc<RowAddrMask> {
-                self.mask.clone()
-            }
-            fn filter_row_ids<'a>(
-                &self,
-                row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>,
-            ) -> Vec<u64> {
-                self.mask.selected_indices(row_ids)
-            }
-        }
-
         const DIM: usize = 32;
         const TOTAL: usize = 2048;
         let fsl =
@@ -2231,18 +2892,13 @@ mod tests {
                 dist_q_c: 0.0,
                 use_acorn,
             };
-            let filter = Arc::new(MaskPreFilter {
-                mask: Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
-                    allowed,
-                ))),
-            });
             let batch = hnsw
                 .search(
                     query_key.clone(),
                     k,
                     params,
                     store.as_ref(),
-                    filter,
+                    masked_prefilter(allowed),
                     &NoOpMetricsCollector,
                 )
                 .unwrap();
@@ -2262,7 +2918,7 @@ mod tests {
 
         // All-pass mask: shortcuts to the unfiltered path.
         let all: Vec<u64> = (0..TOTAL as u64).collect();
-        let unfiltered = hnsw
+        let (unfiltered, _) = hnsw
             .search_basic(
                 query_key.clone(),
                 k,
@@ -2295,6 +2951,237 @@ mod tests {
         let mut expected = truth;
         expected.sort_unstable();
         assert_eq!(got, expected);
+    }
+
+    #[rstest]
+    #[case::prefetch(Some(2))]
+    #[case::no_prefetch(None)]
+    fn test_distance_range_prefilter_dispatch(#[case] prefetch_distance: Option<usize>) {
+        const DIM: usize = 32;
+        const TOTAL: usize = 100;
+
+        let mut values = vec![0.0; TOTAL * DIM];
+        for row in 1..TOTAL {
+            values[row * DIM] = row as f32;
+        }
+        let fsl = FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM as i32)
+            .unwrap();
+        let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
+        let hnsw = HNSW::index_vectors(
+            store.as_ref(),
+            HnswBuildParams {
+                prefetch_distance,
+                ..HnswBuildParams::default()
+            },
+        )
+        .unwrap();
+        let query = fsl.value(0);
+
+        let search_row_ids = |allowed: Vec<u64>| {
+            let filter = Arc::new(MaskPreFilter {
+                mask: Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+                    allowed,
+                ))),
+            });
+            let batch = hnsw
+                .search(
+                    query.clone(),
+                    10,
+                    HnswQueryParams {
+                        ef: TOTAL,
+                        lower_bound: Some(0.0),
+                        upper_bound: Some(1.0),
+                        dist_q_c: 0.0,
+                        use_acorn: false,
+                    },
+                    store.as_ref(),
+                    filter,
+                    &NoOpMetricsCollector,
+                )
+                .unwrap();
+            batch[lance_core::ROW_ID]
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .values()
+                .to_vec()
+        };
+
+        // Sparse masks take the exact flat scan, while dense masks traverse
+        // the graph. Both must include the lower bound and exclude the upper.
+        assert_eq!(search_row_ids(vec![0, 1, 2]), vec![0]);
+        assert_eq!(search_row_ids((0..60).collect()), vec![0]);
+    }
+
+    /// Every dispatch path reports exactly the distances it computed: the
+    /// metric is compared against a [CountingStorage] oracle, so a dropped or
+    /// double-counted call fails even though the reported number itself is
+    /// graph-dependent.
+    #[tokio::test]
+    async fn test_search_reports_distance_comparisons() {
+        const DIM: usize = 32;
+        const TOTAL: usize = 2048;
+        let fsl = FixedSizeListArray::try_new_from_values(
+            generate_random_array_with_seed::<Float32Type>(TOTAL * DIM, [42; 32]),
+            DIM as i32,
+        )
+        .unwrap();
+        let store = FlatFloatStorage::new(fsl.clone(), DistanceType::L2);
+        let hnsw = HNSW::index_vectors(
+            &store,
+            HnswBuildParams::default().num_edges(20).ef_construction(50),
+        )
+        .unwrap();
+        // build through the plain storage, search through the counting one, so
+        // only query-time distances reach the oracle
+        let counting = CountingStorage::new(store);
+
+        let k = 10;
+        let query_key = fsl.value(0);
+        let reported = |prefilter: Arc<dyn PreFilter>, use_acorn: bool| {
+            counting.take();
+            let metrics = LocalMetricsCollector::default();
+            hnsw.search(
+                query_key.clone(),
+                k,
+                HnswQueryParams {
+                    ef: 50,
+                    lower_bound: None,
+                    upper_bound: None,
+                    dist_q_c: 0.0,
+                    use_acorn,
+                },
+                &counting,
+                prefilter,
+                &metrics,
+            )
+            .unwrap();
+            let reported = metrics.comparisons.load(Ordering::Relaxed);
+            let computed = counting.take();
+            assert_eq!(
+                reported, computed,
+                "reported {reported} distances, computed {computed} (use_acorn={use_acorn})"
+            );
+            reported
+        };
+
+        // Unfiltered graph traversal: exact against the oracle, and the point
+        // of the graph is to stay under a full scan.
+        let unfiltered = reported(Arc::new(NoFilter), false);
+        assert!(
+            (k..TOTAL).contains(&unfiltered),
+            "unfiltered comparisons {unfiltered} outside [{k}, {TOTAL})"
+        );
+
+        // A mask that passes every row is dispatched as unfiltered, so it must
+        // cost exactly the same.
+        let all: Vec<u64> = (0..TOTAL as u64).collect();
+        assert_eq!(reported(masked_prefilter(all), false), unfiltered);
+
+        // Sparse mask takes the exact flat scan, which scores every passing row
+        // once, so the count is also known up front.
+        let sparse: Vec<u64> = (0..TOTAL as u64).step_by(25).collect();
+        assert_eq!(
+            reported(masked_prefilter(sparse.clone()), false),
+            sparse.len()
+        );
+
+        // Dense mask, both graph traversals.
+        let dense: Vec<u64> = (0..TOTAL as u64).step_by(2).collect();
+        for use_acorn in [false, true] {
+            reported(masked_prefilter(dense.clone()), use_acorn);
+        }
+    }
+
+    /// When ACORN under-delivers, the query re-runs the basic traversal and the
+    /// reported count is the sum of both: the abandoned work was still paid for.
+    #[tokio::test]
+    async fn test_acorn_fallback_reports_both_traversals() {
+        const DIM: usize = 32;
+        const TOTAL: usize = 4096;
+        const STEP: usize = 9;
+        let fsl = FixedSizeListArray::try_new_from_values(
+            generate_random_array_with_seed::<Float32Type>(TOTAL * DIM, [42; 32]),
+            DIM as i32,
+        )
+        .unwrap();
+        let store = FlatFloatStorage::new(fsl.clone(), DistanceType::L2);
+        // ACORN scores only mask-passing nodes and bridges through masked ones
+        // on a budget of `ACORN_BRIDGE_BUDGET_FACTOR * ef`, so a thin mask
+        // starves it: at one row in `STEP` the budget runs out with a handful
+        // of passing nodes still unreached, and `MIN_HNSW_M` keeps the degree
+        // low enough for that to bite. Insertion runs in parallel, so build on
+        // a single-threaded pool: with the level RNG already seeded that makes
+        // the graph reproducible and keeps the fallback from being a coin flip.
+        let hnsw = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                HNSW::index_vectors(
+                    &store,
+                    HnswBuildParams::default()
+                        .num_edges(MIN_HNSW_M)
+                        .ef_construction(MIN_HNSW_M),
+                )
+            })
+            .unwrap();
+        let counting = CountingStorage::new(store);
+
+        let passing: Vec<u64> = (0..TOTAL as u64).step_by(STEP).collect();
+        let remained = passing.len();
+        // above the flat-scan threshold, so the query is dispatched to ACORN
+        assert!((TOTAL * 10 / 100..TOTAL).contains(&remained));
+        // `k.min(remained) == remained` demands every passing node, which the
+        // starved frontier cannot deliver in full, so the fallback fires
+        let k = remained;
+        let params = HnswQueryParams {
+            ef: k,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: true,
+        };
+        let query_key = fsl.value(0);
+
+        let mut generator = VisitedGenerator::new(TOTAL);
+        let mut bitset = generator.generate(TOTAL);
+        for id in &passing {
+            bitset.insert(*id as u32);
+        }
+        counting.take();
+        let (acorn_results, acorn_reported) = hnsw
+            .search_acorn(query_key.clone(), k, &params, &bitset, &counting)
+            .unwrap();
+        assert_eq!(acorn_reported, counting.take());
+        assert!(
+            acorn_results.len() < k.min(remained),
+            "ACORN delivered {} of {} demanded, so the fallback is no longer forced",
+            acorn_results.len(),
+            k.min(remained)
+        );
+        drop(bitset);
+
+        let mut bitset = generator.generate(TOTAL);
+        for id in &passing {
+            bitset.insert(*id as u32);
+        }
+        let (_, basic_reported) = hnsw
+            .search_basic(query_key.clone(), k, &params, Some(bitset), &counting)
+            .unwrap();
+        assert_eq!(basic_reported, counting.take());
+
+        let metrics = LocalMetricsCollector::default();
+        hnsw.search(
+            query_key,
+            k,
+            params,
+            &counting,
+            masked_prefilter(passing),
+            &metrics,
+        )
+        .unwrap();
+        let reported = metrics.comparisons.load(Ordering::Relaxed);
+        assert_eq!(reported, counting.take());
+        assert_eq!(reported, acorn_reported + basic_reported);
     }
 
     /// Every fresh `level_offsets` range must exactly delimit the rows emitted
@@ -2432,10 +3319,10 @@ mod tests {
         assert_eq!(query_indices.len(), 3);
         for query_index in query_indices {
             let query = fsl.value(query_index);
-            let builder_results = builder
+            let (builder_results, _) = builder
                 .search_basic(query.clone(), 10, &params, None, store.as_ref())
                 .unwrap();
-            let loaded_results = loaded
+            let (loaded_results, _) = loaded
                 .search_basic(query, 10, &params, None, store.as_ref())
                 .unwrap();
             assert_eq!(builder_results, loaded_results);
@@ -2481,6 +3368,178 @@ mod tests {
             HNSW::load(corrupted).is_err(),
             "load() must reject a misaligned level-0 __vector_id"
         );
+    }
+
+    /// A graph whose nodes outrun its storage must be refused, not faulted.
+    ///
+    /// Node ids are storage row numbers, so scoring a node past the last row
+    /// indexes out of bounds and panics the worker rather than failing the
+    /// query. The entry point is scored before any traversal decision, so the
+    /// refusal has to come first. Storage with rows the graph never reached is
+    /// left alone -- that direction is safe and ordinary.
+    #[test]
+    fn search_refuses_a_graph_its_storage_cannot_cover() {
+        const DIM: usize = 16;
+        const NODES: usize = 256;
+        let build_store = |rows: usize| {
+            let fsl = FixedSizeListArray::try_new_from_values(
+                generate_random_array(rows * DIM),
+                DIM as i32,
+            )
+            .unwrap();
+            Arc::new(FlatFloatStorage::new(fsl, DistanceType::L2))
+        };
+
+        let full = build_store(NODES);
+        let hnsw = HNSW::index_vectors(
+            full.as_ref(),
+            HnswBuildParams::default().num_edges(20).ef_construction(50),
+        )
+        .unwrap();
+        assert_eq!(hnsw.len(), NODES);
+
+        let params = HnswQueryParams {
+            ef: 50,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+        };
+        let query = Arc::new(generate_random_array(DIM)) as ArrayRef;
+
+        // Storage short of the graph: refused with a message, never scored.
+        let short = build_store(NODES / 4);
+        let refused = hnsw.search_basic(query.clone(), 10, &params, None, short.as_ref());
+        let message = refused
+            .expect_err("a graph its storage cannot cover must be refused")
+            .to_string();
+        assert!(
+            message.contains("no vector to score"),
+            "the error has to name the defect, got: {message}"
+        );
+
+        // The safe direction, and the matching one, both still search.
+        let over = build_store(NODES * 2);
+        for storage in [full.as_ref(), over.as_ref()] {
+            let (results, _) = hnsw
+                .search_basic(query.clone(), 10, &params, None, storage)
+                .expect("storage that covers the graph must search");
+            assert!(!results.is_empty());
+        }
+    }
+
+    /// The domain scan must see only the rows it was handed.
+    ///
+    /// Each level is a slice of the concatenated batch, and `ListArray::values()`
+    /// hands back the whole child array regardless of the slice, so a scan over
+    /// it would count another level's ids.
+    #[test]
+    fn neighbors_within_domain_counts_only_the_sliced_rows() {
+        use arrow::array::{ListBuilder, UInt32Builder};
+        use arrow_array::Array;
+
+        use super::neighbors_within_domain;
+
+        const NODE_COUNT: usize = 4;
+        let mut builder = ListBuilder::with_capacity(UInt32Builder::new(), 4);
+        // Rows 0..2 stay inside the domain; rows 2..4 do not.
+        builder.append_value([Some(0u32), Some(1)]);
+        builder.append_value([Some(2u32), Some(3)]);
+        builder.append_value([Some(99u32)]);
+        builder.append_value([Some(100u32)]);
+        let all = builder.finish();
+
+        let clean = all.slice(0, 2);
+        let (out, dropped) = neighbors_within_domain(&clean, NODE_COUNT);
+        assert_eq!(dropped, 0, "a clean slice must report no dropped ids");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.value(0).len(), 2, "a clean slice keeps its ids");
+
+        let dirty = all.slice(2, 2);
+        let (out, dropped) = neighbors_within_domain(&dirty, NODE_COUNT);
+        assert_eq!(dropped, 2, "both out-of-domain ids are counted");
+        assert_eq!(out.value(0).len(), 0, "the bad id is gone");
+        assert_eq!(out.value(1).len(), 0);
+    }
+
+    /// A dangling neighbor id must be gone before search, not caught at lookup.
+    ///
+    /// Traversal scores a neighbor before it is ever looked up as a node, so a
+    /// guard inside the node lookup runs too late -- the id has already reached
+    /// the distance calculator. Indices written before the writer bounded its
+    /// own snapshot carry such edges, so `load()` drops them and the query
+    /// still answers.
+    #[tokio::test]
+    async fn test_load_drops_neighbor_ids_outside_the_graph() {
+        use arrow::array::{AsArray, ListBuilder, UInt32Builder};
+        use arrow::datatypes::UInt32Type;
+        use arrow_array::Array;
+
+        const DIM: usize = 16;
+        const TOTAL: usize = 256;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let store = Arc::new(FlatFloatStorage::new(fsl, DistanceType::L2));
+        let builder = HNSW::index_vectors(
+            store.as_ref(),
+            HnswBuildParams::default().num_edges(20).ef_construction(50),
+        )
+        .unwrap();
+        let batch = builder.to_batch().unwrap();
+
+        // Put an out-of-domain edge on every node, the shape a writer that
+        // snapshotted a node count while reading adjacency live would persist.
+        // Every node, so whichever ones traversal expands, it scores the bad id
+        // -- `FlatFloatStorage::dist_calculator` panics on an id past its rows.
+        let neighbors = batch.column(1).as_list::<i32>();
+        let mut rebuilt = ListBuilder::with_capacity(UInt32Builder::new(), neighbors.len());
+        for row in 0..neighbors.len() {
+            let ids = neighbors.value(row);
+            let ids = ids.as_primitive::<UInt32Type>();
+            let mut ids: Vec<u32> = ids.values().to_vec();
+            ids.insert(0, TOTAL as u32 + 7);
+            rebuilt.append_value(ids.into_iter().map(Some));
+        }
+        let mut columns = batch.columns().to_vec();
+        columns[1] = Arc::new(rebuilt.finish());
+        // `__distance` is now shorter than `__neighbors` per row, which search
+        // does not read; the ids are what traversal follows.
+        let corrupted = RecordBatch::try_new(batch.schema(), columns).unwrap();
+
+        let corrupted_bytes = corrupted.get_array_memory_size();
+        let clean_loaded = HNSW::load(batch.clone()).expect("the clean batch loads");
+        let loaded = HNSW::load(corrupted).expect("a dangling edge must not fail the load");
+        // A clean load borrows every level from its batch, so it charges little
+        // beyond it. A repaired level owns its buffers, and they have to be
+        // charged too or the index cache sizes itself from memory it is not
+        // holding. Measured: ~0.3 KiB over for clean, ~38 KiB for repaired.
+        let clean_over = clean_loaded.deep_size_of() - batch.get_array_memory_size();
+        let repaired_over = loaded.deep_size_of() - corrupted_bytes;
+        assert!(
+            clean_over < 1024,
+            "a clean load keeps its levels zero-copy, but charged {clean_over} bytes over its batch"
+        );
+        assert!(
+            repaired_over > 16 * 1024,
+            "a repaired load must charge the buffers it owns, but charged only \
+             {repaired_over} bytes over its batch"
+        );
+
+        assert_eq!(loaded.len(), TOTAL);
+        // Searching has to answer rather than panic on the out-of-domain id.
+        let query = Arc::new(generate_random_array(DIM)) as ArrayRef;
+        let params = HnswQueryParams {
+            ef: 50,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+        };
+        let (results, _) = loaded
+            .search_basic(query, 10, &params, None, store.as_ref())
+            .expect("search must survive a dropped edge");
+        assert!(!results.is_empty(), "the query still returns neighbors");
     }
 
     /// `load()` must reject metadata whose `entry_point` is out of range for
@@ -2575,10 +3634,10 @@ mod tests {
             use_acorn: false,
         };
         let query = fsl.value(7);
-        let a = builder
+        let (a, _) = builder
             .search_basic(query.clone(), 10, &params, None, store.as_ref())
             .unwrap();
-        let b = reloaded
+        let (b, _) = reloaded
             .search_basic(query, 10, &params, None, store.as_ref())
             .unwrap();
         assert_eq!(a, b);
@@ -2673,5 +3732,230 @@ mod tests {
             loaded.deep_size_of(),
             builder.deep_size_of(),
         );
+    }
+
+    fn query_with(k: usize, ef: Option<usize>, refine_factor: Option<u32>) -> Query {
+        Query {
+            column: "vector".to_string(),
+            key: Arc::new(Float32Array::from(vec![0.0; 8])),
+            k,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 1,
+            maximum_nprobes: None,
+            search_effort: 0.5,
+            ef,
+            refine_factor,
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            query_parallelism: 0,
+            dist_q_c: 0.0,
+            approx_mode: Default::default(),
+        }
+    }
+
+    #[rstest]
+    #[case::floor_binds_at_search_shaped_k(10, None, None, DEFAULT_MIN_EF)]
+    #[case::floor_stops_binding_by_k(1000, None, None, 1500)]
+    #[case::floor_stops_binding_by_refine(10, None, Some(100), 1500)]
+    #[case::explicit_ef_wins_below_the_floor(10, Some(15), None, 15)]
+    #[case::explicit_ef_wins_above_the_floor(10, Some(4096), None, 4096)]
+    fn default_ef_is_floored_but_never_overrides_the_caller(
+        #[case] k: usize,
+        #[case] ef: Option<usize>,
+        #[case] refine_factor: Option<u32>,
+        #[case] expected: usize,
+    ) {
+        let params = HnswQueryParams::from(&query_with(k, ef, refine_factor));
+        assert_eq!(params.ef, expected);
+    }
+
+    /// Wraps [FlatFloatStorage] so tests can observe whether the search path
+    /// issued prefetches, which is otherwise invisible in the results.
+    #[derive(Clone)]
+    struct PrefetchCountingStorage {
+        inner: FlatFloatStorage,
+        prefetch_calls: Arc<AtomicUsize>,
+    }
+
+    struct PrefetchCountingCalc<'a> {
+        inner: <FlatFloatStorage as VectorStore>::DistanceCalculator<'a>,
+        prefetch_calls: &'a AtomicUsize,
+    }
+
+    impl DistCalculator for PrefetchCountingCalc<'_> {
+        fn distance(&self, id: u32) -> f32 {
+            self.inner.distance(id)
+        }
+
+        fn distance_all(&self, k_hint: usize) -> Vec<f32> {
+            self.inner.distance_all(k_hint)
+        }
+
+        fn prefetch(&self, id: u32) {
+            self.prefetch_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.prefetch(id);
+        }
+    }
+
+    impl VectorStore for PrefetchCountingStorage {
+        type DistanceCalculator<'a> = PrefetchCountingCalc<'a>;
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn schema(&self) -> &arrow_schema::SchemaRef {
+            self.inner.schema()
+        }
+
+        fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch> + Send> {
+            self.inner.to_batches()
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn distance_type(&self) -> DistanceType {
+            self.inner.distance_type()
+        }
+
+        fn row_id(&self, id: u32) -> u64 {
+            self.inner.row_id(id)
+        }
+
+        fn row_ids(&self) -> impl Iterator<Item = &u64> {
+            self.inner.row_ids()
+        }
+
+        fn append_batch(&self, _batch: RecordBatch, _vector_column: &str) -> Result<Self> {
+            unreachable!("not used by search tests")
+        }
+
+        fn dist_calculator(&self, query: ArrayRef, dist_q_c: f32) -> Self::DistanceCalculator<'_> {
+            PrefetchCountingCalc {
+                inner: self.inner.dist_calculator(query, dist_q_c),
+                prefetch_calls: &self.prefetch_calls,
+            }
+        }
+
+        fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
+            PrefetchCountingCalc {
+                inner: self.inner.dist_calculator_from_id(id),
+                prefetch_calls: &self.prefetch_calls,
+            }
+        }
+    }
+
+    /// `search_basic` used to hardcode its bottom-level prefetch distance to
+    /// `Some(2)`, so `prefetch_distance: None` silently kept prefetching
+    /// (issue #8275). The counting storage observes what the results cannot.
+    #[rstest]
+    #[case::disabled(None, false)]
+    #[case::enabled(Some(2), true)]
+    fn test_search_basic_honors_prefetch_distance(
+        #[case] prefetch_distance: Option<usize>,
+        #[case] expect_prefetch: bool,
+    ) {
+        const DIM: usize = 16;
+        const TOTAL: usize = 256;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let storage = FlatFloatStorage::new(fsl.clone(), DistanceType::L2);
+        let hnsw = HNSW::index_vectors(
+            &storage,
+            HnswBuildParams {
+                prefetch_distance,
+                ..HnswBuildParams::default()
+            },
+        )
+        .unwrap();
+
+        let counting = PrefetchCountingStorage {
+            inner: storage,
+            prefetch_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let (results, _) = hnsw
+            .search_basic(
+                fsl.value(0),
+                10,
+                &HnswQueryParams {
+                    ef: 50,
+                    lower_bound: None,
+                    upper_bound: None,
+                    dist_q_c: 0.0,
+                    use_acorn: false,
+                },
+                None,
+                &counting,
+            )
+            .unwrap();
+        assert_eq!(results.len(), 10);
+        assert_eq!(
+            counting.prefetch_calls.load(Ordering::Relaxed) > 0,
+            expect_prefetch
+        );
+    }
+
+    /// Prefetch is a pure cache hint: any distance (and any `do_prefetch`
+    /// internals, such as its cache-line cap) must leave results identical.
+    #[test]
+    fn test_prefetch_distance_does_not_change_results() {
+        const DIM: usize = 16;
+        const TOTAL: usize = 256;
+        const K: usize = 10;
+        let fsl =
+            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
+                .unwrap();
+        let storage = FlatFloatStorage::new(fsl.clone(), DistanceType::L2);
+        let hnsw = HNSW::index_vectors(&storage, HnswBuildParams::default()).unwrap();
+        let params = HnswQueryParams {
+            ef: 50,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+        };
+
+        let mut visited_generator = VisitedGenerator::new(storage.len());
+        let baseline: Vec<(u32, f32)> = hnsw
+            .search_inner(
+                fsl.value(1),
+                K,
+                &params,
+                None,
+                &mut visited_generator,
+                &storage,
+                None,
+            )
+            .unwrap()
+            .0
+            .iter()
+            .map(|node| (node.id, node.dist.0))
+            .collect();
+
+        for prefetch_distance in [Some(1), Some(2), Some(64)] {
+            let with_prefetch: Vec<(u32, f32)> = hnsw
+                .search_inner(
+                    fsl.value(1),
+                    K,
+                    &params,
+                    None,
+                    &mut visited_generator,
+                    &storage,
+                    prefetch_distance,
+                )
+                .unwrap()
+                .0
+                .iter()
+                .map(|node| (node.id, node.dist.0))
+                .collect();
+            assert_eq!(
+                baseline, with_prefetch,
+                "results changed with prefetch_distance={prefetch_distance:?}"
+            );
+        }
     }
 }

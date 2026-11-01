@@ -13,6 +13,7 @@
  */
 package org.lance;
 
+import org.lance.file.FileWriteOptions;
 import org.lance.fragment.FragmentMergeResult;
 import org.lance.fragment.FragmentUpdateResult;
 import org.lance.ipc.LanceScanner;
@@ -113,7 +114,9 @@ public class Fragment {
    *     returns a new fragment with the updated deletion vector.
    */
   public FragmentMetadata deleteRows(List<Integer> rowIndexes) {
-    return nativeDeleteRows(dataset, fragmentMetadata.getId(), rowIndexes);
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return nativeDeleteRows(dataset, fragmentMetadata.getId(), rowIndexes);
+    }
   }
 
   private static native FragmentMetadata nativeDeleteRows(
@@ -129,7 +132,9 @@ public class Fragment {
    * @return row counts in this Fragment
    */
   public int countRows() {
-    return countRowsNative(dataset, fragmentMetadata.getId());
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return countRowsNative(dataset, fragmentMetadata.getId());
+    }
   }
 
   /**
@@ -153,8 +158,10 @@ public class Fragment {
    * @return the fragment metadata and new schema.
    */
   public FragmentMergeResult mergeColumns(ArrowArrayStream stream, String leftOn, String rightOn) {
-    return nativeMergeColumns(
-        dataset, fragmentMetadata.getId(), stream.memoryAddress(), leftOn, rightOn);
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return nativeMergeColumns(
+          dataset, fragmentMetadata.getId(), stream.memoryAddress(), leftOn, rightOn);
+    }
   }
 
   private native FragmentMergeResult nativeMergeColumns(
@@ -186,8 +193,10 @@ public class Fragment {
    */
   public FragmentUpdateResult updateColumns(
       ArrowArrayStream stream, String leftOn, String rightOn) {
-    return nativeUpdateColumns(
-        dataset, fragmentMetadata.getId(), stream.memoryAddress(), leftOn, rightOn);
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return nativeUpdateColumns(
+          dataset, fragmentMetadata.getId(), stream.memoryAddress(), leftOn, rightOn);
+    }
   }
 
   public FragmentUpdateResult updateColumns(ArrowArrayStream stream) {
@@ -200,6 +209,33 @@ public class Fragment {
       long arrowStreamMemoryAddress,
       String leftOn,
       String rightOn);
+
+  /**
+   * Append new columns to this Fragment from a stream of new-column values. This is the
+   * fragment-level equivalent of {@link Dataset#addColumns(ArrowArrayStream, Optional)}: the stream
+   * is zipped positionally against the fragment, so it must contain exactly one row for every live
+   * (non-deleted) row of this fragment, in row address order, and only the new columns. A stream
+   * with too few or too many rows fails; use {@link #mergeColumns} for inputs that cover a subset
+   * of the rows.
+   *
+   * <p>Unlike {@link #mergeColumns}, the stream is never buffered in full, so it can backfill
+   * columns far larger than memory.
+   *
+   * <p>The returned Result will be further committed.
+   *
+   * @param stream the new column values, one row per live row in row address order
+   * @param batchSize read batch size for zipping, or empty for the default
+   * @return the fragment metadata and new schema
+   */
+  public FragmentMergeResult addColumns(ArrowArrayStream stream, Optional<Long> batchSize) {
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return nativeAddColumnsByReader(
+          dataset, fragmentMetadata.getId(), stream.memoryAddress(), batchSize);
+    }
+  }
+
+  private native FragmentMergeResult nativeAddColumnsByReader(
+      Dataset dataset, long fragmentId, long arrowStreamMemoryAddress, Optional<Long> batchSize);
 
   /**
    * Create a new fragment writer builder.
@@ -303,6 +339,7 @@ public class Fragment {
               tableId,
               params.getAllowExternalBlobOutsideBases(),
               params.getBlobPackFileSizeThreshold(),
+              params.getFileWriteOptions(),
               lanceSchema.memoryAddress(),
               sessionHandle);
         }
@@ -325,6 +362,7 @@ public class Fragment {
           tableId,
           params.getAllowExternalBlobOutsideBases(),
           params.getBlobPackFileSizeThreshold(),
+          params.getFileWriteOptions(),
           0L,
           sessionHandle);
     }
@@ -375,6 +413,7 @@ public class Fragment {
             tableId,
             params.getAllowExternalBlobOutsideBases(),
             params.getBlobPackFileSizeThreshold(),
+            params.getFileWriteOptions(),
             lanceSchema.memoryAddress(),
             sessionHandle);
       }
@@ -396,6 +435,7 @@ public class Fragment {
         tableId,
         params.getAllowExternalBlobOutsideBases(),
         params.getBlobPackFileSizeThreshold(),
+        params.getFileWriteOptions(),
         0L,
         sessionHandle);
   }
@@ -427,6 +467,7 @@ public class Fragment {
       List<String> tableId,
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold,
+      FileWriteOptions fileWriteOptions,
       long schemaMemoryAddress,
       long sessionHandle);
 
@@ -448,6 +489,7 @@ public class Fragment {
       List<String> tableId,
       Optional<Boolean> allowExternalBlobOutsideBases,
       Optional<Long> blobPackFileSizeThreshold,
+      FileWriteOptions fileWriteOptions,
       long schemaMemoryAddress,
       long sessionHandle);
 }

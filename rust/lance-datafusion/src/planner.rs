@@ -4,12 +4,13 @@
 //! Exec plan planner
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::exec::{LanceExecutionOptions, get_session_context};
 use crate::expr::safe_coerce_scalar;
-use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
+use crate::logical_expr::{coerce_filter_type_to_boolean, resolve_expr};
+use crate::signed_zero::{normalize_float_comparisons, rewrite_float_comparisons};
 use crate::sql::{parse_sql_expr, parse_sql_filter};
 use arrow::compute::CastOptions;
 use arrow_array::ListArray;
@@ -17,12 +18,14 @@ use arrow_buffer::OffsetBuffer;
 use arrow_cast::cast_with_options;
 use arrow_schema::{DataType as ArrowDataType, Field, SchemaRef, TimeUnit};
 use arrow_select::concat::concat;
+use datafusion::catalog::Session;
 use datafusion::common::DFSchema;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
-use datafusion::execution::context::SessionState;
+use datafusion::execution::context::{SessionContext, SessionState};
 use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
     AggregateUDF, ColumnarValue, GetFieldAccess, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
@@ -45,7 +48,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use datafusion_functions::core::getfield::GetFieldFunc;
-use lance_core::datatypes::Schema;
+use lance_core::datatypes::{Schema, parse_field_path};
 use lance_core::error::LanceOptionExt;
 
 use chrono::Utc;
@@ -181,28 +184,39 @@ impl ScalarUDFImpl for CastListF16Udf {
 // Adapter that instructs datafusion how lance expects expressions to be interpreted
 struct LanceContextProvider {
     options: datafusion::config::ConfigOptions,
-    state: SessionState,
+    // Functions are looked up in the session's shared state rather than in a
+    // clone of it: planners are created several times per query, and cloning
+    // every function map and rule list for each one is a measurable share of
+    // CPU for short queries.
+    session: SessionContext,
     expr_planners: Vec<Arc<dyn ExprPlanner>>,
+}
+
+impl LanceContextProvider {
+    fn new(session: SessionContext) -> Self {
+        let expr_planners = session.state_ref().read().expr_planners().to_vec();
+        Self {
+            options: ConfigOptions::default(),
+            session,
+            expr_planners,
+        }
+    }
+
+    fn with_state<T>(&self, read: impl FnOnce(&SessionState) -> T) -> T {
+        read(&self.session.state_ref().read())
+    }
 }
 
 impl Default for LanceContextProvider {
     fn default() -> Self {
-        let ctx = get_session_context(&LanceExecutionOptions::default());
-        let state = ctx.state();
-        let expr_planners = state.expr_planners().to_vec();
-
-        Self {
-            options: ConfigOptions::default(),
-            state,
-            expr_planners,
-        }
+        Self::new(get_session_context(&LanceExecutionOptions::default()))
     }
 }
 
 impl ContextProvider for LanceContextProvider {
     fn get_table_source(
         &self,
-        name: datafusion::sql::TableReference,
+        name: datafusion::common::TableReference,
     ) -> DFResult<Arc<dyn datafusion::logical_expr::TableSource>> {
         Err(datafusion::error::DataFusionError::NotImplemented(format!(
             "Attempt to reference inner table {} not supported",
@@ -211,18 +225,18 @@ impl ContextProvider for LanceContextProvider {
     }
 
     fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>> {
-        self.state.aggregate_functions().get(name).cloned()
+        self.with_state(|state| state.aggregate_functions().get(name).cloned())
     }
 
     fn get_window_meta(&self, name: &str) -> Option<Arc<WindowUDF>> {
-        self.state.window_functions().get(name).cloned()
+        self.with_state(|state| state.window_functions().get(name).cloned())
     }
 
     fn get_higher_order_meta(
         &self,
         name: &str,
     ) -> Option<Arc<datafusion::logical_expr::HigherOrderUDF>> {
-        self.state.higher_order_functions().get(name).cloned()
+        self.with_state(|state| state.higher_order_functions().get(name).cloned())
     }
 
     fn get_function_meta(&self, f: &str) -> Option<Arc<ScalarUDF>> {
@@ -230,7 +244,7 @@ impl ContextProvider for LanceContextProvider {
             // TODO: cast should go thru CAST syntax instead of UDF
             // Going thru UDF makes it hard for the optimizer to find no-ops
             "_cast_list_f16" => Some(Arc::new(ScalarUDF::new_from_impl(CastListF16Udf::new()))),
-            _ => self.state.scalar_functions().get(f).cloned(),
+            _ => self.with_state(|state| state.scalar_functions().get(f).cloned()),
         }
     }
 
@@ -244,23 +258,19 @@ impl ContextProvider for LanceContextProvider {
     }
 
     fn udf_names(&self) -> Vec<String> {
-        self.state.scalar_functions().keys().cloned().collect()
+        self.with_state(|state| state.scalar_functions().keys().cloned().collect())
     }
 
     fn udaf_names(&self) -> Vec<String> {
-        self.state.aggregate_functions().keys().cloned().collect()
+        self.with_state(|state| state.aggregate_functions().keys().cloned().collect())
     }
 
     fn udwf_names(&self) -> Vec<String> {
-        self.state.window_functions().keys().cloned().collect()
+        self.with_state(|state| state.window_functions().keys().cloned().collect())
     }
 
     fn higher_order_function_names(&self) -> Vec<String> {
-        self.state
-            .higher_order_functions()
-            .keys()
-            .cloned()
-            .collect()
+        self.with_state(|state| state.higher_order_functions().keys().cloned().collect())
     }
 
     fn get_expr_planners(&self) -> &[Arc<dyn ExprPlanner>] {
@@ -357,6 +367,8 @@ impl Planner {
             BinaryOperator::NotEq => Operator::NotEq,
             BinaryOperator::And => Operator::And,
             BinaryOperator::Or => Operator::Or,
+            BinaryOperator::PGBitwiseShiftLeft => Operator::BitwiseShiftLeft,
+            BinaryOperator::PGBitwiseShiftRight => Operator::BitwiseShiftRight,
             _ => {
                 return Err(Error::invalid_input(format!(
                     "Operator {op} is not supported"
@@ -506,7 +518,11 @@ impl Planner {
             Value::DoubleQuotedString(s) => Expr::Literal(ScalarValue::Utf8(Some(s.clone())), None),
             Value::Boolean(v) => Expr::Literal(ScalarValue::Boolean(Some(*v)), None),
             Value::Null => Expr::Literal(ScalarValue::Null, None),
-            _ => todo!(),
+            _ => {
+                return Err(Error::invalid_input(format!(
+                    "Unsupported SQL value: {value:?}"
+                )));
+            }
         })
     }
 
@@ -533,6 +549,12 @@ impl Planner {
                     return Err(Error::invalid_input(format!(
                         "Function name must have 1 part, got: {:?}",
                         func.name.0
+                    )));
+                }
+                if args.args.len() != 1 {
+                    return Err(Error::invalid_input(format!(
+                        "is_valid() takes exactly one argument, got {}",
+                        args.args.len()
                     )));
                 }
                 Ok(Expr::IsNotNull(Box::new(
@@ -796,6 +818,16 @@ impl Planner {
             SQLExpr::IsNotTrue(expr) => Ok(Expr::IsNotTrue(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsNull(expr) => Ok(Expr::IsNull(Box::new(self.parse_sql_expr(expr)?))),
             SQLExpr::IsNotNull(expr) => Ok(Expr::IsNotNull(Box::new(self.parse_sql_expr(expr)?))),
+            SQLExpr::IsDistinctFrom(left, right) => Ok(Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(self.parse_sql_expr(left)?),
+                Operator::IsDistinctFrom,
+                Box::new(self.parse_sql_expr(right)?),
+            ))),
+            SQLExpr::IsNotDistinctFrom(left, right) => Ok(Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(self.parse_sql_expr(left)?),
+                Operator::IsNotDistinctFrom,
+                Box::new(self.parse_sql_expr(right)?),
+            ))),
             SQLExpr::InList {
                 expr,
                 list,
@@ -951,14 +983,34 @@ impl Planner {
 
     /// Create Logical [Expr] from a SQL expression.
     ///
+    /// Plain column names (e.g. `id`) and backtick-quoted column names (e.g.
+    /// `` `order` ``), as produced by
+    /// [`lance_core::datatypes::escape_field_path_for_project`], are resolved
+    /// directly against the schema without going through the SQL parser,
+    /// producing the same expression the SQL parser would. Anything else,
+    /// including nested field paths, falls through to the full SQL parser.
+    ///
     /// Note: the returned expression must be passed through `optimize_filter()`
     /// before being passed to `create_physical_expr()`.
     pub fn parse_expr(&self, expr: &str) -> Result<Expr> {
         // First check if it's a simple column reference (no operators, functions, etc.)
-        // resolve_column_name tries exact match first, then falls back to case-insensitive
+        // resolve_column_name tries exact match first, then falls back to case-insensitive.
+        // This also covers literal column names containing dots, which must win over a
+        // nested path interpretation.
         let resolved_name = self.resolve_column_name(expr);
         if self.schema.field_with_name(&resolved_name).is_ok() {
             return Ok(Expr::Column(Column::from_name(resolved_name)));
+        }
+
+        // A single backtick-quoted name is looked up exactly, as the SQL parser
+        // would. Multi-segment paths are left to the SQL parser: unquoted
+        // segments may carry SQL syntax (e.g. `parent.child + 1`) that
+        // `parse_field_path` does not reject.
+        if let Ok(path) = parse_field_path(expr)
+            && let [name] = path.as_slice()
+            && self.schema.field_with_name(name).is_ok()
+        {
+            return Ok(Expr::Column(Column::from_name(name)));
         }
 
         // Parse as SQL expression
@@ -1009,6 +1061,43 @@ impl Planner {
     pub fn optimize_expr(&self, expr: Expr) -> Result<Expr> {
         let df_schema = Arc::new(DFSchema::try_from(self.schema.as_ref().clone())?);
 
+        // DataFusion rewrites arrow_cast to Expr::Cast, whose Arrow kernel does not support
+        // integer-to-Time32 casts. Convert literal values with Lance's scalar coercion first.
+        let expr = expr
+            .transform_up(|expr| {
+                let coerced = match &expr {
+                    Expr::ScalarFunction(ScalarFunction { func, args })
+                        if func.name() == "arrow_cast" =>
+                    {
+                        match args.as_slice() {
+                            [
+                                Expr::Literal(value, metadata),
+                                Expr::Literal(ScalarValue::Utf8(Some(data_type)), _),
+                            ] => data_type
+                                .parse::<ArrowDataType>()
+                                .ok()
+                                .filter(|data_type| matches!(data_type, ArrowDataType::Time32(_)))
+                                .and_then(|data_type| {
+                                    if matches!(value, ScalarValue::Null) {
+                                        ScalarValue::try_new_null(&data_type).ok()
+                                    } else {
+                                        safe_coerce_scalar(value, &data_type)
+                                    }
+                                })
+                                .map(|value| Expr::Literal(value, metadata.clone())),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+
+                Ok(match coerced {
+                    Some(coerced) => Transformed::yes(coerced),
+                    None => Transformed::no(expr),
+                })
+            })?
+            .data;
+
         // DataFusion needs the coerce and simplify passes to be applied before
         // expressions can be handled by the physical planner.
         let simplify_context = SimplifyContext::builder()
@@ -1020,7 +1109,25 @@ impl Planner {
 
         // Coerce before simplify to match DataFusion's analyzer-before-optimizer pipeline.
         let expr = simplifier.coerce(expr, &df_schema)?;
+
+        // Fold each comparison's own operands and rewrite it before anything above
+        // it folds. `simplify` folds an operand and everything above it in one
+        // pass, so a fully constant predicate whose zero appears only as a result
+        // of folding never presents a zero literal to the rewrite:
+        // `-1.0 * 0.0 < (1.0 - 1.0)` answered `true` where IEEE says false, and a
+        // wrapper such as `IS TRUE` or a `CAST` did the same to the comparison's
+        // own result.
+        let expr =
+            normalize_float_comparisons(expr, &|operand| simplifier.simplify(operand), &df_schema)?;
+
+        // Again after simplify, which is what expands `BETWEEN` into two
+        // comparisons and folds the casts `coerce` inserts, so those forms only
+        // become visible on this pass.
+        //
+        // Running the rewrite more than once is safe because its output is a fixed
+        // point of `optimize_expr`; `optimizing_twice_changes_nothing` pins that.
         let expr = simplifier.simplify(expr)?;
+        let expr = rewrite_float_comparisons(expr, &df_schema)?;
 
         Ok(expr)
     }
@@ -1032,7 +1139,18 @@ impl Planner {
             expr,
             df_schema.as_ref(),
             &Default::default(),
+            &PhysicalPlanningContext::default(),
         )?)
+    }
+
+    /// Create a [`PhysicalExpr`] using the caller's DataFusion session.
+    pub fn create_physical_expr_with_session(
+        &self,
+        expr: &Expr,
+        session: &dyn Session,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+        Ok(session.create_physical_expr(expr.clone(), &df_schema)?)
     }
 
     /// Collect the columns in the expression.
@@ -1042,75 +1160,20 @@ impl Planner {
     /// If the expr refers to nested columns these will be returned
     /// as dotted paths (x.y.z)
     pub fn column_names_in_expr(expr: &Expr) -> Vec<String> {
-        let mut visitor = ColumnCapturingVisitor {
-            current_path: VecDeque::new(),
-            columns: BTreeSet::new(),
-        };
-        expr.visit(&mut visitor).unwrap();
-        visitor.columns.into_iter().collect()
-    }
-}
-
-struct ColumnCapturingVisitor {
-    // Current column path. If this is empty, we are not in a column expression.
-    current_path: VecDeque<String>,
-    columns: BTreeSet<String>,
-}
-
-impl TreeNodeVisitor<'_> for ColumnCapturingVisitor {
-    type Node = Expr;
-
-    fn f_down(&mut self, node: &Self::Node) -> DFResult<TreeNodeRecursion> {
-        match node {
-            Expr::Column(Column { name, .. }) => {
-                // Build the field path from the column name and any nested fields
-                // The nested field names from get_field already come as literal strings,
-                // so we just need to concatenate them properly
-                let mut path = name.clone();
-                for part in self.current_path.drain(..) {
-                    path.push('.');
-                    // Check if the part needs quoting (contains dots)
-                    if part.contains('.') || part.contains('`') {
-                        // Quote the field name with backticks and escape any existing backticks
-                        let escaped = part.replace('`', "``");
-                        path.push('`');
-                        path.push_str(&escaped);
-                        path.push('`');
-                    } else {
-                        path.push_str(&part);
-                    }
-                }
-                self.columns.insert(path);
-                self.current_path.clear();
-            }
-            Expr::ScalarFunction(udf) if udf.name() == GetFieldFunc::default().name() => {
-                if let Some(name) = get_as_string_scalar_opt(&udf.args[1]) {
-                    self.current_path.push_front(name.to_string())
-                } else {
-                    self.current_path.clear();
-                }
-            }
-            _ => {
-                self.current_path.clear();
-            }
-        }
-
-        Ok(TreeNodeRecursion::Continue)
+        lance_datafusion_exec::expr::column_names_in_expr(expr)
     }
 }
 
 #[cfg(test)]
 mod tests {
 
-    use crate::logical_expr::ExprExt;
-
     use super::*;
 
     use arrow::datatypes::Float64Type;
     use arrow_array::{
         ArrayRef, BooleanArray, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray,
-        StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-        TimestampNanosecondArray, TimestampSecondArray,
+        StructArray, Time32SecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray, UInt64Array,
     };
     use arrow_schema::{DataType, Fields, Schema};
     use datafusion::{
@@ -1118,6 +1181,76 @@ mod tests {
         prelude::{array_element, get_field},
     };
     use datafusion_functions::core::expr_ext::FieldAccessor;
+    use rstest::rstest;
+
+    /// Literal spellings the planner has no mapping for, such as placeholders
+    /// and national strings, used to reach a `todo!()`.
+    #[rstest]
+    #[case::named_placeholder("i = :id")]
+    #[case::numbered_placeholder("i = $1")]
+    #[case::question_placeholder("i = ?")]
+    #[case::national_string("s = N'abc'")]
+    #[case::in_array_literal("s = [N'abc']")]
+    fn test_parse_filter_rejects_unsupported_literals(#[case] filter: &str) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("i", DataType::Int32, false),
+        ]));
+        let planner = Planner::new(schema);
+
+        let err = planner.parse_filter(filter).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput for {filter}, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("Unsupported SQL value"),
+            "error should name the unsupported value for {filter}, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_filter_checks_is_valid_arity() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let planner = Planner::new(schema);
+
+        // Zero arguments used to panic on `args[0]`; extra ones were dropped.
+        for filter in ["is_valid()", "is_valid(s, s)"] {
+            let err = planner.parse_filter(filter).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidInput { .. }),
+                "expected InvalidInput for {filter}, got {err:?}"
+            );
+            assert!(
+                err.to_string()
+                    .contains("is_valid() takes exactly one argument"),
+                "unexpected error for {filter}: {err}"
+            );
+        }
+        assert_eq!(
+            planner.parse_filter("is_valid(s)").unwrap(),
+            col("s").is_not_null()
+        );
+    }
+
+    #[test]
+    fn test_parse_expr_rejects_multiple_expressions() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let planner = Planner::new(schema);
+
+        // A misplaced parenthesis turns `coalesce(s, 'x')` into two items;
+        // keeping only the first would silently compute `coalesce(s)`.
+        let err = planner.parse_expr("coalesce(s), 'x'").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("Expression is not valid"),
+            "unexpected error: {err}"
+        );
+        assert!(planner.parse_expr("coalesce(s, 'x')").is_ok());
+    }
 
     #[test]
     fn test_parse_filter_simple() {
@@ -1138,7 +1271,7 @@ mod tests {
 
         let expected = col("i")
             .gt(lit(3_i32))
-            .and(col("st").field_newstyle("x").lt_eq(lit(5.0_f32)))
+            .and(col("st").field("x").lt_eq(lit(5.0_f32)))
             .and(
                 col("s")
                     .eq(lit("str-4"))
@@ -1190,6 +1323,90 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::not_equal_to_integer_expression(
+        "flag != (id > 0)",
+        [false, false, true]
+    )]
+    #[case::equal_to_float_expression("flag = (x > 1.0)", [false, false, false])]
+    #[case::expression_on_left("(id > 0) != flag", [false, false, true])]
+    #[case::literal_expression("flag != (1 > 0)", [false, true, false])]
+    #[case::boolean_literal("flag != TRUE", [false, true, false])]
+    fn test_parse_boolean_column_compared_to_expression(
+        #[case] filter: &str,
+        #[case] expected: [bool; 3],
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("flag", Boolean, [true, false, true]),
+            ("id", Int32, [1, 0, -1]),
+            ("x", Float32, [0.5, 2.0, 1.0])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_filter(filter).unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(expected.to_vec())
+        );
+    }
+
+    #[rstest]
+    #[case::shift("u = (1 << 63)", [true, false, false])]
+    #[case::string_concat("s = ('a' || 'b')", [true, false, false])]
+    fn test_parse_comparison_to_same_type_literal_expression(
+        #[case] filter: &str,
+        #[case] expected: [bool; 3],
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("u", UInt64, [1_u64 << 63, 3, 0]),
+            ("s", LargeUtf8, ["ab", "a", "b"])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_filter(filter).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(expected.to_vec())
+        );
+    }
+
+    #[rstest]
+    #[case::float_literal("f = n + 0.5")]
+    #[case::float_literal_on_left("f = 0.5 + n")]
+    #[case::float_expression_on_left("n + 0.5 = f")]
+    #[case::wide_integer_literal("wide = small + 128")]
+    #[case::wide_integer_literal_on_left("wide = 128 + small")]
+    #[case::integer_expression_on_left("small + 128 = wide")]
+    fn test_parse_comparison_to_mixed_type_expression(#[case] filter: &str) {
+        let batch = arrow_array::record_batch!(
+            ("f", Float64, [Some(1.5), Some(1.5), None, Some(1.5)]),
+            ("n", Int64, [Some(1), Some(2), Some(1), None]),
+            ("wide", Int64, [Some(129), Some(129), Some(129), None]),
+            ("small", Int8, [Some(1), Some(2), None, Some(1)])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_filter(filter).unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+
+        assert_eq!(
+            predicates.into_array(batch.num_rows()).unwrap().as_ref(),
+            &BooleanArray::from(vec![Some(true), Some(false), None, None])
+        );
+    }
+
     #[test]
     fn test_parse_filter_uint64_literal_above_i64_max() {
         let value = u64::MAX - 1;
@@ -1205,6 +1422,130 @@ mod tests {
             predicates.into_array(0).unwrap().as_ref(),
             &BooleanArray::from(vec![false, true])
         );
+
+        let expr = planner
+            .parse_expr("arrow_cast(NULL, 'Time32(Second)')")
+            .unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        assert_eq!(expr, Expr::Literal(ScalarValue::Time32Second(None), None));
+    }
+
+    fn column_resolution_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("order", DataType::Utf8, true),
+            Field::new("a`b", DataType::Int32, false),
+            Field::new(
+                "parent",
+                DataType::Struct(Fields::from(vec![Field::new(
+                    "child",
+                    DataType::Int32,
+                    false,
+                )])),
+                false,
+            ),
+        ]))
+    }
+
+    /// Parse `input` through the SQL parser only, bypassing the field path
+    /// fast path in `parse_expr`.
+    fn parse_expr_via_sql(planner: &Planner, input: &str) -> Expr {
+        let ast_expr = parse_sql_expr(input).unwrap();
+        let expr = planner.parse_sql_expr(&ast_expr).unwrap();
+        let schema = lance_core::datatypes::Schema::try_from(planner.schema.as_ref()).unwrap();
+        resolve_expr(&expr, &schema).unwrap()
+    }
+
+    #[rstest]
+    #[case::bare("id", col("id"))]
+    #[case::backtick_quoted("`id`", col("id"))]
+    #[case::case_insensitive("ID", col("id"))]
+    #[case::reserved_word("`order`", col("order"))]
+    #[case::escaped_backtick("`a``b`", col("a`b"))]
+    fn test_parse_expr_column_resolution(#[case] input: &str, #[case] expected: Expr) {
+        let planner = Planner::new(column_resolution_schema());
+
+        let expr = planner.parse_expr(input).unwrap();
+        assert_eq!(expr, expected);
+        // The fast path must produce the same expression as the SQL parser.
+        assert_eq!(expr, parse_expr_via_sql(&planner, input));
+    }
+
+    /// Inputs the fast path does not resolve must behave exactly like the SQL path.
+    #[rstest]
+    #[case::unknown_column("`missing`")]
+    #[case::quoted_wrong_case("`ID`")]
+    #[case::unknown_nested_root("`missing`.`child`")]
+    #[case::not_a_path("id + 1")]
+    #[case::nested("`parent`.`child`")]
+    #[case::nested_unquoted("parent.child")]
+    #[case::nested_case_insensitive("`PARENT`.`child`")]
+    #[case::nested_arithmetic("parent.child + 1")]
+    #[case::nested_comparison("parent.child > 1")]
+    #[case::nested_null_test("parent.child IS NULL")]
+    #[case::nested_cast("parent.child::BIGINT")]
+    #[case::quoted_nested_arithmetic("`parent`.`child` + 1")]
+    fn test_parse_expr_column_resolution_falls_back_to_sql(#[case] input: &str) {
+        let planner = Planner::new(column_resolution_schema());
+
+        let fast = planner.parse_expr(input);
+        let sql = parse_sql_expr(input)
+            .and_then(|ast| planner.parse_sql_expr(&ast))
+            .and_then(|expr| {
+                let schema = lance_core::datatypes::Schema::try_from(planner.schema.as_ref())?;
+                resolve_expr(&expr, &schema)
+            });
+        assert_eq!(fast.is_ok(), sql.is_ok(), "{input}: {fast:?} vs {sql:?}");
+        if let (Ok(fast), Ok(sql)) = (fast, sql) {
+            assert_eq!(fast, sql);
+        }
+    }
+
+    /// A literal column whose name contains a dot must win over the nested
+    /// field interpretation of the same string (see #4825).
+    #[test]
+    fn test_parse_expr_literal_dotted_column_beats_nested_path() {
+        let child = Arc::new(Field::new("child", DataType::Int32, false));
+        let parent = StructArray::new(
+            vec![child].into(),
+            vec![Arc::new(Int32Array::from(vec![7, 10]))],
+            None,
+        );
+        let batch = RecordBatch::try_from_iter([
+            ("parent", Arc::new(parent) as ArrayRef),
+            (
+                "parent.child",
+                Arc::new(Int32Array::from(vec![100, 200])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_expr("parent.child").unwrap();
+        assert_eq!(expr, Expr::Column(Column::from_name("parent.child")));
+        let expr = planner.optimize_expr(expr).unwrap();
+        let physical = planner.create_physical_expr(&expr).unwrap();
+        let actual = physical.evaluate(&batch).unwrap().into_array(2).unwrap();
+        let expected: ArrayRef = Arc::new(Int32Array::from(vec![100, 200]));
+        assert_eq!(actual.as_ref(), expected.as_ref());
+    }
+
+    #[test]
+    fn test_parse_expr_with_relations_uses_sql_path() {
+        let planner = Planner::new(column_resolution_schema()).with_enable_relations(true);
+
+        // With relations enabled, the first segment is a relation name.
+        let expr = planner.parse_expr("`t`.`id`").unwrap();
+        assert_eq!(expr, Expr::Column(Column::new(Some("t"), "id")));
+    }
+
+    #[test]
+    fn test_parse_expr_sql_fallback() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let planner = Planner::new(schema);
+
+        let expr = planner.parse_expr("id + 1").unwrap();
+        assert_eq!(expr, col("id") + lit(1_i32));
     }
 
     #[test]
@@ -1404,6 +1745,88 @@ mod tests {
         );
     }
 
+    /// A literal under NOT or IS [NOT] TRUE/FALSE is narrowed to the column
+    /// type like one outside it. Otherwise the Float32 column is cast to
+    /// Float64, `0.1f32` no longer equals `0.1`, and the wrapped predicate
+    /// disagrees with the bare one on that row.
+    #[rstest]
+    #[case::eq("f = 0.1", vec![true, false])]
+    #[case::gt("f > 0.1", vec![false, true])]
+    #[case::between("f BETWEEN 0.0 AND 0.1", vec![true, false])]
+    #[case::in_list("f IN (0.1, 0.2)", vec![true, false])]
+    fn test_parse_filter_narrows_under_not_and_is(
+        #[case] filter: &str,
+        #[case] expected: Vec<bool>,
+    ) {
+        let batch = RecordBatch::try_from_iter([(
+            "f",
+            Arc::new(Float32Array::from(vec![0.1, 0.5])) as ArrayRef,
+        )])
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let evaluate = |filter: &str| {
+            let expr = planner
+                .optimize_expr(planner.parse_filter(filter).unwrap())
+                .unwrap();
+            planner
+                .create_physical_expr(&expr)
+                .unwrap()
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap()
+        };
+
+        let negated = BooleanArray::from(expected.iter().map(|m| !m).collect::<Vec<_>>());
+        let expected = BooleanArray::from(expected);
+        assert_eq!(evaluate(filter).as_ref(), &expected);
+        assert_eq!(evaluate(&format!("NOT ({filter})")).as_ref(), &negated);
+        assert_eq!(evaluate(&format!("({filter}) IS TRUE")).as_ref(), &expected);
+        assert_eq!(evaluate(&format!("({filter}) IS FALSE")).as_ref(), &negated);
+        assert_eq!(
+            evaluate(&format!("({filter}) IS NOT TRUE")).as_ref(),
+            &negated
+        );
+        assert_eq!(
+            evaluate(&format!("({filter}) IS NOT FALSE")).as_ref(),
+            &expected
+        );
+    }
+
+    #[rstest]
+    #[case::right("value >> 32", Operator::BitwiseShiftRight, vec![0, 1, 3])]
+    #[case::left(
+        "value << 1",
+        Operator::BitwiseShiftLeft,
+        vec![0, 2_u64 << 32, ((3_u64 << 32) + 7) << 1]
+    )]
+    fn test_bitwise_shift_expressions(
+        #[case] sql: &str,
+        #[case] expected_op: Operator,
+        #[case] expected: Vec<u64>,
+    ) {
+        let input = vec![0, 1_u64 << 32, (3_u64 << 32) + 7];
+        let batch =
+            RecordBatch::try_from_iter([("value", Arc::new(UInt64Array::from(input)) as ArrayRef)])
+                .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner.parse_expr(sql).unwrap();
+        let Expr::BinaryExpr(binary_expr) = &expr else {
+            panic!("expected binary expression for {sql}, got {expr}");
+        };
+        assert_eq!(binary_expr.op, expected_op);
+
+        let expr = planner.optimize_expr(expr).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let values = physical_expr
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        assert_eq!(values.as_ref(), &UInt64Array::from(expected));
+    }
+
     #[test]
     fn test_negative_array_expressions() {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
@@ -1581,6 +2004,22 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::distinct("a IS DISTINCT FROM b", [false, true, true, false])]
+    #[case::not_distinct("a IS NOT DISTINCT FROM b", [true, false, false, true])]
+    fn test_sql_is_distinct_from(#[case] filter: &str, #[case] expected: [bool; 4]) {
+        let batch = arrow_array::record_batch!(
+            ("a", Int32, [Some(1), None, Some(2), None]),
+            ("b", Int32, [Some(1), Some(2), None, None])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let expr = planner.optimize_expr(planner.parse_filter(filter).unwrap());
+        let physical = planner.create_physical_expr(&expr.unwrap()).unwrap();
+        let result = physical.evaluate(&batch).unwrap().into_array(4).unwrap();
+        assert_eq!(result.as_ref(), &BooleanArray::from(expected.to_vec()));
+    }
+
     #[test]
     fn test_sql_invert() {
         let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Boolean, true)]));
@@ -1685,6 +2124,28 @@ mod tests {
                 _ => panic!("Expected binary expression"),
             }
         }
+    }
+
+    #[test]
+    fn test_arrow_cast_int_literal_to_time32() {
+        let batch = RecordBatch::try_from_iter([(
+            "v",
+            Arc::new(Time32SecondArray::from(vec![3725, 3726])) as ArrayRef,
+        )])
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+
+        let expr = planner
+            .parse_filter("v = arrow_cast(3726, 'Time32(Second)')")
+            .unwrap();
+        let expr = planner.optimize_expr(expr).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(vec![false, true])
+        );
     }
 
     #[test]
@@ -1954,6 +2415,33 @@ mod tests {
     }
 
     #[test]
+    fn test_lance_context_provider_resolves_session_functions() {
+        let session = crate::exec::new_session_context(&LanceExecutionOptions::default());
+        let ctx_provider = LanceContextProvider::new(session.clone());
+        assert!(ctx_provider.get_function_meta("contains_tokens").is_some());
+        assert!(ctx_provider.get_function_meta("lower").is_some());
+        assert!(ctx_provider.get_aggregate_meta("sum").is_some());
+        assert!(ctx_provider.get_window_meta("row_number").is_some());
+        assert!(ctx_provider.get_function_meta("registered_later").is_none());
+
+        // The provider reads the session's functions instead of a copy, so a
+        // function registered on the session afterwards resolves as well.
+        session.register_udf(datafusion::logical_expr::create_udf(
+            "registered_later",
+            vec![DataType::Utf8],
+            DataType::Utf8,
+            Volatility::Immutable,
+            Arc::new(|args: &[ColumnarValue]| Ok(args[0].clone())),
+        ));
+        assert!(ctx_provider.get_function_meta("registered_later").is_some());
+        assert!(
+            ctx_provider
+                .udf_names()
+                .contains(&"registered_later".to_string())
+        );
+    }
+
+    #[test]
     fn test_regexp_match_and_non_empty_captions() {
         // Repro for a bug where regexp_match inside an AND chain wasn't coerced to boolean,
         // causing planning/evaluation failures. This should evaluate successfully.
@@ -2013,28 +2501,77 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_regexp_match_infer_error_without_boolean_coercion() {
-        // With the fix applied, using parse_filter should coerce regexp_match to boolean
-        // even when nested in a larger AND expression, so this should plan successfully.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("keywords", DataType::Utf8, true),
-            Field::new("natural_caption", DataType::Utf8, true),
-            Field::new("poetic_caption", DataType::Utf8, true),
-        ]));
+    #[rstest]
+    #[case::bare("regexp_match(name, 'e[12]')", [false, true, true, false, false, false])]
+    #[case::is_not_null(
+        "regexp_match(name, 'e[12]') IS NOT NULL",
+        [false, true, true, false, false, false]
+    )]
+    #[case::is_null(
+        "regexp_match(name, 'e[12]') IS NULL",
+        [true, false, false, true, true, true]
+    )]
+    #[case::not_bare(
+        "NOT regexp_match(name, 'e[12]')",
+        [true, false, false, true, true, true]
+    )]
+    #[case::and_bare(
+        "regexp_match(name, 'e[12]') AND name <> 'name2'",
+        [false, true, false, false, false, false]
+    )]
+    #[case::or_bare(
+        "regexp_match(name, 'e[12]') OR name IS NULL",
+        [false, true, true, true, false, false]
+    )]
+    #[case::not_is_not_null(
+        "NOT (regexp_match(name, 'e[12]') IS NOT NULL)",
+        [true, false, false, true, true, true]
+    )]
+    #[case::and_is_null(
+        "regexp_match(name, 'e[12]') IS NULL AND name IS NOT NULL",
+        [true, false, false, false, true, true]
+    )]
+    #[case::or_is_not_null(
+        "regexp_match(name, 'e[12]') IS NOT NULL OR name IS NULL",
+        [false, true, true, true, false, false]
+    )]
+    fn test_regexp_match_filter_coercion(#[case] filter: &str, #[case] expected: [bool; 6]) {
+        let batch = arrow_array::record_batch!((
+            "name",
+            Utf8,
+            [
+                Some("name0"),
+                Some("name1"),
+                Some("name2"),
+                None,
+                Some("name4"),
+                Some("name5")
+            ]
+        ))
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let expr = planner.parse_filter(filter).unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        let result = physical_expr.evaluate(&batch).unwrap();
 
+        assert_eq!(
+            result.into_array(batch.num_rows()).unwrap().as_ref(),
+            &BooleanArray::from(expected.to_vec())
+        );
+    }
+
+    #[rstest]
+    #[case::is_not_null("regexp_match(name, 'e[12]') IS NOT NULL")]
+    #[case::is_null("regexp_match(name, 'e[12]') IS NULL")]
+    #[case::comparison("regexp_match(name, 'e[12]') = regexp_match(name, 'e[12]')")]
+    fn test_regexp_match_preserves_value_contexts(#[case] filter: &str) {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
         let planner = Planner::new(schema);
 
-        let expr = planner
-            .parse_filter(
-                "regexp_match(keywords, 'Liberty|revolution') AND \
-                 (natural_caption IS NOT NULL AND natural_caption <> '' AND \
-                  poetic_caption IS NOT NULL AND poetic_caption <> '')",
-            )
-            .unwrap();
-
-        // Should not panic
-        let _physical = planner.create_physical_expr(&expr).unwrap();
+        assert_eq!(
+            planner.parse_filter(filter).unwrap(),
+            planner.parse_expr(filter).unwrap()
+        );
     }
 
     #[test]

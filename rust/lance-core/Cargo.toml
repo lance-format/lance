@@ -19,13 +19,11 @@ arrow-schema.workspace = true
 async-trait.workspace = true
 lance-arrow.workspace = true
 blake3.workspace = true
-byteorder.workspace = true
 bytes.workspace = true
 datafusion-common = { workspace = true, optional = true }
 datafusion-sql = { workspace = true, optional = true }
 lance-derive.workspace = true
 futures.workspace = true
-itertools.workspace = true
 libc.workspace = true
 libm.workspace = true
 moka.workspace = true
@@ -40,22 +38,17 @@ serde_json.workspace = true
 snafu.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
-tokio-stream.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 twox-hash.workspace = true
 url.workspace = true
 log.workspace = true
 
-# This is used to detect CPU features at runtime.
-# See src/utils/cpu.rs
-[target.'cfg(all(any(target_arch = "aarch64", target_arch = "loongarch64"), target_os = "linux"))'.dependencies]
-libc = { version = "0.2" }
-
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true
 rstest.workspace = true
+tokio-stream.workspace = true
 
 [features]
 # Capture Rust backtraces in error types. When disabled (the default),

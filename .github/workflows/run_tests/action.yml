@@ -13,6 +13,10 @@ inputs:
     required: false
     description: "Install and preload the prebuilt memtest library"
     default: "false"
+  pytest-workers:
+    required: false
+    description: "pytest-xdist worker count; 'auto' matches the runner's cores"
+    default: "auto"
 runs:
   using: "composite"
   steps:
@@ -42,4 +46,4 @@ runs:
     - name: Run python tests
       shell: bash
       working-directory: python
-      run: make test
+      run: make test PYTEST_WORKERS=${{ inputs.pytest-workers }}

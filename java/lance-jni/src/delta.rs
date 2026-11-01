@@ -95,11 +95,17 @@ fn inner_native_build<'local>(
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET)? };
 
+        // Forward every field as set: `build` rejects conflicting or half-set
+        // selections, which filtering here would hide.
         let mut builder = dataset_guard.inner.delta();
         if let Some(compared) = compared_against {
             builder = builder.compared_against_version(compared);
-        } else if let (Some(begin), Some(end)) = (begin_version, end_version) {
-            builder = builder.with_begin_version(begin).with_end_version(end);
+        }
+        if let Some(begin) = begin_version {
+            builder = builder.with_begin_version(begin);
+        }
+        if let Some(end) = end_version {
+            builder = builder.with_end_version(end);
         }
         builder.build()?
     };
@@ -181,6 +187,33 @@ fn inner_get_updated_rows<'local>(
         unsafe { env.get_rust_field::<_, _, BlockingDatasetDelta>(&j_delta, NATIVE_DELTA) }?;
 
     let stream: DatasetRecordBatchStream = block_on(delta_guard.inner.get_updated_rows())?;
+    let ffi_stream = to_ffi_arrow_array_stream(stream, RT.handle().clone())?;
+
+    unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
+    Ok(())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_delta_DatasetDelta_nativeGetDeletedRowIds<'local>(
+    mut env: JNIEnv<'local>,
+    j_delta: JObject<'local>,
+    stream_addr: jlong,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_get_deleted_row_ids(&mut env, j_delta, stream_addr)
+    )
+}
+
+fn inner_get_deleted_row_ids<'local>(
+    env: &mut JNIEnv,
+    j_delta: JObject<'local>,
+    stream_addr: jlong,
+) -> Result<()> {
+    let delta_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDatasetDelta>(&j_delta, NATIVE_DELTA) }?;
+
+    let stream: DatasetRecordBatchStream = block_on(delta_guard.inner.get_deleted_row_ids())?;
     let ffi_stream = to_ffi_arrow_array_stream(stream, RT.handle().clone())?;
 
     unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }

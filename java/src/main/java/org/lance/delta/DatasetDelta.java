@@ -91,6 +91,24 @@ public class DatasetDelta implements Closeable {
 
   private native void nativeGetUpdatedRows(long streamAddress) throws IOException;
 
+  /**
+   * Return a streaming ArrowReader of the row ids deleted in the range.
+   *
+   * <p>The batches carry a single {@code _rowid} column. Requires stable row ids.
+   */
+  public ArrowReader getDeletedRowIds() throws IOException {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDeltaHandle != 0, "DatasetDelta is closed");
+      BufferAllocator allocator = dataset.allocator();
+      try (ArrowArrayStream s = ArrowArrayStream.allocateNew(allocator)) {
+        nativeGetDeletedRowIds(s.memoryAddress());
+        return Data.importArrayStream(allocator, s);
+      }
+    }
+  }
+
+  private native void nativeGetDeletedRowIds(long streamAddress) throws IOException;
+
   @Override
   public void close() {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
