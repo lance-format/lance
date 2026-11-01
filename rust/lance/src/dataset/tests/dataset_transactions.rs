@@ -1431,14 +1431,8 @@ async fn restore_fence_dataset() -> (TempStrDir, Dataset) {
         DataType::Int32,
         false,
     )]));
-    let first = record_batch! {
-        "id" => Int32Array::from(vec![1])
-    }
-    .unwrap();
-    let second = record_batch! {
-        "id" => Int32Array::from(vec![2])
-    }
-    .unwrap();
+    let first = record_batch!(("id", Int32, [1])).unwrap();
+    let second = record_batch!(("id", Int32, [2])).unwrap();
     let dir = TempStrDir::default();
     Dataset::write(
         RecordBatchIterator::new([Ok(first)], schema.clone()),

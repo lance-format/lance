@@ -1812,9 +1812,6 @@ pub(crate) async fn commit_transaction(
     // catch-up is work the commit must do however many retries it gets.
     let mut retry_start: Option<Instant> = None;
 
-    // Other transactions that may have been committed since the read_version.
-    // We keep pair of (version, transaction). No other transactions to check initially
-    let mut other_transactions: Vec<(u64, Arc<Transaction>)>;
     // Track the transaction file written in the current loop iteration so we can
     // delete it if the commit ultimately fails.
     let mut current_transaction_file = String::new();
@@ -1849,10 +1846,11 @@ pub(crate) async fn commit_transaction(
                     .into(),
                 ));
             }
-            other_transactions = Vec::new();
         } else if !strict_overwrite {
             let checked_since = dataset.manifest.version;
-            (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
+            let (loaded_dataset, other_transactions) =
+                load_and_sort_new_transactions(&dataset).await?;
+            dataset = loaded_dataset;
 
             ensure_can_write_manifest(&dataset.manifest)?;
 
