@@ -1211,8 +1211,8 @@ impl ScalarQueryParser for FtsQueryParser {
             && self.has_index_tokens(&scalar_str)
         {
             let query = TokenQuery::TokensContains(scalar_str);
-            // The index tokenizer lowercases and drops stop words, so its rows
-            // are candidates the scan still has to check.
+            // The index tokenizer can lowercase, fold and drop stop words, so
+            // its rows are candidates the scan still has to check.
             return Some(IndexedExpression::index_query_with_recheck(
                 column.to_string(),
                 self.index_name.clone(),

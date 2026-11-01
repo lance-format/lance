@@ -8678,6 +8678,17 @@ async fn test_sql_contains_tokens() {
         .await
         .unwrap();
         assert_results(results, &StringArray::from(expected));
+
+        // The index cannot narrow such a query, so the plan leaves it to the scan.
+        let results = execute_sql(
+            &format!("explain select * from foo where contains_tokens(text, '{query}')"),
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        let plan = format!("{:?}", results);
+        assert_not_contains!(&plan, "ScalarIndexQuery");
     }
 
     // Counting reads the index result directly unless it needs a recheck, and
@@ -8690,6 +8701,60 @@ async fn test_sql_contains_tokens() {
         assert_eq!(
             count, expected,
             "count_rows of contains_tokens(text, '{query}')"
+        );
+    }
+}
+
+/// On legacy storage the index result is materialized before the recheck. A
+/// query made only of the index's custom stop words leaves the index no
+/// tokens, and must still match the rows the scan matches.
+#[tokio::test]
+async fn test_sql_contains_tokens_custom_stop_words_on_legacy_storage() {
+    let text_col = Arc::new(StringArray::from(vec![
+        "a cat catch a fish",
+        "a fish catch a cat",
+        "dog fish",
+    ]));
+    // Not a built-in stop word, so only the index's own list drops it.
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+        vec![text_col],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let params = WriteParams {
+        data_storage_version: Some(LanceFileVersion::Legacy),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(stream, "memory://", Some(params))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .max_token_length(None)
+                .stem(false)
+                .custom_stop_words(Some(vec!["cat".to_string()])),
+            true,
+        )
+        .await
+        .unwrap();
+
+    for query in ["cat", "a"] {
+        let results = execute_sql(
+            &format!("select * from foo where contains_tokens(text, '{query}')"),
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        assert_results(
+            results,
+            &StringArray::from(vec!["a cat catch a fish", "a fish catch a cat"]),
         );
     }
 }
