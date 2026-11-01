@@ -17,12 +17,12 @@
 //! `- rows: RowMapping
 //!    |- UniformFlat { .. }          flat page, uniform leaf chunking (arithmetic)
 //!    |- Flat { value_starts }       flat page, non-uniform leaf chunking
-//!    `- Nested { row_starts, .. }   repetition present; rows tracked as prefix sums
+//!    `- Nested(_)                   repetition present; rows tracked as prefix sums
 //! ```
 
 use std::ops::Range;
 
-use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
+use arrow_buffer::bit_util;
 use lance_core::cache::{Context, DeepSizeOf};
 
 /// Cumulative (prefix-sum) array of length `num_chunks + 1` (entry `0` is `0`,
@@ -190,19 +190,35 @@ impl ItemCounts {
     }
 }
 
+/// Nested-page-only row metadata, boxed by [`RowMapping`] so flat page indices
+/// do not carry its inline footprint.
+#[derive(Debug)]
+pub struct NestedRowMapping {
+    row_starts: PrefixSums,
+    has_trailer: Box<[u8]>,
+    item_counts: ItemCounts,
+}
+
+impl DeepSizeOf for NestedRowMapping {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.row_starts.deep_size_of_children(context)
+            + self.has_trailer.len()
+            + self.item_counts.deep_size_of_children(context)
+    }
+}
+
 /// How row ranges map onto chunks.
 ///
 /// Flat pages have row == value index and no preamble/trailer.  Nested pages
 /// track rows separately from leaf items and store a trailer bit per chunk; a
 /// chunk's preamble is the previous chunk's trailer.
-#[derive(Debug)]
+#[derive(Debug, DeepSizeOf)]
 pub enum RowMapping {
     /// Flat page whose non-last chunks all hold `values_per_chunk` values, so
     /// row->chunk is pure arithmetic.
     UniformFlat {
         values_per_chunk: u64,
         last_chunk_values: u64,
-        num_chunks: usize,
     },
     /// Flat page with non-uniform chunk sizes; `value_starts` are the cumulative
     /// value counts (final entry == number of items in the page).
@@ -210,34 +226,23 @@ pub enum RowMapping {
     /// Nested page.  `row_starts` are cumulative row counts (final entry ==
     /// number of rows in the page); `has_trailer[i]` is set when chunk `i` ends
     /// with a partial list.
-    Nested {
-        row_starts: PrefixSums,
-        has_trailer: BooleanBuffer,
-        item_counts: ItemCounts,
-    },
+    Nested(Box<NestedRowMapping>),
 }
 
-impl DeepSizeOf for RowMapping {
-    fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        match self {
-            Self::UniformFlat { .. } => 0,
-            Self::Flat { value_starts } => value_starts.deep_size_of_children(context),
-            Self::Nested {
-                row_starts,
-                has_trailer,
-                item_counts,
-            } => {
-                row_starts.deep_size_of_children(context)
-                    + has_trailer.len().div_ceil(8)
-                    + item_counts.deep_size_of_children(context)
-            }
-        }
+impl RowMapping {
+    /// Builds a nested row mapping without inflating the flat enum variants.
+    pub fn nested(row_starts: PrefixSums, has_trailer: Box<[u8]>, item_counts: ItemCounts) -> Self {
+        Self::Nested(Box::new(NestedRowMapping {
+            row_starts,
+            has_trailer,
+            item_counts,
+        }))
     }
 }
 
 /// Compact per-page chunk index that avoids fully materializing the repetition
 /// index into u64's to save RAM.  See the module docs for the layout.
-#[derive(Debug)]
+#[derive(Debug, DeepSizeOf)]
 pub struct MiniBlockChunkIndex {
     base: u64,
     byte_starts: PrefixSums,
@@ -271,7 +276,6 @@ impl MiniBlockChunkIndex {
             RowMapping::UniformFlat {
                 values_per_chunk,
                 last_chunk_values,
-                ..
             } => {
                 if i == num_chunks.saturating_sub(1) {
                     *last_chunk_values
@@ -280,7 +284,7 @@ impl MiniBlockChunkIndex {
                 }
             }
             RowMapping::Flat { value_starts } => value_starts.delta(i),
-            RowMapping::Nested { item_counts, .. } => item_counts.get(i, num_chunks),
+            RowMapping::Nested(mapping) => mapping.item_counts.get(i, num_chunks),
         }
     }
 
@@ -288,12 +292,10 @@ impl MiniBlockChunkIndex {
     pub fn find_chunk(&self, row: u64) -> usize {
         match &self.rows {
             RowMapping::UniformFlat {
-                values_per_chunk,
-                num_chunks,
-                ..
-            } => ((row / values_per_chunk) as usize).min(num_chunks.saturating_sub(1)),
+                values_per_chunk, ..
+            } => ((row / values_per_chunk) as usize).min(self.num_chunks().saturating_sub(1)),
             RowMapping::Flat { value_starts } => value_starts.find(row),
-            RowMapping::Nested { row_starts, .. } => row_starts.find(row),
+            RowMapping::Nested(mapping) => mapping.row_starts.find(row),
         }
     }
 
@@ -304,7 +306,7 @@ impl MiniBlockChunkIndex {
                 values_per_chunk, ..
             } => i as u64 * values_per_chunk,
             RowMapping::Flat { value_starts } => value_starts.get(i),
-            RowMapping::Nested { row_starts, .. } => row_starts.get(i),
+            RowMapping::Nested(mapping) => mapping.row_starts.get(i),
         }
     }
 
@@ -316,16 +318,15 @@ impl MiniBlockChunkIndex {
             RowMapping::UniformFlat {
                 values_per_chunk,
                 last_chunk_values,
-                ..
             } => {
-                if i == num_chunks - 1 {
+                if i == num_chunks.saturating_sub(1) {
                     *last_chunk_values
                 } else {
                     *values_per_chunk
                 }
             }
             RowMapping::Flat { value_starts } => value_starts.delta(i),
-            RowMapping::Nested { row_starts, .. } => row_starts.delta(i),
+            RowMapping::Nested(mapping) => mapping.row_starts.delta(i),
         }
     }
 
@@ -334,7 +335,9 @@ impl MiniBlockChunkIndex {
     /// previous chunk's trailer.
     pub fn has_preamble(&self, i: usize) -> bool {
         match &self.rows {
-            RowMapping::Nested { has_trailer, .. } => i > 0 && has_trailer.value(i - 1),
+            RowMapping::Nested(mapping) => {
+                i > 0 && bit_util::get_bit(mapping.has_trailer.as_ref(), i - 1)
+            }
             _ => false,
         }
     }
@@ -343,7 +346,7 @@ impl MiniBlockChunkIndex {
     /// next chunk).  Always false for flat pages.
     pub fn has_trailer(&self, i: usize) -> bool {
         match &self.rows {
-            RowMapping::Nested { has_trailer, .. } => has_trailer.value(i),
+            RowMapping::Nested(mapping) => bit_util::get_bit(mapping.has_trailer.as_ref(), i),
             _ => false,
         }
     }
@@ -354,7 +357,7 @@ impl MiniBlockChunkIndex {
         match &self.rows {
             RowMapping::UniformFlat { .. } => "uniform_flat",
             RowMapping::Flat { .. } => "flat",
-            RowMapping::Nested { .. } => "nested",
+            RowMapping::Nested(_) => "nested",
         }
     }
 
@@ -373,21 +376,15 @@ impl MiniBlockChunkIndex {
         Self {
             base: 0,
             byte_starts,
-            rows: RowMapping::Nested {
+            rows: RowMapping::nested(
                 row_starts,
                 has_trailer,
-                item_counts: ItemCounts::Uniform {
+                ItemCounts::Uniform {
                     values_per_chunk: 1,
                     last_chunk_values: 1,
                 },
-            },
+            ),
         }
-    }
-}
-
-impl DeepSizeOf for MiniBlockChunkIndex {
-    fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        self.byte_starts.deep_size_of_children(context) + self.rows.deep_size_of_children(context)
     }
 }
 
@@ -397,7 +394,7 @@ impl DeepSizeOf for MiniBlockChunkIndex {
 /// finishing in the chunk) and `partial` (leftover items).  Only cumulative row
 /// starts and a trailer bit are kept: `has_preamble[i] = has_trailer[i-1]` and
 /// `starts_including_trailer = ends + has_trailer - has_preamble`.
-pub fn parse_nested_rep(rep_bytes: &[u8], stride: usize) -> (PrefixSums, BooleanBuffer) {
+pub fn parse_nested_rep(rep_bytes: &[u8], stride: usize) -> (PrefixSums, Box<[u8]>) {
     // Read the two `u64`s per group straight from the little-endian bytes rather
     // than copying the buffer to reinterpret it.  The caller guarantees
     // `rep_bytes.len() % 8 == 0`, so the 8-byte windows stay in bounds.
@@ -408,7 +405,7 @@ pub fn parse_nested_rep(rep_bytes: &[u8], stride: usize) -> (PrefixSums, Boolean
     };
     let num_chunks = (rep_bytes.len() / WORD) / stride;
 
-    let mut has_trailer_builder = BooleanBufferBuilder::new(num_chunks);
+    let mut has_trailer_bits = vec![0u8; num_chunks.div_ceil(8)];
     // Accumulate the cumulative row starts in a single pass (entry 0 is 0, the
     // trailing entry is the total) so there is no separate deltas buffer.
     let mut row_starts = Vec::with_capacity(num_chunks + 1);
@@ -424,7 +421,9 @@ pub fn parse_nested_rep(rep_bytes: &[u8], stride: usize) -> (PrefixSums, Boolean
         let has_trailer = partial > 0;
         let starts_including_trailer = ends + (has_trailer as u64) - (chunk_has_preamble as u64);
 
-        has_trailer_builder.append(has_trailer);
+        if has_trailer {
+            bit_util::set_bit(&mut has_trailer_bits, i);
+        }
         acc += starts_including_trailer;
         row_starts.push(acc);
 
@@ -433,7 +432,7 @@ pub fn parse_nested_rep(rep_bytes: &[u8], stride: usize) -> (PrefixSums, Boolean
 
     (
         PrefixSums::from_prefix(row_starts),
-        has_trailer_builder.finish(),
+        has_trailer_bits.into_boxed_slice(),
     )
 }
 
@@ -527,6 +526,7 @@ mod tests {
             let reference = reference_decode(&bytes, 2);
             let (row_starts, has_trailer) = parse_nested_rep(&bytes, 2);
             assert_eq!(row_starts.num_chunks(), reference.len());
+            assert_eq!(has_trailer.len(), reference.len().div_ceil(8));
             for (i, block) in reference.iter().enumerate() {
                 assert_eq!(row_starts.get(i), block.first_row, "first_row[{i}]");
                 assert_eq!(
@@ -534,11 +534,23 @@ mod tests {
                     block.starts_including_trailer,
                     "starts_including_trailer[{i}]"
                 );
-                assert_eq!(has_trailer.value(i), block.has_trailer, "has_trailer[{i}]");
-                let derived_preamble = i > 0 && has_trailer.value(i - 1);
+                assert_eq!(
+                    bit_util::get_bit(has_trailer.as_ref(), i),
+                    block.has_trailer,
+                    "has_trailer[{i}]"
+                );
+                let derived_preamble = i > 0 && bit_util::get_bit(has_trailer.as_ref(), i - 1);
                 assert_eq!(derived_preamble, block.has_preamble, "has_preamble[{i}]");
             }
         }
+    }
+
+    #[test]
+    fn flat_row_mapping_does_not_inline_nested_state() {
+        assert!(
+            std::mem::size_of::<RowMapping>() < std::mem::size_of::<NestedRowMapping>(),
+            "flat row mappings should only store a pointer to nested-only state"
+        );
     }
 
     #[test]
