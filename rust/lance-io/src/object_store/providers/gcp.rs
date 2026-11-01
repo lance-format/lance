@@ -25,7 +25,10 @@ use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::build_dynamic_credential_provider,
-    throttle::{AimdThrottleState, cloud_http_connector, shared_throttle_state, with_throttling},
+    throttle::{
+        AimdThrottleState, Transport, cloud_http_connector, reject_http_connector_for_opendal,
+        shared_throttle_state, with_throttling,
+    },
 };
 use lance_core::error::{Error, Result};
 use lance_core::utils::parse::str_is_truthy;
@@ -238,6 +241,7 @@ impl GcsStoreProvider {
         storage_options: &StorageOptions,
         accessor: Option<Arc<StorageOptionsAccessor>>,
         throttle_state: Option<&AimdThrottleState>,
+        transport: Transport,
         // Concrete rather than `dyn`, so the caller keeps the handle a paginated listing
         // needs: `PaginatedListStore` is a separate trait from `ObjectStore`.
     ) -> Result<Arc<GoogleCloudStorage>> {
@@ -283,6 +287,7 @@ impl GcsStoreProvider {
         builder = builder.with_http_connector(cloud_http_connector(
             throttle_state,
             crate::object_store::metrics_base(&store_prefix, base_path),
+            transport,
         ));
 
         Ok(Arc::new(builder.build()?))
@@ -312,6 +317,7 @@ impl ObjectStoreProvider for GcsStoreProvider {
         let throttle_state = shared_throttle_state(&store_prefix, params)?;
 
         let (inner, paginated_lister) = if use_opendal {
+            reject_http_connector_for_opendal(params)?;
             // OpenDAL GCS intentionally uses static/environment-backed configuration only.
             // Namespace-vended dynamic credentials are supported on the native object_store path.
             // Listed in full: no paginated lister covers OpenDAL yet.
@@ -327,6 +333,7 @@ impl ObjectStoreProvider for GcsStoreProvider {
                     &storage_options,
                     accessor,
                     throttle_state.as_ref(),
+                    Transport::new(params.http_connector.as_ref()),
                 )
                 .await?;
             (
@@ -405,6 +412,7 @@ mod tests {
     use super::*;
     use std::{collections::HashMap, fs, sync::Arc};
 
+    use crate::object_store::test_utils::RecordingConnector;
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
     use crate::object_store::{ObjectStoreParams, StorageOptionsAccessor};
     use tempfile::TempDir;
@@ -630,5 +638,34 @@ mod tests {
             "unexpected error: {error}"
         );
         mock_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_gcs_store_opens_its_clients_with_the_given_http_connector() {
+        let connector = Arc::new(RecordingConnector::default());
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([("google_skip_signature".to_string(), "true".to_string())]),
+            ))),
+            http_connector: Some(connector.clone()),
+            ..Default::default()
+        };
+
+        let url = Url::parse("gs://bucket/path").unwrap();
+        let store = GcsStoreProvider.new_store(url, &params).await.unwrap();
+        let found = object_store::ObjectStoreExt::get(
+            store.inner.as_ref(),
+            &object_store::path::Path::from("path/file"),
+        )
+        .await;
+
+        assert!(
+            matches!(found, Err(object_store::Error::NotFound { .. })),
+            "{found:?}"
+        );
+        assert!(connector.connects.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        let requests = connector.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(requests[0].ends_with("/bucket/path%2Ffile"), "{requests:?}");
     }
 }
