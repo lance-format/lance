@@ -5,9 +5,11 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::io::ErrorKind;
 use std::ops::Range;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -69,6 +71,7 @@ pub mod throttle;
 mod tracing;
 use crate::object_reader::SmallReader;
 use crate::object_writer::{LocalWriter, WriteResult};
+use crate::scheduler::{SCHEDULER_ERROR_MODE_STORAGE_OPTION, SchedulerErrorMode};
 use crate::traits::{WriteExt, Writer};
 use crate::utils::tracking_store::{IOTracker, IoStats};
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
@@ -83,12 +86,6 @@ pub const DEFAULT_LOCAL_IO_PARALLELISM: usize = 8;
 pub const DEFAULT_CLOUD_IO_PARALLELISM: usize = 64;
 
 const SERVER_SIDE_COPY_ENABLED_ENV: &str = "LANCE_IO_SERVER_SIDE_COPY_ENABLED";
-
-#[derive(Clone, Copy)]
-enum StreamCopyMode {
-    Overwrite,
-    Create,
-}
 
 const DEFAULT_LOCAL_BLOCK_SIZE: usize = 4 * 1024; // 4KB block size
 #[cfg(any(
@@ -110,6 +107,10 @@ pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock:
 });
 
 pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
+
+/// Storage option that sets the registry-wide minimum prune threshold of the
+/// object store cache; see [`StorageOptions::object_store_cache_prune_threshold`].
+pub const OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION: &str = "object_store_cache_prune_threshold";
 
 #[derive(Debug)]
 struct StreamCopyError {
@@ -176,6 +177,17 @@ pub trait ObjectStoreExt {
 #[async_trait]
 pub(super) trait LocalDirOperations: std::fmt::Debug + Send + Sync {
     async fn remove_dir_all(&self, path: &Path) -> Result<()>;
+    async fn canonicalize(&self, path: &Path) -> Result<Option<PathBuf>>;
+}
+
+pub(crate) fn canonicalize_local_io_result(
+    result: std::io::Result<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    match result {
+        Ok(path) => Ok(Some(path)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[async_trait]
@@ -211,20 +223,22 @@ pub struct ObjectStore {
     pub inner: Arc<dyn OSObjectStore>,
     // Provider-owned native directory operations for rooted local stores.
     local_dir_operations: Option<Arc<dyn LocalDirOperations>>,
+    // Whether local writes sync file data and directory entries before returning.
+    local_fsync: bool,
     scheme: String,
     block_size: usize,
     max_iop_size: u64,
     /// Whether to use constant size upload parts for multipart uploads. This
     /// is only necessary for Cloudflare R2.
     pub use_constant_size_upload_parts: bool,
-    /// Whether multipart uploads honor [`PutMode::Create`] at completion.
-    supports_conditional_multipart_put: bool,
     /// Whether we can assume that the list of files is lexically ordered. This
     /// is true for object stores, but not for local filesystems.
     pub list_is_lexically_ordered: bool,
     io_parallelism: usize,
     /// Number of times to retry a failed download
     download_retry_count: usize,
+    /// Scheduler error handling validated at the store construction boundary.
+    scheduler_error_mode: SchedulerErrorMode,
     /// IO tracker for monitoring read/write operations
     io_tracker: IOTracker,
     /// The datastore prefix that uniquely identifies this object store. It encodes information
@@ -242,15 +256,12 @@ impl std::fmt::Debug for ObjectStore {
         f.debug_struct("ObjectStore")
             .field("inner", &self.inner)
             .field("scheme", &self.scheme)
+            .field("local_fsync", &self.local_fsync)
             .field("block_size", &self.block_size)
             .field("max_iop_size", &self.max_iop_size)
             .field(
                 "use_constant_size_upload_parts",
                 &self.use_constant_size_upload_parts,
-            )
-            .field(
-                "supports_conditional_multipart_put",
-                &self.supports_conditional_multipart_put,
             )
             .field("list_is_lexically_ordered", &self.list_is_lexically_ordered)
             .field("io_parallelism", &self.io_parallelism)
@@ -420,6 +431,10 @@ impl ObjectStoreParams {
         }
     }
 
+    pub(crate) fn scheduler_error_mode(&self) -> Result<SchedulerErrorMode> {
+        parse_scheduler_error_mode(self.storage_options())
+    }
+
     /// Resolve these params for a single base path scope.
     ///
     /// Storage options may carry base-scoped entries (`base_<id>.<key>`) that
@@ -440,6 +455,22 @@ impl ObjectStoreParams {
             })
         }
     }
+}
+
+fn parse_scheduler_error_mode(
+    storage_options: Option<&HashMap<String, String>>,
+) -> Result<SchedulerErrorMode> {
+    let value = storage_options.and_then(|options| {
+        options
+            .get(SCHEDULER_ERROR_MODE_STORAGE_OPTION)
+            .or_else(|| {
+                options.iter().find_map(|(key, value)| {
+                    key.eq_ignore_ascii_case(SCHEDULER_ERROR_MODE_STORAGE_OPTION)
+                        .then_some(value)
+                })
+            })
+    });
+    value.map_or(Ok(SchedulerErrorMode::BestEffort), |value| value.parse())
 }
 
 fn wrapper_allocation_ptr(wrapper: &Arc<dyn WrappingObjectStore>) -> *const () {
@@ -700,14 +731,15 @@ impl ObjectStore {
             let store = Self {
                 inner: tracked_store,
                 local_dir_operations: None,
+                local_fsync: false,
                 scheme: path.scheme().to_string(),
                 block_size: params.resolved_block_size()?.unwrap_or(64 * 1024),
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
                 use_constant_size_upload_parts: params.use_constant_size_upload_parts,
-                supports_conditional_multipart_put: false,
                 list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
+                scheduler_error_mode: params.scheduler_error_mode()?,
                 io_tracker,
                 store_prefix,
                 // Type-erased on the way in, so there is no telling if it can paginate.
@@ -795,6 +827,35 @@ impl ObjectStore {
         self.is_local() && self.store_prefix == self.scheme
     }
 
+    /// Canonicalize a local object path, resolving rooted and UNC stores through
+    /// their filesystem root mapping.
+    ///
+    /// Returns `Ok(None)` for non-local stores and when the filesystem identity cannot
+    /// be resolved, including missing paths and unsupported local root mappings. Other
+    /// local filesystem errors are returned to the caller.
+    ///
+    /// ```
+    /// # use lance_core::Result;
+    /// # use lance_io::object_store::ObjectStore;
+    /// # use object_store::path::Path;
+    /// # async fn same_directory(store: &ObjectStore, a: &Path, b: &Path) -> Result<bool> {
+    /// let a = store.canonicalize_local_path(a).await?;
+    /// let b = store.canonicalize_local_path(b).await?;
+    /// # Ok(a.is_some() && a == b)
+    /// # }
+    /// ```
+    pub async fn canonicalize_local_path(&self, path: &Path) -> Result<Option<PathBuf>> {
+        if let Some(local_dir_operations) = &self.local_dir_operations {
+            return local_dir_operations.canonicalize(path).await;
+        }
+        if self.has_direct_local_paths() || self.scheme == "file-object-store" {
+            return canonicalize_local_io_result(
+                tokio::fs::canonicalize(super::local::to_local_path(path)).await,
+            );
+        }
+        Ok(None)
+    }
+
     pub fn is_cloud(&self) -> bool {
         if self.is_local() || self.scheme == "memory" || self.scheme == "shared-memory" {
             return false;
@@ -844,6 +905,10 @@ impl ObjectStore {
             .max(1)
     }
 
+    pub(crate) fn scheduler_error_mode(&self) -> SchedulerErrorMode {
+        self.scheduler_error_mode
+    }
+
     /// Get the IO tracker for this object store
     ///
     /// The IO tracker can be used to get statistics about read/write operations
@@ -876,7 +941,6 @@ impl ObjectStore {
     /// [`Self::read_dir_page`] falls back through the (already-wrapped) `inner`.
     pub fn apply_wrapper(&mut self, wrapper: &dyn WrappingObjectStore) {
         self.inner = wrapper.wrap(&self.store_prefix, self.inner.clone());
-        self.supports_conditional_multipart_put = false;
         self.paginated_lister = self
             .paginated_lister
             .take()
@@ -1001,6 +1065,50 @@ impl ObjectStore {
         }
     }
 
+    /// Open a file after verifying its complete length against a checkpoint.
+    ///
+    /// Files within the existing small-file threshold are checked and buffered
+    /// by the same GET. Larger files retain the metadata check and range reader.
+    /// This does not pin a version of a mutable large file across later reads.
+    ///
+    /// ```
+    /// # use lance_io::object_store::ObjectStore;
+    /// # use object_store::path::Path;
+    /// # async fn example(store: &ObjectStore, path: &Path) -> lance_core::Result<()> {
+    /// let reader = store.open_with_expected_size(path, 1024).await?;
+    /// let bytes = reader.get_range(0..16).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn open_with_expected_size(
+        &self,
+        path: &Path,
+        expected_size: u64,
+    ) -> Result<Box<dyn Reader>> {
+        if expected_size <= self.block_size as u64 {
+            let reader = SmallReader::open_with_expected_size(
+                self.inner.clone(),
+                path.clone(),
+                self.download_retry_count,
+                expected_size as usize,
+            )
+            .await?;
+            return Ok(Box::new(reader));
+        }
+        let actual_size = self.size(path).await?;
+        if actual_size != expected_size {
+            return Err(Error::invalid_input(format!(
+                "object at '{path}' has {actual_size} bytes, checkpoint expects {expected_size}"
+            )));
+        }
+        let size = usize::try_from(actual_size).map_err(|_| {
+            Error::invalid_input(format!(
+                "object at '{path}' is too large for this platform: {actual_size} bytes"
+            ))
+        })?;
+        self.open_with_size(path, size).await
+    }
+
     /// Create an [ObjectWriter] from local [std::path::Path]
     pub async fn create_local_writer(path: &std::path::Path) -> Result<ObjectWriter> {
         let object_store = Self::local();
@@ -1023,14 +1131,17 @@ impl ObjectStore {
             "file" if self.has_direct_local_paths() => {
                 let local_path = super::local::to_local_path(path);
                 let local_path = std::path::PathBuf::from(&local_path);
-                if let Some(parent) = local_path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
                 let parent = local_path
                     .parent()
                     .expect("file path must have parent")
                     .to_owned();
+                let local_fsync = self.local_fsync;
                 let named_temp = tokio::task::spawn_blocking(move || {
+                    if local_fsync {
+                        super::local::create_dir_all_durable(&parent)?;
+                    } else {
+                        std::fs::create_dir_all(&parent)?;
+                    }
                     #[cfg(unix)]
                     {
                         // NamedTempFile defaults to 0o600. Use ordinary file creation permissions so the published file honors the caller's umask.
@@ -1045,12 +1156,15 @@ impl ObjectStore {
                 .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))??;
                 let (std_file, temp_path) = named_temp.into_parts();
                 let file = tokio::fs::File::from_std(std_file);
-                Ok(Box::new(LocalWriter::new(
-                    file,
-                    path.clone(),
-                    temp_path,
-                    Arc::new(self.io_tracker.clone()),
-                )))
+                Ok(Box::new(
+                    LocalWriter::new(
+                        file,
+                        path.clone(),
+                        temp_path,
+                        Arc::new(self.io_tracker.clone()),
+                    )
+                    .with_fsync(local_fsync),
+                ))
             }
             _ => Ok(Box::new(ObjectWriter::new(self, path).await?)),
         }
@@ -1234,6 +1348,8 @@ impl ObjectStore {
     /// copy. The source and destination may use different object stores. The copy
     /// succeeds only after the byte count reported by the writer and a destination
     /// metadata lookup both match the source size.
+    /// Local copies use the filesystem's native copy unless the destination
+    /// enables `local_fsync`, in which case its durable local writer is used.
     ///
     /// ```no_run
     /// # use lance_core::Result;
@@ -1275,30 +1391,19 @@ impl ObjectStore {
         destination_store: &Self,
         destination_path: &Path,
     ) -> Result<WriteResult> {
-        self.copy_via_stream_with_mode(
-            source_path,
-            destination_store,
-            destination_path,
-            StreamCopyMode::Overwrite,
-        )
-        .await
+        self.copy_via_stream_inner(source_path, destination_store, destination_path)
+            .await
     }
 
     /// Copy within this store without replacing an existing destination.
     ///
-    /// Backends with verified conditional multipart completion stream through
-    /// the client. Other backends retain their native conditional-copy path.
+    /// This uses the provider's native conditional copy. An existing destination
+    /// with the same size is treated as a successful retry.
     pub async fn copy_if_not_exists(
         &self,
         source_path: &Path,
         destination_path: &Path,
     ) -> Result<WriteResult> {
-        if self.supports_conditional_multipart_put {
-            return self
-                .copy_if_not_exists_via_stream(source_path, self, destination_path)
-                .await;
-        }
-
         let source_size = self.size(source_path).await?;
         match self
             .inner
@@ -1331,49 +1436,17 @@ impl ObjectStore {
         })
     }
 
-    #[instrument(
-        name = "multipart_stream_copy_if_not_exists",
-        level = "info",
-        skip(self, source_path, destination_store, destination_path),
-        fields(
-            source = %source_path,
-            destination = %destination_path,
-            source_size = Empty,
-            read_chunk_size = Empty,
-            multipart_part_size = crate::object_writer::initial_upload_size(),
-            multipart_concurrency = crate::object_writer::max_upload_parallelism(),
-            part_count = Empty,
-            bytes_transferred = Empty,
-            destination_size = Empty,
-            validation = Empty,
-            elapsed_ms = Empty,
-        ),
-        err
-    )]
-    async fn copy_if_not_exists_via_stream(
+    async fn copy_via_stream_inner(
         &self,
         source_path: &Path,
         destination_store: &Self,
         destination_path: &Path,
-    ) -> Result<WriteResult> {
-        self.copy_via_stream_with_mode(
-            source_path,
-            destination_store,
-            destination_path,
-            StreamCopyMode::Create,
-        )
-        .await
-    }
-
-    async fn copy_via_stream_with_mode(
-        &self,
-        source_path: &Path,
-        destination_store: &Self,
-        destination_path: &Path,
-        mode: StreamCopyMode,
     ) -> Result<WriteResult> {
         let started_at = Instant::now();
-        if self.has_direct_local_paths() && destination_store.has_direct_local_paths() {
+        if self.has_direct_local_paths()
+            && destination_store.has_direct_local_paths()
+            && !destination_store.local_fsync
+        {
             let source_size = std::fs::metadata(super::local::to_local_path(source_path))
                 .map_err(|source| {
                     let source = if source.kind() == std::io::ErrorKind::NotFound {
@@ -1395,20 +1468,7 @@ impl ObjectStore {
             Span::current().record("source_size", source_size as u64);
 
             let metrics = destination_store.io_tracker.begin_io("copy");
-            let result = match mode {
-                StreamCopyMode::Overwrite => super::local::copy_file(source_path, destination_path),
-                StreamCopyMode::Create => match destination_store
-                    .inner
-                    .copy_if_not_exists(source_path, destination_path)
-                    .await
-                {
-                    Ok(()) => Ok(()),
-                    Err(copy_error) => match destination_store.size(destination_path).await {
-                        Ok(destination_size) if destination_size == source_size as u64 => Ok(()),
-                        _ => Err(Error::from(copy_error)),
-                    },
-                },
-            };
+            let result = super::local::copy_file(source_path, destination_path);
             metrics.record(&result, source_size as u64);
             result.map_err(|source| {
                 stream_copy_error(
@@ -1458,22 +1518,17 @@ impl ObjectStore {
         })?;
         Span::current().record("source_size", source_size as u64);
 
-        let mut writer: Box<dyn Writer> = match mode {
-            StreamCopyMode::Overwrite => destination_store.create(destination_path).await,
-            StreamCopyMode::Create => {
-                ObjectWriter::new_with_mode(destination_store, destination_path, PutMode::Create)
-                    .await
-                    .map(|writer| Box::new(writer) as Box<dyn Writer>)
-            }
-        }
-        .map_err(|source| {
-            stream_copy_error(
-                "destination writer creation",
-                source_path,
-                destination_path,
-                source,
-            )
-        })?;
+        let mut writer = destination_store
+            .create(destination_path)
+            .await
+            .map_err(|source| {
+                stream_copy_error(
+                    "destination writer creation",
+                    source_path,
+                    destination_path,
+                    source,
+                )
+            })?;
         let read_chunk_size = usize::try_from(self.max_iop_size())
             .unwrap_or(usize::MAX)
             .max(1);
@@ -1537,36 +1592,14 @@ impl ObjectStore {
         }
         Span::current().record("bytes_transferred", bytes_transferred as u64);
 
-        let write_result = match Writer::shutdown(writer.as_mut()).await {
-            Ok(write_result) => write_result,
-            Err(source) => {
-                let completion_error = stream_copy_error(
-                    "destination completion",
-                    source_path,
-                    destination_path,
-                    source,
-                );
-                if !matches!(mode, StreamCopyMode::Create) {
-                    return Err(completion_error);
-                }
-                let Ok(destination_size) = destination_store.size(destination_path).await else {
-                    return Err(completion_error);
-                };
-                Span::current().record("destination_size", destination_size);
-                if destination_size != source_size as u64 {
-                    Span::current().record("validation", "failed");
-                    return Err(Error::io(format!(
-                        "multipart_stream_copy existing destination size mismatch from \
-                         {source_path} to {destination_path}: source_size={source_size}, \
-                         destination_size={destination_size}"
-                    )));
-                }
-                WriteResult {
-                    size: source_size,
-                    e_tag: None,
-                }
-            }
-        };
+        let write_result = Writer::shutdown(writer.as_mut()).await.map_err(|source| {
+            stream_copy_error(
+                "destination completion",
+                source_path,
+                destination_path,
+                source,
+            )
+        })?;
         if write_result.size != source_size {
             Span::current().record("validation", "failed");
             return Err(Error::io(format!(
@@ -1617,6 +1650,11 @@ impl ObjectStore {
         max_single_copy: u64,
     ) -> Result<()> {
         if self.has_direct_local_paths() {
+            // Native filesystem copies bypass the writer's file and directory syncs.
+            if self.local_fsync {
+                self.copy_via_stream(from, self, to).await?;
+                return Ok(());
+            }
             // Use std::fs::copy for local filesystem to support cross-filesystem copies
             let metrics = self.io_tracker.begin_io("copy");
             let result = super::local::copy_file(from, to);
@@ -1982,6 +2020,44 @@ impl StorageOptions {
         Ok(Some(block_size))
     }
 
+    /// Minimum cache size at which the session's object store registry sweeps
+    /// out entries whose store is no longer in use; `0` disables the sweep.
+    /// See [`ObjectStoreRegistry::get_store()`].
+    pub fn object_store_cache_prune_threshold(&self) -> Result<Option<usize>> {
+        let Some((_, value)) = self
+            .0
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION))
+        else {
+            return Ok(None);
+        };
+        let threshold = value.trim().parse::<usize>().map_err(|err| {
+            Error::invalid_input(format!(
+                "storage option {OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION} must be a \
+                 non-negative integer, got `{value}`: {err}"
+            ))
+        })?;
+        Ok(Some(threshold))
+    }
+
+    /// Whether local writes must sync files and directory entries before returning.
+    pub(crate) fn local_fsync(&self) -> Result<bool> {
+        let Some((_, value)) = self
+            .0
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("local_fsync"))
+        else {
+            return Ok(false);
+        };
+        match value.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(Error::invalid_input(format!(
+                "storage option local_fsync must be `true` or `false`, got `{value}`"
+            ))),
+        }
+    }
+
     /// Number of times to retry a download that fails
     pub fn download_retry_count(&self) -> usize {
         self.0
@@ -2061,9 +2137,15 @@ static DEFAULT_OBJECT_STORE_REGISTRY: std::sync::LazyLock<ObjectStoreRegistry> =
     std::sync::LazyLock::new(ObjectStoreRegistry::default);
 
 impl ObjectStore {
+    /// Wrap an object store implementation with Lance I/O behavior.
+    ///
+    /// `storage_options` may contain `scheduler_error_mode`. Valid values are
+    /// `best_effort` and `fail_fast`. Because this legacy constructor is
+    /// infallible, an invalid value is logged and falls back to `best_effort`.
+    /// Use [`Self::try_new`] when invalid storage options must be rejected.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        mut store: Arc<DynObjectStore>,
+        store: Arc<DynObjectStore>,
         location: Url,
         block_size: Option<usize>,
         wrapper: Option<Arc<dyn WrappingObjectStore>>,
@@ -2073,21 +2155,126 @@ impl ObjectStore {
         download_retry_count: usize,
         storage_options: Option<&HashMap<String, String>>,
     ) -> Self {
-        let scheme = location.scheme();
-        let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
-        let store_prefix = match DEFAULT_OBJECT_STORE_REGISTRY.get_provider(scheme) {
-            Some(provider) => provider
-                .calculate_object_store_prefix(&location, storage_options)
-                .unwrap(),
+        let scheduler_error_mode = match parse_scheduler_error_mode(storage_options) {
+            Ok(mode) => mode,
+            Err(error) => {
+                log::warn!(
+                    "{error}; ObjectStore::new is falling back to best_effort. Use ObjectStore::try_new to reject invalid storage options"
+                );
+                SchedulerErrorMode::BestEffort
+            }
+        };
+        let store_prefix = Self::direct_store_prefix(&location, storage_options).unwrap();
+        Self::new_with_scheduler_error_mode(
+            store,
+            location,
+            block_size,
+            wrapper,
+            use_constant_size_upload_parts,
+            list_is_lexically_ordered,
+            io_parallelism,
+            download_retry_count,
+            scheduler_error_mode,
+            store_prefix,
+        )
+    }
+
+    /// Wrap an object store implementation and validate Lance storage options.
+    ///
+    /// This is the fallible counterpart to [`Self::new`]. Custom object-store
+    /// providers may use it to reject an invalid `scheduler_error_mode` before
+    /// returning a store. A store returned through [`ObjectStoreRegistry`] is
+    /// validated by the registry independently of which constructor its provider
+    /// uses.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::{collections::HashMap, sync::Arc};
+    ///
+    /// use lance_io::object_store::ObjectStore;
+    /// use object_store::memory::InMemory;
+    /// use url::Url;
+    ///
+    /// # fn build_store() -> lance_core::Result<()> {
+    /// let storage_options = HashMap::from([(
+    ///     "scheduler_error_mode".to_string(),
+    ///     "fail_fast".to_string(),
+    /// )]);
+    /// let _store = ObjectStore::try_new(
+    ///     Arc::new(InMemory::new()),
+    ///     Url::parse("memory:///").expect("valid memory URL"),
+    ///     None,
+    ///     None,
+    ///     false,
+    ///     true,
+    ///     64,
+    ///     3,
+    ///     Some(&storage_options),
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        store: Arc<DynObjectStore>,
+        location: Url,
+        block_size: Option<usize>,
+        wrapper: Option<Arc<dyn WrappingObjectStore>>,
+        use_constant_size_upload_parts: bool,
+        list_is_lexically_ordered: bool,
+        io_parallelism: usize,
+        download_retry_count: usize,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<Self> {
+        let scheduler_error_mode = parse_scheduler_error_mode(storage_options)?;
+        let store_prefix = Self::direct_store_prefix(&location, storage_options)?;
+        Ok(Self::new_with_scheduler_error_mode(
+            store,
+            location,
+            block_size,
+            wrapper,
+            use_constant_size_upload_parts,
+            list_is_lexically_ordered,
+            io_parallelism,
+            download_retry_count,
+            scheduler_error_mode,
+            store_prefix,
+        ))
+    }
+
+    fn direct_store_prefix(
+        location: &Url,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<String> {
+        match DEFAULT_OBJECT_STORE_REGISTRY.get_provider(location.scheme()) {
+            Some(provider) => provider.calculate_object_store_prefix(location, storage_options),
             None => {
                 let store_prefix = format!("{}${}", location.scheme(), location.authority());
                 log::warn!(
                     "Guessing that object store prefix is {}, since object store scheme is not found in registry.",
                     store_prefix
                 );
-                store_prefix
+                Ok(store_prefix)
             }
-        };
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_scheduler_error_mode(
+        mut store: Arc<DynObjectStore>,
+        location: Url,
+        block_size: Option<usize>,
+        wrapper: Option<Arc<dyn WrappingObjectStore>>,
+        use_constant_size_upload_parts: bool,
+        list_is_lexically_ordered: bool,
+        io_parallelism: usize,
+        download_retry_count: usize,
+        scheduler_error_mode: SchedulerErrorMode,
+        store_prefix: String,
+    ) -> Self {
+        let scheme = location.scheme();
+        let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
         let mut io_tracker = IOTracker::default();
         meter_store(
             &mut store,
@@ -2106,14 +2293,15 @@ impl ObjectStore {
         Self {
             inner: tracked_store,
             local_dir_operations: None,
+            local_fsync: false,
             scheme: scheme.into(),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts,
-            supports_conditional_multipart_put: false,
             list_is_lexically_ordered,
             io_parallelism,
             download_retry_count,
+            scheduler_error_mode,
             io_tracker,
             store_prefix,
             // Type-erased on the way in, so there is no telling if it can paginate.
@@ -2182,6 +2370,26 @@ mod tests {
     use std::ops::Range;
     use std::path::Path as StdPath;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn test_canonicalize_local_io_result() {
+        let path = PathBuf::from("/tmp/lance-canonical");
+        assert_eq!(
+            canonicalize_local_io_result(Ok(path.clone())).unwrap(),
+            Some(path)
+        );
+        assert_eq!(
+            canonicalize_local_io_result(Err(std::io::Error::from(std::io::ErrorKind::NotFound,)))
+                .unwrap(),
+            None
+        );
+
+        let error = canonicalize_local_io_result(Err(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )))
+        .unwrap_err();
+        assert!(matches!(error, Error::IO { .. }), "{error:?}");
+    }
 
     #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
     fn canonical_test_config_key<K: FromStr + AsRef<str>>(key: &str) -> Option<String> {
@@ -2270,6 +2478,82 @@ mod tests {
             store.read_one_all(&path).await.unwrap(),
             b"first".as_slice()
         );
+    }
+
+    #[rstest]
+    #[case::default(None, SchedulerErrorMode::BestEffort)]
+    #[case::best_effort(Some("best_effort"), SchedulerErrorMode::BestEffort)]
+    #[case::fail_fast(Some("fail_fast"), SchedulerErrorMode::FailFast)]
+    #[case::case_insensitive(Some("FAIL_FAST"), SchedulerErrorMode::FailFast)]
+    fn test_scheduler_error_mode_storage_option(
+        #[case] value: Option<&str>,
+        #[case] expected: SchedulerErrorMode,
+    ) {
+        let storage_options_accessor = value.map(|value| {
+            Arc::new(StorageOptionsAccessor::with_static_options(HashMap::from(
+                [(
+                    SCHEDULER_ERROR_MODE_STORAGE_OPTION.to_string(),
+                    value.to_string(),
+                )],
+            )))
+        });
+        let params = ObjectStoreParams {
+            storage_options_accessor,
+            ..Default::default()
+        };
+
+        assert_eq!(params.scheduler_error_mode().unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_scheduler_error_mode_storage_option() {
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(
+                    SCHEDULER_ERROR_MODE_STORAGE_OPTION.to_string(),
+                    "invalid".to_string(),
+                )]),
+            ))),
+            ..Default::default()
+        };
+
+        let error = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "memory:///",
+            &params,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(
+            "Invalid scheduler_error_mode value 'invalid'. Valid values are: best_effort, fail_fast"
+        ));
+    }
+
+    #[test]
+    fn test_try_new_rejects_invalid_scheduler_error_mode() {
+        let storage_options = HashMap::from([(
+            SCHEDULER_ERROR_MODE_STORAGE_OPTION.to_string(),
+            "invalid".to_string(),
+        )]);
+
+        let error = ObjectStore::try_new(
+            Arc::new(InMemory::new()),
+            Url::parse("memory:///").unwrap(),
+            None,
+            None,
+            false,
+            true,
+            DEFAULT_CLOUD_IO_PARALLELISM,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            Some(&storage_options),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(
+            "Invalid scheduler_error_mode value 'invalid'. Valid values are: best_effort, fail_fast"
+        ));
     }
 
     #[tokio::test]
@@ -2531,13 +2815,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_tilde_expansion() {
-        let uri = "~/foo.lance";
-        write_to_file(&format!("{uri}/test_file"), "TILDE").unwrap();
-        let (store, path) = ObjectStore::from_uri(uri).await.unwrap();
-        let contents = read_from_store(store.as_ref(), &path.clone().join("test_file"))
-            .await
-            .unwrap();
-        assert_eq!(contents, "TILDE");
+        // Resolving the path is sufficient to verify expansion and avoids writing
+        // into the real user's home directory.
+        let expected_path = std::env::home_dir()
+            .expect("home directory should be available")
+            .join("foo.lance");
+        let (store, path) = ObjectStore::from_uri("~/foo.lance").await.unwrap();
+
+        assert!(store.is_local());
+        assert_eq!(
+            path,
+            Path::from_absolute_path(expected_path).expect("home path should be absolute")
+        );
     }
 
     #[tokio::test]
@@ -3140,8 +3429,15 @@ mod tests {
         assert_eq!(copied_content, b"test content");
     }
 
+    #[rstest]
+    #[case::copy("copy")]
+    #[case::bulk("bulk")]
+    #[case::stream("stream")]
     #[tokio::test]
-    async fn test_copy_creates_parent_directories() {
+    async fn test_copy_creates_parent_directories(
+        #[case] mode: &str,
+        #[values(false, true)] local_fsync: bool,
+    ) {
         let source_dir = TempStdDir::default();
         let dest_dir = TempStdDir::default();
 
@@ -3150,27 +3446,55 @@ mod tests {
         let source_file = source_dir.join(source_file_name);
         std::fs::write(&source_file, b"test content").unwrap();
 
-        // Create ObjectStore for local filesystem
-        let (store, base_path) = ObjectStore::from_uri(source_dir.to_str().unwrap())
+        let (source_store, base_path) = ObjectStore::from_uri(source_dir.to_str().unwrap())
             .await
             .unwrap();
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([("local_fsync".to_owned(), local_fsync.to_string())]),
+            ))),
+            ..Default::default()
+        };
+        let (destination_store, _) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            dest_dir.to_str().unwrap(),
+            &params,
+        )
+        .await
+        .unwrap();
 
         // Create paths
         let from_path = base_path.clone().join(source_file_name);
 
         // Create destination with nested directories that don't exist yet
         let dest_file = dest_dir.join("nested").join("dirs").join("copied_file.txt");
-        let dest_str = dest_file.to_str().unwrap();
-        let to_path = object_store::path::Path::parse(dest_str).unwrap();
+        let to_path = Path::from_absolute_path(&dest_file).unwrap();
 
-        // Perform the copy operation - should create parent directories
-        store.copy(&from_path, &to_path).await.unwrap();
+        match mode {
+            "copy" => destination_store.copy(&from_path, &to_path).await.unwrap(),
+            "bulk" => {
+                let result = source_store
+                    .copy_bulk(&from_path, &destination_store, &to_path)
+                    .await
+                    .unwrap();
+                assert_eq!(result.size, b"test content".len());
+            }
+            "stream" => {
+                let result = source_store
+                    .copy_via_stream(&from_path, &destination_store, &to_path)
+                    .await
+                    .unwrap();
+                assert_eq!(result.size, b"test content".len());
+            }
+            _ => unreachable!(),
+        }
 
         // Verify the file was copied correctly and directories were created
         assert!(dest_file.exists());
         assert!(dest_file.parent().unwrap().exists());
         let copied_content = std::fs::read(&dest_file).unwrap();
         assert_eq!(copied_content, b"test content");
+        assert_eq!(std::fs::read(&source_file).unwrap(), b"test content");
     }
 
     /// Inner store that forwards everything to `InMemory` except single-shot
@@ -3457,81 +3781,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_copy_if_not_exists_via_stream_preserves_existing_destination() {
-        let mut store = ObjectStore::memory();
-        store.inner = Arc::new(CopyFailingStore {
-            inner: InMemory::new(),
-        });
-
-        let source = Path::from("source.bin");
-        let destination = Path::from("destination.bin");
-        store.put(&source, b"new contents").await.unwrap();
-        store.put(&destination, b"existing contents").await.unwrap();
-
-        store
-            .copy_if_not_exists_via_stream(&source, &store, &destination)
-            .await
-            .expect_err("conditional stream copy must not replace an existing object");
-
-        assert_eq!(
-            store.read_one_all(&destination).await.unwrap().as_ref(),
-            b"existing contents"
-        );
-        assert_eq!(
-            store.read_one_all(&source).await.unwrap().as_ref(),
-            b"new contents"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_copy_if_not_exists_via_stream_creates_destination() {
-        let mut store = ObjectStore::memory();
-        store.inner = Arc::new(CopyFailingStore {
-            inner: InMemory::new(),
-        });
-
-        let source = Path::from("source.bin");
-        let destination = Path::from("destination.bin");
-        let contents = b"stream into a previously absent destination";
-        store.put(&source, contents).await.unwrap();
-
-        let result = store
-            .copy_if_not_exists_via_stream(&source, &store, &destination)
-            .await
-            .unwrap();
-
-        assert_eq!(result.size, contents.len());
-        assert_eq!(
-            store.read_one_all(&destination).await.unwrap().as_ref(),
-            contents
-        );
-    }
-
-    #[tokio::test]
-    async fn test_copy_if_not_exists_via_stream_accepts_equal_size_retry() {
-        let mut store = ObjectStore::memory();
-        store.inner = Arc::new(CopyFailingStore {
-            inner: InMemory::new(),
-        });
-
-        let source = Path::from("source.bin");
-        let destination = Path::from("destination.bin");
-        store.put(&source, b"new").await.unwrap();
-        store.put(&destination, b"old").await.unwrap();
-
-        let result = store
-            .copy_if_not_exists_via_stream(&source, &store, &destination)
-            .await
-            .unwrap();
-
-        assert_eq!(result.size, 3);
-        assert_eq!(
-            store.read_one_all(&destination).await.unwrap().as_ref(),
-            b"old"
-        );
-    }
-
-    #[tokio::test]
     async fn test_copy_if_not_exists_accepts_equal_size_local_retry() {
         let directory = TempStdDir::default();
         let (store, base_path) = ObjectStore::from_uri(directory.to_str().unwrap())
@@ -3555,10 +3804,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_copy_if_not_exists_uses_native_copy_without_conditional_multipart() {
+    async fn test_copy_if_not_exists_uses_native_copy() {
         let observations = Arc::new(MultipartObservations::default());
         let mut store = ObjectStore::memory();
-        store.supports_conditional_multipart_put = false;
         store.inner = Arc::new(ObservedMultipartStore {
             inner: InMemory::new(),
             observations: observations.clone(),
@@ -3933,52 +4181,6 @@ mod tests {
                 .unwrap()
                 .as_ref(),
             contents.as_slice()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_copy_if_not_exists_via_stream_uses_conditional_multipart_completion() {
-        let mut source_store = ObjectStore::memory();
-        source_store.max_iop_size = 1024 * 1024;
-        let observations = Arc::new(MultipartObservations::default());
-        let mut destination_store = ObjectStore::memory();
-        destination_store.inner = Arc::new(ObservedMultipartStore {
-            inner: InMemory::new(),
-            observations: observations.clone(),
-            fail_parts: false,
-            destination_size_adjustment: 0,
-        });
-
-        let source = Path::from("source.bin");
-        let destination = Path::from("destination.bin");
-        let contents = vec![42; crate::object_writer::initial_upload_size() * 2 + 1];
-        source_store.put(&source, &contents).await.unwrap();
-        destination_store
-            .put(&destination, b"existing contents")
-            .await
-            .unwrap();
-
-        source_store
-            .copy_if_not_exists_via_stream(&source, &destination_store, &destination)
-            .await
-            .expect_err("conditional multipart completion must reject an existing object");
-
-        assert!(
-            observations.part_count.load(Ordering::SeqCst) >= 2,
-            "conditional stream copy should use multipart upload for a large destination"
-        );
-        assert_eq!(
-            observations.abort_count.load(Ordering::SeqCst),
-            1,
-            "conditional completion failure should abort the multipart upload"
-        );
-        assert_eq!(
-            destination_store
-                .read_one_all(&destination)
-                .await
-                .unwrap()
-                .as_ref(),
-            b"existing contents"
         );
     }
 

@@ -818,6 +818,8 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         - rows_scanned: total rows examined during the scan
         - iops: number of I/O operations performed
         - requests: number of storage requests made
+        - task_wait_time: time spent waiting for scheduled I/O
+        - decode_time: time spent decoding, summed over concurrent decode tasks
         """  # noqa: E501
         reader = _coerce_reader(data_obj, schema)
 
@@ -830,7 +832,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         return super(MergeInsertBuilder, self).analyze_plan(reader)
 
     def mark_sstables_as_compacted(
-        self, sstables: "List[mem_wal.CompactedSsTable]"
+        self, sstables: "List[mem_wal.CompactedSsTable]", dir_id: str = ""
     ) -> "MergeInsertBuilder":
         """Mark MemWAL SSTables as compacted into the base table.
 
@@ -848,12 +850,102 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         ----------
         sstables : list of CompactedSsTable
             SSTables to mark as compacted.
+        dir_id : str, optional
+            The ``dir_id`` of the MemWAL the SSTables belong to; empty for a
+            MemWAL without one. The commit fails if the table's MemWAL has
+            since been disabled or replaced.
         """
         from .mem_wal import _to_raw_compacted_sstables
 
         raw_sstables = _to_raw_compacted_sstables(sstables)
-        super(MergeInsertBuilder, self).mark_sstables_as_compacted(raw_sstables)
+        super(MergeInsertBuilder, self).mark_sstables_as_compacted(raw_sstables, dir_id)
         return self
+
+
+class CleanupRule(ABC):
+    """A cleanup retention rule: KeepOne samples a band; RemoveAll expires it."""
+
+
+@dataclass(frozen=True)
+class KeepOne(CleanupRule):
+    """Thin history older than a full-history window, keeping one commit per interval.
+
+    Use in ``cleanup_old_versions(policy=CleanupPolicy(rules=[...]))``.
+    ``per_interval`` must be positive. ``older_than`` defaults to two days and
+    must be at least two days, measured from the hinted commit timestamp (or
+    the dataset snapshot without a hint). Validation occurs during cleanup.
+    Cleanup's separate ``older_than`` argument expires all older versions,
+    including sampled commits. For example::
+
+        dataset.cleanup_old_versions(
+            older_than=timedelta(days=7),
+            keep_one=KeepOne(timedelta(days=1), timedelta(days=2)),
+        )
+    """
+
+    per_interval: timedelta
+    older_than: timedelta = timedelta(days=2)
+
+
+@dataclass(frozen=True)
+class RemoveAll(CleanupRule):
+    """Expire all versions older than a wall-clock age, including sampled commits.
+
+    Use as the final rule in a ``CleanupPolicy``. For example,
+    ``RemoveAll(older_than=timedelta(days=30))`` expires thirty-day-old history.
+    Current versions, tags and branch dependencies remain protected.
+    """
+
+    older_than: timedelta
+
+
+@dataclass(frozen=True)
+class CleanupPolicy:
+    """Ordered CleanupRule entries, with an optional final RemoveAll rule.
+
+    By default, contains only ``RemoveAll(timedelta(days=14))``, preserving
+    the existing two-week expiration behavior. For example::
+
+        dataset.cleanup_old_versions(policy=CleanupPolicy(rules=[
+            KeepOne(timedelta(hours=1), timedelta(days=2)),
+            KeepOne(timedelta(days=1), timedelta(days=7)),
+            RemoveAll(timedelta(days=30)),
+        ]))
+    """
+
+    rules: Sequence[CleanupRule] = (RemoveAll(timedelta(days=14)),)
+
+
+def _cleanup_duration_string(value: timedelta) -> str:
+    seconds = value.days * 86_400 + value.seconds
+    return f"{seconds}s {value.microseconds}us"
+
+
+def _cleanup_policy_to_json(policy: CleanupPolicy) -> str:
+    if not isinstance(policy, CleanupPolicy):
+        raise TypeError(f"policy must be a CleanupPolicy, got {type(policy)}")
+    rules = []
+    for rule in policy.rules:
+        if isinstance(rule, KeepOne):
+            rules.append(
+                {
+                    "type": "keep_one",
+                    "per_interval": _cleanup_duration_string(rule.per_interval),
+                    "older_than": _cleanup_duration_string(rule.older_than),
+                }
+            )
+        elif isinstance(rule, RemoveAll):
+            rules.append(
+                {
+                    "type": "remove_all",
+                    "older_than": _cleanup_duration_string(rule.older_than),
+                }
+            )
+        else:
+            raise TypeError(
+                f"policy entries must be KeepOne or RemoveAll, got {type(rule)}"
+            )
+    return json.dumps({"rules": rules})
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -1251,6 +1343,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["all_binary", "blobs_descriptions", "all_descriptions"]
         ] = None,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[Iterable[str]] = None,
         include_deleted_rows: Optional[bool] = None,
         scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
         strict_batch_size: Optional[bool] = None,
@@ -1374,27 +1467,51 @@ class LanceDataset(pa.dataset.Dataset):
             false, throughput may be higher, but batches will be returned out of
             order and memory use might increase.
         fragments: iterable of LanceFragment, default None
-            If specified, only scan these fragments. If scan_in_order is True, then
-            the fragments will be scanned in the order given.
+            Restrict the search scope to these fragments; an empty iterable returns
+            no rows. Vector search enforces this scope before candidate selection,
+            even with ``prefilter=False``. Index segments cannot return rows outside
+            it. Ordinary scans preserve the given order when ``scan_in_order=True``;
+            vector search ranks results by distance.
         index_segments: iterable of str or uuid.UUID, default None
-            If specified, restrict vector index search to these index segment UUIDs.
-            Only supported for vector search. If fragments is also specified, rows
-            from those fragments not covered by the selected index segments will be
-            searched with flat KNN.
-        prefilter: bool, default False
-            If True then the filter will be applied before the vector query is run.
-            This will generate more correct results but it may be a more costly
-            query.  It's generally good when the filter is highly selective.
+            Restrict vector index search to these segment UUIDs. When omitted, Lance
+            selects a suitable logical index and its relevant segments automatically.
+            With explicit ``fragments`` and ``fast_search=False``, fragments not
+            covered by the selected segments are searched with flat KNN, including
+            fragments covered only by an unselected segment. Without ``fragments``,
+            indexed search searches only the selected segments and does not add
+            appended unindexed fragments.
 
-            If False then the filter will be applied after the vector query is run.
-            This will perform well but the results may have fewer than the requested
-            number of rows (or be empty) if the rows closest to the query do not
-            match the filter.  It's generally good when the filter is not very
-            selective.
+            The list must be nonempty. With index use enabled, UUIDs must identify
+            existing segments of one logical index on the query's vector column.
+            Query metric compatibility is checked when selected segments overlap
+            the fragment scope. With no overlap, ordinary search uses flat KNN with
+            the query metric, or the selected index's metric when unset, while fast
+            search returns no rows.
+            Only supported for vector search.
+            With ``nearest["use_index"]=False``, a flat scan uses the fragment scope
+            rather than segment selection.
+        prefilter: bool, default False
+            If True, select vector top-k from rows matching the SQL filter. This can
+            be more expensive and does not guarantee exact results from an
+            approximate index.
+
+            If False, apply the SQL filter after the combined ANN and flat top-k.
+            Rejected rows are not replaced, so fewer than ``k`` rows (or none) may
+            be returned. This also applies to searches without a vector index.
+            The fragment scope, deletions, and external row masks restrict candidates
+            regardless of this setting.
         use_scalar_index: bool, default True
             Lance will automatically use scalar indices to optimize a query.  In some
             corner cases this can make query performance worse and this parameter can
             be used to disable scalar indices in these cases.
+        ignored_scalar_indices: iterable of str, default None
+            Logical scalar index names to ignore during expression-filter planning.
+            Other scalar indices remain eligible, and the original filter is still
+            evaluated. Inverted indices used by ``contains_tokens`` filters are
+            included; vector index segments and explicit full-text search queries
+            are unaffected. If no index query remains, ``fast_search`` falls back
+            to scanning all selected fragments and may return more matching rows.
+            See ``ScannerBuilder.ignored_scalar_indices`` for more information.
         late_materialization: bool or List[str], default None
             Allows custom control over late materialization.  Late materialization
             fetches non-query columns using a take operation after the filter.  This
@@ -1431,7 +1548,10 @@ class LanceDataset(pa.dataset.Dataset):
         fast_search:  bool, default False
             If True, then vector search, full text search, and scalar-indexed
             filters will only search indexed fragments, which yields faster
-            search time but may skip recently appended unindexed data.
+            search time but may skip recently appended unindexed data. Vector search
+            skips flat fallback outside the selected segments' coverage and stale
+            overlay rows needing replay. The fragment scope and SQL filter placement
+            still apply. With no usable vector index coverage, the result is empty.
         scan_stats_callback: Callable[[ScanStatistics], None], default None
             A callback function that will be called with the scan statistics after the
             scan is complete.  Errors raised by the callback will be logged but not
@@ -1474,10 +1594,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         .. note::
 
-            For now, if BOTH filter and nearest is specified, then:
-
-            1. nearest is executed first.
-            2. The results are filtered afterwards.
+            With both ``filter`` and ``nearest``, SQL filtering runs after vector
+            top-k by default. Set ``prefilter=True`` to filter before top-k instead.
+            Both strategies support explicit fragments and mixed ANN and flat search.
 
 
         For debugging ANN results, you can choose to not use the index
@@ -1492,7 +1611,48 @@ class LanceDataset(pa.dataset.Dataset):
                 "k": 10,
                 "q": <query vector>,
                 "use_index": False
-            }
+            })
+
+        Examples
+        --------
+        A segment covers F0/F1 and F2 is appended after indexing. Searching F1/F2
+        combines indexed and unindexed rows; fast search keeps only indexed F1.
+
+        >>> from tempfile import TemporaryDirectory
+        >>> import lance
+        >>> import numpy as np
+        >>> import pyarrow as pa
+        >>> table = pa.table({
+        ...     "id": range(12),
+        ...     "vector": pa.array(
+        ...         [[float(i), 0, 0, 0] for i in range(12)],
+        ...         type=pa.list_(pa.float32(), 4),
+        ...     ),
+        ... })
+        >>> with TemporaryDirectory() as uri:
+        ...     dataset = lance.write_dataset(
+        ...         table.slice(0, 8), uri, max_rows_per_file=4,
+        ...     )
+        ...     dataset = dataset.create_index(
+        ...         "vector", "IVF_FLAT", num_partitions=1,
+        ...         ivf_centroids=np.zeros((1, 4), dtype=np.float32),
+        ...     )
+        ...     dataset = lance.write_dataset(table.slice(8), uri, mode="append")
+        ...     segment_uuid = dataset.describe_indices()[0].segments[0].uuid
+        ...     options = dict(
+        ...         columns=["id"], fragments=dataset.get_fragments()[1:],
+        ...         index_segments=[segment_uuid], prefilter=False,
+        ...         nearest={
+        ...             "column": "vector", "q": [0.0] * 4, "k": 6, "metric": "l2",
+        ...         },
+        ...     )
+        ...     mixed = dataset.scanner(**options, fast_search=False).to_table()
+        ...     fast = dataset.scanner(**options, fast_search=True).to_table()
+        ...     mixed_ids, fast_ids = mixed["id"].to_pylist(), fast["id"].to_pylist()
+        >>> mixed_ids
+        [4, 5, 6, 7, 8, 9]
+        >>> fast_ids
+        [4, 5, 6, 7]
 
         """
         builder = ScannerBuilder(self)
@@ -1530,6 +1690,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.with_row_address, with_row_address)
         setopt(builder.use_stats, use_stats)
         setopt(builder.use_scalar_index, use_scalar_index)
+        setopt(builder.ignored_scalar_indices, ignored_scalar_indices)
         setopt(builder.fast_search, fast_search)
         setopt(builder.include_deleted_rows, include_deleted_rows)
         setopt(builder.scan_stats_callback, scan_stats_callback)
@@ -1632,6 +1793,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[Iterable[str]] = None,
         include_deleted_rows: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
@@ -1686,7 +1848,9 @@ class LanceDataset(pa.dataset.Dataset):
             throughput may be higher, but batches will be returned out of order
             and memory use might increase.
         prefilter: bool, optional, default False
-            Run filter before the vector search.
+            If True, select vector top-k from rows matching the SQL filter. If False,
+            filter the top-k result without replacing rejected rows. See
+            :meth:`scanner` for details; approximate indices remain approximate.
         late_materialization: bool or List[str], default None
             Allows custom control over late materialization.  See
             ``ScannerBuilder.late_materialization`` for more information.
@@ -1696,6 +1860,9 @@ class LanceDataset(pa.dataset.Dataset):
         use_scalar_index: bool, default True
             Allows custom control over scalar index usage.  See
             ``ScannerBuilder.use_scalar_index`` for more information.
+        ignored_scalar_indices: iterable of str, default None
+            Scalar index names to ignore during expression-filter planning. See
+            ``ScannerBuilder.ignored_scalar_indices`` for more information.
         with_row_id: bool, optional, default False
             Return row ID.
         with_row_address: bool, optional, default False
@@ -1740,10 +1907,10 @@ class LanceDataset(pa.dataset.Dataset):
 
         Notes
         -----
-        If BOTH filter and nearest is specified, then:
-
-        1. nearest is executed first.
-        2. The results are filtered afterward, unless pre-filter sets to True.
+        With both ``filter`` and ``nearest``, SQL filtering runs after vector top-k
+        by default. Set ``prefilter=True`` to filter before top-k instead. Postfilter
+        may return fewer than ``k`` rows. For fragment and segment selection, use
+        :meth:`scanner` followed by :meth:`LanceScanner.to_table`.
         """
         return self.scanner(
             columns=columns,
@@ -1759,6 +1926,7 @@ class LanceDataset(pa.dataset.Dataset):
             late_materialization=late_materialization,
             blob_handling=blob_handling,
             use_scalar_index=use_scalar_index,
+            ignored_scalar_indices=ignored_scalar_indices,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -1793,6 +1961,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         blob_mode: str = _BLOB_PANDAS_MODE_LAZY,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[Iterable[str]] = None,
         include_deleted_rows: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
@@ -1826,6 +1995,7 @@ class LanceDataset(pa.dataset.Dataset):
             fragment_readahead=fragment_readahead,
             late_materialization=late_materialization,
             use_scalar_index=use_scalar_index,
+            ignored_scalar_indices=ignored_scalar_indices,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -2229,6 +2399,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[Iterable[str]] = None,
         strict_batch_size: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
@@ -2259,6 +2430,7 @@ class LanceDataset(pa.dataset.Dataset):
             late_materialization=late_materialization,
             blob_handling=blob_handling,
             use_scalar_index=use_scalar_index,
+            ignored_scalar_indices=ignored_scalar_indices,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -2751,6 +2923,9 @@ class LanceDataset(pa.dataset.Dataset):
         is the right side. Rows existing in the dataset but not on the left will
         be filled with null values, unless Lance doesn't support null values for
         some types, in which case an error will be raised.
+        The right-side join column must contain unique keys; null counts as a
+        key, so at most one null value is allowed. Duplicate right-side keys
+        raise an error.
 
         Parameters
         ----------
@@ -3436,6 +3611,8 @@ class LanceDataset(pa.dataset.Dataset):
         delete_rate_limit: Optional[int] = None,
         versions: Optional[List[int]] = None,
         delete_concurrency: Optional[int] = None,
+        keep_one: Optional[KeepOne] = None,
+        policy: Optional[CleanupPolicy] = None,
     ) -> CleanupStats:
         """
         Cleans up old versions of the dataset.
@@ -3452,8 +3629,10 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
 
         older_than: timedelta, optional
-            Only versions older than this will be removed.  If ``older_than`` and
-            ``retain_versions`` are not specified, this will default to two weeks.
+            Remove all versions older than this wall-clock age, including sampled
+            commits from ``keep_one``. Without ``keep_one``, ``retain_versions``
+            or ``versions``, defaults to two weeks. With ``keep_one`` alone,
+            sampled history has no expiration limit.
 
         retain_versions: int, optional
             Retain the last N versions of the dataset. Must be positive.
@@ -3491,18 +3670,61 @@ class LanceDataset(pa.dataset.Dataset):
             Clean up only the specified dataset versions. The current version is
             never removed, and tagged versions are still protected by
             ``error_if_tagged_old_versions``.
+
+        keep_one: KeepOne, optional
+            Keep the newest eligible commit per UTC epoch-aligned interval, breaking
+            timestamp ties by version. Its ``older_than`` age controls when thinning
+            begins and is independent of this method's expiration ``older_than``.
+            The hinted version and all later versions are protected from thinning
+            even with backwards clocks. Tags, current versions and branch
+            dependencies remain protected. For daily history between two and seven
+            days, use ``older_than=timedelta(days=7),
+            keep_one=KeepOne(timedelta(days=1), timedelta(days=2))``.
+            The two-day delay bounds exposure to delayed hint writes; it does not
+            make hint updates monotonic.
+
+        policy: CleanupPolicy, optional
+            Retention rules ordered by strictly increasing ``older_than`` ages.
+            Each version uses the oldest matching KeepOne rule. RemoveAll is
+            optional and must be last; without it, sampled history never expires.
+            KeepOne ages are hint-relative and at least two days; RemoveAll uses
+            wall-clock age. All comparisons are strictly older-than, so a version
+            exactly at a threshold remains in the younger band. Version filters,
+            tags and branch protections still apply. Cannot be combined with
+            ``older_than`` or ``keep_one``. For example::
+
+                dataset.cleanup_old_versions(policy=CleanupPolicy(rules=[
+                    KeepOne(timedelta(hours=1), timedelta(days=2)),
+                    KeepOne(timedelta(days=1), timedelta(days=7)),
+                    RemoveAll(timedelta(days=30)),
+                ]))
         """
-        if older_than is None and retain_versions is None and versions is None:
-            older_than = timedelta(days=14)
+        if policy is not None and (older_than is not None or keep_one is not None):
+            raise ValueError("policy cannot be combined with older_than or keep_one")
+        if (
+            older_than is None
+            and retain_versions is None
+            and versions is None
+            and keep_one is None
+            and policy is None
+        ):
+            policy = CleanupPolicy()
 
         return self._ds.cleanup_old_versions(
-            td_to_micros(older_than) if older_than else None,
+            td_to_micros(older_than) if older_than is not None else None,
             retain_versions,
             delete_unverified,
             error_if_tagged_old_versions,
             delete_rate_limit,
             versions,
             delete_concurrency,
+            (
+                td_to_micros(keep_one.per_interval),
+                td_to_micros(keep_one.older_than),
+            )
+            if keep_one is not None
+            else None,
+            _cleanup_policy_to_json(policy) if policy is not None else None,
         )
 
     def explain_cleanup_old_versions(
@@ -3516,6 +3738,8 @@ class LanceDataset(pa.dataset.Dataset):
         versions: Optional[List[int]] = None,
         include_files: bool = False,
         max_files: int = 1000,
+        keep_one: Optional[KeepOne] = None,
+        policy: Optional[CleanupPolicy] = None,
     ) -> CleanupExplanation:
         """
         Explain what :meth:`cleanup_old_versions` would remove without deleting files.
@@ -3524,8 +3748,9 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
 
         older_than: timedelta, optional
-            Only versions older than this would be removed. If ``older_than`` and
-            ``retain_versions`` are not specified, this will default to two weeks.
+            Remove all versions older than this wall-clock age, including sampled
+            commits. Defaults to two weeks only when no version filters or
+            ``keep_one`` are specified, as in :meth:`cleanup_old_versions`.
 
         retain_versions: int, optional
             Retain the last N versions of the dataset. Must be positive.
@@ -3550,14 +3775,30 @@ class LanceDataset(pa.dataset.Dataset):
         max_files: int, default 1000
             Maximum number of candidate files to include when ``include_files``
             is `True`.
+
+        keep_one: KeepOne, optional
+            Thinning interval and minimum age, as in :meth:`cleanup_old_versions`.
+            Its age is independent of the expiration ``older_than`` argument.
+
+        policy: CleanupPolicy, optional
+            Ordered retention rules, as in :meth:`cleanup_old_versions`.
+            Cannot be combined with ``older_than`` or ``keep_one``.
         """
-        if older_than is None and retain_versions is None and versions is None:
-            older_than = timedelta(days=14)
+        if policy is not None and (older_than is not None or keep_one is not None):
+            raise ValueError("policy cannot be combined with older_than or keep_one")
+        if (
+            older_than is None
+            and retain_versions is None
+            and versions is None
+            and keep_one is None
+            and policy is None
+        ):
+            policy = CleanupPolicy()
         if max_files <= 0:
             raise ValueError("max_files must be positive")
 
         return self._ds.explain_cleanup_old_versions(
-            td_to_micros(older_than) if older_than else None,
+            td_to_micros(older_than) if older_than is not None else None,
             retain_versions,
             delete_unverified,
             error_if_tagged_old_versions,
@@ -3565,6 +3806,13 @@ class LanceDataset(pa.dataset.Dataset):
             versions,
             include_files,
             max_files,
+            (
+                td_to_micros(keep_one.per_interval),
+                td_to_micros(keep_one.older_than),
+            )
+            if keep_one is not None
+            else None,
+            _cleanup_policy_to_json(policy) if policy is not None else None,
         )
 
     def _prepare_scalar_index_request(
@@ -3600,11 +3848,12 @@ class LanceDataset(pa.dataset.Dataset):
                 "BLOOMFILTER",
                 "RTREE",
                 "MINHASHLSH",
+                "FM",
             ]:
                 raise NotImplementedError(
                     (
                         'Only "BTREE", "BITMAP", "NGRAM", "ZONEMAP", "LABEL_LIST", '
-                        '"INVERTED", "BLOOMFILTER", "RTREE" or "MINHASHLSH" are '
+                        '"INVERTED", "BLOOMFILTER", "RTREE", "MINHASHLSH" or "FM" are '
                         f"supported for scalar columns.  Received {index_type}",
                     )
                 )
@@ -3708,6 +3957,7 @@ class LanceDataset(pa.dataset.Dataset):
             "BLOOMFILTER",
             "LABEL_LIST",
             "MINHASHLSH",
+            "FM",
         }
 
     @classmethod
@@ -3724,6 +3974,7 @@ class LanceDataset(pa.dataset.Dataset):
             "BLOOMFILTER",
             "LABEL_LIST",
             "MINHASHLSH",
+            "FM",
         }
 
     def create_scalar_index(
@@ -3740,6 +3991,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["BLOOMFILTER"],
             Literal["RTREE"],
             Literal["MINHASHLSH"],
+            Literal["FM"],
             IndexConfig,
         ],
         name: Optional[str] = None,
@@ -3816,6 +4068,8 @@ class LanceDataset(pa.dataset.Dataset):
         * ``BLOOMFILTER``. This inexact index uses a bloom filter.  It is small
              but can only handle filters with equals and not equals and may require
              more I/O than a btree or bitmap index```
+        * ``FM``. An FM-index for substring search. It answers ``contains``
+          filters exactly, including single-character patterns.
 
         Index training sorts can spill to disk under memory pressure.
         ``LANCE_MEM_POOL_SIZE`` configures this pool in bytes; it is not a limit
@@ -3844,7 +4098,7 @@ class LanceDataset(pa.dataset.Dataset):
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
             ``"LABEL_LIST"``, ``"NGRAM"``, ``"ZONEMAP"``, ``"INVERTED"``,
-            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``, ``"MINHASHLSH"``.
+            ``"FTS"``, ``"BLOOMFILTER"``, ``"RTREE"``, ``"MINHASHLSH"``, ``"FM"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -3876,6 +4130,12 @@ class LanceDataset(pa.dataset.Dataset):
             If unset, Lance uses ``LANCE_FTS_FORMAT_VERSION`` when present and
             otherwise writes v2 for text analysis with ``block_size=128`` and
             v3 for code analysis or ``block_size=256``.
+
+        num_segments: int, optional
+            This is for ``index_type="FM"``. Split the fragments, in order, into
+            at most this many segments, each an independent FM-index. There are
+            never more segments than fragments. ``create_index_uncommitted``
+            ignores it and always writes one segment.
 
         document_granularity: DocumentGranularity, default ROW
             This is for the ``INVERTED`` / ``FTS`` index. ``ROW`` treats all
@@ -3918,6 +4178,8 @@ class LanceDataset(pa.dataset.Dataset):
             * "ngram": produces character N-grams for substring search.
             * "icu": ICU dictionary-based Unicode word segmentation.
             * "icu/split": ICU segmentation with simple-style delimiter splitting.
+            * "code": splits code-like text. Requires FTS format v3 and enables
+              the code analyzer options below.
         language: str, default "English"
             This is for the ``INVERTED`` index. The language for stemming
             and stop words. This is only used when `stem` or `remove_stop_words` is true
@@ -3942,6 +4204,34 @@ class LanceDataset(pa.dataset.Dataset):
             This is for the ``INVERTED`` index. If True, the index will convert
             non-ascii characters to ascii characters if possible.
             This would remove accents like "é" -> "e".
+        analyzer: str, optional
+            This is for the ``INVERTED`` index. Selects an analyzer profile:
+            ``"text"`` (the default) or ``"code"``. The ``"code"`` profile sets
+            ``base_tokenizer="code"`` and applies code-oriented defaults:
+            ``split_identifiers=False``, ``split_on_numerics=True``,
+            ``preserve_original=True``, ``stem=False``, and
+            ``remove_stop_words=False``. If unset, the profile is inferred from
+            ``base_tokenizer="code"``. Explicit arguments override the profile
+            defaults. Code analysis requires FTS format v3.
+        split_identifiers: bool, default False
+            This is for the ``INVERTED`` index with the code analyzer. If True,
+            identifiers such as ``getUserName`` are split into subwords
+            (``get``, ``User``, ``Name``) so each subword is searchable. When
+            False, an identifier is only indexed as a whole, so ``getUserName``
+            is not matched by ``user``.
+        split_on_numerics: bool, default False (True for the "code" analyzer)
+            This is for the ``INVERTED`` index with the code analyzer. If True,
+            identifier subwords are split at letter/number boundaries, for
+            example ``value42`` into ``value`` and ``42``. Only takes effect
+            when ``split_identifiers=True``.
+        preserve_original: bool, default False (True for the "code" analyzer)
+            This is for the ``INVERTED`` index with the code analyzer. If True,
+            the complete identifier is indexed in addition to its subwords.
+            Only takes effect when ``split_identifiers=True``.
+        index_operators: bool, default False
+            This is for the ``INVERTED`` index with the code analyzer. If True,
+            code operators such as ``::``, ``->``, and ``!=`` are indexed.
+            Other punctuation is still dropped.
 
         Examples
         --------
@@ -4734,8 +5024,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         This is the public distributed-build API for vector, BTREE scalar,
         canonical bitmap scalar, INVERTED scalar, NGRAM scalar, RTREE scalar,
-        ZONEMAP scalar, BLOOMFILTER scalar, LABEL_LIST scalar, and MINHASHLSH
-        scalar index construction.
+        ZONEMAP scalar, BLOOMFILTER scalar, LABEL_LIST scalar, MINHASHLSH
+        scalar, and FM scalar index construction.
         Unlike :meth:`create_index`, this method does not publish the index into
         the dataset manifest. Instead, it writes one segment under
         ``_indices/<segment_uuid>/`` and returns the resulting
@@ -4752,7 +5042,7 @@ class LanceDataset(pa.dataset.Dataset):
            :meth:`commit_existing_index_segments`
 
         BTREE, BITMAP, INVERTED, NGRAM, RTREE, ZONEMAP, BLOOMFILTER,
-        LABEL_LIST, and MINHASHLSH segments may be merged with
+        LABEL_LIST, MINHASHLSH, and FM segments may be merged with
         :meth:`merge_existing_index_segments` before commit. MINHASHLSH
         segments of one index must share parameters. NGRAM segments
         built before a deferred compaction must be merged before commit so
@@ -5518,6 +5808,10 @@ class LanceDataset(pa.dataset.Dataset):
         current version against a specific older version) or both ``begin_version``
         and ``end_version`` for an explicit range.
 
+        Reading row changes requires stable row IDs at both nonzero endpoints.
+        Enable them when creating the dataset with ``enable_stable_row_ids=True``.
+        Transaction listing is available without stable row IDs.
+
         Parameters
         ----------
         compared_against : int, optional
@@ -5552,24 +5846,21 @@ class LanceDataset(pa.dataset.Dataset):
             # Write initial data (v1)
             ds = lance.write_dataset(
                 pa.table({"id": [1, 2], "val": ["a", "b"]}),
-                "memory://delta_demo"
+                "memory://delta_demo",
+                enable_stable_row_ids=True,
             )
 
             # Append some data to create v2
-            ds_append = lance.write_dataset(
-                pa.table({"id": [3], "val": ["c"]}),
-                "memory://delta_demo",
-                mode="append"
-            )
+            ds.insert(pa.table({"id": [3], "val": ["c"]}))
 
             # Compute inserted rows from v1 -> v2 (shorthand)
-            delta = ds_append.delta(compared_against=1)
+            delta = ds.delta(compared_against=1)
             reader = delta.get_inserted_rows()
             for batch in reader:
                 print(batch)
 
             # Or using explicit version range
-            delta = ds_append.delta(begin_version=1, end_version=2)
+            delta = ds.delta(begin_version=1, end_version=2)
         """
         builder = _DatasetDeltaBuilder(self._ds.delta())
 
@@ -5785,8 +6076,10 @@ class LanceDataset(pa.dataset.Dataset):
         -------
         dict or None
             A dict with ``num_shards``, ``maintained_indexes``,
-            ``writer_config_defaults``, and ``sharding_specs``, or ``None`` when
-            MemWAL has not been initialized on this dataset.
+            ``writer_config_defaults``, ``sharding_specs``, and ``dir_id``, or
+            ``None`` when MemWAL has not been initialized on this dataset.
+            ``dir_id`` names the MemWAL that commits recording compaction
+            progress must carry.
         """
         return self._ds.mem_wal_index_details()
 
@@ -6053,6 +6346,52 @@ class SqlQueryBuilder:
         self._builder = self._builder.blob_handling(blob_handling)
         return self
 
+    def register_arrow(
+        self, name: str, data: Union[pa.Table, pa.RecordBatchReader]
+    ) -> "SqlQueryBuilder":
+        """
+        Register an in-memory Arrow relation that the query can join.
+
+        The relation is exposed under ``name`` and can be referenced like any
+        other table in the SQL (for example joined or used in a subquery). It
+        must be non-empty, since the schema is derived from the provided data.
+        The input is fully materialized in memory when this method is called,
+        so ``data`` must be bounded to available memory.
+
+        ``name`` is parsed as a SQL identifier, so an unquoted name is lowercased
+        (``IDs`` registers the table ``ids``) while a quoted one keeps its case
+        (``"IDs"``). If two names resolve to the same table, the later
+        registration wins. A name that resolves to the query's own
+        :meth:`table_name` would hide the dataset and is rejected.
+
+        Registered names are validated when the query is executed, not when
+        :meth:`build` returns, so a rejected name raises from
+        :meth:`SqlQuery.to_batch_records` (as ``ValueError``) or
+        :meth:`SqlQuery.to_stream_reader` (as ``OSError``).
+
+        Parameters
+        ----------
+        name: str
+            The name the relation is registered under in the query.
+        data: pyarrow.Table or pyarrow.RecordBatchReader
+            The in-memory relation to register. Must be non-empty.
+
+        Examples
+        --------
+        Register an in-memory relation and semi-join it in the query::
+
+            ids = pa.table({"id": [1, 2, 3]})
+            batches = (
+                dataset.sql("SELECT * FROM d WHERE id IN (SELECT id FROM ids)")
+                .table_name("d")
+                .register_arrow("ids", ids)
+                .build()
+                .to_batch_records()
+            )
+        """
+        self._builder = self._builder.register_arrow(name, data)
+        return self
+
     def batch_size(self, batch_size: int) -> "SqlQueryBuilder":
         """
         Set the maximum number of rows produced by each query batch.
@@ -6105,12 +6444,16 @@ class DatasetDelta:
     def get_inserted_rows(self) -> pa.RecordBatchReader:
         """
         Return a streaming RecordBatchReader for inserted rows.
+
+        Raises ``ValueError`` if either nonzero endpoint lacks stable row IDs.
         """
         return self._delta.get_inserted_rows()
 
     def get_updated_rows(self) -> pa.RecordBatchReader:
         """
         Return a streaming RecordBatchReader for updated rows.
+
+        Raises ``ValueError`` if either nonzero endpoint lacks stable row IDs.
         """
         return self._delta.get_updated_rows()
 
@@ -6155,12 +6498,22 @@ class BulkCommitResult(TypedDict):
 
 @dataclass
 class Transaction:
+    """A dataset change based on one read version.
+
+    Attributes
+    ----------
+    tag: str, optional
+        Optional label stored with the transaction and returned by
+        :meth:`LanceDataset.read_transaction`.
+    """
+
     read_version: int
     operation: LanceOperation.BaseOperation
     uuid: str = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
     transaction_properties: Optional[Dict[str, str]] = dataclasses.field(
         default_factory=dict
     )
+    tag: Optional[str] = None
 
 
 class Tag(TypedDict):
@@ -6253,6 +6606,11 @@ class Index:
     files: Optional[List["IndexFile"]] = None
     index_details: Optional[Tuple[str, bytes]] = None
     covering_fields: List[int] = dataclasses.field(default_factory=list)
+    clustering_id: Optional[int] = None
+    """The clustering definition this segment was built under, if any."""
+    metadata: Dict[str, str] = dataclasses.field(default_factory=dict)
+    """Generic metadata attached to this segment. Preserved verbatim, including
+    keys this library does not understand."""
 
 
 class IndexInformation(TypedDict):
@@ -6501,6 +6859,13 @@ class LanceOperation:
             each serialized in the portable RoaringBitmap format. Set on
             ``rewrite_columns`` updates over stable row ids so the commit
             refreshes row-level version metadata for the matched rows only.
+        compacted_sstables: list[lance.mem_wal.CompactedSsTable]
+            MemWAL SSTables to record as compacted. An empty list changes
+            nothing. A non-empty list requires a MemWAL index on the table.
+        mem_wal_dir_id: str, optional
+            The ``dir_id`` of the MemWAL the SSTables belong to. Required when
+            ``compacted_sstables`` is non-empty; the commit fails if the
+            table's MemWAL has since been disabled or replaced.
         """
 
         removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
@@ -6514,6 +6879,10 @@ class LanceOperation:
         )
         update_mode: str = ""
         updated_fragment_offsets: Optional[Dict[int, bytes]] = None
+        compacted_sstables: List["mem_wal.CompactedSsTable"] = dataclasses.field(
+            default_factory=list
+        )
+        mem_wal_dir_id: Optional[str] = None
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
@@ -6669,6 +7038,9 @@ class LanceOperation:
             Groups of files that have been rewritten.
         rewritten_indices: list[RewrittenIndex]
             Indices that have been rewritten.
+        frag_reuse_index: Index, optional
+            Fragment reuse index entry to install with this rewrite. ``None``
+            leaves the existing entry unchanged.
 
         Warning
         -------
@@ -6676,7 +7048,8 @@ class LanceOperation:
         """
 
         groups: Iterable[LanceOperation.RewriteGroup]
-        rewritten_indices: Iterable[LanceOperation.RewrfittenIndex]
+        rewritten_indices: Iterable[LanceOperation.RewrittenIndex]
+        frag_reuse_index: Optional[Index] = None
 
         def __post_init__(self):
             all_frags = [old for group in self.groups for old in group.old_fragments]
@@ -6873,6 +7246,28 @@ class LanceOperation:
         schema_metadata_updates: Optional[LanceOperation.UpdateMap] = None
         field_metadata_updates: Optional[Dict[int, LanceOperation.UpdateMap]] = None
 
+    @dataclass
+    class UpdateMemWalState(BaseOperation):
+        """Record MemWAL SSTables compacted into the base table.
+
+        An empty list commits as a no-op. A non-empty list requires a MemWAL
+        index (``__lance_mem_wal``) and updates that index's compaction record.
+
+        Attributes
+        ----------
+        compacted_sstables: list[lance.mem_wal.CompactedSsTable]
+            SSTables to mark compacted, one entry per shard.
+        dir_id: str
+            The ``dir_id`` of the MemWAL this update was built for; empty for a
+            MemWAL without one. The commit fails unless the table still carries
+            that MemWAL.
+        """
+
+        compacted_sstables: List["mem_wal.CompactedSsTable"] = dataclasses.field(
+            default_factory=list
+        )
+        dir_id: str = ""
+
 
 @dataclass
 class ColumnOrdering:
@@ -6887,32 +7282,64 @@ class ColumnOrdering:
     nulls_first: bool = False
 
 
-def _needs_substrait_placeholder(t: pa.DataType) -> bool:
+def _needs_substrait_placeholder(t: pa.DataType, nested: bool = False) -> bool:
     """Return True if *t* contains a type that PyArrow's substrait serializer
-    cannot handle at any nesting depth.
+    or Lance's substrait decoder cannot handle.
 
-    Three cases require a placeholder:
+    These require a placeholder at any nesting depth:
 
     * ``fixed_size_list`` — substrait has no equivalent type.
+    * ``large_list``, ``duration`` and ``decimal256`` — PyArrow has no
+      substrait conversion for them.
     * Arrow extension types (e.g. ``fixed_shape_tensor``) — substrait cannot
       represent them.
     * A struct whose fields carry non-``None`` metadata — substrait rejects
       such structs.  Extension types leave ``metadata={}`` on struct fields
       after a lance round-trip; ``{}`` is non-``None``.
+    * ``time64("us")`` — PyArrow writes it as substrait ``time``, which Lance
+      cannot decode.
+
+    Unsigned integers, ``large_string``, ``large_binary``, ``date64``,
+    ``time32`` and ``time64`` need one only inside a list, struct or map.
+    PyArrow 16 and later write them as user-defined types; Lance drops those
+    from the top level of the schema but cannot decode them when nested.  It
+    writes a dictionary as its value type, so the value type decides.
     """
-    if pa.types.is_fixed_size_list(t):
+    if (
+        pa.types.is_fixed_size_list(t)
+        or pa.types.is_large_list(t)
+        or pa.types.is_duration(t)
+        or pa.types.is_decimal256(t)
+        or (pa.types.is_time64(t) and t.unit == "us")
+    ):
         return True
     if isinstance(t, pa.lib.BaseExtensionType):
         return True
+    if nested and (
+        pa.types.is_unsigned_integer(t)
+        or pa.types.is_large_string(t)
+        or pa.types.is_large_binary(t)
+        or pa.types.is_date64(t)
+        or pa.types.is_time32(t)
+        or pa.types.is_time64(t)
+    ):
+        return True
+    if pa.types.is_dictionary(t):
+        return _needs_substrait_placeholder(t.value_type, nested)
     if pa.types.is_struct(t):
         for i in range(t.num_fields):
             f = t.field(i)
             if f.metadata is not None:
                 return True
-            if _needs_substrait_placeholder(f.type):
+            if _needs_substrait_placeholder(f.type, nested=True):
                 return True
-    if pa.types.is_list(t) or pa.types.is_large_list(t):
-        return _needs_substrait_placeholder(t.value_type)
+    if pa.types.is_list(t):
+        return _needs_substrait_placeholder(t.value_type, nested=True)
+    if pa.types.is_map(t):
+        return any(
+            _needs_substrait_placeholder(child, nested=True)
+            for child in (t.key_type, t.item_type)
+        )
     return False
 
 
@@ -6987,6 +7414,7 @@ class ScannerBuilder:
         self._fast_search = False
         self._full_text_query = None
         self._use_scalar_index = None
+        self._ignored_scalar_indices = None
         self._include_deleted_rows = None
         self._scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None
         self._strict_batch_size = False
@@ -7164,6 +7592,12 @@ class ScannerBuilder:
         return self
 
     def prefilter(self, prefilter: bool) -> ScannerBuilder:
+        """Choose SQL filtering before vector top-k (True) or after it (False).
+
+        Defaults to False. Postfilter does not replace rejected neighbors; prefilter
+        does not guarantee exact ANN results. Fragment scope, deletions, and external
+        row masks restrict candidates in either mode. See :meth:`LanceDataset.scanner`.
+        """
         self._prefilter = prefilter
         return self
 
@@ -7226,9 +7660,43 @@ class ScannerBuilder:
         self._use_scalar_index = use_scalar_index
         return self
 
+    def ignored_scalar_indices(self, index_names: Iterable[str]) -> ScannerBuilder:
+        """Ignore named scalar indices from expression-filter planning.
+
+        Other scalar indices remain eligible, and the original filter is still
+        evaluated. Names that do not identify an available scalar index have no
+        effect. This option is ignored when scalar indices are disabled with
+        :meth:`use_scalar_index`.
+
+        Inverted index names are also honored for expression filters such as
+        ``contains_tokens``, which fall back to evaluating the function without
+        that index. This does not control vector index segments or explicit
+        full-text search queries.
+
+        With :meth:`fast_search`, only a filter plan that still uses an index
+        skips unindexed fragments. If ignoring indices removes every index query,
+        the scan falls back to evaluating the filter over all selected fragments,
+        potentially returning more matching rows. Explicit fragment and row
+        selections still apply; use them to preserve a caller-defined scan scope.
+        """
+        index_names = list(index_names)
+        if any(not isinstance(name, str) or not name for name in index_names):
+            raise ValueError("ignored_scalar_indices must contain non-empty strings")
+        self._ignored_scalar_indices = index_names
+        return self
+
     def with_fragments(
         self, fragments: Optional[Iterable[LanceFragment]]
     ) -> ScannerBuilder:
+        """Set the search scope, or clear it with None.
+
+        An empty iterable yields no rows.
+        Vector search enforces this scope before candidate selection regardless of
+        SQL prefilter placement. Fragments outside selected index coverage use flat
+        KNN unless fast search is enabled. This can be called before or after
+        :meth:`nearest` and :meth:`with_index_segments`.
+        See :meth:`LanceDataset.scanner` for a mixed-search example.
+        """
         if fragments is not None:
             inner_fragments = []
             for f in fragments:
@@ -7247,6 +7715,21 @@ class ScannerBuilder:
     def with_index_segments(
         self, index_segments: Optional[Iterable[Union[str, uuid.UUID]]]
     ) -> ScannerBuilder:
+        """Select vector index segments, or restore automatic selection with None.
+
+        With index use enabled, UUIDs must identify existing segments of one logical
+        index on the query's vector column. Metric compatibility is checked when
+        selected segments overlap the fragment scope. With no overlap, ordinary
+        search uses flat KNN with the query metric, or the selected index's metric
+        when unset, while fast search returns no rows.
+        An empty iterable is invalid, and segment selection is only supported for
+        vector search.
+        With explicit fragments, uncovered fragments use flat KNN unless fast search
+        is enabled. Without fragments, indexed search searches only these segments.
+        This controls index use rather than flat scans with ``use_index=False``.
+        It can be called before or after :meth:`nearest` and :meth:`with_fragments`.
+        See :meth:`LanceDataset.scanner` for a mixed-search example.
+        """
         self._index_segments = _normalize_index_segment_ids(index_segments)
         return self
 
@@ -7266,8 +7749,15 @@ class ScannerBuilder:
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
         distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
         search_effort: Optional[float] = None,
+        quantized_refine_factor: Optional[int] = None,
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
+
+        Fragment and segment selection can be configured before or after this method.
+        The fragment scope applies with either SQL prefilter or postfilter. With a
+        suitable index, uncovered fragments use flat KNN unless fast search is enabled;
+        without an index, ordinary search uses flat KNN. See
+        :meth:`LanceDataset.scanner` for a mixed-search example and filtering semantics.
 
         Parameters
         ----------
@@ -7307,6 +7797,16 @@ class ScannerBuilder:
             setting. ``fast`` favors lower latency and may reduce recall,
             ``normal`` uses the default balance, and ``accurate`` favors higher
             recall and may increase latency.
+        quantized_refine_factor: int, optional
+            For an IVF_RQ flat index, overfetch this many one-bit candidates per
+            requested result and rerank them with the index's most accurate stored
+            RQ representation. Unlike ``refine_factor``, indexed candidates do not
+            read their original vectors. Unindexed fragments and stale overlay rows
+            still use flat fallback and may read original vectors. The two stages can
+            be combined; exact refinement remains the final stage and reads original
+            vectors for its candidates. With ``distance_range``, selected partitions
+            use Accurate RQ search directly so the range applies before top-k
+            truncation.
         """
         self._nearest = _build_vector_search_query(
             column,
@@ -7318,6 +7818,7 @@ class ScannerBuilder:
             minimum_nprobes=minimum_nprobes,
             maximum_nprobes=maximum_nprobes,
             refine_factor=refine_factor,
+            quantized_refine_factor=quantized_refine_factor,
             use_index=use_index,
             ef=ef,
             query_parallelism=query_parallelism,
@@ -7328,7 +7829,19 @@ class ScannerBuilder:
         return self
 
     def fast_search(self, flag: bool) -> ScannerBuilder:
-        """Enable fast search, which only performs search on indexed fragments.
+        """Set whether searches use only indexed data (default: False).
+
+        Vector search skips flat fallback outside selected segment coverage and stale
+        overlay rows requiring replay. The fragment scope and SQL prefilter placement
+        are unchanged. No usable vector index coverage produces an empty result.
+        Use :meth:`LanceDataset.create_index` or
+        :meth:`DatasetOptimizer.optimize_indices` to index newly appended data.
+        See :meth:`LanceDataset.scanner` for a mixed-search example.
+
+        For scalar expression filters, this applies only when the filter plan
+        uses an index. If no index query remains, including after
+        :meth:`ignored_scalar_indices`, the scan falls back to all selected
+        fragments while retaining the original filter and explicit row selections.
 
         Users can use `Table::optimize()` or `create_index()` to include new data
         in an index, thus making new data searchable.
@@ -7490,6 +8003,7 @@ class ScannerBuilder:
             self._late_materialization,
             self._blob_handling,
             self._use_scalar_index,
+            self._ignored_scalar_indices,
             self._include_deleted_rows,
             self._scan_stats_callback,
             self._strict_batch_size,
@@ -7932,6 +8446,46 @@ class DatasetOptimizer:
         }
         return Compaction.execute(self._dataset, opts)
 
+    def inline_deletions(self) -> int:
+        """Move small deletion vectors from ``_deletions/`` files into the manifest.
+
+        A reader fetches every deletion file it needs with one request each, so
+        on a table where most fragments carry a few deleted rows the first
+        ``take`` of a process costs one request per fragment. Deletion vectors
+        stored in the manifest arrive with it instead.
+
+        The budget comes from the table config key
+        ``lance.deletions.inline_max_bytes``: a deletion vector whose bitmap
+        encoding is at most that many bytes is stored inline, both by this
+        call and by later deletes. Set it with :meth:`LanceDataset.update_config`
+        first. Readers must support the ``FLAG_INLINE_DELETIONS`` feature flag
+        once a fragment stores its deletions inline, and the move is one way:
+        setting the budget back to ``0`` stops new inline writes but leaves the
+        moved vectors in the manifest, so upgrade every reader of the table
+        before calling this.
+
+        Returns
+        -------
+        int
+            The number of fragments whose deletion vector moved into the
+            manifest. Nothing is committed when it is zero.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> ds = lance.write_dataset(pa.table({"a": range(100)}), "memory://inline")
+        >>> ds.delete("a < 10")
+        {'num_deleted_rows': 10}
+        >>> ds.update_config({"lance.deletions.inline_max_bytes": "65536"})
+        {'lance.deletions.inline_max_bytes': '65536'}
+        >>> ds.optimize.inline_deletions()
+        1
+        >>> ds.count_rows()
+        90
+        """
+        return self._dataset._ds.inline_deletions()
+
     def optimize_indices(self, **kwargs) -> None:
         """Optimizes index performance.
 
@@ -7983,10 +8537,16 @@ class DatasetOptimizer:
         )
 
     def disable_auto_cleanup(self, **kwargs):
-        """Disable autocleaning via delete related keys."""
-        self._dataset._ds.delete_config_keys(
-            ["lance.auto_cleanup.interval", "lance.auto_cleanup.older_than"]
-        )
+        """Disable every automatic cleanup activation form."""
+        config = self._dataset.config()
+        keys = [
+            "lance.auto_cleanup.interval",
+            "lance.auto_cleanup.older_than",
+            "lance.auto_cleanup.policy_interval",
+            "lance.auto_cleanup.policy",
+            *(key for key in config if key.startswith("lance.auto_cleanup.keep_one.")),
+        ]
+        self._dataset._ds.delete_config_keys(keys)
 
 
 class Tags:
@@ -7996,6 +8556,40 @@ class Tags:
 
     def __init__(self, dataset: _Dataset):
         self._ds = dataset
+
+    def get(self, tag: str) -> Tag:
+        """
+        Get metadata for a dataset tag by name without listing all tags.
+
+        Parameters
+        ----------
+        tag: str
+            The name of the tag to retrieve.
+
+        Returns
+        -------
+        Tag
+            Tag metadata with the same fields as the values returned by
+            :meth:`list`, including the referenced branch, version, timestamps,
+            manifest size, and attached metadata.
+
+        Raises
+        ------
+        ValueError
+            If the tag does not exist or its name is invalid.
+
+        Examples
+        --------
+        >>> import tempfile
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> with tempfile.TemporaryDirectory() as uri:
+        ...     ds = lance.write_dataset(pa.table({"id": [1, 2]}), uri)
+        ...     ds.tags.create("v1", 1)
+        ...     ds.tags.get("v1")["version"]
+        1
+        """
+        return self._ds.get_tag(tag)
 
     def list(self) -> dict[str, Tag]:
         """
@@ -8252,7 +8846,11 @@ def write_dataset(
     ----------
     data_obj: Reader-like
         The data to be written. Acceptable types are:
-        - Pandas DataFrame, Pyarrow Table, Dataset, Scanner, or RecordBatchReader
+        - Pandas DataFrame, Polars DataFrame
+        - Pyarrow Table, RecordBatch, Dataset, Scanner, or RecordBatchReader
+        - An iterable of Pyarrow RecordBatch (requires ``schema``)
+        - A dict of columns, or a non-empty list of row dicts
+        - A non-empty list of instances of the same Pydantic model class
         - Huggingface dataset
     uri: str, Path, LanceDataset, or None
         Where to write the dataset to (directory). If a LanceDataset is passed,
@@ -8616,6 +9214,7 @@ def _build_vector_search_query(
     minimum_nprobes: Optional[int] = None,
     maximum_nprobes: Optional[int] = None,
     refine_factor: Optional[int] = None,
+    quantized_refine_factor: Optional[int] = None,
     use_index: bool = True,
     ef: Optional[int] = None,
     query_parallelism: Optional[int] = None,
@@ -8652,6 +9251,13 @@ def _build_vector_search_query(
         both initial and later probing without disabling Auto probing.
     refine_factor: int, optional
         The refine factor for the search.
+    quantized_refine_factor: int, optional
+        For an IVF_RQ flat index, overfetch this many one-bit candidates per
+        requested result and rerank them using the most accurate stored RQ data.
+        Indexed candidates do not read their original vectors. Unindexed fragments
+        and stale overlay rows still use flat fallback and may read original vectors.
+        With ``distance_range``, selected partitions use Accurate RQ search directly
+        so the range applies before top-k truncation.
     use_index: bool, default True
         Whether to use the index for the search.
     ef: int, optional
@@ -8734,6 +9340,10 @@ def _build_vector_search_query(
         raise ValueError("minimum_nprobes must be <= maximum_nprobes")
     if refine_factor is not None and int(refine_factor) < 1:
         raise ValueError(f"Refine factor must be 1 or more got {refine_factor}")
+    if quantized_refine_factor is not None and int(quantized_refine_factor) < 1:
+        raise ValueError(
+            f"Quantized refine factor must be 1 or more got {quantized_refine_factor}"
+        )
     if ef is not None and int(ef) <= 0:
         # `ef` should be >= `k`, but `k` could be None so we can't check it here
         # the rust code will check it
@@ -8765,6 +9375,7 @@ def _build_vector_search_query(
         "minimum_nprobes": minimum_nprobes,
         "maximum_nprobes": maximum_nprobes,
         "refine_factor": refine_factor,
+        "quantized_refine_factor": quantized_refine_factor,
         "use_index": use_index,
         "ef": ef,
         "query_parallelism": query_parallelism,
@@ -8912,6 +9523,9 @@ class VectorIndexReader:
 
 class VectorSearchQuery:
     """Vector search parameters, including continuous ``search_effort`` in [0, 1].
+
+    If metric is omitted and use_index is True, use the column's index metric
+    when an index exists. Otherwise, use the default for the vector's element type.
 
     Effort defaults to None, which resolves to 0.5 (Auto). Explicit effort
     ignores nprobes. See :meth:`ScannerBuilder.nearest` for probe bounds and

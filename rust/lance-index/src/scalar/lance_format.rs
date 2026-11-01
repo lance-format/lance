@@ -254,6 +254,13 @@ impl IndexReader for V1IndexReader {
         )))
     }
 
+    fn guarantees_byte_splitting(&self) -> bool {
+        // A batch is exactly one row group, and the V1 format bounds the
+        // offsets inside a row group, so a batch never merges rows into one
+        // oversized offset array.
+        true
+    }
+
     async fn num_batches(&self, _batch_size: u64) -> u32 {
         self.0.num_batches() as u32
     }
@@ -499,6 +506,13 @@ impl IndexReader for CurrentIndexReader {
         let num_rows = CurrentFileReader::num_rows(&self.0) as usize;
         self.read_range_stream(0..num_rows, None, batch_size, batch_readahead)
             .await
+    }
+
+    fn guarantees_byte_splitting(&self) -> bool {
+        // The V2.0 decoder splits a batch before its i32 offsets overflow
+        // (#9225). The V2.1+ structural decoder drains by row count alone, so
+        // a multi-row batch of huge rows can overflow inside one batch.
+        self.0.metadata().version() == ConcreteFileVersion::V2_0
     }
 
     // V2 format has removed the row group concept,
@@ -748,8 +762,8 @@ mod tests {
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field, TimeUnit};
     use arrow_select::take::TakeOptions;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::FutureExt;
     use lance_core::ROW_ADDR;
     use lance_core::utils::row_addr_remap::RowAddrRemap;
@@ -996,7 +1010,7 @@ mod tests {
         };
         let params = serde_json::to_string(&params).unwrap();
         let btree_plugin = BTreeIndexPlugin;
-        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        let data = lance_datafusion_exec::utils::reader_to_stream(Box::new(data));
         let request = btree_plugin
             .new_training_request(
                 &params,
@@ -1144,7 +1158,7 @@ mod tests {
         let updated_index_store = test_store(&updated_index_dir);
         index
             .update(
-                lance_datafusion::utils::reader_to_stream(Box::new(data)),
+                lance_datafusion_exec::utils::reader_to_stream(Box::new(data)),
                 updated_index_store.as_ref(),
                 None,
             )
@@ -1532,7 +1546,7 @@ mod tests {
             Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
-        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        let data = lance_datafusion_exec::utils::reader_to_stream(Box::new(data));
 
         train_btree_index(
             data,
@@ -2000,7 +2014,7 @@ mod tests {
         let updated_index_store = test_store(&updated_index_dir);
         index
             .update(
-                lance_datafusion::utils::reader_to_stream(Box::new(data)),
+                lance_datafusion_exec::utils::reader_to_stream(Box::new(data)),
                 updated_index_store.as_ref(),
                 None,
             )
@@ -2103,7 +2117,7 @@ mod tests {
         index_store: &Arc<dyn IndexStore>,
         data: impl RecordBatchReader + Send + Sync + 'static,
     ) {
-        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        let data = lance_datafusion_exec::utils::reader_to_stream(Box::new(data));
         let request = LabelListIndexPlugin
             .new_training_request(
                 "{}",
@@ -2323,7 +2337,7 @@ mod tests {
             .unwrap();
 
         BitmapIndexPlugin::train_bitmap_index(
-            lance_datafusion::utils::reader_to_stream(Box::new(RecordBatchIterator::new(
+            lance_datafusion_exec::utils::reader_to_stream(Box::new(RecordBatchIterator::new(
                 vec![Ok(batch)],
                 schema,
             ))),

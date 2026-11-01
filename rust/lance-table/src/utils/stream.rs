@@ -878,7 +878,7 @@ fn wrap_with_row_id_and_delete_impl<const USE_DENSE_ROW_ID_EXPANSION: bool>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::VecDeque, sync::Arc, time::Duration};
 
     use arrow::{array::AsArray, datatypes::UInt64Type};
     use arrow_array::{RecordBatch, UInt32Array, types::Int32Type};
@@ -892,7 +892,14 @@ mod tests {
         utils::{address::RowAddress, deletion::DeletionVector},
     };
     use lance_datagen::{BatchCount, RowCount};
-    use lance_io::{ReadBatchParams, stream::arrow_stream_to_lance_stream};
+    use lance_io::{
+        ReadBatchParams,
+        object_store::ObjectStore,
+        scheduler::{FileScheduler, ScanScheduler, SchedulerConfig},
+        stream::arrow_stream_to_lance_stream,
+        utils::CachedFileSize,
+    };
+    use object_store::path::Path;
     use roaring::RoaringBitmap;
 
     use crate::{rowids::RowIdSequence, utils::stream::ReadBatchTask};
@@ -939,6 +946,88 @@ mod tests {
             .collect::<Result<Vec<_>, ArrowError>>()
             .unwrap();
         assert_eq!(merged, expected);
+    }
+
+    #[tokio::test]
+    async fn test_merge_files_with_different_batch_boundaries_under_backpressure() {
+        fn file_stream(
+            file: FileScheduler,
+            name: &'static str,
+            batch_size: u32,
+        ) -> super::ReadBatchTaskStream {
+            // Each row is a page. Scheduling is eager, but consuming a page
+            // requires polling this file's decoder stream.
+            let pages = (0..8)
+                .map(|row| file.submit_request(vec![row..row + 1], row).boxed())
+                .collect::<VecDeque<_>>();
+            stream::unfold((pages, 0_u32), move |(mut pages, offset)| async move {
+                if pages.is_empty() {
+                    return None;
+                }
+                for _ in 0..batch_size {
+                    pages.pop_front().unwrap().await.unwrap();
+                }
+                let values = (offset..offset + batch_size).collect::<Vec<_>>();
+                let batch = arrow_array::record_batch!((name, UInt32, values)).unwrap();
+                Some((
+                    ReadBatchTask {
+                        num_rows: batch_size,
+                        task: std::future::ready(Ok(batch)).boxed(),
+                    },
+                    (pages, offset + batch_size),
+                ))
+            })
+            .boxed()
+        }
+
+        let store = Arc::new(ObjectStore::memory());
+        let scheduler = ScanScheduler::new(
+            store.clone(),
+            SchedulerConfig {
+                io_buffer_size_bytes: 1,
+                use_lite_scheduler: Some(false),
+            },
+        );
+        let mut files = Vec::with_capacity(3);
+        for name in ["base", "wide", "narrow"] {
+            let path = Path::from(name);
+            store.put(&path, &[0; 8]).await.unwrap();
+            files.push(
+                scheduler
+                    .open_file(&path, &CachedFileSize::new(8))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut files = files.into_iter();
+        let streams = vec![
+            file_stream(files.next().unwrap(), "base", 2),
+            file_stream(files.next().unwrap(), "wide", 4),
+            file_stream(files.next().unwrap(), "narrow", 1),
+        ];
+        let scan = async move {
+            let mut merged = super::merge_streams(streams);
+            let mut offset = 0;
+            while let Some(task) = merged.next().await {
+                let batch = task.task.await.unwrap();
+                for name in ["base", "wide", "narrow"] {
+                    assert_eq!(
+                        batch[name]
+                            .as_primitive::<arrow_array::types::UInt32Type>()
+                            .values(),
+                        &[offset]
+                    );
+                }
+                offset += 1;
+            }
+            assert_eq!(offset, 8);
+        };
+        // The ready wide batch retains rows while the other files advance.
+        // Polling only streams without pending batches cannot break this cycle
+        // with a global row-priority reservation.
+        tokio::time::timeout(Duration::from_millis(500), scan)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

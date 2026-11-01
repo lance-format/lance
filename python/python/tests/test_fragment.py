@@ -6,6 +6,7 @@ import multiprocessing
 import pickle
 import uuid
 from pathlib import Path
+from unittest import mock
 
 import lance
 import pandas as pd
@@ -24,6 +25,7 @@ from lance.debug import format_fragment
 from lance.file import LanceFileReader, LanceFileWriter
 from lance.fragment import RowIdMeta, RowIdSequence, write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
+from pyarrow.fs import FileInfo, FileType
 
 
 def test_write_fragment(tmp_path: Path):
@@ -322,6 +324,53 @@ def test_dataset_progress(tmp_path: Path):
     assert metadata["id"] == 1
 
 
+def test_file_system_progress_clears_marker_of_last_file(tmp_path: Path):
+    progress_uri = tmp_path / "progress"
+    dataset = write_dataset(
+        pa.table({"a": range(7)}),
+        tmp_path / "dataset",
+        max_rows_per_file=5,
+        progress=FileSystemFragmentWriteProgress(progress_uri),
+    )
+
+    assert len(dataset.get_fragments()) == 2
+    assert list(progress_uri.glob("*.in_progress")) == []
+    assert (progress_uri / "fragment_0.json").exists()
+
+
+def test_file_system_progress_shared_directory(tmp_path: Path):
+    fragment = FragmentMetadata(id=0, files=[], physical_rows=0)
+    marker = tmp_path / "fragment_0.in_progress"
+    first = FileSystemFragmentWriteProgress(tmp_path)
+    second = FileSystemFragmentWriteProgress(tmp_path)
+
+    first.begin(fragment)
+    second.begin(fragment)
+    assert marker.exists()
+    first.complete(fragment)
+    assert not marker.exists()
+    # The marker is already gone: the second writer must not fail for that.
+    second.complete(fragment)
+
+
+def test_file_system_progress_tolerates_only_a_missing_marker(tmp_path: Path):
+    fragment = FragmentMetadata(id=0, files=[], physical_rows=0)
+    progress = FileSystemFragmentWriteProgress(tmp_path)
+    progress.begin(fragment)
+
+    # Another writer can recreate the marker right after this delete failed, so
+    # the error alone decides: looking at the marker afterwards would be a race.
+    progress._fs = mock.Mock(
+        delete_file=mock.Mock(side_effect=FileNotFoundError("gone")),
+        get_file_info=mock.Mock(return_value=FileInfo("marker", FileType.File)),
+    )
+    progress.complete(fragment)
+
+    progress._fs = mock.Mock(delete_file=mock.Mock(side_effect=PermissionError("no")))
+    with pytest.raises(PermissionError, match="no"):
+        progress.complete(fragment)
+
+
 def test_fragment_meta():
     # Intentionally leaving off column_indices / version fields to make sure
     # we can handle backwards compatibility (though not clear we need to)
@@ -355,7 +404,8 @@ def test_fragment_meta():
         "file_size_bytes=100), DataFile(path='1.lance', fields=[1], column_indices=[], "
         "file_major_version=0, file_minor_version=0, file_size_bytes=None)], "
         "physical_rows=100, deletion_file=None, row_id_meta=None, "
-        "created_at_version_meta=None, last_updated_at_version_meta=None, overlays=[])"
+        "created_at_version_meta=None, last_updated_at_version_meta=None, overlays=[], "
+        "clustering_id=None, metadata={})"
     )
 
 
@@ -529,20 +579,51 @@ def test_fragment_count_rows(tmp_path: Path):
     assert fragments[0].count_rows(pc.field("a") < 200) == 200
 
 
-def test_fragment_pyarrow_expression_filter(tmp_path: Path):
+@pytest.mark.parametrize("ignored_scalar_indices", [None, ["s_btree"]])
+def test_fragment_pyarrow_expression_filter(tmp_path: Path, ignored_scalar_indices):
     data = pa.table({"id": [0, 1, 2], "s": ["C:\\temp", "plain", "other"]})
     dataset = write_dataset(data, tmp_path, max_rows_per_file=2)
+    dataset.create_scalar_index("s", "BTREE", name="s_btree")
     assert len(dataset.get_fragments()) == 2
     fragment = dataset.get_fragments()[0]
     expression = pc.field("s") != "C:\\temp"
 
     assert dataset.count_rows(filter=expression) == 2
     assert fragment.count_rows(expression) == 1
-    assert fragment.scanner(filter=expression).to_table()["id"].to_pylist() == [1]
-    assert fragment.to_table(filter=expression)["id"].to_pylist() == [1]
+    scanner = fragment.scanner(
+        filter=expression, ignored_scalar_indices=ignored_scalar_indices
+    )
+    assert ("ScalarIndexQuery" in scanner.explain_plan(True)) == (
+        ignored_scalar_indices is None
+    )
+    assert scanner.to_table()["id"].to_pylist() == [1]
+    assert fragment.to_table(
+        filter=expression, ignored_scalar_indices=ignored_scalar_indices
+    )["id"].to_pylist() == [1]
     assert fragment.to_table(filter=pc.field("s").isin(["C:\\temp"]))[
         "id"
     ].to_pylist() == [0]
+
+
+def test_fragment_to_table_preserves_positional_arguments(tmp_path: Path):
+    data = pa.table({"id": [0, 1, 2], "s": ["C:\\temp", "plain", "other"]})
+    dataset = write_dataset(data, tmp_path, max_rows_per_file=2)
+    dataset.create_scalar_index("s", "BTREE", name="s_btree")
+    fragment = dataset.get_fragments()[0]
+
+    table = fragment.to_table(
+        None,
+        pc.field("s") != "C:\\temp",
+        None,
+        None,
+        False,
+        False,
+        None,
+        None,
+        None,
+        1 << 20,
+    )
+    assert table["id"].to_pylist() == [1]
 
 
 @pytest.mark.parametrize("enable_stable_row_ids", [False, True])
@@ -613,6 +694,46 @@ def test_deletion_file_with_base_id_serialization():
     deserialized = FragmentMetadata.from_json(json.dumps(json_data))
     assert deserialized.deletion_file is not None
     assert deserialized.deletion_file.base_id == 456
+
+
+def test_fragment_metadata_json_round_trips_clustering_metadata():
+    """clustering_id and the generic map survive to_json/from_json and pickle,
+    and JSON written before the fields existed reads back with defaults."""
+    from lance.fragment import FragmentMetadata
+
+    metadata = {
+        "org.example.cluster.bucket": "3",
+        "org.example.unknown": "  opaque value: 東京  ",
+        "org.example.empty": "",
+    }
+    stamped = FragmentMetadata(
+        id=0, files=[], physical_rows=1, clustering_id=7, metadata=metadata
+    )
+
+    json_data = stamped.to_json()
+    assert json_data["clustering_id"] == 7
+    assert json_data["metadata"] == metadata
+    restored = FragmentMetadata.from_json(json.dumps(json_data))
+    assert restored == stamped
+    assert restored.clustering_id == 7
+    assert restored.metadata == metadata
+    assert pickle.loads(pickle.dumps(stamped)) == stamped
+
+    # A fragment without either field writes explicit defaults and reads back.
+    plain = FragmentMetadata(id=1, files=[], physical_rows=1)
+    plain_json = plain.to_json()
+    assert plain_json["clustering_id"] is None
+    assert plain_json["metadata"] == {}
+    assert FragmentMetadata.from_json(json.dumps(plain_json)) == plain
+
+    # JSON produced before these fields existed carries neither key.
+    legacy = {
+        k: v for k, v in plain_json.items() if k not in ("clustering_id", "metadata")
+    }
+    legacy_restored = FragmentMetadata.from_json(json.dumps(legacy))
+    assert legacy_restored.clustering_id is None
+    assert legacy_restored.metadata == {}
+    assert legacy_restored == plain
 
 
 def test_fragment_update_columns_basic(tmp_path):

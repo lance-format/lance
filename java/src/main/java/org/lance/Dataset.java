@@ -29,6 +29,8 @@ import org.lance.index.IndexType;
 import org.lance.index.OptimizeOptions;
 import org.lance.index.scalar.ZoneStats;
 import org.lance.ipc.DataStatistics;
+import org.lance.ipc.FtsGlobalStatistics;
+import org.lance.ipc.FullTextQuery;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.lance.memwal.InitializeMemWalParams;
@@ -1204,8 +1206,9 @@ public class Dataset implements Closeable {
   /**
    * Creates a new index on the dataset.
    *
-   * <p>Concurrent {@link #createIndex} / {@link #mergeIndexMetadata} calls on the same Dataset
-   * handle are serialized.
+   * <p>Concurrent {@link #createIndex} / {@link #mergeIndexMetadata} calls that commit on the same
+   * Dataset handle are serialized. Uncommitted builds (with fragment ids, or a BTree build from
+   * preprocessed data) only read this handle's snapshot and may run concurrently.
    *
    * @param options options for building index
    * @return the metadata of the created index
@@ -1222,8 +1225,8 @@ public class Dataset implements Closeable {
    * callback must be thread-safe because Lance may invoke it concurrently from native runtime
    * threads. Callbacks may re-enter read-only methods on this Dataset. Conflicting write re-entry
    * from a callback is rejected; unrelated concurrent callers keep their normal wait behavior.
-   * Concurrent {@link #createIndex} / {@link #mergeIndexMetadata} calls on the same Dataset handle
-   * are serialized.
+   * Concurrent {@link #createIndex} / {@link #mergeIndexMetadata} calls that commit on the same
+   * Dataset handle are serialized; uncommitted builds may run concurrently.
    *
    * <pre>{@code
    * Index index = dataset.createIndex(options, new IndexBuildProgress() {
@@ -1249,7 +1252,15 @@ public class Dataset implements Closeable {
     }
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      acquireIndexBuildLock();
+      // Uncommitted builds only read this handle's snapshot and never publish a new version, so
+      // they skip the build lock. Mirrors skip_commit in the JNI layer.
+      boolean commits =
+          !options.getFragmentIds().isPresent()
+              && !(options.getIndexType() == IndexType.BTREE
+                  && options.getPreprocessedData().isPresent());
+      if (commits) {
+        acquireIndexBuildLock();
+      }
       try {
         if (progress == null) {
           return nativeCreateIndex(
@@ -1275,7 +1286,9 @@ public class Dataset implements Closeable {
             options.getPreprocessedData().map(ArrowArrayStream::memoryAddress),
             new ContextIndexBuildProgress(this, progress));
       } finally {
-        indexBuildLock.unlock();
+        if (commits) {
+          indexBuildLock.unlock();
+        }
       }
     }
   }
@@ -1345,7 +1358,7 @@ public class Dataset implements Closeable {
    *
    * <p>Callback re-entry semantics match {@link #createIndex(IndexOptions, IndexBuildProgress)}:
    * read-only Dataset methods are allowed, conflicting write re-entry is rejected, and concurrent
-   * create/merge builds on this handle are serialized.
+   * committing create/merge builds on this handle are serialized.
    *
    * @param indexUUID shared UUID used by the distributed index parts
    * @param indexType type of index metadata to merge
@@ -1738,6 +1751,37 @@ public class Dataset implements Closeable {
   private native String nativeGetIndexStatistics(String indexName);
 
   /**
+   * Build global BM25 statistics for a full-text query across every committed segment of its
+   * logical FTS index.
+   *
+   * <p>The returned opaque protobuf is bound to this dataset version and the exact segment set. It
+   * also preserves every scoring query leaf's prepared vocabulary, Match term groups, or Phrase
+   * token positions, including fuzzy expansions. It does not include documents in unindexed
+   * fragments. Queries spanning more than one indexed column are not supported. V1 emits one
+   * DOCUMENT-counted corpus with prepared Match/Phrase leaves. The caller must attach the payload
+   * only to the same query used to produce it because V1 consumers cannot independently verify the
+   * source query identity.
+   *
+   * <pre>{@code
+   * FtsGlobalStatistics statistics =
+   *     dataset.getFtsGlobalStatistics(FullTextQuery.match("hello", "text"));
+   * byte[] transportPayload = statistics.toBytes();
+   * }</pre>
+   *
+   * @param query full-text query whose token statistics should be collected
+   * @return opaque, protobuf-encoded global FTS statistics
+   */
+  public FtsGlobalStatistics getFtsGlobalStatistics(FullTextQuery query) {
+    Preconditions.checkNotNull(query, "query must not be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return FtsGlobalStatistics.fromBytes(nativeGetFtsGlobalStatistics(query));
+    }
+  }
+
+  private native byte[] nativeGetFtsGlobalStatistics(FullTextQuery query);
+
+  /**
    * Describe indices on this dataset filtered by criteria.
    *
    * @param criteria filter options such as column, name or index capabilities
@@ -1764,6 +1808,42 @@ public class Dataset implements Closeable {
   }
 
   private native List<IndexDescription> nativeDescribeIndices(Optional<IndexCriteria> criteria);
+
+  /**
+   * Describe indices on this dataset without materializing per-segment metadata.
+   *
+   * <p>The returned descriptions contain the same logical index properties and aggregate fragment
+   * coverage as {@link #describeIndices(IndexCriteria)}, but their segment lists are empty. Use
+   * this method when only summary information is needed, especially for indices covering many
+   * fragments.
+   *
+   * @param criteria filter options such as column, name or index capabilities
+   * @return list of index descriptions with empty segment lists
+   */
+  public List<IndexDescription> describeIndexSummaries(IndexCriteria criteria) {
+    Preconditions.checkNotNull(criteria, "criteria cannot be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeDescribeIndexSummaries(Optional.of(criteria));
+    }
+  }
+
+  /**
+   * Describe all indices on this dataset without materializing per-segment metadata.
+   *
+   * <p>The returned descriptions contain aggregate fragment coverage and have empty segment lists.
+   *
+   * @return list of index descriptions with empty segment lists
+   */
+  public List<IndexDescription> describeIndexSummaries() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeDescribeIndexSummaries(Optional.empty());
+    }
+  }
+
+  private native List<IndexDescription> nativeDescribeIndexSummaries(
+      Optional<IndexCriteria> criteria);
 
   /**
    * Read zonemap statistics for a column.
@@ -2707,23 +2787,33 @@ public class Dataset implements Closeable {
   }
 
   RemovalStats executeCleanup(
-      CleanupPolicy policy, Optional<Long> deleteConcurrency, Optional<Long> deleteRateLimit) {
+      CleanupPolicy policy,
+      Optional<Long> deleteConcurrency,
+      Optional<Long> deleteRateLimit,
+      Optional<String> retentionPolicyJson) {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeCleanupWithPolicy(policy, deleteConcurrency, deleteRateLimit);
+      return nativeCleanupWithPolicy(
+          policy, deleteConcurrency, deleteRateLimit, retentionPolicyJson);
     }
   }
 
   private native RemovalStats nativeCleanupWithPolicy(
-      CleanupPolicy policy, Optional<Long> deleteConcurrency, Optional<Long> deleteRateLimit);
+      CleanupPolicy policy,
+      Optional<Long> deleteConcurrency,
+      Optional<Long> deleteRateLimit,
+      Optional<String> retentionPolicyJson);
 
-  CleanupExplanation explainCleanup(CleanupPolicy policy, Optional<Long> maxCandidateFiles) {
+  CleanupExplanation explainCleanup(
+      CleanupPolicy policy,
+      Optional<Long> maxCandidateFiles,
+      Optional<String> retentionPolicyJson) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeExplainCleanupWithPolicy(policy, maxCandidateFiles);
+      return nativeExplainCleanupWithPolicy(policy, maxCandidateFiles, retentionPolicyJson);
     }
   }
 
   private native CleanupExplanation nativeExplainCleanupWithPolicy(
-      CleanupPolicy policy, Optional<Long> maxCandidateFiles);
+      CleanupPolicy policy, Optional<Long> maxCandidateFiles, Optional<String> retentionPolicyJson);
 }

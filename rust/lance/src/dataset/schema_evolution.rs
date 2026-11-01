@@ -810,17 +810,22 @@ async fn add_columns_from_stream(
                     }
                 }
 
-                let new_batch =
-                    arrow_select::concat::concat_batches(&batches[0].schema(), batches.iter())?;
-
                 // Reject nulls the dataset's file format cannot store (e.g. integer
                 // nulls on Legacy), matching the hash-join based merge path, instead
                 // of silently writing them as default values.
-                for (field, column) in new_batch.schema().fields().iter().zip(new_batch.columns()) {
-                    HashJoiner::check_lance_support_null(field.name(), column, updater.dataset())?;
+                for batch in &batches {
+                    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+                        HashJoiner::check_lance_support_null(
+                            field.name(),
+                            column,
+                            updater.dataset(),
+                        )?;
+                    }
                 }
 
-                updater.update(new_batch).await?;
+                // Concatenating these could overflow 32-bit offsets once they hold
+                // more than 2 GiB of variable-width values.
+                updater.update_batches(batches).await?;
             }
             updater.finish().await
         }
@@ -963,15 +968,20 @@ pub(super) async fn alter_columns(
         let affected: Vec<&lance_table::format::IndexMetadata> = indices
             .iter()
             .filter(|idx| {
+                let dependency_fields = idx.dependency_fields();
                 cast_fields
                     .iter()
-                    .any(|(old, _)| idx.fields.contains(&old.id))
+                    .any(|(old, _)| dependency_fields.contains(&old.id))
             })
             .collect();
         if !affected.is_empty() {
             let affected_cols: Vec<String> = cast_fields
                 .iter()
-                .filter(|(old, _)| affected.iter().any(|i| i.fields.contains(&old.id)))
+                .filter(|(old, _)| {
+                    affected
+                        .iter()
+                        .any(|i| i.dependency_fields().contains(&old.id))
+                })
                 .map(|(old, _)| old.name.clone())
                 .collect();
             let affected_idx_names: Vec<String> = affected.iter().map(|i| i.name.clone()).collect();
@@ -1315,6 +1325,9 @@ mod test {
     use std::{collections::HashMap, fs, num::NonZero, path::Path as StdPath, sync::Mutex};
 
     use crate::index::DatasetIndexExt;
+    use crate::session::index_caches::IndexMetadataKey;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use arrow_array::types::Int32Type;
 
     /// What the `add_columns` guard refuses, and what it lets through.
     ///
@@ -1719,6 +1732,7 @@ mod test {
     }
 
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
+    use arrow_array::builder::BinaryBuilder;
     use arrow_array::cast::AsArray;
     use arrow_array::{
         ArrayRef, BinaryArray, Int32Array, Int64Array, LargeStringArray, ListArray,
@@ -1736,6 +1750,109 @@ mod test {
     // Used to validate that futures returned are Send.
     fn require_send<T: Send>(t: T) -> T {
         t
+    }
+
+    #[rstest]
+    #[case::row_id("_rowid")]
+    #[case::row_address("_rowaddr")]
+    #[case::row_offset("_rowoffset")]
+    #[case::created_version("_row_created_at_version")]
+    #[case::updated_version("_row_last_updated_at_version")]
+    #[tokio::test]
+    async fn schema_changes_reject_reserved_column_names(#[case] name: &str) -> Result<()> {
+        let batch = arrow_array::record_batch!(("id", Int32, [Some(1), None]))?;
+        let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await?;
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let version = dataset.version().version;
+        let error = dataset
+            .alter_columns(&[ColumnAlteration::new("id".into()).rename(name.into())])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(&format!("path '{name}'")));
+        assert!(error.to_string().contains("reserved name"));
+
+        let output_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            name,
+            DataType::Int32,
+            true,
+        )]));
+        let output = RecordBatch::try_new(output_schema.clone(), vec![batch["id"].clone()])?;
+        let transforms = [
+            NewColumnTransform::SqlExpressions(vec![(name.into(), "id + 1".into())]),
+            NewColumnTransform::AllNulls(output_schema.clone()),
+            NewColumnTransform::Stream(
+                RecordBatchIterator::new([Ok(output.clone())], output_schema.clone()).into_stream(),
+            ),
+            NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                [Ok(output)],
+                output_schema.clone(),
+            ))),
+            NewColumnTransform::BatchUDF(BatchUDF {
+                mapper: Box::new(|_| {
+                    panic!("reserved names must be rejected before running the UDF")
+                }),
+                output_schema,
+                result_checkpoint: None,
+            }),
+        ];
+        for transform in transforms {
+            let error = dataset
+                .add_columns(transform, None, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains(&format!("path '{name}'")));
+            assert!(error.to_string().contains("reserved name"));
+            assert_eq!(dataset.version().version, version);
+        }
+        let actual = dataset.scan().with_row_id().try_into_batch().await?;
+        assert_eq!(actual["id"].as_ref(), batch["id"].as_ref());
+        assert!(actual.column_by_name("_rowid").is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn schema_changes_allow_nested_system_column_names() -> Result<()> {
+        let batch = arrow_array::record_batch!(("id", Int32, [1, 2]))?;
+        let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(reader, "memory://", None).await?;
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "nested",
+                    DataType::Struct(vec![ArrowField::new("_rowid", DataType::Int32, true)].into()),
+                    true,
+                )]))),
+                None,
+                None,
+            )
+            .await?;
+        dataset
+            .alter_columns(&[
+                ColumnAlteration::new("nested._rowid".into()).rename("_rowaddr".into())
+            ])
+            .await?;
+        assert!(dataset.schema().field("nested._rowaddr").is_some());
+        assert_eq!(
+            dataset
+                .scan()
+                .with_row_id()
+                .try_into_batch()
+                .await?
+                .num_rows(),
+            2
+        );
+        Ok(())
     }
 
     fn file_paths_in(dir: impl AsRef<StdPath>) -> Vec<String> {
@@ -2798,6 +2915,179 @@ mod test {
             "expected the add_blanks rejection, got: {err}"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_columns_stream_batches_preserve_deleted_row_alignment() -> Result<()> {
+        let source_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let source_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..12))],
+        )?;
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(source_batch)], source_schema),
+            "memory://stream-batch-deletion-alignment",
+            Some(WriteParams {
+                max_rows_per_file: 6,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        // This leaves a fully deleted read batch [4..6), as well as deleted
+        // rows at the boundary of the neighboring read batches.
+        dataset.delete("i >= 2 AND i < 10").await?;
+
+        let output_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("binary", DataType::Binary, true),
+            ArrowField::new("string", DataType::Utf8, true),
+            ArrowField::new("fixed", DataType::Int32, true),
+        ]));
+        let output_batch = RecordBatch::try_new(
+            output_schema.clone(),
+            vec![
+                Arc::new(BinaryArray::from(vec![
+                    Some(b"b0".as_ref()),
+                    Some(b"b1".as_ref()),
+                    Some(b"b10".as_ref()),
+                    Some(b"b11".as_ref()),
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("s0"),
+                    None,
+                    Some("s10"),
+                    Some("s11"),
+                ])),
+                Arc::new(Int32Array::from(
+                    [0, 1, 10, 11]
+                        .into_iter()
+                        .map(|value| Some(value * 10))
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )?;
+
+        let reader = RecordBatchIterator::new(
+            vec![
+                Ok(output_batch.slice(0, 1)),
+                Ok(output_batch.slice(1, 0)),
+                Ok(output_batch.slice(1, 2)),
+                Ok(output_batch.slice(3, 1)),
+            ],
+            output_schema.clone(),
+        );
+        dataset
+            .add_columns(NewColumnTransform::Reader(Box::new(reader)), None, Some(4))
+            .await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        assert_eq!(data.num_rows(), 4);
+        let expected_binary = BinaryArray::from(vec![
+            Some(b"b0".as_ref()),
+            Some(b"b1".as_ref()),
+            Some(b"b10".as_ref()),
+            Some(b"b11".as_ref()),
+        ]);
+        let expected_string = StringArray::from(vec![Some("s0"), None, Some("s10"), Some("s11")]);
+        let expected_fixed = Int32Array::from(vec![Some(0), Some(10), Some(100), Some(110)]);
+        assert_eq!(
+            data.column_by_name("binary").unwrap().as_ref(),
+            &expected_binary
+        );
+        assert_eq!(
+            data.column_by_name("string").unwrap().as_ref(),
+            &expected_string
+        );
+        assert_eq!(
+            data.column_by_name("fixed").unwrap().as_ref(),
+            &expected_fixed
+        );
+        Ok(())
+    }
+
+    #[ignore = "requires ~5 GiB RAM; run manually"]
+    #[tokio::test]
+    async fn test_add_columns_binary_column_over_2gib() -> Result<()> {
+        const NUM_ROWS: usize = 1_100;
+        const VALUE_SIZE: usize = 2 * 1024 * 1024;
+        const STREAM_BATCH_SIZE: usize = 10;
+
+        let source_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let source_batch = RecordBatch::try_new(
+            source_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..NUM_ROWS as i32))],
+        )?;
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(source_batch)], source_schema),
+            "memory://add-columns-over-2gib",
+            Some(WriteParams {
+                max_rows_per_file: NUM_ROWS + 1,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let output_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "payload",
+            DataType::Binary,
+            false,
+        )]));
+        let mut output_batches = Vec::with_capacity(NUM_ROWS / STREAM_BATCH_SIZE);
+        for start in (0..NUM_ROWS).step_by(STREAM_BATCH_SIZE) {
+            let end = (start + STREAM_BATCH_SIZE).min(NUM_ROWS);
+            let mut builder = BinaryBuilder::with_capacity(end - start, (end - start) * VALUE_SIZE);
+            for row in start..end {
+                let mut value = vec![0; VALUE_SIZE];
+                value[0] = (row % 251) as u8;
+                builder.append_value(value);
+            }
+            output_batches.push(Ok(RecordBatch::try_new(
+                output_schema.clone(),
+                vec![Arc::new(builder.finish())],
+            )?));
+        }
+
+        dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    output_batches,
+                    output_schema,
+                ))),
+                None,
+                Some(NUM_ROWS as u32),
+            )
+            .await?;
+        dataset.validate().await?;
+
+        let mut scanner = dataset.scan();
+        scanner.batch_size(STREAM_BATCH_SIZE);
+        let mut stream = scanner.try_into_stream().await?;
+        let mut rows_seen = 0;
+        while let Some(batch) = stream.try_next().await? {
+            let payload = batch
+                .column_by_name("payload")
+                .ok_or_else(|| Error::internal("payload column missing from scan"))?
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| Error::internal("payload column has unexpected type"))?;
+            for row in 0..payload.len() {
+                assert_eq!(payload.value(row).len(), VALUE_SIZE);
+                assert_eq!(payload.value(row)[0], ((rows_seen + row) % 251) as u8);
+            }
+            rows_seen += payload.len();
+        }
+        assert_eq!(rows_seen, NUM_ROWS);
         Ok(())
     }
 
@@ -5568,6 +5858,67 @@ mod test {
         );
 
         Ok(())
+    }
+
+    /// The index goes into the session's index cache because decode and
+    /// commit reject a `fields` that omits a carried column.
+    #[rstest]
+    #[case::suffix(&["key", "carried"])]
+    #[case::keys_only(&["key"])]
+    #[tokio::test]
+    async fn test_alter_columns_cast_fails_with_covering_index(#[case] fields: &[&str]) {
+        for (column, refused) in [("key", true), ("carried", true), ("other", false)] {
+            let dataset = lance_datagen::gen_batch()
+                .col("key", lance_datagen::array::step::<Int32Type>())
+                .col("carried", lance_datagen::array::step::<Int32Type>())
+                .col("other", lance_datagen::array::step::<Int32Type>())
+                .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(4))
+                .await
+                .unwrap();
+            let field_id = |name: &str| dataset.schema().field_id(name).unwrap();
+            let covered = lance_table::format::IndexMetadata {
+                uuid: uuid::Uuid::new_v4(),
+                name: "covered".to_string(),
+                fields: fields.iter().map(|name| field_id(name)).collect(),
+                covering_fields: vec![field_id("carried")],
+                dataset_version: dataset.manifest.version,
+                fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
+                index_details: None,
+                index_version: 0,
+                created_at: None,
+                base_id: None,
+                files: None,
+                clustering_id: None,
+                metadata: Default::default(),
+            };
+            let metadata_key = IndexMetadataKey {
+                version: dataset.manifest.version,
+                store_identity: &dataset.object_store.store_prefix,
+                e_tag: dataset.manifest_location.e_tag.as_deref(),
+            };
+            dataset
+                .index_cache
+                .insert_with_key(&metadata_key, Arc::new(vec![covered]))
+                .await;
+
+            let mut dataset = dataset;
+            let error = dataset
+                .alter_columns(&[ColumnAlteration::new(column.into()).cast_to(DataType::Int64)])
+                .await
+                .err()
+                .map(|err| err.to_string());
+            if refused {
+                let names_both = error.as_ref().is_some_and(|msg| {
+                    msg.contains(&format!("[{column}]")) && msg.contains("[covered]")
+                });
+                assert!(
+                    names_both,
+                    "fields {fields:?}: casting {column} should name it and the index, got {error:?}"
+                );
+            } else {
+                assert_eq!(error, None, "fields {fields:?}: casting {column}");
+            }
+        }
     }
 
     #[test]

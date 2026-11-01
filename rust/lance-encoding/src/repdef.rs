@@ -1608,7 +1608,7 @@ pub struct RepDefUnraveler {
     // Current layer index, 0 means inner-most layer and it counts up from there.  Used to index
     // into special_defs
     current_layer: usize,
-    // Number of items in the inner-most layer (needed if the definition levels are not present)
+    // Number of items in the current layer (needed if the definition levels are not present)
     num_items: u64,
 }
 
@@ -1777,6 +1777,7 @@ impl RepDefUnraveler {
         // Or, to think about it another way, if every unraveler adds the starting 0 and the trailing
         // length then we have N + unravelers.len() values instead of N + 1.
         offsets.pop();
+        let offsets_len_before = offsets.len();
 
         let to_offset = |val: usize| {
             T::from_usize(val)
@@ -1836,6 +1837,8 @@ impl RepDefUnraveler {
                     read_idx += 1;
                 }
             }
+            // The layer above sees one item per list, not one per leaf value
+            self.num_items = (offsets.len() - offsets_len_before) as u64;
             offsets.push(to_offset(curlen)?);
             rep_levels.truncate(write_idx);
             def_levels.truncate(write_idx);
@@ -1860,6 +1863,7 @@ impl RepDefUnraveler {
                 }
             }
             let num_new_lists = offsets.len() - old_offsets_len;
+            self.num_items = num_new_lists as u64;
             offsets.push(to_offset(curlen)?);
             // Truncate to the number of lists THIS unraveler produced (write_idx),
             // not `offsets.len() - 1` — the latter includes offsets contributed by
@@ -1901,6 +1905,21 @@ impl RepDefUnraveler {
 
         let current_def_cmp = self.current_def_cmp;
         self.current_def_cmp += 1;
+
+        // If every level present is visible at this layer (always the case without lists) then
+        // each level yields one validity bit and we can build them in bulk.  Slicing up to the
+        // max def level keeps the out-of-range panic of the per-level lookup below.
+        let max_def = def_levels.iter().copied().max().unwrap_or(0);
+        let current_rep_cmp = self.current_rep_cmp;
+        if self.levels_to_rep[..=max_def as usize]
+            .iter()
+            .all(|&rep| rep <= current_rep_cmp)
+        {
+            validity.append_buffer(&BooleanBuffer::collect_bool(def_levels.len(), |i| {
+                def_levels[i] <= current_def_cmp
+            }));
+            return Ok(());
+        }
 
         for is_valid in def_levels.iter().filter_map(|&level| {
             if self.levels_to_rep[level as usize] <= self.current_rep_cmp {
@@ -1949,6 +1968,7 @@ impl RepDefUnraveler {
                 "Reading a column that combines a fixed-size-list with a list-like layer is not yet supported: the fixed-size-list layer cannot decimate repetition levels",
             ));
         }
+        self.num_items /= dimension as u64;
         let Some(def_levels) = self.def_levels.as_mut() else {
             return Ok(());
         };
@@ -2303,7 +2323,11 @@ impl NilaryControlWordIterator {
 
 /// Helper function to get a bit mask of the given width
 fn get_mask(width: u16) -> u16 {
-    (1 << width) - 1
+    if width >= u16::BITS as u16 {
+        u16::MAX
+    } else {
+        (1 << width) - 1
+    }
 }
 
 // We're really going out of our way to avoid boxing here but this will be called on a per-value basis
@@ -2851,8 +2875,8 @@ mod tests {
         SparseValiditySet,
     };
     use crate::repdef::{
-        CompositeRepDefUnraveler, DefinitionInterpretation, RepDefUnraveler, SerializedRepDefs,
-        max_visible_level,
+        CompositeRepDefUnraveler, ControlWordParser, DefinitionInterpretation, RepDefUnraveler,
+        SerializedRepDefs, max_visible_level,
     };
 
     use super::RepDefBuilder;
@@ -2885,6 +2909,16 @@ mod tests {
         #[case] expected: u16,
     ) {
         assert_eq!(max_visible_level(def_meaning), expected);
+    }
+
+    #[test]
+    fn control_word_parser_handles_16_bit_levels() {
+        let parser = ControlWordParser::new(16, 16);
+        let mut rep = Vec::new();
+        let mut def = Vec::new();
+        parser.parse(&[0xff; 4], &mut rep, &mut def);
+        assert_eq!(rep, vec![u16::MAX]);
+        assert_eq!(def, vec![u16::MAX]);
     }
 
     fn validity(values: &[bool]) -> NullBuffer {
@@ -4093,6 +4127,65 @@ mod tests {
             (
                 offsets_32(&[0, 2, 2, 2, 4]),
                 Some(validity(&[true, true, false, true]))
+            )
+        );
+    }
+
+    #[test]
+    fn test_unravel_validity_unaligned_pages() {
+        // Pages whose lengths are not multiples of 64 append at unaligned bit offsets
+        let def1: Vec<u16> = (0..70).map(|i| (i % 3 == 0) as u16).collect();
+        let def2: Vec<u16> = (0..130).map(|i| (i % 5 == 0) as u16).collect();
+        let expected = def1
+            .iter()
+            .chain(def2.iter())
+            .map(|&level| level == 0)
+            .collect::<Vec<_>>();
+
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![
+            RepDefUnraveler::new(
+                None,
+                Some(def1),
+                vec![DefinitionInterpretation::NullableItem].into(),
+                70,
+            ),
+            RepDefUnraveler::new(
+                None,
+                Some(def2),
+                vec![DefinitionInterpretation::NullableItem].into(),
+                130,
+            ),
+        ]);
+
+        assert_eq!(
+            unraveler.unravel_validity(200).unwrap(),
+            Some(validity(&expected))
+        );
+    }
+
+    #[test]
+    fn test_unravel_validity_list_page_without_null_lists() {
+        // No null or empty lists, so every level is visible at the item layer
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            Some(vec![1, 0, 1, 1, 0]),
+            Some(vec![0, 1, 0, 1, 0]),
+            vec![
+                DefinitionInterpretation::NullableItem,
+                DefinitionInterpretation::NullableList,
+            ]
+            .into(),
+            5,
+        )]);
+
+        assert_eq!(
+            unraveler.unravel_validity(5).unwrap(),
+            Some(validity(&[true, false, true, false, true]))
+        );
+        assert_eq!(
+            unraveler.unravel_offsets::<i32>().unwrap(),
+            (
+                offsets_32(&[0, 2, 3, 5]),
+                Some(validity(&[true, true, true]))
             )
         );
     }

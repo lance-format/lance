@@ -115,6 +115,10 @@ impl Writer {
         self.encoding.write_batch(batch, &mut self.sink).await
     }
 
+    pub fn prepare_for_flush(&mut self) {
+        self.encoding.prepare_for_flush();
+    }
+
     /// Write one top-level field, advancing only that field's row count.
     pub async fn write_column(&mut self, column_index: usize, array: ArrayRef) -> Result<()> {
         self.encoding

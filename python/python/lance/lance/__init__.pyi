@@ -444,6 +444,7 @@ class _Dataset:
         late_materialization: Optional[bool | List[str]] = None,
         blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[List[str]] = None,
         include_deleted_rows: Optional[bool] = None,
         scan_stats_callback: Optional[Callable[[Any], None]] = None,
         strict_batch_size: Optional[bool] = None,
@@ -554,6 +555,8 @@ class _Dataset:
         delete_rate_limit: Optional[int] = None,
         versions: Optional[List[int]] = None,
         delete_concurrency: Optional[int] = None,
+        keep_one_micros: Optional[Tuple[int, int]] = None,
+        policy_json: Optional[str] = None,
     ) -> CleanupStats: ...
     def explain_cleanup_old_versions(
         self,
@@ -565,9 +568,12 @@ class _Dataset:
         versions: Optional[List[int]] = None,
         include_files: bool = False,
         max_files: int = 1000,
+        keep_one_micros: Optional[Tuple[int, int]] = None,
+        policy_json: Optional[str] = None,
     ) -> CleanupExplanation: ...
     def get_version(self, tag: str) -> int: ...
     # Tag operations
+    def get_tag(self, tag: str) -> Tag: ...
     def tags(self) -> Dict[str, Tag]: ...
     def tags_ordered(self, order: Optional[str]) -> List[Tuple[str, Tag]]: ...
     def create_tag(
@@ -797,6 +803,7 @@ class _Fragment:
         blob_handling: Optional[str] = None,
         order_by: Optional[List[Any]] = None,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[List[str]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         include_deleted_rows: Optional[bool] = None,
@@ -930,6 +937,7 @@ class _LsmScanner:
     def with_memtable_gen(self) -> Self: ...
     def to_batch(self) -> pa.RecordBatch: ...
     def to_batches(self) -> List[pa.RecordBatch]: ...
+    def to_reader(self) -> pa.RecordBatchReader: ...
     def count_rows(self) -> int: ...
 
 class _ExecutionPlan:

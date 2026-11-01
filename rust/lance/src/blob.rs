@@ -50,6 +50,7 @@ use lance_io::{
 use object_store::path::Path;
 use tokio::io::AsyncWriteExt;
 
+use crate::dataset::BLOBS_DIR;
 use crate::{Error, Result};
 
 /// Construct the Arrow field for a blob v2 column.
@@ -154,7 +155,7 @@ pub(crate) fn with_field_ids_of(prepared: Field, source: &Field) -> Result<Field
     ))
 }
 
-fn logical_to_prepared_blob_field(field: &Field) -> Result<Field> {
+pub(crate) fn logical_to_prepared_blob_field(field: &Field) -> Result<Field> {
     if field.is_blob_v2() {
         return match blob_v2_layout(field) {
             Some(BlobV2Layout::Logical) | Some(BlobV2Layout::Prepared) => with_field_ids_of(
@@ -1066,7 +1067,7 @@ impl ManagedBlobLocation {
     pub(crate) fn new(base_id: Option<u32>) -> Self {
         Self {
             base_id,
-            relative_path: Path::from("_blobs").join(format!("{}.blob", uuid::Uuid::new_v4())),
+            relative_path: Path::from(BLOBS_DIR).join(format!("{}.blob", uuid::Uuid::new_v4())),
         }
     }
 

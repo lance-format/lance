@@ -27,7 +27,7 @@ use crate::{
         ALP_META_KEY, BSS_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY,
         RLE_THRESHOLD_META_KEY,
     },
-    data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock},
+    data::{DataBlock, FixedSizeListBlock, FixedWidthDataBlock, VariableWidthBlock},
     encodings::{
         logical::primitive::{
             fullzip::PerValueCompressor,
@@ -67,8 +67,8 @@ use crate::{
             range::RangeDecompressor,
             rle::{
                 BlockRleDecompressor, BlockRleRunCount, RleChildDecompressor, RleDecompressor,
-                RleEncoder, RunLengthWidth, rle_encoded_size, select_miniblock_run_length_width,
-                select_run_length_width,
+                RleEncoder, RunLengthWidth, rle_encoded_size, rle_encoded_size_from_entries,
+                select_miniblock_run_length_width, select_run_length_width,
             },
             value::{ValueDecompressor, ValueEncoder},
         },
@@ -238,6 +238,13 @@ fn rle_is_applicable(data: &FixedWidthDataBlock, params: &CompressionFieldParams
     Some((data.num_values as u128) * (type_size as u128))
 }
 
+/// Every run yields at least one RLE entry, and every entry stores one value and
+/// at least one length byte, so `RunCount` bounds the RLE payload from below.
+fn rle_payload_lower_bound(data: &FixedWidthDataBlock) -> u128 {
+    let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
+    rle_encoded_size_from_entries(run_count, data.bits_per_value, RunLengthWidth::U8)
+}
+
 fn rle_beats_raw_and_bitpacking(
     data: &FixedWidthDataBlock,
     encoded_bytes: u128,
@@ -263,6 +270,10 @@ fn try_fixed_u8_rle_for_mini_block(
     params: &CompressionFieldParams,
 ) -> Option<Box<dyn MiniBlockCompressor>> {
     let raw_bytes = rle_is_applicable(data, params)?;
+    // Skip the value scan when even the lower bound cannot win.
+    if !rle_beats_raw_and_bitpacking(data, rle_payload_lower_bound(data), raw_bytes) {
+        return None;
+    }
     let rle_bytes = estimate_rle_size_for_width_from_data(
         data,
         Some(*MAX_MINIBLOCK_VALUES),
@@ -326,8 +337,7 @@ fn rle_child_compression_config(params: &CompressionFieldParams) -> Option<Compr
 fn try_rle_for_block_with_width(
     data: &FixedWidthDataBlock,
     params: &CompressionFieldParams,
-    run_length_width: RunLengthWidth,
-    rle_payload_bytes: u128,
+    estimate: impl FnOnce() -> Result<(RunLengthWidth, u128)>,
 ) -> Result<Option<Box<dyn BlockCompressor>>> {
     let bits = data.bits_per_value;
     if !matches!(bits, 8 | 16 | 32 | 64) {
@@ -349,19 +359,22 @@ fn try_rle_for_block_with_width(
     }
 
     let raw_bytes = (data.num_values as u128) * ((bits / 8) as u128);
-    let rle_bytes = rle_payload_bytes.saturating_add(RLE_BLOCK_HEADER_BYTES);
+    #[cfg(feature = "bitpacking")]
+    let bitpack_bytes = estimate_block_bitpacking_bytes(data);
+    #[cfg(not(feature = "bitpacking"))]
+    let bitpack_bytes = None::<u128>;
+    let beats = |payload_bytes: u128| {
+        let rle_bytes = payload_bytes.saturating_add(RLE_BLOCK_HEADER_BYTES);
+        rle_bytes < raw_bytes && !bitpack_bytes.is_some_and(|bytes| bytes < rle_bytes)
+    };
 
-    if rle_bytes >= raw_bytes {
+    // Skip the value scan when even the lower bound cannot win.
+    if !beats(rle_payload_lower_bound(data)) {
         return Ok(None);
     }
-
-    #[cfg(feature = "bitpacking")]
-    {
-        if let Some(bitpack_bytes) = estimate_block_bitpacking_bytes(data)
-            && bitpack_bytes < rle_bytes
-        {
-            return Ok(None);
-        }
+    let (run_length_width, rle_payload_bytes) = estimate()?;
+    if !beats(rle_payload_bytes) {
+        return Ok(None);
     }
 
     Ok(Some(Box::new(RleEncoder::with_run_length_width(
@@ -376,8 +389,10 @@ fn try_fixed_u8_rle_for_block(
     if !matches!(data.bits_per_value, 8 | 16 | 32 | 64) {
         return Ok(None);
     }
-    let encoded_bytes = estimate_rle_size_for_width_from_data(data, None, RunLengthWidth::U8)?;
-    try_rle_for_block_with_width(data, params, RunLengthWidth::U8, encoded_bytes)
+    try_rle_for_block_with_width(data, params, || {
+        let bytes = estimate_rle_size_for_width_from_data(data, None, RunLengthWidth::U8)?;
+        Ok((RunLengthWidth::U8, bytes))
+    })
 }
 
 fn try_variable_rle_for_block(
@@ -387,8 +402,9 @@ fn try_variable_rle_for_block(
     if !matches!(data.bits_per_value, 8 | 16 | 32 | 64) {
         return Ok(None);
     }
-    let (width, encoded_bytes) = estimate_rle_width_and_size_from_data(data, None)?;
-    try_rle_for_block_with_width(data, params, width, encoded_bytes)
+    try_rle_for_block_with_width(data, params, || {
+        estimate_rle_width_and_size_from_data(data, None)
+    })
 }
 
 fn estimate_rle_width_and_size_from_data(
@@ -826,15 +842,34 @@ pub fn try_fixed_packed_struct_miniblock(
     )))
 }
 
+/// The value encoder can store fixed-size lists only when every layer wraps
+/// fixed-width values or an all-null leaf.
+fn fixed_size_list_can_use_value_encoder(fsl: &FixedSizeListBlock) -> bool {
+    let mut child = fsl.child.as_ref();
+    loop {
+        child = match child {
+            DataBlock::FixedSizeList(inner) => inner.child.as_ref(),
+            DataBlock::Nullable(inner) => inner.data.as_ref(),
+            DataBlock::FixedWidth(_) | DataBlock::AllNull(_) => return true,
+            _ => return false,
+        };
+    }
+}
+
 /// Store fixed-size-list miniblocks without a value codec.
 pub fn try_raw_fixed_size_list_miniblock(data: &DataBlock) -> Option<Box<dyn MiniBlockCompressor>> {
-    matches!(data, DataBlock::FixedSizeList(_)).then(|| Box::new(ValueEncoder::default()) as _)
+    matches!(data, DataBlock::FixedSizeList(fsl) if fixed_size_list_can_use_value_encoder(fsl))
+        .then(|| Box::new(ValueEncoder::default()) as _)
 }
 
 /// Store fixed-width and fixed-size-list values directly in full-zip pages.
 pub fn try_raw_per_value(data: &DataBlock) -> Option<Box<dyn PerValueCompressor>> {
-    matches!(data, DataBlock::FixedWidth(_) | DataBlock::FixedSizeList(_))
-        .then(|| Box::new(ValueEncoder::default()) as _)
+    let raw = match data {
+        DataBlock::FixedWidth(_) => true,
+        DataBlock::FixedSizeList(fsl) => fixed_size_list_can_use_value_encoder(fsl),
+        _ => false,
+    };
+    raw.then(|| Box::new(ValueEncoder::default()) as _)
 }
 
 fn validate_packed_struct(field: &Field, data: &DataBlock) -> Result<Option<bool>> {
@@ -942,6 +977,18 @@ pub fn try_variable_width_per_value(
         let requested_scheme = match (general_compression, compression) {
             (_, None | Some("fsst")) => None,
             (PerValueGeneralCompression::ZstdOnly, Some(compression)) => {
+                if compression != "zstd" {
+                    // Released 2.1/2.2 readers cannot decode nullable lz4 full-zip pages.
+                    // This runs once per page, so warn once per process.
+                    static WARNED: std::sync::Once = std::sync::Once::new();
+                    WARNED.call_once(|| {
+                        log::warn!(
+                            "field '{}': per-value compression honors only zstd in this file version, ignoring requested '{}'",
+                            field.name,
+                            compression
+                        )
+                    });
+                }
                 (compression == "zstd").then_some(CompressionScheme::Zstd)
             }
             (PerValueGeneralCompression::Any, Some(compression)) => Some(compression.parse()?),
@@ -1073,6 +1120,35 @@ pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decoded_size_bytes(&self, _num_values: u64) -> Option<u64> {
         None
     }
+
+    /// Returns an exact count or conservative upper bound on the decoded byte count
+    /// for `num_rows` values in this chunk starting at `offset_in_chunk`, without
+    /// decompressing the values.
+    ///
+    /// `chunk_buffers` is the raw buffer data for this chunk (as stored in the file).
+    /// `offset_in_chunk` is the number of rows already consumed from the start of the chunk.
+    ///
+    /// The default implementation returns `None`, indicating no reliable bound is
+    /// available without decompression. Implementations for variable-width types
+    /// (e.g. binary) should override this to read the offset table from
+    /// `chunk_buffers` directly.
+    ///
+    /// # Known gaps (byte-budget planning accuracy)
+    ///
+    /// The following mini-block decoders currently return `None`, causing the byte budget
+    /// to fall back to schema-based estimates:
+    ///
+    /// - **`PackedStructFixedWidthMiniBlockDecompressor`**: all child fields are
+    ///   fixed-width so the total decoded size is the sum of `bits_per_values` × rows,
+    ///   but this is not yet wired through `decoded_bytes_from_chunk`.
+    fn decoded_bytes_from_chunk(
+        &self,
+        _chunk_buffers: &[crate::buffer::LanceBuffer],
+        _offset_in_chunk: u64,
+        _num_rows: u64,
+    ) -> Option<u64> {
+        None
+    }
 }
 
 pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
@@ -1097,6 +1173,37 @@ pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
 pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
     /// Decompress one or more values
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock>;
+
+    /// Returns an exact count or conservative upper bound on the total decompressed
+    /// size for a slice of `num_values` compressed values.
+    ///
+    /// `data` is the raw byte buffer covering exactly those values (pre-rebased).
+    /// `offsets_bytes` is the corresponding slice of the offsets buffer
+    /// (`offset_starts[start]..offset_starts[end] + bytes_per_offset`), and
+    /// `bits_per_offset` is either 32 or 64.
+    ///
+    /// The offsets let implementations iterate per-value frames to read embedded
+    /// size headers (LZ4, Zstd), or apply a fixed multiplier (FSST, plain).
+    ///
+    /// Returns `None` when no exact count or reliable upper bound is available.
+    ///
+    /// # Known gaps (byte-budget planning accuracy)
+    ///
+    /// The following cases currently return `None`:
+    ///
+    /// - **`PackedStructVariablePerValueDecompressor`** (full-zip path): packed struct
+    ///   layout is a column-to-row transformation rather than compression, so the
+    ///   decompressed size equals the sum of per-field decoded sizes.  We do not yet
+    ///   walk the field descriptors to compute this; the decompressor currently
+    ///   returns `None`.
+    fn decompressed_size(
+        &self,
+        _data: &[u8],
+        _offsets_bytes: &[u8],
+        _bits_per_offset: u8,
+    ) -> Option<u64> {
+        None
+    }
 }
 
 pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
