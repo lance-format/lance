@@ -116,15 +116,20 @@ fn bench_distance(c: &mut Criterion) {
         for &dim in &[128, 256, 512, 1024] {
             let num_vectors = 1024 * 1024 / dim; // ~1M elements total
             let mut rng = rand::rng();
-            let key_u8: Vec<u8> = (0..dim).map(|_| rng.random()).collect();
-            let target_u8: Vec<u8> = (0..num_vectors * dim).map(|_| rng.random()).collect();
+            // Slice 64-byte-aligned views out of padded buffers: zmm loads split cache
+            // lines on misaligned inputs, so results depended on heap placement.
+            let key_buf: Vec<u8> = (0..dim + 63).map(|_| rng.random()).collect();
+            let key_u8 = &key_buf[key_buf.as_ptr().align_offset(64)..][..dim];
+            let target_buf: Vec<u8> = (0..num_vectors * dim + 63).map(|_| rng.random()).collect();
+            let target_u8 =
+                &target_buf[target_buf.as_ptr().align_offset(64)..][..num_vectors * dim];
 
             c.bench_function(&format!("Dot(u8, scalar, dim={dim})"), |b| {
                 b.iter(|| {
                     black_box(
                         target_u8
                             .chunks(dim)
-                            .map(|y| dot_u8_scalar(key_u8.as_slice(), y))
+                            .map(|y| dot_u8_scalar(key_u8, y))
                             .collect::<Vec<_>>(),
                     )
                 });
@@ -135,7 +140,7 @@ fn bench_distance(c: &mut Criterion) {
                     black_box(
                         target_u8
                             .chunks(dim)
-                            .map(|y| dot_u8(key_u8.as_slice(), y))
+                            .map(|y| dot_u8(key_u8, y))
                             .collect::<Vec<_>>(),
                     )
                 });

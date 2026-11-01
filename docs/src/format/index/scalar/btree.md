@@ -46,6 +46,19 @@ The BTree index consists of two files:
 | `values` | {DataType} | true     | Sorted values from the indexed column (flat file) |
 | `ids`    | UInt64     | false    | Physical row address (`fragment_id << 32 \| offset`) corresponding to each value. A segment persisted before format version 1 (`IndexMetadata::index_version`) stores a row id here instead. |
 
+## Stable Row ID Reverse Lookup
+
+An ordinary BTree may index the logical `_rowid` column of a table, given the following rules:
+
+* Stable Row IDs **must** be enabled on the table.
+* `IndexMetadata.fields` **must** be a single field ID `-3`.
+* `_rowid` **must** be represented as a non-nullable `UInt64` field.
+* The index **must** use the address-domain format and be at least version 1.
+
+The logical field need not appear in the user schema. Its inline and spilled
+representations are defined in
+[Row ID and Lineage](../../table/row_id_lineage.md#inline-and-spilled-storage).
+
 ## Accelerated Queries
 
 The BTree index provides exact results for the following query types:

@@ -5,7 +5,7 @@ use arrow::array::{RecordBatch, RecordBatchIterator, StructArray};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::{DataType, Schema as ArrowSchema};
-use jni::objects::{JByteArray, JIntArray, JValue, JValueGen};
+use jni::objects::{JByteArray, JIntArray, JMap, JValue, JValueGen};
 use jni::{
     JNIEnv,
     objects::{JClass, JLongArray, JObject, JString},
@@ -34,7 +34,7 @@ use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::session::session_from_handle;
 use crate::traits::{FromJObjectWithEnv, IntoJava, JLance, export_vec, import_vec};
-use crate::utils::extract_storage_options;
+use crate::utils::{extract_storage_options, to_java_map, to_rust_map};
 use crate::{
     block_on,
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
@@ -762,10 +762,10 @@ const DATA_FILE_CONSTRUCTOR_SIG: &str =
     "(Ljava/lang/String;[I[IIILjava/lang/Long;Ljava/lang/Integer;)V";
 const DELETE_FILE_CLASS: &str = "org/lance/fragment/DeletionFile";
 const DELETE_FILE_CONSTRUCTOR_SIG: &str =
-    "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
+    "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;[B)V";
 const DELETE_FILE_TYPE_CLASS: &str = "org/lance/fragment/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "org/lance/FragmentMetadata";
-const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/VersionMeta;Ljava/util/List;)V";
+const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/VersionMeta;Ljava/util/List;Ljava/lang/Long;Ljava/util/Map;)V";
 const ROW_ID_META_CLASS: &str = "org/lance/fragment/RowIdMeta";
 const ROW_ID_META_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;)V";
 const VERSION_META_CLASS: &str = "org/lance/fragment/VersionMeta";
@@ -861,6 +861,10 @@ impl IntoJava for &DeletionFile {
         };
         let file_type = self.file_type.into_java(env)?;
         let base_id = convert_to_java_integer(env, self.base_id)?;
+        let inline = match &self.inline {
+            Some(bytes) => env.byte_array_from_slice(bytes)?.into(),
+            None => JObject::null(),
+        };
         Ok(env.new_object(
             DELETE_FILE_CLASS,
             DELETE_FILE_CONSTRUCTOR_SIG,
@@ -870,6 +874,7 @@ impl IntoJava for &DeletionFile {
                 JValueGen::Object(&num_deleted_rows),
                 JValueGen::Object(&file_type),
                 JValueGen::Object(&base_id),
+                JValueGen::Object(&inline),
             ],
         )?)
     }
@@ -925,6 +930,15 @@ impl IntoJava for &Fragment {
             Some(m) => m.into_java(env)?,
             None => JObject::null(),
         };
+        // A u32 id fits a Java long losslessly; `int` would fold the upper
+        // half of the range into negative values.
+        let clustering_id = match self.clustering_id {
+            Some(id) => {
+                env.new_object("java/lang/Long", "(J)V", &[JValueGen::Long(i64::from(id))])?
+            }
+            None => JObject::null(),
+        };
+        let metadata = to_java_map(env, &self.metadata)?;
 
         env.new_object(
             FRAGMENT_METADATA_CLASS,
@@ -938,6 +952,8 @@ impl IntoJava for &Fragment {
                 JValueGen::Object(&created_at),
                 JValueGen::Object(&last_updated_at),
                 JValueGen::Object(&referenced_data_files),
+                JValueGen::Object(&clustering_id),
+                JValueGen::Object(&metadata),
             ],
         )
         .map_err(|e| {
@@ -1021,8 +1037,47 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
             // Overlays are not exposed to Java yet, and the reverse conversion
             // does not export them, so this round-trip is overlay-free.
             overlays: vec![],
+            clustering_id: extract_clustering_id(env, self, "getClusteringId")?,
+            metadata: extract_metadata_map(env, self, "getMetadata")?,
         })
     }
+}
+
+/// Read a nullable `java.lang.Long` clustering id and check it fits the
+/// unsigned 32-bit id range of the format.
+pub(crate) fn extract_clustering_id(
+    env: &mut JNIEnv<'_>,
+    obj: &JObject<'_>,
+    method: &str,
+) -> Result<Option<u32>> {
+    let boxed = env
+        .call_method(obj, method, "()Ljava/lang/Long;", &[])?
+        .l()?;
+    if boxed.is_null() {
+        return Ok(None);
+    }
+    let value = env.call_method(&boxed, "longValue", "()J", &[])?.j()?;
+    u32::try_from(value).map(Some).map_err(|_| {
+        Error::input_error(format!(
+            "clustering id {value} is outside the unsigned 32-bit range"
+        ))
+    })
+}
+
+/// Read a non-null `java.util.Map<String, String>` of generic object metadata.
+pub(crate) fn extract_metadata_map(
+    env: &mut JNIEnv<'_>,
+    obj: &JObject<'_>,
+    method: &str,
+) -> Result<HashMap<String, String>> {
+    let map = env
+        .call_method(obj, method, "()Ljava/util/Map;", &[])?
+        .l()?;
+    if map.is_null() {
+        return Ok(HashMap::new());
+    }
+    let jmap = JMap::from_env(env, &map)?;
+    to_rust_map(env, &jmap)
 }
 
 impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
@@ -1044,12 +1099,19 @@ impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
             .l()?
             .extract_object(env)?;
         let base_id = get_base_id(env, self)?;
+        let inline = env.call_method(self, "getInline", "()[B", &[])?.l()?;
+        let inline = if inline.is_null() {
+            None
+        } else {
+            Some(env.convert_byte_array(JByteArray::from(inline))?.into())
+        };
         Ok(DeletionFile {
             read_version,
             id,
             num_deleted_rows,
             file_type,
             base_id,
+            inline,
         })
     }
 }
@@ -1101,6 +1163,7 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
             file_major_version,
             file_minor_version,
             file_size_bytes,
+            file_metadata_size_bytes: None,
             base_id,
         })
     }

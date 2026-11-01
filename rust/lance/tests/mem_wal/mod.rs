@@ -1,20 +1,113 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! End-to-end MemWAL tests through the public [`ShardWriter`] surface, as
+//! End-to-end MemWAL tests through the public dataset and [`ShardWriter`] APIs, as
 //! opposed to the lib-level unit tests that can reach internals directly.
 
-use std::time::Duration;
+use std::{cell::RefCell, time::Duration};
 
 use arrow_array::cast::AsArray;
-use arrow_array::record_batch;
 use arrow_array::types::Int32Type;
-use lance::dataset::mem_wal::{ShardWriter, ShardWriterConfig};
+use arrow_array::{RecordBatchIterator, record_batch};
+use lance::Dataset;
+use lance::dataset::WriteParams;
+use lance::dataset::mem_wal::{DatasetMemWalExt, ShardWriter, ShardWriterConfig};
+use lance::index::DatasetIndexExt;
 use lance_core::FenceReason;
+use lance_index::IndexType;
+use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
+use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
 use lance_io::object_store::ObjectStore;
 use uuid::Uuid;
 
 mod future_depth;
+
+#[tokio::test(flavor = "current_thread")]
+async fn full_text_search_after_initialize_mem_wal_does_not_log_errors() {
+    // Keep capture on this test's runtime thread so parallel tests cannot contribute logs.
+    thread_local! {
+        static INDEX_ERRORS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+    struct IndexErrorLogger;
+    impl log::Log for IndexErrorLogger {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.target() == "lance::index" && metadata.level() == log::Level::Error
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                INDEX_ERRORS.with_borrow_mut(|errors| errors.push(record.args().to_string()));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+    log::set_logger(&IndexErrorLogger).unwrap();
+    log::set_max_level(log::LevelFilter::Error);
+
+    let batch = record_batch!(
+        ("id", Int32, [0, 1]),
+        (
+            "code",
+            Utf8,
+            ["def getUserName(): pass", "def getOrder(): pass"]
+        )
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+    let tmp = tempfile::tempdir().unwrap();
+    let uri = tmp.path().to_str().unwrap();
+    let mut dataset = Dataset::write(
+        reader,
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    dataset
+        .create_index(
+            &["code"],
+            IndexType::Inverted,
+            Some("code_idx".to_string()),
+            &InvertedIndexParams::code().split_identifiers(true),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .initialize_mem_wal()
+        .unsharded()
+        .maintained_indexes(["code_idx"])
+        .execute()
+        .await
+        .unwrap();
+
+    let dataset = Dataset::open(uri).await.unwrap();
+    let indices = dataset.load_indices().await.unwrap();
+    let mem_wal = indices
+        .iter()
+        .find(|index| index.name == MEM_WAL_INDEX_NAME)
+        .unwrap();
+    assert!(mem_wal.fields.is_empty());
+    INDEX_ERRORS.with_borrow_mut(Vec::clear);
+    for _ in 0..2 {
+        let result = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new("user".to_string()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result["id"].as_primitive::<Int32Type>().values(), &[0]);
+        INDEX_ERRORS.with_borrow(|errors| assert!(errors.is_empty(), "{errors:?}"));
+    }
+}
 
 fn durable_writer_config(shard_id: Uuid) -> ShardWriterConfig {
     ShardWriterConfig {

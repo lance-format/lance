@@ -28,6 +28,7 @@ fsst.workspace = true
 hex.workspace = true
 itertools.workspace = true
 log.workspace = true
+serde_json.workspace = true
 num-traits.workspace = true
 prost.workspace = true
 hyperloglogplus.workspace = true
@@ -37,7 +38,7 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 bytemuck.workspace = true
 byteorder.workspace = true
 lz4 = { version = "1", optional = true }
-zstd = { version = "0.13", optional = true }
+zstd = { version = "0.14", optional = true }
 
 [dev-dependencies]
 lance-datagen.workspace = true
@@ -79,6 +80,22 @@ harness = false
 
 [[bench]]
 name = "buffer"
+harness = false
+
+[[bench]]
+name = "take"
+harness = false
+
+[[bench]]
+name = "compression_levels"
+harness = false
+
+[[bench]]
+name = "scheme_comparison"
+harness = false
+
+[[bench]]
+name = "synthetic_distributions"
 harness = false
 
 [lints]
