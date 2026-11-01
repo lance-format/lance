@@ -664,6 +664,7 @@ impl TryFrom<&Transaction> for pb::Transaction {
                 schema_metadata_updates,
                 field_metadata_updates,
             } => pb::transaction::Operation::UpdateConfig(pb::transaction::UpdateConfig {
+                new_clustering_definitions: Vec::new(),
                 config_updates: config_updates
                     .as_ref()
                     .map(pb::transaction::UpdateMap::from),

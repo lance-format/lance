@@ -342,7 +342,9 @@ The Restore operation reverts the table to a previous version. It's generally as
 other operation. Here are the operations that conflict with Restore:
 
 - UpdateMemWalState
-- UpdateConfig (only if it updates schema or field metadata, which a restore rewinds)
+- UpdateConfig (only if it updates schema or field metadata, which a restore rewinds,
+  or allocates clustering definitions, whose ids were chosen against a mark the
+  restore replaces)
 
 ### ReserveFragments
 
@@ -424,6 +426,9 @@ are rebaseable conflicts with Update:
 ### UpdateConfig
 
 Modifies table configuration, table metadata, schema metadata, or field metadata without changing data.
+It can also allocate clustering definitions: each new definition
+carries the id the writer derived from `Manifest.max_clustering_id`, the commit verifies the ids are the
+next ones in order, appends the definitions and raises the mark in the same version as the metadata updates.
 
 <details>
 <summary>UpdateConfig protobuf message</summary>
@@ -440,8 +445,12 @@ An UpdateConfig operation only modifies table config and tends to be compatible 
 are the operations that conflict with UpdateConfig:
 
 - Overwrite
-- Restore (only if the UpdateConfig updates schema or field metadata)
-- UpdateConfig (only if the two operations modify the same config)
+- Restore (only if the UpdateConfig updates schema or field metadata, or allocates clustering definitions)
+- UpdateConfig (only if the two operations modify the same config, or both allocate clustering definitions)
+
+A conflict involving allocated clustering definitions is not retryable: the ids and any `table_metadata`
+keys that embed them were computed against a `max_clustering_id` that has since moved, so the writer must
+read the new mark and build a new transaction.
 
 ### DataReplacement
 
