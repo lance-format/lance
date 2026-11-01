@@ -86,9 +86,9 @@ pub const FLAG_SPILLED_ROW_LINEAGE: u64 = 1 << 11;
 /// Deprecated name for [`FLAG_SPILLED_ROW_LINEAGE`].
 #[deprecated(since = "14.0.0", note = "use FLAG_SPILLED_ROW_LINEAGE instead")]
 pub const FLAG_UNSTABLE_SPILLED_ROW_LINEAGE: u64 = FLAG_SPILLED_ROW_LINEAGE;
-/// Reserved for fragment trees. Readers and writers reject it until implemented.
-///
-/// Bit 11 is spilled row lineage, so this takes the next free bit.
+/// Fragment records are stored in immutable tree objects outside the manifest.
+/// This build masks the bit out in `supported_flags_when`, so
+/// [`can_read_dataset`] and [`can_write_dataset`] refuse these tables.
 pub const FLAG_FRAGMENT_TREE: u64 = 1 << 12;
 /// Index key fields and covering fields are declared independently.
 ///
@@ -165,6 +165,16 @@ pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_ZONE_WRITE_SEEDS;
 pub(crate) const STICKY_READER_FLAGS: u64 = STICKY_PAIRED_FLAGS;
 pub(crate) const STICKY_WRITER_FLAGS: u64 = STICKY_PAIRED_FLAGS | FLAG_NON_REUSABLE_FIELD_IDS;
+
+/// Bits required in both words that a tree version keeps, because
+/// `apply_feature_flags` cannot see records outside the manifest.
+pub(crate) const TREE_CARRIED_PAIRED_FLAGS: u64 = FLAG_DELETION_FILES
+    | FLAG_INLINE_DELETIONS
+    | FLAG_STABLE_ROW_IDS
+    | FLAG_UNSTABLE_DATA_OVERLAY_FILES
+    | FLAG_SPILLED_ROW_LINEAGE;
+/// [`TREE_CARRIED_PAIRED_FLAGS`] with the writer-only [`FLAG_OBJECT_METADATA`].
+pub(crate) const TREE_CARRIED_WRITER_FLAGS: u64 = TREE_CARRIED_PAIRED_FLAGS | FLAG_OBJECT_METADATA;
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
@@ -257,9 +267,21 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
     }
     validate_non_reusable_field_id_flags(manifest)?;
+
+    // Check the tree bits too, so a successor still waiting for its tree keeps
+    // its tree flags. Fragments outside the in-memory list can still need these
+    // flags, and this function can't see them.
+    let tree_flags = if manifest.uses_fragment_tree() {
+        ((manifest.reader_feature_flags | manifest.writer_feature_flags)
+            & TREE_CARRIED_PAIRED_FLAGS)
+            | FLAG_FRAGMENT_TREE
+    } else {
+        0
+    };
+
     // Reset flags
-    manifest.reader_feature_flags = 0;
-    manifest.writer_feature_flags = 0;
+    manifest.reader_feature_flags = tree_flags;
+    manifest.writer_feature_flags = tree_flags;
 
     let has_deletion_files = manifest
         .fragments
@@ -520,7 +542,6 @@ fn supported_flags_when(
         FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
         frag_reuse_with_stable_row_ids_enabled,
     );
-    // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
     mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
     mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
@@ -913,11 +934,26 @@ mod tests {
     fn test_fragment_tree_flag_is_reserved_not_supported() {
         assert_eq!(FLAG_FRAGMENT_TREE, 4096);
         assert_eq!(
-            FLAG_FRAGMENT_TREE & (FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS | FLAG_FRAGMENT_REUSE_INDEX),
+            FLAG_FRAGMENT_TREE
+                & (FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS
+                    | FLAG_FRAGMENT_REUSE_INDEX
+                    | FLAG_SPILLED_ROW_LINEAGE),
             0
         );
         assert!(!can_read_dataset(FLAG_FRAGMENT_TREE));
         assert!(!can_write_dataset(FLAG_FRAGMENT_TREE));
+
+        let mut manifest = empty_manifest();
+        manifest.fragment_tree = Some(std::sync::Arc::new(Default::default()));
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        for result in [
+            ensure_can_read_manifest(&manifest),
+            ensure_can_write_manifest(&manifest),
+        ] {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::NotSupported { .. }));
+            assert!(error.to_string().contains("Flags: 4096"));
+        }
     }
 
     #[test]
@@ -952,6 +988,84 @@ mod tests {
         let flags = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
         assert!(!can_read_dataset(flags));
         assert!(!can_write_dataset(flags));
+    }
+
+    #[test]
+    fn lazy_fragment_metadata_preserves_tree_carried_flags() {
+        let mut manifest = Manifest::new(
+            Default::default(),
+            std::sync::Arc::new(Vec::new()),
+            Default::default(),
+            Default::default(),
+        );
+        manifest.fragment_tree = Some(std::sync::Arc::new(Default::default()));
+        let features = FLAG_DELETION_FILES
+            | FLAG_INLINE_DELETIONS
+            | FLAG_STABLE_ROW_IDS
+            | FLAG_UNSTABLE_DATA_OVERLAY_FILES
+            | FLAG_SPILLED_ROW_LINEAGE;
+        manifest.reader_feature_flags = features;
+        manifest.writer_feature_flags = FLAG_OBJECT_METADATA;
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.reader_feature_flags, features | FLAG_FRAGMENT_TREE);
+        assert_eq!(
+            manifest.writer_feature_flags,
+            features | FLAG_FRAGMENT_TREE | FLAG_OBJECT_METADATA
+        );
+
+        let next_version = Manifest::new_from_previous(
+            &manifest,
+            manifest.schema.clone(),
+            std::sync::Arc::new(Vec::new()),
+        );
+        // A successor has only the tree bits, which still mark its own
+        // successor as a tree.
+        let following_version = Manifest::new_from_previous(
+            &next_version,
+            next_version.schema.clone(),
+            std::sync::Arc::new(Vec::new()),
+        );
+        let cloned =
+            manifest.shallow_clone(None, "memory://source".to_string(), 7, None, String::new());
+        let all = features | FLAG_FRAGMENT_TREE | FLAG_OBJECT_METADATA;
+        for mut derived in [next_version, following_version, cloned] {
+            assert!(derived.fragment_tree.is_none());
+            apply_feature_flags(&mut derived, false, false).unwrap();
+            assert_eq!(
+                derived.reader_feature_flags & all,
+                features | FLAG_FRAGMENT_TREE
+            );
+            assert_eq!(derived.writer_feature_flags & all, all);
+        }
+
+        // A descriptor alone still marks a tree, so its successor and clone
+        // gain the tree bits instead of turning flat.
+        manifest.reader_feature_flags &= !FLAG_FRAGMENT_TREE;
+        manifest.writer_feature_flags &= !FLAG_FRAGMENT_TREE;
+        let next_version = Manifest::new_from_previous(
+            &manifest,
+            manifest.schema.clone(),
+            std::sync::Arc::new(Vec::new()),
+        );
+        let cloned =
+            manifest.shallow_clone(None, "memory://source".to_string(), 7, None, String::new());
+        for derived in [next_version, cloned] {
+            assert_ne!(derived.reader_feature_flags & FLAG_FRAGMENT_TREE, 0);
+            assert_ne!(derived.writer_feature_flags & FLAG_FRAGMENT_TREE, 0);
+        }
+
+        // A flat successor derives its requirements from its own fragments.
+        manifest.fragment_tree = None;
+        manifest.reader_feature_flags &= !FLAG_FRAGMENT_TREE;
+        manifest.writer_feature_flags &= !FLAG_FRAGMENT_TREE;
+        let mut flat = Manifest::new_from_previous(
+            &manifest,
+            manifest.schema.clone(),
+            std::sync::Arc::new(Vec::new()),
+        );
+        apply_feature_flags(&mut flat, false, false).unwrap();
+        assert_eq!(flat.reader_feature_flags, 0);
+        assert_eq!(flat.writer_feature_flags, 0);
     }
 
     #[test]

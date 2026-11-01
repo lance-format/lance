@@ -4665,6 +4665,7 @@ dependencies = [
  "futures",
  "lance-arrow",
  "lance-core",
+ "lance-encoding",
  "lance-file",
  "lance-io",
  "lance-select",
