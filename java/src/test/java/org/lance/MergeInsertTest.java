@@ -626,8 +626,7 @@ public class MergeInsertTest {
             result.stats().numInsertedRows(),
             "FirstSeen should insert only the first row for the duplicate key id=10");
         TreeMap<Integer, String> rows = readAll(result.dataset());
-        Assertions.assertEquals(
-            6, rows.size(), "Base 5 rows plus 1 deduplicated insert for id=10");
+        Assertions.assertEquals(6, rows.size(), "Base 5 rows plus 1 deduplicated insert for id=10");
         Assertions.assertEquals(
             "First 10",
             rows.get(10),
