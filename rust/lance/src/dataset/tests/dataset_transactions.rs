@@ -4897,7 +4897,10 @@ mod composite {
                     base: None,
                 }),
                 Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata {
-                    fragment_ids: vec![rewritten],
+                    rows: vec![RowSelection {
+                        fragment_id: u32::try_from(rewritten).unwrap(),
+                        rows: SelectedRows::Full,
+                    }],
                 }),
             ],
         )
