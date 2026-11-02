@@ -14,7 +14,9 @@ use lance_core::deepsize::DeepSizeOf;
 
 use crate::dataset::metadata::UpdateFieldMetadataBuilder;
 use crate::dataset::transaction::translate_schema_metadata_updates;
-use crate::session::caches::{DSMetadataCache, ManifestKey, TransactionKey};
+use crate::session::caches::{
+    DSMetadataCache, ManifestDigestKey, ManifestKey, TransactionKey, cache_manifest,
+};
 use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
 use lance_core::ROW_ADDR;
@@ -34,9 +36,7 @@ use lance_io::object_store::{
     WrappingObjectStore,
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_io::utils::{
-    CachedFileSize, read_last_block, read_message, read_metadata_offset, read_struct,
-};
+use lance_io::utils::{CachedFileSize, read_last_block, read_message, read_metadata_offset};
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
     ClusteringDefinition, DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata,
@@ -90,6 +90,7 @@ pub mod refs;
 pub mod rowids;
 pub mod scanner;
 mod schema_evolution;
+pub mod snapshot;
 pub mod sql;
 pub mod statistics;
 mod take;
@@ -264,6 +265,7 @@ pub struct Dataset {
     // Path for the manifest that is loaded. Used to get additional information,
     // such as the index metadata.
     pub(crate) manifest_location: ManifestLocation,
+    pub(crate) snapshot_digest: Arc<tokio::sync::OnceCell<[u8; 32]>>,
     pub(crate) session: Arc<Session>,
     pub refs: Refs,
     // Keep the incarnation opened by this handle; the name may later be reused.
@@ -604,8 +606,9 @@ impl Dataset {
 
     /// Check out the latest version of the dataset
     pub async fn checkout_latest(&mut self) -> Result<()> {
-        let (manifest, manifest_location) = self.latest_manifest().await?;
+        let (manifest, manifest_location, digest) = self.latest_manifest_with_digest().await?;
         self.set_manifest(manifest, manifest_location);
+        self.snapshot_digest = digest;
         Ok(())
     }
 
@@ -615,6 +618,7 @@ impl Dataset {
         if manifest.base_paths != self.manifest.base_paths {
             self.base_object_stores = Default::default();
         }
+        self.snapshot_digest = Default::default();
         self.manifest = manifest;
         self.manifest_location = manifest_location;
         self.fragment_bitmap = Arc::new(
@@ -807,7 +811,7 @@ impl Dataset {
             return Ok(self.clone());
         }
 
-        let manifest = Self::get_manifest(
+        let (manifest, digest) = Self::get_manifest(
             self.object_store.as_ref(),
             &manifest_location,
             &new_location.uri,
@@ -828,7 +832,7 @@ impl Dataset {
             )));
         }
 
-        let dataset = Self::checkout_manifest(
+        let mut dataset = Self::checkout_manifest(
             self.object_store.clone(),
             new_location.path,
             new_location.uri,
@@ -849,6 +853,7 @@ impl Dataset {
                 ),
             });
         }
+        dataset.snapshot_digest = digest;
         Ok(dataset)
     }
 
@@ -858,6 +863,19 @@ impl Dataset {
         uri: &str,
         session: &Session,
     ) -> Result<Manifest> {
+        Ok(
+            Self::load_manifest_with_digest(object_store, manifest_location, uri, session)
+                .await?
+                .0,
+        )
+    }
+
+    pub(crate) async fn load_manifest_with_digest(
+        object_store: &ObjectStore,
+        manifest_location: &ManifestLocation,
+        uri: &str,
+        session: &Session,
+    ) -> Result<(Manifest, [u8; 32])> {
         let object_reader = if let Some(size) = manifest_location.size {
             object_store
                 .open_with_size(&manifest_location.path, size as usize)
@@ -885,7 +903,7 @@ impl Dataset {
                     size: None,
                     ..manifest_location.clone()
                 };
-                return Box::pin(Self::load_manifest(
+                return Box::pin(Self::load_manifest_with_digest(
                     object_store,
                     &manifest_location,
                     uri,
@@ -920,7 +938,7 @@ impl Dataset {
                 size: None,
                 ..manifest_location.clone()
             };
-            return Box::pin(Self::load_manifest(
+            return Box::pin(Self::load_manifest_with_digest(
                 object_store,
                 &manifest_location,
                 uri,
@@ -933,18 +951,29 @@ impl Dataset {
 
         // If manifest is in the last block, we can decode directly from memory.
         let manifest_size = object_reader.size().await?;
-        let mut manifest = if manifest_size - offset <= last_block.len() {
+        let (mut manifest, digest) = if manifest_size - offset <= last_block.len() {
             let manifest_len = manifest_size - offset;
             let offset_in_block = last_block.len() - manifest_len;
             let message_len =
                 LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
             let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)
+            (
+                Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)?,
+                lance_table::snapshot::digest_manifest(message_data),
+            )
         } else {
-            let mut manifest: Manifest = read_struct(object_reader.as_ref(), offset).await?;
+            let bytes = lance_table::io::manifest::read_manifest_bytes(
+                object_store,
+                &manifest_location.path,
+                Some(manifest_size as u64),
+            )
+            .await?;
+            let digest = lance_table::snapshot::digest_manifest(bytes.clone());
+            let mut manifest =
+                Manifest::try_from(lance_table::format::pb::Manifest::decode(bytes)?)?;
             manifest.detach_sparse_inline_row_ids(manifest_size - offset);
-            Ok(manifest)
-        }?;
+            (manifest, digest)
+        };
 
         ensure_can_read_manifest(&manifest)?;
 
@@ -1005,7 +1034,7 @@ impl Dataset {
 
         populate_manifest_schema_dictionaries(&mut manifest, object_reader.as_ref()).await?;
 
-        Ok(manifest)
+        Ok((manifest, digest))
     }
 
     /// Fetch the manifest for `manifest_location` from the session metadata
@@ -1015,27 +1044,44 @@ impl Dataset {
         manifest_location: &ManifestLocation,
         uri: &str,
         session: &Session,
-    ) -> Result<Arc<Manifest>> {
-        if manifest_location.size.is_none() {
-            return Ok(Arc::new(
-                Self::load_manifest(object_store, manifest_location, uri, session).await?,
-            ));
-        }
+    ) -> Result<(Arc<Manifest>, Arc<tokio::sync::OnceCell<[u8; 32]>>)> {
         let metadata_cache = session.metadata_cache.for_dataset(uri);
         let manifest_key = ManifestKey {
             version: manifest_location.version,
             e_tag: manifest_location.e_tag.as_deref(),
         };
-        if let Some(cached) = metadata_cache.get_with_key(&manifest_key).await {
+        let digest_key = ManifestDigestKey {
+            version: manifest_location.version,
+            store_identity: &object_store.store_prefix,
+            manifest_path: &manifest_location.path,
+            manifest_identity: manifest_location.identity.as_deref(),
+            e_tag: manifest_location.e_tag.as_deref(),
+        };
+        if manifest_location.size.is_some()
+            && manifest_location.e_tag.is_some()
+            && let Some(cached) = metadata_cache.get_with_key(&manifest_key).await
+            && let Some(digest) = metadata_cache.get_with_key(&digest_key).await
+            && digest.manifest.ptr_eq(&Arc::downgrade(&cached))
+            && digest.store.ptr_eq(&Arc::downgrade(&object_store.inner))
+        {
             ensure_can_read_manifest(&cached)?;
-            return Ok(cached);
+            return Ok((cached, digest.digest.clone()));
         }
-        let loaded =
-            Arc::new(Self::load_manifest(object_store, manifest_location, uri, session).await?);
-        metadata_cache
-            .insert_with_key(&manifest_key, loaded.clone())
+        let (loaded, digest) =
+            Self::load_manifest_with_digest(object_store, manifest_location, uri, session).await?;
+        let loaded = Arc::new(loaded);
+        let digest = Arc::new(tokio::sync::OnceCell::new_with(Some(digest)));
+        if manifest_location.size.is_some() {
+            cache_manifest(
+                &metadata_cache,
+                object_store,
+                manifest_location,
+                loaded.clone(),
+                digest.clone(),
+            )
             .await;
-        Ok(loaded)
+        }
+        Ok((loaded, digest))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1079,6 +1125,7 @@ impl Dataset {
             uri,
             manifest,
             manifest_location,
+            snapshot_digest: Default::default(),
             commit_handler,
             session,
             refs,
@@ -1406,6 +1453,17 @@ impl Dataset {
     }
 
     pub async fn latest_manifest(&self) -> Result<(Arc<Manifest>, ManifestLocation)> {
+        let (manifest, location, _) = self.latest_manifest_with_digest().await?;
+        Ok((manifest, location))
+    }
+
+    async fn latest_manifest_with_digest(
+        &self,
+    ) -> Result<(
+        Arc<Manifest>,
+        ManifestLocation,
+        Arc<tokio::sync::OnceCell<[u8; 32]>>,
+    )> {
         self.ensure_branch_exists().await?;
         let location = self
             .commit_handler
@@ -1415,12 +1473,16 @@ impl Dataset {
         if self.already_checked_out(&location, self.manifest.branch.as_deref()) {
             ensure_can_read_manifest(&self.manifest)?;
             self.ensure_branch_exists().await?;
-            return Ok((self.manifest.clone(), self.manifest_location.clone()));
+            return Ok((
+                self.manifest.clone(),
+                self.manifest_location.clone(),
+                self.snapshot_digest.clone(),
+            ));
         }
-        let manifest =
+        let (manifest, digest) =
             Self::get_manifest(&self.object_store, &location, &self.uri, &self.session).await?;
         self.ensure_branch_exists().await?;
-        Ok((manifest, location))
+        Ok((manifest, location, digest))
     }
 
     /// Read the transaction file for this version of the dataset.
@@ -2932,6 +2994,7 @@ impl Dataset {
         Self {
             fragment_bitmap: Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect()),
             manifest,
+            snapshot_digest: Default::default(),
             base_object_stores,
             ..self.clone()
         }
@@ -4112,7 +4175,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
         .map_ok(move |location| {
             let latest_tx = latest_tx.take();
             async move {
-                let manifest = Dataset::get_manifest(
+                let (manifest, _) = Dataset::get_manifest(
                     dataset.object_store.as_ref(),
                     &location,
                     &dataset.uri,

@@ -12,32 +12,37 @@ authenticate a worker or retain source files.
 
 ## Source contexts
 
-A `BlobSourceContext` identifies one exact snapshot and its storage authority:
+A `BlobSourceContext` combines a generic [snapshot reference](snapshot_references.md)
+with an authenticated worker storage binding and blob capabilities:
 
 ```text
 Source context
 +-- protocol version and required capabilities
-+-- canonical table-incarnation identity
-+-- absolute table root URI
-+-- resolved branch and numeric version
-+-- exact manifest path, original protobuf image, optional commit-store identity
++-- SnapshotRef
+|   +-- canonical table-incarnation identity and absolute table root URI
+|   +-- resolved branch and numeric version
+|   +-- exact manifest path, content digest, optional commit-store identity
 +-- key to an authenticated worker storage context
 ```
 
-`BlobSourceContext::from_dataset` captures an already resolved `Dataset`. It reads
-manifest metadata and verifies that it still matches the loaded snapshot. It does
-not fetch blob payloads, resolve a tag again, or substitute the latest version.
-Open the source using an absolute URI or local path; relative locations are rejected.
-The manifest image includes registered base mappings, including shallow-clone
-source bases. Its original bytes are preserved across transport. Re-encoding the
-manifest protobuf would change map-entry order and must not replace that image.
+`BlobSourceContext::from_dataset` captures an already resolved `Dataset` using
+`Dataset::snapshot_ref`. It does not fetch blob payloads, resolve a tag again, or
+substitute the latest version. `BlobSourceContext::try_new` accepts an existing
+`SnapshotRef` so ordinary reads and blob reads can share the same snapshot identity.
+Contexts never embed the full manifest or its registered-base registry.
 
 The caller supplies a canonical `table_identity` that distinguishes table
 incarnations and storage/catalog authorities. A URI or catalog name alone is
 insufficient when tables can be recreated or different storage endpoints use the
-same URI. The snapshot additionally binds the branch, version, manifest path, and
-manifest contents. When available, the commit handler's authoritative record
-identity is included. An ETag is not used as a table-incarnation or content identity.
+same URI. The snapshot binds the resolved branch, version, manifest path, and a
+BLAKE3 digest of the original manifest protobuf bytes. When available, the commit
+handler's authoritative record identity is included. An ETag is not used as a
+table-incarnation or content identity.
+
+The original bytes are hashed once, without re-encoding protobuf maps. The digest
+is shared with the loaded snapshot; a dataset returned by a write may read its
+manifest metadata on first capture. Open the source using an absolute URI or local
+path; relative locations are rejected.
 
 The caller also supplies an `access_context_key`. Every participating worker must
 resolve it through an authenticated context with the correct storage settings,
@@ -131,8 +136,8 @@ reads and retries, as described below.
 
 `BlobRefReader` accepts full-value and blob-local range demands. On each worker,
 resolve every context's `access_context_key` to authenticated storage settings and
-open its exact branch and version. Pair that snapshot with its transported context
-using `BlobRefBinding::try_new`. Supply bindings in the same slot order as the
+reopen its `snapshot_ref()` with `DatasetBuilder::from_snapshot`. Pair that snapshot
+with its transported context using `BlobRefBinding::try_new`. Supply bindings in the same slot order as the
 reference context table. Construction checks the loaded manifest; each request
 also checks its locator fingerprint, registered base, and bound storage root.
 
@@ -263,10 +268,11 @@ source binding. Opening the locator URI with default storage settings is not equ
 The source fingerprint is BLAKE3 of the validated `SourceContext` encoded by Lance.
 Encoding uses ascending protobuf field numbers, minimal varints, omitted implicit
 defaults, and the sorted, packed capability list. Optional fields preserve presence.
-The original manifest image is an opaque byte field in that encoding. There are no
-protobuf maps in `SourceContext` itself. Engines should forward the encoded context
-or use Lance's codec rather than reconstructing its fingerprint.
-The v1 fingerprint covers the fields numbered 1 through 10 in this contract.
+The nested snapshot reference contains identity fields and a fixed-size manifest
+digest. Neither message contains protobuf maps. Engines should forward the encoded
+context or use Lance's codec rather than reconstructing its fingerprint.
+The v1 fingerprint covers fields 1, 2, 10, and 11 in this contract; fields 3 through
+9 from the unreleased full-manifest design are reserved.
 Future extensions must preserve that fingerprint or change the protocol version.
 
 Each locator embeds this fingerprint. Validation compares it with the context at
@@ -300,6 +306,18 @@ validation. Engines must not decode locators themselves or reinterpret unsupport
 objects as raw byte ranges. This execution protocol does not change the persisted
 descriptor layout or require future Object Layer backends to use raw ranges.
 
+A **blob** is one logical binary value. An **object** is its physical storage
+container, such as a data file or packed blob file; many blobs can occupy distinct
+ranges of one object. `ObjectLocator.source_id` is the **source binding
+fingerprint**: BLAKE3 of the encoded, validated `SourceContext`, including the
+snapshot reference, worker access key, and required capabilities. It differs from
+the manifest content digest and from the storage-binding-independent
+`SnapshotRef::snapshot_id`.
+
+Registered base IDs are checked against the authenticated worker snapshot before
+payload I/O. Transport validation alone cannot check base membership because the
+compact context does not carry a base registry.
+
 ## Combining batches
 
 Two independently produced batches can both use slot zero for unrelated sources.
@@ -331,7 +349,7 @@ The envelope is a self-contained convenience format. For a streaming exchange,
 engines can send each encoded context once during query setup, then carry extension
 arrays in their existing Arrow transport. Workers validate those arrays with
 `BlobRefBatch::try_from_arrow` and the registered context table. This avoids sending
-the manifest images again for every batch.
+even the compact source contexts again for every batch.
 
 Unknown protocol versions, locator origins, and required capabilities fail clearly.
 They must never trigger interpretation as user bytes, selector fallback, or opening
@@ -354,7 +372,7 @@ can provide only the application's immutability guarantee.
 
 Source files, sidecars, Managed objects, and applicable external bases must remain
 available until every deferred read, worker retry, and lazy consumer has finished.
-An open `Dataset`, a serialized manifest, or a reference value is not a GC root.
+An open `Dataset`, a `SnapshotRef`, or a reference value is not a GC root.
 The application must retain the exact source snapshots and coordinate cleanup.
 External objects remain subject to their own ownership and immutability contract.
 Cross-query persistence or export needs an explicit retention agreement extending
