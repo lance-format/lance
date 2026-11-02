@@ -3738,6 +3738,8 @@ mod tests {
             "NOT (i = 7)",
             "i = 7 AND rid > 3",
             "i = 7 OR rid = 0",
+            "(i = 7 AND rid > 3) OR s = 'b'",
+            "(i > 0 AND rid < 6) OR (s = 'apple' AND rid >= 6)",
             "rid >= 6 AND f > 0.0",
             "b",
             "NOT b",

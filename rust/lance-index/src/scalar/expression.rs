@@ -1418,13 +1418,18 @@ impl IndexedExpression {
         }
     }
 
-    /// Try and perform a logical OR of two indexed expressions
+    /// Try and perform a logical OR of two indexed expressions, where `expr` is the
+    /// original OR expression
     ///
-    /// This is a bit tricky because something like:
+    /// The refine expressions cannot be OR'd on their own because something like:
     ///   (color == 'blue' AND size < 20) OR (color == 'green' AND size < 50)
     /// is not equivalent to:
     ///   (color == 'blue' OR color == 'green') AND (size < 20 OR size < 50)
-    fn maybe_or(self, other: Self) -> Option<Self> {
+    ///
+    /// Every row matching a side is in the result of that side's index query, so the OR
+    /// of the two index queries still finds every matching row. If either side has a
+    /// refine then the rows found are refined with the original expression.
+    fn maybe_or(self, other: Self, expr: &BinaryExpr) -> Option<Self> {
         // If either expression is missing a scalar_query then we need to load all rows from
         // the database and so we short-circuit and return None
         let scalar_query = self.scalar_query?;
@@ -1433,28 +1438,8 @@ impl IndexedExpression {
             Box::new(scalar_query),
             Box::new(other_scalar_query),
         ));
-
-        let refine_expr = match (self.refine_expr, other.refine_expr) {
-            // TODO
-            //
-            // To handle these cases we need a way of going back from a scalar expression query to a logical DF expression (perhaps
-            // we can store the expression that led to the creation of the query)
-            //
-            // For example, imagine we have something like "(color == 'blue' AND size < 20) OR (color == 'green' AND size < 50)"
-            //
-            // We can do an indexed load of all rows matching "color == 'blue' OR color == 'green'" but then we need to
-            // refine that load with the full original expression which, at the moment, we no longer have.
-            (Some(_), Some(_)) => {
-                return None;
-            }
-            (Some(_), None) => {
-                return None;
-            }
-            (None, Some(_)) => {
-                return None;
-            }
-            (None, None) => None,
-        };
+        let refine_expr = (self.refine_expr.is_some() || other.refine_expr.is_some())
+            .then(|| Expr::BinaryExpr(expr.clone()));
         Some(Self {
             scalar_query,
             refine_expr,
@@ -2451,7 +2436,7 @@ fn visit_or(
     let left = visit_node(&expr.left, index_info, depth + 1)?;
     let right = visit_node(&expr.right, index_info, depth + 1)?;
     Ok(match (left, right) {
-        (Some(left), Some(right)) => left.maybe_or(right),
+        (Some(left), Some(right)) => left.maybe_or(right, expr),
         // If one side can use an index and the other side cannot then
         // we must abandon the entire thing.  For example, consider the
         // query "color == 'blue' or size > 10" where color is indexed but
@@ -3465,18 +3450,81 @@ mod tests {
             &index_info,
             "(aisle = 10 OR color = 'blue') AND size > 30",
             Some(IndexedExpression {
-                scalar_query: Some(ScalarIndexExpr::Or(left, right)),
+                scalar_query: Some(ScalarIndexExpr::Or(left.clone(), right.clone())),
                 refine_expr: Some(refine),
             }),
             false,
         );
-        // Examples of things that are not yet supported but should be supportable someday
-
-        // OR'd group of refined index searches (see IndexedExpression::or for details)
-        check_no_index(
+        // OR'd group of refined index searches: the OR of the index searches finds every
+        // row either side could match and the original OR refines them
+        let col = |name: &str| Expr::Column(Column::new_unqualified(name));
+        let aisle_refined = col("aisle")
+            .eq(datafusion_expr::lit(10_i64))
+            .and(col("size").gt(datafusion_expr::lit(30_i64)));
+        let color_refined = col("color")
+            .eq(datafusion_expr::lit("blue"))
+            .and(col("size").gt(datafusion_expr::lit(20_i64)));
+        let or_query = ScalarIndexExpr::Or(left, right.clone());
+        check(
+            &index_info,
+            "(aisle = 10 AND size > 30) OR color = 'blue'",
+            Some(IndexedExpression {
+                scalar_query: Some(or_query.clone()),
+                refine_expr: Some(
+                    aisle_refined
+                        .clone()
+                        .or(col("color").eq(datafusion_expr::lit("blue"))),
+                ),
+            }),
+            false,
+        );
+        check(
             &index_info,
             "(aisle = 10 AND size > 30) OR (color = 'blue' AND size > 20)",
+            Some(IndexedExpression {
+                scalar_query: Some(or_query.clone()),
+                refine_expr: Some(aisle_refined.clone().or(color_refined.clone())),
+            }),
+            false,
         );
+        // Nested in an AND, the original OR is AND'd with the other refine
+        check(
+            &index_info,
+            "((aisle = 10 AND size > 30) OR (color = 'blue' AND size > 20)) AND size < 50",
+            Some(IndexedExpression {
+                scalar_query: Some(or_query.clone()),
+                refine_expr: Some(
+                    aisle_refined
+                        .clone()
+                        .or(color_refined.clone())
+                        .and(col("size").lt(datafusion_expr::lit(50_i64))),
+                ),
+            }),
+            false,
+        );
+        // Nested in an OR, the outermost OR is the refine
+        check(
+            &index_info,
+            "((aisle = 10 AND size > 30) OR color = 'blue') OR (color = 'blue' AND size > 20)",
+            Some(IndexedExpression {
+                scalar_query: Some(ScalarIndexExpr::Or(Box::new(or_query), right)),
+                refine_expr: Some(
+                    aisle_refined
+                        .or(col("color").eq(datafusion_expr::lit("blue")))
+                        .or(color_refined),
+                ),
+            }),
+            false,
+        );
+        // An index search with a refine cannot be negated, so NOT gives up on the index
+        check_no_index(
+            &index_info,
+            "NOT ((aisle = 10 AND size > 30) OR color = 'blue')",
+        );
+        // A side with no index search still makes the OR a full scan
+        check_no_index(&index_info, "(aisle = 10 AND size > 30) OR size < 5");
+
+        // Examples of things that are not yet supported but should be supportable someday
 
         // Non-normalized arithmetic (can use expression simplification)
         check_no_index(&index_info, "aisle + 3 < 10");
