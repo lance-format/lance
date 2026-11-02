@@ -579,20 +579,51 @@ def test_fragment_count_rows(tmp_path: Path):
     assert fragments[0].count_rows(pc.field("a") < 200) == 200
 
 
-def test_fragment_pyarrow_expression_filter(tmp_path: Path):
+@pytest.mark.parametrize("ignored_scalar_indices", [None, ["s_btree"]])
+def test_fragment_pyarrow_expression_filter(tmp_path: Path, ignored_scalar_indices):
     data = pa.table({"id": [0, 1, 2], "s": ["C:\\temp", "plain", "other"]})
     dataset = write_dataset(data, tmp_path, max_rows_per_file=2)
+    dataset.create_scalar_index("s", "BTREE", name="s_btree")
     assert len(dataset.get_fragments()) == 2
     fragment = dataset.get_fragments()[0]
     expression = pc.field("s") != "C:\\temp"
 
     assert dataset.count_rows(filter=expression) == 2
     assert fragment.count_rows(expression) == 1
-    assert fragment.scanner(filter=expression).to_table()["id"].to_pylist() == [1]
-    assert fragment.to_table(filter=expression)["id"].to_pylist() == [1]
+    scanner = fragment.scanner(
+        filter=expression, ignored_scalar_indices=ignored_scalar_indices
+    )
+    assert ("ScalarIndexQuery" in scanner.explain_plan(True)) == (
+        ignored_scalar_indices is None
+    )
+    assert scanner.to_table()["id"].to_pylist() == [1]
+    assert fragment.to_table(
+        filter=expression, ignored_scalar_indices=ignored_scalar_indices
+    )["id"].to_pylist() == [1]
     assert fragment.to_table(filter=pc.field("s").isin(["C:\\temp"]))[
         "id"
     ].to_pylist() == [0]
+
+
+def test_fragment_to_table_preserves_positional_arguments(tmp_path: Path):
+    data = pa.table({"id": [0, 1, 2], "s": ["C:\\temp", "plain", "other"]})
+    dataset = write_dataset(data, tmp_path, max_rows_per_file=2)
+    dataset.create_scalar_index("s", "BTREE", name="s_btree")
+    fragment = dataset.get_fragments()[0]
+
+    table = fragment.to_table(
+        None,
+        pc.field("s") != "C:\\temp",
+        None,
+        None,
+        False,
+        False,
+        None,
+        None,
+        None,
+        1 << 20,
+    )
+    assert table["id"].to_pylist() == [1]
 
 
 @pytest.mark.parametrize("enable_stable_row_ids", [False, True])
@@ -750,6 +781,56 @@ def test_fragment_update_columns_basic(tmp_path):
     assert result["name"] == ["Alice_Updated", "Bob", "Charlie_Updated", "David"]
     assert result["value"] == [100, 20, 300, 40]
     assert result["id"] == [1, 2, 3, 4]  # id column should remain unchanged
+
+
+@pytest.mark.parametrize("strategy", ["auto", "hash", "sort_merge"])
+def test_fragment_update_columns_join_options(tmp_path, strategy):
+    data = pa.table({"id": [1, 2, 3], "value": [10, 20, 30]})
+    dataset_uri = tmp_path / strategy
+    dataset = lance.write_dataset(data, dataset_uri)
+    updates = pa.table({"id": [1, 3], "value": [100, 300]})
+
+    fragment = dataset.get_fragment(0)
+    updated_fragment, fields_modified = fragment.update_columns(
+        updates,
+        left_on="id",
+        right_on="id",
+        strategy=strategy,
+        max_hash_rows=1,
+        max_hash_bytes=1,
+        external_memory_pool_bytes=16 * 1024 * 1024,
+        max_temp_directory_bytes=64 * 1024 * 1024,
+    )
+
+    assert updated_fragment.id == fragment.fragment_id
+    assert fields_modified
+
+    op = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri), op, read_version=dataset.version
+    )
+    result = updated_dataset.to_table().to_pydict()
+    assert result["id"] == [1, 2, 3]
+    assert result["value"] == [100, 20, 300]
+
+
+def test_fragment_update_columns_rejects_invalid_join_options(tmp_path):
+    dataset = lance.write_dataset(
+        pa.table({"id": [1], "value": [10]}), tmp_path / "invalid_options"
+    )
+    updates = pa.table({"id": [1], "value": [100]})
+    fragment = dataset.get_fragment(0)
+
+    with pytest.raises(ValueError, match="strategy must be one of"):
+        fragment.update_columns(
+            updates, left_on="id", right_on="id", strategy="nested_loop"
+        )
+
+    with pytest.raises(ValueError, match="must be specified together"):
+        fragment.update_columns(updates, left_on="id", right_on="id", max_hash_rows=1)
 
 
 def test_fragment_update_columns_with_custom_join_key(tmp_path):
@@ -1729,6 +1810,25 @@ def test_fragment_scanner_batch_size_bytes(tmp_path: Path):
     small_budget = list(fragment.to_batches(batch_size_bytes=64 * 1024))
     assert len(small_budget) > len(default_batches)
     assert pa.Table.from_batches(small_budget) == fragment.to_table()
+
+
+def test_fragment_scanner_scan_stats_callback(tmp_path: Path):
+    dataset = write_dataset(
+        pa.table({"a": range(200)}), tmp_path, max_rows_per_file=100
+    )
+    fragments = dataset.get_fragments()
+    assert len(fragments) == 2
+
+    calls = []
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        calls.append(stats)
+
+    result = fragments[0].scanner(scan_stats_callback=scan_stats_callback).to_table()
+    assert result.num_rows == 100
+    assert len(calls) == 1, "Callback should have been called exactly once"
+    assert calls[0].bytes_read > 0, "Expected some bytes read"
+    assert calls[0].iops > 0, "Expected some I/O operations"
 
 
 @pytest.mark.parametrize("enable_stable_row_ids", [False, True])

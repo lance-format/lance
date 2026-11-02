@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow_schema::{DataType, Field as ArrowField};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::catalog::Session;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::ExecutionPlan;
@@ -49,6 +49,7 @@ use super::schema_evolution::optimize::{
     ChainedNewColumnTransformOptimizer, SqlToAllNullsOptimizer,
 };
 use super::statistics::FieldStatistics;
+use super::write::dictionary_budget::DictionaryValueBudget;
 use super::write::seeds::SeedCollector;
 use super::write::{self, GenericWriter, TargetBaseInfo, WriteMode, WriteParams, WriterOptions};
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
@@ -133,6 +134,7 @@ pub async fn write_fragments(
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
     inherited_field_ids: bool,
+    disable_dictionary_split: bool,
     created_blob_payloads: Option<BlobPayloadInventory>,
 ) -> Result<(Vec<Fragment>, Schema)> {
     // A writer that spills row lineage into the fragment's own data file
@@ -183,6 +185,7 @@ pub async fn write_fragments(
         file_row_counts,
         preassigned_data_file_name,
         created_blob_payloads,
+        disable_dictionary_split,
     )
     .await?;
     Ok((fragments, schema))
@@ -261,6 +264,7 @@ pub async fn write_fragments_direct(
     file_row_counts: Option<Vec<usize>>,
     preassigned_data_file_name: Option<Arc<String>>,
     created_blob_payloads: Option<BlobPayloadInventory>,
+    disable_dictionary_split: bool,
 ) -> Result<Vec<Fragment>> {
     validate_row_limits(version, &params)?;
     let buffered_reader = if let Some(file_row_counts) = file_row_counts.as_ref() {
@@ -314,6 +318,20 @@ pub async fn write_fragments_direct(
         }
         ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => None,
     };
+    // The 2.0 writer stores a null as one more dictionary value and keeps its own key-type
+    // check, so its files are not split here. Neither is a write that must produce one
+    // file, the preassigned one or a MemWAL generation's; the encoder's key-type check
+    // applies to it instead.
+    let dictionary_budget = match version {
+        ConcreteFileVersion::V2_1 | ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
+            if preassigned_data_file_name.is_some() || disable_dictionary_split {
+                None
+            } else {
+                DictionaryValueBudget::try_new(&ArrowSchema::from(schema))?
+            }
+        }
+        ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 => None,
+    };
     write::do_write_fragments_impl(
         dataset,
         object_store,
@@ -330,6 +348,7 @@ pub async fn write_fragments_direct(
         file_row_counts,
         preassigned_data_file_name,
         created_blob_payloads,
+        dictionary_budget,
     )
     .await
 }
@@ -628,23 +647,8 @@ pub async fn write_fragment(
         | ConcreteFileVersion::V2_1
         | ConcreteFileVersion::V2_2
         | ConcreteFileVersion::V2_3 => {
-            let file_writer_options = builder.file_writer_options();
             builder
-                .write_current_impl(
-                    move |object_writer, schema, filename| {
-                        create_current_file_writer(
-                            version,
-                            object_writer,
-                            schema,
-                            filename,
-                            None,
-                            file_writer_options,
-                        )
-                    },
-                    stream,
-                    schema,
-                    id,
-                )
+                .write_current_impl(version, stream, schema, id)
                 .await
         }
     }
@@ -721,6 +725,25 @@ pub async fn open_update_writer(
     schema: &Schema,
     allow_external_blob_outside_bases: bool,
 ) -> Result<Box<dyn GenericWriter>> {
+    // Blob v1 columns are stored as Blob v2 from 2.2 on, as `Dataset::write`
+    // does. The promoted children take ids above the table's so the file's
+    // schema reuses none of them; the commit assigns the manifest's own.
+    let promoted;
+    let schema = if writes_blob_v2(version)
+        && schema
+            .fields_pre_order()
+            .any(|field| field.is_blob() && !field.is_blob_v2())
+    {
+        let mut schema = schema.clone();
+        for field in &mut schema.fields {
+            field.promote_blob_v2()?;
+        }
+        schema.try_set_field_id(Some(dataset.manifest.max_field_id()))?;
+        promoted = schema;
+        &promoted
+    } else {
+        schema
+    };
     let external_base_resolver = match version {
         ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {
             write::blob_v2_external_base_resolver(Some(dataset), &WriteParams::default(), schema)
@@ -781,6 +804,15 @@ pub async fn create_fragment_from_file(
         | ConcreteFileVersion::V2_3 => {
             FileFragment::create_from_current_file(filename, dataset, fragment_id).await
         }
+    }
+}
+
+/// Whether `version` writes blob columns in the Blob v2 layout. Earlier
+/// versions only have the legacy layout; 2.2 reads both but writes v2.
+pub fn writes_blob_v2(version: ConcreteFileVersion) -> bool {
+    match version {
+        ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => false,
+        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => true,
     }
 }
 
