@@ -810,6 +810,7 @@ class _Fragment:
         batch_size_bytes: Optional[int] = None,
         strict_batch_size: Optional[bool] = None,
         substrait_filter: Optional[bytes] = None,
+        scan_stats_callback: Optional[Callable[[Any], None]] = None,
     ) -> _Scanner: ...
     def add_columns_from_reader(
         self,
