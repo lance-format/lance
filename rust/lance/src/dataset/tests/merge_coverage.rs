@@ -9,17 +9,20 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::Int32Type;
+use arrow_array::types::{Float32Type, Int32Type};
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::utils::tempfile::TempStrDir;
+use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_index::IndexType;
+use lance_index::frag_reuse::{CompactFragReuseIndex, FragReuseIndexDetails};
 use lance_index::scalar::BuiltinIndexType;
 use lance_index::scalar::ScalarIndexParams;
 use lance_table::format::IndexMetadata;
 use lance_table::format::overlay::OverlayCoverage;
 use roaring::RoaringBitmap;
 use rstest::rstest;
+use uuid::Uuid;
 
 use super::dataset_overlay_index_masking::{
     commit_overlay, create_base_dataset_with, i32_array, ids_matching,
@@ -30,10 +33,13 @@ use crate::dataset::optimize::remapping::remap_column_index;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::transaction::Operation;
 use crate::dataset::{
-    MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched, WriteDestination,
-    WriteParams,
+    MergeInsertBuilder, MergeInsertWriteMode, NewColumnTransform, WhenMatched, WhenNotMatched,
+    WriteDestination, WriteParams,
 };
-use crate::index::DatasetIndexExt;
+use crate::index::{
+    DatasetIndexExt, IntoIndexSegment, fresh_fragments, prune_stale_segment_coverage,
+    vector_index_details_default,
+};
 use crate::utils::test::compact_into_two;
 #[cfg(feature = "geo")]
 use crate::utils::test::geo;
@@ -149,7 +155,7 @@ async fn test_btree_merge_drops_coverage_a_restore_took_an_overlay_from() {
 
     let mut dataset = dataset.checkout_version(before_overlay).await.unwrap();
     dataset.restore().await.unwrap();
-    let dataset = btree_merge_and_commit(dataset, staged).await;
+    let dataset = Box::pin(btree_merge_and_commit(dataset, staged)).await;
 
     assert_eq!(
         ids_matching(&dataset, "age = 0").await,
@@ -193,7 +199,7 @@ async fn test_btree_merge_drops_coverage_a_restore_revived_a_row_in() {
 
     let mut dataset = dataset.checkout_version(before_delete).await.unwrap();
     dataset.restore().await.unwrap();
-    let dataset = btree_merge_and_commit(dataset, staged).await;
+    let dataset = Box::pin(btree_merge_and_commit(dataset, staged)).await;
 
     assert_eq!(
         ids_matching(&dataset, "age = 30").await,
@@ -1860,4 +1866,94 @@ async fn test_merge_covers_a_chain_only_when_its_segments_indexed_every_source(
         assert_uses_val_idx(&dataset, "val < 60").await;
     }
     assert_val_lookups_match_scan(&dataset, (0..24).map(|id| id * 10), "").await;
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SegmentFreshnessCheck {
+    PruneStaleSegmentCoverage,
+    FreshFragments,
+}
+
+impl SegmentFreshnessCheck {
+    async fn marks_stale(self, dataset: &Dataset, segment: IndexMetadata) -> bool {
+        match self {
+            Self::PruneStaleSegmentCoverage => {
+                let mut segments = [segment.into_index_segment().unwrap()];
+                prune_stale_segment_coverage(
+                    dataset,
+                    &mut segments,
+                    false,
+                    &RoaringBitmap::new(),
+                    false,
+                )
+                .await
+                .unwrap();
+                !segments[0].fragment_bitmap().contains(0)
+            }
+            Self::FreshFragments => {
+                let no_compactions = CompactFragReuseIndex::try_new(
+                    Uuid::new_v4(),
+                    FragReuseIndexDetails { versions: vec![] },
+                )
+                .unwrap();
+                !fresh_fragments(dataset, &no_compactions, &[segment])
+                    .await
+                    .unwrap()
+                    .contains(0)
+            }
+        }
+    }
+}
+
+/// A segment goes stale on a fragment once its carried column gains a data
+/// file there, and not when another column does, whether or not `fields`
+/// repeats the carried column.
+#[rstest]
+#[case::prune_stale_segment_coverage(SegmentFreshnessCheck::PruneStaleSegmentCoverage)]
+#[case::fresh_fragments(SegmentFreshnessCheck::FreshFragments)]
+#[tokio::test]
+async fn test_covering_dependency(#[case] check: SegmentFreshnessCheck) {
+    let test_dir = TempStrDir::default();
+    let reader = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("vector", array::rand_vec::<Float32Type>(8.into()))
+        .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+    let mut dataset = Dataset::write(reader, &test_dir, None).await.unwrap();
+    let built_at = dataset.manifest.version;
+    dataset
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("payload".into(), "id * 2".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let vector_field_id = dataset.schema().field_id("vector").unwrap();
+    for (carried, stale) in [("payload", true), ("id", false)] {
+        let carried_id = dataset.schema().field_id(carried).unwrap();
+        for fields in [vec![vector_field_id, carried_id], vec![vector_field_id]] {
+            let segment = IndexMetadata {
+                uuid: Uuid::new_v4(),
+                name: "vector_idx".to_string(),
+                fields: fields.clone(),
+                covering_fields: vec![carried_id],
+                dataset_version: built_at,
+                fragment_bitmap: Some(RoaringBitmap::from([0])),
+                index_details: Some(Arc::new(vector_index_details_default())),
+                index_version: IndexType::Vector.version(),
+                created_at: None,
+                base_id: None,
+                files: None,
+                clustering_id: None,
+                metadata: Default::default(),
+            };
+            assert_eq!(
+                check.marks_stale(&dataset, segment).await,
+                stale,
+                "{check:?}, fields {fields:?}: a segment carrying `{carried}` after \
+                 add_columns wrote `payload`"
+            );
+        }
+    }
 }

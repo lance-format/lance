@@ -173,7 +173,8 @@ impl RabitScanContext {
         self.index
             .prepare_partition_without_prefilter_wait(
                 partition_id,
-                &query,
+                Arc::new(query),
+                dist_q_c,
                 self.pre_filter.clone(),
                 self.metrics.as_ref(),
                 self.raw_query.clone(),

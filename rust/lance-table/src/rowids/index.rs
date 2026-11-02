@@ -1924,8 +1924,11 @@ mod tests {
         let live: Vec<u64> = (1000..3000u64)
             .filter(|v| !(1200..1900).contains(v))
             .collect();
-        let mut runs_sequence = RowIdSequence::from(live.as_slice());
-        assert!(runs_sequence.use_range_segments());
+        let runs_sequence = RowIdSequence::from(live.as_slice()).reencode();
+        assert!(matches!(
+            runs_sequence.segments(),
+            [crate::rowids::segment::U64Segment::Ranges { .. }]
+        ));
         let index = RowIdIndex::new(&[fragment(7, runs_sequence)]).unwrap();
         for (position, &row_id) in live.iter().enumerate() {
             assert_eq!(

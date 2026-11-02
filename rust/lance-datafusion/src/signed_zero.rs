@@ -353,6 +353,18 @@ fn equivalent_encodings(value: &ScalarValue) -> Option<(ScalarValue, ScalarValue
     }
 }
 
+/// Both sign encodings of a floating-point zero, negative first.
+///
+/// Returns `None` for anything else, including NULL, NaN, and integer zero.
+pub fn zero_encodings(value: &ScalarValue) -> Option<(ScalarValue, ScalarValue)> {
+    match value {
+        Float16(Some(v)) if v.is_zero() => equivalent_encodings(value),
+        Float32(Some(v)) if *v == 0.0 => equivalent_encodings(value),
+        Float64(Some(v)) if *v == 0.0 => equivalent_encodings(value),
+        _ => None,
+    }
+}
+
 fn is_nan(value: &ScalarValue) -> bool {
     match value {
         Float16(Some(v)) => v.is_nan(),

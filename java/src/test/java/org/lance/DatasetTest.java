@@ -18,6 +18,7 @@ import org.lance.file.FileWriteOptions;
 import org.lance.index.Index;
 import org.lance.index.IndexCriteria;
 import org.lance.index.IndexDescription;
+import org.lance.index.IndexFragmentCoverage;
 import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
@@ -2713,6 +2714,33 @@ public class DatasetTest {
             desc.getSegments().get(0).getSizeBytes(),
             desc.getTotalSizeBytes(),
             "single-segment size should equal the logical index size");
+        IndexFragmentCoverage coverage =
+            desc.getFragmentCoverage().orElseThrow(AssertionError::new);
+        assertTrue(coverage.getCurrentFragmentCount() > 0);
+        assertEquals(coverage.getCurrentFragmentCount(), coverage.getCoveredFragmentCount());
+        assertEquals(0, coverage.getMissingFragmentCount());
+        assertEquals(0, coverage.getStaleFragmentCount());
+        assertTrue(coverage.getFragmentBitmapSizeBytes() > 0);
+        assertEquals(1.0, coverage.getCoverageRatio().orElseThrow(AssertionError::new));
+
+        List<IndexDescription> summaries = dataset.describeIndexSummaries(criteria);
+        assertEquals(1, summaries.size());
+        IndexDescription summary = summaries.get(0);
+        assertEquals(desc.getName(), summary.getName());
+        assertEquals(desc.getRowsIndexed(), summary.getRowsIndexed());
+        assertEquals(desc.getTotalSizeBytes(), summary.getTotalSizeBytes());
+        assertTrue(summary.getSegments().isEmpty());
+        IndexFragmentCoverage summaryCoverage =
+            summary.getFragmentCoverage().orElseThrow(AssertionError::new);
+        assertEquals(coverage.getCoveredFragmentCount(), summaryCoverage.getCoveredFragmentCount());
+        assertEquals(coverage.getCurrentFragmentCount(), summaryCoverage.getCurrentFragmentCount());
+        assertEquals(coverage.getMissingFragmentCount(), summaryCoverage.getMissingFragmentCount());
+        assertEquals(coverage.getStaleFragmentCount(), summaryCoverage.getStaleFragmentCount());
+        assertEquals(
+            coverage.getFragmentBitmapSizeBytes(), summaryCoverage.getFragmentBitmapSizeBytes());
+        assertTrue(
+            new IndexFragmentCoverage(0, 0, 0, 0, 0).getCoverageRatio().isEmpty(),
+            "an empty fragment set has no coverage ratio");
 
         descriptions = dataset.describeIndices();
         assertEquals(2, descriptions.size(), "Expected exactly one matching index");
