@@ -1377,6 +1377,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Compression::Alp(description) => Ok(Box::new(
                 AlpMiniBlockDecompressor::from_description(description)?,
             )),
+            Compression::Pcodec(_) => Err(Error::not_supported_source(
+                "pcodec decoding is not yet implemented".into(),
+            )),
             Compression::General(general) => {
                 // Create inner decompressor
                 let inner_decompressor = self.create_miniblock_decompressor(
@@ -2196,6 +2199,7 @@ fn compression_name(compression: &Compression) -> &'static str {
         Compression::Range(_) => "range",
         Compression::Delta(_) => "delta",
         Compression::Alp(_) => "alp",
+        Compression::Pcodec(_) => "pcodec",
     }
 }
 

@@ -379,7 +379,8 @@ pub async fn can_use_binary_copy(
             if !binary_copy_files_match(fragments, version)? {
                 return Ok(false);
             }
-            super::optimize::can_use_binary_copy_current(dataset, options, fragments).await
+            super::optimize::execution::can_use_binary_copy_current(dataset, options, fragments)
+                .await
         }
     }
 }

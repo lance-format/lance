@@ -73,7 +73,7 @@ use crate::dataset::mem_wal::index::FtsMemQuery;
 use crate::dataset::mem_wal::index::IndexStore;
 use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::memtable::scanner::{MemTableScanner, local_fts_query};
-use crate::dataset::scanner::apply_dataset_planner_auto_fuzziness_compatibility_gate;
+use crate::dataset::scanner::fts::apply_dataset_planner_auto_fuzziness_compatibility_gate;
 use crate::index::scalar::inverted::{
     indexed_fts_document_granularities, indexed_fts_index_params, resolve_fts_field,
 };

@@ -2675,7 +2675,7 @@ mod tests {
     #[tokio::test]
     async fn a_scalar_build_uses_the_plugin_flush_params(#[case] deviation: Deviation) {
         use crate::dataset::mem_wal::index::test_plugin::wrapped_with_flush_params;
-        use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+        use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
         use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::btree::BTreeParameters;
         use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
