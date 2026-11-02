@@ -32,7 +32,7 @@ pub(crate) use corpus::SharedFtsScorer;
 pub use corpus::{FtsCorpusBinding, SharedFtsScorerExec};
 pub use document::FtsDocumentExec;
 pub use flat_combined_fields::{FlatCombinedFieldsExec, FlatStatsCoverage, FlatStatsScope};
-pub use flat_match::{FlatMatchFilterExec, FlatMatchQueryExec};
+pub use flat_match::{FlatMatchFilterExec, FlatMatchQueryExec, FtsFilterDocumentBinding};
 pub use match_query::MatchQueryExec;
 pub use phrase::PhraseQueryExec;
 pub use selection::{FTS_SEGMENT_BIND_DURATION_METRIC, FtsIndexMetrics};
