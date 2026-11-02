@@ -1858,6 +1858,10 @@ pub(crate) async fn commit_transaction(
     // latest version on every attempt below.
     let run_anchor =
         lance_table::format::clustering_run_anchor(transaction.transaction_properties.as_deref())?;
+    // A commit may also state table-metadata entries it relies on; they are
+    // judged against the version it would land on, on every attempt below.
+    let expected_metadata =
+        lance_table::format::expected_table_metadata(transaction.transaction_properties.as_deref());
     if let Some(anchor) = run_anchor {
         if anchor > read_version {
             return Err(Error::invalid_input(format!(
@@ -1945,6 +1949,10 @@ pub(crate) async fn commit_transaction(
                     refuse_restore_in_run_window(anchor, other_transaction, *other_version)?;
                 }
             }
+            lance_table::format::refuse_changed_expected_metadata(
+                &expected_metadata,
+                &dataset.manifest,
+            )?;
             // A cleaned-up version may have replaced a key field; an identity
             // window with a hole cannot be judged, so it is refused.
             if identity_fence.is_some() && !missing.is_empty() {

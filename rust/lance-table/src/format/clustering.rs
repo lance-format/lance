@@ -572,6 +572,68 @@ pub fn clustering_run_anchor(
     })
 }
 
+/// Prefix of the transaction properties that make a commit conditional on
+/// table metadata: `lance.commit.expect_table_metadata.<key>` = `<value>`
+/// says the commit holds only while `table_metadata[key]` is exactly
+/// `value` on the latest version. The condition is judged on every attempt,
+/// after the transaction is rebased over unrelated writes, and a mismatch (or
+/// an absent key) is a hard refusal, not a retryable conflict: the writer's
+/// premise is gone, and no re-read brings it back. Lance compares strings
+/// and interprets nothing else; a writer that keeps its state in table
+/// metadata (a clustering run's record, its latest pair) uses it to refuse
+/// its own late commit once another writer moved that state.
+pub const COMMIT_EXPECT_TABLE_METADATA_PREFIX: &str = "lance.commit.expect_table_metadata.";
+
+/// The `(key, expected value)` pairs a transaction's properties declare under
+/// [`COMMIT_EXPECT_TABLE_METADATA_PREFIX`], in key order.
+pub fn expected_table_metadata(
+    properties: Option<&std::collections::HashMap<String, String>>,
+) -> Vec<(String, String)> {
+    let mut expected: Vec<(String, String)> = properties
+        .map(|properties| {
+            properties
+                .iter()
+                .filter_map(|(property, value)| {
+                    property
+                        .strip_prefix(COMMIT_EXPECT_TABLE_METADATA_PREFIX)
+                        .filter(|key| !key.is_empty())
+                        .map(|key| (key.to_string(), value.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    expected.sort();
+    expected
+}
+
+/// Refuse a commit whose expected table-metadata entries no longer hold on
+/// `manifest`, the version the commit would land on.
+pub fn refuse_changed_expected_metadata(
+    expected: &[(String, String)],
+    manifest: &Manifest,
+) -> Result<()> {
+    for (key, value) in expected {
+        match manifest.table_metadata.get(key) {
+            Some(actual) if actual == value => {}
+            Some(actual) => {
+                return Err(Error::invalid_input(format!(
+                    "commit refused: table metadata '{key}' is '{actual}', not the expected \
+                     '{value}'; the writer's premise no longer holds on version {}",
+                    manifest.version
+                )));
+            }
+            None => {
+                return Err(Error::invalid_input(format!(
+                    "commit refused: table metadata '{key}' is absent, not the expected \
+                     '{value}'; the writer's premise no longer holds on version {}",
+                    manifest.version
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl From<&ClusteringDefinition> for pb::Clustering {
     fn from(definition: &ClusteringDefinition) -> Self {
         Self {
