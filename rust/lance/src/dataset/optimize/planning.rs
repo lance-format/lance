@@ -616,6 +616,7 @@ pub struct DefaultCompactionPlanner {
     options: CompactionOptions,
     excluded_fragment_ids: RoaringBitmap,
     can_replace_vector_segments: bool,
+    byte_aware_consolidation: bool,
 }
 
 impl DefaultCompactionPlanner {
@@ -626,7 +627,17 @@ impl DefaultCompactionPlanner {
             options,
             excluded_fragment_ids,
             can_replace_vector_segments: false,
+            byte_aware_consolidation: false,
         })
+    }
+
+    /// Leave byte-full fragments out of ordinary consolidation.
+    ///
+    /// Deletion and overlay rewrites remain eligible. Unknown sizes retain
+    /// row-only behavior. See [`super::consolidation`] for measurement details.
+    pub fn with_byte_aware_consolidation(mut self) -> Self {
+        self.byte_aware_consolidation = true;
+        self
     }
 
     /// Select the publication contract used by this plan. Without an explicit
@@ -674,7 +685,15 @@ impl DefaultCompactionPlanner {
             && metrics.deletion_percentage() > self.options.materialize_deletions_threshold
         {
             Some(CompactionCandidacy::CompactItself)
-        } else if metrics.physical_rows < self.options.target_rows_per_fragment {
+        } else if metrics.physical_rows < self.options.target_rows_per_fragment
+            && (!self.byte_aware_consolidation
+                || super::consolidation::needs_consolidation(
+                    metrics.physical_rows as u64,
+                    super::consolidation::fragment_file_bytes(fragment, schema_field_ids),
+                    self.options.target_rows_per_fragment,
+                    self.options.max_bytes_per_file,
+                ))
+        {
             // Worth compacting only with neighbors, to make a larger fragment.
             Some(CompactionCandidacy::CompactWithNeighbors)
         } else {

@@ -94,6 +94,7 @@ use tracing::info;
 
 pub(super) mod binary_copy;
 pub(crate) mod commit;
+pub mod consolidation;
 pub(crate) mod execution;
 mod planning;
 pub mod remapping;
