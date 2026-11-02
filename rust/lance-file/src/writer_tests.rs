@@ -2888,25 +2888,27 @@ mod tests {
     }
 
     #[rstest]
-    #[case::narrow_f32(DataType::Float32, vec![3], None)]
-    #[case::nested_f64(DataType::Float64, vec![4, 4], None)]
-    #[case::wide_f64(DataType::Float64, vec![64], None)]
-    #[case::scalar_f64(DataType::Float64, vec![], None)]
+    #[case::narrow_f32(DataType::Float32, vec![3], None, 5000)]
+    #[case::nested_f64(DataType::Float64, vec![4, 4], None, 5000)]
+    #[case::wide_f64(DataType::Float64, vec![64], None, 5000)]
+    // Rows wider than half a chunk still need two rows per non-final chunk.
+    #[case::very_wide_f64(DataType::Float64, vec![4096], None, 7)]
+    #[case::scalar_f64(DataType::Float64, vec![], None, 5000)]
     // Few distinct values would otherwise be dictionary encoded.
-    #[case::few_levels_f64(DataType::Float64, vec![], Some(4))]
-    #[case::few_levels_vector_f64(DataType::Float64, vec![8], Some(4))]
+    #[case::few_levels_f64(DataType::Float64, vec![], Some(4), 5000)]
+    #[case::few_levels_vector_f64(DataType::Float64, vec![8], Some(4), 5000)]
     #[tokio::test]
     async fn test_v2_3_pcodec_round_trip(
         #[case] item_type: DataType,
         #[case] dims: Vec<i32>,
         #[case] num_levels: Option<usize>,
+        #[case] num_rows: usize,
     ) {
         use futures::TryStreamExt;
         use lance_encoding::constants::COMPRESSION_META_KEY;
         use lance_encoding::decoder::FilterExpression;
         use lance_io::ReadBatchParams;
 
-        let num_rows = 5000;
         let dimension = dims.iter().product::<i32>() as usize;
         let values = pcodec_trajectory(num_rows, dimension, num_levels);
         let mut array: ArrayRef = match item_type {
@@ -2985,7 +2987,11 @@ mod tests {
         };
         let full = read(ReadBatchParams::RangeFull).await;
         assert_eq!(full.to_data(), array.to_data());
-        for row in [0_u32, 1, 2, 1023, 1024, 4999] {
+        let last_row = num_rows as u32 - 1;
+        for row in [0, 1, 2, 1023, 1024, last_row]
+            .into_iter()
+            .filter(|r| *r <= last_row)
+        {
             let taken = read(ReadBatchParams::Indices(arrow_array::UInt32Array::from(
                 vec![row],
             )))
