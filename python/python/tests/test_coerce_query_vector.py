@@ -7,7 +7,7 @@ raise TypeError instead of falling into the numpy conversion branch."""
 import numpy as np
 import pyarrow as pa
 import pytest
-from lance.dataset import _coerce_query_vector
+from lance._dataset.scanner import _coerce_query_vector
 
 
 class TestCoerceQueryVectorInvalidTypes:
