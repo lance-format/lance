@@ -115,10 +115,10 @@ test_data/venv
 docs/src/format/catalog/**
 docs/src/format/namespace/**
 docs/src/format/layout.png
+docs/src/guide/spark/**
 docs/src/integrations/duckdb/**
 docs/src/integrations/huggingface/**
 docs/src/integrations/ray/**
-docs/src/integrations/spark/**
 docs/src/integrations/trino/**
 docs/src/community/project-specific/.pages
 docs/src/community/project-specific/lance/**

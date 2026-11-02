@@ -246,8 +246,8 @@ else
     warn_missing_repo "Lance HuggingFace docs" "$huggingface_repo/docs/src"
 fi
 
-if copy_docs_dir "$spark_repo/docs/src" "$docs_src/integrations/spark"; then
-    python3 - <<'PY' "$docs_src/integrations/spark/operations/ddl/create-index.md"
+if copy_docs_dir "$spark_repo/docs/src" "$docs_src/guide/spark"; then
+    python3 - <<'PY' "$docs_src/guide/spark/operations/ddl/create-index.md"
 from pathlib import Path
 import sys
 
@@ -256,7 +256,6 @@ if path.exists():
     text = path.read_text()
     path.write_text(text.replace('https://lance.org/format/table/index/scalar/fts/#tokenizers', 'https://lance.org/format/index/scalar/fts/#tokenizers'))
 PY
-    integration_entries+=("  - Apache Spark: spark")
 else
     warn_missing_repo "Lance Spark docs" "$spark_repo/docs/src"
 fi
