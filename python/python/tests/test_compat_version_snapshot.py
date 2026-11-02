@@ -29,12 +29,7 @@ def _fetch_stable_versions():
     return sorted(Version(v) for v in ["6.0.0", "7.0.0", *extra])
 
 
-def _fetch_last_beta_release():
-    return "7.1.0b1"
-
-
 compat_decorator._fetch_stable_versions = _fetch_stable_versions
-compat_decorator._fetch_last_beta_release = _fetch_last_beta_release
 """
 
 # Not run with --run-compat: the generated cases stay collected but skipped, which
