@@ -519,6 +519,8 @@ async fn test_index_withdraws_a_folded_overlay(#[case] fold: Fold, #[case] same_
 enum Racing {
     UpdateInPlace,
     FoldOverlay,
+    Overlay,
+    OverlayThenDelete,
     /// An in-place update, then cleanup of the compaction's version.
     UpdateAndCleanUpCompaction,
     /// The remap job trims the compaction's record.
@@ -531,6 +533,8 @@ enum Racing {
 #[rstest]
 #[case::update_in_place(Racing::UpdateInPlace)]
 #[case::fold_overlay(Racing::FoldOverlay)]
+#[case::overlay(Racing::Overlay)]
+#[case::overlay_then_delete(Racing::OverlayThenDelete)]
 #[case::update_and_clean_up_compaction(Racing::UpdateAndCleanUpCompaction)]
 #[case::remap_and_trim(Racing::RemapAndTrim)]
 #[tokio::test]
@@ -549,6 +553,13 @@ async fn test_index_retry_accounts_for_a_compaction_already_checked(#[case] raci
         let mut table = open_in_new_session(&hook_uri).await;
         let compaction = table.manifest.version;
         match racing {
+            Racing::Overlay | Racing::OverlayThenDelete => {
+                let fragment = fragment_of(&hook_uri, 0).await as u64;
+                let mut table = overlay_val(table, fragment, 999).await;
+                if matches!(racing, Racing::OverlayThenDelete) {
+                    table.delete("id = 0").await.unwrap();
+                }
+            }
             Racing::UpdateInPlace => update_in_place(table, vec![0], vec![999]).await,
             Racing::FoldOverlay => {
                 let fragment = fragment_of(&hook_uri, 0).await as u64;
@@ -587,7 +598,9 @@ async fn test_index_retry_accounts_for_a_compaction_already_checked(#[case] raci
         let live = live_fragments(&uri).await;
         assert!(coverage(&uri, "val_idx").await.is_disjoint(&live));
     } else {
-        assert_covers_all_but_the_fragment_of(&uri, Some(0)).await;
+        let withdrawn =
+            (!matches!(racing, Racing::Overlay | Racing::OverlayThenDelete)).then_some(0);
+        assert_covers_all_but_the_fragment_of(&uri, withdrawn).await;
     }
 }
 

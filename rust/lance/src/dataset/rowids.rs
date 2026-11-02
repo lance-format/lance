@@ -523,6 +523,7 @@ mod test {
 
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::index::DatasetIndexExt;
+    use crate::index::visibility::IndexVisibility;
     use crate::session::Session;
     use crate::utils::test::{DatagenExt, FailingProxyStore, FragmentCount, FragmentRowCount};
     use arrow_array::cast::AsArray;
@@ -744,7 +745,23 @@ mod test {
                 .contains("injected deletion-vector read failure")
         );
 
+        let visibility = IndexVisibility::from_physical_rows(
+            Arc::new(dataset.clone()),
+            HashMap::from([(0, [4].into_iter().collect())]),
+        );
+        let error = visibility.block_mask().await.unwrap_err();
+        assert!(matches!(&error, Error::IO { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("injected deletion-vector read failure")
+        );
+
         failing_store.clear_fail_when("get_opts", "_deletions");
+        assert_eq!(
+            visibility.result_rows().await.unwrap(),
+            &RowAddrTreeMap::from_iter([4])
+        );
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(2).unwrap().is_some());
         assert!(index.get(3).unwrap().is_none());

@@ -10,10 +10,10 @@
 //! the consumer. Deletions remain the responsibility of the read and prefilter.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use futures::FutureExt;
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, ready};
 use lance_core::Result;
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::overlay::staleness::{
@@ -34,8 +34,14 @@ use crate::index::scalar_logical::load_named_scalar_segments;
 pub struct IndexVisibility {
     dataset: Arc<Dataset>,
     physical_rows: HashMap<u32, RoaringBitmap>,
-    result_rows: OnceCell<RowAddrTreeMap>,
+    result_rows: ResultRows,
     has_stale_unknown_coverage: bool,
+}
+
+enum ResultRows {
+    // Address selections need no I/O and must not wait for async task budget.
+    Addresses(OnceLock<RowAddrTreeMap>),
+    StableIds(OnceCell<RowAddrTreeMap>),
 }
 
 impl IndexVisibility {
@@ -45,45 +51,58 @@ impl IndexVisibility {
         fragments: &[Fragment],
     ) -> Result<Self> {
         let overlaid = overlaid_fragments(fragments);
-        let mut physical_rows = HashMap::new();
-        let mut has_stale_unknown_coverage = false;
-        if !overlaid.is_empty() {
-            for segment in segments {
-                if segment.fragment_bitmap.is_none() {
-                    let mut stale = HashMap::new();
-                    collect_overlay_stale_rows_for_segment(
-                        segment,
-                        &overlaid,
-                        &mut stale,
-                        dataset.schema(),
-                    )?;
-                    has_stale_unknown_coverage |= !stale.is_empty();
-                    for (fragment, offsets) in stale {
-                        *physical_rows.entry(fragment).or_default() |= offsets;
-                    }
-                    continue;
-                }
+        let mut plan = Self::from_physical_rows(dataset, HashMap::new());
+        plan.collect_segments(segments, &overlaid)?;
+        Ok(plan)
+    }
+
+    // Construction only: the result-domain selection has not been initialized.
+    fn collect_segments(
+        &mut self,
+        segments: &[IndexMetadata],
+        overlaid: &HashMap<u32, &Fragment>,
+    ) -> Result<()> {
+        if overlaid.is_empty() {
+            return Ok(());
+        }
+        for segment in segments {
+            if segment.fragment_bitmap.is_none() {
+                let mut stale = HashMap::new();
                 collect_overlay_stale_rows_for_segment(
                     segment,
-                    &overlaid,
-                    &mut physical_rows,
-                    dataset.schema(),
+                    overlaid,
+                    &mut stale,
+                    self.dataset.schema(),
+                )?;
+                self.has_stale_unknown_coverage |= !stale.is_empty();
+                for (fragment, offsets) in stale {
+                    *self.physical_rows.entry(fragment).or_default() |= offsets;
+                }
+            } else {
+                collect_overlay_stale_rows_for_segment(
+                    segment,
+                    overlaid,
+                    &mut self.physical_rows,
+                    self.dataset.schema(),
                 )?;
             }
         }
-        let mut plan = Self::from_physical_rows(dataset, physical_rows);
-        plan.has_stale_unknown_coverage = has_stale_unknown_coverage;
-        Ok(plan)
+        Ok(())
     }
 
     pub(crate) fn from_physical_rows(
         dataset: Arc<Dataset>,
         physical_rows: HashMap<u32, RoaringBitmap>,
     ) -> Self {
+        let result_rows = if dataset.manifest().uses_stable_row_ids() {
+            ResultRows::StableIds(OnceCell::new())
+        } else {
+            ResultRows::Addresses(OnceLock::new())
+        };
         Self {
             dataset,
             physical_rows,
-            result_rows: OnceCell::new(),
+            result_rows,
             has_stale_unknown_coverage: false,
         }
     }
@@ -96,20 +115,42 @@ impl IndexVisibility {
         fragments: &[Fragment],
         segment_uuids: Option<&HashSet<Uuid>>,
     ) -> Result<Self> {
-        if fragments
+        let overlaid = overlaid_fragments(fragments);
+        let mut plan = Self::from_physical_rows(dataset, HashMap::new());
+        if overlaid.is_empty() {
+            return Ok(plan);
+        }
+        // Scalar expressions and composite key probes require every selected
+        // leaf to cover a fragment. Anything else is already read in full by
+        // their fallback, and must not also receive stale-row replay.
+        let mut covered: RoaringBitmap = fragments
             .iter()
-            .all(|fragment| fragment.overlays.is_empty())
-        {
-            return Ok(Self::from_physical_rows(dataset, HashMap::new()));
-        }
-        let mut selected = Vec::new();
+            .map(|fragment| fragment.id as u32)
+            .collect();
         for &(column, name) in indices {
-            let segments = load_named_scalar_segments(&dataset, column, name).await?;
-            selected.extend(segments.into_iter().filter(|segment| {
-                segment_uuids.is_none_or(|selected| selected.contains(&segment.uuid))
-            }));
+            let mut segments = load_named_scalar_segments(&plan.dataset, column, name).await?;
+            if let Some(segment_uuids) = segment_uuids {
+                segments.retain(|segment| segment_uuids.contains(&segment.uuid));
+            }
+            // Unknown historical coverage remains conservative, rather than
+            // being interpreted as an empty fragment set.
+            if segments
+                .iter()
+                .all(|segment| segment.fragment_bitmap.is_some())
+            {
+                let mut leaf_coverage = RoaringBitmap::new();
+                for segment in &segments {
+                    if let Some(coverage) = &segment.fragment_bitmap {
+                        leaf_coverage |= coverage;
+                    }
+                }
+                covered &= leaf_coverage;
+            }
+            plan.collect_segments(&segments, &overlaid)?;
         }
-        Self::from_segments(dataset, &selected, fragments)
+        plan.physical_rows
+            .retain(|fragment, _| covered.contains(*fragment));
+        Ok(plan)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -138,19 +179,29 @@ impl IndexVisibility {
     /// IDs in the domain emitted by index evaluation. Translation retains the
     /// physical offset positions of deleted slots in stable-ID sequences.
     pub(crate) fn result_rows(&self) -> BoxFuture<'_, Result<&RowAddrTreeMap>> {
-        async move {
-            let load = async {
-                let physical = self.physical_selection();
-                if self.is_empty() || !self.dataset.manifest().uses_stable_row_ids() {
-                    Ok(physical)
-                } else {
-                    translate_addr_treemap_to_row_ids(&self.dataset, &physical).await
-                }
+        match &self.result_rows {
+            ResultRows::Addresses(cache) => {
+                ready(Ok(cache.get_or_init(|| self.physical_selection()))).boxed()
             }
-            .boxed();
-            self.result_rows.get_or_try_init(|| load).await
+            ResultRows::StableIds(cache) => {
+                if let Some(rows) = cache.get() {
+                    return ready(Ok(rows)).boxed();
+                }
+                async move {
+                    let load = async {
+                        let physical = self.physical_selection();
+                        if self.is_empty() {
+                            Ok(physical)
+                        } else {
+                            translate_addr_treemap_to_row_ids(&self.dataset, &physical).await
+                        }
+                    }
+                    .boxed();
+                    cache.get_or_try_init(|| load).await
+                }
+                .boxed()
+            }
         }
-        .boxed()
     }
 
     pub(crate) async fn block_mask(&self) -> Result<Option<RowAddrMask>> {
@@ -160,5 +211,44 @@ impl IndexVisibility {
         Ok(Some(RowAddrMask::from_block(
             self.result_rows().await?.clone(),
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::task::Poll;
+
+    use arrow_array::types::UInt32Type;
+    use futures::future::poll_fn;
+    use lance_datagen::{BatchCount, RowCount, array, gen_batch};
+    use tokio::task::coop::poll_proceed;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn address_selection_does_not_wait_for_async_budget() {
+        let reader = gen_batch()
+            .col("value", array::step::<UInt32Type>())
+            .into_reader_rows(RowCount::from(4), BatchCount::from(1));
+        let dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+        let plan = IndexVisibility::from_physical_rows(
+            Arc::new(dataset),
+            HashMap::from([(0, [1].into_iter().collect())]),
+        );
+        poll_fn(|context| {
+            while let Poll::Ready(guard) = poll_proceed(context) {
+                guard.made_progress();
+            }
+            // Address-domain selection only copies in-memory metadata. It must
+            // not add a scheduler round trip before an indexed read can start.
+            let rows = plan
+                .result_rows()
+                .now_or_never()
+                .expect("address-domain visibility must be ready even without async task budget")
+                .unwrap();
+            assert_eq!(rows, &RowAddrTreeMap::from_iter([1]));
+            Poll::Ready(())
+        })
+        .await;
     }
 }

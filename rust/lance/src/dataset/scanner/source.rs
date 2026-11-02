@@ -436,7 +436,9 @@ impl Scanner {
         // and re-evaluate them on a targeted take path below — O(stale_rows), not O(fragment).
         let mut overlay_stale_rows =
             IndexVisibility::from_physical_rows(self.dataset.clone(), HashMap::new());
-        if let Some(index_query) = filter_plan.index_query.as_ref() {
+        // An external mask is already the row source and reads current values.
+        // It has no stale index entries to exclude or replay outside that mask.
+        if !use_external_mask && let Some(index_query) = filter_plan.index_query.as_ref() {
             let candidate_frags = read_options
                 .fragments
                 .clone()
@@ -765,17 +767,10 @@ impl Scanner {
                 }
             }
         }
-        // A fragment already read in full must not also contribute a stale-row replay.
-        let covered = self.fragments_covered_by_index_query(index_expr).await?;
-        let fragments = fragments
-            .iter()
-            .filter(|fragment| covered.contains(fragment.id as u32))
-            .cloned()
-            .collect::<Vec<_>>();
         IndexVisibility::for_scalar_indices(
             self.dataset.clone(),
             &searches,
-            &fragments,
+            fragments,
             self.scalar_index_selection
                 .as_ref()
                 .and_then(|selection| selection.segment_uuids.as_deref()),

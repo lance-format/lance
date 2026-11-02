@@ -45,7 +45,7 @@ use crate::Dataset;
 use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
 use crate::dataset::scanner::{RowAddrMask, RowAddrTreeMap};
 use crate::dataset::transaction::{DataOverlayGroup, Operation};
-use crate::dataset::{WriteDestination, WriteParams};
+use crate::dataset::{UpdateBuilder, WriteDestination, WriteParams};
 use crate::index::frag_reuse_reader::tests::persist_fixture;
 use crate::index::vector::VectorIndexParams;
 use crate::index::{CreateIndexBuilder, DatasetIndexExt, loading::DatasetIndexInternalExt};
@@ -484,12 +484,71 @@ async fn test_overlay_replay_does_not_duplicate_uncovered_fragments(
     assert_ids_match_oracle(&dataset, "age = 999 OR id = 7", &[2, 7]).await;
 }
 
+#[rstest]
+#[tokio::test]
+async fn test_selected_scalar_segments_use_their_own_overlay_watermarks(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
+    let params = ScalarIndexParams::default();
+    let old = CreateIndexBuilder::new(&mut dataset, &["age"], IndexType::BTree, &params)
+        .name("age_idx".into())
+        .fragments(vec![0])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    dataset = overlay_age(dataset, "old_segment", 0, &[(1, Some(999))]).await;
+    dataset = overlay_age(dataset, "new_segment", 1, &[(2, Some(888))]).await;
+    let new = CreateIndexBuilder::new(&mut dataset, &["age"], IndexType::BTree, &params)
+        .name("age_idx".into())
+        .fragments(vec![1])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    dataset
+        .commit_existing_index_segments("age_idx", "age", vec![old, new])
+        .await
+        .unwrap();
+    let segments = dataset.load_indices_by_name("age_idx").await.unwrap();
+    assert_eq!(segments.len(), 2);
+    assert_ne!(segments[0].dataset_version, segments[1].dataset_version);
+    for segment in &segments {
+        let fragment = segment
+            .fragment_bitmap
+            .as_ref()
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap();
+        let (current, old) = if fragment == 0 { (999, 10) } else { (888, 80) };
+        for (value, expected) in [(current, 1), (old, 0)] {
+            assert_eq!(
+                dataset
+                    .count_indexed_rows(
+                        "age_idx",
+                        &format!("age = {value}"),
+                        Some(&[segment.uuid]),
+                        Some(&[fragment])
+                    )
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+    assert_ids_match_oracle(&dataset, "age = 999 OR age = 888", &[1, 8]).await;
+}
+
 /// The scalar-index stale-row replay is a second read branch. A physical row selection must
 /// constrain it too, otherwise an overlaid row outside the requested slice can be reintroduced.
 #[rstest]
+#[case::physical("physical")]
+#[case::allow("allow")]
+#[case::block("block")]
 #[tokio::test]
 async fn test_overlay_matches_respect_physical_row_selection(
     #[values(false, true)] stable_row_ids: bool,
+    #[case] selection: &str,
 ) {
     let mut dataset = create_base_dataset_with(stable_row_ids).await;
     build_age_index(&mut dataset).await;
@@ -506,8 +565,21 @@ async fn test_overlay_matches_respect_physical_row_selection(
 
     let unselected_row_addr = u64::from(RowAddress::new_from_parts(0, 2));
     let mut scanner = dataset.scan();
+    match selection {
+        "physical" => {
+            scanner
+                .with_physical_row_addr_prefilter(RowAddrTreeMap::from_iter([unselected_row_addr]));
+        }
+        "allow" => {
+            scanner
+                .with_row_id_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([2])));
+        }
+        "block" => {
+            scanner.with_row_id_prefilter(RowAddrMask::from_block(RowAddrTreeMap::from_iter([1])));
+        }
+        _ => unreachable!(),
+    }
     scanner
-        .with_physical_row_addr_prefilter(RowAddrTreeMap::from_iter([unselected_row_addr]))
         .filter("age = 999")
         .unwrap()
         .project(&["id"])
@@ -516,8 +588,20 @@ async fn test_overlay_matches_respect_physical_row_selection(
 
     let updated_row_addr = u64::from(RowAddress::new_from_parts(0, 1));
     let mut scanner = dataset.scan();
+    match selection {
+        "physical" => {
+            scanner.with_physical_row_addr_prefilter(RowAddrTreeMap::from_iter([updated_row_addr]));
+        }
+        "allow" => {
+            scanner
+                .with_row_id_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([1])));
+        }
+        "block" => {
+            scanner.with_row_id_prefilter(RowAddrMask::from_block(RowAddrTreeMap::from_iter([2])));
+        }
+        _ => unreachable!(),
+    }
     scanner
-        .with_physical_row_addr_prefilter(RowAddrTreeMap::from_iter([updated_row_addr]))
         .filter("age = 999")
         .unwrap()
         .project(&["id"])
@@ -1281,11 +1365,12 @@ async fn test_overlay_stale_with_compound_index_expression() {
 /// Here `age` is indexed and overlaid (id=1: age 10 -> 999); the update sets the non-indexed
 /// `id` column on that row. After it, `age = 10` must stay dropped and `age = 999` must still
 /// find the row — otherwise the stale index entry has resurfaced.
+#[rstest]
 #[tokio::test]
-async fn test_update_nonindexed_column_preserves_overlay_masking() {
-    use crate::dataset::UpdateBuilder;
-
-    let mut dataset = create_base_dataset_with(true).await;
+async fn test_update_nonindexed_column_preserves_overlay_masking(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
     build_age_index(&mut dataset).await;
 
     // Overlay fragment 0, offset 1 (id=1): age 10 -> 999, committed after the index.
@@ -1332,6 +1417,40 @@ async fn test_update_nonindexed_column_preserves_overlay_masking() {
     );
     // A row untouched by the overlay is unaffected.
     assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
+
+    let mut dataset = dataset.as_ref().clone();
+    dataset.delete("id = 2").await.unwrap();
+    assert_ids_match_oracle(&dataset, "age = 10 OR age = 20", &[]).await;
+    assert_ids_match_oracle(&dataset, "age = 999", &[100]).await;
+    // Once compaction materializes the overlays, coverage must remain honest
+    // without the overlay metadata that previously masked the stale entry.
+    for _ in 0..2 {
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 32,
+                max_overlays_per_fragment: Some(0),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset
+                .fragments()
+                .iter()
+                .all(|fragment| fragment.overlays.is_empty())
+        );
+        assert_ids_match_oracle(&dataset, "age = 10 OR age = 20", &[]).await;
+        assert_ids_match_oracle(&dataset, "age = 999", &[100]).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(10))
+            .await
+            .unwrap();
+        assert_ids_match_oracle(&dataset, "age = 10 OR age = 20", &[]).await;
+        assert_ids_match_oracle(&dataset, "age = 999", &[100]).await;
+    }
 }
 
 /// Text dataset: two fragments, 6 rows each. Schema: id (Int32), text (Utf8).
