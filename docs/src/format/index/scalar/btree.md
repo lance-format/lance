@@ -374,7 +374,7 @@ Index version 2 keeps released readers from using an index with a
 updating a table with stable row IDs. Their update adds the fragment that
 receives the rewritten rows to the index's `fragment_bitmap`, although the
 index holds no row address in that fragment. A table with such an index
-therefore sets `FLAG_BTREE_KEY_LAYOUT` (`2^19`) in its writer
+therefore sets `FLAG_BTREE_KEY_LAYOUT` (`2^20`) in its writer
 [feature flags](../../table/versioning.md#current-feature-flags), and not in its
 reader feature flags. The index version fences readers from v10.0.0 on, and the
 flag fences writers from v12.0.0 on.
