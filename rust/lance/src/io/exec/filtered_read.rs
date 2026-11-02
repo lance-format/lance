@@ -4049,7 +4049,7 @@ mod tests {
 
     use crate::{
         dataset::{InsertBuilder, WriteDestination, WriteMode, WriteParams},
-        index::DatasetIndexInternalExt,
+        index::loading::DatasetIndexInternalExt,
         io::exec::scalar_index::ScalarIndexExec,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount},
     };

@@ -43,11 +43,12 @@ use lance_select::RowAddrMask;
 use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 
+use crate::index::DatasetIndexExt;
+use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::scalar_logical::scalar_index_fragment_bitmap;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use crate::io::exec::knn::{
     BatchRefineExec, KnnBatchParams, MultivectorScoringExec, QUERY_INDEX_COL,
     knn_empty_result_schema, new_knn_batch_exec, new_knn_exec,
@@ -247,7 +248,8 @@ impl Scanner {
                 // older writers drop, so it would widen to the carried columns exactly
                 // when the declaration is lost.
                 let candidates = indices.iter().filter(|i| {
-                    i.fields.first() == Some(&column_id) && crate::index::index_type_is_known(i)
+                    i.fields.first() == Some(&column_id)
+                        && crate::index::segment::index_type_is_known(i)
                 });
 
                 // A column may carry several vector indices with different metrics. The
@@ -1048,7 +1050,8 @@ impl Scanner {
             let column_id = self.dataset.schema().field_id(&q.column)?;
             let indices = self.dataset.load_indices().await?;
             if let Some(index) = indices.iter().find(|index| {
-                index.fields.first() == Some(&column_id) && crate::index::index_type_is_known(index)
+                index.fields.first() == Some(&column_id)
+                    && crate::index::segment::index_type_is_known(index)
             }) {
                 let index_metric = if let Some(metric) =
                     crate::index::vector::details::metric_type_from_index_metadata(index)

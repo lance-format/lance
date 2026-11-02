@@ -28,7 +28,8 @@ use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
 
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use crate::index::DatasetIndexExt;
+use crate::index::loading::DatasetIndexInternalExt;
 use crate::io::exec::knn::knn_empty_result_schema;
 use crate::io::exec::{
     FilterPlan as ExprFilterPlan, FlatMinHashExec, LanceFilterExec, MinHashSearchExec, Planner,
