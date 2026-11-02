@@ -23,7 +23,9 @@ identifies the store; its cardinality is controlled by the
 - `off` — omit the `base` label entirely.
 
 `operation` is one of `get`, `put`, `put_part`, `head`, `list`, `delete`,
-`copy`, `rename`, `complete_multipart`, or `abort_multipart`.
+`copy`, `rename`, `create_multipart`, `complete_multipart`, or
+`abort_multipart`. A multipart upload reports `create_multipart`, one
+`put_part` per part, and then `complete_multipart` or `abort_multipart`.
 
 Request counts are per logical operation: a `list` or `delete` that spans many
 objects is one request, matching how backends batch them.

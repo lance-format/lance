@@ -11,12 +11,13 @@ use async_trait::async_trait;
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::RequestId;
-use aws_sdk_dynamodb::operation::delete_item::builders::DeleteItemFluentBuilder;
 use aws_sdk_dynamodb::operation::{
     get_item::builders::GetItemFluentBuilder, put_item::builders::PutItemFluentBuilder,
     query::builders::QueryFluentBuilder,
 };
-use aws_sdk_dynamodb::types::{AttributeValue, KeyType};
+use aws_sdk_dynamodb::types::{
+    AttributeDefinition, AttributeValue, DeleteRequest, KeyType, WriteRequest,
+};
 use object_store::path::Path;
 use snafu::OptionExt;
 use tokio::sync::RwLock;
@@ -25,6 +26,7 @@ use tracing::warn;
 use crate::io::commit::external_manifest::ExternalManifestStore;
 use lance_core::error::NotFoundSnafu;
 use lance_core::error::box_error;
+use lance_core::utils::backoff::Backoff;
 use lance_core::{Error, Result};
 
 use super::ManifestLocation;
@@ -102,6 +104,10 @@ where
 /// path -- string
 /// committer -- string
 ///
+/// The credentials need `dynamodb:DescribeTable` for that check, `GetItem`,
+/// `PutItem` and `Query` for the commit protocol, and `BatchWriteItem` for
+/// [`ExternalManifestStore::delete`], which removes a dataset's rows in batches.
+///
 /// Consistency: This store is expected to have read-after-write consistency
 /// consistent_read should always be set to true
 ///
@@ -157,6 +163,70 @@ fn parse_size_attribute(item: &HashMap<String, AttributeValue>) -> Result<Option
             "dynamodb error: could not parse the size returned {size}, error: {e}"
         ))
     })
+}
+
+/// The maximum number of write requests `BatchWriteItem` accepts.
+const BATCH_WRITE_ITEM_LIMIT: usize = 25;
+
+/// How many times to re-send the rows `BatchWriteItem` reports as unprocessed
+/// before giving up and reporting them.
+const MAX_BATCH_WRITE_ATTEMPTS: u32 = 8;
+
+/// Check that the table's key attributes have the types this store writes.
+///
+/// The key schema check only compares names, and the range key's type decides
+/// how DynamoDB orders it. [`DynamoDBExternalManifestStore::get_latest_manifest_location`]
+/// takes the first row of a descending scan, so a string-typed version orders
+/// "9" above "12" and silently resolves the wrong latest version.
+fn validate_key_attribute_types(
+    table_name: &str,
+    attribute_definitions: Option<&[AttributeDefinition]>,
+) -> Result<()> {
+    let declared: HashMap<&str, &str> = attribute_definitions
+        .unwrap_or_default()
+        .iter()
+        .map(|def| (def.attribute_name.as_str(), def.attribute_type.as_str()))
+        .collect();
+    for (key, expected) in [(base_uri!(), "S"), (version!(), "N")] {
+        match declared.get(key) {
+            Some(actual) if *actual == expected => {}
+            Some(actual) => {
+                return Err(Error::io(format!(
+                    "dynamodb table: {table_name} key `{key}` must have attribute type \
+                     {expected}, but the table declares {actual}"
+                )));
+            }
+            None => {
+                return Err(Error::io(format!(
+                    "dynamodb table: {table_name} does not declare an attribute type for \
+                     key `{key}`, expected {expected}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build the delete requests for one page of manifest rows.
+///
+/// A row without a numeric `version` is not one this store wrote, so it is left
+/// alone rather than deleted on a guess.
+fn page_delete_requests(
+    base_uri: &str,
+    items: &[HashMap<String, AttributeValue>],
+) -> Result<Vec<WriteRequest>> {
+    let mut requests = Vec::with_capacity(items.len());
+    for item in items {
+        if let Some(AttributeValue::N(version)) = item.get(version!()) {
+            let delete = DeleteRequest::builder()
+                .key(base_uri!(), AttributeValue::S(base_uri.to_string()))
+                .key(version!(), AttributeValue::N(version.clone()))
+                .build()
+                .map_err(|e| Error::io(format!("failed to build DynamoDB delete request: {e}")))?;
+            requests.push(WriteRequest::builder().delete_request(delete).build());
+        }
+    }
+    Ok(requests)
 }
 
 impl DynamoDBExternalManifestStore {
@@ -233,6 +303,8 @@ impl DynamoDBExternalManifestStore {
             )));
         }
 
+        validate_key_attribute_types(table_name, table.attribute_definitions.as_deref())?;
+
         SANITY_CHECK_CACHE
             .write()
             .await
@@ -259,8 +331,43 @@ impl DynamoDBExternalManifestStore {
             .consistent_read(true)
     }
 
-    fn ddb_delete(&self) -> DeleteItemFluentBuilder {
-        self.client.delete_item().table_name(&self.table_name)
+    /// Send one `BatchWriteItem` and re-send whatever the service reports as
+    /// unprocessed.
+    ///
+    /// The client's retry policy does not cover these: the call succeeded, it
+    /// just did not do all of the work (a throttled table). Bounded with a
+    /// backoff so a throttled table reports what is left instead of spinning
+    /// against the service.
+    async fn batch_delete(&self, requests: &[WriteRequest]) -> Result<()> {
+        let mut pending = requests.to_vec();
+        let mut backoff = Backoff::default();
+        while !pending.is_empty() {
+            let request_items = HashMap::from([(self.table_name.clone(), pending)]);
+            let result = self
+                .client
+                .batch_write_item()
+                .set_request_items(Some(request_items))
+                .send()
+                .await
+                .wrap_err()?;
+            pending = result
+                .unprocessed_items
+                .and_then(|mut items| items.remove(&self.table_name))
+                .unwrap_or_default();
+            if pending.is_empty() {
+                break;
+            }
+            if backoff.attempt() >= MAX_BATCH_WRITE_ATTEMPTS {
+                return Err(Error::io(format!(
+                    "dynamodb table: {} left {} manifest rows unprocessed after re-sending them {} times",
+                    self.table_name,
+                    pending.len(),
+                    MAX_BATCH_WRITE_ATTEMPTS
+                )));
+            }
+            tokio::time::sleep(backoff.next_backoff()).await;
+        }
+        Ok(())
     }
 }
 
@@ -485,27 +592,30 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
 
     /// Delete the manifest information for the given base_uri in dynamodb
     async fn delete(&self, base_uri: &str) -> Result<()> {
-        let query_result = self
+        // A single Query returns at most 1MB of items; a long-versioned
+        // dataset exceeds that, and the leftover highest-version row would
+        // shadow a dataset recreated at the same base_uri. Page through the
+        // whole partition instead.
+        let mut pages = self
             .ddb_query()
             .key_condition_expression(format!("{} = :{}", base_uri!(), base_uri!()))
             .expression_attribute_values(
                 format!(":{}", base_uri!()),
                 AttributeValue::S(base_uri.into()),
             )
-            .send()
-            .await
-            .wrap_err()?;
+            .into_paginator()
+            .send();
 
-        if let Some(items) = query_result.items {
-            for item in items {
-                if let Some(AttributeValue::N(version)) = item.get("version") {
-                    self.ddb_delete()
-                        .key(base_uri!(), AttributeValue::S(base_uri.to_string()))
-                        .key(version!(), AttributeValue::N(version.clone()))
-                        .send()
-                        .await
-                        .wrap_err()?;
-                }
+        // The paginator owns the continuation key, which is what keeps an empty
+        // terminal key from being read as "there is more".
+        while let Some(page) = pages.next().await {
+            let page = page.wrap_err()?;
+            let items = page.items.unwrap_or_default();
+            let delete_requests = page_delete_requests(base_uri, &items)?;
+
+            // DeleteItem is one round trip per row; batch them instead.
+            for chunk in delete_requests.chunks(BATCH_WRITE_ITEM_LIMIT) {
+                self.batch_delete(chunk).await?;
             }
         }
         Ok(())
@@ -515,6 +625,72 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_sdk_dynamodb::types::ScalarAttributeType;
+
+    fn attr(name: &str, ty: ScalarAttributeType) -> AttributeDefinition {
+        AttributeDefinition::builder()
+            .attribute_name(name)
+            .attribute_type(ty)
+            .build()
+            .unwrap()
+    }
+
+    /// The key schema check only compares names. A string-typed version key
+    /// orders "9" above "12", and the latest-version lookup takes the first row
+    /// of a descending scan, so the wrong manifest would be resolved silently.
+    #[test]
+    fn test_key_attribute_types_are_checked() {
+        let good = [
+            attr(base_uri!(), ScalarAttributeType::S),
+            attr(version!(), ScalarAttributeType::N),
+        ];
+        validate_key_attribute_types("t", Some(&good)).unwrap();
+
+        let string_version = [
+            attr(base_uri!(), ScalarAttributeType::S),
+            attr(version!(), ScalarAttributeType::S),
+        ];
+        let err = validate_key_attribute_types("t", Some(&string_version))
+            .expect_err("a string-typed version key must be rejected");
+        assert!(
+            err.to_string().contains(version!()) && err.to_string().contains("type N"),
+            "unexpected message: {err}"
+        );
+
+        let numeric_base_uri = [
+            attr(base_uri!(), ScalarAttributeType::N),
+            attr(version!(), ScalarAttributeType::N),
+        ];
+        validate_key_attribute_types("t", Some(&numeric_base_uri))
+            .expect_err("a number-typed base_uri key must be rejected");
+
+        let only_base_uri = [attr(base_uri!(), ScalarAttributeType::S)];
+        validate_key_attribute_types("t", Some(&only_base_uri))
+            .expect_err("a missing version definition must be rejected");
+
+        validate_key_attribute_types("t", None)
+            .expect_err("a table without attribute definitions must be rejected");
+    }
+
+    /// `delete` deletes by key, so a row that does not carry a numeric version
+    /// is not one this store wrote and must be left alone.
+    #[test]
+    fn test_page_delete_requests_uses_rows_with_a_numeric_version() {
+        let mut no_version = item(None);
+        no_version.remove(version!());
+        let mut string_version = item(None);
+        string_version.insert(version!().to_string(), AttributeValue::S("7".into()));
+        let page = [item(None), no_version, string_version];
+
+        let requests = page_delete_requests("s3://bucket/table", &page).unwrap();
+        assert_eq!(requests.len(), 1);
+        let key = &requests[0].delete_request().unwrap().key;
+        assert_eq!(
+            key.get(base_uri!()),
+            Some(&AttributeValue::S("s3://bucket/table".into()))
+        );
+        assert_eq!(key.get(version!()), Some(&AttributeValue::N("7".into())));
+    }
 
     fn item(size: Option<AttributeValue>) -> HashMap<String, AttributeValue> {
         let mut item = HashMap::from([

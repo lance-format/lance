@@ -6,6 +6,7 @@
 use arrow_schema::DataType;
 
 use crate::expr::safe_coerce_scalar;
+use crate::numeric_coercion::rewrite as rewrite_numeric;
 use datafusion::logical_expr::{Between, ScalarUDFImpl};
 use datafusion::logical_expr::{BinaryExpr, Operator};
 use datafusion::prelude::*;
@@ -71,6 +72,24 @@ pub fn resolve_column_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
     Some(field.data_type())
 }
 
+fn is_literal_only_same_type_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+            (op.is_numerical_operators()
+                || matches!(
+                    op,
+                    Operator::BitwiseShiftLeft
+                        | Operator::BitwiseShiftRight
+                        | Operator::StringConcat
+                ))
+                && is_literal_only_same_type_expr(left)
+                && is_literal_only_same_type_expr(right)
+        }
+        Expr::Literal(..) => true,
+        _ => false,
+    }
+}
+
 /// Resolve logical expression `expr`.
 ///
 /// Parameters
@@ -78,7 +97,17 @@ pub fn resolve_column_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
 /// - *expr*: a datafusion logical expression
 /// - *schema*: lance schema.
 pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
+    if let Some(rewritten) = rewrite_numeric(expr, schema) {
+        return Ok(rewritten);
+    }
     match expr {
+        // A predicate wrapped in NOT or IS [NOT] TRUE/FALSE compares the same
+        // literal, so it has to be narrowed the same way.
+        Expr::Not(inner) => Ok(Expr::Not(Box::new(resolve_expr(inner.as_ref(), schema)?))),
+        Expr::IsTrue(inner) => Ok(Expr::IsTrue(Box::new(resolve_expr(inner, schema)?))),
+        Expr::IsFalse(inner) => Ok(Expr::IsFalse(Box::new(resolve_expr(inner, schema)?))),
+        Expr::IsNotTrue(inner) => Ok(Expr::IsNotTrue(Box::new(resolve_expr(inner, schema)?))),
+        Expr::IsNotFalse(inner) => Ok(Expr::IsNotFalse(Box::new(resolve_expr(inner, schema)?))),
         Expr::Between(Between {
             expr: inner_expr,
             low,
@@ -105,27 +134,28 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                 }))
             } else if let Some(left_type) = resolve_column_type(left.as_ref(), schema) {
                 match right.as_ref() {
-                    Expr::Literal(..) => Ok(Expr::BinaryExpr(BinaryExpr {
+                    Expr::Literal(..) | Expr::Cast(_) => Ok(Expr::BinaryExpr(BinaryExpr {
                         left: left.clone(),
                         op: *op,
-                        right: Box::new(resolve_value(right.as_ref(), &left_type)?),
+                        right: Box::new(coerce_expr(right.as_ref(), &left_type)?),
                     })),
-                    // For cases complex expressions (not just literals) on right hand side like x = 1 + 1 + -2*2
-                    Expr::BinaryExpr(r) => Ok(Expr::BinaryExpr(BinaryExpr {
-                        left: left.clone(),
-                        op: *op,
-                        right: Box::new(Expr::BinaryExpr(BinaryExpr {
-                            left: coerce_expr(&r.left, &left_type).map(Box::new)?,
-                            op: r.op,
-                            right: coerce_expr(&r.right, &left_type).map(Box::new)?,
-                        })),
-                    })),
+                    // Constant expressions need the column type applied to all of their literals.
+                    Expr::BinaryExpr(_) if is_literal_only_same_type_expr(right) => {
+                        Ok(Expr::BinaryExpr(BinaryExpr {
+                            left: left.clone(),
+                            op: *op,
+                            right: Box::new(coerce_expr(right, &left_type)?),
+                        }))
+                    }
+                    // Let DataFusion coerce other expressions. Recursively resolving them
+                    // can narrow literals to an inner column's type before arithmetic promotes
+                    // its operands, for example the 0.5 in `float_col = int_col + 0.5`.
                     _ => Ok(expr.clone()),
                 }
             } else if let Some(right_type) = resolve_column_type(right.as_ref(), schema) {
                 match left.as_ref() {
-                    Expr::Literal(..) => Ok(Expr::BinaryExpr(BinaryExpr {
-                        left: Box::new(resolve_value(left.as_ref(), &right_type)?),
+                    Expr::Literal(..) | Expr::Cast(_) => Ok(Expr::BinaryExpr(BinaryExpr {
+                        left: Box::new(coerce_expr(left.as_ref(), &right_type)?),
                         op: *op,
                         right: right.clone(),
                     })),
@@ -176,8 +206,33 @@ pub fn coerce_expr(expr: &Expr, dtype: &DataType) -> Result<Expr> {
             right: Box::new(coerce_expr(right, dtype)?),
         })),
         literal_expr @ Expr::Literal(..) => Ok(resolve_value(literal_expr, dtype)?),
+        Expr::Cast(_) => Ok(narrow_double_literal(expr, dtype).unwrap_or_else(|| expr.clone())),
         _ => Ok(expr.clone()),
     }
+}
+
+/// Narrows a double literal such as `CAST(0.5 AS double)` to a `Float32` column's
+/// type when the value converts exactly, so the column is not cast and stays
+/// indexable.
+fn narrow_double_literal(expr: &Expr, dtype: &DataType) -> Option<Expr> {
+    let Expr::Cast(cast) = expr else {
+        return None;
+    };
+    let Expr::Literal(value, _) = cast.expr.as_ref() else {
+        return None;
+    };
+    if *dtype != DataType::Float32 || *cast.field.data_type() != DataType::Float64 {
+        return None;
+    }
+    let ScalarValue::Float64(value) = value.cast_to(&DataType::Float64).ok()? else {
+        return None;
+    };
+    let narrowed = value.map(|value| value as f32);
+    // `total_cmp` also tells NaN signs and signed zeros apart.
+    let is_exact = value
+        .zip(narrowed)
+        .is_none_or(|(value, narrowed)| f64::from(narrowed).total_cmp(&value).is_eq());
+    is_exact.then(|| lit(ScalarValue::Float32(narrowed)))
 }
 
 /// Coerce logical expression for filters to boolean.
@@ -195,15 +250,18 @@ pub fn coerce_filter_type_to_boolean(expr: Expr) -> Expr {
             Expr::IsNotNull(Box::new(Expr::ScalarFunction(sf)))
         }
 
-        // Recurse into boolean contexts so nested regexp_match terms are also coerced
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) => Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(coerce_filter_type_to_boolean(*left)),
-            op,
-            right: Box::new(coerce_filter_type_to_boolean(*right)),
-        }),
+        // Only boolean operands need coercion. Null checks and comparisons must
+        // preserve regexp_match's nullable list result.
+        Expr::BinaryExpr(BinaryExpr { left, op, right })
+            if matches!(op, Operator::And | Operator::Or) =>
+        {
+            Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(coerce_filter_type_to_boolean(*left)),
+                op,
+                right: Box::new(coerce_filter_type_to_boolean(*right)),
+            })
+        }
         Expr::Not(inner) => Expr::Not(Box::new(coerce_filter_type_to_boolean(*inner))),
-        Expr::IsNull(inner) => Expr::IsNull(Box::new(coerce_filter_type_to_boolean(*inner))),
-        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(coerce_filter_type_to_boolean(*inner))),
 
         // Pass-through for all other nodes
         other => other,
@@ -388,6 +446,34 @@ mod tests {
             true,
         );
         assert_eq!(resolved, expected);
+    }
+
+    #[rstest::rstest]
+    #[case::half("x > CAST(0.5 AS DOUBLE)", col("x").gt(lit(0.5_f32)))]
+    #[case::reversed("CAST(0.5 AS DOUBLE) < x", lit(0.5_f32).lt(col("x")))]
+    #[case::negative_infinity("x < CAST('-inf' AS DOUBLE)", col("x").lt(lit(f32::NEG_INFINITY)))]
+    #[case::null("x > CAST(NULL AS DOUBLE)", col("x").gt(lit(ScalarValue::Float32(None))))]
+    #[case::between(
+        "x BETWEEN 0.0 AND CAST(0.5 AS DOUBLE)",
+        col("x").between(lit(0.0_f32), lit(0.5_f32))
+    )]
+    #[case::in_list("x IN (CAST(0.5 AS DOUBLE))", col("x").in_list(vec![lit(0.5_f32)], false))]
+    #[case::inexact(
+        "x = CAST(0.1 AS DOUBLE)",
+        col("x").eq(cast(lit(0.1), DataType::Float64))
+    )]
+    #[case::overflow(
+        "x > CAST(1e300 AS DOUBLE)",
+        col("x").gt(cast(lit(1e300), DataType::Float64))
+    )]
+    #[case::underflow(
+        "x > CAST(1e-300 AS DOUBLE)",
+        col("x").gt(cast(lit(1e-300), DataType::Float64))
+    )]
+    fn test_resolve_double_literal_on_float32(#[case] sql: &str, #[case] expected: Expr) {
+        let schema = ArrowSchema::new(vec![Field::new("x", DataType::Float32, true)]);
+        let planner = crate::planner::Planner::new(Arc::new(schema));
+        assert_eq!(planner.parse_filter(sql).unwrap(), expected, "{sql}");
     }
 
     #[test]

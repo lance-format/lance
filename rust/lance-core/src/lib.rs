@@ -51,6 +51,33 @@ pub static ROW_LAST_UPDATED_AT_VERSION_FIELD: LazyLock<ArrowField> =
 pub static ROW_CREATED_AT_VERSION_FIELD: LazyLock<ArrowField> =
     LazyLock::new(|| ArrowField::new(ROW_CREATED_AT_VERSION, DataType::UInt64, true));
 
+/// Field id of the hidden `_rowid` column a spilled row id sequence lives in.
+///
+/// Field ids are `i32` and every negative value is reserved for system use:
+/// `-1` is the unassigned sentinel, `-2` the tombstone for a field superseded by
+/// a later data file, and `-3..=-5` the three row lineage columns.
+pub const ROW_ID_FIELD_ID: i32 = -3;
+/// Field id of the hidden `_row_created_at_version` column a spilled created-at
+/// version sequence lives in.
+pub const ROW_CREATED_AT_VERSION_FIELD_ID: i32 = -4;
+/// Field id of the hidden `_row_last_updated_at_version` column a spilled
+/// last-updated-at version sequence lives in.
+pub const ROW_LAST_UPDATED_AT_VERSION_FIELD_ID: i32 = -5;
+
+/// The reserved field id of a row lineage column, by column name.
+///
+/// These are the only negative field ids a data file schema may carry: a
+/// lineage sequence spilled into the fragment's own data file is written as a
+/// column under this id, next to the user columns.
+pub fn row_lineage_field_id(column_name: &str) -> Option<i32> {
+    match column_name {
+        ROW_ID => Some(ROW_ID_FIELD_ID),
+        ROW_CREATED_AT_VERSION => Some(ROW_CREATED_AT_VERSION_FIELD_ID),
+        ROW_LAST_UPDATED_AT_VERSION => Some(ROW_LAST_UPDATED_AT_VERSION_FIELD_ID),
+        _ => None,
+    }
+}
+
 /// Check if a column name is a system column.
 ///
 /// System columns are virtual columns that are computed at read time and don't

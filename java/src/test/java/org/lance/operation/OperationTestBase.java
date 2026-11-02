@@ -28,8 +28,13 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.TestInstance;
 
 import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.Collections;
 import java.util.UUID;
+import java.util.stream.Stream;
 
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 public class OperationTestBase {
@@ -46,6 +51,19 @@ public class OperationTestBase {
     // Cleanup resources used by the tests
     if (dataset != null) {
       dataset.close();
+    }
+  }
+
+  protected void copyDirectory(Path source, Path target) throws IOException {
+    try (Stream<Path> paths = Files.walk(source)) {
+      for (Path path : (Iterable<Path>) paths::iterator) {
+        Path destination = target.resolve(source.relativize(path));
+        if (Files.isDirectory(path)) {
+          Files.createDirectories(destination);
+        } else {
+          Files.copy(path, destination, StandardCopyOption.REPLACE_EXISTING);
+        }
+      }
     }
   }
 

@@ -676,7 +676,7 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
 
     let shard_id = Uuid::new_v4();
     let row_bytes = 2048; // rough FineWeb text row size
-    // The memtable seals at `max_memtable_rows`, giving one generation per cap.
+    // The memtable freezes at `max_memtable_rows`, giving one generation per cap.
     // `max_memtable_batches` is sized to that same boundary, and
     // `max_memtable_size` kept high so the byte threshold never pre-empts it.
     let batches_per_gen = (args.max_memtable_rows / args.batch_rows).max(1);
@@ -730,7 +730,7 @@ async fn run_search(args: &Args) -> Result<serde_json::Value> {
             tokio::time::sleep(flush_wait).await;
         }
     }
-    // Wait for any triggered (sealed) memtable flushes to commit to the
+    // Wait for any triggered (frozen) memtable flushes to commit to the
     // manifest before we snapshot it — otherwise the SSTables
     // race the read and may not all be visible yet.
     writer.wait_for_flush_drain().await?;

@@ -4,7 +4,7 @@
 //! Product Quantization
 //!
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use arrow::datatypes::{self, ArrowPrimitiveType};
 use arrow_array::{Array, FixedSizeListArray, UInt8Array, cast::AsArray};
@@ -16,13 +16,14 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, assume_eq};
 use lance_linalg::distance::{DistanceType, Dot, L2, dot::DotPrepared, l2::L2Prepared};
 use lance_table::utils::LanceIteratorExtension;
-use num_traits::Float;
+use num_traits::{Float, ToPrimitive};
 use prost::Message;
 use storage::{PQ_METADATA_KEY, ProductQuantizationMetadata, ProductQuantizationStorage};
 use tracing::instrument;
 
 pub mod builder;
 pub mod distance;
+pub(crate) mod pairwise;
 pub mod storage;
 pub mod transform;
 pub(crate) mod utils;
@@ -40,37 +41,6 @@ use crate::vector::kmeans::compute_partition;
 pub use builder::PQBuildParams;
 use utils::get_sub_vector_centroids;
 
-#[derive(Debug)]
-pub(super) struct LazyPreparedTargets<T> {
-    targets: OnceLock<Vec<T>>,
-}
-
-impl<T> LazyPreparedTargets<T> {
-    fn new() -> Self {
-        Self {
-            targets: OnceLock::new(),
-        }
-    }
-
-    fn get_or_init(&self, init: impl FnOnce() -> Vec<T>) -> &[T] {
-        self.targets.get_or_init(init)
-    }
-
-    #[cfg(test)]
-    fn get(&self) -> Option<&[T]> {
-        self.targets.get().map(Vec::as_slice)
-    }
-}
-
-impl<T: DeepSizeOf> DeepSizeOf for LazyPreparedTargets<T> {
-    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.targets
-            .get()
-            .map(|targets| targets.deep_size_of_children(context))
-            .unwrap_or_default()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ProductQuantizer {
     pub num_sub_vectors: usize,
@@ -78,13 +48,14 @@ pub struct ProductQuantizer {
     pub dimension: usize,
     pub codebook: FixedSizeListArray,
     pub distance_type: DistanceType,
-    /// Lazy pre-transposed targets for fast f32 L2 batch computation.
-    /// The cache only exists for L2 f32 codebooks (Cosine is converted to L2)
-    /// and is shared by an IVF index and all its loaded partitions.
-    l2_targets: Option<Arc<LazyPreparedTargets<L2Prepared>>>,
-    /// Lazy pre-transposed targets for fast f32 Dot computation.
-    /// The cache is shared by an IVF index and all its loaded partitions.
-    dot_targets: Option<Arc<LazyPreparedTargets<DotPrepared>>>,
+    /// Pre-transposed L2 targets per sub-vector for fast L2 batch computation.
+    /// Populated for f32 and f16 codebooks with 4- or 8-bit codes (Cosine is
+    /// converted to L2 before construction). Wrapped in Arc so the index and
+    /// its cached partitions share one copy.
+    l2_targets: Option<Arc<Vec<L2Prepared>>>,
+    /// Pre-transposed targets for fast f32 PQ8 Dot computation. Wrapped in Arc
+    /// so the index and its cached partitions share one copy.
+    dot_targets: Option<Arc<Vec<DotPrepared>>>,
 }
 
 impl DeepSizeOf for ProductQuantizer {
@@ -101,66 +72,66 @@ impl DeepSizeOf for ProductQuantizer {
 }
 
 impl ProductQuantizer {
-    /// Create a lazy shared target cache if this codebook supports prepared L2.
+    /// Build per-sub-vector L2Prepared from the codebook if applicable.
     fn build_l2_targets(
         codebook: &FixedSizeListArray,
-        num_bits: u32,
         distance_type: DistanceType,
-    ) -> Option<Arc<LazyPreparedTargets<L2Prepared>>> {
-        if codebook.value_type() != DataType::Float32
-            || num_bits != 8
-            || distance_type != DistanceType::L2
-        {
+        num_sub_vectors: usize,
+        num_bits: u32,
+        dimension: usize,
+    ) -> Option<Arc<Vec<L2Prepared>>> {
+        if distance_type != DistanceType::L2 {
             return None;
         }
-        Some(Arc::new(LazyPreparedTargets::new()))
+        let widened: Vec<f32>;
+        let values: &[f32] = match codebook.value_type() {
+            DataType::Float32 => codebook
+                .values()
+                .as_primitive::<datatypes::Float32Type>()
+                .values(),
+            DataType::Float16 => {
+                widened = codebook
+                    .values()
+                    .as_primitive::<datatypes::Float16Type>()
+                    .values()
+                    .iter()
+                    .map(|&v| half::f16::to_f32(v))
+                    .collect();
+                &widened
+            }
+            _ => return None,
+        };
+        Some(Arc::new(prepare_l2_targets(
+            values,
+            num_bits,
+            num_sub_vectors,
+            dimension,
+        )))
     }
 
-    /// Create a lazy shared target cache if this codebook supports prepared Dot.
+    /// Build f32 PQ8 Dot targets that can be shared across partition searches.
     fn build_dot_targets(
         codebook: &FixedSizeListArray,
         num_bits: u32,
         distance_type: DistanceType,
-    ) -> Option<Arc<LazyPreparedTargets<DotPrepared>>> {
+        num_sub_vectors: usize,
+        dimension: usize,
+    ) -> Option<Arc<Vec<DotPrepared>>> {
         if codebook.value_type() != DataType::Float32
             || num_bits != 8
             || distance_type != DistanceType::Dot
         {
             return None;
         }
-        Some(Arc::new(LazyPreparedTargets::new()))
-    }
-
-    fn l2_targets(&self) -> Option<&[L2Prepared]> {
-        self.l2_targets.as_ref().map(|targets| {
-            targets.get_or_init(|| {
-                prepare_l2_targets(
-                    self.codebook
-                        .values()
-                        .as_primitive::<datatypes::Float32Type>()
-                        .values(),
-                    self.num_bits,
-                    self.num_sub_vectors,
-                    self.dimension,
-                )
-            })
-        })
-    }
-
-    fn dot_targets(&self) -> Option<&[DotPrepared]> {
-        self.dot_targets.as_ref().map(|targets| {
-            targets.get_or_init(|| {
-                prepare_dot_targets(
-                    self.codebook
-                        .values()
-                        .as_primitive::<datatypes::Float32Type>()
-                        .values(),
-                    self.num_bits,
-                    self.num_sub_vectors,
-                    self.dimension,
-                )
-            })
-        })
+        Some(Arc::new(prepare_dot_targets(
+            codebook
+                .values()
+                .as_primitive::<datatypes::Float32Type>()
+                .values(),
+            num_bits,
+            num_sub_vectors,
+            dimension,
+        )))
     }
 
     pub fn new(
@@ -170,8 +141,20 @@ impl ProductQuantizer {
         codebook: FixedSizeListArray,
         distance_type: DistanceType,
     ) -> Self {
-        let l2_targets = Self::build_l2_targets(&codebook, num_bits, distance_type);
-        let dot_targets = Self::build_dot_targets(&codebook, num_bits, distance_type);
+        let l2_targets = Self::build_l2_targets(
+            &codebook,
+            distance_type,
+            num_sub_vectors,
+            num_bits,
+            dimension,
+        );
+        let dot_targets = Self::build_dot_targets(
+            &codebook,
+            num_bits,
+            distance_type,
+            num_sub_vectors,
+            dimension,
+        );
         Self {
             num_bits,
             num_sub_vectors,
@@ -249,14 +232,25 @@ impl ProductQuantizer {
         let num_centroids = 2_usize.pow(NUM_BITS);
         let total_code_length = fsl.len() * num_sub_vectors / (8 / NUM_BITS as usize);
 
-        let values = if let Some(targets) = self.l2_targets() {
-            // Fast path for f32 + L2: use pre-transposed codebook.
-            // SAFETY: l2_targets is only populated when T::Native is f32.
-            let flat_f32: &[f32] = unsafe {
-                std::slice::from_raw_parts(
-                    flatten_data.values().as_ptr() as *const f32,
-                    flatten_data.values().len(),
-                )
+        let values = if let Some(targets) = &self.l2_targets {
+            // Fast path for L2: pre-transposed f32 codebook. A half-precision batch
+            // is widened once here rather than once per distance.
+            let widened: Vec<f32>;
+            let flat_f32: &[f32] = if T::DATA_TYPE == DataType::Float32 {
+                // SAFETY: T::Native is f32 when T::DATA_TYPE is Float32.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        flatten_data.values().as_ptr() as *const f32,
+                        flatten_data.values().len(),
+                    )
+                }
+            } else {
+                widened = flatten_data
+                    .values()
+                    .iter()
+                    .map(|v| v.to_f32().unwrap_or(f32::NAN))
+                    .collect();
+                &widened
             };
             let mut values = vec![0u8; total_code_length];
             let bytes_per_vector = num_sub_vectors / (8 / NUM_BITS as usize);
@@ -283,6 +277,7 @@ impl ProductQuantizer {
             }
             values
         } else {
+            let mut distances = vec![0.0; num_centroids];
             flatten_data
                 .values()
                 .chunks_exact(dim)
@@ -298,13 +293,15 @@ impl ProductQuantizer {
                                 sub_idx,
                             );
                             assume_eq!(centroids.len(), num_centroids * sub_dim);
-                            compute_partition(centroids, sub_vector, distance_type).unwrap_or(0)
-                                as u8
+                            compute_partition(centroids, sub_vector, distance_type, &mut distances)
+                                .unwrap_or(0) as u8
                         })
                         .collect();
                     if NUM_BITS == 4 {
                         sub_vec_code
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .map(|v| (v[1] << 4) | v[0])
                             .collect::<Vec<_>>()
                     } else {
@@ -376,7 +373,7 @@ impl ProductQuantizer {
                 self.dot_distances_impl::<datatypes::Float16Type>(key.as_primitive(), code)
             }
             DataType::Float32 => {
-                if let Some(targets) = self.dot_targets() {
+                if let Some(targets) = self.dot_targets.as_deref() {
                     let query = key.as_primitive::<datatypes::Float32Type>().values();
                     let distance_table =
                         distance::build_distance_table_dot_prepared(targets, query);
@@ -419,7 +416,6 @@ impl ProductQuantizer {
             self.num_bits,
             self.num_sub_vectors,
             code.values(),
-            0,
         );
 
         let diff = self.num_sub_vectors as f32 - 1.0;
@@ -433,7 +429,7 @@ impl ProductQuantizer {
                 Ok(self.build_l2_distance_table_impl::<datatypes::Float16Type>(key.as_primitive()))
             }
             DataType::Float32 => {
-                if let Some(targets) = self.l2_targets() {
+                if let Some(targets) = &self.l2_targets {
                     let query = key.as_primitive::<datatypes::Float32Type>().values();
                     Ok(build_distance_table_l2_prepared(targets, query))
                 } else {
@@ -489,7 +485,6 @@ impl ProductQuantizer {
             self.num_bits,
             self.num_sub_vectors,
             code,
-            100,
         ))
     }
 
@@ -557,6 +552,24 @@ pub fn validate_supplied_codebook(
     Ok(())
 }
 
+/// Check that a user-supplied PQ codebook has the value type of the vectors it
+/// will quantize. Quantization reads both as the vector type, so a mismatch
+/// would panic on the first batch instead of failing here.
+pub fn validate_codebook_value_type(
+    codebook_type: &DataType,
+    vector_type: &DataType,
+) -> Result<()> {
+    // Non-float columns are quantized as f32 residuals, so only a float
+    // column's own type is a contract here.
+    if vector_type.is_floating() && codebook_type != vector_type {
+        return Err(Error::invalid_input(format!(
+            "PQ codebook value type {codebook_type} does not match the vector value type \
+             {vector_type}"
+        )));
+    }
+    Ok(())
+}
+
 impl Quantization for ProductQuantizer {
     type BuildParams = PQBuildParams;
     type Metadata = ProductQuantizationMetadata;
@@ -575,6 +588,7 @@ impl Quantization for ProductQuantizer {
 
         if let Some(codebook) = params.codebook.as_ref() {
             let dimension = fsl.value_length() as usize;
+            validate_codebook_value_type(codebook.data_type(), &fsl.value_type())?;
             validate_supplied_codebook(
                 codebook.len(),
                 dimension,
@@ -735,7 +749,7 @@ mod tests {
     use arrow::datatypes::UInt8Type;
     use arrow_array::Float16Array;
     use half::f16;
-    use lance_linalg::distance::l2_distance_batch;
+    use lance_linalg::distance::{l2, l2_distance_batch_into};
     use lance_linalg::kernels::argmin;
     use lance_testing::datagen::generate_random_array;
     use num_traits::Zero;
@@ -791,15 +805,14 @@ mod tests {
             .map(|code| {
                 code.iter()
                     .enumerate()
-                    .flat_map(|(sub_idx, c)| {
+                    .map(|(sub_idx, c)| {
                         let subvec_centroids = pq.centroids::<datatypes::Float32Type>(sub_idx);
                         let subvec =
                             &query.values()[sub_idx * sub_vec_len..(sub_idx + 1) * sub_vec_len];
-                        l2_distance_batch(
+                        l2(
                             subvec,
                             &subvec_centroids
                                 [*c as usize * sub_vec_len..(*c as usize + 1) * sub_vec_len],
-                            sub_vec_len,
                         )
                     })
                     .sum::<f32>()
@@ -815,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn test_four_bit_pq_keeps_low_setup_distance_path() {
+    fn test_four_bit_pq_keeps_prepared_transform_targets() {
         const DIM: usize = 128;
         const NUM_BITS: u32 = 4;
         const NUM_SUB_VECTORS: usize = 16;
@@ -832,7 +845,11 @@ mod tests {
             codebook.clone(),
             DistanceType::L2,
         );
-        assert!(l2.l2_targets.is_none());
+        assert_eq!(
+            l2.l2_targets.as_ref().unwrap().len(),
+            NUM_SUB_VECTORS,
+            "PQ4 transform should keep main's prepared L2 path"
+        );
 
         let dot =
             ProductQuantizer::new(NUM_SUB_VECTORS, NUM_BITS, DIM, codebook, DistanceType::Dot);
@@ -853,7 +870,10 @@ mod tests {
         // indexes even though current writers reject this configuration.
         let indexed_vector = (1..=DIM).map(|value| value as f32).collect::<Vec<_>>();
         let mut codebook = Vec::with_capacity(NUM_SUB_VECTORS * NUM_CENTROIDS * SUB_VECTOR_DIM);
-        for sub_vector in indexed_vector[..PERSISTED_DIM].chunks_exact(SUB_VECTOR_DIM) {
+        for sub_vector in indexed_vector[..PERSISTED_DIM]
+            .as_chunks::<SUB_VECTOR_DIM>()
+            .0
+        {
             for _ in 0..NUM_CENTROIDS {
                 codebook.extend_from_slice(sub_vector);
             }
@@ -877,11 +897,9 @@ mod tests {
             DistanceType::L2,
         );
         assert!(prepared_l2.l2_targets.is_some());
-        assert!(prepared_l2.l2_targets.as_ref().unwrap().get().is_none());
         let distances = prepared_l2
             .compute_distances(&Float32Array::from(query.clone()), &code)
             .unwrap();
-        assert!(prepared_l2.l2_targets.as_ref().unwrap().get().is_some());
         assert_relative_eq!(distances.value(0), PERSISTED_DIM as f32, epsilon = 1e-4);
 
         let generic_l2 = ProductQuantizer::new(
@@ -920,7 +938,6 @@ mod tests {
             DistanceType::Dot,
         );
         assert!(dot.dot_targets.is_some());
-        assert!(dot.dot_targets.as_ref().unwrap().get().is_none());
         let expected_dot_distance = 1.0
             - indexed_vector[..PERSISTED_DIM]
                 .iter()
@@ -930,7 +947,6 @@ mod tests {
         let distances = dot
             .compute_distances(&Float32Array::from(query), &code)
             .unwrap();
-        assert!(dot.dot_targets.as_ref().unwrap().get().is_some());
         assert_relative_eq!(distances.value(0), expected_dot_distance, epsilon = 1e-4);
     }
 
@@ -952,16 +968,24 @@ mod tests {
         let pq_code = pq.quantize(&fsl).unwrap();
 
         let mut expected = Vec::with_capacity(TOTAL * 4);
-        vectors.values().chunks_exact(DIM).for_each(|vec| {
-            vec.chunks_exact(DIM / 4)
-                .enumerate()
-                .for_each(|(sub_idx, sub_vec)| {
-                    let centroids = pq.centroids::<datatypes::Float32Type>(sub_idx);
-                    let dists = l2_distance_batch(sub_vec, centroids, DIM / 4);
-                    let code = argmin(dists).unwrap() as u8;
-                    expected.push(code);
-                });
-        });
+        vectors
+            .values()
+            .as_chunks::<DIM>()
+            .0
+            .iter()
+            .for_each(|vec| {
+                vec.as_chunks::<{ DIM / 4 }>()
+                    .0
+                    .iter()
+                    .enumerate()
+                    .for_each(|(sub_idx, sub_vec)| {
+                        let centroids = pq.centroids::<datatypes::Float32Type>(sub_idx);
+                        let mut dists = vec![0.0; centroids.len() / (DIM / 4)];
+                        l2_distance_batch_into(sub_vec, centroids, DIM / 4, &mut dists);
+                        let code = argmin(dists.iter().copied()).unwrap() as u8;
+                        expected.push(code);
+                    });
+            });
 
         assert_eq!(pq_code.len(), TOTAL);
         assert_eq!(
@@ -971,6 +995,69 @@ mod tests {
                 .values()
                 .as_primitive::<UInt8Type>()
                 .values()
+        );
+    }
+
+    /// f16 vectors are encoded through the widened fast path and must get the
+    /// codes of the same values encoded as f32 against the same (widened) codebook.
+    #[test]
+    fn test_quantize_f16_matches_widened_f32() {
+        const DIM: usize = 16;
+        const TOTAL: usize = 64;
+        let codebook_f16 =
+            arrow::compute::cast(&generate_random_array(DIM * 256), &DataType::Float16).unwrap();
+        let codebook_f32 = arrow::compute::cast(&codebook_f16, &DataType::Float32).unwrap();
+        let vectors_f16 =
+            arrow::compute::cast(&generate_random_array(DIM * TOTAL), &DataType::Float16).unwrap();
+        let vectors_f32 = arrow::compute::cast(&vectors_f16, &DataType::Float32).unwrap();
+        let fsl = |values: &ArrayRef| {
+            FixedSizeListArray::try_new_from_values(values.clone(), DIM as i32).unwrap()
+        };
+
+        let pq_f16 = ProductQuantizer::new(4, 8, DIM, fsl(&codebook_f16), DistanceType::L2);
+        let pq_f32 = ProductQuantizer::new(4, 8, DIM, fsl(&codebook_f32), DistanceType::L2);
+        assert!(
+            pq_f16.l2_targets.is_some(),
+            "an f16 codebook must get widened L2 targets"
+        );
+
+        let codes_f16 = pq_f16.quantize(&fsl(&vectors_f16)).unwrap();
+        let codes_f32 = pq_f32.quantize(&fsl(&vectors_f32)).unwrap();
+        assert_eq!(codes_f16.len(), TOTAL);
+        assert_eq!(
+            codes_f16
+                .as_fixed_size_list()
+                .values()
+                .as_primitive::<UInt8Type>()
+                .values(),
+            codes_f32
+                .as_fixed_size_list()
+                .values()
+                .as_primitive::<UInt8Type>()
+                .values()
+        );
+    }
+
+    #[test]
+    fn test_build_rejects_codebook_value_type_mismatch() {
+        use arrow_array::Float16Array;
+        const DIM: usize = 8;
+
+        // An f16 column with an f32 flat codebook: the length check passes
+        // and the quantizer builds, but every later `as_primitive::<T>` panics
+        // (or trains on garbage), so the mismatch must be rejected at the boundary.
+        let values = Float16Array::from_iter((0..64 * DIM).map(|v| half::f16::from_f32(v as f32)));
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+        let codebook =
+            Arc::new(Float32Array::from_iter((0..256 * DIM).map(|v| v as f32))) as ArrayRef;
+
+        let params = PQBuildParams::with_codebook(8, 8, codebook);
+        let error =
+            <ProductQuantizer as Quantization>::build(&fsl, DistanceType::L2, &params).unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("codebook"),
+            "the error must name the codebook: {error}"
         );
     }
 

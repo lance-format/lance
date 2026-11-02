@@ -3,7 +3,7 @@
 
 use std::{any::Any, collections::VecDeque, ops::Range, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, new_empty_array};
+use arrow_array::{Array, ArrayRef, new_empty_array, new_null_array};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::DataType;
 use bytes::Bytes;
@@ -23,7 +23,7 @@ use crate::{
     encodings::logical::primitive::{
         CachedPageData, PageInitialization, PageInitializationBuffers, PageLoadTask,
     },
-    format::ProtobufUtils21,
+    format::EncodingUtils,
     repdef::{DefinitionInterpretation, RepDefUnraveler, max_visible_level},
 };
 
@@ -43,7 +43,7 @@ pub(crate) fn encode_constant_page(
         ))
     };
 
-    let description = ProtobufUtils21::constant_layout(&repdef.def_meaning, inline_value);
+    let description = EncodingUtils::constant_layout(&repdef.def_meaning, inline_value);
 
     let has_repdef = repdef.repetition_levels.is_some() || repdef.definition_levels.is_some();
 
@@ -338,7 +338,7 @@ impl ConstantPageDecoder {
         ranges
     }
 
-    fn take_row(&mut self) -> Result<(Range<usize>, u64)> {
+    fn take_row(&mut self) -> Result<()> {
         let start = self.cursor_level;
         let end = if let Some(rep) = &self.rep {
             if start >= rep.len() {
@@ -360,21 +360,22 @@ impl ConstantPageDecoder {
             start + 1
         };
 
-        let visible = if let Some(def) = &self.def {
-            def[start..end]
-                .iter()
-                .filter(|d| **d <= self.max_visible_def)
-                .count() as u64
-        } else {
-            (end - start) as u64
-        };
-
         self.cursor_level = end;
         self.cursor_row += 1;
-        Ok((start..end, visible))
+        Ok(())
     }
 
     fn skip_to_row(&mut self, target_row: u64) -> Result<()> {
+        debug_assert!(
+            target_row >= self.cursor_row,
+            "rows must be requested in order"
+        );
+        if self.rep.is_none() {
+            // Without repetition every row is exactly one level, so jump straight there
+            self.cursor_row = self.cursor_row.max(target_row);
+            self.cursor_level = self.cursor_row as usize;
+            return Ok(());
+        }
         while self.cursor_row < target_row {
             self.take_row()?;
         }
@@ -389,19 +390,24 @@ impl crate::encodings::logical::primitive::StructuralPageDecoder for ConstantPag
         let mut level_slices: Vec<Range<usize>> = Vec::new();
         let mut visible_items_total: u64 = 0;
 
+        // Each row range is one contiguous level slice, so locate both ends rather than
+        // stepping through it row by row
         for range in drained_ranges {
             self.skip_to_row(range.start)?;
-            for _ in range.start..range.end {
-                let (level_range, visible) = self.take_row()?;
-                visible_items_total += visible;
-                if let Some(last) = level_slices.last_mut()
-                    && last.end == level_range.start
-                {
-                    last.end = level_range.end;
-                    continue;
-                }
-                level_slices.push(level_range);
+            let level_start = self.cursor_level;
+            self.skip_to_row(range.end)?;
+            let level_range = level_start..self.cursor_level;
+            // With definition levels `decode` counts the visible items from the sliced levels
+            if self.def.is_none() {
+                visible_items_total += level_range.len() as u64;
             }
+            if let Some(last) = level_slices.last_mut()
+                && last.end == level_range.start
+            {
+                last.end = level_range.end;
+                continue;
+            }
+            level_slices.push(level_range);
         }
 
         Ok(Box::new(DecodeConstantTask {
@@ -446,7 +452,11 @@ impl DecodeConstantTask {
         })
     }
 
-    fn materialize_values(&self, num_values: u64) -> Result<ArrayRef> {
+    /// Repeats the scalar once per visible item.  Items that are null (definition
+    /// level > 0) are materialized as nulls instead of copies of the scalar so that
+    /// a large scalar with many null slots does not amplify into an oversized array
+    /// (e.g. overflowing i32 offsets for utf8/binary).
+    fn materialize_values(&self, def: Option<&[u16]>, num_values: u64) -> Result<ArrayRef> {
         if num_values == 0 {
             return Ok(new_empty_array(self.scalar.data_type()));
         }
@@ -458,6 +468,22 @@ impl DecodeConstantTask {
                 num_values as usize,
                 None,
             )) as ArrayRef);
+        }
+
+        if let Some(def) = def
+            && self.scalar.null_count() == 0
+            && def.iter().any(|d| *d != 0 && *d <= self.max_visible_def)
+        {
+            let null_slot = new_null_array(self.scalar.data_type(), 1);
+            let source = arrow_select::concat::concat(&[self.scalar.as_ref(), null_slot.as_ref()])?;
+            let indices = arrow_array::UInt64Array::from(
+                def.iter()
+                    .filter(|d| **d <= self.max_visible_def)
+                    .map(|d| if *d == 0 { 0u64 } else { 1u64 })
+                    .collect::<Vec<_>>(),
+            );
+            debug_assert_eq!(indices.len() as u64, num_values);
+            return Ok(arrow_select::take::take(source.as_ref(), &indices, None)?);
         }
 
         let indices = arrow_array::UInt64Array::from(vec![0u64; num_values as usize]);
@@ -480,8 +506,8 @@ impl crate::decoder::DecodePageTask for DecodeConstantTask {
             self.visible_items_total
         };
 
-        let values = self.materialize_values(visible_items_total)?;
-        let data = crate::data::DataBlock::from_array(values);
+        let values = self.materialize_values(def.as_deref(), visible_items_total)?;
+        let data = crate::data::DataBlock::from_decoded_array(values);
         let unraveler =
             RepDefUnraveler::new(rep, def, self.def_meaning.clone(), visible_items_total);
 

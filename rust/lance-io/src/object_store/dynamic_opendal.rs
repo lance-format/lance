@@ -252,12 +252,31 @@ impl OSObjectStore for DynamicOpenDalStore {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
+    use async_trait::async_trait;
+    use object_store::ObjectStoreExt as _;
     use opendal::{Operator, services::Memory};
 
     use super::*;
+    use crate::object_store::ObjectStore;
+    use crate::object_store::providers::opendal::finish_opendal_operator;
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
+    use crate::object_store::{StorageOptions, StorageOptionsProvider};
+
+    fn build_memory_store(config: HashMap<String, String>) -> Result<OpendalStore> {
+        let storage_options = StorageOptions(config);
+        let operator = Operator::new(Memory::default()).map_err(|e| {
+            lance_core::Error::invalid_input(format!("Failed to create memory operator: {e:?}"))
+        })?;
+        Ok(OpendalStore::new(finish_opendal_operator(
+            operator,
+            storage_options.client_max_retries(),
+        )))
+    }
 
     #[tokio::test]
     async fn test_dynamic_store_caches_by_normalized_config() {
@@ -272,14 +291,7 @@ mod tests {
             HashMap::new(),
             accessor,
             |options| Ok(options.clone()),
-            |_| {
-                let operator = Operator::new(Memory::default()).map_err(|e| {
-                    lance_core::Error::invalid_input(format!(
-                        "Failed to create memory operator: {e:?}"
-                    ))
-                })?;
-                Ok(OpendalStore::new(operator))
-            },
+            build_memory_store,
         );
 
         let first = store
@@ -292,8 +304,73 @@ mod tests {
             .expect("second store should reuse cache");
 
         assert!(Arc::ptr_eq(&first, &second));
+        let dynamic = Arc::new(store);
+        let (mut object_store, _) = ObjectStore::from_uri("memory://").await.unwrap();
+        let object_store_mut = Arc::get_mut(&mut object_store).unwrap();
+        object_store_mut.inner = dynamic.clone();
+        first
+            .put(
+                &Path::from("dataset/file"),
+                Bytes::from_static(b"test").into(),
+            )
+            .await
+            .unwrap();
+        object_store.remove_dir_all("dataset").await.unwrap();
+        assert!(matches!(
+            first.head(&Path::from("dataset/file")).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
     }
 
+    #[derive(Debug)]
+    struct ChangingRetryConfigProvider {
+        fetch_count: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl StorageOptionsProvider for ChangingRetryConfigProvider {
+        async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+            let fetch_count = self.fetch_count.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(HashMap::from([
+                (
+                    "client_max_retries".to_string(),
+                    (fetch_count + 1).to_string(),
+                ),
+                ("expires_at_millis".to_string(), "0".to_string()),
+            ])))
+        }
+
+        fn provider_id(&self) -> String {
+            "ChangingRetryConfigProvider".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_store_rebuilds_when_retry_config_changes() {
+        let accessor = Arc::new(StorageOptionsAccessor::with_provider(Arc::new(
+            ChangingRetryConfigProvider {
+                fetch_count: AtomicUsize::new(0),
+            },
+        )));
+        let store = DynamicOpenDalStore::new(
+            "memory",
+            HashMap::new(),
+            accessor,
+            |options| Ok(options.clone()),
+            build_memory_store,
+        );
+
+        let first = store
+            .current_store()
+            .await
+            .expect("first store should build");
+        let second = store
+            .current_store()
+            .await
+            .expect("changed retry config should rebuild store");
+
+        assert!(!Arc::ptr_eq(&first, &second));
+    }
     #[test]
     fn test_merge_options_preserves_protected_base_keys() {
         let accessor = Arc::new(StorageOptionsAccessor::with_provider(Arc::new(
@@ -310,14 +387,7 @@ mod tests {
             ]),
             accessor,
             |options| Ok(options.clone()),
-            |_| {
-                let operator = Operator::new(Memory::default()).map_err(|e| {
-                    lance_core::Error::invalid_input(format!(
-                        "Failed to create memory operator: {e:?}"
-                    ))
-                })?;
-                Ok(OpendalStore::new(operator))
-            },
+            build_memory_store,
         )
         .with_protected_keys(["bucket", "root"]);
 

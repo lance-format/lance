@@ -394,7 +394,7 @@ pub fn compress_positions(positions: &[u32]) -> Result<arrow::array::LargeBinary
     let num_positions = positions.len() as u32;
     builder.append_value(num_positions.to_le_bytes().as_ref());
 
-    let position_chunks = positions.chunks_exact(BLOCK_SIZE);
+    let (position_chunks, _) = positions.as_chunks::<BLOCK_SIZE>();
     let mut buffer = [0u8; BLOCK_SIZE * 4 + 5];
     for position_chunk in position_chunks {
         // delta encoding + bitpacking for positions
@@ -1205,8 +1205,8 @@ fn decompress_block_with<P: BitPacker>(
 }
 
 pub fn decompress_raw_remainder(compressed: &[u8], n: usize, dest: &mut Vec<u32>) {
-    for bytes in compressed.chunks_exact(4).take(n) {
-        let data = u32::from_le_bytes(bytes.try_into().unwrap());
+    for bytes in compressed.as_chunks::<4>().0.iter().take(n) {
+        let data = u32::from_le_bytes(*bytes);
         dest.push(data);
     }
 }

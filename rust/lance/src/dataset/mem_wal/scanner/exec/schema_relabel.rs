@@ -8,11 +8,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::dataset::mem_wal::reconcile::relabel_to;
 use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::SchemaRef;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
     SendableRecordBatchStream,
@@ -83,6 +86,13 @@ impl ExecutionPlan for SchemaRelabelExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -123,12 +133,26 @@ impl Stream for SchemaRelabelStream {
             Poll::Ready(Some(Ok(batch))) => {
                 // Carry the row count explicitly: `try_new` infers it from the
                 // first column, which a column-less batch does not have.
-                let relabeled = RecordBatch::try_new_with_options(
-                    self.schema.clone(),
-                    batch.columns().to_vec(),
-                    &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
-                )
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None));
+                // A nested column carries its field ids inside its own type, so
+                // relabelling the schema alone would leave the arrays
+                // disagreeing with it.
+                let columns: Result<Vec<_>, _> = batch
+                    .columns()
+                    .iter()
+                    .zip(self.schema.fields())
+                    .map(|(column, field)| {
+                        relabel_to(column, field.data_type())
+                            .map_err(|e| DataFusionError::External(Box::new(e)))
+                    })
+                    .collect();
+                let relabeled = columns.and_then(|columns| {
+                    RecordBatch::try_new_with_options(
+                        self.schema.clone(),
+                        columns,
+                        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+                    )
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                });
                 Poll::Ready(Some(relabeled))
             }
             other => other,
@@ -238,7 +262,7 @@ mod tests {
 
         let error = run(relabeled).await.unwrap_err().to_string();
         assert!(
-            error.contains("column types must match"),
+            error.contains("cannot be read as Int32"),
             "expected a data type error, got: {error}"
         );
     }
