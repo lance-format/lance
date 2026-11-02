@@ -105,9 +105,15 @@ pub(super) async fn load_indices(
             .into_iter()
             .zip(mapping.segment_coverage(&provenance))
         {
-            // FTS needs the index's tokenizer settings even when all live
-            // fragments are uncovered and must be searched with a scan.
-            if coverage.is_empty() && !super::segment_has_inverted_details(index) {
+            // FTS needs tokenizer settings when stored provenance yields no
+            // live coverage. A stored empty bitmap instead denotes withdrawn
+            // coverage, whose stale postings must stay excluded from queries.
+            let has_fts_provenance = super::segment_has_inverted_details(index)
+                && index
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| !bitmap.is_empty());
+            if coverage.is_empty() && !has_fts_provenance {
                 continue;
             }
             let mut index = index.clone();

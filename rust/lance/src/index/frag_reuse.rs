@@ -3583,6 +3583,114 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn inverted_search_after_tagged_column_replacement() {
+        let batch = record_batch!(
+            ("i", Int32, [0, 1, 2, 3]),
+            ("text", Utf8, ["old", "old", "old", "old"])
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        reserve_fragments(&mut dataset, 20).await;
+        let old_fragments = dataset.fragments().as_ref().clone();
+        let source_ids = old_fragments
+            .iter()
+            .map(|fragment| fragment.id)
+            .collect::<Vec<_>>();
+        let (transition, destinations) =
+            reader_tests::prepare_partition(&dataset, &source_ids, 10).await;
+        let frag_reuse_index = Some(entry_appending(&dataset, vec![transition]).await);
+        let read_version = dataset.manifest.version;
+        dataset = crate::dataset::write::CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new(
+                read_version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments,
+                        new_fragments: destinations,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index,
+                },
+                None,
+            ))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["text"],
+                lance_index::IndexType::Inverted,
+                Some("text_idx".into()),
+                &InvertedIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let schema = dataset.schema().clone();
+        let mut replacements = Vec::with_capacity(dataset.fragments().len());
+        for fragment in dataset.get_fragments() {
+            let before = fragment.scan().try_into_batch().await.unwrap();
+            let values = record_batch!(
+                (
+                    "i",
+                    Int32,
+                    before["i"].as_primitive::<Int32Type>().values().to_vec()
+                ),
+                ("text", Utf8, vec!["new"; before.num_rows()])
+            )
+            .unwrap();
+            replacements.push(
+                fragment
+                    .write_columns(futures::stream::iter([Ok(values)]), &schema)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let read_version = dataset.manifest.version;
+        dataset = crate::dataset::write::CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new(
+                read_version,
+                Operation::DataReplacement { replacements },
+                None,
+            ))
+            .await
+            .unwrap();
+        let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+        assert!(
+            stored
+                .iter()
+                .find(|index| index.name == "text_idx")
+                .unwrap()
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .is_empty()
+        );
+        for (query, expected) in [("new", vec![0, 1, 2, 3]), ("old", vec![])] {
+            let mut scan = dataset.scan();
+            scan.full_text_search(
+                FullTextSearchQuery::new(query.into())
+                    .with_column("text".into())
+                    .unwrap(),
+            )
+            .unwrap();
+            let hits = scan.try_into_batch().await.unwrap();
+            let mut values = hits["i"].as_primitive::<Int32Type>().values().to_vec();
+            values.sort_unstable();
+            assert_eq!(values, expected, "query {query:?}");
+        }
+    }
+
     async fn filtered_values(dataset: &Dataset, predicate: &str) -> Vec<i32> {
         let mut scan = dataset.scan();
         scan.filter(predicate).unwrap();
