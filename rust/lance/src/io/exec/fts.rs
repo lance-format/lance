@@ -3,22 +3,21 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, OnceLock};
 
 use arrow::array::{AsArray, BooleanBuilder, ListBuilder, UInt32Builder};
 use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_array::{Array, BooleanArray, Float32Array, OffsetSizeTrait, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, SchemaRef};
 use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{NullEquality, Statistics};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::ChildStats;
 use datafusion::physical_plan::StatisticsArgs;
 use datafusion::physical_plan::empty::EmptyExec;
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, reset_plan_states};
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, Gauge, MetricValue, MetricsSet};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, Gauge, MetricsSet};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
@@ -35,7 +34,6 @@ use itertools::Itertools;
 use lance_core::{
     Error, ROW_ID, Result,
     utils::{
-        futures::FinallyStreamExt,
         tokio::{get_num_compute_intensive_cpus, spawn_cpu},
         tracing::StreamTracingExt,
     },
@@ -89,6 +87,11 @@ use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use tracing::instrument;
 use uuid::Uuid;
+
+mod corpus;
+pub(crate) use corpus::SharedFtsScorer;
+use corpus::SharedFtsScorerProducer;
+pub use corpus::{FtsCorpusBinding, SharedFtsScorerExec};
 
 /// Maximum number of additional kth-score rows retained before exact replay.
 /// One extra probe slot is reserved for the strict lower-score guard.
@@ -2676,423 +2679,6 @@ fn tokenize_cross_column_compound_query(
     let mut leaves = Vec::with_capacity(count_fts_leaves(query));
     visit(query, indices, &mut leaves)?;
     Ok(TokenizedCompoundQuery(leaves))
-}
-
-type SharedScorerResult<S> = std::result::Result<Arc<S>, Arc<str>>;
-
-/// Coordinates BM25 corpus statistics between the indexed and flat branches
-/// of a mixed search. The flat branch extends the indexed statistics with the
-/// unindexed documents, then publishes the resulting corpus-wide scorer.
-///
-/// Generic over the scorer so the single-column path can share a
-/// [`MemBM25Scorer`] and `combined_fields` a [`CombinedFieldsBM25Scorer`]; the
-/// coordination is the same either way.
-#[derive(Debug)]
-pub(crate) struct SharedFtsScorer<S = MemBM25Scorer> {
-    sender: tokio::sync::watch::Sender<Option<SharedScorerResult<S>>>,
-}
-
-impl<S: Send + Sync + 'static> SharedFtsScorer<S> {
-    pub(crate) fn new() -> Self {
-        let (sender, _) = tokio::sync::watch::channel(None);
-        Self { sender }
-    }
-
-    fn publish(&self, scorer: Arc<S>) {
-        self.sender.send_replace(Some(Ok(scorer)));
-    }
-
-    fn publish_error(&self, error: &DataFusionError) {
-        self.sender
-            .send_replace(Some(Err(Arc::from(error.to_string()))));
-    }
-
-    async fn wait(&self) -> DataFusionResult<Arc<S>> {
-        let mut receiver = self.sender.subscribe();
-        loop {
-            let result = receiver.borrow_and_update().clone();
-            if let Some(result) = result {
-                return result.map_err(|message| DataFusionError::Execution(message.to_string()));
-            }
-            receiver.changed().await.map_err(|_| {
-                DataFusionError::Execution(
-                    "mixed FTS corpus scorer producer stopped before publishing statistics"
-                        .to_string(),
-                )
-            })?;
-        }
-    }
-}
-
-struct SharedFtsScorerProducer<S: Send + Sync + 'static = MemBM25Scorer> {
-    scorer: Arc<SharedFtsScorer<S>>,
-    completed: bool,
-}
-
-impl<S: Send + Sync + 'static> SharedFtsScorerProducer<S> {
-    fn new(scorer: Arc<SharedFtsScorer<S>>) -> Self {
-        Self {
-            scorer,
-            completed: false,
-        }
-    }
-
-    fn publish(mut self, scorer: Arc<S>) {
-        self.scorer.publish(scorer);
-        self.completed = true;
-    }
-
-    fn publish_error(mut self, error: &DataFusionError) {
-        self.scorer.publish_error(error);
-        self.completed = true;
-    }
-}
-
-impl<S: Send + Sync + 'static> Drop for SharedFtsScorerProducer<S> {
-    fn drop(&mut self) {
-        if !self.completed {
-            self.scorer.sender.send_replace(Some(Err(Arc::from(
-                "mixed FTS corpus scorer producer was cancelled before publishing statistics",
-            ))));
-        }
-    }
-}
-
-/// Owns one mixed FTS plan's scorer lifecycle. Each execution gets a
-/// fresh producer/consumer pair, including after failure or child replacement.
-/// Re-execution still requires replayable children: an overlay-stale scalar
-/// prefilter can contain a consumable `OneShotExec` that this owner cannot replay.
-#[derive(Debug)]
-pub(crate) struct SharedFtsScorerExec {
-    input: Arc<dyn ExecutionPlan>,
-    scorer: SharedFtsCorpus,
-    /// Retain metric handles, never a finished execution's task-owning plan.
-    /// Concurrent executions have independent scorers. Rebound metrics describe
-    /// the latest execution; template-retained counters keep their existing semantics.
-    metrics: Arc<Mutex<SharedFtsExecutionMetrics>>,
-}
-
-#[derive(Debug, Clone)]
-enum SharedFtsCorpus {
-    Match(Arc<SharedFtsScorer>),
-    Combined(Arc<SharedFtsScorer<CombinedFieldsBM25Scorer>>),
-}
-
-#[derive(Debug)]
-struct SharedFtsExecutionMetrics {
-    execution: Arc<()>,
-    active: Option<Weak<dyn ExecutionPlan>>,
-    snapshot: MetricsSet,
-}
-
-struct SharedFtsMetricsGuard {
-    input: Arc<dyn ExecutionPlan>,
-    template: Arc<dyn ExecutionPlan>,
-    metrics: Arc<Mutex<SharedFtsExecutionMetrics>>,
-    execution: Arc<()>,
-}
-
-impl Drop for SharedFtsMetricsGuard {
-    fn drop(&mut self) {
-        let snapshot =
-            SharedFtsScorerExec::execution_metrics(self.template.as_ref(), self.input.as_ref());
-        match self.metrics.lock() {
-            Ok(mut metrics) if Arc::ptr_eq(&metrics.execution, &self.execution) => {
-                metrics.snapshot = snapshot;
-                metrics.active = None;
-            }
-            Ok(_) => {}
-            Err(error) => log::warn!("could not retain FTS runtime metrics: {error}"),
-        }
-    }
-}
-
-impl SharedFtsScorerExec {
-    pub(crate) fn new(input: Arc<dyn ExecutionPlan>, scorer: Arc<SharedFtsScorer>) -> Self {
-        Self::with_corpus(input, SharedFtsCorpus::Match(scorer))
-    }
-
-    pub(crate) fn new_combined(
-        input: Arc<dyn ExecutionPlan>,
-        scorer: Arc<SharedFtsScorer<CombinedFieldsBM25Scorer>>,
-    ) -> Self {
-        Self::with_corpus(input, SharedFtsCorpus::Combined(scorer))
-    }
-
-    fn with_corpus(input: Arc<dyn ExecutionPlan>, scorer: SharedFtsCorpus) -> Self {
-        Self {
-            metrics: Arc::new(Mutex::new(SharedFtsExecutionMetrics {
-                execution: Arc::new(()),
-                active: None,
-                snapshot: MetricsSet::new(),
-            })),
-            input,
-            scorer,
-        }
-    }
-
-    fn prepare_execution(&self) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let fresh = match &self.scorer {
-            SharedFtsCorpus::Match(_) => SharedFtsCorpus::Match(Arc::new(SharedFtsScorer::new())),
-            SharedFtsCorpus::Combined(_) => {
-                SharedFtsCorpus::Combined(Arc::new(SharedFtsScorer::new()))
-            }
-        };
-        let mut consumers = 0;
-        let mut producers = 0;
-        // Reset other execution state too, particularly a previous top-k sort's
-        // score threshold. Each execution owns its corpus independently.
-        let input = reset_plan_states(self.input.clone())?;
-        let input = input
-            .transform_up(|plan| {
-                if let (SharedFtsCorpus::Match(template), SharedFtsCorpus::Match(scorer)) =
-                    (&self.scorer, &fresh)
-                {
-                    if let Some(node) = plan.downcast_ref::<MatchQueryExec>()
-                        && node
-                            .shared_scorer
-                            .as_ref()
-                            .is_some_and(|shared| Arc::ptr_eq(shared, template))
-                    {
-                        consumers += 1;
-                        return Ok(Transformed::yes(Arc::new(MatchQueryExec {
-                            dataset: node.dataset.clone(),
-                            query: node.query.clone(),
-                            tokenized_query: node.tokenized_query.clone(),
-                            params: node.params.clone(),
-                            prefilter_source: node.prefilter_source.clone(),
-                            base_scorer: node.base_scorer.clone(),
-                            prepared_query: node.prepared_query.clone(),
-                            shared_scorer: Some(scorer.clone()),
-                            segment_selection: node.segment_selection.clone(),
-                            overlay_block: node.overlay_block.clone(),
-                            document_granularity: node.document_granularity,
-                            schema: node.schema.clone(),
-                            external_mask: node.external_mask.clone(),
-                            properties: node.properties.clone(),
-                            metrics: node.metrics.clone(),
-                        })
-                            as Arc<dyn ExecutionPlan>));
-                    }
-                    if let Some(node) = plan.downcast_ref::<FlatMatchQueryExec>()
-                        && node
-                            .shared_scorer
-                            .as_ref()
-                            .is_some_and(|shared| Arc::ptr_eq(shared, template))
-                    {
-                        producers += 1;
-                        return Ok(Transformed::yes(Arc::new(FlatMatchQueryExec {
-                            dataset: node.dataset.clone(),
-                            query: node.query.clone(),
-                            tokenized_query: node.tokenized_query.clone(),
-                            params: node.params.clone(),
-                            unindexed_input: node.unindexed_input.clone(),
-                            candidate_filter: node.candidate_filter.clone(),
-                            base_scorer: node.base_scorer.clone(),
-                            shared_scorer: Some(scorer.clone()),
-                            preset_segments: node.preset_segments.clone(),
-                            document_granularity: node.document_granularity,
-                            document_column: node.document_column.clone(),
-                            schema: node.schema.clone(),
-                            properties: node.properties.clone(),
-                            metrics: node.metrics.clone(),
-                        })
-                            as Arc<dyn ExecutionPlan>));
-                    }
-                }
-                if let (SharedFtsCorpus::Combined(template), SharedFtsCorpus::Combined(scorer)) =
-                    (&self.scorer, &fresh)
-                {
-                    if let Some(node) = plan.downcast_ref::<CombinedFieldsQueryExec>()
-                        && node
-                            .shared_scorer
-                            .as_ref()
-                            .is_some_and(|shared| Arc::ptr_eq(shared, template))
-                    {
-                        consumers += 1;
-                        let mut node = node.clone();
-                        node.shared_scorer = Some(scorer.clone());
-                        return Ok(Transformed::yes(Arc::new(node) as Arc<dyn ExecutionPlan>));
-                    }
-                    if let Some(node) = plan.downcast_ref::<FlatCombinedFieldsExec>()
-                        && node
-                            .shared_scorer
-                            .as_ref()
-                            .is_some_and(|shared| Arc::ptr_eq(shared, template))
-                    {
-                        producers += 1;
-                        let mut node = node.clone();
-                        node.shared_scorer = Some(scorer.clone());
-                        return Ok(Transformed::yes(Arc::new(node) as Arc<dyn ExecutionPlan>));
-                    }
-                }
-                Ok(Transformed::no(plan))
-            })?
-            .data;
-        if consumers != 1 || producers != 1 {
-            return Err(DataFusionError::Internal(format!(
-                "FTS corpus requires one scorer consumer and producer, got {consumers} and {producers}"
-            )));
-        }
-        Ok(input)
-    }
-
-    fn execution_metrics(template: &dyn ExecutionPlan, runtime: &dyn ExecutionPlan) -> MetricsSet {
-        fn collect(plan: &dyn ExecutionPlan, metrics: &mut MetricsSet, only_named: bool) {
-            if let Some(node_metrics) = plan.metrics() {
-                for metric in node_metrics.iter() {
-                    if !only_named
-                        || matches!(
-                            metric.value(),
-                            MetricValue::Count { .. }
-                                | MetricValue::Gauge { .. }
-                                | MetricValue::Time { .. }
-                                | MetricValue::PruningMetrics { .. }
-                                | MetricValue::Ratio { .. }
-                                | MetricValue::Custom { .. }
-                        )
-                    {
-                        metrics.push(metric.clone());
-                    }
-                }
-            }
-            for child in plan.children() {
-                collect(child.as_ref(), metrics, only_named);
-            }
-        }
-        let mut template_metrics = MetricsSet::new();
-        collect(template, &mut template_metrics, false);
-        let mut seen = template_metrics
-            .iter()
-            .map(|metric| Arc::as_ptr(metric) as usize)
-            .collect::<HashSet<_>>();
-        // The wrapper has its input's output and compute metrics. Descendant
-        // baseline metrics describe different operators, so only their named
-        // I/O, scorer and other diagnostic metrics belong in this aggregation.
-        let mut runtime_metrics = runtime.metrics().unwrap_or_default();
-        for child in runtime.children() {
-            collect(child.as_ref(), &mut runtime_metrics, true);
-        }
-        let mut metrics = MetricsSet::new();
-        for metric in runtime_metrics.iter() {
-            // Some leaf resets intentionally retain metric handles. The visible
-            // template already exposes these, so do not count them twice.
-            if seen.insert(Arc::as_ptr(metric) as usize) {
-                metrics.push(metric.clone());
-            }
-        }
-        metrics
-    }
-}
-
-impl DisplayAs for SharedFtsScorerExec {
-    fn fmt_as(&self, _format: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(match &self.scorer {
-            SharedFtsCorpus::Match(_) => "MatchCorpus",
-            SharedFtsCorpus::Combined(_) => "CombinedFieldsCorpus",
-        })
-    }
-}
-
-impl ExecutionPlan for SharedFtsScorerExec {
-    fn name(&self) -> &str {
-        "SharedFtsScorerExec"
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        self.input.properties()
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-
-    fn apply_expressions(
-        &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
-    ) -> DataFusionResult<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
-    }
-
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
-    }
-
-    fn maintains_input_order(&self) -> Vec<bool> {
-        vec![true]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        mut children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return Err(DataFusionError::Internal(format!(
-                "FTS corpus requires one input, got {}",
-                children.len()
-            )));
-        }
-        let input = children
-            .pop()
-            .ok_or_else(|| DataFusionError::Internal("FTS corpus input is missing".to_string()))?;
-        Ok(Arc::new(Self::with_corpus(input, self.scorer.clone())))
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<datafusion::execution::TaskContext>,
-    ) -> DataFusionResult<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Internal(format!(
-                "FTS corpus requires partition 0, got {partition}"
-            )));
-        }
-        let input = self.prepare_execution()?;
-        if input.output_partitioning().partition_count() != 1 {
-            return Err(DataFusionError::Internal(
-                "FTS corpus input must have one output partition".to_string(),
-            ));
-        }
-        let execution = Arc::new(());
-        let result = input.execute(partition, context);
-        let snapshot = Self::execution_metrics(self.input.as_ref(), input.as_ref());
-        *self.metrics.lock().map_err(|_| {
-            DataFusionError::Internal("FTS runtime lock was poisoned".to_string())
-        })? = SharedFtsExecutionMetrics {
-            execution: execution.clone(),
-            active: Some(Arc::downgrade(&input)),
-            snapshot,
-        };
-        let stream = result?;
-        let schema = stream.schema();
-        let guard = SharedFtsMetricsGuard {
-            input,
-            template: self.input.clone(),
-            metrics: self.metrics.clone(),
-            execution,
-        };
-        // The captured guard also runs when this closure is dropped before EOF,
-        // preserving lazily registered metrics on error or cancellation.
-        let stream = stream.finally(move || drop(guard));
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
-    }
-
-    fn metrics(&self) -> Option<MetricsSet> {
-        let (active, snapshot) = {
-            let metrics = self.metrics.lock().ok()?;
-            (
-                metrics.active.as_ref().and_then(Weak::upgrade),
-                metrics.snapshot.clone(),
-            )
-        };
-        // Expose active metrics before EOF without retaining the execution
-        // between inspections.
-        Some(match active {
-            Some(input) => Self::execution_metrics(self.input.as_ref(), input.as_ref()),
-            None => snapshot,
-        })
-    }
 }
 
 /// Time spent resolving an exact ordered UUID selection to committed FTS segments.
@@ -6725,6 +6311,8 @@ impl ExecutionPlan for BooleanQueryExec {
 
 #[cfg(test)]
 mod tests {
+    mod corpus;
+
     use datafusion::common::tree_node::TreeNodeRecursion;
     use datafusion::physical_plan::ChildrenPropertiesMode;
     use datafusion::physical_plan::ReplaceChildrenOptions;
@@ -7697,7 +7285,10 @@ mod tests {
     #[case::stream(ResidualFailure::Stream)]
     #[case::cancel(ResidualFailure::Cancel)]
     #[tokio::test]
-    async fn test_9058_shared_corpus_retries_after_failure(#[case] failure: ResidualFailure) {
+    async fn test_9058_shared_corpus_retries_after_failure(
+        #[case] failure: ResidualFailure,
+        #[values(false, true)] is_reconstructed: bool,
+    ) {
         let dataset = indexed_match_dataset().await;
         let query = MatchQuery::new("alpha beta".to_string())
             .with_column(Some("text".to_string()))
@@ -7724,14 +7315,52 @@ mod tests {
             .with_shared_scorer(shared.clone()),
         );
         let flat = Arc::new(
-            FlatMatchQueryExec::new(dataset, query, FtsSearchParams::default(), residual.clone())
-                .unwrap()
-                .with_shared_scorer(shared.clone())
-                .with_candidate_filter(candidate_input(vec![], false)),
+            FlatMatchQueryExec::new(
+                dataset.clone(),
+                query.clone(),
+                FtsSearchParams::default(),
+                residual.clone(),
+            )
+            .unwrap()
+            .with_shared_scorer(shared.clone())
+            .with_candidate_filter(candidate_input(vec![], false)),
         );
         let union = UnionExec::try_new(vec![indexed, flat]).unwrap();
         let input: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(union));
-        let owner = Arc::new(SharedFtsScorerExec::new(input.clone(), shared));
+        let owner = Arc::new(SharedFtsScorerExec::new(input, shared));
+        let owner: Arc<dyn ExecutionPlan> = if is_reconstructed {
+            let binding = owner.binding().unwrap();
+            // Model a decoder: neither leaf carries the original shared Arc,
+            // and a shallow Dataset clone is still the same opened snapshot.
+            let indexed = Arc::new(
+                MatchQueryExec::new(
+                    dataset.clone(),
+                    query.clone(),
+                    FtsSearchParams::default().with_limit(Some(1)),
+                    PreFilterSource::None,
+                )
+                .unwrap(),
+            );
+            let flat = Arc::new(
+                FlatMatchQueryExec::new(
+                    Arc::new(dataset.as_ref().clone()),
+                    query,
+                    FtsSearchParams::default(),
+                    residual.clone(),
+                )
+                .unwrap()
+                .with_candidate_filter(candidate_input(vec![], false)),
+            );
+            let decoded: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(
+                UnionExec::try_new(vec![indexed, flat]).unwrap(),
+            ));
+            let rebuilt = SharedFtsScorerExec::try_new(decoded, binding.clone()).unwrap();
+            assert_eq!(rebuilt.binding().unwrap(), binding);
+            Arc::new(rebuilt)
+        } else {
+            owner
+        };
+        let input = owner.children()[0].clone();
         let owner = owner
             .replace_children(
                 vec![input],
