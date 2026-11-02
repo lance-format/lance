@@ -57,8 +57,7 @@ use super::utils::{
 use crate::dataset::mem_wal::index::{QueryLocalFtsIndex, QueryLocalFtsStats};
 use crate::index::prefilter::{DatasetPreFilter, prefilter_may_match_segment};
 use crate::index::scalar::inverted::{
-    ResolvedFtsField, flatten_fts_document_column, fts_document_schema, load_segment_details,
-    load_segments, transform_fts_document_stream,
+    ResolvedFtsField, flatten_fts_document_column, load_segment_details, load_segments,
 };
 use crate::index::segment_coverage::{SegmentCoverage, SegmentRowDomain};
 use crate::{Dataset, index::DatasetIndexInternalExt};
@@ -89,6 +88,9 @@ use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 use tracing::instrument;
 use uuid::Uuid;
+
+mod document;
+pub use document::FtsDocumentExec;
 
 /// Maximum number of additional kth-score rows retained before exact replay.
 /// One extra probe slot is reserved for the strict lower-score guard.
@@ -197,90 +199,6 @@ fn fmt_tokenized_compound_query(
         write!(f, "{separator}tokenized_query={tokens}")?;
     }
     Ok(())
-}
-
-/// Expands a schema-derived nested FTS source into one canonical row per
-/// logical document before flat search or index building consumes it.
-#[derive(Debug)]
-pub struct FtsDocumentExec {
-    input: Arc<dyn ExecutionPlan>,
-    resolved: ResolvedFtsField,
-    properties: Arc<PlanProperties>,
-}
-
-impl FtsDocumentExec {
-    pub(crate) fn new(input: Arc<dyn ExecutionPlan>, resolved: ResolvedFtsField) -> Self {
-        let schema = fts_document_schema(resolved.coordinate_rank());
-        let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(schema),
-            input.output_partitioning().clone(),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        ));
-        Self {
-            input,
-            resolved,
-            properties,
-        }
-    }
-}
-
-impl DisplayAs for FtsDocumentExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "FtsDocument: column={}, granularity={:?}",
-            self.resolved.canonical_path, self.resolved.document_granularity
-        )
-    }
-}
-
-impl ExecutionPlan for FtsDocumentExec {
-    fn name(&self) -> &str {
-        "FtsDocumentExec"
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-
-    fn apply_expressions(
-        &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
-    ) -> DataFusionResult<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        mut children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return Err(DataFusionError::Internal(
-                "FtsDocumentExec expects one child".to_string(),
-            ));
-        }
-        Ok(Arc::new(Self::new(
-            children.pop().unwrap(),
-            self.resolved.clone(),
-        )))
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<datafusion::execution::TaskContext>,
-    ) -> DataFusionResult<SendableRecordBatchStream> {
-        transform_fts_document_stream(
-            self.input.execute(partition, context)?,
-            self.resolved.clone(),
-        )
-        .map_err(DataFusionError::from)
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
 }
 
 /// Open one FTS segment as an [`InvertedIndex`].
