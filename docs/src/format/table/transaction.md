@@ -613,13 +613,13 @@ They mutate only the authoritative current pin list and its required capability.
 They cannot be used in detached commits. The record, time, identity, no-op, and
 confirmation rules are specified in [Ongoing Work Pins](ongoing_work_pins.md).
 Their manifest conflict rules do not make physical cleanup or branch deletion
-atomic with acquisition; the existing [maintenance concurrency limits](ongoing_work_pins.md#maintenance-concurrency-limits)
+atomic with acquisition; the existing [cleanup and deletion races](ongoing_work_pins.md#cleanup-and-deletion-races)
 still apply.
 
 An attached commit whose resulting manifest contains active pins must persist
 its own transaction inline or in its referenced sidecar before publication.
 This preserves the committed-change evidence required by the
-[snapshot retention window](ongoing_work_pins.md#retention-and-data-operations),
+[version retention window](ongoing_work_pins.md#retention-and-data-operations),
 including when the operation carries existing pins without changing them.
 
 Detached commits instead serialize an empty pin list and preserve the sticky
@@ -648,7 +648,7 @@ Unknown transaction operations retain their existing fail-closed conflict rule.
 | CreateIndex | May rebase under existing index rules, preserve current pins, and revalidate retained FRI history if the operation replaces or trims it. Index attachment does not release a pin. |
 | Rewrite | Revalidate current pins at the final target. A result without required movement records is a conflict requiring replanning, even when planned before registration. Preserve current pin membership and required history. |
 | Restore, Overwrite | Preserve the current active list and sticky capability, including current `expires_at` values and fixed sources; never substitute historical or newly empty lists. Existing data conflicts remain. |
-| Clone | Does not copy source pins into the new branch/table. Preserve an inherited sticky capability and the source's independent snapshot protections. Source publication/retention rules still apply. |
+| Clone | Does not copy source pins into the new branch/table. Preserve an inherited sticky capability and the source's independent version protections. Source publication/retention rules still apply. |
 | RegisterPin | Recover the identical active ID/source or fail the fresh exact-source guard. Never move an existing acquisition to a new source. |
 | RenewPin | Re-read the target pin. Missing is an error; an already satisfied request is a no-op; otherwise extend to the fixed later `expires_at`. Another renewal cannot shorten it. |
 | ReleasePin | Remove only the target ID from the current list; absent is a no-op. Concurrent renewal does not prevent explicit release. |
@@ -674,7 +674,7 @@ pin and attached-consumer requirements, using the representation-specific rules
 in [Ongoing Work Pins](ongoing_work_pins.md#retention-and-data-operations).
 Restore and Overwrite apply those rules to the resulting current history and
 may discard translation paths as described there; they must still preserve
-current pins and the complete snapshot retention window.
+current pins and the complete version retention window.
 Pin changes never loosen other transaction preconditions.
 
 ## Conflict Resolution

@@ -211,7 +211,7 @@ the index. Checking only published indices would miss that requirement.
 
 [Ongoing-work pins](../../table/ongoing_work_pins.md) record these dependencies.
 For each pin, load its source-version manifest and use all fragment IDs listed
-there. This reads snapshot metadata, not the rows. Cleanup must consider both
+there. This reads manifest metadata, not the rows. Cleanup must consider both
 active pins and existing consumers before removing history.
 
 FRI version 0 uses an inclusive source-version boundary. FRI version 1 follows
@@ -226,7 +226,7 @@ Every operation that trims or replaces history must recheck all consumers'
 requirements against the current table version before committing, even if it
 was planned before a pin registered. Restore and Overwrite apply this check to
 the resulting current history; they may discard translation paths while
-preserving current pins and their retained snapshots.
+preserving current pins and their retained versions.
 
 Compaction must record the movements active pins need and recheck those pins
 before committing. Reject a result lacking required mappings so the caller can
@@ -235,11 +235,11 @@ layout, establish index freshness, or authorize publication of an old result.
 
 History can be trimmed when no active pin or other consumer needs it, including
 any intermediate movements needed to translate old addresses. External mapping
-files remain protected while any retained snapshot or required history
+files remain protected while any retained version or required history
 references them, including files added after registration. Replacing FRI
 metadata does not release those files. Creating a pin does not cancel an
 earlier deletion decision; see the examples in
-[Maintenance concurrency limits](../../table/ongoing_work_pins.md#maintenance-concurrency-limits).
+[Cleanup and deletion races](../../table/ongoing_work_pins.md#cleanup-and-deletion-races).
 
 ## Stable Row IDs
 

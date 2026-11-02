@@ -108,7 +108,7 @@ This follows existing tag protection: the check is separate from physical
 deletion and is not atomic with concurrent acquisition. Registration after a
 deleter's inspection does not force that deleter to observe the new pin.
 Delayed deletion after recovery and name reuse also remains a known gap. See
-[Maintenance concurrency limits](ongoing_work_pins.md#maintenance-concurrency-limits).
+[Cleanup and deletion races](ongoing_work_pins.md#cleanup-and-deletion-races).
 
 Resolving those existing coordination gaps is outside the pin proposal. Branch
 names remain reusable; pins add no name-retirement record, deletion marker,

@@ -63,7 +63,7 @@ for pins. Copy the pin list, all record fields, and the sticky capability from
 the predecessor manifest used for each attempt, including after rebasing, and
 atomically publish at that predecessor's version plus one without replacing an
 occupied version. Do not copy membership from the transaction's original read
-snapshot after rebasing. Required transaction persistence still applies.
+version after rebasing. Required transaction persistence still applies.
 
 A write that advances the head must carry that head's pin state. A successful
 write to a reclaimed older slot does not make it the authoritative head or
@@ -88,5 +88,5 @@ head through their own commit protocol; do not replace their coordination with
 an uncoordinated object listing. A backend must provide the visibility guarantees
 required by its commit protocol or refuse pin acquisition. These reads do not
 lock current state. Apply the transaction's publication and retry rules after
-resolution; the [maintenance concurrency limits](ongoing_work_pins.md#maintenance-concurrency-limits)
+resolution; the [cleanup and deletion races](ongoing_work_pins.md#cleanup-and-deletion-races)
 remain even when these reads succeed.

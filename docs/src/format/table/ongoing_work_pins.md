@@ -1,12 +1,15 @@
 # Ongoing Work Pins
 
-An ongoing-work pin retains a fixed source snapshot, intervening committed
+An ongoing-work pin retains a fixed source version, intervening committed
 history needed to validate publication, and applicable fragment reuse index
 (FRI) history while a job runs. This revision preserves the intervening history
-by retaining complete snapshots. Pins do not establish the freshness or
-publication validity of a job's output. Creating a pin does not cancel a
-destructive operation that has already checked whether deletion is allowed;
-see [Maintenance concurrency limits](#maintenance-concurrency-limits).
+by retaining complete versions. Pins do not establish the freshness or
+publication validity of a job's output.
+
+A successful registration cannot stop an earlier cleanup or branch-deletion
+operation from deleting files it already selected. See
+[Cleanup and deletion races](#cleanup-and-deletion-races) for examples and
+guidance.
 
 ## Persisted state
 
@@ -44,9 +47,9 @@ registry of ended pins is required.
 
 The source is the attached `source_version` in the pin's table and branch.
 Requests and handles must remain bound to that table location and, for named
-branches, the acquired branch identifier. A version number identifies a
-snapshot within that table and branch; registration does not require the
-source transaction's UUID or contents.
+branches, the acquired branch identifier. Within that table and branch, the
+version number identifies the source. Registration does not require the source
+transaction's UUID or contents.
 
 Requests and handles must not be reused after the whole table is deleted and
 recreated, even at the same path. The owning service or catalog must coordinate
@@ -110,10 +113,10 @@ source version V:
    matching P alone is insufficient. If these facts cannot be established,
    return an indeterminate outcome or failure, never acknowledge registration.
 
-These confirmation reads establish observed current state, not an atomic
-handoff against physical deletion. Branch deletion must perform the
-[active-pin check](branch_tag.md#deletion-with-ongoing-work-pins), but that check
-is not atomic with registration or subsequent physical deletion.
+These reads confirm that the pin and its source are present at that time.
+They do not cancel deletion decisions already in progress. Branch deletion
+must perform the [active-pin check](branch_tag.md#deletion-with-ongoing-work-pins),
+but a pin registered after that check does not stop the deletion.
 Main has no branch-reference ID that distinguishes table-root recreation;
 whole-table deletion must be coordinated by the owning service or catalog.
 No permanent table identity is introduced here.
@@ -163,15 +166,15 @@ trigger the same cleanup.
 
 Resolve current pin membership and the authoritative attached head H when
 planning retention. If any pins are active, let F be their minimum
-`source_version`. Retain every attached snapshot in the same branch from F
-through H, inclusive. Detached snapshots are not part of this window. Preserve
+`source_version`. Retain every attached version in the same branch from F
+through H, inclusive. Detached versions are not part of this window. Preserve
 the manifest and any commit-store records needed to discover and read each
 version through the backend's authoritative protocol.
 
-Reuse normal snapshot retention for every manifest in this window, including
+Reuse normal version retention for every manifest in this window, including
 its base data, deletion files, overlays, indices, FRI metadata, referenced
 transaction sidecars, and external mapping files. Retain shared physical files
-once. These remain ordinary readable snapshots; retaining their manifests
+once. These remain ordinary readable versions; retaining their manifests
 while deleting their referenced data does not satisfy this contract.
 
 Each attached commit whose result contains active pins must persist its own
@@ -190,14 +193,14 @@ release by an unambiguous ID remains available.
 
 Renewal never moves a pin's source version. Release or committed expiration may
 advance the minimum source version; removing the last pin removes this window
-requirement. Other pins, tags, snapshots, and consumers still retain their
+requirement. Other pins, tags, retained versions, and consumers still retain their
 resources. Cleanup may remove other eligible resources and must report retention
 caused by pins. Passing `expires_at` alone does not advance the boundary.
 
 This window can retain intermediate data and index generations that publication
 does not itself read. Its storage cost grows with rewritten resources and the
 age of the oldest active source. No new pin field or metadata-only history
-representation is introduced. Replacing complete snapshot retention with a
+representation is introduced. Replacing complete version retention with a
 smaller evidence representation requires a separately specified compatible
 discovery and retention protocol.
 
@@ -235,31 +238,31 @@ checks.
 
 Retain the external mapping files referenced by required history, including
 records added after registration. Physical cleanup may remove a mapping file
-only when no retained snapshot or required history references it, subject to
-the existing maintenance concurrency limits. Replacing FRI metadata does not
-by itself make its mapping files eligible for deletion.
+only when no retained version or required history references it, subject to
+the [cleanup and deletion races](#cleanup-and-deletion-races). Replacing FRI
+metadata does not by itself make its mapping files eligible for deletion.
 
 Pin retention does not change overlay/index correctness requirements or make
 an unsupported overlay or rewrite operation valid.
 
 Attached Restore and Overwrite carry the current active list, fixed sources,
-timestamps, and sticky bit. They never import the target snapshot's historical
+timestamps, and sticky bit. They never import the target version's historical
 pin list.
-Neither operation shortens the retained snapshot window.
+Neither operation shortens the retained version window.
 Apply FRI retention to the resulting current history. Neither operation is
 required to reconstruct discarded translation paths. Within that history,
-retain movement records needed to connect a pinned snapshot to the current
+retain movement records needed to connect a pinned version to the current
 table layout. Records needed only for a discarded intermediate layout may be
 removed if no other consumer requires them. Pins keep source files available,
 but do not guarantee that a job can translate or publish its results after a
 restore or overwrite; retention does not supply a missing mapping.
 Removing a record from the current FRI does not reclaim files still referenced
-by snapshots in the retained window.
+by versions in the retained window.
 
 New branches and clones have empty pin lists and preserve the sticky bit when
-inherited. Detached snapshots must serialize an empty pin list and preserve the
-sticky bit when inherited. Creating a detached snapshot does not change the
-branch's current pin list. Detached snapshots cannot own active pins, and none
+inherited. Detached versions must serialize an empty pin list and preserve the
+sticky bit when inherited. Creating a detached version does not change the
+branch's current pin list. Detached versions cannot own active pins, and none
 of the four pin operations may be used in a detached commit.
 
 Other attached commits preserve the current list. All operations that rewrite
@@ -292,35 +295,49 @@ older or unverified destructive clients, and completion or cancellation of
 incompatible operations already in flight. Existing branch deleters that never
 inspect capability flags are not made safe by this bit.
 
-## Maintenance concurrency limits
+## Cleanup and deletion races
 
-This feature does not add atomic coordination between protection acquisition,
-restore, and destructive maintenance. Existing tags also use separate
-acquisition and retention checks. A tag created after cleanup's inspection can
-succeed while that sweep still deletes its old source files. An earlier sweep
-can likewise delete files adopted by a concurrent restore, and a delayed branch
-deletion can damage a replacement after overlapping recovery and name reuse.
+Cleanup checks which versions and files are still needed, then deletes the
+eligible files. Registering a pin changes what later checks must retain. It
+does not cancel a deletion decision already made by an earlier operation.
 
-Current-version-only acquisition avoids selecting an arbitrary old version
-already eligible for cleanup. A sweep retains the head it inspected, and the
-usual grace period protects newly written, unverified files while they remain
-recent. This narrows exposure compared with old-version tags, but is not a
-general concurrency guarantee: the grace period can elapse or be bypassed by
-`delete_unverified`, and restore can reintroduce older files. The old-version
-tag case is not evidence that every current-version pin has the same exposure.
+Pins only register against the current version. A cleanup run retains the
+current version it inspected. Cleanup also leaves recent files alone when it
+cannot verify that they belong to an old version being removed. This grace
+period gives writers time to commit their files. It ends as files age, and
+`delete_unverified` bypasses it.
 
-The pin checks do not cancel an earlier deletion plan or prevent a destructive
-operation from running after confirmation. A successful registration therefore
-does not guarantee safety against these overlapping operations. Callers must
-not treat the pin as a lock against destructive maintenance.
+Restore can bring old files back into use after cleanup has selected them for
+deletion. For example:
 
-For example, branch deletion may inspect the current manifest and find no
-pins. A job may then register a pin before the deletion removes the branch.
-The deletion can still proceed using its earlier check: inspection and physical
-deletion are separate steps, and registration does not cancel that decision.
+1. Cleanup decides that an old version's file A can be deleted.
+2. A user restores that version. The new current version references file A.
+3. A job registers a pin on the restored version. Registration succeeds while
+   file A still exists.
+4. Cleanup deletes file A using its earlier decision. The job now needs a
+   missing file, even though its pin is active.
 
-These are existing maintenance and branch-coordination gaps. Their fixes are
-outside this proposal; no deletion marker, permanent name retirement, new
-branch layout, or reference journal is specified. Branch names remain reusable.
-This limitation does not relax the required active-pin checks, the retention
-of sources selected by those checks, or the transactional FRI retention rules.
+Users can call restore at any time. The restore API does not wait for cleanup,
+and pins do not block restore. Applications that control both operations can
+avoid this race by waiting for running cleanup to finish before restoring,
+and keeping new cleanup runs paused until the job's pin is confirmed. The
+application must arrange that ordering; pins do not enforce it. Cleanup can
+then resume while the job runs.
+
+Running cleanup less often does not guarantee that it will avoid a restore.
+Keeping recent versions for longer also does not protect old files already
+selected for deletion. Jobs should register before reading and preserve normal
+cleanup grace protections, but neither measure fixes this restore race.
+
+Branch deletion has a similar gap: it can check the current manifest, find no
+pins, and proceed after a job registers one. Delayed deletion can also damage
+a replacement branch when recovery and name reuse overlap the deletion.
+Likewise, a tag added after cleanup's inspection may fail to protect an old
+version. Pins avoid selecting arbitrary old versions, but inherit the restore
+and branch-deletion races described above.
+
+Fixing these existing races is outside this proposal. Branch names remain
+reusable; pins add no deletion marker, permanent name retirement, new branch
+layout, or reference journal. Cleanup and branch deletion must still check
+active pins and retain the resources those checks require. Compaction and
+FRI trimming must still validate pin requirements before committing.

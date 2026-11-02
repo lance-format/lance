@@ -48,7 +48,7 @@ message OngoingWorkPin {
   optional string id = 1;
   /* The fixed attached source manifest version. Absent or zero is invalid.
    * Renewal never changes this version. Active pins retain complete attached
-   * snapshots from their oldest source version through the current branch head,
+   * versions from their oldest source version through the current branch head,
    * including committed transaction history, as specified in Ongoing Work Pins.
    */
   optional uint64 source_version = 2;
