@@ -296,9 +296,10 @@ def test_btree_row_address_reader_capability(
 def test_btree_row_address_maintenance_restores_coverage(btree_row_address_compat_case):
     case = btree_row_address_compat_case
     case.compat_version = "14.0.0b16"
+    expected_key = lance.dataset(case.path).count_rows()
     case.check_write()
     case.check_read()
-    assert lance.dataset(case.path).count_rows("btree == 1000") == 1
+    assert lance.dataset(case.path).count_rows(f"btree == {expected_key}") == 1
 
 
 @compat_test(min_version="0.30.0")
