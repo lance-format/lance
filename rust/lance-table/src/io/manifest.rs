@@ -55,7 +55,6 @@ use super::commit::ManifestLocation;
 /// # Ok(())
 /// # }
 /// ```
-#[instrument(level = "debug", skip(object_store))]
 pub async fn read_manifest_proto(
     object_store: &ObjectStore,
     path: &Path,
@@ -87,7 +86,6 @@ pub async fn read_manifest_proto(
 /// # Ok(())
 /// # }
 /// ```
-#[instrument(level = "debug", skip(object_store))]
 pub async fn read_manifest(
     object_store: &ObjectStore,
     path: &Path,

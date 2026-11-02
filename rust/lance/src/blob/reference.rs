@@ -23,21 +23,15 @@ use arrow_array::{
 use arrow_buffer::NullBufferBuilder;
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_schema::{DataType, Field, Fields, Schema};
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use lance_core::datatypes::BlobKind;
 use lance_core::{Error, Result};
 use lance_io::object_store::uri_to_url;
-use lance_table::{
-    format::{Manifest, pb as table_pb},
-    io::manifest::read_manifest_bytes,
-};
-use object_store::path::Path;
+use lance_table::snapshot::SnapshotRef;
 use prost::Message;
-use roaring::RoaringBitmap;
 
 use crate::Dataset;
-use crate::dataset::refs::check_valid_branch;
 
 pub use crate::dataset::blob::capture::BlobRefCapture;
 pub use crate::dataset::blob::{
@@ -86,48 +80,50 @@ static REFERENCE_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
 pub struct BlobSourceContext {
     proto: pb::SourceContext,
     source_id: [u8; 32],
-    registered_bases: Arc<RoaringBitmap>,
+    snapshot: SnapshotRef,
 }
 
 impl BlobSourceContext {
-    /// Capture the resolved snapshot, including the original manifest protobuf bytes.
+    /// Capture a compact reference to the resolved snapshot without reading payloads.
     ///
-    /// `table_identity` identifies the table incarnation and its catalog/storage
-    /// authority. It must distinguish different tables that can reuse a URI.
-    /// `access_context_key` names an authenticated binding available to every worker,
-    /// including per-base configuration. Neither value may be empty.
-    ///
-    /// This reads manifest metadata, never blob payloads. It rejects a manifest
-    /// that no longer matches `dataset`, rather than capturing a different snapshot.
+    /// `table_identity` distinguishes table incarnations and catalog/storage
+    /// authorities. `access_context_key` names an authenticated binding available
+    /// to every worker, including per-base configuration. Neither may be empty.
     pub async fn from_dataset(
         dataset: &Dataset,
         table_identity: impl Into<String>,
         access_context_key: impl Into<String>,
     ) -> Result<Self> {
-        let location = dataset.manifest_location();
-        let mut manifest =
-            read_manifest_bytes(&dataset.object_store, &location.path, location.size).await?;
-        let manifest = manifest.copy_to_bytes(manifest.remaining());
-        let mut observed = Manifest::try_from(table_pb::Manifest::decode(manifest.clone())?)?;
-        observed.detach_sparse_inline_row_ids(manifest.len());
-        if !matches_loaded_manifest(&observed, dataset.manifest()) {
-            return Err(Error::invalid_input(format!(
-                "Manifest {} no longer matches the loaded snapshot at version {}",
-                location.path,
-                dataset.manifest().version,
-            )));
+        let access_context_key = access_context_key.into();
+        if access_context_key.trim().is_empty() {
+            return Err(Error::invalid_input(
+                "Blob source access_context_key cannot be empty",
+            ));
         }
-        let root = dataset.refs.root()?;
+        Self::try_new(
+            dataset.snapshot_ref(table_identity).await?,
+            access_context_key,
+        )
+    }
+
+    /// Bind a generic snapshot reference to worker routing and blob capabilities.
+    ///
+    /// The snapshot contains no credentials and does not acquire retention.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::blob::reference::BlobSourceContext;
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let snapshot = dataset.snapshot_ref("catalog/table-incarnation").await?;
+    /// let context = BlobSourceContext::try_new(snapshot, "query/storage-binding")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn try_new(snapshot: SnapshotRef, access_context_key: impl Into<String>) -> Result<Self> {
         Self::from_proto(pb::SourceContext {
             protocol_version: VERSION,
             required_capabilities: vec![OBJECT_RANGES],
-            table_identity: table_identity.into(),
-            table_uri: canonical_uri(&root.uri)?,
-            branch: dataset.manifest().branch.clone(),
-            version: dataset.manifest().version,
-            manifest_path: location.path.to_string(),
-            manifest,
-            manifest_identity: location.identity.clone(),
+            snapshot: Some((&snapshot).into()),
             access_context_key: access_context_key.into(),
         })
     }
@@ -165,22 +161,22 @@ impl BlobSourceContext {
 
     /// Canonical table-incarnation identity supplied by the application.
     pub fn table_identity(&self) -> &str {
-        &self.proto.table_identity
+        self.snapshot.table_identity()
     }
 
     /// Absolute table root URI, without the branch suffix.
     pub fn table_uri(&self) -> &str {
-        &self.proto.table_uri
+        self.snapshot.table_uri()
     }
 
     /// Resolved branch name; `None` identifies the main branch.
     pub fn branch(&self) -> Option<&str> {
-        self.proto.branch.as_deref()
+        self.snapshot.branch()
     }
 
     /// Exact version within the resolved branch, never an unresolved latest version.
     pub fn version(&self) -> u64 {
-        self.proto.version
+        self.snapshot.version()
     }
 
     /// Portable key for independently resolving credentials and base routing.
@@ -188,32 +184,13 @@ impl BlobSourceContext {
         &self.proto.access_context_key
     }
 
-    /// Original protobuf manifest image, including the source's registered bases.
-    pub fn serialized_manifest(&self) -> &[u8] {
-        &self.proto.manifest
+    /// Generic snapshot reference, independent of worker storage binding keys.
+    pub fn snapshot_ref(&self) -> &SnapshotRef {
+        &self.snapshot
     }
 
     pub(crate) fn validate_dataset(&self, dataset: &Dataset) -> Result<()> {
-        let location = dataset.manifest_location();
-        let mut manifest =
-            Manifest::try_from(table_pb::Manifest::decode(self.proto.manifest.clone())?)?;
-        manifest.detach_sparse_inline_row_ids(self.proto.manifest.len());
-        if self.proto.table_uri != canonical_uri(&dataset.refs.root()?.uri)?
-            || self.proto.manifest_path != location.path.as_ref()
-            || self.proto.manifest_identity != location.identity
-            || !matches_loaded_manifest(&manifest, dataset.manifest())
-        {
-            return Err(Error::invalid_input(format!(
-                "Blob source context {:?}/{} at {} does not match dataset snapshot {:?}/{} at {}",
-                self.proto.branch,
-                self.proto.version,
-                self.proto.table_uri,
-                dataset.manifest().branch,
-                dataset.version().version,
-                dataset.uri(),
-            )));
-        }
-        Ok(())
+        dataset.validate_snapshot(&self.snapshot)
     }
 
     pub(crate) fn reference(
@@ -269,58 +246,21 @@ impl BlobSourceContext {
                 proto.required_capabilities,
             )));
         }
-        for (name, value) in [
-            ("table_identity", &proto.table_identity),
-            ("access_context_key", &proto.access_context_key),
-            ("manifest_path", &proto.manifest_path),
-        ] {
-            if value.trim().is_empty() {
-                return Err(Error::invalid_input(format!(
-                    "Blob source {name} cannot be empty"
-                )));
-            }
-        }
-        if proto.table_uri != canonical_uri(&proto.table_uri)? {
-            return Err(Error::invalid_input(format!(
-                "Noncanonical table URI {}",
-                proto.table_uri
-            )));
-        }
-        Path::parse(&proto.manifest_path)?;
-        if let Some(branch) = &proto.branch {
-            check_valid_branch(branch).map_err(|error| {
-                Error::invalid_input(format!("Invalid blob source branch {branch:?}: {error}",))
-            })?;
-        }
-        if proto.version == 0 {
+        if proto.access_context_key.trim().is_empty() {
             return Err(Error::invalid_input(
-                "Blob source version must be greater than 0, got 0",
+                "Blob source access_context_key cannot be empty",
             ));
         }
-        if proto
-            .manifest_identity
+        let snapshot = proto
+            .snapshot
             .as_ref()
-            .is_some_and(String::is_empty)
-        {
-            return Err(Error::invalid_input(
-                "Blob source manifest identity cannot be empty",
-            ));
-        }
-        let manifest = table_pb::Manifest::decode(proto.manifest.clone()).map_err(|error| {
-            Error::invalid_input(format!("Invalid blob source manifest protobuf: {error}",))
-        })?;
-        if manifest.version != proto.version || manifest.branch != proto.branch {
-            return Err(Error::invalid_input(format!(
-                "Blob source snapshot {:?}/{} disagrees with manifest {:?}/{}",
-                proto.branch, proto.version, manifest.branch, manifest.version,
-            )));
-        }
+            .ok_or_else(|| Error::invalid_input("Blob source snapshot reference is required"))?;
+        let snapshot = SnapshotRef::try_from(snapshot.clone())?;
         let source_id = *blake3::hash(&proto.encode_to_vec()).as_bytes();
-        let registered_bases = Arc::new(manifest.base_paths.iter().map(|base| base.id).collect());
         Ok(Self {
             proto,
             source_id,
-            registered_bases,
+            snapshot,
         })
     }
 }
@@ -422,13 +362,6 @@ impl BlobRef {
             return Err(Error::invalid_input(format!(
                 "Blob reference does not match source_context slot {}",
                 self.source_context,
-            )));
-        }
-        if let Some(base_id) = object.base_id
-            && !context.registered_bases.contains(base_id)
-        {
-            return Err(Error::invalid_input(format!(
-                "Blob reference references unknown base_id {base_id}"
             )));
         }
         if object.origin == pb::object_locator::Origin::ExternalImmutable as i32
@@ -733,21 +666,6 @@ impl BlobRefBatch {
     }
 }
 
-/// Compare a decoded manifest with a loaded snapshot, ignoring hydrated dictionary values.
-fn matches_loaded_manifest(observed: &Manifest, loaded: &Manifest) -> bool {
-    // Writes and session caches populate dictionary values that are not part of
-    // the manifest schema's persisted dictionary metadata.
-    let mut expected = loaded.clone();
-    let mut fields = expected.schema.fields.iter_mut().collect::<Vec<_>>();
-    while let Some(field) = fields.pop() {
-        if let Some(dictionary) = &mut field.dictionary {
-            dictionary.values = None;
-        }
-        fields.extend(&mut field.children);
-    }
-    observed == &expected
-}
-
 fn check_version(version: u32, component: &str) -> Result<()> {
     if version != VERSION {
         return Err(Error::invalid_input(format!(
@@ -806,25 +724,26 @@ mod tests {
 
     #[cfg_attr(coverage, coverage(off))]
     fn context(version: u64, branch: Option<&str>) -> BlobSourceContext {
-        let manifest = table_pb::Manifest {
-            version,
-            branch: branch.map(str::to_string),
-            transaction_file: format!("0-transaction-{version}.txn"),
-            ..Default::default()
-        };
-        BlobSourceContext::from_proto(pb::SourceContext {
-            protocol_version: VERSION,
-            required_capabilities: vec![OBJECT_RANGES, IMMUTABLE_EXTERNAL],
-            table_identity: "catalog/table-incarnation".to_string(),
-            table_uri: "s3://source/table.lance".to_string(),
-            branch: branch.map(str::to_string),
-            version,
-            manifest_path: format!("table.lance/_versions/{version}.manifest"),
-            manifest: manifest.encode_to_vec().into(),
-            manifest_identity: None,
-            access_context_key: "query/authenticated-storage".to_string(),
-        })
-        .unwrap()
+        let snapshot = SnapshotRef::try_new(
+            "catalog/table-incarnation",
+            "s3://source/table.lance",
+            branch.map(str::to_string),
+            &lance_table::io::commit::ManifestLocation {
+                version,
+                path: object_store::path::Path::from(format!(
+                    "table.lance/_versions/{version}.manifest"
+                )),
+                size: None,
+                naming_scheme: lance_table::io::commit::ManifestNamingScheme::V1,
+                e_tag: None,
+                identity: None,
+            },
+            [version as u8; 32],
+        )
+        .unwrap();
+        BlobSourceContext::try_new(snapshot, "query/authenticated-storage")
+            .unwrap()
+            .with_external_immutability_assumption()
     }
 
     #[cfg_attr(coverage, coverage(off))]
@@ -934,7 +853,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case::table_identity(|p: &mut pb::SourceContext| p.table_identity = "catalog/other-incarnation".to_string())]
+    #[case::table_identity(|p: &mut pb::SourceContext| p.snapshot.as_mut().unwrap().table_identity = "catalog/other-incarnation".to_string())]
     #[case::storage_authority(|p: &mut pb::SourceContext| p.access_context_key = "other-storage-binding".to_string())]
     fn rejects_different_table_or_storage_authority(#[case] mutate: fn(&mut pb::SourceContext)) {
         let original = context(1, None);
@@ -944,7 +863,21 @@ mod tests {
         let other = BlobSourceContext::from_proto(proto).unwrap();
         assert_eq!(original.table_uri(), other.table_uri());
         assert_eq!(original.version(), other.version());
-        assert_eq!(original.serialized_manifest(), other.serialized_manifest());
+        if original.table_identity() == other.table_identity() {
+            assert_eq!(
+                original.snapshot_ref().snapshot_id(),
+                other.snapshot_ref().snapshot_id()
+            );
+        } else {
+            assert_ne!(
+                original.snapshot_ref().snapshot_id(),
+                other.snapshot_ref().snapshot_id()
+            );
+        }
+        assert_eq!(
+            original.snapshot_ref().manifest_digest(),
+            other.snapshot_ref().manifest_digest()
+        );
         let error = BlobRefBatch::try_new(vec![other], [Some(reference)]).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("does not match source_context"));
@@ -954,13 +887,13 @@ mod tests {
     #[case::version(|p: &mut pb::SourceContext| p.protocol_version = 2, "protocol version 2")]
     #[case::capability(|p: &mut pb::SourceContext| p.required_capabilities.push(999), "capabilities")]
     #[case::missing_capability(|p: &mut pb::SourceContext| p.required_capabilities.clear(), "capabilities")]
-    #[case::identity(|p: &mut pb::SourceContext| p.table_identity.clear(), "table_identity")]
+    #[case::identity(|p: &mut pb::SourceContext| p.snapshot.as_mut().unwrap().table_identity.clear(), "table_identity")]
     #[case::access(|p: &mut pb::SourceContext| p.access_context_key.clear(), "access_context_key")]
-    #[case::uri(|p: &mut pb::SourceContext| p.table_uri = "relative/table".to_string(), "must be absolute")]
-    #[case::main_alias(|p: &mut pb::SourceContext| p.branch = Some("main".to_string()), "branch")]
-    #[case::version_mismatch(|p: &mut pb::SourceContext| p.version = 9, "disagrees with manifest")]
-    #[case::branch_mismatch(|p: &mut pb::SourceContext| p.branch = Some("other".to_string()), "disagrees with manifest")]
-    #[case::empty_manifest_identity(|p: &mut pb::SourceContext| p.manifest_identity = Some(String::new()), "manifest identity")]
+    #[case::uri(|p: &mut pb::SourceContext| p.snapshot.as_mut().unwrap().table_uri = "relative/table".to_string(), "must be absolute")]
+    #[case::main_alias(|p: &mut pb::SourceContext| p.snapshot.as_mut().unwrap().branch = Some("main".to_string()), "branch")]
+    #[case::missing_snapshot(|p: &mut pb::SourceContext| p.snapshot = None, "snapshot reference")]
+    #[case::digest(|p: &mut pb::SourceContext| p.snapshot.as_mut().unwrap().manifest_digest.clear(), "manifest_digest")]
+    #[case::empty_manifest_identity(|p: &mut pb::SourceContext| p.snapshot.as_mut().unwrap().manifest_identity = Some(String::new()), "manifest_identity")]
     fn rejects_invalid_source_context(
         #[case] mutate: fn(&mut pb::SourceContext),
         #[case] message: &str,
@@ -1212,11 +1145,14 @@ mod tests {
         assert_eq!(first.table_uri(), replacement.table_uri());
         assert_eq!(first.version(), replacement.version());
         assert_ne!(first.source_id(), replacement.source_id());
-        let error = BlobSourceContext::from_dataset(&original, "catalog/first", "workers")
-            .await
-            .unwrap_err();
+        let worker = Dataset::open(uri).await.unwrap();
+        let error = first.validate_dataset(&worker).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains("no longer matches"));
+        assert!(
+            error
+                .to_string()
+                .contains("does not match dataset snapshot")
+        );
     }
 
     #[cfg_attr(coverage, coverage(off))]
@@ -2757,29 +2693,38 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rejects_unregistered_locator_base() {
-        let context = context(1, None);
+    #[tokio::test]
+    async fn rejects_unregistered_locator_base() {
+        let directory = tempfile::tempdir().unwrap();
+        let dataset = capture_dataset(directory.path().join("table").to_str().unwrap()).await;
+        let context = BlobSourceContext::from_dataset(&dataset, "catalog/table", "workers")
+            .await
+            .unwrap();
         let mut locator = reference(&context, 0, Some(3)).object_locator().unwrap();
         locator.base_id = Some(999);
         let reference = BlobRef::try_new(0, locator.encode_to_vec(), Some(3)).unwrap();
-        let error = BlobRefBatch::try_new(vec![context], [Some(reference)]).unwrap_err();
+        let batch = BlobRefBatch::try_new(vec![context.clone()], [Some(reference)]).unwrap();
+        let transported = BlobRefBatch::decode(&batch.encode().unwrap()).unwrap();
+        let reader = BlobRefReader::try_new(
+            vec![BlobRefBinding::try_new(context, dataset).unwrap()],
+            BlobMaterializationContext::try_new(16, 32).unwrap(),
+        )
+        .unwrap();
+        let error = reader
+            .read([BlobRefRequest::new(
+                0,
+                transported.reference(0).unwrap(),
+                BlobRefDemand::Whole,
+            )])
+            .err()
+            .unwrap();
         assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains("unknown base_id 999"));
+        assert!(error.to_string().contains("unknown base_id 999"), "{error}");
     }
 
     #[test]
     fn registered_zero_base_survives_transport() {
-        let mut proto = context(1, None).proto;
-        let mut manifest = table_pb::Manifest::decode(proto.manifest.clone()).unwrap();
-        manifest.base_paths.push(table_pb::BasePath {
-            id: 0,
-            name: None,
-            path: "s3://source/table.lance".to_string(),
-            is_dataset_root: true,
-        });
-        proto.manifest = manifest.encode_to_vec().into();
-        let context = BlobSourceContext::from_proto(proto).unwrap();
+        let context = context(1, None);
         let reference = context
             .reference(
                 "s3://source/table.lance/data/blob".to_string(),

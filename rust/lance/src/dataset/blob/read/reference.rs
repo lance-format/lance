@@ -31,8 +31,9 @@ use crate::dataset::blob::materialize::{
 /// One transported source context paired with an authenticated worker snapshot.
 ///
 /// The worker must resolve the context's `access_context_key` to the correct
-/// storage settings, credentials, registry, and per-base routing, then open the
-/// exact branch/version. Construction checks the loaded manifest; it never opens
+/// storage settings, credentials, registry, and per-base routing, then reopen its
+/// `snapshot_ref()` with [`crate::dataset::builder::DatasetBuilder::from_snapshot`].
+/// Construction checks the original manifest digest and identity; it never opens
 /// the latest snapshot or infers authentication from the locator URI.
 #[derive(Clone)]
 pub struct BlobRefBinding {
