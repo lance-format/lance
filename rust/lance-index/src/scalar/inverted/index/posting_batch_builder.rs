@@ -22,6 +22,11 @@ pub(super) enum BatchPositionsBuilder {
     },
 }
 
+pub(super) enum PostingListPositions {
+    Legacy(ListArray),
+    Shared(EncodedPositionBlocks),
+}
+
 pub(super) struct PostingListParts {
     pub(super) with_positions: bool,
     pub(super) posting_tail_codec: PostingTailCodec,
@@ -77,13 +82,27 @@ impl PostingListBatchBuilder {
         self.len == 0
     }
 
+    /// Encoded v3 payload bytes, excluding array offsets and allocation slack.
+    pub fn payload_bytes(&self) -> usize {
+        let positions = match &self.positions {
+            BatchPositionsBuilder::Shared { bytes, .. } => bytes.values_slice().len(),
+            _ => 0,
+        };
+        self.postings.values_ref().values_slice().len()
+            + self
+                .impacts
+                .as_ref()
+                .map_or(0, |impacts| impacts.values_ref().values_slice().len())
+            + positions
+    }
+
     pub(super) fn append(
         &mut self,
         compressed: LargeBinaryArray,
         impacts: Option<&ImpactSkipData>,
         max_score: f32,
         length: u32,
-        positions: Option<&CompressedPositionStorage>,
+        positions: Option<PostingListPositions>,
     ) -> Result<()> {
         {
             let values = self.postings.values();
@@ -120,17 +139,12 @@ impl PostingListBatchBuilder {
                         length
                     ))
                 })?;
-                let CompressedPositionStorage::SharedStream(positions) = positions else {
+                let PostingListPositions::Shared(positions) = positions else {
                     return Err(Error::index(
                         "shared positions builder received legacy positions".to_owned(),
                     ));
                 };
-                bytes.append_value(positions.bytes());
-                let offsets_builder = block_offsets.values();
-                for &offset in positions.block_offsets() {
-                    offsets_builder.append_value(offset);
-                }
-                block_offsets.append(true);
+                positions.append_to(bytes, block_offsets)?;
             }
             BatchPositionsBuilder::Legacy(position_lists) => {
                 let positions = positions.ok_or_else(|| {
@@ -139,7 +153,7 @@ impl PostingListBatchBuilder {
                         length
                     ))
                 })?;
-                let CompressedPositionStorage::LegacyPerDoc(positions) = positions else {
+                let PostingListPositions::Legacy(positions) = positions else {
                     return Err(Error::index(
                         "legacy positions builder received shared position stream".to_owned(),
                     ));

@@ -67,6 +67,7 @@ impl MergeInsertBuilder {
                 spill_for_retry: true,
                 retry_timeout: Duration::from_secs(30),
                 compacted_sstables: Vec::new(),
+                mem_wal_dir_id: None,
                 skip_auto_cleanup: false,
                 use_index: true,
                 write_mode: MergeInsertWriteMode::default(),
@@ -77,6 +78,7 @@ impl MergeInsertBuilder {
                 target_all_bases: None,
                 data_storage_version: None,
             },
+            write_params: Arc::new(WriteParams::default()),
         })
     }
 
@@ -127,8 +129,8 @@ impl MergeInsertBuilder {
     ///
     /// This has no effect on re-scannable sources (materialized batches via
     /// [`MergeInsertJob::execute_batches`], or a [`TableProvider`] via
-    /// [`MergeInsertJob::execute_provider`]), which are replayed directly and never
-    /// spill.
+    /// [`MergeInsertJob::execute_provider`]). Arbitrary providers may still use
+    /// bounded replay within an indexed attempt to preserve one logical snapshot.
     ///
     /// Default is true.
     ///
@@ -215,7 +217,16 @@ impl MergeInsertBuilder {
     /// so it cannot enforce this: if a delete pass carried the marker and the
     /// process then died before the matching upsert, the recorded generation
     /// would claim rows were copied in that never were.
-    pub fn mark_sstables_as_compacted(&mut self, sstables: Vec<CompactedSsTable>) -> &mut Self {
+    ///
+    /// `dir_id` names the MemWAL the SSTables belong to; the commit fails with
+    /// [`Error::StaleMemWal`] if it was since disabled or replaced. Pass an
+    /// empty `sstables` on passes that record no progress so they are checked too.
+    pub fn mark_sstables_as_compacted(
+        &mut self,
+        dir_id: impl Into<String>,
+        sstables: Vec<CompactedSsTable>,
+    ) -> &mut Self {
+        self.params.mem_wal_dir_id = Some(dir_id.into());
         self.params.compacted_sstables.extend(sstables);
         self
     }
@@ -249,19 +260,58 @@ impl MergeInsertBuilder {
         self
     }
 
+    /// Set the write parameters for the data files this merge insert writes,
+    /// as [`InsertBuilder::with_params`](super::InsertBuilder::with_params)
+    /// does for an insert.
+    ///
+    /// Every path that writes rows applies them: file size limits, file writer
+    /// options, store parameters, progress, the Blob pack size and external
+    /// Blob handling. With `allow_external_blob_outside_bases`, an external
+    /// Blob URI the source supplies outside the dataset's registered bases is
+    /// stored as an absolute reference instead of being refused.
+    ///
+    /// The file version and the bases new files go to are set on this builder
+    /// ([`Self::data_storage_version`], [`Self::target_bases`] and its
+    /// siblings), so [`Self::try_build`] refuses parameters that set them.
+    /// `mode` must stay at its default, `WriteMode::Create`: merge insert
+    /// decides how its files are written, and another mode would change the
+    /// schema they are written with (`Overwrite`) or start index seeds the
+    /// merge does not commit (`Append`). `try_build` also refuses
+    /// `ExternalBlobMode::Ingest`, which merge insert does not support. Fields
+    /// that only shape a commit or a new dataset, such as
+    /// `transaction_properties` or `enable_stable_row_ids`, do not apply.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::{MergeInsertBuilder, WhenMatched, WriteParams};
+    /// # async fn test(dataset: Arc<Dataset>) -> Result<()> {
+    /// let job = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])?
+    ///     .when_matched(WhenMatched::UpdateAll)
+    ///     .with_params(&WriteParams {
+    ///         allow_external_blob_outside_bases: true,
+    ///         ..Default::default()
+    ///     })
+    ///     .try_build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_params(&mut self, params: &WriteParams) -> &mut Self {
+        self.write_params = Arc::new(params.clone());
+        self
+    }
+
     /// Write new fragments produced by this merge insert to these base IDs.
     ///
     /// New data files are distributed across the target bases round-robin,
     /// the same way a normal write with [`WriteParams::target_bases`] routes
     /// them. The IDs must be registered in the dataset manifest, or
-    /// [`crate::dataset::write::PRIMARY_BASE_ID`] (0) to include the dataset's primary
+    /// [`super::PRIMARY_BASE_ID`] (0) to include the dataset's primary
     /// storage in the rotation (e.g. `vec![0, 1, 2]` spreads across primary
     /// plus bases 1 and 2). Data files that patch existing fragments and
     /// deletion files are always written to the dataset's primary storage.
     ///
     /// Cannot be combined with [`Self::target_base_names_or_paths`].
-    ///
-    /// [`WriteParams::target_bases`]: crate::dataset::write::WriteParams::target_bases
     pub fn target_bases(&mut self, base_ids: Vec<u32>) -> &mut Self {
         self.params.target_bases = Some(base_ids);
         self
@@ -322,11 +372,58 @@ impl MergeInsertBuilder {
                 "Cannot specify target_all_bases together with target_bases or target_base_names_or_paths.",
             ));
         }
+        validate_merge_insert_write_params(&self.write_params)?;
         let mut params = self.params.clone();
         params.data_storage_version = Some(PlanFileVersion(write_version));
+        let spill_execution_options = merge_insert_execution_options();
+        // DataFusion 54.1.0 can retain a rejected spill charge. Keep its manager
+        // operation-scoped so any execution error discards that accounting and
+        // cannot reduce the quota of a later merge job.
+        let spill_session_context = new_session_context(&spill_execution_options);
         Ok(MergeInsertJob {
             dataset: self.dataset.clone(),
             params,
+            spill_session_context,
+            spill_execution_options,
+            write_params: self.write_params.clone(),
         })
     }
+}
+
+/// Refuse write parameters a merge insert cannot honor: the write mode, the
+/// file version and the target bases are the job's own, and the job has no
+/// ingest path for external Blob URIs.
+fn validate_merge_insert_write_params(params: &WriteParams) -> Result<()> {
+    // The fragment writers prepare their schema and index seeds by mode; merge
+    // insert has always written with `Create` and commits that result.
+    if !matches!(params.mode, WriteMode::Create) {
+        return Err(Error::invalid_input(format!(
+            "Merge insert write params set mode={:?}; leave mode at its default, WriteMode::Create, since merge insert decides how its files are written",
+            params.mode
+        )));
+    }
+    if let Some(version) = params.data_storage_version {
+        return Err(Error::invalid_input(format!(
+            "Merge insert write params set data_storage_version={version:?}; use MergeInsertBuilder::data_storage_version instead",
+        )));
+    }
+    if params.target_bases.is_some()
+        || params.target_base_names_or_paths.is_some()
+        || params.target_all_bases.is_some()
+        || params.initial_bases.is_some()
+    {
+        return Err(Error::invalid_input(format!(
+            "Merge insert write params set target_bases={:?}, target_base_names_or_paths={:?}, target_all_bases={:?} and initial_bases={}; route new files with MergeInsertBuilder::target_bases, target_base_names_or_paths or target_all_bases instead",
+            params.target_bases,
+            params.target_base_names_or_paths,
+            params.target_all_bases,
+            params.initial_bases.as_ref().map_or(0, Vec::len),
+        )));
+    }
+    if params.external_blob_mode == ExternalBlobMode::Ingest {
+        return Err(Error::invalid_input(
+            "Merge insert write params set external_blob_mode=\"ingest\", which merge insert does not support",
+        ));
+    }
+    Ok(())
 }

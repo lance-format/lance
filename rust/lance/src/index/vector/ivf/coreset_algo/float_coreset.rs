@@ -10,29 +10,29 @@ use crate::dataset::Dataset;
 
 use super::super::{
     FixedIvfTrainingRanges, FixedIvfTrainingSampler, KMeansProgressCallback,
-    StreamingFloatKMeansMetricPolicy, StreamingKMeansMetricPolicy, WeightedCoreset,
-    WeightedHierarchicalKMeansParams, append_local_coreset, cast_training_data_to_f32,
-    f32_fsl_from_values, refine_streaming_f32_kmeans_with_resampling,
-    refine_streaming_f32_kmeans_with_sampler, refine_weighted_f32_kmeans,
-    train_weighted_hierarchical_f32_kmeans,
+    StreamingFloatKMeansMetricPolicy, StreamingKMeansArrowType, StreamingKMeansMetricPolicy,
+    WeightedCoreset, WeightedHierarchicalKMeansParams, append_local_coreset,
+    prepare_streaming_coreset_sample, refine_streaming_kmeans_with_resampling,
+    refine_streaming_kmeans_with_sampler, refine_weighted_kmeans, streaming_kmeans_fsl_from_values,
+    train_weighted_hierarchical_kmeans,
 };
 use super::StreamingCoresetAlgorithm;
 
-pub(in crate::index::vector::ivf) struct FloatCoresetAlgorithm<'a> {
-    metric_policy: &'a dyn StreamingFloatKMeansMetricPolicy,
+pub(in crate::index::vector::ivf) struct FloatCoresetAlgorithm<'a, T: StreamingKMeansArrowType> {
+    metric_policy: &'a dyn StreamingFloatKMeansMetricPolicy<T>,
 }
 
-impl<'a> FloatCoresetAlgorithm<'a> {
+impl<'a, T: StreamingKMeansArrowType> FloatCoresetAlgorithm<'a, T> {
     pub(in crate::index::vector::ivf) fn new(
-        metric_policy: &'a dyn StreamingFloatKMeansMetricPolicy,
+        metric_policy: &'a dyn StreamingFloatKMeansMetricPolicy<T>,
     ) -> Self {
         Self { metric_policy }
     }
 }
 
 #[async_trait]
-impl StreamingCoresetAlgorithm for FloatCoresetAlgorithm<'_> {
-    type Coreset = WeightedCoreset;
+impl<T: StreamingKMeansArrowType> StreamingCoresetAlgorithm for FloatCoresetAlgorithm<'_, T> {
+    type Coreset = WeightedCoreset<T>;
 
     fn metric_policy(&self) -> &dyn StreamingKMeansMetricPolicy {
         self.metric_policy
@@ -44,7 +44,7 @@ impl StreamingCoresetAlgorithm for FloatCoresetAlgorithm<'_> {
         sampled_metric: MetricType,
     ) -> Result<FixedSizeListArray> {
         self.metric_policy.validate_sample_metric(sampled_metric)?;
-        cast_training_data_to_f32(training_data)
+        prepare_streaming_coreset_sample::<T>(training_data)
     }
 
     fn new_coreset(&self, dimension: usize, capacity: usize) -> Self::Coreset {
@@ -59,7 +59,7 @@ impl StreamingCoresetAlgorithm for FloatCoresetAlgorithm<'_> {
         max_iters: usize,
         on_progress: KMeansProgressCallback,
     ) -> Result<()> {
-        append_local_coreset(
+        append_local_coreset::<T>(
             coreset,
             data,
             self.metric_policy,
@@ -104,14 +104,14 @@ impl StreamingCoresetAlgorithm for FloatCoresetAlgorithm<'_> {
                 max_iters,
                 on_progress: on_progress.clone(),
             };
-            train_weighted_hierarchical_f32_kmeans(
+            train_weighted_hierarchical_kmeans::<T>(
                 &coreset_data,
                 &coreset_weights,
                 &coreset_losses,
                 &params,
             )?
         };
-        let refined = refine_weighted_f32_kmeans(
+        let refined = refine_weighted_kmeans::<T>(
             &coreset_data,
             &coreset_weights,
             &coreset_losses,
@@ -120,7 +120,7 @@ impl StreamingCoresetAlgorithm for FloatCoresetAlgorithm<'_> {
             3,
             on_progress,
         )?;
-        centroids = f32_fsl_from_values(refined.centroids, dimension)?;
+        centroids = streaming_kmeans_fsl_from_values::<T>(refined.centroids, dimension)?;
         Ok(centroids)
     }
 
@@ -133,7 +133,7 @@ impl StreamingCoresetAlgorithm for FloatCoresetAlgorithm<'_> {
         passes: usize,
         on_progress: KMeansProgressCallback,
     ) -> Result<FixedSizeListArray> {
-        refine_streaming_f32_kmeans_with_sampler(
+        refine_streaming_kmeans_with_sampler::<T>(
             sampler,
             self.metric_policy.metric_type(),
             streaming_sample_size,
@@ -157,7 +157,7 @@ impl StreamingCoresetAlgorithm for FloatCoresetAlgorithm<'_> {
         passes: usize,
         on_progress: KMeansProgressCallback,
     ) -> Result<FixedSizeListArray> {
-        refine_streaming_f32_kmeans_with_resampling(
+        refine_streaming_kmeans_with_resampling::<T>(
             dataset,
             column,
             self.metric_policy.metric_type(),

@@ -92,6 +92,7 @@ mod exec;
 mod job;
 mod logical_plan;
 mod merger;
+mod row_ids;
 mod update_fragments;
 
 /// Check a merge source against the target schema. As on append, a legacy
@@ -439,12 +440,14 @@ struct MergeInsertParams {
     // When the source is a one-shot stream and `conflict_retries > 0`, the source
     // is spilled (memory, then disk) so it can be replayed on each retry. Set to
     // false to fail fast on contention instead of buffering the stream. Has no
-    // effect on re-scannable sources (materialized batches, files), which never
-    // spill.
+    // effect on re-scannable sources; arbitrary providers may still use bounded
+    // replay within an indexed attempt to preserve one logical snapshot.
     spill_for_retry: bool,
     retry_timeout: Duration,
     // MemWAL SSTables to mark as compacted when this commit succeeds.
     compacted_sstables: Vec<CompactedSsTable>,
+    // The `dir_id` of the MemWAL `compacted_sstables` belongs to.
+    mem_wal_dir_id: Option<String>,
     // If true, skip auto cleanup during commits. This should be set to true
     // for high frequency writes to improve performance. This is also useful
     // if the writer does not have delete permissions and the clean up would
@@ -478,6 +481,20 @@ impl MergeInsertParams {
             .map(|version| version.0)
             .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format())
     }
+
+    fn carried_lineage_spill_budget(&self, dataset: &Dataset) -> Result<Option<usize>> {
+        if dataset.manifest.uses_stable_row_ids()
+            && self.write_version(dataset) != ConcreteFileVersion::V1
+            && matches!(
+                self.when_matched,
+                WhenMatched::UpdateAll | WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_)
+            )
+        {
+            inline_row_lineage_max_bytes(dataset)
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 /// What [`MergeInsertJob::update_fragments`] wrote.
@@ -503,12 +520,18 @@ pub(super) struct PatchedFragments {
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
 /// part of a single transaction.
-#[derive(Clone)]
 pub struct MergeInsertJob {
     // The column to merge the new data into
     dataset: Arc<Dataset>,
     // The parameters controlling how to merge the two streams
     params: MergeInsertParams,
+    // The caller's parameters for the data files this job writes. Kept out of
+    // `MergeInsertParams`, which the logical plan compares and hashes.
+    write_params: Arc<WriteParams>,
+    // A job-local context shared by retry replay, indexed execution, and
+    // partial-update sorting, including across commit retries.
+    spill_session_context: SessionContext,
+    spill_execution_options: LanceExecutionOptions,
 }
 
 /// Build a merge insert operation.
@@ -558,6 +581,7 @@ pub struct MergeInsertJob {
 pub struct MergeInsertBuilder {
     dataset: Arc<Dataset>,
     params: MergeInsertParams,
+    write_params: Arc<WriteParams>,
 }
 
 /// Resolve the merge insert target bases against the base paths registered in
@@ -723,6 +747,10 @@ impl PartitionStream for DeduplicatingSourcePartitionStream {
 /// dataset field and makes it a normal data column from the write exec's
 /// perspective.
 ///
+/// A column `from_target` rejects is filled with a NULL of the target column's
+/// type instead, which keeps it out of the target scan. That is only correct
+/// when no row that reaches the write needs its stored value.
+///
 /// A filled column replaces `target.X` in place rather than being appended, so
 /// the output is the join schema with some columns unqualified, in the same
 /// order, and the same width. Appending instead would leave both `target.X` and
@@ -731,6 +759,7 @@ fn fill_missing_target_columns(
     df: DataFrame,
     dataset_schema: &Schema,
     source_field_names: &HashSet<String>,
+    from_target: impl Fn(&str) -> bool,
 ) -> Result<DataFrame> {
     let missing_from_source: HashSet<&str> = dataset_schema
         .fields()
@@ -755,14 +784,23 @@ fn fill_missing_target_columns(
             if qualifier == Some(&target_qualifier)
                 && missing_from_source.contains(field.name().as_str())
             {
+                // Same type and metadata as the target column, so the write
+                // handles both alike.
+                let expr = match from_target(field.name()) {
+                    true => expr,
+                    false => logical_expr::lit_with_metadata(
+                        ScalarValue::try_from(field.data_type())?,
+                        Some(field.as_ref().into()),
+                    ),
+                };
                 // An alias is unqualified, which is what drops the `target.`
                 // prefix and makes this a plain data column.
-                expr.alias(field.name())
+                Ok(expr.alias(field.name()))
             } else {
-                expr
+                Ok(expr)
             }
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     Ok(df.select(projection)?)
 }
 
@@ -812,3 +850,36 @@ pub struct UncommittedMergeInsert {
 
 #[cfg(test)]
 mod tests;
+
+/// Row cap for indexed external-sort output batches; payload rows may be wide.
+const INDEXED_JOIN_BATCH_ROWS: usize = 128;
+
+/// Byte cap for indexed sort input batches and in-memory replay buffers.
+const MAX_INDEXED_JOIN_BATCH_BYTES: usize = 25 * 1024 * 1024;
+
+/// Byte cap for each batch entering the partial-update fragment sort.
+const MAX_FRAGMENT_UPDATE_BATCH_BYTES: usize = 25 * 1024 * 1024;
+
+/// The transaction a merge insert write node built during execution, if the
+/// node ran to completion.
+fn uncommitted_transaction(plan: &dyn ExecutionPlan) -> Option<Transaction> {
+    if let Some(full_exec) = plan.downcast_ref::<exec::FullSchemaMergeInsertExec>() {
+        full_exec.transaction()
+    } else if let Some(in_place_exec) = plan.downcast_ref::<exec::InPlaceMergeInsertExec>() {
+        in_place_exec.transaction()
+    } else if let Some(delete_exec) = plan.downcast_ref::<exec::DeleteOnlyMergeInsertExec>() {
+        delete_exec.transaction()
+    } else {
+        None
+    }
+}
+
+/// The managed blob payloads a merge insert write node created.
+///
+/// Only the full-schema node can create any. The in-place node refuses a source
+/// that carries a blob column and never inserts rows, and the delete-only node
+/// writes no data.
+fn created_blob_payloads(plan: &dyn ExecutionPlan) -> Option<&BlobPayloadInventory> {
+    plan.downcast_ref::<exec::FullSchemaMergeInsertExec>()
+        .map(|full_exec| full_exec.created_blob_payloads())
+}

@@ -21,6 +21,9 @@ from .lance import (
     LanceBlobFile,
 )
 from .lance import (
+    ManagedBlobWriter as ManagedBlobWriter,
+)
+from .lance import (
     PackedBlobWriter as PackedBlobWriter,
 )
 

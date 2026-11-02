@@ -1019,7 +1019,7 @@ fn id_value_schema() -> Arc<Schema> {
 }
 
 fn collect_exact_row_counts(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<usize>) {
-    if let Ok(stats) = plan.partition_statistics(None)
+    if let Ok(stats) = StatisticsContext::new().compute(plan.as_ref(), &StatisticsArgs::new())
         && let datafusion::common::stats::Precision::Exact(n) = stats.num_rows
     {
         out.push(n);
@@ -1083,4 +1083,188 @@ async fn test_merge_insert_source_statistics_in_plan() {
         row_counts.contains(&source_rows),
         "source provider's exact row count ({source_rows}) should reach the plan; got {row_counts:?}"
     );
+}
+
+fn list_dataset_files(base_dir: &str) -> Vec<std::path::PathBuf> {
+    fn walk(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, files);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(std::path::Path::new(base_dir), &mut files);
+    files.sort();
+    files
+}
+
+/// `analyze_plan` executes the merge without committing it, so every file
+/// the execution wrote is unreferenced and must be removed afterwards.
+/// Each case drives a different write node: the full-schema upsert writes a
+/// new fragment plus deletion files, the in-place update writes a patch
+/// file onto existing fragments, and the delete-only path writes only
+/// deletion files.
+#[derive(Debug, Clone, Copy)]
+enum AnalyzedWriteNode {
+    FullSchema,
+    InPlace,
+    DeleteOnly,
+}
+
+#[rstest::rstest]
+#[case::full_schema_upsert(AnalyzedWriteNode::FullSchema)]
+#[case::in_place_update(AnalyzedWriteNode::InPlace)]
+#[case::delete_only(AnalyzedWriteNode::DeleteOnly)]
+#[tokio::test]
+async fn test_analyze_plan_removes_written_files(#[case] write_node: AnalyzedWriteNode) {
+    let tempdir = TempStrDir::default();
+    let data = lance_datagen::gen_batch()
+        .col("key", array::step::<UInt32Type>())
+        .col("value", array::step::<UInt32Type>())
+        .col("other", array::cycle_utf8_literals(&["a", "b"]))
+        .into_reader_rows(RowCount::from(4), BatchCount::from(2));
+    let write_params = WriteParams {
+        max_rows_per_file: 4,
+        ..Default::default()
+    };
+    let dataset = Arc::new(
+        Dataset::write(data, &tempdir, Some(write_params))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(dataset.get_fragments().len(), 2);
+    let files_before = list_dataset_files(&tempdir);
+
+    // Keys 1 and 5 hit both fragments; key 100 is new.
+    let builder = || MergeInsertBuilder::try_new(dataset.clone(), vec!["key".to_string()]).unwrap();
+    let (job, source, expected_node) = match write_node {
+        AnalyzedWriteNode::FullSchema => (
+            builder()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap(),
+            record_batch!(
+                ("key", UInt32, [1, 5, 100]),
+                ("value", UInt32, [10, 50, 1000]),
+                ("other", Utf8, ["x", "y", "z"])
+            )
+            .unwrap(),
+            "MergeInsert:",
+        ),
+        AnalyzedWriteNode::InPlace => (
+            builder()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .write_mode(MergeInsertWriteMode::RewriteColumns)
+                .try_build()
+                .unwrap(),
+            record_batch!(("key", UInt32, [1, 5]), ("value", UInt32, [10, 50])).unwrap(),
+            "InPlaceMergeInsert:",
+        ),
+        AnalyzedWriteNode::DeleteOnly => (
+            builder()
+                .when_matched(WhenMatched::Delete)
+                .when_not_matched(WhenNotMatched::DoNothing)
+                .try_build()
+                .unwrap(),
+            record_batch!(("key", UInt32, [1, 5])).unwrap(),
+            "DeleteOnlyMergeInsert:",
+        ),
+    };
+
+    let analysis = job.analyze_plan_batches(vec![source]).await.unwrap();
+    assert!(
+        analysis.trim_start().starts_with(expected_node),
+        "expected the {expected_node} write node:\n{analysis}"
+    );
+
+    assert_eq!(list_dataset_files(&tempdir), files_before);
+    let mut dataset = (*dataset).clone();
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(dataset.version().version, 1);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 8);
+}
+
+/// With managed blobs enabled, Blob v2 payloads above the inline threshold
+/// live in their own `_blobs/<uuid>.blob` objects rather than beside the
+/// data file, so removing the analyzed data files alone leaves them behind. Repeated
+/// analyses must not accumulate those objects, and the committed blobs the
+/// target rows still reference must stay readable.
+#[rstest::rstest]
+#[case::packed(65 * 1024)]
+#[case::dedicated(4 * 1024 * 1024 + 1)]
+#[tokio::test]
+async fn test_analyze_plan_removes_written_blob_payloads(#[case] payload_size: usize) {
+    let tempdir = TempStrDir::default();
+    let schema = Arc::new(crate::dataset::blob::test_util::managed_blob_schema(vec![
+        Field::new("id", DataType::Int64, true),
+        crate::blob_field("payload", true),
+    ]));
+    let make_batch = |ids: Vec<i64>, value: u8| {
+        let payload = vec![value; payload_size];
+        let mut blobs = crate::BlobArrayBuilder::new(ids.len());
+        for _ in &ids {
+            blobs.push_bytes(&payload).unwrap();
+        }
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(ids)), blobs.finish().unwrap()],
+        )
+        .unwrap()
+    };
+    let dataset = Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(make_batch(vec![0, 1], 1))], schema.clone()),
+            &tempdir,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(dataset.get_fragments().len(), 2);
+    let files_before = list_dataset_files(&tempdir);
+    let blobs_dir = std::path::Path::new(tempdir.as_ref() as &str).join("_blobs");
+    assert!(
+        files_before.iter().any(|path| path.starts_with(&blobs_dir)),
+        "the fixture must store its payloads as managed objects: {files_before:?}"
+    );
+
+    let job = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap();
+    for _ in 0..2 {
+        let analysis = job
+            .analyze_plan_batches(vec![make_batch(vec![0, 2], 2)])
+            .await
+            .unwrap();
+        assert!(
+            analysis.trim_start().starts_with("MergeInsert:"),
+            "expected the full-schema write node:\n{analysis}"
+        );
+    }
+
+    assert_eq!(list_dataset_files(&tempdir), files_before);
+    assert_eq!(dataset.version().version, 1);
+    for blob in dataset
+        .take_blobs_by_indices(&[0, 1], "payload")
+        .await
+        .unwrap()
+    {
+        assert_eq!(
+            blob.unwrap().read().await.unwrap().as_ref(),
+            vec![1; payload_size]
+        );
+    }
 }

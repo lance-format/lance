@@ -837,30 +837,39 @@ async fn test_first_seen_dedupes_unmatched_source_rows(#[case] with_index: bool)
             .unwrap();
     }
 
-    // Split distinct duplicate values across batches to verify that FirstSeen
-    // preserves source order across the entire stream. On the v2 path, also
-    // verify that NULL keys remain distinct under SQL equality.
-    let (first, second, expected_inserted) = if with_index {
-        (
-            record_batch!(("id", Int32, [Some(108)]), ("value", Int32, [Some(1)])).unwrap(),
-            record_batch!(("id", Int32, [Some(108)]), ("value", Int32, [Some(2)])).unwrap(),
-            1,
+    // Exercise enough indexed duplicates to force the source sort to
+    // rearrange keys. The first 64 rows contain each key exactly once, so
+    // their values are the expected FirstSeen winners after the sort.
+    let (source_batches, expected_inserted, expected_updated, expected_skipped) = if with_index {
+        let ids = (0..4096).map(|row| (row * 37) % 64).collect::<Vec<i32>>();
+        let values = (0..4096).collect::<Vec<i32>>();
+        let source = RecordBatch::try_new(
+            initial.schema(),
+            vec![
+                Arc::new(Int32Array::from(ids)),
+                Arc::new(Int32Array::from(values)),
+            ],
         )
+        .unwrap();
+        let source_batches = (0..source.num_rows())
+            .step_by(40)
+            .map(|offset| Ok(source.slice(offset, (source.num_rows() - offset).min(40))))
+            .collect();
+        (source_batches, 63, 1, 4096 - 64)
     } else {
-        (
-            record_batch!(
-                ("id", Int32, [Some(108), None]),
-                ("value", Int32, [Some(1), Some(3)])
-            )
-            .unwrap(),
-            record_batch!(
-                ("id", Int32, [Some(108), None]),
-                ("value", Int32, [Some(2), Some(4)])
-            )
-            .unwrap(),
-            3,
+        let first = record_batch!(
+            ("id", Int32, [Some(108), None]),
+            ("value", Int32, [Some(1), Some(3)])
         )
+        .unwrap();
+        let second = record_batch!(
+            ("id", Int32, [Some(108), None]),
+            ("value", Int32, [Some(2), Some(4)])
+        )
+        .unwrap();
+        (vec![Ok(first), Ok(second)], 3, 0, 1)
     };
+    let source_schema = source_batches[0].as_ref().unwrap().schema();
 
     let (dataset, stats) = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
         .unwrap()
@@ -870,15 +879,33 @@ async fn test_first_seen_dedupes_unmatched_source_rows(#[case] with_index: bool)
         .try_build()
         .unwrap()
         .execute_reader(Box::new(RecordBatchIterator::new(
-            [Ok(first.clone()), Ok(second)],
-            first.schema(),
+            source_batches,
+            source_schema,
         )))
         .await
         .unwrap();
 
     assert_eq!(stats.num_inserted_rows, expected_inserted);
-    assert_eq!(stats.num_updated_rows, 0);
-    assert_eq!(stats.num_skipped_duplicates, 1);
+    assert_eq!(stats.num_updated_rows, expected_updated);
+    assert_eq!(stats.num_skipped_duplicates, expected_skipped);
+
+    if with_index {
+        let result = dataset.scan().try_into_batch().await.unwrap();
+        let ids = result["id"].as_primitive::<Int32Type>();
+        let values = result["value"].as_primitive::<Int32Type>();
+        let actual = ids
+            .values()
+            .iter()
+            .zip(values.values().iter())
+            .map(|(&id, &value)| (id, value))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(actual.len(), 64);
+        for first_row in 0..64 {
+            let id = (first_row * 37) % 64;
+            assert_eq!(actual.get(&id), Some(&first_row));
+        }
+        return;
+    }
 
     let inserted = dataset
         .scan()
@@ -1217,41 +1244,71 @@ async fn test_merge_insert_partial_composite_key_null() {
     );
 }
 
-/// Variant of test_merge_insert_null_on_column_inserts with a single ON column
-/// that is entirely NULL, and a target row that also has a NULL in that column.
-/// Since standard SQL equality treats NULL != NULL, the source row must not match
-/// the existing target row and must be inserted separately.
+/// NULL source keys must be inserted separately from NULL target keys in both
+/// indexed and full-scan merges, including when every source key is NULL.
+#[rstest::rstest]
+#[case::no_index(None, true)]
+#[case::btree(Some(IndexType::BTree), true)]
+#[case::btree_full_scan(Some(IndexType::BTree), false)]
+#[case::bitmap(Some(IndexType::Bitmap), true)]
+#[case::bitmap_full_scan(Some(IndexType::Bitmap), false)]
 #[tokio::test]
-async fn test_merge_insert_null_single_on_column() {
-    // Dataset with a single row where id is NULL.
+async fn test_merge_insert_null_single_on_column(
+    #[case] index_type: Option<IndexType>,
+    #[case] use_index: bool,
+    #[values(WhenMatched::UpdateAll, WhenMatched::DoNothing)] when_matched: WhenMatched,
+    #[values(false, true)] all_null_source: bool,
+) {
     let initial_data = record_batch!(
-        ("id", Int32, [Option::<i32>::None]),
-        ("value", Int32, [Some(1)])
+        ("id", Int32, [None, Some(1), Some(2)]),
+        ("value", Int32, [1, 2, 3])
     )
     .unwrap();
 
-    let dataset = Dataset::write(
+    let mut dataset = Dataset::write(
         RecordBatchIterator::new(vec![Ok(initial_data.clone())], initial_data.schema()),
-        "memory://test_null_single_on_column",
-        None,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
     )
     .await
     .unwrap();
+    if let Some(index_type) = index_type {
+        dataset
+            .create_index(
+                &["id"],
+                index_type,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
 
-    // Source has two rows: one with id=NULL and one with id=5.
-    // id=NULL should not match the existing id=NULL row (standard equality), so it
-    // gets inserted.  id=5 is a brand-new key and also gets inserted.
-    let new_data = record_batch!(
-        ("id", Int32, [Option::<i32>::None, Some(5)]),
-        ("value", Int32, [Some(99), Some(50)])
-    )
-    .unwrap();
+    let new_data = if all_null_source {
+        record_batch!(
+            ("id", Int32, [Option::<i32>::None, None]),
+            ("value", Int32, [99, 50])
+        )
+        .unwrap()
+    } else {
+        record_batch!(
+            ("id", Int32, [None, Some(1), Some(5)]),
+            ("value", Int32, [99, 20, 50])
+        )
+        .unwrap()
+    };
 
+    let has_update = !all_null_source && when_matched == WhenMatched::UpdateAll;
     let (merged_dataset, stats) =
         MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
             .unwrap()
-            .when_matched(WhenMatched::UpdateAll)
+            .when_matched(when_matched)
             .when_not_matched(WhenNotMatched::InsertAll)
+            .use_index(use_index)
             .try_build()
             .unwrap()
             .execute_reader(Box::new(RecordBatchIterator::new(
@@ -1261,16 +1318,32 @@ async fn test_merge_insert_null_single_on_column() {
             .await
             .unwrap();
 
-    // Both source rows must be inserted (not silently dropped).
-    assert_eq!(
-        stats.num_inserted_rows, 2,
-        "both rows with NULL ON column should be inserted"
-    );
-    assert_eq!(stats.num_updated_rows, 0);
+    assert_eq!(stats.num_inserted_rows, 2);
+    assert_eq!(stats.num_updated_rows, u64::from(has_update));
+    assert_eq!(stats.num_deleted_rows, 0);
 
-    // Dataset now has: original NULL-id row + 2 newly inserted rows = 3 total.
-    let count = merged_dataset.count_rows(None).await.unwrap();
-    assert_eq!(count, 3);
+    let actual = merged_dataset
+        .scan()
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_first("value".into())]))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let inserted_key = (!all_null_source).then_some(5);
+    let expected = if has_update {
+        record_batch!(
+            ("id", Int32, [None, Some(2), Some(1), inserted_key, None]),
+            ("value", Int32, [1, 3, 20, 50, 99])
+        )
+        .unwrap()
+    } else {
+        record_batch!(
+            ("id", Int32, [None, Some(1), Some(2), inserted_key, None]),
+            ("value", Int32, [1, 2, 3, 50, 99])
+        )
+        .unwrap()
+    };
+    assert_eq!(actual, expected);
 }
 
 /// Test case for Issue #3634: merge_insert should provide a helpful error
@@ -1720,5 +1793,127 @@ async fn test_merge_insert_spill_for_retry_false_fails_fast() {
         ),
         "Expected fail-fast TooMuchWriteContention, got: {:?}",
         merge_result
+    );
+}
+
+/// Test WhenMatched::Delete combined with deleting rows not matched by source,
+/// when the source carries dataset columns besides the key. This is not
+/// delete-only, so the general write exec runs and needs those columns.
+#[rstest::rstest]
+#[tokio::test]
+async fn test_when_matched_delete_with_delete_not_matched_by_source(
+    #[values(true, false)] full_source: bool,
+    #[values(true, false)] delete_if: bool,
+) {
+    let test_uri = "memory://test_delete_with_delete_by_source.lance";
+
+    // Create dataset with keys 1-6 (full schema: key, value, filterme)
+    let ds = create_test_dataset(test_uri, LanceFileVersion::V2_0, false).await;
+    // Keys 4, 5, 6 match and are deleted; 1, 2, 3 are only in the target
+    let full_batch = create_new_batch(create_test_schema());
+    let new_batch = if full_source {
+        full_batch
+    } else {
+        full_batch.project(&[0, 1]).unwrap()
+    };
+
+    let when_not_matched_by_source = if delete_if {
+        WhenNotMatchedBySource::delete_if(&ds, "key < 3").unwrap()
+    } else {
+        WhenNotMatchedBySource::Delete
+    };
+    let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::Delete)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .when_not_matched_by_source(when_not_matched_by_source)
+        .try_build()
+        .unwrap();
+
+    let new_schema = new_batch.schema();
+    let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], new_schema));
+    let (merged_dataset, merge_stats) = job.execute(reader_to_stream(new_reader)).await.unwrap();
+
+    let expected_keys: Vec<u32> = if delete_if { vec![3] } else { vec![] };
+    assert_eq!(merge_stats.num_deleted_rows, 6 - expected_keys.len() as u64);
+    assert_eq!(merge_stats.num_inserted_rows, 0);
+    assert_eq!(merge_stats.num_updated_rows, 0);
+
+    let batches = merged_dataset
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let merged = concat_batches(&create_test_schema(), &batches).unwrap();
+    let mut remaining_keys: Vec<u32> = merged
+        .column(0)
+        .as_primitive::<UInt32Type>()
+        .values()
+        .to_vec();
+    remaining_keys.sort();
+    assert_eq!(remaining_keys, expected_keys);
+}
+
+/// A source column the dataset lacks is never written, so it is not carried
+/// through the join even when the merge is not delete-only.
+#[rstest::rstest]
+#[tokio::test]
+async fn test_delete_by_source_drops_source_columns_not_in_dataset(
+    #[values(WhenMatched::Delete, WhenMatched::DoNothing)] when_matched: WhenMatched,
+    #[values(true, false)] delete_if: bool,
+) {
+    let ds = create_test_dataset(
+        "memory://test_delete_by_source_drops_columns.lance",
+        LanceFileVersion::V2_0,
+        false,
+    )
+    .await;
+    // Keys 4, 5, 6 match; 1, 2, 3 are only in the target
+    let source_schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::UInt32, true),
+        Field::new("extra", DataType::Utf8, true),
+    ]));
+    let new_batch = RecordBatch::try_new(
+        source_schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from(vec![4, 5, 6, 7, 8, 9])),
+            Arc::new(StringArray::from(vec!["x"; 6])),
+        ],
+    )
+    .unwrap();
+
+    let when_not_matched_by_source = if delete_if {
+        WhenNotMatchedBySource::delete_if(&ds, "key < 3").unwrap()
+    } else {
+        WhenNotMatchedBySource::Delete
+    };
+    let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+        .unwrap()
+        .when_matched(when_matched.clone())
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .when_not_matched_by_source(when_not_matched_by_source)
+        .try_build()
+        .unwrap();
+
+    let plan = job
+        .explain_plan(Some(source_schema.as_ref()), false)
+        .await
+        .unwrap();
+    assert!(!plan.contains("extra"), "{plan}");
+
+    let new_reader = Box::new(RecordBatchIterator::new([Ok(new_batch)], source_schema));
+    let (_, merge_stats) = job.execute(reader_to_stream(new_reader)).await.unwrap();
+    let matched_deleted = if when_matched == WhenMatched::Delete {
+        3
+    } else {
+        0
+    };
+    let unmatched_deleted = if delete_if { 2 } else { 3 };
+    assert_eq!(
+        merge_stats.num_deleted_rows,
+        matched_deleted + unmatched_deleted
     );
 }

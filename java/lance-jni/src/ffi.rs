@@ -186,8 +186,9 @@ impl JNIEnvExt for JNIEnv<'_> {
         let mut results = Vec::with_capacity(list.size(self)? as usize);
         while let Some(elem) = iter.next(self)? {
             let jstr = JString::from(elem);
-            let val = self.get_string(&jstr)?;
-            results.push(val.to_str()?.to_string())
+            // `into` decodes the modified UTF-8 that JNI returns; `to_str` expects standard
+            // UTF-8 and rejects characters outside the BMP.
+            results.push(self.get_string(&jstr)?.into())
         }
         Ok(results)
     }
@@ -206,8 +207,7 @@ impl JNIEnvExt for JNIEnv<'_> {
     fn get_string_opt(&mut self, obj: &JObject) -> Result<Option<String>> {
         self.get_optional(obj, |env, java_string_obj| {
             let jstr = JString::from(java_string_obj);
-            let val = env.get_string(&jstr)?;
-            Ok(val.to_str()?.to_string())
+            Ok(env.get_string(&jstr)?.into())
         })
     }
 

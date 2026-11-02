@@ -789,3 +789,229 @@ async fn test_merge_insert_with_complete_blob_v2_preserves_schema() {
         b"qux"
     );
 }
+
+/// `with_params` reaches every path that writes a source's Blob values:
+/// the v2 plan for a full-schema source and for a partial source that
+/// updates, the indexed full-schema path, and the indexed partial-schema
+/// insert. Each refuses a source URI outside the registered bases by
+/// default, and stores it as an external reference when the caller allows
+/// references outside the bases.
+#[rstest::rstest]
+#[case::v2_full(false, false, true)]
+#[case::v2_partial_update(false, true, true)]
+#[case::indexed_full(true, false, true)]
+#[case::indexed_partial_insert(true, true, false)]
+#[tokio::test]
+async fn test_merge_insert_with_params_stores_external_blob_outside_bases(
+    #[case] indexed: bool,
+    #[case] partial: bool,
+    #[case] update: bool,
+    #[values(false, true)] allow: bool,
+) {
+    use crate::{BlobArrayBuilder, blob_field};
+    use arrow_schema::Schema as ArrowSchema;
+
+    let test_dir = TempStrDir::default();
+    let outside = format!("{test_dir}/outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let outside_uri = |name: &str, bytes: &[u8]| {
+        let path = format!("{outside}/{name}");
+        std::fs::write(&path, bytes).unwrap();
+        format!("file://{path}")
+    };
+    let schema = Arc::new(ArrowSchema::new(vec![
+        blob_field("blobs", true),
+        Field::new("id", DataType::Int64, true),
+        Field::new("other", DataType::Int64, true),
+    ]));
+    let mut managed = BlobArrayBuilder::new(2);
+    managed.push_bytes(b"foo").unwrap();
+    managed.push_bytes(b"bar").unwrap();
+    let initial = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            managed.finish().unwrap(),
+            Arc::new(Int64Array::from(vec![0, 1])),
+            Arc::new(Int64Array::from(vec![0, 10])),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(initial)], schema.clone()),
+        &format!("{test_dir}/dataset"),
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    if indexed {
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    let mut external = BlobArrayBuilder::new(2);
+    external.push_uri(outside_uri("one", b"one")).unwrap();
+    external.push_uri(outside_uri("two", b"two")).unwrap();
+    let mut source = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            external.finish().unwrap(),
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(Int64Array::from(vec![100, 200])),
+        ],
+    )
+    .unwrap();
+    if partial {
+        source = source.project(&[0, 1]).unwrap();
+    }
+
+    let mut builder =
+        MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()]).unwrap();
+    builder
+        .when_matched(if update {
+            WhenMatched::UpdateAll
+        } else {
+            WhenMatched::DoNothing
+        })
+        .when_not_matched(WhenNotMatched::InsertAll);
+    if allow {
+        builder.with_params(&WriteParams {
+            allow_external_blob_outside_bases: true,
+            ..Default::default()
+        });
+    }
+    let result = builder
+        .try_build()
+        .unwrap()
+        .execute_reader(Box::new(RecordBatchIterator::new(
+            vec![Ok(source.clone())],
+            source.schema(),
+        )))
+        .await;
+    if !allow {
+        let error = result.expect_err("a URI outside the bases is refused by default");
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("outside registered external bases"),
+            "{error}"
+        );
+        return;
+    }
+    let (new_dataset, _) = result.unwrap();
+
+    let ids = new_dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let ids = ids["id"].as_primitive::<arrow_array::types::Int64Type>();
+    let blobs = new_dataset
+        .take_blobs_by_indices(&(0..ids.len() as u64).collect::<Vec<_>>(), "blobs")
+        .await
+        .unwrap();
+    let mut actual = Vec::new();
+    for (row, blob) in blobs.into_iter().enumerate() {
+        let blob = blob.unwrap();
+        let external = blob.uri().is_some();
+        actual.push((
+            ids.value(row),
+            blob.read().await.unwrap().to_vec(),
+            external,
+        ));
+    }
+    actual.sort();
+    let matched = if update {
+        (1, b"one".to_vec(), true)
+    } else {
+        (1, b"bar".to_vec(), false)
+    };
+    assert_eq!(
+        actual,
+        vec![
+            (0, b"foo".to_vec(), false),
+            matched,
+            (2, b"two".to_vec(), true)
+        ]
+    );
+}
+
+/// The file options of `with_params` reach every path that writes new
+/// rows: with one row per file, three inserted rows make three fragments.
+#[rstest::rstest]
+#[case::v2_full(false, false)]
+#[case::indexed_full(true, false)]
+#[case::indexed_partial(true, true)]
+#[tokio::test]
+async fn test_merge_insert_with_params_applies_file_options_on_every_path(
+    #[case] indexed: bool,
+    #[case] partial: bool,
+    #[values(false, true)] with_params: bool,
+) {
+    let initial = record_batch!(("id", Int64, [0, 1]), ("value", Int64, [0, 10])).unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(initial.clone())], initial.schema()),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    if indexed {
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    let before = dataset.get_fragments().len();
+    let mut source =
+        record_batch!(("id", Int64, [2, 3, 4]), ("value", Int64, [20, 30, 40])).unwrap();
+    if partial {
+        source = source.project(&[0]).unwrap();
+    }
+
+    let mut builder =
+        MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()]).unwrap();
+    builder
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll);
+    if with_params {
+        builder.with_params(&WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        });
+    }
+    let (new_dataset, stats) = builder
+        .try_build()
+        .unwrap()
+        .execute_reader(Box::new(RecordBatchIterator::new(
+            vec![Ok(source.clone())],
+            source.schema(),
+        )))
+        .await
+        .unwrap();
+
+    assert_eq!(stats.num_inserted_rows, 3);
+    assert_eq!(
+        new_dataset.get_fragments().len() - before,
+        if with_params { 3 } else { 1 }
+    );
+}

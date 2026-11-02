@@ -149,8 +149,8 @@ const PK_BLOOM_FILTER_FPP: f64 = 0.00057;
 /// measurement, and a memory view need not carry it per memtable.
 ///
 /// Counted as index memory rather than row data: it is an auxiliary lookup
-/// structure, and a fixed term in the `max_memtable_size` seal trigger would
-/// make every memtable seal a constant early.
+/// structure, and a fixed term in the `max_memtable_size` freeze trigger would
+/// make every memtable freeze a constant early.
 pub fn pk_bloom_filter_bytes() -> usize {
     static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *BYTES.get_or_init(|| {
@@ -819,7 +819,7 @@ impl MemTable {
     }
 
     /// Whether every committed batch in this memtable is WAL-durable, given the
-    /// writer-global durability cursor. The L0 flush's precondition.
+    /// writer-global durability cursor. The SSTable flush's precondition.
     pub fn all_flushed_to_wal(&self, durable: usize) -> bool {
         self.batch_store.pending_wal_flush_count(durable) == 0
     }
@@ -985,7 +985,7 @@ mod tests {
         assert_eq!(total_rows, 15);
     }
 
-    /// `all_flushed_to_wal(durable)` is the L0 flush's precondition (`flush.rs:171`):
+    /// `all_flushed_to_wal(durable)` is the SSTable flush's precondition (`flush.rs:171`):
     /// false while any committed batch is still un-appended, true once the
     /// durability watermark covers every one of them.
     #[tokio::test]

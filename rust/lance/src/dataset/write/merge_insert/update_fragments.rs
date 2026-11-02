@@ -787,14 +787,21 @@ mod tests {
         .unwrap();
         let update_stream =
             RecordBatchStreamAdapter::new(updates.schema(), futures::stream::iter([Ok(updates)]));
+        let spill_execution_options = merge_insert_execution_options();
+        let spill_session_context = new_session_context(&spill_execution_options);
 
         let error = MergeInsertJob::update_fragments(
             dataset.clone(),
             Box::pin(update_stream),
-            dataset.manifest().version + 1,
             None,
-            dataset.manifest.data_storage_format.lance_file_format(),
+            &spill_session_context,
+            &spill_execution_options,
+            (
+                dataset.manifest().version + 1,
+                dataset.manifest.data_storage_format.lance_file_format(),
+            ),
             &[],
+            Arc::new(WriteParams::default()),
         )
         .await
         .unwrap_err();

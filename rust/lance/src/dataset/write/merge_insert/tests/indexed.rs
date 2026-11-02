@@ -349,12 +349,15 @@ async fn test_indexed_merge_insert_composite_key_no_index() {
 /// (NULL != NULL) on the post-filter hash join so its behavior is
 /// identical to the full-scan path; otherwise enabling the indexed
 /// path for multi-column joins would silently change semantics.
+#[rstest::rstest]
+#[case::btree(IndexType::BTree)]
+#[case::bitmap(IndexType::Bitmap)]
 #[tokio::test]
-async fn test_indexed_merge_insert_composite_key_null_semantics() {
+async fn test_indexed_merge_insert_composite_key_null_semantics(#[case] index_type: IndexType) {
     let initial = record_batch!(
-        ("a", Int32, [Some(1)]),
-        ("b", Utf8, [Option::<&str>::None]),
-        ("value", Int32, [Some(10)])
+        ("a", Int32, [Some(1), None]),
+        ("b", Utf8, [Option::<&str>::None, None]),
+        ("value", Int32, [10, 11])
     )
     .unwrap();
     let schema = initial.schema();
@@ -367,20 +370,22 @@ async fn test_indexed_merge_insert_composite_key_null_semantics() {
     .await
     .unwrap();
 
-    ds.create_index(
-        &["a"],
-        IndexType::Scalar,
-        None,
-        &ScalarIndexParams::default(),
-        false,
-    )
-    .await
-    .unwrap();
+    for key in ["a", "b"] {
+        ds.create_index(
+            &[key],
+            index_type,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    }
 
     let source = record_batch!(
-        ("a", Int32, [Some(1)]),
-        ("b", Utf8, [Option::<&str>::None]),
-        ("value", Int32, [Some(99)])
+        ("a", Int32, [Some(1), None]),
+        ("b", Utf8, [Option::<&str>::None, None]),
+        ("value", Int32, [99, 100])
     )
     .unwrap();
 
@@ -398,9 +403,22 @@ async fn test_indexed_merge_insert_composite_key_null_semantics() {
             .await
             .unwrap();
 
-    assert_eq!(stats.num_inserted_rows, 1);
+    assert_eq!(stats.num_inserted_rows, 2);
     assert_eq!(stats.num_updated_rows, 0);
-    assert_eq!(updated_ds.count_rows(None).await.unwrap(), 2);
+    let actual = updated_ds
+        .scan()
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_first("value".into())]))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let expected = record_batch!(
+        ("a", Int32, [Some(1), None, Some(1), None]),
+        ("b", Utf8, [Option::<&str>::None, None, None, None]),
+        ("value", Int32, [10, 11, 99, 100])
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
 }
 
 /// Composite-key merge_insert where new (unindexed) fragments are
@@ -1150,8 +1168,11 @@ fn map_index_exec_multi_lookup_plan_shape() {
     );
 
     let rebuilt = plan
-        .with_new_children(vec![dummy_input.clone()])
-        .expect("with_new_children must accept exactly one child");
+        .replace_children(
+            vec![dummy_input.clone()],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+        .expect("replace_children must accept exactly one child");
     let rebuilt_rendered = format!("{}", displayable(rebuilt.as_ref()).indent(false));
     assert!(
         rebuilt_rendered.contains("IndexedLookup [a, b]"),
@@ -2495,5 +2516,381 @@ async fn test_issue_6877_fts_no_duplicates_stable_row_ids() {
         "Expected {} rows but got {}",
         rows_per_frag * num_frags,
         unique_ids.len()
+    );
+}
+
+/// Returns rows only from its first scan, simulating a provider whose
+/// snapshot changes between scans.
+#[derive(Debug)]
+struct ChangingScanProvider {
+    first_batch: RecordBatch,
+    scan_count: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl TableProvider for ChangingScanProvider {
+    fn schema(&self) -> Arc<Schema> {
+        self.first_batch.schema()
+    }
+
+    fn table_type(&self) -> datafusion::logical_expr::TableType {
+        datafusion::logical_expr::TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        session: &dyn datafusion::catalog::Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        let schema = self.first_batch.schema();
+        let scan_number = self.scan_count.fetch_add(1, Ordering::SeqCst);
+        let batch = if scan_number == 0 {
+            self.first_batch.clone()
+        } else {
+            RecordBatch::new_empty(schema.clone())
+        };
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::iter([Ok(batch)]),
+        ));
+        let partition = Arc::new(OneShotPartitionStream::new(stream));
+        let provider = StreamingTable::try_new(schema, vec![partition])?;
+        provider.scan(session, projection, filters, limit).await
+    }
+}
+
+#[tokio::test]
+async fn test_indexed_merge_provider_scans_must_share_a_snapshot() {
+    let test_dir = TempStrDir::default();
+    let initial = record_batch!(("id", UInt32, [2]), ("value", UInt32, [20])).unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(initial.clone())], initial.schema()),
+        test_dir.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let dataset = Arc::new(dataset);
+    let source = record_batch!(("id", UInt32, [2]), ("value", UInt32, [200])).unwrap();
+    let scan_count = Arc::new(AtomicUsize::new(0));
+    let provider: Arc<dyn TableProvider> = Arc::new(ChangingScanProvider {
+        first_batch: source,
+        scan_count: scan_count.clone(),
+    });
+
+    let (dataset, stats) = MergeInsertBuilder::try_new(dataset, vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap()
+        .execute_provider(provider)
+        .await
+        .unwrap();
+
+    assert_eq!(scan_count.load(Ordering::SeqCst), 1);
+    assert_eq!(stats.num_updated_rows, 1);
+    assert_eq!(stats.num_inserted_rows, 0);
+    drop(dataset);
+
+    let reopened = Dataset::open(test_dir.as_str()).await.unwrap();
+    let batch = reopened.scan().try_into_batch().await.unwrap();
+    let ids = batch["id"].as_primitive::<UInt32Type>();
+    let values = batch["value"].as_primitive::<UInt32Type>();
+    let mut rows = ids
+        .values()
+        .iter()
+        .zip(values.values())
+        .map(|(id, value)| (*id, *value))
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    assert_eq!(rows, vec![(2, 200)]);
+}
+
+#[rstest::rstest]
+#[case::single_key(vec!["key".to_string()], Some(1))]
+#[case::null_key(vec!["key".to_string()], None)]
+#[case::composite_key(vec!["key".to_string(), "other_key".to_string()], Some(1))]
+#[tokio::test]
+async fn test_indexed_merge_insert_overlaid_keys(
+    #[case] on: Vec<String>,
+    #[case] base_key: Option<i32>,
+    #[values(false, true)] stable_row_ids: bool,
+    #[values(false, true)] use_index: bool,
+) {
+    let initial = record_batch!(
+        ("key", Int32, [Some(0), base_key, Some(2), Some(3)]),
+        ("other_key", Int32, [10, 20, 30, 40]),
+        ("tag", Utf8, ["base0", "base1", "base2", "base3"])
+    )
+    .unwrap();
+    let schema = initial.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(initial)], schema.clone()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            enable_stable_row_ids: stable_row_ids,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    for column in &on {
+        dataset
+            .create_index(
+                &[column],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    let appended = record_batch!(
+        ("key", Int32, [4, 5]),
+        ("other_key", Int32, [50, 60]),
+        ("tag", Utf8, ["base4", "base5"])
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(appended)], schema.clone()),
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    // Deleted offsets must not shift the overlay's physical row selection.
+    dataset.delete("key = 0").await.unwrap();
+    let dataset = Arc::new(dataset);
+    let key_schema = dataset
+        .schema()
+        .project_by_ids(&[dataset.schema().field("key").unwrap().id], true);
+    let mut groups = Vec::new();
+    for (fragment_id, offsets, keys) in [
+        (0, vec![1], vec![100]),
+        // The unchanged key must not be returned by both the index and stale-row scan.
+        (1, vec![0, 1], vec![101, 3]),
+        // An overlay on an unindexed fragment must still be scanned only once.
+        (2, vec![0], vec![200]),
+    ] {
+        let row_addrs = offsets
+            .into_iter()
+            .map(|offset| u64::from(RowAddress::new_from_parts(fragment_id, offset)))
+            .collect::<Vec<_>>();
+        let batch = record_batch!(("_rowaddr", UInt64, row_addrs), ("key", Int32, keys)).unwrap();
+        let mut writer = dataset
+            .get_fragment(fragment_id as usize)
+            .unwrap()
+            .write_overlay(&key_schema)
+            .await
+            .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        groups.push(writer.finish().await.unwrap().unwrap());
+    }
+    let read_version = dataset.version().version;
+    let dataset = Dataset::commit(
+        WriteDestination::Dataset(dataset),
+        Operation::DataOverlay { groups },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let source = record_batch!(
+        ("key", Int32, [100, 101, 3, 200, 999]),
+        ("other_key", Int32, [20, 30, 40, 50, 99]),
+        (
+            "tag",
+            Utf8,
+            ["merged", "merged", "merged", "merged", "inserted"]
+        )
+    )
+    .unwrap();
+    let (dataset, stats) = MergeInsertBuilder::try_new(Arc::new(dataset), on)
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .use_index(use_index)
+        .try_build()
+        .unwrap()
+        .execute_reader(Box::new(RecordBatchIterator::new(
+            [Ok(source.slice(0, 2)), Ok(source.slice(2, 3))],
+            schema,
+        )))
+        .await
+        .unwrap();
+
+    assert_eq!(stats.num_updated_rows, 4);
+    assert_eq!(stats.num_inserted_rows, 1);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 6);
+    for (key, other_key, tag) in [
+        (100, 20, "merged"),
+        (101, 30, "merged"),
+        (3, 40, "merged"),
+        (200, 50, "merged"),
+        (5, 60, "base5"),
+        (999, 99, "inserted"),
+    ] {
+        assert_eq!(
+            dataset
+                .count_rows(Some(format!(
+                    "key = {key} AND other_key = {other_key} AND tag = '{tag}'"
+                )))
+                .await
+                .unwrap(),
+            1,
+        );
+    }
+}
+
+#[rstest::rstest]
+#[case::first_key("key", false, true)]
+#[case::second_key("other_key", false, true)]
+#[case::unindexed_field("value", false, false)]
+#[case::rebuilt_index("key", true, false)]
+#[tokio::test]
+async fn test_indexed_merge_insert_overlay_staleness(
+    #[case] column: &str,
+    #[case] rebuild_index: bool,
+    #[case] is_stale: bool,
+) {
+    let initial = record_batch!(
+        ("key", Int32, [0, 1]),
+        ("other_key", Int32, [10, 20]),
+        ("value", Int32, [0, 1])
+    )
+    .unwrap();
+    let schema = initial.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(initial)], schema.clone()),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_1),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    for key in ["key", "other_key"] {
+        dataset
+            .create_index(
+                &[key],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    let dataset = Arc::new(dataset);
+    let overlay_schema = dataset
+        .schema()
+        .project_by_ids(&[dataset.schema().field(column).unwrap().id], true);
+    let batch = record_batch!((ROW_ADDR, UInt64, [1]), (column, Int32, [100])).unwrap();
+    let mut writer = dataset
+        .get_fragment(0)
+        .unwrap()
+        .write_overlay(&overlay_schema)
+        .await
+        .unwrap();
+    writer.write_batch(&batch).await.unwrap();
+    let group = writer.finish().await.unwrap().unwrap();
+    let read_version = dataset.version().version;
+    let mut dataset = Dataset::commit(
+        WriteDestination::Dataset(dataset),
+        Operation::DataOverlay {
+            groups: vec![group],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+    if rebuild_index {
+        dataset
+            .create_index(
+                &[column],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+    }
+    let job = MergeInsertBuilder::try_new(
+        Arc::new(dataset),
+        vec!["key".to_string(), "other_key".to_string()],
+    )
+    .unwrap()
+    .when_matched(WhenMatched::UpdateAll)
+    .when_not_matched(WhenNotMatched::InsertAll)
+    .try_build()
+    .unwrap();
+    let indexed_keys = job.indexed_join_keys().await.unwrap();
+    let stale_rows = job
+        .overlay_stale_rows_for_keys(&indexed_keys)
+        .await
+        .unwrap();
+    assert_eq!(
+        stale_rows,
+        if is_stale {
+            RowAddrTreeMap::from_iter([1u64])
+        } else {
+            RowAddrTreeMap::new()
+        }
+    );
+
+    let source = record_batch!(
+        ("key", Int32, [if column == "key" { 100 } else { 1 }]),
+        (
+            "other_key",
+            Int32,
+            [if column == "other_key" { 100 } else { 20 }]
+        ),
+        ("value", Int32, [999])
+    )
+    .unwrap();
+    let (dataset, stats) = job
+        .execute_reader(Box::new(RecordBatchIterator::new([Ok(source)], schema)))
+        .await
+        .unwrap();
+    assert_eq!(stats.num_updated_rows, 1);
+    assert_eq!(stats.num_inserted_rows, 0);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 2);
+    assert_eq!(
+        dataset
+            .count_rows(Some("value = 999".to_string()))
+            .await
+            .unwrap(),
+        1
     );
 }

@@ -358,13 +358,15 @@ async fn test_basic_merge(
         .unwrap()
         .try_build()
         .unwrap();
-    check_then_refresh_dataset(
+    // Boxed: the dataset and job held across the await put this
+    // future over the `large_futures` threshold.
+    Box::pin(check_then_refresh_dataset(
         new_batch.clone(),
         job,
         &[1, 2, 3, 4, 5, 6],
         &[7, 8, 9],
         &[3, 0, 0],
-    )
+    ))
     .await;
 
     // upsert, no delete
@@ -373,13 +375,15 @@ async fn test_basic_merge(
         .when_matched(WhenMatched::UpdateAll)
         .try_build()
         .unwrap();
-    check_then_refresh_dataset(
+    // Boxed: the dataset and job held across the await put this
+    // future over the `large_futures` threshold.
+    Box::pin(check_then_refresh_dataset(
         new_batch.clone(),
         job,
         &[1, 2, 3],
         &[4, 5, 6, 7, 8, 9],
         &[3, 3, 0],
-    )
+    ))
     .await;
 
     // conditional upsert, no delete
@@ -388,13 +392,15 @@ async fn test_basic_merge(
         .when_matched(WhenMatched::update_if(&ds, "source.filterme != target.filterme").unwrap())
         .try_build()
         .unwrap();
-    check_then_refresh_dataset(
+    // Boxed: the dataset and job held across the await put this
+    // future over the `large_futures` threshold.
+    Box::pin(check_then_refresh_dataset(
         new_batch.clone(),
         job,
         &[1, 2, 3, 4, 5],
         &[6, 7, 8, 9],
         &[3, 1, 0],
-    )
+    ))
     .await;
 
     // conditional update, no matches
@@ -404,7 +410,16 @@ async fn test_basic_merge(
         .when_matched(WhenMatched::update_if(&ds, "target.filterme = 'z'").unwrap())
         .try_build()
         .unwrap();
-    check_then_refresh_dataset(new_batch.clone(), job, &[1, 2, 3, 4, 5, 6], &[], &[0, 0, 0]).await;
+    // Boxed: the dataset and job held across the await put this
+    // future over the `large_futures` threshold.
+    Box::pin(check_then_refresh_dataset(
+        new_batch.clone(),
+        job,
+        &[1, 2, 3, 4, 5, 6],
+        &[],
+        &[0, 0, 0],
+    ))
+    .await;
 
     // update only, no delete (useful for bulk update)
     let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -413,7 +428,16 @@ async fn test_basic_merge(
         .when_not_matched(WhenNotMatched::DoNothing)
         .try_build()
         .unwrap();
-    check_then_refresh_dataset(new_batch.clone(), job, &[1, 2, 3], &[4, 5, 6], &[0, 3, 0]).await;
+    // Boxed: the dataset and job held across the await put this
+    // future over the `large_futures` threshold.
+    Box::pin(check_then_refresh_dataset(
+        new_batch.clone(),
+        job,
+        &[1, 2, 3],
+        &[4, 5, 6],
+        &[0, 3, 0],
+    ))
+    .await;
 
     // Conditional update
     let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -422,7 +446,16 @@ async fn test_basic_merge(
         .when_not_matched(WhenNotMatched::DoNothing)
         .try_build()
         .unwrap();
-    check_then_refresh_dataset(new_batch.clone(), job, &[1, 2, 3, 6], &[4, 5], &[0, 2, 0]).await;
+    // Boxed: the dataset and job held across the await put this
+    // future over the `large_futures` threshold.
+    Box::pin(check_then_refresh_dataset(
+        new_batch.clone(),
+        job,
+        &[1, 2, 3, 6],
+        &[4, 5],
+        &[0, 2, 0],
+    ))
+    .await;
 
     // No-op (will raise an error)
     assert!(
@@ -439,7 +472,16 @@ async fn test_basic_merge(
         .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
         .try_build()
         .unwrap();
-    check_then_refresh_dataset(new_batch.clone(), job, &[4, 5, 6], &[7, 8, 9], &[3, 0, 3]).await;
+    // Boxed: the dataset and job held across the await put this
+    // future over the `large_futures` threshold.
+    Box::pin(check_then_refresh_dataset(
+        new_batch.clone(),
+        job,
+        &[4, 5, 6],
+        &[7, 8, 9],
+        &[3, 0, 3],
+    ))
+    .await;
 
     // upsert, with delete all
     let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -448,7 +490,16 @@ async fn test_basic_merge(
         .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
         .try_build()
         .unwrap();
-    check_then_refresh_dataset(new_batch.clone(), job, &[], &[4, 5, 6, 7, 8, 9], &[3, 3, 3]).await;
+    // Boxed: the dataset and job held across the await put this
+    // future over the `large_futures` threshold.
+    Box::pin(check_then_refresh_dataset(
+        new_batch.clone(),
+        job,
+        &[],
+        &[4, 5, 6, 7, 8, 9],
+        &[3, 3, 3],
+    ))
+    .await;
 
     // conditional upsert, with delete all
     let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -457,7 +508,16 @@ async fn test_basic_merge(
         .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
         .try_build()
         .unwrap();
-    check_then_refresh_dataset(new_batch.clone(), job, &[4, 5], &[6, 7, 8, 9], &[3, 1, 3]).await;
+    // Boxed: the dataset and job held across the await put this
+    // future over the `large_futures` threshold.
+    Box::pin(check_then_refresh_dataset(
+        new_batch.clone(),
+        job,
+        &[4, 5],
+        &[6, 7, 8, 9],
+        &[3, 1, 3],
+    ))
+    .await;
 
     // update only, with delete all (unusual)
     let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -467,7 +527,16 @@ async fn test_basic_merge(
         .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
         .try_build()
         .unwrap();
-    check_then_refresh_dataset(new_batch.clone(), job, &[], &[4, 5, 6], &[0, 3, 3]).await;
+    // Boxed: the dataset and job held across the await put this
+    // future over the `large_futures` threshold.
+    Box::pin(check_then_refresh_dataset(
+        new_batch.clone(),
+        job,
+        &[],
+        &[4, 5, 6],
+        &[0, 3, 3],
+    ))
+    .await;
 
     // just delete all (not real case, just use delete)
     let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -476,7 +545,16 @@ async fn test_basic_merge(
         .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
         .try_build()
         .unwrap();
-    check_then_refresh_dataset(new_batch.clone(), job, &[4, 5, 6], &[], &[0, 0, 3]).await;
+    // Boxed: the dataset and job held across the await put this
+    // future over the `large_futures` threshold.
+    Box::pin(check_then_refresh_dataset(
+        new_batch.clone(),
+        job,
+        &[4, 5, 6],
+        &[],
+        &[0, 0, 3],
+    ))
+    .await;
 
     // For the "delete some" tests we use key > 1
     let condition = create_delete_condition();
@@ -486,13 +564,15 @@ async fn test_basic_merge(
         .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
         .try_build()
         .unwrap();
-    check_then_refresh_dataset(
+    // Boxed: the dataset and job held across the await put this
+    // future over the `large_futures` threshold.
+    Box::pin(check_then_refresh_dataset(
         new_batch.clone(),
         job,
         &[1, 4, 5, 6],
         &[7, 8, 9],
         &[3, 0, 2],
-    )
+    ))
     .await;
 
     // upsert, with delete some
@@ -502,13 +582,15 @@ async fn test_basic_merge(
         .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
         .try_build()
         .unwrap();
-    check_then_refresh_dataset(
+    // Boxed: the dataset and job held across the await put this
+    // future over the `large_futures` threshold.
+    Box::pin(check_then_refresh_dataset(
         new_batch.clone(),
         job,
         &[1],
         &[4, 5, 6, 7, 8, 9],
         &[3, 3, 2],
-    )
+    ))
     .await;
 
     // conditional upsert, with delete some
@@ -518,13 +600,15 @@ async fn test_basic_merge(
         .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
         .try_build()
         .unwrap();
-    check_then_refresh_dataset(
+    // Boxed: the dataset and job held across the await put this
+    // future over the `large_futures` threshold.
+    Box::pin(check_then_refresh_dataset(
         new_batch.clone(),
         job,
         &[1, 4, 5],
         &[6, 7, 8, 9],
         &[3, 1, 2],
-    )
+    ))
     .await;
 
     // update only, witxh delete some (unusual)
@@ -535,7 +619,16 @@ async fn test_basic_merge(
         .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
         .try_build()
         .unwrap();
-    check_then_refresh_dataset(new_batch.clone(), job, &[1], &[4, 5, 6], &[0, 3, 2]).await;
+    // Boxed: the dataset and job held across the await put this
+    // future over the `large_futures` threshold.
+    Box::pin(check_then_refresh_dataset(
+        new_batch.clone(),
+        job,
+        &[1],
+        &[4, 5, 6],
+        &[0, 3, 2],
+    ))
+    .await;
 
     // just delete some (not real case, just use delete)
     let job = MergeInsertBuilder::try_new(ds.clone(), keys.clone())
@@ -544,7 +637,16 @@ async fn test_basic_merge(
         .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition.clone()))
         .try_build()
         .unwrap();
-    check_then_refresh_dataset(new_batch.clone(), job, &[1, 4, 5, 6], &[], &[0, 0, 2]).await;
+    // Boxed: the dataset and job held across the await put this
+    // future over the `large_futures` threshold.
+    Box::pin(check_then_refresh_dataset(
+        new_batch.clone(),
+        job,
+        &[1, 4, 5, 6],
+        &[],
+        &[0, 0, 2],
+    ))
+    .await;
 }
 
 #[rstest::rstest]
@@ -553,23 +655,27 @@ async fn test_upsert_and_delete_all_with_stable_row_id(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
     #[values(true, false)] enable_stable_row_ids: bool,
 ) {
-    MergeInsertTestBuilder::new()
-        .with_version(version)
-        .with_stable_row_ids(enable_stable_row_ids)
-        .with_test_keys(&[4, 5, 6])
-        .with_expected_left_keys(&[])
-        .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
-        .with_expected_stats(&[3, 3, 3])
-        .with_job_builder(|ds| {
-            MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
-                .unwrap()
-                .when_matched(WhenMatched::UpdateAll)
-                .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
-                .try_build()
-                .unwrap()
-        })
-        .run_test()
-        .await;
+    // Boxed: the builder holds several `Fragment`s, which puts the
+    // future over the `large_futures` threshold.
+    Box::pin(
+        MergeInsertTestBuilder::new()
+            .with_version(version)
+            .with_stable_row_ids(enable_stable_row_ids)
+            .with_test_keys(&[4, 5, 6])
+            .with_expected_left_keys(&[])
+            .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
+            .with_expected_stats(&[3, 3, 3])
+            .with_job_builder(|ds| {
+                MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+                    .try_build()
+                    .unwrap()
+            })
+            .run_test(),
+    )
+    .await;
 }
 
 #[rstest::rstest]
@@ -578,22 +684,26 @@ async fn test_upsert_only_with_stable_row_id(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
     #[values(true, false)] enable_stable_row_ids: bool,
 ) {
-    MergeInsertTestBuilder::new()
-        .with_version(version)
-        .with_stable_row_ids(enable_stable_row_ids)
-        .with_test_keys(&[4, 5, 6])
-        .with_expected_left_keys(&[1, 2, 3])
-        .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
-        .with_expected_stats(&[3, 3, 0])
-        .with_job_builder(|ds| {
-            MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
-                .unwrap()
-                .when_matched(WhenMatched::UpdateAll)
-                .try_build()
-                .unwrap()
-        })
-        .run_test()
-        .await;
+    // Boxed: the builder holds several `Fragment`s, which puts the
+    // future over the `large_futures` threshold.
+    Box::pin(
+        MergeInsertTestBuilder::new()
+            .with_version(version)
+            .with_stable_row_ids(enable_stable_row_ids)
+            .with_test_keys(&[4, 5, 6])
+            .with_expected_left_keys(&[1, 2, 3])
+            .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
+            .with_expected_stats(&[3, 3, 0])
+            .with_job_builder(|ds| {
+                MergeInsertBuilder::try_new(ds, vec!["key".to_string()])
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .try_build()
+                    .unwrap()
+            })
+            .run_test(),
+    )
+    .await;
 }
 
 #[rstest::rstest]
@@ -602,25 +712,29 @@ async fn test_conditional_update_with_stable_row_id(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
     #[values(true, false)] enable_stable_row_ids: bool,
 ) {
-    MergeInsertTestBuilder::new()
-        .with_version(version)
-        .with_stable_row_ids(enable_stable_row_ids)
-        .with_test_keys(&[6])
-        .with_expected_left_keys(&[1, 2, 3, 4, 5])
-        .with_expected_right_keys(&[6, 7, 8, 9])
-        .with_expected_stats(&[3, 1, 0])
-        .with_job_builder(|ds| {
-            let keys = vec!["key".to_string()];
-            MergeInsertBuilder::try_new(ds.clone(), keys)
-                .unwrap()
-                .when_matched(
-                    WhenMatched::update_if(&ds, "source.filterme != target.filterme").unwrap(),
-                )
-                .try_build()
-                .unwrap()
-        })
-        .run_test()
-        .await;
+    // Boxed: the builder holds several `Fragment`s, which puts the
+    // future over the `large_futures` threshold.
+    Box::pin(
+        MergeInsertTestBuilder::new()
+            .with_version(version)
+            .with_stable_row_ids(enable_stable_row_ids)
+            .with_test_keys(&[6])
+            .with_expected_left_keys(&[1, 2, 3, 4, 5])
+            .with_expected_right_keys(&[6, 7, 8, 9])
+            .with_expected_stats(&[3, 1, 0])
+            .with_job_builder(|ds| {
+                let keys = vec!["key".to_string()];
+                MergeInsertBuilder::try_new(ds.clone(), keys)
+                    .unwrap()
+                    .when_matched(
+                        WhenMatched::update_if(&ds, "source.filterme != target.filterme").unwrap(),
+                    )
+                    .try_build()
+                    .unwrap()
+            })
+            .run_test(),
+    )
+    .await;
 }
 
 #[rstest::rstest]
@@ -629,24 +743,28 @@ async fn test_update_only_with_stable_row_id(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
     #[values(true, false)] enable_stable_row_ids: bool,
 ) {
-    MergeInsertTestBuilder::new()
-        .with_version(version)
-        .with_stable_row_ids(enable_stable_row_ids)
-        .with_test_keys(&[4, 5, 6])
-        .with_expected_left_keys(&[1, 2, 3])
-        .with_expected_right_keys(&[4, 5, 6])
-        .with_expected_stats(&[0, 3, 0])
-        .with_job_builder(|ds| {
-            let keys = vec!["key".to_string()];
-            MergeInsertBuilder::try_new(ds, keys)
-                .unwrap()
-                .when_matched(WhenMatched::UpdateAll)
-                .when_not_matched(WhenNotMatched::DoNothing)
-                .try_build()
-                .unwrap()
-        })
-        .run_test()
-        .await;
+    // Boxed: the builder holds several `Fragment`s, which puts the
+    // future over the `large_futures` threshold.
+    Box::pin(
+        MergeInsertTestBuilder::new()
+            .with_version(version)
+            .with_stable_row_ids(enable_stable_row_ids)
+            .with_test_keys(&[4, 5, 6])
+            .with_expected_left_keys(&[1, 2, 3])
+            .with_expected_right_keys(&[4, 5, 6])
+            .with_expected_stats(&[0, 3, 0])
+            .with_job_builder(|ds| {
+                let keys = vec!["key".to_string()];
+                MergeInsertBuilder::try_new(ds, keys)
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched(WhenNotMatched::DoNothing)
+                    .try_build()
+                    .unwrap()
+            })
+            .run_test(),
+    )
+    .await;
 }
 
 #[rstest::rstest]
@@ -655,25 +773,29 @@ async fn test_upsert_with_conditional_delete_and_stable_row_id(
     #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
     #[values(true, false)] enable_stable_row_ids: bool,
 ) {
-    MergeInsertTestBuilder::new()
-        .with_version(version)
-        .with_stable_row_ids(enable_stable_row_ids)
-        .with_test_keys(&[1, 4, 5, 6])
-        .with_expected_left_keys(&[1])
-        .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
-        .with_expected_stats(&[3, 3, 2])
-        .with_job_builder(|ds| {
-            let keys = vec!["key".to_string()];
-            let condition = create_delete_condition();
-            MergeInsertBuilder::try_new(ds, keys)
-                .unwrap()
-                .when_matched(WhenMatched::UpdateAll)
-                .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition))
-                .try_build()
-                .unwrap()
-        })
-        .run_test()
-        .await;
+    // Boxed: the builder holds several `Fragment`s, which puts the
+    // future over the `large_futures` threshold.
+    Box::pin(
+        MergeInsertTestBuilder::new()
+            .with_version(version)
+            .with_stable_row_ids(enable_stable_row_ids)
+            .with_test_keys(&[1, 4, 5, 6])
+            .with_expected_left_keys(&[1])
+            .with_expected_right_keys(&[4, 5, 6, 7, 8, 9])
+            .with_expected_stats(&[3, 3, 2])
+            .with_job_builder(|ds| {
+                let keys = vec!["key".to_string()];
+                let condition = create_delete_condition();
+                MergeInsertBuilder::try_new(ds, keys)
+                    .unwrap()
+                    .when_matched(WhenMatched::UpdateAll)
+                    .when_not_matched_by_source(WhenNotMatchedBySource::DeleteIf(condition))
+                    .try_build()
+                    .unwrap()
+            })
+            .run_test(),
+    )
+    .await;
 }
 
 #[rstest::rstest]
@@ -818,15 +940,36 @@ async fn test_multiple_merge_insert_stable_row_id(
 }
 
 #[rstest::rstest]
+#[case::updates_before_inserts(1, 1, 7, 2)]
+#[case::insert_batches_before_updates(1000, 1, 0, 256)]
+#[case::insert_batches_between_updates(128, 256, 0, 1024)]
 #[tokio::test]
-async fn test_multi_batch_upsert_preserves_stable_row_ids(#[values(true, false)] use_index: bool) {
-    let mut dataset = (*create_test_dataset(
-        "memory://test_multi_batch_upsert_row_ids",
-        LanceFileVersion::default(),
-        true,
-    )
-    .await)
-        .clone();
+async fn test_multi_batch_upsert_preserves_stable_row_ids(
+    #[case] first_key: u32,
+    #[case] key_step: u32,
+    #[case] first_insert: u32,
+    #[case] insert_range_len: u32,
+    #[values(true, false)] use_index: bool,
+    #[values(64, 1024)] max_rows_per_file: usize,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let uri = directory.path().to_str().unwrap();
+    let mut dataset = lance_datagen::gen_batch()
+        .col("key", array::step_custom::<UInt32Type>(first_key, key_step))
+        .col("value", array::fill::<UInt32Type>(1))
+        .col("filterme", array::fill_utf8("original".to_string()))
+        .into_dataset_with_params(
+            uri,
+            FragmentCount(2),
+            FragmentRowCount(3),
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
     dataset
         .create_index(
             &["key"],
@@ -839,33 +982,45 @@ async fn test_multi_batch_upsert_preserves_stable_row_ids(#[values(true, false)]
         .unwrap();
     let dataset = Arc::new(dataset);
 
-    let initial_keys = [1, 2, 3, 4, 5, 6];
+    let initial_keys = (0..6).map(|i| first_key + i * key_step).collect::<Vec<_>>();
     let initial_row_ids = get_row_ids_for_keys(&dataset, &initial_keys).await;
-    let initial_row_ids = initial_row_ids
-        .values()
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>();
-    let updated_keys = [2, 4];
-    let updated_row_ids_before = get_row_ids_for_keys(&dataset, &updated_keys).await;
+    let updated_keys = [initial_keys[1], initial_keys[3]];
+    let inserted_keys = (first_insert..first_insert + insert_range_len)
+        .filter(|key| !initial_keys.contains(key))
+        .collect::<Vec<_>>();
+    let midpoint = inserted_keys.len() / 2;
 
-    // Put inserts in the first source batch and updates in the second. Stable
-    // row-id assignment still relies on the join emitting all updates first.
-    let insert_batch = record_batch!(
-        ("key", UInt32, [7, 8]),
-        ("value", UInt32, [70, 80]),
-        ("filterme", Utf8, ["inserted", "inserted"])
+    // Input batch order differs from key order. The indexed join must also
+    // handle entire output batches of inserts before or between updates.
+    let first_insert_batch = record_batch!(
+        ("key", UInt32, inserted_keys[..midpoint].to_vec()),
+        ("value", UInt32, vec![70; midpoint]),
+        ("filterme", Utf8, vec!["inserted before"; midpoint])
     )
     .unwrap();
     let update_batch = record_batch!(
-        ("key", UInt32, [2, 4]),
-        ("value", UInt32, [20, 40]),
+        ("key", UInt32, updated_keys.to_vec()),
+        ("value", UInt32, [20, 20]),
         ("filterme", Utf8, ["updated", "updated"])
     )
     .unwrap();
-    let source_schema = insert_batch.schema();
+    let second_insert_batch = record_batch!(
+        ("key", UInt32, inserted_keys[midpoint..].to_vec()),
+        ("value", UInt32, vec![80; inserted_keys.len() - midpoint]),
+        (
+            "filterme",
+            Utf8,
+            vec!["inserted after"; inserted_keys.len() - midpoint]
+        )
+    )
+    .unwrap();
+    let source_schema = first_insert_batch.schema();
     let source = Box::new(RecordBatchIterator::new(
-        [Ok(insert_batch), Ok(update_batch)],
+        [
+            Ok(first_insert_batch),
+            Ok(update_batch),
+            Ok(second_insert_batch),
+        ],
         source_schema,
     ));
 
@@ -874,23 +1029,45 @@ async fn test_multi_batch_upsert_preserves_stable_row_ids(#[values(true, false)]
         .when_matched(WhenMatched::UpdateAll)
         .when_not_matched(WhenNotMatched::InsertAll)
         .use_index(use_index)
+        .with_params(&WriteParams {
+            max_rows_per_file,
+            ..Default::default()
+        })
         .try_build()
         .unwrap()
         .execute_reader(source)
         .await
         .unwrap();
 
-    assert_eq!(stats.num_updated_rows, 2);
-    assert_eq!(stats.num_inserted_rows, 2);
-    let updated_row_ids_after = get_row_ids_for_keys(&dataset, &updated_keys).await;
-    assert_eq!(updated_row_ids_after, updated_row_ids_before);
+    assert_eq!(stats.num_updated_rows, updated_keys.len() as u64);
+    assert_eq!(stats.num_inserted_rows, inserted_keys.len() as u64);
+    drop(dataset);
+    let dataset = Dataset::open(uri).await.unwrap();
+    assert_eq!(
+        dataset.count_rows(None).await.unwrap(),
+        initial_keys.len() + inserted_keys.len()
+    );
+    let row_ids_after = get_row_ids_for_keys(&dataset, &initial_keys).await;
+    assert_eq!(row_ids_after, initial_row_ids);
+    let original_rows = dataset
+        .take_rows(initial_row_ids.values(), dataset.schema().clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        original_rows["key"].as_primitive::<UInt32Type>().values(),
+        &initial_keys
+    );
+    assert_eq!(
+        original_rows["value"].as_primitive::<UInt32Type>().values(),
+        &[1, 20, 1, 20, 1, 1]
+    );
 
-    let inserted_row_ids = get_row_ids_for_keys(&dataset, &[7, 8]).await;
+    let inserted_row_ids = get_row_ids_for_keys(&dataset, &inserted_keys).await;
     assert!(
         inserted_row_ids
             .values()
             .iter()
-            .all(|row_id| !initial_row_ids.contains(row_id))
+            .all(|row_id| !initial_row_ids.values().contains(row_id))
     );
 }
 
@@ -1156,12 +1333,24 @@ async fn test_repro_3515_partial_schema_fully_indexed(
     )
     .unwrap();
 
-    let (ds, stats) = MergeInsertBuilder::try_new(ds.clone(), vec!["path".to_string()])
+    let job = MergeInsertBuilder::try_new(ds.clone(), vec!["path".to_string()])
         .unwrap()
         .when_matched(WhenMatched::UpdateAll)
         .when_not_matched(WhenNotMatched::DoNothing)
         .try_build()
-        .unwrap()
+        .unwrap();
+    let job_disk_manager = job.spill_session_context.runtime_env().disk_manager.clone();
+    let fragment_update_context =
+        fragment_update_session_context(&job.spill_session_context, &job.spill_execution_options);
+    assert!(
+        Arc::ptr_eq(
+            &job_disk_manager,
+            &fragment_update_context.runtime_env().disk_manager
+        ),
+        "indexed execution and partial-update sorting must share one disk manager"
+    );
+
+    let (ds, stats) = job
         .execute_reader(RecordBatchIterator::new([Ok(updates)], upd_schema))
         .await
         .unwrap();
@@ -1245,13 +1434,10 @@ async fn test_indexed_partial_merge_with_reordered_source(
     assert_eq!(actual_payload, expected_payload);
 }
 
-/// merge_insert matches keys by bit pattern, in the indexed probe and in the
-/// hash join behind it alike, so a source key of `+0.0` updates only the
-/// `+0.0` row. Filters answer zero comparisons per IEEE 754 now, and this
-/// pins that the two are still allowed to disagree: making key matching agree
-/// needs the unindexed join fixed too, and DataFusion 54 hashes join keys by
-/// raw bits. Both settings of `use_index` are exercised; which one the planner
-/// picks for a one-row source is not asserted.
+/// merge_insert matches float keys per IEEE 754, like filters do, so a source
+/// key of `+0.0` matches both the `-0.0` and the `+0.0` row. Both settings of
+/// `use_index` are exercised; which one the planner picks for a one-row source
+/// is not asserted.
 #[rstest::rstest]
 #[tokio::test]
 async fn test_merge_insert_on_float_zero_key(#[values(true, false)] use_index: bool) {
@@ -1294,14 +1480,159 @@ async fn test_merge_insert_on_float_zero_key(#[values(true, false)] use_index: b
         .await
         .unwrap();
 
-    // Only the +0.0 row is updated. Checking both sides pins which row was
-    // replaced, not just how many; `value = 20` is the -0.0 row.
+    // Both zero rows are updated; `value = 20` was the -0.0 row and
+    // `value = 30` the +0.0 row.
     assert_eq!(ds.count_rows(None).await.unwrap(), 4);
-    for (filter, expected) in [("value = 99", 1), ("value = 30", 0), ("value = 20", 1)] {
+    for (filter, expected) in [("value = 99", 2), ("value = 30", 0), ("value = 20", 0)] {
         assert_eq!(
             ds.count_rows(Some(filter.to_string())).await.unwrap(),
             expected,
             "{filter}"
         );
+    }
+}
+
+/// `-0.0` and `+0.0` are one key, so a source holding both has a duplicate
+/// key: each zero target row is matched twice. The default `Fail` rejects
+/// that as ambiguous; `FirstSeen` updates each zero row once, with either
+/// source row's value depending on join order.
+#[rstest::rstest]
+#[tokio::test]
+async fn test_merge_insert_source_with_both_float_zeros(
+    #[values(true, false)] use_index: bool,
+    #[values(SourceDedupeBehavior::Fail, SourceDedupeBehavior::FirstSeen)]
+    behavior: SourceDedupeBehavior,
+) {
+    let target = record_batch!(
+        (
+            "key",
+            Float64,
+            [Some(-1.0), Some(-0.0), Some(0.0), Some(1.0)]
+        ),
+        ("value", Int32, [10, 20, 30, 40])
+    )
+    .unwrap();
+    let schema = target.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(target)], schema.clone());
+    let mut ds = Dataset::write(reader, "memory://", None).await.unwrap();
+    ds.create_index(
+        &["key"],
+        IndexType::Scalar,
+        None,
+        &ScalarIndexParams::default(),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let source = record_batch!(
+        ("key", Float64, [Some(-0.0), Some(0.0)]),
+        ("value", Int32, [98, 99])
+    )
+    .unwrap();
+    let result = MergeInsertBuilder::try_new(Arc::new(ds), vec!["key".to_string()])
+        .unwrap()
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .when_matched(WhenMatched::UpdateAll)
+        .use_index(use_index)
+        .source_dedupe_behavior(behavior)
+        .try_build()
+        .unwrap()
+        .execute_reader(Box::new(RecordBatchIterator::new(
+            vec![Ok(source)],
+            schema.clone(),
+        )))
+        .await;
+
+    if behavior == SourceDedupeBehavior::Fail {
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Ambiguous merge inserts"),
+            "Fail must reject a source holding both zeros, got: {err}"
+        );
+        return;
+    }
+
+    let (ds, _) = result.unwrap();
+    assert_eq!(ds.count_rows(None).await.unwrap(), 4);
+    for (filter, expected) in [
+        ("value = 98 OR value = 99", 2),
+        ("value = 20", 0),
+        ("value = 30", 0),
+    ] {
+        assert_eq!(
+            ds.count_rows(Some(filter.to_string())).await.unwrap(),
+            expected,
+            "{filter}"
+        );
+    }
+}
+
+/// `try_build` refuses write parameters a merge insert sets on its own
+/// builder or cannot honor.
+#[tokio::test]
+async fn test_merge_insert_with_params_refuses_what_merge_insert_owns() {
+    let initial = record_batch!(("id", Int64, [0])).unwrap();
+    let dataset = Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(initial.clone())], initial.schema()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    for (params, needle) in [
+        (
+            WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            },
+            "mode=Overwrite",
+        ),
+        (
+            WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            },
+            "mode=Append",
+        ),
+        (
+            WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            },
+            "data_storage_version",
+        ),
+        (
+            WriteParams {
+                target_bases: Some(vec![0]),
+                ..Default::default()
+            },
+            "target_bases=Some([0])",
+        ),
+        (
+            WriteParams {
+                target_all_bases: Some(true),
+                ..Default::default()
+            },
+            "target_all_bases=Some(true)",
+        ),
+        (
+            WriteParams {
+                external_blob_mode: ExternalBlobMode::Ingest,
+                ..Default::default()
+            },
+            "ingest",
+        ),
+    ] {
+        let error = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .with_params(&params)
+            .try_build()
+            .err()
+            .unwrap_or_else(|| panic!("{needle} must be refused"));
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains(needle), "{needle}: {error}");
     }
 }

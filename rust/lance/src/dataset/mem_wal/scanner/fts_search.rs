@@ -1125,8 +1125,8 @@ impl LsmFtsSearchPlanner {
                     )
                     .await?;
                     // The index is on this generation's own column, under the
-                    // name it had when the generation was sealed. A generation
-                    // sealed before the column existed has no index on it and
+                    // name it had when the generation was frozen. A generation
+                    // frozen before the column existed has no index on it and
                     // offers no granularity.
                     let generation = GenerationRead::new(
                         dataset.schema(),
@@ -5855,7 +5855,7 @@ mod tests {
         assert_eq!(search_ids(&planner, combined(columns)).await, vec![1]);
     }
 
-    /// The same queries over a flushed generation sealed before `body` existed.
+    /// The same queries over a generation frozen before `body` existed.
     #[tokio::test]
     async fn a_generation_that_predates_a_column_still_answers_the_rest() {
         use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;

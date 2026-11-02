@@ -31,36 +31,63 @@ use std::{
 // "update if" expressions typically compare fields from the source table to the target table.
 // These tables have the same schema and so filter expressions need to differentiate.  To do that
 // we wrap the left side and the right side in a struct and make a single "combined schema"
-fn combined_schema(schema: &Schema) -> Schema {
-    let target = Field::new("target", DataType::Struct(schema.fields.clone()), false);
-    let source = Field::new("source", DataType::Struct(schema.fields.clone()), false);
-    Schema::new(vec![source, target])
+fn combined_schema(source: &Schema, target: &Schema) -> Schema {
+    let nullable = |schema: &Schema| -> Fields {
+        schema
+            .fields
+            .iter()
+            .map(|f| f.as_ref().clone().with_nullable(true))
+            .collect()
+    };
+    Schema::new(vec![
+        Field::new("source", DataType::Struct(nullable(source)), false),
+        Field::new("target", DataType::Struct(nullable(target)), false),
+    ])
 }
 
 // This takes a double-wide table (e.g. the result of the outer join below) and takes the left
 // half, puts it into a struct, then takes the right half, and puts that into a struct.  This
 // makes the table match the "combined schema" so we can apply an "update if" expression
-fn unzip_batch(batch: &RecordBatch, schema: &Schema) -> RecordBatch {
-    // The schema of the combined batches will be:
-    // target_data_keys, target_data_non_keys, target_data_row_id, source_data_keys, source_data_non_keys
-    // The keys and non_keys on both sides will be equal
-    let num_fields = batch.num_columns();
-    debug_assert_eq!(num_fields % 2, 1);
-    let half_num_fields = num_fields / 2;
-    let row_id_col = num_fields - 1;
+fn unzip_batch(batch: &RecordBatch, combined: &Schema) -> Result<RecordBatch> {
+    let missing =
+        |name: &str| Error::internal(format!("merge insert join is missing column '{name}'"));
+    let struct_fields = |idx: usize| -> Result<Fields> {
+        match combined.field(idx).data_type() {
+            DataType::Struct(fields) => Ok(fields.clone()),
+            other => Err(Error::internal(format!(
+                "merge insert condition schema holds {other} where a struct was expected"
+            ))),
+        }
+    };
 
-    let source_arrays = batch.columns()[0..half_num_fields].to_vec();
-    let source = StructArray::new(schema.fields.clone(), source_arrays, None);
+    let source_fields = struct_fields(0)?;
+    let width = source_fields.len();
+    let source_arrays = source_fields
+        .iter()
+        .map(|f| {
+            batch
+                .column_by_name(f.name())
+                .cloned()
+                .ok_or_else(|| missing(f.name()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let source = StructArray::try_new(source_fields, source_arrays, None)?;
 
-    let target_arrays = batch.columns()[half_num_fields..row_id_col].to_vec();
-    let target = StructArray::new(schema.fields.clone(), target_arrays, None);
+    let target_fields = struct_fields(1)?;
+    let target_arrays = target_fields
+        .iter()
+        .map(|f| {
+            target_column_index(batch.schema_ref(), f.name(), width)
+                .map(|i| batch.column(i).clone())
+                .ok_or_else(|| missing(&format!("target_{}", f.name())))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let target = StructArray::try_new(target_fields, target_arrays, None)?;
 
-    let combined_schema = combined_schema(schema);
-    RecordBatch::try_new(
-        Arc::new(combined_schema),
+    Ok(RecordBatch::try_new(
+        Arc::new(combined.clone()),
         vec![Arc::new(source), Arc::new(target)],
-    )
-    .unwrap()
+    )?)
 }
 
 // A sync-safe structure that is shared by all of the "process batch" tasks.
@@ -68,23 +95,23 @@ fn unzip_batch(batch: &RecordBatch, schema: &Schema) -> RecordBatch {
 // Note: we are not currently using parallelism but this still needs to be sync because it is
 //       held across an await boundary (and we might use parallelism someday)
 #[derive(Debug, Clone)]
-pub(super) struct Merger {
+struct Merger {
     // As the merger runs it will update the list of deleted rows
-    pub(super) deleted_rows: Arc<Mutex<Vec<u64>>>,
+    deleted_rows: Arc<Mutex<Vec<u64>>>,
     // Shared collection to capture row ids that need to be updated
-    pub(super) updating_row_ids: Arc<Mutex<CapturedRowIds>>,
+    updating_row_ids: Arc<Mutex<CapturedRowIds>>,
     // Physical delete expression, only set if params.delete_not_matched_by_source is DeleteIf
     delete_expr: Option<Arc<dyn PhysicalExpr>>,
     // User statistics for merging
-    pub(super) merge_stats: Arc<Mutex<MergeStats>>,
-    // Physical "when matched update if" expression, only set if params.when_matched is UpdateIf
-    match_filter_expr: Option<Arc<dyn PhysicalExpr>>,
+    merge_stats: Arc<Mutex<MergeStats>>,
+    // Only set if params.when_matched is UpdateIf
+    match_filter: Option<MatchFilter>,
     // The parameters controlling the merge
     params: MergeInsertParams,
-    // The schema of the input data, used to recover nullability information
-    schema: Arc<Schema>,
     /// Whether the output schema should include a row address column
     with_row_addr: bool,
+    /// Carry row IDs until full-schema upsert output is ordered for writing.
+    with_row_id: bool,
     /// The output schema of the stream.
     output_schema: Arc<Schema>,
     /// Whether to enable stable row ids
@@ -97,9 +124,10 @@ pub(super) struct Merger {
 
 impl Merger {
     // Creates a new merger with an empty set of deleted rows, compiles expressions, if present
-    pub(super) fn try_new(
+    fn try_new(
         params: MergeInsertParams,
         schema: Arc<Schema>,
+        joined_schema: &Schema,
         with_row_addr: bool,
         enable_stable_row_ids: bool,
     ) -> Result<Self> {
@@ -120,9 +148,10 @@ impl Merger {
         } else {
             None
         };
-        let match_filter_expr = match &params.when_matched {
+        let match_filter = match &params.when_matched {
             WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_) => {
-                let combined_schema = Arc::new(combined_schema(&schema));
+                let target_schema = target_schema_for(&schema, joined_schema)?;
+                let combined_schema = Arc::new(combined_schema(&schema, &target_schema));
                 let planner = Planner::new(combined_schema.clone());
                 let expr = match &params.when_matched {
                     WhenMatched::UpdateIf(expr_str) => planner.parse_filter(expr_str)?,
@@ -138,14 +167,26 @@ impl Merger {
                         expr, data_type
                     )));
                 }
-                Some(match_expr)
+                Some(MatchFilter {
+                    schema: combined_schema,
+                    expr: match_expr,
+                })
             }
             _ => None,
         };
+        let with_row_id = enable_stable_row_ids
+            && !with_row_addr
+            && params.insert_not_matched
+            && matches!(
+                params.when_matched,
+                WhenMatched::UpdateAll | WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_)
+            );
         let output_schema = if with_row_addr {
             Arc::new(schema.try_with_column(ROW_ADDR_FIELD.clone())?)
+        } else if with_row_id {
+            Arc::new(schema.try_with_column(ROW_ID_FIELD.clone())?)
         } else {
-            schema.clone()
+            schema
         };
 
         Ok(Self {
@@ -153,10 +194,10 @@ impl Merger {
             updating_row_ids: Arc::new(Mutex::new(CapturedRowIds::new(enable_stable_row_ids))),
             delete_expr,
             merge_stats: Arc::new(Mutex::new(MergeStats::default())),
-            match_filter_expr,
+            match_filter,
             params,
-            schema,
             with_row_addr,
+            with_row_id,
             output_schema,
             enable_stable_row_ids,
             processed_row_ids: Arc::new(Mutex::new(HashSet::new())),
@@ -164,7 +205,7 @@ impl Merger {
         })
     }
 
-    pub(super) fn output_schema(&self) -> &Arc<Schema> {
+    fn output_schema(&self) -> &Arc<Schema> {
         &self.output_schema
     }
 
@@ -181,39 +222,14 @@ impl Merger {
         Ok(at_least_one_valid)
     }
 
-    // Since we are performing an
-    // outer join below we expect the results to look like:
-    //
-    // | LEFT KEYS | LEFT PAYLOAD | RIGHT KEYS | RIGHT PAYLOAD |
-    // | NULL      | NULL         | NOT NULL   | ************* | <- when not matched
-    // | ********* | ************ | ********** | ************* | <- when matched
-    // | ********* | ************ | NULL       | NULL          | <- when not matched by source
-    //
-    // To test which case we are in we check to see if all of LEFT KEYS or RIGHT KEYS are null
-    //
-    // This returns three selection bitmaps
-    //
-    //  - The first is true for rows that are in the left side only
-    //  - The second is true for rows in both the left and the right
-    //  - The third is true for rows in the right side only
+    // Returns selection bitmaps for source-only, matched, and target-only rows.
     fn extract_selections(
         &self,
         combined_batch: &RecordBatch,
-        right_offset: usize,
+        row_id_col: usize,
     ) -> Result<(BooleanArray, BooleanArray, BooleanArray)> {
-        // The outer join distinguishes its three cases by which side's join
-        // keys were NULL-padded: a present row always has non-null keys, while
-        // the absent side is filled with NULLs. We therefore test the *key*
-        // columns, located by name. They are NOT necessarily the first
-        // `num_keys` columns — a partial-schema source can place a payload
-        // column (e.g. an all-null vector) at position 0, and checking
-        // positions [0, num_keys) there misreads an all-null leading payload
-        // column as an absent join side, silently dropping every matched row
-        // (https://github.com/lancedb/lancedb/issues/3515). The target half is
-        // resolved independently because the indexed path keeps dataset-schema
-        // order even when the source fields are reordered. Restrict that lookup
-        // to the target half because a valid source field can have the same
-        // `target_`-prefixed name.
+        // Locate source keys by name: a reordered partial-schema source can put
+        // an all-null payload before its keys (lancedb/lancedb#3515).
         let combined_schema = combined_batch.schema();
         let source_key_cols = self
             .params
@@ -228,32 +244,16 @@ impl Merger {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let target_key_cols = self
-            .params
-            .on
-            .iter()
-            .map(|key| {
-                let target_key = format!("target_{key}");
-                combined_schema
-                    .fields()
-                    .iter()
-                    .enumerate()
-                    .skip(right_offset)
-                    .find_map(|(index, field)| (field.name() == &target_key).then_some(index))
-                    .ok_or_else(|| {
-                        Error::internal(format!(
-                            "merge insert target key column '{}' not found in joined batch",
-                            target_key
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
 
-        let in_left = Self::not_all_null(combined_batch, &source_key_cols)?;
-        let in_right = Self::not_all_null(combined_batch, &target_key_cols)?;
-        let in_both = arrow::compute::and(&in_left, &in_right)?;
-        let left_only = arrow::compute::and(&in_left, &arrow::compute::not(&in_right)?)?;
-        let right_only = arrow::compute::and(&arrow::compute::not(&in_left)?, &in_right)?;
+        // Every target row has a row id, even when its keys are NULL. A NULL
+        // target row id therefore identifies a source-only row regardless of
+        // its key values. With SQL equality, matched rows have non-null source
+        // keys; target-only rows have NULL-padded source keys.
+        let has_source_key = Self::not_all_null(combined_batch, &source_key_cols)?;
+        let in_right = arrow::compute::is_not_null(combined_batch.column(row_id_col))?;
+        let left_only = arrow::compute::not(&in_right)?;
+        let in_both = arrow::compute::and(&has_source_key, &in_right)?;
+        let right_only = arrow::compute::and(&arrow::compute::not(&has_source_key)?, &in_right)?;
         Ok((left_only, in_both, right_only))
     }
 
@@ -263,7 +263,7 @@ impl Merger {
     //
     // Returns 0, 1, or 2 batches
     // Potentially updates (as a side-effect) the deleted rows vec
-    pub(super) async fn execute_batch(
+    async fn execute_batch(
         self,
         batch: RecordBatch,
     ) -> datafusion::common::Result<impl Stream<Item = datafusion::common::Result<RecordBatch>>>
@@ -283,11 +283,12 @@ impl Merger {
             (num_fields - 2, Some(num_fields - 1), (num_fields - 2) / 2)
         };
 
-        let left_cols = Vec::from_iter(0..right_offset);
+        let output_row_col = row_addr_col.or(self.with_row_id.then_some(row_id_col));
+        let output_cols = (0..right_offset).chain(output_row_col).collect::<Vec<_>>();
         let right_cols_with_id = Vec::from_iter(right_offset..num_fields);
 
         let mut batches = Vec::with_capacity(2);
-        let (left_only, in_both, right_only) = self.extract_selections(&batch, right_offset)?;
+        let (left_only, in_both, right_only) = self.extract_selections(&batch, row_id_col)?;
 
         // There is no contention on this mutex.  We're only using it to bypass the rust
         // borrow checker (the stream needs to be `sync` since it crosses an await point)
@@ -295,7 +296,7 @@ impl Merger {
 
         // Each `WhenMatched` variant handles the matched rows (`in_both`)
         // differently.
-        let match_filter_expr = self.match_filter_expr;
+        let match_filter = self.match_filter;
         match &self.params.when_matched {
             WhenMatched::DoNothing => {}
             WhenMatched::Delete => {
@@ -342,9 +343,9 @@ impl Merger {
             WhenMatched::UpdateAll | WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_) => {
                 let mut matched = arrow::compute::filter_record_batch(&batch, &in_both)?;
 
-                if let Some(match_filter) = match_filter_expr {
-                    let unzipped = unzip_batch(&matched, &self.schema);
-                    let filtered = match_filter.evaluate(&unzipped)?;
+                if let Some(match_filter) = match_filter {
+                    let unzipped = unzip_batch(&matched, &match_filter.schema)?;
+                    let filtered = match_filter.expr.evaluate(&unzipped)?;
                     match filtered {
                         ColumnarValue::Array(mask) => {
                             // Some rows matched, filter down and replace those rows
@@ -413,15 +414,7 @@ impl Merger {
                                 .capture(row_ids.values())?;
                         }
 
-                        let projection = if let Some(row_addr_col) = row_addr_col {
-                            let mut cols = Vec::from_iter(left_cols.iter().cloned());
-                            cols.push(row_addr_col);
-                            cols
-                        } else {
-                            #[allow(clippy::redundant_clone)]
-                            left_cols.clone()
-                        };
-                        let matched = matched.project(&projection)?;
+                        let matched = matched.project(&output_cols)?;
                         // The payload columns of an outer join are always nullable.  We need to restore
                         // non-nullable to columns that were originally non-nullable.  This should be safe
                         // since the not_matched rows should all be valid on the right_cols
@@ -455,11 +448,7 @@ impl Merger {
                         take_record_batch(&not_matched, &UInt32Array::from(keep_indices))?;
                 }
             }
-            let left_cols_with_id = left_cols
-                .into_iter()
-                .chain(row_addr_col)
-                .collect::<Vec<_>>();
-            let not_matched = not_matched.project(&left_cols_with_id)?;
+            let not_matched = not_matched.project(&output_cols)?;
             // See comment above explaining this schema replacement
             let not_matched = RecordBatch::try_new(
                 self.output_schema.clone(),
@@ -506,4 +495,45 @@ impl Merger {
 
         Ok(stream::iter(batches))
     }
+}
+
+/// Index of the target-side column `target_<name>` in a joined schema; the source
+/// columns come first, so the search starts after them.
+fn target_column_index(joined: &Schema, name: &str, num_source_columns: usize) -> Option<usize> {
+    let target_name = format!("target_{name}");
+    joined
+        .fields()
+        .iter()
+        .skip(num_source_columns)
+        .position(|f| f.name() == &target_name)
+        .map(|i| num_source_columns + i)
+}
+
+/// The target side of an "update if" condition: each source column's `target_<name>`
+/// field as the join emits it (the indexed take projects nested children to the source's
+/// subset), renamed and in source order.
+fn target_schema_for(source: &Schema, joined: &Schema) -> Result<Schema> {
+    let width = source.fields.len();
+    let fields = source
+        .fields
+        .iter()
+        .map(|f| {
+            target_column_index(joined, f.name(), width)
+                .map(|i| joined.field(i).as_ref().clone().with_name(f.name()))
+                .ok_or_else(|| {
+                    Error::internal(format!(
+                        "merge insert join is missing column 'target_{}'",
+                        f.name()
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Schema::new(fields))
+}
+
+/// Physical "when matched update if" condition with the schema it evaluates against.
+#[derive(Debug, Clone)]
+struct MatchFilter {
+    schema: Arc<Schema>,
+    expr: Arc<dyn PhysicalExpr>,
 }

@@ -8,7 +8,7 @@ use crate::{
     buffer::LanceBuffer,
     compression::{BlockCompressor, BlockDecompressor, require_no_block_payload},
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
-    format::{ProtobufUtils21, pb21::CompressiveEncoding},
+    format::{EncodingUtils, metadata::CompressiveEncoding},
 };
 use lance_core::{Error, Result};
 
@@ -75,7 +75,7 @@ impl RangeEncoder {
             return ConstantEncoder::new(self.bits_per_value, self.start).encoding(num_values);
         }
         checked_range_last(self.bits_per_value, self.start, self.step, num_values)?;
-        Ok(ProtobufUtils21::range(
+        Ok(EncodingUtils::range(
             self.bits_per_value,
             self.start,
             self.step,
@@ -275,7 +275,7 @@ mod tests {
         });
         let (payload, encoding) = RangeEncoder::new(32, 3, 5).compress(input).unwrap();
         assert!(payload.is_none());
-        assert_eq!(encoding, ProtobufUtils21::range(32, 3, 5));
+        assert_eq!(encoding, EncodingUtils::range(32, 3, 5));
 
         let decoded = RangeDecompressor::new(32, 3, 5)
             .decompress(payload, 4)
