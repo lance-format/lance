@@ -23,7 +23,7 @@ use lance_table::format::IndexMetadata;
 use super::matches::PreparedMatch;
 use super::selection::FtsIndexMetrics;
 use crate::Dataset;
-use crate::index::DatasetIndexInternalExt;
+use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::prefilter::prefilter_may_match_segment;
 use crate::index::segment_coverage::{SegmentCoverage, SegmentRowDomain};
 

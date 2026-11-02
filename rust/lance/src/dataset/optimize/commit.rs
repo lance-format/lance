@@ -27,7 +27,7 @@ use crate::dataset::transaction::{
 };
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::index::frag_reuse_with_stable_row_ids::ensure_frag_reuse_recording_allowed;
-use crate::index::load_all_indices;
+use crate::index::loading::load_all_indices;
 use crate::io::commit::{commit_transaction, default_commit_retry_timeout};
 use crate::io::deletion::read_dataset_deletion_file;
 use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};

@@ -173,7 +173,7 @@ pub async fn compact_files_with_planner(
         && dataset.manifest.writer_feature_flags
             & lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX
             != 0
-        && crate::index::load_all_indices(dataset)
+        && crate::index::loading::load_all_indices(dataset)
             .await?
             .iter()
             .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
