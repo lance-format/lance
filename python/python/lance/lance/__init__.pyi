@@ -33,19 +33,16 @@ import pyarrow as pa
 from lance_namespace import LanceNamespace
 
 from .._arrow.bf16 import BFloat16Array
-from ..commit import CommitLock
-from ..dataset import (
+from .._dataset.index import Index
+from .._dataset.refs import Branch, Tag, Version, VersionRef
+from .._dataset.transaction import (
     AlterColumn,
-    Branch,
     ExecuteResult,
-    Index,
     LanceOperation,
-    Tag,
     Transaction,
     UpdateResult,
-    Version,
-    VersionRef,
 )
+from ..commit import CommitLock
 from ..fragment import (
     DataFile,
     FragmentMetadata,
