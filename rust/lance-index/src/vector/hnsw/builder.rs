@@ -288,6 +288,44 @@ impl HNSW {
         self.len() == 0
     }
 
+    pub(crate) fn build_params(&self) -> &HnswBuildParams {
+        &self.inner.params
+    }
+
+    pub(crate) fn entry_point(&self) -> u32 {
+        self.inner.entry_point
+    }
+
+    /// Number of levels node `id` is a member of, level 0 included.
+    pub(crate) fn node_num_levels(&self, id: u32) -> usize {
+        match &self.inner.graph {
+            HnswGraph::Built(nodes) => nodes[id as usize].level_neighbors.len(),
+            HnswGraph::Loaded(graph) => graph
+                .level_lookup
+                .iter()
+                .take_while(|lookup| match lookup {
+                    LevelLookup::Dense => (id as usize) < graph.level_count[0],
+                    LevelLookup::Sparse(id_to_row) => id_to_row.contains_key(&id),
+                })
+                .count(),
+        }
+    }
+
+    /// Neighbor ids of node `id` at `level`; empty if it is not a member there.
+    pub(crate) fn neighbors_at(&self, level: usize, id: u32) -> Vec<u32> {
+        match &self.inner.graph {
+            HnswGraph::Built(nodes) => nodes[id as usize]
+                .level_neighbors
+                .get(level)
+                .map(|neighbors| neighbors.to_vec())
+                .unwrap_or_default(),
+            HnswGraph::Loaded(graph) if level < graph.level_lookup.len() => {
+                graph.neighbors_at(level, id).to_vec()
+            }
+            HnswGraph::Loaded(_) => Vec::new(),
+        }
+    }
+
     pub fn max_level(&self) -> u16 {
         self.inner.max_level()
     }
@@ -970,8 +1008,8 @@ pub(crate) trait Level0Links {
     fn link(&mut self, anchor: OrderedNode, node: u32);
 }
 
-struct BuilderLevel0<'a> {
-    nodes: &'a [RwLock<GraphBuilderNode>],
+pub(crate) struct BuilderLevel0<'a> {
+    pub(crate) nodes: &'a [RwLock<GraphBuilderNode>],
 }
 
 impl Level0Links for BuilderLevel0<'_> {
