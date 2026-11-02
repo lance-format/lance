@@ -520,12 +520,12 @@ message AxisDelta {
 
 /* Pcodec (pco) compression of floating-point mini-block chunks.
  *
- * The values describe the uncompressed layout: a Flat leaf of 32 (float32) or
- * 64 (float64) bits without buffer compression, optionally wrapped in one or
- * more FixedSizeList layers without validity. Let d be the product of the list
- * dimensions (1 for a bare Flat leaf). A chunk of n values holds n * d items,
- * stored item-major: item j of value i is at position j * n + i, so each list
- * position forms one contiguous sequence. Those n * d little-endian items are
+ * The values describe the uncompressed layout: a Flat leaf of 16 (float16),
+ * 32 (float32) or 64 (float64) bits without buffer compression, optionally
+ * wrapped in one or more FixedSizeList layers without validity. Let d be the
+ * product of the list dimensions (1 for a bare Flat leaf). A chunk of n values
+ * holds n * d items, stored item-major: item j of value i is at position
+ * j * n + i, so each list position forms one contiguous sequence. Those n * d little-endian items are
  * compressed as a single pco standalone file (standalone version 3, format
  * version 4.1, as written by pco 1.0) into the chunk's only buffer. The pco
  * format is specified at https://github.com/pcodec/pcodec/blob/v1.0.4/docs/format.md.

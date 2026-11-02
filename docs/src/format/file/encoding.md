@@ -873,13 +873,13 @@ any chunk exceeding the mini-block byte budget) falls back to the flat encoding,
 ### Pcodec
 
 Pcodec (pco) is a lossless compressor for numerical sequences. It is used in the mini-block context of the
-unstable Lance 2.3 format for float32 and float64 values and for fixed-size lists of them, such as vectors
-sampled over time. It is not transparent, so it cannot be used in the full zip context.
+unstable Lance 2.3 format for float16, float32 and float64 values and for fixed-size lists of them, such as
+vectors sampled over time. It is not transparent, so it cannot be used in the full zip context.
 
-The `Pcodec` message wraps the uncompressed layout of the values: a `Flat` leaf of 32 (float32) or 64 (float64)
-bits without buffer compression, optionally inside one or more `FixedSizeList` layers without item validity. Let
-`d` be the product of the list dimensions, or 1 for a bare `Flat` leaf. Each chunk has a single buffer. For a
-chunk of `n` values (`n * d` items), the writer:
+The `Pcodec` message wraps the uncompressed layout of the values: a `Flat` leaf of 16 (float16), 32 (float32) or
+64 (float64) bits without buffer compression, optionally inside one or more `FixedSizeList` layers without item
+validity. Let `d` be the product of the list dimensions, or 1 for a bare `Flat` leaf. Each chunk has a single
+buffer. For a chunk of `n` values (`n * d` items), the writer:
 
 1. Transposes the items to item-major order: item `j` of value `i` moves to position `j * n + i`. Each list
    position then forms one contiguous sequence of `n` numbers, which compresses far better than the interleaved
@@ -948,7 +948,7 @@ The `lance-encoding:compression` setting enables general-purpose compression alg
 - **`zstd`**: High compression ratios with configurable levels (0-22). Better compression than LZ4 but slower.
 - **`none`**: No general compression applied (default).
 - **`fsst`**: Fast Static Symbol Table compression for string data.
-- **`pcodec`**: Pcodec for float32/float64 values and fixed-size lists of them (unstable 2.3 format only). See
+- **`pcodec`**: Pcodec for float16/float32/float64 values and fixed-size lists of them (unstable 2.3 format only). See
   the Pcodec section above. It accepts `lance-encoding:compression-level` from 0 to 12 (default 8).
 
 General compression is applied on top of other encoding techniques (RLE, BSS, bitpacking, etc.) to further reduce
