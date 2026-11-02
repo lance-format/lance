@@ -228,8 +228,10 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
         ds = lance.dataset(self.path)
         table = ds.to_table(filter="btree == 7")
         assert table.num_rows == 1
+        # upgrade_downgrade lets both the current build and this writer insert
+        # the same key, so only assert that the newly written row is queryable.
         table = ds.to_table(filter="btree == 1000")
-        assert table.num_rows == 1
+        assert table.num_rows >= 1
 
         # Preserve the post-compaction result checks above, then restore
         # physical-address coverage before testing the next reader's format
@@ -539,8 +541,10 @@ class BitmapRowAddressDomainIndex(UpgradeDowngradeTest):
         ds = lance.dataset(self.path)
         table = ds.to_table(filter="bitmap == 7")
         assert table.num_rows == 1
+        # upgrade_downgrade lets both the current build and this writer insert
+        # the same key, so only assert that the newly written row is queryable.
         table = ds.to_table(filter="bitmap == 1000")
-        assert table.num_rows == 1
+        assert table.num_rows >= 1
 
 
 @compat_test(min_version="0.22.0")
@@ -728,8 +732,10 @@ class LabelListRowAddressDomainIndex(UpgradeDowngradeTest):
         ds = lance.dataset(self.path)
         table = ds.to_table(filter="array_has_any(label_list, ['label7'])")
         assert table.num_rows == 1
+        # upgrade_downgrade lets both the current build and this writer insert
+        # the same key, so only assert that the newly written row is queryable.
         table = ds.to_table(filter="array_has_any(label_list, ['label1000'])")
-        assert table.num_rows == 1
+        assert table.num_rows >= 1
 
 
 @compat_test(min_version="0.22.0")
