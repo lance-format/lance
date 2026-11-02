@@ -47,14 +47,11 @@ message OngoingWorkPin {
    */
   optional string id = 1;
   /* The fixed attached source manifest version. Absent or zero is invalid.
-   * Renewal never changes this version.
+   * Renewal never changes this version. Active pins retain complete attached
+   * snapshots from their oldest source version through the current branch head,
+   * including committed transaction history, as specified in Ongoing Work Pins.
    */
   optional uint64 source_version = 2;
-  /* UUID of the transaction that committed the source manifest.
-   * Absent or empty is invalid. Together with source_version, this identifies
-   * the source; it does not itself prevent deletion of that source.
-   */
-  optional string source_transaction_uuid = 3;
   /* Creation time chosen before the first registration attempt, in UTC.
    * Absent is invalid. Retries preserve it; it need not equal commit time.
    */

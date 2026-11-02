@@ -1,27 +1,29 @@
 # Ongoing Work Pins
 
-An ongoing-work pin adds a retention requirement for a fixed source snapshot
-and the applicable fragment reuse index (FRI) history while a job runs. Pins do
-not establish the freshness or publication validity of a job's output. Physical
-retention has the [existing maintenance concurrency limits](#maintenance-concurrency-limits)
-described below; confirmation does not fence deletion already in flight.
+An ongoing-work pin retains a fixed source snapshot, intervening committed
+history needed to validate publication, and applicable fragment reuse index
+(FRI) history while a job runs. This revision preserves the intervening history
+by retaining complete snapshots. Pins do not establish the freshness or
+publication validity of a job's output. Creating a pin does not cancel a
+destructive operation that has already checked whether deletion is allowed;
+see [Maintenance concurrency limits](#maintenance-concurrency-limits).
 
 ## Persisted state
 
 `Manifest.ongoing_work_pins` (field 27) contains `OngoingWorkPin` records. Only
 the current attached manifest's list is authoritative. Missing or empty means
-no active pins. Historical copies of the list do not retain ended pins. Order
+no active pins. Historical copies do not keep removed pins active. Order
 is insignificant; duplicate IDs or incomplete records are invalid for pin
 mutation and maintenance.
 
-Each record contains `id`, `source_version`, `source_transaction_uuid`,
-`created_at`, `expires_at`, and optional `job_label`. Presence and absence
-semantics are defined in `protos/table.proto`. The pin ID is the registering
+Each record contains `id`, `source_version`, `created_at`, `expires_at`, and
+optional `job_label`. Presence and absence semantics are defined in
+`protos/table.proto`. The pin ID is the registering
 transaction's `uuid`; the source version is that transaction's `read_version`.
 
 `expires_at` is the UTC time after which cleanup may expire the pin. Passing
 that time does not automatically remove it. Renewal changes only `expires_at`;
-the source identity, creation time, and label stay fixed. No generation counter
+the source version, creation time, and label stay fixed. No generation counter
 is needed because every extension strictly increases `expires_at`.
 
 The first registration sets writer feature bit 19, `FLAG_ONGOING_WORK_PINS`,
@@ -32,27 +34,27 @@ may ignore the pin list. Pin-aware maintenance must validate it.
 
 ## Identity
 
-IDs are nonempty UTF-8 strings compared byte-for-byte. Do not case-fold,
+Pin IDs are nonempty UTF-8 strings compared byte-for-byte. Do not case-fold,
 normalize, or replace a stored ID with a different textual representation.
-This feature imposes no new canonical UUID spelling. Supported writers must
-generate fresh transaction IDs for distinct logical transactions, including
-Create, Clone, and Restore and after branch-name or table-path reuse. A retry
-preserves its original ID. A committed ID must not identify a different
-transaction or a second successful publication. This is a writer requirement,
-not a persistent registry of all completed transactions.
+This feature imposes no new canonical UUID spelling. Distinct logical
+registrations must use fresh transaction IDs, including after branch-name or
+table-path reuse. A retry preserves its original ID. A pin ID must not be reused
+for another registration, even after the original pin ends. No persistent
+registry of ended pins is required.
 
-The exact source is `(source_version, source_transaction_uuid)`. Read the UUID
-from the source manifest's inline transaction, or from its `transaction_file`
-name. For the filename carrier, require a single relative filename ending in
-`.txn`, split at the first hyphen, validate the nonempty decimal read-version
-prefix, and retain all remaining nonempty text before `.txn` as the ID. The
-prefix is the transaction's read version, not necessarily the source manifest
-version. The sidecar's contents need not still exist. When both carriers are
-present, their IDs must agree exactly. Failure to read or consistently identify
-the source rejects acquisition; never fall back to version alone.
+The source is the attached `source_version` in the pin's table and branch.
+Requests and handles must remain bound to that table location and, for named
+branches, the acquired branch identifier. A version number identifies a
+snapshot within that table and branch; registration does not require the
+source transaction's UUID or contents.
 
-If an active source manifest is missing, unreadable, or its identity disagrees
-with the record, report a protection/integrity failure and halt the affected
+Requests and handles must not be reused after the whole table is deleted and
+recreated, even at the same path. The owning service or catalog must coordinate
+that lifecycle. Pins do not introduce a table-incarnation identifier or detect
+every replacement of a table at the same location.
+
+If an active source manifest is missing, unreadable, or does not match the
+requested version, report a protection/integrity failure and halt the affected
 destructive cleanup. Also refuse any FRI-trimming or fragment-rewrite commit
 that cannot establish the pinned fragment set required by its retention checks.
 The failure is not an implicit release. Explicit Release by an unambiguous ID
@@ -85,15 +87,16 @@ Resolve the authoritative current attached head as specified in
 [Format Versioning](versioning.md#current-state-for-pin-decisions). A cached
 Dataset or a successful write to a previously reclaimed slot is insufficient.
 
-For a registration attempt with ID P, source V, and source transaction S:
+Validate the request's table location and named-branch identity before
+submitting or recovering a registration. For an attempt with pin ID P and
+source version V:
 
-1. If current membership already contains P with the same `(V, S)`, recover
+1. If current membership already contains P with source version V, recover
    that pin's current `expires_at` and label without committing or resetting them.
    A different source under P is an error.
-2. Otherwise the requested snapshot must still be current: its version and
-   source transaction UUID must equal `(V, S)`. If the branch has moved on or
-   the snapshot has been replaced, registration fails. Compare those two values
-   directly; intervening transaction files are not needed for this check.
+2. Otherwise the authoritative current version must equal V. If the branch
+   has moved on, registration fails. Compare the version numbers directly;
+   intervening transaction files are not needed for this check.
 3. Construct the next manifest from that current source, add the pin, and set
    the sticky capability. Publish only at V+1 through the existing atomic
    version-slot protocol. A conflict cannot rebase this acquisition onto another
@@ -101,7 +104,8 @@ For a registration attempt with ID P, source V, and source transaction S:
    explicitly acquire the new head with a new ID.
 4. Before acknowledging either a fresh acquisition or recovery, confirm the
    current named-branch reference still has the acquired branch ID, the
-   authoritative head contains P with `(V, S)`, and the source manifest has S.
+   authoritative head contains P with source version V, and that source
+   manifest can still be read and validated as version V.
    The pin may have been carried into a newer head. A historical transaction
    matching P alone is insufficient. If these facts cannot be established,
    return an indeterminate outcome or failure, never acknowledge registration.
@@ -157,13 +161,45 @@ trigger the same cleanup.
 
 ## Retention and data operations
 
-Resolve current pin membership when planning retention. Retain each active
-source manifest and the resources that normal snapshot retention preserves for
-that manifest, including base data, overlay files, FRI metadata, and referenced
-external mapping files. Reuse the existing retention machinery: an active pin
-adds a retained snapshot. Cleanup may still remove resources that no active pin
-or other retention rule requires. Report when pins prevented removal. Removing a
-pin does not remove protection supplied by another pin, snapshot, or consumer.
+Resolve current pin membership and the authoritative attached head H when
+planning retention. If any pins are active, let F be their minimum
+`source_version`. Retain every attached snapshot in the same branch from F
+through H, inclusive. Detached snapshots are not part of this window. Preserve
+the manifest and any commit-store records needed to discover and read each
+version through the backend's authoritative protocol.
+
+Reuse normal snapshot retention for every manifest in this window, including
+its base data, deletion files, overlays, indices, FRI metadata, referenced
+transaction sidecars, and external mapping files. Retain shared physical files
+once. These remain ordinary readable snapshots; retaining their manifests
+while deleting their referenced data does not satisfy this contract.
+
+Each attached commit whose result contains active pins must persist its own
+transaction, either inline in its manifest or in the referenced transaction
+sidecar, before publishing the manifest. This includes registration and commits
+carrying pins through Restore or Overwrite. Keep the transaction for every
+version after F through H so publication can inspect the committed changes in
+order. A transaction filename alone is not this evidence. The transaction that
+created F is not required solely for pin registration or this retention rule.
+
+If a manifest in the required window, or a transaction required by the preceding
+rule, is missing or unreadable, report a protection/integrity failure and halt
+the affected destructive cleanup. Do not silently skip the missing version or
+reclaim other evidence in its place. This does not release any pin; explicit
+release by an unambiguous ID remains available.
+
+Renewal never moves a pin's source version. Release or committed expiration may
+advance the minimum source version; removing the last pin removes this window
+requirement. Other pins, tags, snapshots, and consumers still retain their
+resources. Cleanup may remove other eligible resources and must report retention
+caused by pins. Passing `expires_at` alone does not advance the boundary.
+
+This window can retain intermediate data and index generations that publication
+does not itself read. Its storage cost grows with rewritten resources and the
+age of the oldest active source. No new pin field or metadata-only history
+representation is introduced. Replacing complete snapshot retention with a
+smaller evidence representation requires a separately specified compatible
+discovery and retention protocol.
 
 Compaction must record the FRI row movements active pins need. Before committing
 its result, compaction must recheck the active pins, including pins registered
@@ -183,12 +219,15 @@ publishing a new legacy record, a pin-aware writer must stamp its
 manifest, and restamp that new record on retry. This makes the retention
 boundary inclusive of V; it does not change stamps on existing records.
 
-For FRI `index_version = 1`, including histories that also contain legacy
-records, determine pin requirements from fragment references rather than
-version stamps. Initialize a set with the fragment IDs in all active pinned
-source snapshots. Retain each current-history record with a source fragment in
-that set, and add its destination fragment IDs to the set. Repeat until no
-additional records are selected. If a selected record is a legacy version,
+For FRI version 1 (`index_version = 1`), including histories that also contain
+legacy records, determine pin requirements from fragment references rather
+than version stamps. For each active pin, load and validate the manifest at
+its `source_version` in the same table and branch. Take all fragment IDs listed
+in that manifest; no row-data scan is needed to obtain this set. Initialize a
+set with these IDs from all active pins. Retain each current-history record
+with a source fragment in that set, and add its destination fragment IDs to
+the set. Repeat until no additional records are selected. If a selected record
+is a legacy version,
 retain all its groups and add every group's destination IDs. Retain whole
 records and the downstream records they require. Add these pin requirements
 to the existing consumers' requirements; do not replace the existing consumer
@@ -203,8 +242,10 @@ by itself make its mapping files eligible for deletion.
 Pin retention does not change overlay/index correctness requirements or make
 an unsupported overlay or rewrite operation valid.
 
-Restore and Overwrite carry the current active list, fixed sources, timestamps,
-and sticky bit. They never import the target snapshot's historical pin list.
+Attached Restore and Overwrite carry the current active list, fixed sources,
+timestamps, and sticky bit. They never import the target snapshot's historical
+pin list.
+Neither operation shortens the retained snapshot window.
 Apply FRI retention to the resulting current history. Neither operation is
 required to reconstruct discarded translation paths. Within that history,
 retain movement records needed to connect a pinned snapshot to the current
@@ -212,11 +253,16 @@ table layout. Records needed only for a discarded intermediate layout may be
 removed if no other consumer requires them. Pins keep source files available,
 but do not guarantee that a job can translate or publish its results after a
 restore or overwrite; retention does not supply a missing mapping.
+Removing a record from the current FRI does not reclaim files still referenced
+by snapshots in the retained window.
 
 New branches and clones have empty pin lists and preserve the sticky bit when
-inherited. Detached snapshots cannot register or mutate authoritative pins.
+inherited. Detached snapshots must serialize an empty pin list and preserve the
+sticky bit when inherited. Creating a detached snapshot does not change the
+branch's current pin list. Detached snapshots cannot own active pins, and none
+of the four pin operations may be used in a detached commit.
 
-Other ordinary commits preserve the current list. All operations that rewrite
+Other attached commits preserve the current list. All operations that rewrite
 or trim FRI revalidate the applicable retention requirements at commit, subject
 to the Restore and Overwrite rules above. Detailed directional rules are in
 [Transactions](transaction.md#ongoing-work-pin-transactions).
@@ -267,6 +313,11 @@ The pin checks do not cancel an earlier deletion plan or prevent a destructive
 operation from running after confirmation. A successful registration therefore
 does not guarantee safety against these overlapping operations. Callers must
 not treat the pin as a lock against destructive maintenance.
+
+For example, branch deletion may inspect the current manifest and find no
+pins. A job may then register a pin before the deletion removes the branch.
+The deletion can still proceed using its earlier check: inspection and physical
+deletion are separate steps, and registration does not cancel that decision.
 
 These are existing maintenance and branch-coordination gaps. Their fixes are
 outside this proposal; no deletion marker, permanent name retirement, new

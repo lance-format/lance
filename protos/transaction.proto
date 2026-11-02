@@ -422,10 +422,6 @@ message Transaction {
    * duplicated here. A fresh registration cannot rebase to another source.
    */
   message RegisterPin {
-    /* UUID of the source manifest's committing transaction.
-     * Absent or empty is invalid; compare exact UTF-8 bytes.
-     */
-    optional string source_transaction_uuid = 1;
     /* UTC request creation time, fixed before the first send.
      * Absent is invalid. The pin retains this value through retries/renewals.
      */

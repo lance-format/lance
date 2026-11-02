@@ -616,18 +616,30 @@ Their manifest conflict rules do not make physical cleanup or branch deletion
 atomic with acquisition; the existing [maintenance concurrency limits](ongoing_work_pins.md#maintenance-concurrency-limits)
 still apply.
 
+An attached commit whose resulting manifest contains active pins must persist
+its own transaction inline or in its referenced sidecar before publication.
+This preserves the committed-change evidence required by the
+[snapshot retention window](ongoing_work_pins.md#retention-and-data-operations),
+including when the operation carries existing pins without changing them.
+
+Detached commits instead serialize an empty pin list and preserve the sticky
+capability when inherited. They do not change the branch's current membership.
+
 ### Directional conflict rules
 
 For an incoming fresh RegisterPin, recover an identical active ID/source first.
-Otherwise require the exact current `(version, source transaction UUID)` to equal
-its fixed source, and publish only at that version plus one. Every intervening
-commit prevents fresh creation; there is no source-changing rebase. This guard
-does not require decoding intervening transactions or fetching their sidecars.
+Otherwise require the authoritative current version in the same table and
+branch to equal its fixed source version, and publish only at that version
+plus one. Validate the acquired named-branch identity as part of this check.
+Every intervening commit prevents fresh creation; there is no source-changing
+rebase. This guard does not require decoding intervening transactions or
+fetching their sidecars.
 A lost-response retry still needs current membership and source confirmation.
+Requests must not be reused across whole-table deletion and recreation.
 
-For all other incoming operations, the following rules describe their behavior
-across a committed pin operation. Existing conflicts with other data operations
-still apply; this does not make a conflicting Append/Overwrite pair compatible.
+For all other incoming attached operations, the following rules describe their
+behavior across a committed pin operation. Existing conflicts with other data
+operations still apply; this does not make a conflicting Append/Overwrite pair compatible.
 Unknown transaction operations retain their existing fail-closed conflict rule.
 
 | Incoming operation | Across committed RegisterPin, RenewPin, ReleasePin, or ExpirePins |
@@ -662,7 +674,7 @@ pin and attached-consumer requirements, using the representation-specific rules
 in [Ongoing Work Pins](ongoing_work_pins.md#retention-and-data-operations).
 Restore and Overwrite apply those rules to the resulting current history and
 may discard translation paths as described there; they must still preserve
-current pins and their source snapshots.
+current pins and the complete snapshot retention window.
 Pin changes never loosen other transaction preconditions.
 
 ## Conflict Resolution

@@ -59,9 +59,6 @@ it is not a dataset version or the sequence number of a rewrite.
   ordered compaction and stable partition. Each legacy group can be interpreted
   as an ordered-compaction transition, forming one history with the new records.
 
-A version-1 history is called **tagged**. If it also contains legacy versions,
-it is called **mixed**.
-
 Adding a transition or a new mapping type does not itself require increasing
 `index_version`. Readers may skip unsupported mappings and fall back to scanning
 where a complete translation path is unavailable. Writers must reject operations
@@ -197,37 +194,52 @@ Each rewrite that defers index remapping records its mapping: a reuse version
 in FRI index version 0, or transitions in index version 1. A rewrite publishes
 its mapping atomically, replacing the FRI entry in the same commit. A
 transition must reference only fragments committed no later than itself.
-Fragments not covered by any index are served by scanning, so correctness
-never depends on a mapping being present.
+Queries scan fragments that no index covers. An in-progress job may still need
+their movements recorded, as described below.
 
-Once all dependent indices have caught up, the corresponding history can be
-trimmed. Cleanup must retain intermediate transitions still needed to translate
-old addresses. External mapping files can be deleted only when no retained
-dataset version references them.
+### Cleanup
 
-### Ongoing work retention
+FRI history is needed as long as an index or another consumer uses its row
+translations. For example, an index may return row addresses in fragments A
+and B after compaction has moved those rows into C. The movements from A and B
+to C must remain available until the index no longer needs those translations.
 
-[Ongoing-work pins](../../table/ongoing_work_pins.md) are additional history
-consumers before their jobs publish an index. Legacy-only histories use the
-inclusive source-version boundary. Tagged and mixed histories retain records
-reachable from pinned source fragments, including all downstream dependencies
-and whole legacy versions when any group is needed. Native tagged transitions
-do not carry a dataset-version stamp. The exact retention rules are defined in
+An in-progress job can have the same dependency before its index exists.
+Building an index against A and B may take hours. If compaction moves those
+rows during the build, the job still needs the movements to C when it publishes
+the index. Checking only published indices would miss that requirement.
+
+[Ongoing-work pins](../../table/ongoing_work_pins.md) record these dependencies.
+For each pin, load its source-version manifest and use all fragment IDs listed
+there. This reads snapshot metadata, not the rows. Cleanup must consider both
+active pins and existing consumers before removing history.
+
+FRI version 0 uses an inclusive source-version boundary. FRI version 1 follows
+movements from the pinned source fragments and retains the downstream records
+needed to complete those paths. A version 1 history may contain legacy records;
+when any group in one of those records is needed, retain the whole record and
+all its downstream dependencies. Version 1 transitions do not carry a dataset
+version stamp. The exact rules are defined in
 [Retention and data operations](../../table/ongoing_work_pins.md#retention-and-data-operations).
-Retain the union of requirements from all pins and existing consumers. Validate
-that union at the final commit target of every operation that trims or replaces
-history, including work planned before registration. Restore and Overwrite
-apply this check to the resulting current history; they may discard translation
-paths while preserving current pins and their source snapshots.
+
+Every operation that trims or replaces history must recheck all consumers'
+requirements against the current table version before committing, even if it
+was planned before a pin registered. Restore and Overwrite apply this check to
+the resulting current history; they may discard translation paths while
+preserving current pins and their retained snapshots.
 
 Compaction must record the movements active pins need and recheck those pins
 before committing. Reject a result lacking required mappings so the caller can
 replan. A pin does not require mappings solely into a discarded intermediate
 layout, establish index freshness, or authorize publication of an old result.
-Required records retain their external mapping files, including mappings added
-after registration. A metadata replacement does not release those files while
-retained snapshots or required history still reference them. Physical cleanup
-remains subject to the existing [maintenance concurrency limits](../../table/ongoing_work_pins.md#maintenance-concurrency-limits).
+
+History can be trimmed when no active pin or other consumer needs it, including
+any intermediate movements needed to translate old addresses. External mapping
+files remain protected while any retained snapshot or required history
+references them, including files added after registration. Replacing FRI
+metadata does not release those files. Creating a pin does not cancel an
+earlier deletion decision; see the examples in
+[Maintenance concurrency limits](../../table/ongoing_work_pins.md#maintenance-concurrency-limits).
 
 ## Stable Row IDs
 
@@ -258,7 +270,7 @@ The first commit publishing FRI index version 1 sets
 `FLAG_FRAGMENT_REUSE_INDEX` (1024) in both manifest flag fields. Subsequent
 manifests retain both bits. FRI index version 0 does not require this flag.
 
-Tables using stable row IDs do not support tagged histories; writers must not
+Tables using stable row IDs do not support FRI version 1; writers must not
 publish `index_version >= 1` on them.
 
 The reader flag prevents older clients from partially interpreting the new

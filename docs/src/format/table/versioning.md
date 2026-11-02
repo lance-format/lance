@@ -33,7 +33,7 @@ they should return an "unsupported" error on any read or write operation.
 | `2^7`    | `FLAG_COVERED_INDEX_METADATA`   | Yes             | Yes             | Some index declares covering columns (`IndexMetadata.covering_fields`). Without `FLAG_INDEPENDENT_COVERING_FIELDS`, the carried columns form the trailing suffix of `fields`. An implementation without this flag may select or maintain an index using the wrong fields. |
 | `2^8`    | `FLAG_MIXED_DATA_FILE_VERSIONS` | Yes             | Yes             | The snapshot may reference recognized V2 data files with different exact versions. Both bits must be set and remain set on later versions. |
 | `2^9`    | `FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS` | Yes       | Yes             | The table uses stable row IDs and carries a [Fragment Reuse Index](../index/system/frag_reuse.md). |
-| `2^10`   | `FLAG_FRAGMENT_REUSE_INDEX`     | Yes             | Yes             | The fragment reuse index records tagged transitions (`IndexMetadata.index_version >= 1`). Readers must translate row addresses through them; writers must preserve them. An implementation without this flag would decode the details as the legacy format and silently drop the transitions when it next rewrites the fragment reuse index. See [FRI index versions](../index/system/frag_reuse.md#fri-index-versions). |
+| `2^10`   | `FLAG_FRAGMENT_REUSE_INDEX`     | Yes             | Yes             | The fragment reuse index uses version 1 or later (`IndexMetadata.index_version >= 1`). Readers must translate row addresses through its transitions; writers must preserve them. An implementation without this flag would decode the details as the legacy format and silently drop the transitions when it next rewrites the fragment reuse index. See [FRI index versions](../index/system/frag_reuse.md#fri-index-versions). |
 | `2^11`   | `FLAG_SPILLED_ROW_LINEAGE` | Yes         | Yes             | Some fragment stores its row ids or row version sequences as hidden columns of a data file rather than inline. A reader without this flag would see the fragment as having no row ids. Readers and writers that do not support this flag must refuse the dataset. Spilling remains opt-in through table configuration. |
 | `2^12`   | `FLAG_FRAGMENT_TREE`            | Yes             | Yes             | Fragment records live in a [fragment tree](fragment_metadata.md). `Manifest.fragments` is empty. |
 | `2^13`   | `FLAG_INDEPENDENT_COVERING_FIELDS` | Yes          | Yes             | Requires `FLAG_COVERED_INDEX_METADATA` and is retained together with it. `IndexMetadata.fields` contains only key fields, while `covering_fields` independently declares carried fields and may overlap `fields`. Implementations that only support the legacy suffix contract must reject the dataset. |
@@ -51,11 +51,27 @@ Committing schema metadata `lance.blob.managed = "true"` activates the Managed B
 
 ## Current state for pin decisions
 
-Pin acquisition, recovery, renewal, expiration, ordinary writes carrying pins,
-restore, overwrite, compaction, retention planning, and branch-deletion checks
+Pin acquisition, recovery, renewal, release, expiration, restore, overwrite,
+compaction, retention planning, and branch-deletion checks
 must resolve the authoritative current attached manifest. A previously opened
 Dataset, historical transaction read-back, or hint that stops probing at a gap
 is insufficient.
+
+Ordinary attached commits that only carry pin state forward may use the existing
+commit and retry protocol without an additional complete-history listing solely
+for pins. Copy the pin list, all record fields, and the sticky capability from
+the predecessor manifest used for each attempt, including after rebasing, and
+atomically publish at that predecessor's version plus one without replacing an
+occupied version. Do not copy membership from the transaction's original read
+snapshot after rebasing. Required transaction persistence still applies.
+
+A write that advances the head must carry that head's pin state. A successful
+write to a reclaimed older slot does not make it the authoritative head or
+revive its historical pins. This exemption does not apply to pin mutations,
+Restore or Overwrite, rewrite/trim validation, retention planning, or branch
+deletion. Cleanup triggered by an ordinary write must resolve current membership
+even when invoked through an older or unflagged Dataset. Supported external
+handlers must provide the same predecessor and atomic-publication guarantees.
 
 For ordinary file/object-store commit handlers, enumerate attached manifests
 using the active naming scheme, exclude detached and staging files, and choose
