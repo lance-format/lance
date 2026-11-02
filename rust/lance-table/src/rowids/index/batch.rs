@@ -5,7 +5,7 @@ use super::{Error, Result, RowAddress, RowIdIndex, SegmentLookup};
 
 /// Independent searches to advance together, hiding dependent-load latency
 /// without the register pressure and long scalar tails of wider batches.
-const LANES: usize = 32;
+pub(super) const LANES: usize = 32;
 
 impl RowIdIndex {
     pub(super) fn probe_many(
@@ -13,12 +13,6 @@ impl RowIdIndex {
         queries: &[(u64, usize)],
         out: &mut [Option<RowAddress>],
     ) -> Result<()> {
-        if queries.len() < LANES {
-            for &(id, ordinal) in queries {
-                out[ordinal] = self.probe(id)?;
-            }
-            return Ok(());
-        }
         self.probe_batch_node(1, 0, self.end_tree.len() / 2, queries, out)
     }
 

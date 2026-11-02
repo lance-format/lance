@@ -177,7 +177,13 @@ impl RowIdIndex {
         sorted.sort_unstable_by_key(|&(id, _)| id);
 
         let Some(merged) = &self.merged else {
-            self.probe_many(&sorted, &mut out)?;
+            if n < batch::LANES {
+                for (id, orig_idx) in sorted {
+                    out[orig_idx] = self.probe(id)?;
+                }
+            } else {
+                self.probe_many(&sorted, &mut out)?;
+            }
             return Ok(out);
         };
 
