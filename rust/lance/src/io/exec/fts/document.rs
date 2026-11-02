@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Execution node that normalizes schema-derived FTS documents.
+
 use std::sync::Arc;
 
 use arrow_schema::DataType;
