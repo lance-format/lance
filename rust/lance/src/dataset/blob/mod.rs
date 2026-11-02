@@ -9,6 +9,7 @@ mod managed;
 mod materialize;
 mod prepared;
 mod read;
+mod rewrite;
 #[cfg(test)]
 pub mod test_util;
 mod write;
@@ -32,6 +33,7 @@ pub use read::{
     ReadBlobRangesStream, ReadBlobsBuilder, ReadBlobsStream, take_blobs_by_addresses,
 };
 pub(super) use read::{take_blobs, validate_blob_column};
+pub use rewrite::{BlobV2BatchRewritePlan, field_contains_blob_v2, transform_blob_v2_batch};
 pub use write::BlobPayloadInventory;
 pub use write::BlobPreprocessor;
 pub(super) use write::{
