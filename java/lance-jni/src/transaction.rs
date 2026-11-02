@@ -4,7 +4,8 @@
 use crate::Error;
 use crate::JNIEnvExt;
 use crate::block_on;
-use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET, extract_namespace_info};
+use crate::blocking_dataset::conversions::extract_namespace_info;
+use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
 use crate::traits::{
     FromJObjectWithEnv, FromJString, IntoJava, JLance, export_vec, import_vec_from_method,
