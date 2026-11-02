@@ -169,7 +169,7 @@ async fn results(plan: Arc<dyn ExecutionPlan>) -> Vec<(u64, Vec<u32>, f32)> {
         .try_collect()
         .await
         .unwrap();
-    batches
+    let mut documents: Vec<_> = batches
         .iter()
         .flat_map(|batch| {
             let ids = batch[ROW_ID].as_primitive::<UInt64Type>();
@@ -191,7 +191,11 @@ async fn results(plan: Arc<dyn ExecutionPlan>) -> Vec<(u64, Vec<u32>, f32)> {
                 })
                 .collect::<Vec<_>>()
         })
-        .collect()
+        .collect();
+    // Leaf plans do not promise tie order. Keep duplicates and compare every
+    // document's exact score rather than the completion order of segment reads.
+    documents.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    documents
 }
 
 fn row_id(row: u32, is_stable: bool) -> u64 {
@@ -601,7 +605,8 @@ async fn indexed_fts_state_preserves_match_groups() {
     let actual = results(Arc::new(restore_match(&leaf))).await;
     assert_eq!(actual.len(), 1);
     assert_eq!(actual[0].0, row_id(2, false));
-    assert_eq!(actual, results(Arc::new(restore_match(&leaf))).await);
+    let original = Arc::new(leaf);
+    assert_eq!(actual, results(original.clone()).await);
     let lost_groups = PreparedBm25Query::from_parts(
         Arc::new(Tokens::with_positions(
             vec!["alpha".into(), "beta".into()],
@@ -612,9 +617,11 @@ async fn indexed_fts_state_preserves_match_groups() {
         true,
     );
     assert_eq!(
-        results(Arc::new(leaf.with_prepared_query(Arc::new(lost_groups))))
-            .await
-            .len(),
+        results(Arc::new(
+            restore_match(&original).with_prepared_query(Arc::new(lost_groups))
+        ))
+        .await
+        .len(),
         3
     );
 }
