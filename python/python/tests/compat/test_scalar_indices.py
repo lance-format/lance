@@ -24,6 +24,22 @@ from .compat_decorator import (
 )
 from .util import safe_data_storage_version
 
+# The writer capability for row-address indices landed in #10352 and first
+# shipped in 15.0.0b7. Later releases understand the flag and may continue
+# writing these datasets; only releases that predate that fence must reject
+# them.
+_ROW_ADDRESS_WRITER_SUPPORT_VERSION = Version("15.0.0b7")
+
+
+def _writer_supports_row_address_indices(compat_version):
+    return Version(compat_version) >= _ROW_ADDRESS_WRITER_SUPPORT_VERSION
+
+
+def test_row_address_writer_support_starts_with_beta_7():
+    assert not _writer_supports_row_address_indices("15.0.0b6")
+    assert _writer_supports_row_address_indices("15.0.0b7")
+    assert _writer_supports_row_address_indices("15.0.0")
+
 
 def _assert_row_address_writes_fenced(dataset, data, compat_version):
     version = dataset.version
@@ -193,13 +209,16 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
     def check_write(self):
         """Fence old writers; verify current writes and index maintenance."""
         ds = lance.dataset(self.path)
+        new_key = ds.count_rows()
         data = pa.table(
             {
-                "idx": pa.array([1000]),
-                "btree": pa.array([1000]),
+                "idx": pa.array([new_key]),
+                "btree": pa.array([new_key]),
             }
         )
-        if self._running_in_old_venv:
+        if self._running_in_old_venv and not _writer_supports_row_address_indices(
+            self.compat_version
+        ):
             _assert_row_address_writes_fenced(ds, data, self.compat_version)
             return
         ds.insert(data)
@@ -210,8 +229,9 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
         ds = lance.dataset(self.path)
         table = ds.to_table(filter="btree == 7")
         assert table.num_rows == 1
-        table = ds.to_table(filter="btree == 1000")
+        table = ds.to_table(filter=f"btree == {new_key}")
         assert table.num_rows == 1
+        assert table.column("idx").to_pylist() == [new_key]
 
         # Preserve the post-compaction result checks above, then restore
         # physical-address coverage before testing the next reader's format
@@ -276,9 +296,10 @@ def test_btree_row_address_reader_capability(
 def test_btree_row_address_maintenance_restores_coverage(btree_row_address_compat_case):
     case = btree_row_address_compat_case
     case.compat_version = "14.0.0b16"
+    expected_key = lance.dataset(case.path).count_rows()
     case.check_write()
     case.check_read()
-    assert lance.dataset(case.path).count_rows("btree == 1000") == 1
+    assert lance.dataset(case.path).count_rows(f"btree == {expected_key}") == 1
 
 
 @compat_test(min_version="0.30.0")
@@ -502,13 +523,16 @@ class BitmapRowAddressDomainIndex(UpgradeDowngradeTest):
     def check_write(self):
         """Fence old writers; verify current writes and index maintenance."""
         ds = lance.dataset(self.path)
+        new_key = ds.count_rows()
         data = pa.table(
             {
-                "idx": pa.array([1000]),
-                "bitmap": pa.array([1000]),
+                "idx": pa.array([new_key]),
+                "bitmap": pa.array([new_key]),
             }
         )
-        if self._running_in_old_venv:
+        if self._running_in_old_venv and not _writer_supports_row_address_indices(
+            self.compat_version
+        ):
             _assert_row_address_writes_fenced(ds, data, self.compat_version)
             return
         ds.insert(data)
@@ -519,8 +543,9 @@ class BitmapRowAddressDomainIndex(UpgradeDowngradeTest):
         ds = lance.dataset(self.path)
         table = ds.to_table(filter="bitmap == 7")
         assert table.num_rows == 1
-        table = ds.to_table(filter="bitmap == 1000")
+        table = ds.to_table(filter=f"bitmap == {new_key}")
         assert table.num_rows == 1
+        assert table.column("idx").to_pylist() == [new_key]
 
 
 @compat_test(min_version="0.22.0")
@@ -689,13 +714,17 @@ class LabelListRowAddressDomainIndex(UpgradeDowngradeTest):
     def check_write(self):
         """Fence old writers; verify current writes and index maintenance."""
         ds = lance.dataset(self.path)
+        new_key = ds.count_rows()
+        label = f"label{new_key}"
         data = pa.table(
             {
-                "idx": pa.array([1000]),
-                "label_list": pa.array([["label1000"]]),
+                "idx": pa.array([new_key]),
+                "label_list": pa.array([[label]]),
             }
         )
-        if self._running_in_old_venv:
+        if self._running_in_old_venv and not _writer_supports_row_address_indices(
+            self.compat_version
+        ):
             _assert_row_address_writes_fenced(ds, data, self.compat_version)
             return
         ds.insert(data)
@@ -706,8 +735,9 @@ class LabelListRowAddressDomainIndex(UpgradeDowngradeTest):
         ds = lance.dataset(self.path)
         table = ds.to_table(filter="array_has_any(label_list, ['label7'])")
         assert table.num_rows == 1
-        table = ds.to_table(filter="array_has_any(label_list, ['label1000'])")
+        table = ds.to_table(filter=f"array_has_any(label_list, ['{label}'])")
         assert table.num_rows == 1
+        assert table.column("idx").to_pylist() == [new_key]
 
 
 @compat_test(min_version="0.22.0")
