@@ -37,9 +37,11 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::TryStreamExt;
-use lance::dataset::mem_wal::write::{
-    IndexStore, MemIndexSpec, MemTable, MemTableFlusher, MemTableScanner, ShardWriterConfig,
-};
+use lance::dataset::mem_wal::MemTableScanner;
+use lance::dataset::mem_wal::index::{IndexStore, MemIndexSpec};
+use lance::dataset::mem_wal::memtable::MemTable;
+use lance::dataset::mem_wal::memtable::flush::MemTableFlusher;
+use lance::dataset::mem_wal::write::ShardWriterConfig;
 use lance::dataset::mem_wal::{DatasetMemWalExt, ShardManifestStore};
 use lance::dataset::{Dataset, WriteParams};
 use lance::index::DatasetIndexExt;
