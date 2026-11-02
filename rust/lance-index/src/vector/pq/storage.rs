@@ -54,10 +54,7 @@ use crate::{
         PQ_CODE_COLUMN,
         pq::transform::PQTransformer,
         quantizer::{Quantizer, QuantizerMetadata, QuantizerStorage},
-        storage::{
-            DistCalculator, DistanceCalculatorOptions, QueryResidual, VectorStore,
-            accumulate_distances_into_heap,
-        },
+        storage::{DistCalculator, VectorStore, accumulate_distances_into_heap},
         transform::Transformer,
     },
 };
@@ -875,35 +872,6 @@ impl VectorStore for ProductQuantizationStorage {
         }
     }
 
-    fn dist_calculator_with_scratch<'a>(
-        &'a self,
-        query: ArrayRef,
-        _dist_q_c: f32,
-        _residual: Option<QueryResidual<'a>>,
-        _f32_scratch: &'a mut Vec<f32>,
-        options: DistanceCalculatorOptions,
-    ) -> Self::DistanceCalculator<'a> {
-        if options.prefer_low_setup_cost
-            && matches!(self.distance_type, DistanceType::L2 | DistanceType::Dot)
-        {
-            let codebook = self.metadata.codebook.as_ref().unwrap();
-            if codebook.value_type() == DataType::Float32 {
-                return PQDistCalculator::new(
-                    codebook
-                        .values()
-                        .as_primitive::<datatypes::Float32Type>()
-                        .values(),
-                    self.metadata.nbits,
-                    self.metadata.num_sub_vectors,
-                    self.pq_code.clone(),
-                    query.as_primitive::<datatypes::Float32Type>().values(),
-                    self.distance_type,
-                );
-            }
-        }
-        self.dist_calculator(query, 0.0)
-    }
-
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
         let codes = get_pq_code(
             self.pq_code.values(),
@@ -1681,6 +1649,7 @@ mod tests {
 
     use super::*;
 
+    use approx::assert_relative_eq;
     use arrow_array::{Float32Array, UInt32Array};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
@@ -2022,20 +1991,12 @@ mod tests {
         }
 
         let query = Arc::new(Float32Array::from_iter_values((0..DIM).map(|v| v as f32)));
-        let legacy_table = source.dist_calculator(query.clone(), 0.0).distance_table;
-        let low_setup_table = first
-            .dist_calculator_with_scratch(
-                query.clone(),
-                0.0,
-                None,
-                &mut Vec::new(),
-                DistanceCalculatorOptions {
-                    prefer_low_setup_cost: true,
-                    ..Default::default()
-                },
-            )
-            .distance_table;
-        assert_eq!(low_setup_table, legacy_table);
+        let prepared_table = first.dist_calculator(query.clone(), 0.0).distance_table;
+        let generic_table = source.dist_calculator(query.clone(), 0.0).distance_table;
+        assert_eq!(prepared_table.len(), generic_table.len());
+        for (actual, expected) in prepared_table.iter().zip(&generic_table) {
+            assert_relative_eq!(actual, expected, epsilon = 1e-5, max_relative = 1e-5);
+        }
         let calculator = first.dist_calculator(query, 0.0);
         let expected = (0..first.len())
             .map(|id| calculator.distance(id as u32))

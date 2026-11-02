@@ -357,9 +357,6 @@ impl QueryScratchCapacity {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DistanceCalculatorOptions {
     pub approx_mode: ApproxMode,
-    /// Prefer a distance calculator with minimal per-query setup when the
-    /// caller knows that the setup cost cannot be amortized over much work.
-    pub prefer_low_setup_cost: bool,
 }
 
 /// A FastScan lookup table quantized from a query's f32 distance table,

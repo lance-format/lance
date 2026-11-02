@@ -235,7 +235,6 @@ impl RabitScanContext {
                     &mut scratch.query_f32,
                     DistanceCalculatorOptions {
                         approx_mode: context.query.approx_mode,
-                        ..Default::default()
                     },
                 );
                 calc.full_sign_stage_with_scratch(
@@ -388,7 +387,6 @@ impl RabitScanContext {
                 &mut scratch.query_f32,
                 DistanceCalculatorOptions {
                     approx_mode: self.query.approx_mode,
-                    ..Default::default()
                 },
                 ex_rows,
             )?;

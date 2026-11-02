@@ -465,10 +465,7 @@ fn ex_bulk_paths(c: &mut Criterion) {
                 0.0,
                 None,
                 &mut f32_scratch,
-                DistanceCalculatorOptions {
-                    approx_mode,
-                    prefer_low_setup_cost: false,
-                },
+                DistanceCalculatorOptions { approx_mode },
             );
             let mut dists = Vec::new();
             let mut u16_scratch = Vec::new();
@@ -616,10 +613,7 @@ fn heap_topk(c: &mut Criterion) {
             1.0,
             None,
             &mut f32_scratch,
-            DistanceCalculatorOptions {
-                approx_mode,
-                prefer_low_setup_cost: false,
-            },
+            DistanceCalculatorOptions { approx_mode },
         );
         let mut heap = BinaryHeap::with_capacity(TOPK_K + 1);
         let mut dists = Vec::new();
