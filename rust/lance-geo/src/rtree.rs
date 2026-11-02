@@ -1,19 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::metrics::{MetricsCollector, NoOpMetricsCollector};
-use crate::scalar::expression::{GeoQueryParser, ScalarQueryParser};
-use crate::scalar::lance_format::LanceIndexStore;
-use crate::scalar::registry::{
-    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
-};
-use crate::scalar::rtree::sort::Sorter;
-use crate::scalar::{
-    AnyQuery, BuiltinIndexType, CreatedIndex, GeoQuery, IndexFile, IndexReader, IndexStore,
-    IndexWriter, OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult,
-    UpdateCriteria,
-};
-use crate::{Index, IndexType, pb};
+use crate::bbox::{BoundingBox, bounding_box, total_bounds};
+use crate::query::{GeoQuery, GeoQueryParser};
+use crate::rtree::sort::Sorter;
 use arrow_array::UInt32Array;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
@@ -41,7 +31,18 @@ use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tempfile::TempDir;
 use lance_core::{Error, ROW_ID, Result};
 use lance_datafusion_exec::chunker::chunk_concat_stream;
-pub use lance_geo::bbox::{BoundingBox, bounding_box, total_bounds};
+use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
+use lance_index::scalar::expression::ScalarQueryParser;
+use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::scalar::registry::{
+    BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+};
+use lance_index::scalar::{
+    AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter,
+    OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult,
+    UpdateCriteria,
+};
+use lance_index::{Index, IndexType, pb};
 use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{
     BatchRowIdRemapper, remap_record_batch_async, remap_row_addrs_tree_map_async,
@@ -637,7 +638,7 @@ fn remap_rtree_data_async(
 /// use lance_core::Result;
 /// use lance_index::scalar::OldIndexDataFilter;
 /// use lance_index::scalar::lance_format::LanceIndexStore;
-/// use lance_index::scalar::rtree::{RTreeIndex, merge_rtree_indices};
+/// use lance_geo::rtree::{RTreeIndex, merge_rtree_indices};
 ///
 /// async fn merge(
 ///     segments: &[Arc<RTreeIndex>],
@@ -856,7 +857,7 @@ impl ScalarIndex for RTreeIndex {
         &self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
-        old_data_filter: Option<super::OldIndexDataFilter>,
+        old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
         let bbox_data = RTreeIndexPlugin::convert_bbox_stream(new_data)?;
         let (old_data, null_map) = self.retained_data(old_data_filter.as_ref()).await?;
@@ -1235,7 +1236,7 @@ impl BasicTrainer for RTreeIndexPlugin {
         index_store: &dyn IndexStore,
         request: Box<dyn TrainingRequest>,
         _fragment_ids: Option<Vec<u32>>,
-        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
+        _progress: Arc<dyn lance_index::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         Self::validate_schema(&data.schema())?;
 
@@ -1337,9 +1338,7 @@ struct EncodedBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails, FragReuseIndexHandle};
-    use crate::metrics::NoOpMetricsCollector;
-    use crate::scalar::registry::VALUE_COLUMN_NAME;
+    use crate::bbox::is_empty_rect;
     use arrow_array::ArrayRef;
     use arrow_schema::Schema;
     use geo_types::{LineString, Rect, coord, line_string};
@@ -1347,7 +1346,9 @@ mod tests {
     use geoarrow_schema::{Dimension, LineStringType, PointType, RectType};
     use lance_core::cache::{CacheDecode, CacheEntry, CacheMissReason};
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_geo::bbox::is_empty_rect;
+    use lance_index::frag_reuse::{FragReuseIndex, FragReuseIndexDetails, FragReuseIndexHandle};
+    use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::scalar::registry::VALUE_COLUMN_NAME;
     use rand::Rng;
 
     #[rstest::rstest]
@@ -1521,7 +1522,7 @@ mod tests {
                     page_size: Some(page_size),
                 })),
                 None,
-                crate::progress::noop_progress(),
+                lance_index::progress::noop_progress(),
             )
             .await
             .unwrap();
@@ -1831,7 +1832,7 @@ mod tests {
                     page_size: Some(4),
                 })),
                 None,
-                crate::progress::noop_progress(),
+                lance_index::progress::noop_progress(),
             )
             .await
             .unwrap();
