@@ -619,9 +619,13 @@ pub struct WriteParams {
     pub data_storage_version: Option<LanceFileVersion>,
 
     /// Experimental: if set to true, the writer will use stable row ids.
-    /// These row ids are stable after compaction operations, but not after updates.
-    /// This makes compaction more efficient, since with stable row ids no
-    /// secondary indices need to be updated to point to new row ids.
+    /// A row then keeps the same id for its lifetime: compaction, update and
+    /// merge insert relocate or rewrite the row without changing its id.
+    ///
+    /// This only applies to new datasets. A write to an existing dataset does
+    /// not change that dataset's setting, so this value can neither enable nor
+    /// disable the feature after creation; to enable it later, use the
+    /// [`super::Dataset::migrate_to_stable_row_ids`] method. Default is false.
     pub enable_stable_row_ids: bool,
 
     /// If set to true, and this is a new dataset, uses the new v2 manifest paths.
@@ -951,12 +955,14 @@ where
     OpenWriter: Fn(Arc<ObjectStore>, Schema, Path, WriterOptions) -> OpenWriterFuture + Send + Sync,
     OpenWriterFuture: Future<Output = Result<Box<dyn GenericWriter>>> + Send,
 {
-    let source_store_registry = dataset
-        .map(|ds| ds.session.store_registry())
-        .unwrap_or_else(|| params.store_registry());
-    let source_store_params = params.store_params.clone().unwrap_or_default();
-
-    let file_writer_options = params.file_writer_options.clone().unwrap_or_default();
+    let options = WriterOptions {
+        source_store_registry: dataset
+            .map(|ds| ds.session.store_registry())
+            .unwrap_or_else(|| params.store_registry()),
+        preassigned_data_file_name,
+        created_blob_payloads,
+        ..WriterOptions::from_params(&params, external_base_resolver)
+    };
     let cleanup_bases = target_bases_info.clone();
     let writer_generator = WriterGenerator::new(
         object_store.clone(),
@@ -964,15 +970,7 @@ where
         schema,
         open_writer,
         target_bases_info,
-        external_base_resolver,
-        params.allow_external_blob_outside_bases,
-        params.external_blob_mode,
-        source_store_registry,
-        source_store_params,
-        params.blob_pack_file_size_threshold,
-        file_writer_options,
-        preassigned_data_file_name,
-        created_blob_payloads,
+        options,
     );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
@@ -2298,7 +2296,7 @@ impl GenericWriter for V2WriterAdapter {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct WriterOptions {
     add_data_dir: bool,
     pub(super) base_id: Option<u32>,
@@ -2324,6 +2322,26 @@ impl WriterOptions {
             external_base_resolver,
             allow_external_blob_outside_bases,
             source_store_registry,
+            ..Default::default()
+        }
+    }
+
+    /// Options for data files written from `params`, under the base's `data/`
+    /// directory. Writes into a registered base override `add_data_dir` and
+    /// `base_id`; dataset writes override the source store registry.
+    pub(super) fn from_params(
+        params: &WriteParams,
+        external_base_resolver: Option<Arc<ExternalBaseResolver>>,
+    ) -> Self {
+        Self {
+            add_data_dir: true,
+            external_base_resolver,
+            allow_external_blob_outside_bases: params.allow_external_blob_outside_bases,
+            external_blob_mode: params.external_blob_mode,
+            source_store_registry: params.store_registry(),
+            source_store_params: params.store_params.clone().unwrap_or_default(),
+            blob_pack_file_size_threshold: params.blob_pack_file_size_threshold,
+            file_writer_options: params.file_writer_options.clone().unwrap_or_default(),
             ..Default::default()
         }
     }
@@ -2553,15 +2571,9 @@ struct WriterGenerator<OpenWriter> {
     open_writer: OpenWriter,
     /// Target base information (if writing to specific bases)
     target_bases_info: Option<Vec<TargetBaseInfo>>,
-    external_base_resolver: Option<Arc<ExternalBaseResolver>>,
-    allow_external_blob_outside_bases: bool,
-    external_blob_mode: ExternalBlobMode,
-    source_store_registry: Arc<ObjectStoreRegistry>,
-    source_store_params: ObjectStoreParams,
-    blob_pack_file_size_threshold: Option<usize>,
-    file_writer_options: FileWriterOptions,
-    preassigned_data_file_name: Option<Arc<String>>,
-    created_blob_payloads: Option<BlobPayloadInventory>,
+    /// Options every writer starts from; `add_data_dir` and `base_id` follow
+    /// the selected base.
+    options: WriterOptions,
     writers_created: AtomicUsize,
     /// Counter for round-robin selection
     next_base_index: AtomicUsize,
@@ -2572,22 +2584,13 @@ where
     OpenWriter: Fn(Arc<ObjectStore>, Schema, Path, WriterOptions) -> OpenWriterFuture + Send + Sync,
     OpenWriterFuture: Future<Output = Result<Box<dyn GenericWriter>>> + Send,
 {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         object_store: Arc<ObjectStore>,
         base_dir: &Path,
         schema: &Schema,
         open_writer: OpenWriter,
         target_bases_info: Option<Vec<TargetBaseInfo>>,
-        external_base_resolver: Option<Arc<ExternalBaseResolver>>,
-        allow_external_blob_outside_bases: bool,
-        external_blob_mode: ExternalBlobMode,
-        source_store_registry: Arc<ObjectStoreRegistry>,
-        source_store_params: ObjectStoreParams,
-        blob_pack_file_size_threshold: Option<usize>,
-        file_writer_options: FileWriterOptions,
-        preassigned_data_file_name: Option<Arc<String>>,
-        created_blob_payloads: Option<BlobPayloadInventory>,
+        options: WriterOptions,
     ) -> Self {
         Self {
             object_store,
@@ -2595,15 +2598,7 @@ where
             schema: schema.clone(),
             open_writer,
             target_bases_info,
-            external_base_resolver,
-            allow_external_blob_outside_bases,
-            external_blob_mode,
-            source_store_registry,
-            source_store_params,
-            blob_pack_file_size_threshold,
-            file_writer_options,
-            preassigned_data_file_name,
-            created_blob_payloads,
+            options,
             writers_created: AtomicUsize::new(0),
             next_base_index: AtomicUsize::new(0),
         }
@@ -2624,7 +2619,7 @@ where
         let writer_index = self
             .writers_created
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if writer_index > 0 && self.preassigned_data_file_name.is_some() {
+        if writer_index > 0 && self.options.preassigned_data_file_name.is_some() {
             return Err(Error::internal(
                 "a fixed data file name requires the write to produce exactly one fragment",
             ));
@@ -2642,15 +2637,7 @@ where
                     // Primary-storage slots stamp no base id, like a write
                     // without target bases.
                     base_id: (base_info.base_id != PRIMARY_BASE_ID).then_some(base_info.base_id),
-                    preassigned_data_file_name: self.preassigned_data_file_name.clone(),
-                    external_base_resolver: self.external_base_resolver.clone(),
-                    allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
-                    external_blob_mode: self.external_blob_mode,
-                    source_store_registry: self.source_store_registry.clone(),
-                    source_store_params: self.source_store_params.clone(),
-                    blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
-                    file_writer_options: self.file_writer_options.clone(),
-                    created_blob_payloads: self.created_blob_payloads.clone(),
+                    ..self.options.clone()
                 },
             )
             .await?
@@ -2662,15 +2649,7 @@ where
                 WriterOptions {
                     add_data_dir: true,
                     base_id: None,
-                    preassigned_data_file_name: self.preassigned_data_file_name.clone(),
-                    external_base_resolver: self.external_base_resolver.clone(),
-                    allow_external_blob_outside_bases: self.allow_external_blob_outside_bases,
-                    external_blob_mode: self.external_blob_mode,
-                    source_store_registry: self.source_store_registry.clone(),
-                    source_store_params: self.source_store_params.clone(),
-                    blob_pack_file_size_threshold: self.blob_pack_file_size_threshold,
-                    file_writer_options: self.file_writer_options.clone(),
-                    created_blob_payloads: self.created_blob_payloads.clone(),
+                    ..self.options.clone()
                 },
             )
             .await?
@@ -3679,15 +3658,7 @@ mod tests {
             &schema,
             open_v2_1_test_writer,
             Some(target_bases),
-            None,
-            false,
-            ExternalBlobMode::Reference,
-            Arc::new(ObjectStoreRegistry::default()),
-            ObjectStoreParams::default(),
-            None,
-            FileWriterOptions::default(),
-            None,
-            None,
+            WriterOptions::default(),
         );
 
         // Create a writer
@@ -3800,15 +3771,7 @@ mod tests {
             &schema,
             open_v2_1_test_writer,
             Some(target_bases),
-            None,
-            false,
-            ExternalBlobMode::Reference,
-            Arc::new(ObjectStoreRegistry::default()),
-            ObjectStoreParams::default(),
-            None,
-            FileWriterOptions::default(),
-            None,
-            None,
+            WriterOptions::default(),
         );
 
         // Create test batch
