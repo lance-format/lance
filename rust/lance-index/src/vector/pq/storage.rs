@@ -373,8 +373,12 @@ impl ProductQuantizationStorage {
     }
 
     fn with_prepared_targets(mut self, quantizer: &ProductQuantizer) -> Self {
-        self.l2_targets = quantizer.l2_targets.clone();
-        self.dot_targets = quantizer.dot_targets.clone();
+        // The quantizer's L2 transform targets cover f16 and PQ4 as well.
+        // Partition-search sharing stays limited to the current f32/PQ8 path.
+        if quantizer.codebook.value_type() == DataType::Float32 && quantizer.num_bits == 8 {
+            self.l2_targets = quantizer.l2_targets.clone();
+            self.dot_targets = quantizer.dot_targets.clone();
+        }
         self
     }
 
@@ -1668,7 +1672,12 @@ fn get_centroids_4bit<T: Clone>(
 
 #[cfg(test)]
 mod tests {
-    use crate::vector::{quantizer::Quantization, storage::StorageBuilder};
+    use crate::vector::{
+        DISTANCE_TYPE_KEY,
+        ivf::storage::IVF_METADATA_KEY,
+        quantizer::{Quantization, Quantizer},
+        storage::{IvfQuantizationStorage, STORAGE_METADATA_KEY, StorageBuilder},
+    };
 
     use super::*;
 
@@ -1676,6 +1685,13 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::ROW_ID_FIELD;
+    use lance_core::cache::LanceCache;
+    use lance_encoding::decoder::DecoderPlugins;
+    use lance_file::reader::{FileReader, FileReaderOptions};
+    use lance_file::versions::v2_1;
+    use lance_file::writer::FileWriterOptions;
+    use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+    use lance_io::utils::CachedFileSize;
     use rand::{Rng, SeedableRng, rngs::StdRng};
     use rstest::rstest;
 
@@ -1748,6 +1764,64 @@ mod tests {
             .unwrap()
             .build(vec![batch])
             .unwrap()
+    }
+
+    async fn write_partitioned_pq_file(storage: &ProductQuantizationStorage) -> FileReader {
+        let object_store = ObjectStore::memory();
+        let path = Path::from("partitioned-pq.lance");
+        let schema =
+            lance_core::datatypes::Schema::try_from(storage.batch.schema().as_ref()).unwrap();
+        let object_writer = object_store.create(&path).await.unwrap();
+        let mut writer =
+            v2_1::create_writer(object_writer, schema, FileWriterOptions::default()).unwrap();
+
+        let mut metadata = storage.metadata.clone();
+        let codebook_tensor: pb::Tensor =
+            pb::Tensor::try_from(metadata.codebook.as_ref().unwrap()).unwrap();
+        let codebook_position = writer
+            .add_global_buffer(Bytes::from(codebook_tensor.encode_to_vec()))
+            .await
+            .unwrap();
+        metadata.codebook_position = codebook_position as usize;
+
+        writer.add_schema_metadata(DISTANCE_TYPE_KEY, storage.distance_type.to_string());
+        let metadata_json = serde_json::to_string(&metadata).unwrap();
+        writer.add_schema_metadata(
+            STORAGE_METADATA_KEY,
+            serde_json::to_string(&vec![metadata_json]).unwrap(),
+        );
+
+        let partition_rows = (TOTAL / 2) as u32;
+        let ivf = pb::Ivf {
+            lengths: vec![partition_rows; 2],
+            offsets: vec![0, u64::from(partition_rows)],
+            ..Default::default()
+        };
+        let ivf_position = writer
+            .add_global_buffer(Bytes::from(ivf.encode_to_vec()))
+            .await
+            .unwrap();
+        writer.add_schema_metadata(IVF_METADATA_KEY, ivf_position.to_string());
+        writer.write_batch(&storage.batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let scheduler = ScanScheduler::new(
+            Arc::new(object_store.clone()),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+        let file = scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        FileReader::try_open(
+            file,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -1882,6 +1956,27 @@ mod tests {
         assert_eq!(distances, expected);
     }
 
+    #[test]
+    fn test_partition_search_prepared_targets_are_f32_pq8_only() {
+        let source = create_4bit_pq_storage(TOTAL, DistanceType::L2);
+        let Quantizer::Product(quantizer) =
+            ProductQuantizer::from_metadata(source.metadata(), DistanceType::L2).unwrap()
+        else {
+            unreachable!();
+        };
+        assert!(quantizer.l2_targets.is_some());
+
+        let storage = ProductQuantizationStorage::try_from_batch_with_quantizer(
+            source.batch.clone(),
+            &Quantizer::Product(quantizer),
+            source.metadata(),
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
+        assert!(storage.l2_targets.is_none());
+    }
+
     #[rstest]
     #[case::l2(DistanceType::L2)]
     #[case::dot(DistanceType::Dot)]
@@ -1948,65 +2043,86 @@ mod tests {
         assert_eq!(calculator.distance_all(100), expected);
     }
 
-    /// Regression test for the prewarm path: `IvfQuantizationStorage::
-    /// materialize_partition_for_prewarm` must pass the retained index-level
-    /// quantizer through to each partition storage (via
-    /// `try_from_batch_with_quantizer`). The pre-fix code rebuilt every
-    /// partition from metadata alone, so each prewarmed partition owned an
-    /// empty prepared-target cache and re-transposed the codebook on first use.
-    ///
-    /// This exercises the same construction the fixed prewarm materialization
-    /// takes and proves multiple partitions share one lazily initialized target
-    /// cache.
+    /// Both partition-loading paths must carry the retained index-level
+    /// quantizer, so all loaded and prewarmed partitions share its prepared
+    /// targets instead of building one copy per partition.
     #[rstest]
     #[case::l2(DistanceType::L2)]
     #[case::dot(DistanceType::Dot)]
     #[tokio::test]
-    async fn test_prewarm_materialization_shares_prepared_targets(
+    async fn test_load_and_prewarm_partitions_share_prepared_targets(
         #[case] distance_type: DistanceType,
     ) {
         let source = create_pq_storage_with_distance(distance_type).await;
-        let quantizer = ProductQuantizer::from_metadata(source.metadata(), distance_type).unwrap();
+        let reader = write_partitioned_pq_file(&source).await;
+        let loader = IvfQuantizationStorage::<ProductQuantizer>::try_new(reader, None)
+            .await
+            .unwrap();
 
-        // Two partitions materialized through the shared quantizer, matching
-        // the fixed prewarm path.
-        let first = ProductQuantizationStorage::try_from_batch_with_quantizer(
-            source.batch.clone(),
-            &quantizer,
-            source.metadata(),
-            distance_type,
-            None,
-        )
-        .unwrap();
-        let second = ProductQuantizationStorage::try_from_batch_with_quantizer(
-            source.batch.clone(),
-            &quantizer,
-            source.metadata(),
-            distance_type,
-            None,
-        )
-        .unwrap();
+        let first = loader.load_partition(0, None).await.unwrap();
+        let second = loader.load_partition(1, None).await.unwrap();
+        let first_batch = loader.read_partition_batch(0, None).await.unwrap();
+        let second_batch = loader.read_partition_batch(1, None).await.unwrap();
+        let prewarmed_first = loader
+            .materialize_partition_for_prewarm(vec![first_batch])
+            .await
+            .unwrap();
+        let prewarmed_second = loader
+            .materialize_partition_for_prewarm(vec![second_batch])
+            .await
+            .unwrap();
 
-        // Both partitions alias the same Arc-backed prepared targets.
+        let Quantizer::Product(index_quantizer) = loader.quantizer().unwrap() else {
+            unreachable!();
+        };
         match distance_type {
             DistanceType::L2 => {
-                let first_targets = first.l2_targets.as_ref().unwrap();
-                let second_targets = second.l2_targets.as_ref().unwrap();
-                assert!(Arc::ptr_eq(first_targets, second_targets));
-                assert_eq!(first_targets.len(), NUM_SUB_VECTORS);
+                let index_targets = index_quantizer.l2_targets.as_ref().unwrap();
+                assert!(Arc::ptr_eq(
+                    index_targets,
+                    first.l2_targets.as_ref().unwrap()
+                ));
+                assert!(Arc::ptr_eq(
+                    index_targets,
+                    second.l2_targets.as_ref().unwrap()
+                ));
+                assert!(Arc::ptr_eq(
+                    index_targets,
+                    prewarmed_first.l2_targets.as_ref().unwrap()
+                ));
+                assert!(Arc::ptr_eq(
+                    index_targets,
+                    prewarmed_second.l2_targets.as_ref().unwrap()
+                ));
             }
             DistanceType::Dot => {
-                let first_targets = first.dot_targets.as_ref().unwrap();
-                let second_targets = second.dot_targets.as_ref().unwrap();
-                assert!(Arc::ptr_eq(first_targets, second_targets));
-                assert_eq!(first_targets.len(), NUM_SUB_VECTORS);
+                let index_targets = index_quantizer.dot_targets.as_ref().unwrap();
+                assert!(Arc::ptr_eq(
+                    index_targets,
+                    first.dot_targets.as_ref().unwrap()
+                ));
+                assert!(Arc::ptr_eq(
+                    index_targets,
+                    second.dot_targets.as_ref().unwrap()
+                ));
+                assert!(Arc::ptr_eq(
+                    index_targets,
+                    prewarmed_first.dot_targets.as_ref().unwrap()
+                ));
+                assert!(Arc::ptr_eq(
+                    index_targets,
+                    prewarmed_second.dot_targets.as_ref().unwrap()
+                ));
             }
             _ => unreachable!(),
         }
 
-        // Both partitions use the same prepared targets.
         let query = Arc::new(Float32Array::from_iter_values((0..DIM).map(|v| v as f32)));
-        let _ = first.dist_calculator(query, 0.0);
+        let loaded_distances = first.dist_calculator(query.clone(), 0.0).distance_all(100);
+        let prewarmed_distances = prewarmed_first
+            .dist_calculator(query, 0.0)
+            .distance_all(100);
+        assert_eq!(loaded_distances, prewarmed_distances);
     }
 
     #[tokio::test]

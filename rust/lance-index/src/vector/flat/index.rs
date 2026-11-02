@@ -138,6 +138,7 @@ fn search_candidates_with_scratch(
         &mut scratch.query_f32,
         DistanceCalculatorOptions {
             approx_mode: params.approx_mode,
+            prefer_low_setup_cost: params.prefer_low_setup_cost,
         },
     );
     let mut candidates = BinaryHeap::with_capacity(candidate_limit);

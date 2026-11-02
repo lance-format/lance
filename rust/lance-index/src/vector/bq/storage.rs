@@ -4536,7 +4536,10 @@ mod tests {
                         query: None,
                     }),
                     &mut fallback_scratch,
-                    DistanceCalculatorOptions { approx_mode },
+                    DistanceCalculatorOptions {
+                        approx_mode,
+                        ..Default::default()
+                    },
                 )
                 .distance_all(0);
 
@@ -4550,7 +4553,10 @@ mod tests {
                         query: Some(&raw_query),
                     }),
                     &mut prepared_scratch,
-                    DistanceCalculatorOptions { approx_mode },
+                    DistanceCalculatorOptions {
+                        approx_mode,
+                        ..Default::default()
+                    },
                 )
                 .distance_all(0);
 

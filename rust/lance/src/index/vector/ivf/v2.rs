@@ -3048,6 +3048,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     &mut scratch.query_f32,
                     DistanceCalculatorOptions {
                         approx_mode: ApproxMode::Accurate,
+                        ..Default::default()
                     },
                 );
                 let mut row_ids = Vec::with_capacity(offsets_in_partition.len());
