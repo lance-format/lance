@@ -25,3 +25,18 @@ dataset.create_scalar_index(
     with_position=True,
 )
 assert dataset.list_indices()[0]["type"] == "Inverted"
+
+# Bigrams of four-letter words, for the FTS global statistics tests.
+bigram_path = Path(__file__).parent / "ngram_bigram_with_position.lance"
+shutil.rmtree(bigram_path, ignore_errors=True)
+bigram_data = pa.table({"text": ["abcd", "xbcd", "axcd", "abxd"]})
+bigram_dataset = lance.write_dataset(bigram_data, bigram_path)
+bigram_dataset.create_scalar_index(
+    "text",
+    "INVERTED",
+    base_tokenizer="ngram",
+    min_ngram_length=2,
+    max_ngram_length=2,
+    with_position=True,
+)
+assert bigram_dataset.list_indices()[0]["type"] == "Inverted"

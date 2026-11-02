@@ -9892,7 +9892,8 @@ mod test {
     // `knn` module, so the tests below cover that surface too.
     use crate::io::exec::{ANNIvfBatchExec, QUERY_INDEX_COL};
     use crate::utils::test::{
-        DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper, assert_plan_node_equals,
+        DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper,
+        assert_plan_node_equals, copy_test_data_to_tmp,
     };
 
     #[test]
@@ -25458,20 +25459,12 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
 
     #[tokio::test]
     async fn test_fts_global_statistics_preserves_ngram_fuzzy_and_phrase_positions() {
-        let batch =
-            arrow_array::record_batch!(("text", Utf8, ["abcd", "xbcd", "axcd", "abxd"])).unwrap();
-        let schema = batch.schema();
-        let reader = RecordBatchIterator::new([Ok(batch)], schema);
-        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
-        let params = InvertedIndexParams::default()
-            .base_tokenizer("ngram".into())
-            .ngram_min_length(2)
-            .ngram_max_length(2)
-            .with_position(true);
-        dataset
-            .create_index(&["text"], IndexType::Inverted, None, &params, true)
-            .await
-            .unwrap();
+        // A bigram index with positions over "abcd", "xbcd", "axcd" and "abxd".
+        // New indexes refuse these settings, so it was built by 13.0.0.
+        let test_dir =
+            copy_test_data_to_tmp("v13.0.0/ngram_with_position/ngram_bigram_with_position.lance")
+                .unwrap();
+        let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
 
         let match_query: FtsQuery = BooleanQuery::new([
             (
