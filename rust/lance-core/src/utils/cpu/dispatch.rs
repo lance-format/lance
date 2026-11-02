@@ -111,6 +111,7 @@ macro_rules! impl_call {
     };
 }
 
+impl_call!(<A: ?Sized> fn(a: &A));
 impl_call!(<A: ?Sized, B: ?Sized> fn(a: &A, b: &B));
 impl_call!(<A: ?Sized, C: ?Sized> fn(a: &A, b: f32, c: &C));
 impl_call!(<A: ?Sized, B: ?Sized, D: ?Sized> fn(a: &A, b: &B, c: usize, d: &mut D));
@@ -433,6 +434,25 @@ mod tests {
         let mut out = [0.0; 2];
         FILL.get().call(&[1.0], &[2.0, 3.0], 1, &mut out);
         assert_eq!(out, [3.0, 4.0]);
+    }
+
+    type NormFn = unsafe fn(&[f32]) -> f32;
+
+    crate::target_kernel! {
+        #[target_features()]
+        #[candidate(PORTABLE_NORM: NormFn)]
+        fn portable_norm(x: &[f32]) -> f32 {
+            x.iter().map(|v| v * v).sum::<f32>().sqrt()
+        }
+    }
+
+    crate::dispatch! {
+        static NORM: Dispatch<NormFn> = &[PORTABLE_NORM];
+    }
+
+    #[test]
+    fn single_argument_kernel_is_callable() {
+        assert_eq!(NORM.get().call(&[3.0, 4.0]), 5.0);
     }
 
     type ScaledSumFn = unsafe fn(&[f32], f32, &[f32]) -> f32;
