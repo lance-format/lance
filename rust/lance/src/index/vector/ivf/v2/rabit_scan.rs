@@ -16,12 +16,13 @@ use std::time::Instant;
 
 use arrow_array::{Float32Array, RecordBatch, UInt32Array};
 use async_trait::async_trait;
+use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
+use futures::{StreamExt, stream};
 use lance_core::cache::WeakLanceCache;
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_index::metrics::MetricsCollector;
 use lance_index::prefilter::PreFilter;
-use lance_index::vector::Query;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::scan_stats;
 use lance_index::vector::bq::storage::{
@@ -33,6 +34,7 @@ use lance_index::vector::storage::{
     DistanceCalculatorOptions, ExIndex, GatheredRabitEx, IndexFileKey, IvfQuantizationStorage,
     OriginLatencyClass, RabitExLayout, RabitRawQueryContext, VectorStore,
 };
+use lance_index::vector::{PartitionSearchControl, Query, VECTOR_RESULT_SCHEMA};
 
 use super::{
     IVFIndex, PartitionEntry, PreparedPartitionGuard, PreparedPartitionSearch,
@@ -78,6 +80,129 @@ pub trait RabitScan: Debug + Send + Sync {
     /// Returning `None` must leave the query unexecuted. Execution errors must
     /// be returned as errors, since retrying on another path can hide failures.
     async fn search(&self, context: Arc<RabitScanContext>) -> Result<Option<RecordBatch>>;
+
+    /// Construct a stream with one batch per probe for partition-controlled search.
+    ///
+    /// Put asynchronous preparation in the returned stream so Lance can apply
+    /// stop checks before polling it. Any bounded prefetch must be owned by the
+    /// stream and cancelled when it is dropped.
+    ///
+    /// Batches follow `context.probes` order, including empty batches. Each batch
+    /// must preserve the built-in partition search's candidate budget, filtering,
+    /// bounds and tie semantics. A cumulative global heap cannot replace these batches:
+    /// their row counts drive the caller's stopping decision.
+    ///
+    /// Lance owns stop checks and calls [`PartitionSearchControl::record_batch`]
+    /// exactly once for each accepted batch. The strategy must bound prefetch and
+    /// cancel outstanding work when its stream is dropped. Both the stream and
+    /// its batches must use [`VECTOR_RESULT_SCHEMA`]. Each batch has at most
+    /// `k * refine_factor` rows (an unset refinement factor means 1).
+    ///
+    /// `None` leaves the search unexecuted and selects the built-in partition
+    /// stream. Errors propagate without retrying on another strategy. Existing
+    /// implementations can retain that fallback by omitting this method:
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use arrow_array::RecordBatch;
+    /// use lance::index::vector::ivf::v2::rabit_scan::{RabitScan, RabitScanContext};
+    /// use lance_core::Result;
+    ///
+    /// #[derive(Debug)]
+    /// struct BuiltInScan;
+    /// #[async_trait::async_trait]
+    /// impl RabitScan for BuiltInScan {
+    ///     async fn search(&self, _: Arc<RabitScanContext>) -> Result<Option<RecordBatch>> {
+    ///         Ok(None)
+    ///     }
+    /// }
+    /// ```
+    fn search_partition_stream(
+        &self,
+        _context: Arc<RabitScanContext>,
+    ) -> Result<Option<SendableRecordBatchStream>> {
+        Ok(None)
+    }
+}
+
+/// Keep the streaming strategy's result accounting at the same boundary as
+/// built-in partition search. In particular, empty batches still represent a
+/// searched partition, and an incomplete stream must not silently lose rows.
+pub(super) fn controlled_partition_stream(
+    source: SendableRecordBatchStream,
+    expected_batches: usize,
+    candidate_limit: usize,
+    control: Arc<dyn PartitionSearchControl>,
+) -> Result<SendableRecordBatchStream> {
+    if source.schema().as_ref() != VECTOR_RESULT_SCHEMA.as_ref() {
+        return Err(Error::internal(format!(
+            "RaBitQ partition stream schema must be {:?}, got {:?}",
+            VECTOR_RESULT_SCHEMA.as_ref(),
+            source.schema()
+        )));
+    }
+    let batches = stream::unfold(Some((source, 0usize)), move |state| {
+        let control = control.clone();
+        async move {
+            let (mut source, emitted) = state?;
+            if control.should_stop() {
+                return None;
+            }
+            // An error from a poll already in flight remains an error even if
+            // another segment satisfies the shared budget during that poll.
+            let next = match source.next().await {
+                Some(Ok(batch)) => Some(batch),
+                Some(Err(error)) => return Some((Err(error), None)),
+                None => None,
+            };
+            if control.should_stop() {
+                return None;
+            }
+            let batch = match next {
+                Some(batch) => batch,
+                None if emitted == expected_batches => return None,
+                None => {
+                    let error = Error::internal(format!(
+                        "RaBitQ partition stream ended after {emitted} batches; expected {expected_batches}"
+                    ));
+                    return Some((Err(error.into()), None));
+                }
+            };
+            let invalid = if emitted == expected_batches {
+                Some(format!(
+                    "RaBitQ partition stream produced more than {expected_batches} batches"
+                ))
+            } else if batch.schema().as_ref() != VECTOR_RESULT_SCHEMA.as_ref() {
+                Some(format!(
+                    "RaBitQ partition batch {emitted} has an unexpected schema: {:?}",
+                    batch.schema()
+                ))
+            } else if batch.num_rows() > candidate_limit {
+                Some(format!(
+                    "RaBitQ partition batch {emitted} has {} rows, exceeding candidate limit {candidate_limit}",
+                    batch.num_rows()
+                ))
+            } else {
+                None
+            };
+            if let Some(message) = invalid {
+                return Some((Err(Error::internal(message).into()), None));
+            }
+            control.record_batch(&batch);
+            // Release prefetched work as soon as this batch meets the budget,
+            // without waiting for the consumer to ask for another batch.
+            let state = if control.should_stop() {
+                None
+            } else {
+                Some((source, emitted + 1))
+            };
+            Some((Ok(batch), state))
+        }
+    });
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        VECTOR_RESULT_SCHEMA.clone(),
+        batches,
+    )))
 }
 
 /// Native preparation and scoring inputs for one query.

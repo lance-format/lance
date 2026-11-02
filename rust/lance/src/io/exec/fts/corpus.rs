@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Corpus-scorer coordination shared by indexed and flat FTS branches.
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -149,36 +151,24 @@ impl SharedFtsCorpus {
         match self {
             Self::Match(template) => {
                 if let Some(node) = plan.downcast_ref::<MatchQueryExec>()
-                    && node
-                        .shared_scorer
-                        .as_ref()
-                        .is_some_and(|shared| Arc::ptr_eq(shared, template))
+                    && node.uses_shared_scorer(template)
                 {
                     return Some(ScorerRole::Consumer);
                 }
                 if let Some(node) = plan.downcast_ref::<FlatMatchQueryExec>()
-                    && node
-                        .shared_scorer
-                        .as_ref()
-                        .is_some_and(|shared| Arc::ptr_eq(shared, template))
+                    && node.uses_shared_scorer(template)
                 {
                     return Some(ScorerRole::Producer);
                 }
             }
             Self::Combined(template) => {
                 if let Some(node) = plan.downcast_ref::<CombinedFieldsQueryExec>()
-                    && node
-                        .shared_scorer
-                        .as_ref()
-                        .is_some_and(|shared| Arc::ptr_eq(shared, template))
+                    && node.uses_shared_scorer(template)
                 {
                     return Some(ScorerRole::Consumer);
                 }
                 if let Some(node) = plan.downcast_ref::<FlatCombinedFieldsExec>()
-                    && node
-                        .shared_scorer
-                        .as_ref()
-                        .is_some_and(|shared| Arc::ptr_eq(shared, template))
+                    && node.uses_shared_scorer(template)
                 {
                     return Some(ScorerRole::Producer);
                 }
@@ -199,65 +189,26 @@ impl SharedFtsCorpus {
             ))
         };
         let rebound: Arc<dyn ExecutionPlan> = match (self, role) {
-            (Self::Match(scorer), ScorerRole::Consumer) => {
-                let node = plan
-                    .downcast_ref::<MatchQueryExec>()
-                    .ok_or_else(wrong_role)?;
-                Arc::new(MatchQueryExec {
-                    dataset: node.dataset.clone(),
-                    query: node.query.clone(),
-                    tokenized_query: node.tokenized_query.clone(),
-                    params: node.params.clone(),
-                    prefilter_source: node.prefilter_source.clone(),
-                    base_scorer: node.base_scorer.clone(),
-                    prepared_query: node.prepared_query.clone(),
-                    shared_scorer: Some(scorer.clone()),
-                    segment_selection: node.segment_selection.clone(),
-                    overlay_block: node.overlay_block.clone(),
-                    document_granularity: node.document_granularity,
-                    schema: node.schema.clone(),
-                    external_mask: node.external_mask.clone(),
-                    properties: node.properties.clone(),
-                    metrics: node.metrics.clone(),
-                })
-            }
-            (Self::Match(scorer), ScorerRole::Producer) => {
-                let node = plan
-                    .downcast_ref::<FlatMatchQueryExec>()
-                    .ok_or_else(wrong_role)?;
-                Arc::new(FlatMatchQueryExec {
-                    dataset: node.dataset.clone(),
-                    query: node.query.clone(),
-                    tokenized_query: node.tokenized_query.clone(),
-                    params: node.params.clone(),
-                    unindexed_input: node.unindexed_input.clone(),
-                    candidate_filter: node.candidate_filter.clone(),
-                    base_scorer: node.base_scorer.clone(),
-                    shared_scorer: Some(scorer.clone()),
-                    preset_segments: node.preset_segments.clone(),
-                    document_granularity: node.document_granularity,
-                    document_column: node.document_column.clone(),
-                    schema: node.schema.clone(),
-                    properties: node.properties.clone(),
-                    metrics: node.metrics.clone(),
-                })
-            }
-            (Self::Combined(scorer), ScorerRole::Consumer) => {
-                let mut node = plan
-                    .downcast_ref::<CombinedFieldsQueryExec>()
+            (Self::Match(scorer), ScorerRole::Consumer) => plan
+                .downcast_ref::<MatchQueryExec>()
+                .ok_or_else(wrong_role)?
+                .rebuilt_with_shared_scorer(scorer.clone()),
+            (Self::Match(scorer), ScorerRole::Producer) => plan
+                .downcast_ref::<FlatMatchQueryExec>()
+                .ok_or_else(wrong_role)?
+                .rebuilt_with_shared_scorer(scorer.clone()),
+            (Self::Combined(scorer), ScorerRole::Consumer) => Arc::new(
+                plan.downcast_ref::<CombinedFieldsQueryExec>()
                     .ok_or_else(wrong_role)?
-                    .clone();
-                node.shared_scorer = Some(scorer.clone());
-                Arc::new(node)
-            }
-            (Self::Combined(scorer), ScorerRole::Producer) => {
-                let mut node = plan
-                    .downcast_ref::<FlatCombinedFieldsExec>()
+                    .clone()
+                    .with_shared_scorer(scorer.clone()),
+            ),
+            (Self::Combined(scorer), ScorerRole::Producer) => Arc::new(
+                plan.downcast_ref::<FlatCombinedFieldsExec>()
                     .ok_or_else(wrong_role)?
-                    .clone();
-                node.shared_scorer = Some(scorer.clone());
-                Arc::new(node)
-            }
+                    .clone()
+                    .with_shared_scorer(scorer.clone()),
+            ),
         };
         Ok(rebound)
     }
@@ -270,9 +221,9 @@ impl SharedFtsCorpus {
             producer.downcast_ref::<FlatMatchQueryExec>(),
             consumer.downcast_ref::<MatchQueryExec>(),
         ) {
-            require_same_snapshot(&producer.dataset, &consumer.dataset)?;
-            if producer.query != consumer.query
-                || producer.document_granularity != consumer.document_granularity
+            require_same_snapshot(producer.dataset(), consumer.dataset())?;
+            if producer.query() != consumer.query()
+                || producer.document_granularity() != consumer.document_granularity()
             {
                 return Err(DataFusionError::Plan(
                     "FTS corpus branches must use the same Match query and document granularity"
@@ -285,8 +236,8 @@ impl SharedFtsCorpus {
             producer.downcast_ref::<FlatCombinedFieldsExec>(),
             consumer.downcast_ref::<CombinedFieldsQueryExec>(),
         ) {
-            require_same_snapshot(&producer.dataset, &consumer.dataset)?;
-            if producer.query != consumer.query {
+            require_same_snapshot(producer.dataset(), consumer.dataset())?;
+            if producer.query() != consumer.query() {
                 return Err(DataFusionError::Plan(
                     "FTS corpus branches must use the same combined_fields query".to_string(),
                 ));
@@ -320,19 +271,19 @@ fn require_same_snapshot(producer: &Dataset, consumer: &Dataset) -> DataFusionRe
 
 fn has_shared_scorer(plan: &dyn ExecutionPlan) -> bool {
     plan.downcast_ref::<MatchQueryExec>()
-        .is_some_and(|node| node.shared_scorer.is_some())
+        .is_some_and(|node| node.has_shared_scorer())
         || plan
             .downcast_ref::<FlatMatchQueryExec>()
-            .is_some_and(|node| node.shared_scorer.is_some())
+            .is_some_and(|node| node.has_shared_scorer())
         || plan
             .downcast_ref::<CombinedFieldsQueryExec>()
-            .is_some_and(|node| node.shared_scorer.is_some())
+            .is_some_and(|node| node.has_shared_scorer())
         || plan
             .downcast_ref::<FlatCombinedFieldsExec>()
-            .is_some_and(|node| node.shared_scorer.is_some())
+            .is_some_and(|node| node.has_shared_scorer())
         || plan
             .downcast_ref::<PhraseQueryExec>()
-            .is_some_and(|node| node.shared_scorer.is_some())
+            .is_some_and(|node| node.has_shared_scorer())
 }
 
 /// Visit only this owner's scope, leaving nested corpus owners opaque.
@@ -445,6 +396,7 @@ impl SharedFtsScorerExec {
     /// query and opened dataset snapshot. Resolve the dataset once and reuse it
     /// (or a shallow clone) for both leaves. Candidate filters and limits may
     /// differ; their separation from the statistics corpus is preserved.
+    /// Native segment/fragment scopes and scorer overrides remain authoritative.
     ///
     /// The two branches must be separate and cannot cross another corpus owner.
     /// Other shared-scorer leaves require their own nested owner. This creates
@@ -549,7 +501,7 @@ impl SharedFtsScorerExec {
         }
     }
 
-    pub(super) fn prepare_execution(&self) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    fn prepare_execution(&self) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let fresh = match &self.scorer {
             SharedFtsCorpus::Match(_) => SharedFtsCorpus::Match(Arc::new(SharedFtsScorer::new())),
             SharedFtsCorpus::Combined(_) => {
@@ -748,5 +700,262 @@ impl ExecutionPlan for SharedFtsScorerExec {
             Some(input) => Self::execution_metrics(self.input.as_ref(), input.as_ref()),
             None => snapshot,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    mod reconstruction;
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use arrow_array::record_batch;
+    use arrow_array::{Float32Array, RecordBatch, UInt64Array};
+    use datafusion::execution::TaskContext;
+    use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+    use datafusion::physical_plan::union::UnionExec;
+    use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
+    use futures::{FutureExt, TryStreamExt};
+    use lance_core::ROW_ID;
+    use lance_datafusion::exec::{ExecutionSummaryCounts, collect_execution_metrics};
+    use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
+    use lance_index::scalar::inverted::query::{FtsSearchParams, MatchQuery};
+    use lance_index::scalar::inverted::{DocumentGranularity, FTS_SCHEMA, SCORE_COL};
+    use rstest::rstest;
+
+    use crate::io::exec::PreFilterSource;
+    use crate::io::exec::fts::tests::{
+        FailingResidualExec, ResidualFailure, candidate_input, indexed_match_dataset, memory_input,
+        metric_value,
+    };
+
+    #[rstest]
+    #[case::execute(ResidualFailure::Execute)]
+    #[case::stream(ResidualFailure::Stream)]
+    #[case::cancel(ResidualFailure::Cancel)]
+    #[tokio::test]
+    async fn test_9058_shared_corpus_retries_after_failure(
+        #[case] failure: ResidualFailure,
+        #[values(false, true)] is_reconstructed: bool,
+    ) {
+        let dataset = indexed_match_dataset().await;
+        let query = MatchQuery::new("alpha beta".to_string())
+            .with_column(Some("text".to_string()))
+            .with_document_granularity(DocumentGranularity::Row);
+        let residual = Arc::new(FailingResidualExec::new(
+            memory_input(
+                record_batch!(
+                    ("text", Utf8, vec!["alpha"; 10]),
+                    (ROW_ID, UInt64, (100..110).collect::<Vec<u64>>())
+                )
+                .unwrap(),
+            ),
+            failure,
+        ));
+        let shared = Arc::new(SharedFtsScorer::new());
+        let indexed = Arc::new(
+            MatchQueryExec::new(
+                dataset.clone(),
+                query.clone(),
+                FtsSearchParams::default().with_limit(Some(1)),
+                PreFilterSource::None,
+            )
+            .unwrap()
+            .with_shared_scorer(shared.clone()),
+        );
+        let flat = Arc::new(
+            FlatMatchQueryExec::new(
+                dataset.clone(),
+                query.clone(),
+                FtsSearchParams::default(),
+                residual.clone(),
+            )
+            .unwrap()
+            .with_shared_scorer(shared.clone())
+            .with_candidate_filter(candidate_input(vec![], false)),
+        );
+        let union = UnionExec::try_new(vec![indexed, flat]).unwrap();
+        let input: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(union));
+        let owner = Arc::new(SharedFtsScorerExec::new(input, shared));
+        let owner: Arc<dyn ExecutionPlan> = if is_reconstructed {
+            let binding = owner.binding().unwrap();
+            // Model a decoder: neither leaf carries the original shared Arc,
+            // and a shallow Dataset clone is still the same opened snapshot.
+            let indexed = Arc::new(
+                MatchQueryExec::new(
+                    dataset.clone(),
+                    query.clone(),
+                    FtsSearchParams::default().with_limit(Some(1)),
+                    PreFilterSource::None,
+                )
+                .unwrap(),
+            );
+            let flat = Arc::new(
+                FlatMatchQueryExec::new(
+                    Arc::new(dataset.as_ref().clone()),
+                    query,
+                    FtsSearchParams::default(),
+                    residual.clone(),
+                )
+                .unwrap()
+                .with_candidate_filter(candidate_input(vec![], false)),
+            );
+            let decoded: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(
+                UnionExec::try_new(vec![indexed, flat]).unwrap(),
+            ));
+            let rebuilt = SharedFtsScorerExec::try_new(decoded, binding.clone()).unwrap();
+            assert_eq!(rebuilt.binding().unwrap(), binding);
+            Arc::new(rebuilt)
+        } else {
+            owner
+        };
+        let input = owner.children()[0].clone();
+        let owner = owner
+            .replace_children(
+                vec![input],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap();
+        let distributions = owner.input_distribution_requirements();
+        let distributions = distributions.per_child_distributions().collect::<Vec<_>>();
+        assert_eq!(distributions.len(), 1);
+        assert!(matches!(
+            distributions[0],
+            datafusion_physical_expr::Distribution::SinglePartition
+        ));
+        assert_eq!(owner.schema(), FTS_SCHEMA.clone());
+        let context = Arc::new(TaskContext::default());
+        let stream = owner.execute(0, context.clone()).unwrap();
+        if matches!(failure, ResidualFailure::Cancel) {
+            tokio::time::timeout(Duration::from_secs(1), residual.started.notified())
+                .await
+                .unwrap();
+            drop(stream);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !residual.dropped.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect(
+                "dropping the output must cancel the residual stream while the owner stays alive",
+            );
+        } else {
+            let error =
+                tokio::time::timeout(Duration::from_secs(1), stream.try_collect::<Vec<_>>())
+                    .await
+                    .unwrap()
+                    .unwrap_err();
+            assert!(error.to_string().contains("injected residual"), "{error}");
+        }
+        let mut counts = ExecutionSummaryCounts::default();
+        collect_execution_metrics(owner.as_ref(), &mut counts);
+        assert_eq!(counts.all_counts["residual_executions"], 1);
+        assert!(
+            owner
+                .metrics()
+                .unwrap()
+                .iter()
+                .any(|metric| metric.value().name() == "scorer_build_ms")
+        );
+
+        // Poll the next execution's real indexed consumer through index opening
+        // before starting its producer. It must wait, never see the old error.
+        let runtime = owner
+            .downcast_ref::<SharedFtsScorerExec>()
+            .unwrap()
+            .prepare_execution()
+            .unwrap();
+        let union = runtime.children()[0].clone();
+        let indexed = union.children()[0].clone();
+        let flat = union.children()[1].clone();
+        let mut indexed_stream = indexed.execute(0, context.clone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                tokio::select! {
+                    result = indexed_stream.try_next() => panic!("consumer completed before its producer: {result:?}"),
+                    _ = tokio::task::yield_now() => {}
+                }
+                if metric_value(indexed.as_ref(), PARTITIONS_SEARCHED_METRIC) > 0 { break; }
+            }
+        }).await.unwrap();
+        assert!(indexed_stream.try_next().now_or_never().is_none());
+        let flat_batches: Vec<_> = flat
+            .execute(0, context.clone())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            flat_batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            0
+        );
+        let result = tokio::time::timeout(Duration::from_secs(1), indexed_stream.try_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result[ROW_ID]
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+
+        let mut stream = owner.execute(0, context).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let batch = stream.try_next().await.unwrap().unwrap();
+                if batch.num_rows() > 0 {
+                    break batch;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.num_rows(), 1);
+        assert_eq!(
+            result[ROW_ID]
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+        assert!(
+            (result[SCORE_COL]
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(0)
+                - 2.1594842)
+                .abs()
+                < 1e-5
+        );
+        let mut counts = ExecutionSummaryCounts::default();
+        // Inspect metrics before EOF or stream drop. Lazy registrations must
+        // already be visible while the owner is still executing.
+        collect_execution_metrics(owner.as_ref(), &mut counts);
+        assert_eq!(
+            owner.metrics().unwrap().output_rows(),
+            Some(result.num_rows())
+        );
+        assert_eq!(counts.all_counts[PARTITIONS_SEARCHED_METRIC], 2);
+        assert_eq!(
+            counts.all_counts["residual_executions"], 3,
+            "shared source metrics must not be counted twice"
+        );
+        assert!(owner.metrics().unwrap().elapsed_compute().unwrap() > 0);
+        drop(stream);
+        let mut final_counts = ExecutionSummaryCounts::default();
+        collect_execution_metrics(owner.as_ref(), &mut final_counts);
+        assert_eq!(final_counts.all_counts, counts.all_counts);
     }
 }

@@ -59,12 +59,13 @@ use crate::index::scalar::inverted::{
     resolve_fts_field, resolve_query_document_granularity, validate_combined_fields_target_column,
 };
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use crate::io::exec::fts::segments::open_fts_segments_without_coverage;
 use crate::io::exec::fts::{
     BoolSlot, BooleanQueryExec, BoostQueryExec, CombinedFieldsQueryExec, CompoundQueryExec,
     CrossColumnCompoundQueryExec, FlatCombinedFieldsExec, FlatMatchFilterExec, FlatMatchQueryExec,
     FlatStatsCoverage, FlatStatsScope, FtsDocumentExec, HybridCompoundQueryExec, MatchQueryExec,
     PhraseQueryExec, SharedFtsScorer, SharedFtsScorerExec,
-    build_boolean_query_children_with_schema, open_fts_segments_without_coverage,
+    build_boolean_query_children_with_schema,
 };
 use crate::io::exec::{FilterPlan as ExprFilterPlan, PreFilterSource, RowAddrMaskFilterExec};
 use crate::{Error, Result};

@@ -2,12 +2,23 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::index::DatasetIndexExt;
 use crate::io::exec::fts::FtsCorpusBinding;
+use crate::io::exec::fts::tests::{assert_execution_error, execute_results};
+use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+use arrow_array::RecordBatchIterator;
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::Column;
+use lance_datafusion::exec::OneShotExec;
 use lance_index::scalar::inverted::query::CombinedFieldsQuery;
+use lance_index::scalar::inverted::query::FtsQuery;
+use lance_index::{
+    IndexType,
+    scalar::{FullTextSearchQuery, InvertedIndexParams},
+};
 
 fn binding() -> FtsCorpusBinding {
     FtsCorpusBinding {
@@ -307,25 +318,31 @@ async fn shared_corpus_combined_reconstruction_replays_after_failure(
     let native_owner = native.downcast_ref::<SharedFtsScorerExec>().unwrap();
     let state = native_owner.binding().unwrap();
     let mut residual = None;
-    // Model decoded leaves with no original process-local scorer. Keep their
-    // native coverage, field order, prefilters and statistics scope intact.
+    // Model decoded leaves with independently allocated coordination, sharing
+    // no original scorer. Keep native coverage, field order and statistics scope.
     let input = native_owner.children()[0]
         .clone()
         .transform_up(|plan| {
             if let Some(node) = plan.downcast_ref::<FlatCombinedFieldsExec>() {
-                let mut node = node.clone();
-                node.shared_scorer = None;
-                let source = Arc::new(FailingResidualExec::new(
-                    node.unindexed_input.clone(),
-                    failure,
-                ));
-                node.unindexed_input = source.clone();
+                let mut children = node.children().into_iter().cloned().collect::<Vec<_>>();
+                let source = Arc::new(FailingResidualExec::new(children[0].clone(), failure));
+                children[0] = source.clone();
                 residual = Some(source);
+                let replaced = plan.replace_children(
+                    children,
+                    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                )?;
+                let node = replaced
+                    .downcast_ref::<FlatCombinedFieldsExec>()
+                    .unwrap()
+                    .clone()
+                    .with_shared_scorer(Arc::new(SharedFtsScorer::new()));
                 return Ok(Transformed::yes(Arc::new(node) as Arc<dyn ExecutionPlan>));
             }
             if let Some(node) = plan.downcast_ref::<CombinedFieldsQueryExec>() {
-                let mut node = node.clone();
-                node.shared_scorer = None;
+                let node = node
+                    .clone()
+                    .with_shared_scorer(Arc::new(SharedFtsScorer::new()));
                 return Ok(Transformed::yes(Arc::new(node) as Arc<dyn ExecutionPlan>));
             }
             Ok(Transformed::no(plan))
@@ -412,9 +429,18 @@ async fn shared_corpus_binding_rejects_different_field_weights() {
     let input = owner.children()[0]
         .clone()
         .transform_up(|plan| {
-            if let Some(node) = plan.downcast_ref::<FlatCombinedFieldsExec>() {
-                let mut node = node.clone();
-                node.query = node.query.try_with_boosts(vec![2.0, 1.0]).unwrap();
+            if let Some(node) = plan.downcast_ref::<CombinedFieldsQueryExec>() {
+                let query = node
+                    .query()
+                    .clone()
+                    .try_with_boosts(vec![2.0, 1.0])
+                    .unwrap();
+                let node = CombinedFieldsQueryExec::new(
+                    node.dataset().clone(),
+                    query,
+                    node.params().clone(),
+                    node.prefilter_source().clone(),
+                );
                 return Ok(Transformed::yes(Arc::new(node) as Arc<dyn ExecutionPlan>));
             }
             Ok(Transformed::no(plan))
