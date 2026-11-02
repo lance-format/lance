@@ -45,12 +45,15 @@ fn reconstruct_indexed(exec: &CombinedFieldsQueryExec) -> CombinedFieldsQueryExe
     rebuilt
 }
 
-fn reconstruct_flat(exec: &FlatCombinedFieldsExec) -> FlatCombinedFieldsExec {
+fn reconstruct_flat(
+    exec: &FlatCombinedFieldsExec,
+    decoded_input: Arc<dyn ExecutionPlan>,
+) -> FlatCombinedFieldsExec {
     FlatCombinedFieldsExec::try_new(
         exec.dataset().clone(),
         exec.query().clone(),
         exec.params().clone(),
-        exec.children()[0].clone(),
+        decoded_input,
         exec.scanned_fragments().clone(),
         exec.stats_scope().clone(),
         exec.emit_prefilter().clone(),
@@ -75,7 +78,7 @@ pub(super) fn reconstruct_plan(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn Executio
                 return Ok(Transformed::yes(Arc::new(rebuilt) as Arc<dyn ExecutionPlan>));
             }
             if let Some(exec) = plan.downcast_ref::<FlatCombinedFieldsExec>() {
-                let mut rebuilt = reconstruct_flat(exec);
+                let mut rebuilt = reconstruct_flat(exec, exec.children()[0].clone());
                 if exec.has_shared_scorer() {
                     rebuilt = rebuilt.with_shared_scorer(shared.clone());
                 }
@@ -201,6 +204,7 @@ async fn bm25f_plan_roundtrip_partial_coverage(
     scanner
         .project(&["id"])
         .unwrap()
+        .prefilter(true)
         .filter("id != 0")
         .unwrap()
         .full_text_search(FullTextSearchQuery::new_query(combined_query_with_boosts(
@@ -352,7 +356,8 @@ async fn bm25f_plan_roundtrip_whole_corpus() {
         PreFilterSource::None,
     )
     .unwrap();
-    let actual = batches(Arc::new(reconstruct_flat(&flat))).await;
+    let rebuilt = reconstruct_flat(&flat, scanner.create_plan().await.unwrap());
+    let actual = batches(Arc::new(rebuilt)).await;
     assert_eq!(actual, batches(Arc::new(flat)).await);
     let oracle = brute_force_bm25f(
         &[
