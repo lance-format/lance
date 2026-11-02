@@ -209,10 +209,11 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
     def check_write(self):
         """Fence old writers; verify current writes and index maintenance."""
         ds = lance.dataset(self.path)
+        new_key = ds.count_rows()
         data = pa.table(
             {
-                "idx": pa.array([1000]),
-                "btree": pa.array([1000]),
+                "idx": pa.array([new_key]),
+                "btree": pa.array([new_key]),
             }
         )
         if self._running_in_old_venv and not _writer_supports_row_address_indices(
@@ -228,10 +229,9 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
         ds = lance.dataset(self.path)
         table = ds.to_table(filter="btree == 7")
         assert table.num_rows == 1
-        # upgrade_downgrade lets both the current build and this writer insert
-        # the same key, so only assert that the newly written row is queryable.
-        table = ds.to_table(filter="btree == 1000")
-        assert table.num_rows >= 1
+        table = ds.to_table(filter=f"btree == {new_key}")
+        assert table.num_rows == 1
+        assert table.column("idx").to_pylist() == [new_key]
 
         # Preserve the post-compaction result checks above, then restore
         # physical-address coverage before testing the next reader's format
@@ -522,10 +522,11 @@ class BitmapRowAddressDomainIndex(UpgradeDowngradeTest):
     def check_write(self):
         """Fence old writers; verify current writes and index maintenance."""
         ds = lance.dataset(self.path)
+        new_key = ds.count_rows()
         data = pa.table(
             {
-                "idx": pa.array([1000]),
-                "bitmap": pa.array([1000]),
+                "idx": pa.array([new_key]),
+                "bitmap": pa.array([new_key]),
             }
         )
         if self._running_in_old_venv and not _writer_supports_row_address_indices(
@@ -541,10 +542,9 @@ class BitmapRowAddressDomainIndex(UpgradeDowngradeTest):
         ds = lance.dataset(self.path)
         table = ds.to_table(filter="bitmap == 7")
         assert table.num_rows == 1
-        # upgrade_downgrade lets both the current build and this writer insert
-        # the same key, so only assert that the newly written row is queryable.
-        table = ds.to_table(filter="bitmap == 1000")
-        assert table.num_rows >= 1
+        table = ds.to_table(filter=f"bitmap == {new_key}")
+        assert table.num_rows == 1
+        assert table.column("idx").to_pylist() == [new_key]
 
 
 @compat_test(min_version="0.22.0")
@@ -713,10 +713,12 @@ class LabelListRowAddressDomainIndex(UpgradeDowngradeTest):
     def check_write(self):
         """Fence old writers; verify current writes and index maintenance."""
         ds = lance.dataset(self.path)
+        new_key = ds.count_rows()
+        label = f"label{new_key}"
         data = pa.table(
             {
-                "idx": pa.array([1000]),
-                "label_list": pa.array([["label1000"]]),
+                "idx": pa.array([new_key]),
+                "label_list": pa.array([[label]]),
             }
         )
         if self._running_in_old_venv and not _writer_supports_row_address_indices(
@@ -732,10 +734,9 @@ class LabelListRowAddressDomainIndex(UpgradeDowngradeTest):
         ds = lance.dataset(self.path)
         table = ds.to_table(filter="array_has_any(label_list, ['label7'])")
         assert table.num_rows == 1
-        # upgrade_downgrade lets both the current build and this writer insert
-        # the same key, so only assert that the newly written row is queryable.
-        table = ds.to_table(filter="array_has_any(label_list, ['label1000'])")
-        assert table.num_rows >= 1
+        table = ds.to_table(filter=f"array_has_any(label_list, ['{label}'])")
+        assert table.num_rows == 1
+        assert table.column("idx").to_pylist() == [new_key]
 
 
 @compat_test(min_version="0.22.0")
