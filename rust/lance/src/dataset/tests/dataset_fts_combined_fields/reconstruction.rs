@@ -6,7 +6,7 @@ use super::*;
 use crate::io::exec::PreFilterSource;
 use crate::io::exec::fts::{
     CombinedFieldsQueryExec, FlatCombinedFieldsExec, FlatStatsCoverage, FlatStatsScope,
-    SharedFtsScorer, SharedFtsScorerExec,
+    SharedFtsScorerExec,
 };
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -61,45 +61,48 @@ fn reconstruct_flat(
     .unwrap()
 }
 
-/// Each fixture is one BM25F query. Reconnect its fresh leaves using the native
-/// owner constructor; owner binding export is tested separately from leaf state.
+/// Reconstruct leaf configuration through its public API, then let each native
+/// owner reconnect its producer and consumer using the exported binding.
 pub(super) fn reconstruct_plan(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-    let shared = Arc::new(SharedFtsScorer::new());
     let mut leaves = 0;
     let mut owners = 0;
     let rebuilt = plan
-        .transform_up(|plan| {
-            if let Some(exec) = plan.downcast_ref::<CombinedFieldsQueryExec>() {
-                let mut rebuilt = reconstruct_indexed(exec);
-                if exec.has_shared_scorer() {
-                    rebuilt = rebuilt.with_shared_scorer(shared.clone());
+        .transform_down_up(
+            |plan| {
+                if let Some(owner) = plan.downcast_ref::<SharedFtsScorerExec>() {
+                    owners += 1;
+                    let binding = owner.binding().unwrap();
+                    let input = reconstruct_plan(owner.children()[0].clone());
+                    let rebuilt = SharedFtsScorerExec::try_new(input, binding).unwrap();
+                    return Ok(Transformed::new(
+                        Arc::new(rebuilt) as Arc<dyn ExecutionPlan>,
+                        true,
+                        TreeNodeRecursion::Jump,
+                    ));
                 }
-                leaves += 1;
-                return Ok(Transformed::yes(Arc::new(rebuilt) as Arc<dyn ExecutionPlan>));
-            }
-            if let Some(exec) = plan.downcast_ref::<FlatCombinedFieldsExec>() {
-                let mut rebuilt = reconstruct_flat(exec, exec.children()[0].clone());
-                if exec.has_shared_scorer() {
-                    rebuilt = rebuilt.with_shared_scorer(shared.clone());
+                Ok(Transformed::no(plan))
+            },
+            |plan| {
+                if let Some(exec) = plan.downcast_ref::<CombinedFieldsQueryExec>() {
+                    leaves += 1;
+                    return Ok(Transformed::yes(
+                        Arc::new(reconstruct_indexed(exec)) as Arc<dyn ExecutionPlan>
+                    ));
                 }
-                leaves += 1;
-                return Ok(Transformed::yes(Arc::new(rebuilt) as Arc<dyn ExecutionPlan>));
-            }
-            if plan.is::<SharedFtsScorerExec>() {
-                owners += 1;
-                return Ok(Transformed::yes(
-                    Arc::new(SharedFtsScorerExec::new_combined(
-                        plan.children()[0].clone(),
-                        shared.clone(),
-                    )) as Arc<dyn ExecutionPlan>,
-                ));
-            }
-            Ok(Transformed::no(plan))
-        })
+                if let Some(exec) = plan.downcast_ref::<FlatCombinedFieldsExec>() {
+                    leaves += 1;
+                    return Ok(Transformed::yes(Arc::new(reconstruct_flat(
+                        exec,
+                        exec.children()[0].clone(),
+                    ))
+                        as Arc<dyn ExecutionPlan>));
+                }
+                Ok(Transformed::no(plan))
+            },
+        )
         .unwrap()
         .data;
-    assert!(leaves > 0);
-    assert!(owners <= 1);
+    assert!(leaves > 0 || owners > 0);
     rebuilt
 }
 
