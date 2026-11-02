@@ -24,21 +24,9 @@ from .compat_decorator import (
 )
 from .util import safe_data_storage_version
 
-# The writer capability for row-address indices landed in #10352 and first
-# shipped in 15.0.0b7. Later releases understand the flag and may continue
-# writing these datasets; only releases that predate that fence must reject
-# them.
-_ROW_ADDRESS_WRITER_SUPPORT_VERSION = Version("15.0.0b7")
-
 
 def _writer_supports_row_address_indices(compat_version):
-    return Version(compat_version) >= _ROW_ADDRESS_WRITER_SUPPORT_VERSION
-
-
-def test_row_address_writer_support_starts_with_beta_7():
-    assert not _writer_supports_row_address_indices("15.0.0b6")
-    assert _writer_supports_row_address_indices("15.0.0b7")
-    assert _writer_supports_row_address_indices("15.0.0")
+    return Version(compat_version) >= Version("15.0.0")
 
 
 def _assert_row_address_writes_fenced(dataset, data, compat_version):
@@ -151,8 +139,8 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
       by the current build.
     - Updating it (inserting rows, then optimizing) with the current build
       keeps both old and new rows queryable.
-    - Readers released before 14.0.0b16 must ignore the updated index and
-      answer correctly via a full scan. Readers from 14.0.0b16 onward must
+    - Readers released before 14.0.0 must ignore the updated index and
+      answer correctly via a full scan. Readers from 14.0.0 onward must
       use it. The writer capability must reject inserts and unsafe updates
       from released writers without changing the dataset.
     """
@@ -161,11 +149,8 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
         self.path = path
 
     def _supports_row_address_index(self) -> bool:
-        # beta.16 is the first released reader for the row-address format.
-        # The current checkout's version string may still predate that release,
-        # so distinguish it by the harness role, not by lance.__version__.
         return not self._running_in_old_venv or Version(self.compat_version) >= Version(
-            "14.0.0b16"
+            "14.0.0"
         )
 
     def create(self):
@@ -237,69 +222,6 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
         # physical-address coverage before testing the next reader's format
         # support.
         ds.optimize.optimize_indices()
-
-
-@pytest.fixture
-def btree_row_address_compat_case(tmp_path):
-    path = tmp_path / "data.lance"
-    dataset = lance.write_dataset(
-        pa.table({"idx": range(16), "btree": range(16)}),
-        path,
-        max_rows_per_file=8,
-        data_storage_version="2.1",
-        enable_stable_row_ids=True,
-    )
-    dataset.create_scalar_index("btree", "BTREE")
-    return BTreeRowAddressDomainIndex(path)
-
-
-@pytest.mark.parametrize(
-    "version,running_in_old_venv,expect_index_used",
-    [
-        pytest.param("14.0.0b15", False, True, id="current-before-release"),
-        pytest.param("14.0.0b16", False, True, id="current-same-version"),
-        pytest.param("13.0.0", True, False, id="older-stable"),
-        pytest.param("14.0.0b15", True, False, id="last-unsupported-beta"),
-        pytest.param("14.0.0b16", True, True, id="first-supported-beta"),
-        pytest.param("14.0.0-beta.16", True, True, id="cargo-beta-spelling"),
-        pytest.param("14.0.0", True, True, id="stable-release"),
-    ],
-)
-def test_btree_row_address_reader_capability(
-    btree_row_address_compat_case,
-    monkeypatch,
-    version,
-    running_in_old_venv,
-    expect_index_used,
-):
-    case = btree_row_address_compat_case
-    monkeypatch.setattr(lance, "__version__", version)
-    case.compat_version = version
-    case._running_in_old_venv = running_in_old_venv
-    dataset = lance.dataset(case.path)
-    if not expect_index_used:
-        dataset.drop_index("btree_idx")
-    case.check_read()
-
-    # The opposite plan must still fail: neither reader capability may be
-    # treated as permission to silently stop checking index usage.
-    if expect_index_used:
-        dataset.drop_index("btree_idx")
-        message = "expected the BTREE index to be used"
-    else:
-        dataset.create_scalar_index("btree", "BTREE")
-        message = "an older build must not use a BTREE index"
-    with pytest.raises(AssertionError, match=message):
-        case.check_read()
-
-
-def test_btree_row_address_maintenance_restores_coverage(btree_row_address_compat_case):
-    case = btree_row_address_compat_case
-    case.compat_version = "14.0.0b16"
-    expected_key = lance.dataset(case.path).count_rows()
-    case.check_write()
-    case.check_read()
-    assert lance.dataset(case.path).count_rows(f"btree == {expected_key}") == 1
 
 
 @compat_test(min_version="0.30.0")
@@ -467,19 +389,18 @@ class BitmapRowAddressDomainIndex(UpgradeDowngradeTest):
       correctly by the current build.
     - Updating it (inserting rows, then optimizing) with the current build
       keeps both old and new rows queryable.
-    - Readers released before 15.0.0b2 must ignore the updated index and
-      answer correctly via a full scan. Readers from 15.0.0b2 onward must
-      use it. The writer capability must reject inserts and unsafe updates
-      from released writers without changing the dataset.
+    - Stable readers that do not support the updated index must ignore it and
+      answer correctly via a full scan. Readers from 15.0.0 onward must use
+      it. Stable writers without the row-address capability must reject
+      inserts and unsafe updates without changing the dataset.
     """
 
     def __init__(self, path: Path):
         self.path = path
 
     def _supports_row_address_index(self) -> bool:
-        # 15.0.0b2 is the first release containing the row-address format.
         return not self._running_in_old_venv or Version(self.compat_version) >= Version(
-            "15.0.0b2"
+            "15.0.0"
         )
 
     def create(self):
@@ -656,19 +577,18 @@ class LabelListRowAddressDomainIndex(UpgradeDowngradeTest):
       correctly by the current build.
     - Updating it (inserting rows, then optimizing) with the current build
       keeps both old and new rows queryable.
-    - Readers released before 15.0.0b2 must ignore the updated index and
-      answer correctly via a full scan. Readers from 15.0.0b2 onward must
-      use it. The writer capability must reject inserts and unsafe updates
-      from released writers without changing the dataset.
+    - Stable readers that do not support the updated index must ignore it and
+      answer correctly via a full scan. Readers from 15.0.0 onward must use
+      it. Stable writers without the row-address capability must reject
+      inserts and unsafe updates without changing the dataset.
     """
 
     def __init__(self, path: Path):
         self.path = path
 
     def _supports_row_address_index(self) -> bool:
-        # 15.0.0b2 is the first release containing the row-address format.
         return not self._running_in_old_venv or Version(self.compat_version) >= Version(
-            "15.0.0b2"
+            "15.0.0"
         )
 
     def create(self):
