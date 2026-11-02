@@ -384,14 +384,14 @@ pub struct QuantizedDistTable {
 /// use lance_index::vector::storage::RabitRawQueryContext;
 ///
 /// let context = RabitRawQueryContext::new(
-///     8,
+///     64,
 ///     1,
-///     vec![0.0; 8],
-///     vec![0.0; 32],
+///     vec![0.0; 64],
+///     vec![0.0; 256],
 ///     Vec::new(),
 ///     0.0,
 /// );
-/// assert_eq!(context.dist_table().len(), 32);
+/// assert_eq!(context.dist_table().len(), 256);
 /// ```
 #[non_exhaustive]
 #[derive(Debug)]
