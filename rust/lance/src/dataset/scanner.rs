@@ -7761,6 +7761,14 @@ impl Scanner {
                             q.k, q.refine_factor
                         ))
                     })?;
+            if q.refine_factor.is_some() {
+                // Refinement applies the range to exact distances, while the
+                // ANN stage ranks on the index's own scale. Transform only the
+                // candidate bounds; BatchRefineExec receives the original query.
+                let scale = index_distance_scale(index_metric, index_segments);
+                batch_query.lower_bound = q.lower_bound.map(|bound| bound * scale);
+                batch_query.upper_bound = q.upper_bound.map(|bound| bound * scale);
+            }
             batch_query.refine_factor = None;
             let prefilter_source = self
                 .ann_prefilter_source(filter_plan, index_segments)
@@ -13261,6 +13269,144 @@ mod test {
                 (lower..upper).contains(distance),
                 "{distance} is outside [{lower}, {upper})"
             );
+        }
+    }
+
+    /// The batch ANN stage must translate the exact cosine range to the SQ
+    /// index's L2 scale before collecting refinement candidates.
+    #[tokio::test]
+    async fn test_batch_refined_knn_scales_cosine_range_for_ann_stage() {
+        use lance_linalg::distance::cosine_distance;
+
+        const DIM: usize = 16;
+        const ROWS: usize = 512;
+        let mut seed: u64 = 42;
+        let values: Vec<f32> = (0..ROWS * DIM)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+            })
+            .collect();
+        let query_values = values[..2 * DIM].to_vec();
+        let queries = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(query_values.clone()),
+            DIM as i32,
+        )
+        .unwrap();
+        let rows = values.as_chunks::<DIM>().0;
+        let exact = query_values
+            .as_chunks::<DIM>()
+            .0
+            .iter()
+            .map(|query| {
+                let mut distances = rows
+                    .iter()
+                    .map(|row| cosine_distance(query, row))
+                    .collect::<Vec<_>>();
+                distances.sort_by(f32::total_cmp);
+                distances
+            })
+            .collect::<Vec<_>>();
+        // Make the unscaled ANN range exclude every exact in-range candidate.
+        let lower = exact
+            .iter()
+            .map(|distances| distances[20])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let upper = exact
+            .iter()
+            .map(|distances| distances[60])
+            .fold(f32::INFINITY, f32::min)
+            .min(2.0 * lower);
+        assert!(upper > lower);
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    DIM as i32,
+                ),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..ROWS as i32)),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM as i32)
+                        .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let tmp = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &tmp,
+            None,
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::with_ivf_sq_params(
+                    DistanceType::Cosine,
+                    IvfBuildParams::new(1),
+                    SQBuildParams::default(),
+                ),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, 5)
+            .unwrap()
+            .minimum_nprobes(1)
+            .maximum_nprobes(1)
+            .refine(10)
+            .distance_range(Some(lower), Some(upper))
+            .project(&["id"])
+            .unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ANNIvfBatch"), "{plan}");
+        assert!(plan.contains("BatchRefine"), "{plan}");
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 10);
+        for query_index in 0..2 {
+            let query = Float32Array::from(
+                query_values[query_index * DIM..(query_index + 1) * DIM].to_vec(),
+            );
+            let single = dataset
+                .scan()
+                .nearest("vec", &query, 5)
+                .unwrap()
+                .minimum_nprobes(1)
+                .maximum_nprobes(1)
+                .refine(10)
+                .distance_range(Some(lower), Some(upper))
+                .project(&["id"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(single.num_rows(), 5);
+            let mask = BooleanArray::from_iter(
+                batch[QUERY_INDEX_COL]
+                    .as_primitive::<Int32Type>()
+                    .iter()
+                    .map(|value| value.map(|value| value == query_index as i32)),
+            );
+            let actual = arrow::compute::filter_record_batch(&batch, &mask).unwrap();
+            assert_eq!(actual["id"].as_ref(), single["id"].as_ref());
+            assert_eq!(actual[DIST_COL].as_ref(), single[DIST_COL].as_ref());
         }
     }
 

@@ -10,8 +10,10 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{Int32Type, UInt64Type};
 use arrow_array::{Array, Float32Array, Int32Array, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, SchemaRef};
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::context::TaskContext;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
@@ -233,10 +235,8 @@ impl BatchRefineExec {
                             let selected =
                                 arrow_select::take::take(vectors.as_ref(), &indices, None)?;
                             let key = query.key.slice(query_index * dim, dim);
-                            let distances = metric.arrow_batch_func()(
-                                key.as_ref(),
-                                selected.as_fixed_size_list(),
-                            )?;
+                            let distances =
+                                metric.batch(key.as_ref(), selected.as_fixed_size_list())?;
                             let heap = &mut heaps[query_index];
                             for (position, distance) in distances.iter().enumerate() {
                                 let Some(distance) = distance else { continue };
@@ -332,6 +332,12 @@ impl ExecutionPlan for BatchRefineExec {
     }
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![Distribution::SinglePartition]
+    }
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
@@ -490,6 +496,7 @@ mod tests {
             upper_bound: (scenario == "bounded").then_some(101.0),
             minimum_nprobes: 1,
             maximum_nprobes: Some(1),
+            search_effort: 0.5,
             ef: None,
             refine_factor: Some(2),
             metric_type: Some(DistanceType::L2),
