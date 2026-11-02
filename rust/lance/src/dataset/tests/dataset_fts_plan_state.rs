@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod compound;
+
 use std::sync::Arc;
 
 use arrow_array::builder::{ListBuilder, StringBuilder};
