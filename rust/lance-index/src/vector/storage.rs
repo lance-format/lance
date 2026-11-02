@@ -1331,6 +1331,7 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
     reader: FileReader,
 
     distance_type: DistanceType,
+    quantizer: Option<Quantizer>,
     metadata: Q::Metadata,
 
     ivf: IvfModel,
@@ -1358,9 +1359,9 @@ pub struct IvfQuantizationStorage<Q: Quantization> {
 
 impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        // The resident store is charged as its own entry of the index cache
-        // (`ResidentColumnsEntry`), not with every storage reading it.
-        self.metadata.deep_size_of_children(context) + self.ivf.deep_size_of_children(context)
+        self.quantizer.deep_size_of_children(context)
+            + self.metadata.deep_size_of_children(context)
+            + self.ivf.deep_size_of_children(context)
     }
 }
 
@@ -1433,10 +1434,16 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         if let Some(bytes) = quantizer_bytes {
             metadata.parse_buffer(bytes)?;
         }
+        let quantizer = if Q::retain_quantizer_for_partition_storage() {
+            Some(Q::from_metadata(&metadata, distance_type)?)
+        } else {
+            None
+        };
 
         Ok(Self {
             reader,
             distance_type,
+            quantizer,
             metadata,
             ivf,
             frag_reuse_index,
@@ -1472,9 +1479,15 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         distance_type: DistanceType,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
     ) -> Self {
+        let quantizer = if Q::retain_quantizer_for_partition_storage() {
+            Q::from_metadata(&metadata, distance_type).ok()
+        } else {
+            None
+        };
         Self {
             reader,
             distance_type,
+            quantizer,
             metadata,
             ivf,
             frag_reuse_index,
@@ -1659,8 +1672,10 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     }
 
     pub fn quantizer(&self) -> Result<Quantizer> {
-        let metadata = self.metadata();
-        Q::from_metadata(metadata, self.distance_type)
+        match &self.quantizer {
+            Some(quantizer) => Ok(quantizer.clone()),
+            None => Q::from_metadata(self.metadata(), self.distance_type),
+        }
     }
 
     pub fn metadata(&self) -> &Q::Metadata {
@@ -1717,12 +1732,21 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             .read_partition_batch(part_id, io_stats.as_ref())
             .await?;
         let (batch, remapper) = self.remap_partition_batch(batch).await?;
-        Q::Storage::try_from_batch_with_remapper(
-            batch,
-            self.metadata(),
-            self.distance_type,
-            remapper,
-        )
+        match &self.quantizer {
+            Some(quantizer) => Q::Storage::try_from_batch_with_quantizer(
+                batch,
+                quantizer,
+                self.metadata(),
+                self.distance_type,
+                remapper,
+            ),
+            None => Q::Storage::try_from_batch_with_remapper(
+                batch,
+                self.metadata(),
+                self.distance_type,
+                remapper,
+            ),
+        }
     }
 
     /// Every row of partition `part_id` as [`Self::schema`]'s
@@ -1868,12 +1892,21 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             Some(store) => store.attach(schema, Some(entry), ResidentRows::Range(range), attach)?,
         };
         let (batch, remapper) = self.remap_partition_batch(batch).await?;
-        let storage = Q::Storage::try_from_batch_with_remapper(
-            batch,
-            self.metadata(),
-            self.distance_type,
-            remapper,
-        )?;
+        let storage = match &self.quantizer {
+            Some(quantizer) => Q::Storage::try_from_batch_with_quantizer(
+                batch,
+                quantizer,
+                self.metadata(),
+                self.distance_type,
+                remapper,
+            )?,
+            None => Q::Storage::try_from_batch_with_remapper(
+                batch,
+                self.metadata(),
+                self.distance_type,
+                remapper,
+            )?,
+        };
         let stats = scan_stats::counters();
         stats.code_only_partition_builds.incr();
         stats.code_only_partition_build_ns.add_elapsed(started);
@@ -3004,6 +3037,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     {
         let metadata = self.metadata.clone();
         let distance_type = self.distance_type;
+        let quantizer = self.quantizer.clone();
         if let Some(remapping) = &self.batch_remapper {
             // Tagged asynchronous path.
             lance_index_core::remapping::check_batch_remapping_entry()?;
@@ -3014,13 +3048,21 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             let (batch, remapper) =
                 remap_row_ids_preserving_layout_async(remapping.as_ref(), batch, row_id_idx)
                     .await?;
-            return spawn_prewarm_materialization(move || {
-                Q::Storage::try_from_batch_with_remapper(
+            let quantizer = quantizer.clone();
+            return spawn_prewarm_materialization(move || match &quantizer {
+                Some(quantizer) => Q::Storage::try_from_batch_with_quantizer(
+                    batch,
+                    quantizer,
+                    &metadata,
+                    distance_type,
+                    Some(remapper),
+                ),
+                None => Q::Storage::try_from_batch_with_remapper(
                     batch,
                     &metadata,
                     distance_type,
                     Some(remapper),
-                )
+                ),
             })
             .await;
         }
@@ -3028,12 +3070,21 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         let frag_reuse_index = self.frag_reuse_index.clone();
         spawn_prewarm_materialization(move || {
             let batch = compact_prewarm_batches(batches)?;
-            Q::Storage::try_from_batch_with_remapper(
-                batch,
-                &metadata,
-                distance_type,
-                frag_reuse_index,
-            )
+            match &quantizer {
+                Some(quantizer) => Q::Storage::try_from_batch_with_quantizer(
+                    batch,
+                    quantizer,
+                    &metadata,
+                    distance_type,
+                    frag_reuse_index,
+                ),
+                None => Q::Storage::try_from_batch_with_remapper(
+                    batch,
+                    &metadata,
+                    distance_type,
+                    frag_reuse_index,
+                ),
+            }
         })
         .await
     }
