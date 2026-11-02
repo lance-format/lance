@@ -412,9 +412,9 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .collect::<Result<Vec<_>>>()?,
             },
             Some(pb::transaction::Operation::CompositeOperation(_)) => {
-                // Action-based transactions (Transaction V2) are an experimental
-                // wire format (discussion #5960). This version of Lance recognizes
-                // the message but has no support for it: reject on load, fail-closed. Because
+                // This version of Lance recognizes action-based transactions
+                // (Transaction V2) but has no support for them yet: reject on
+                // load, fail-closed. Because
                 // load_and_sort_new_transactions collects transactions with
                 // try_collect, a concurrent V2 commit in the conflict window
                 // aborts the whole commit rather than being silently skipped.
@@ -951,8 +951,8 @@ mod tests {
 
     #[test]
     fn test_composite_operation_rejected_on_load() {
-        // Action-based transactions (Transaction V2) are an experimental wire
-        // format that this version of Lance does not support. Loading one must fail closed
+        // This version of Lance does not yet support action-based transactions
+        // (Transaction V2). Loading one must fail closed
         // (never be silently skipped or leniently parsed), so that a concurrent
         // V2 commit in the conflict window aborts an in-flight commit.
         let message = pb::Transaction {

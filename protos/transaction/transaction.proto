@@ -390,8 +390,6 @@ message Transaction {
     DataOverlay data_overlay = 115;
     /* Action-based transaction (Transaction V2). See actions.proto.
      *
-     * EXPERIMENTAL: currently rejected on load; no write path.
-     *
      * Lance before v14.0.0 fails to decode this arm when it reads the
      * transaction history or checks a concurrent commit for conflicts. It
      * can still open and scan the table, since the inline transaction is in a
