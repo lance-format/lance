@@ -1075,6 +1075,7 @@ impl MaterializeIndexExec {
             fragments: None,
             segment_uuids: segment_uuids.as_deref(),
         };
+        let needs_recheck = expr.needs_recheck();
         let expr_result = expr.evaluate(&loader, metrics.as_ref());
         let span = debug_span!("create_prefilter");
         let prefilter = span.in_scope(|| {
@@ -1093,9 +1094,10 @@ impl MaterializeIndexExec {
         // runs on the materialized batches via the scan plan, so any
         // non-matching candidates in `upper` are dropped before they
         // reach the user). `AtLeast` carries an unbounded upper, so the
-        // candidate set is the whole row space — not actionable here.
+        // candidate set is the whole row space, which is only usable when
+        // every row is rechecked.
         let take_upper = |result: IndexExprResult| -> Result<RowAddrMask> {
-            if result.is_at_least() && !result.is_exact() {
+            if result.is_at_least() && !result.is_exact() && !needs_recheck {
                 todo!("Support AtLeast in MaterializeIndexExec")
             }
             Ok(result.upper)

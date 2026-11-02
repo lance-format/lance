@@ -21,7 +21,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
-from lance.dataset import ScannerBuilder
+from lance._dataset.scanner import ScannerBuilder
 from lance.indices import IndexConfig
 from lance.query import (
     BooleanQuery,
@@ -277,7 +277,7 @@ def test_list_indices_index_without_details(tmp_path):
     """An index whose manifest entry has no index details (e.g. committed by an
     older writer) is still reported on a best-effort basis: describe_indices()
     does not error, and the type is reported as "Unknown"."""
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     data = pa.table({"id": range(100), "val": range(100)})
     ds = lance.write_dataset(data, tmp_path)
@@ -313,7 +313,7 @@ def test_list_indices_legacy_vector_index_without_details(tmp_path):
     """A legacy vector index predates VectorIndexDetails: it has no index
     details but stores a monolithic index file. Its type is recognized as
     "Vector" from the index file rather than reported as "Unknown"."""
-    from lance.dataset import Index, IndexFile
+    from lance._dataset.index import Index, IndexFile
 
     data = pa.table({"id": range(100), "val": range(100)})
     ds = lance.write_dataset(data, tmp_path)
@@ -4485,7 +4485,7 @@ def build_distributed_fts_index(
     """
     import uuid
 
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     # Generate unique index ID for distributed indexing
     index_id = str(uuid.uuid4())
@@ -5454,7 +5454,7 @@ def test_distribute_fts_index_build(tmp_path):
     ds.merge_index_metadata(index_id, index_type="INVERTED")
 
     # Create an Index object using the new dataclass format
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     # Get the schema field for the indexed column
     # Only use for non nested struct schema
@@ -6887,7 +6887,9 @@ def test_describe_indices(tmp_path, format_version, expected_format_version):
         "{}",
         "{}",
         "{}",
-        '{"path":"x","target_details":{}}',
+        # `$.x` is absent from every document, so the target type was inferred
+        # as utf8, the fallback for an all-null path.
+        '{"path":"x","target_data_type":"utf8","target_details":{}}',
         "{}",
         "{}",
     ]

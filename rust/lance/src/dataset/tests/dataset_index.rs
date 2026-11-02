@@ -23,7 +23,7 @@ use lance_arrow::FixedSizeListArrayExt;
 
 use crate::dataset::write::{WriteMode, WriteParams};
 use crate::index::scalar::load_scalar_segment_params;
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
 use arrow::array::{AsArray, GenericListBuilder, GenericStringBuilder};
 use arrow::datatypes::UInt64Type;
 use arrow_array::RecordBatch;
@@ -8648,6 +8648,62 @@ async fn test_sql_contains_tokens() {
     assert_contains!(&plan, "ScalarIndexQuery");
     assert_eq!(count_null_query_matches(dataset.clone()).await, 0);
 
+    // The index drops stop words, and a query with no tokens left must still
+    // match the rows the scan matches.
+    for (query, expected) in [
+        (
+            "a",
+            vec![
+                "a cat catch a fish",
+                "a fish catch a cat",
+                "a white cat catch a big fish",
+            ],
+        ),
+        (
+            "",
+            vec![
+                "a cat catch a fish",
+                "a fish catch a cat",
+                "a white cat catch a big fish",
+                "cat catchup fish",
+                "cat fish catch",
+            ],
+        ),
+    ] {
+        let results = execute_sql(
+            &format!("select * from foo where contains_tokens(text, '{query}')"),
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        assert_results(results, &StringArray::from(expected));
+
+        // The index cannot narrow such a query, so the plan leaves it to the scan.
+        let results = execute_sql(
+            &format!("explain select * from foo where contains_tokens(text, '{query}')"),
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        let plan = format!("{:?}", results);
+        assert_not_contains!(&plan, "ScalarIndexQuery");
+    }
+
+    // Counting reads the index result directly unless it needs a recheck, and
+    // the index lowercases and drops stop words.
+    for (query, expected) in [("a cat", 3), ("A", 0), ("cat catch fish", 4)] {
+        let count = dataset
+            .count_rows(Some(format!("contains_tokens(text, '{query}')")))
+            .await
+            .unwrap();
+        assert_eq!(
+            count, expected,
+            "count_rows of contains_tokens(text, '{query}')"
+        );
+    }
+
     let appended = arrow_array::record_batch!(("text", Utf8, ["cat catch fish", "dog"])).unwrap();
     let reader = RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema());
     dataset.append(reader, None).await.unwrap();
@@ -8671,6 +8727,73 @@ async fn test_sql_contains_tokens() {
             "cat catch fish",
         ]),
     );
+}
+
+/// On legacy storage the index result is materialized before the recheck. The
+/// query parser does not see the index's custom stop words: 'cat' reaches the
+/// index, which drops it, and 'a' is dropped by the parser but not the index.
+/// Both must match the rows the scan matches.
+#[tokio::test]
+async fn test_sql_contains_tokens_custom_stop_words_on_legacy_storage() {
+    let text_col = Arc::new(StringArray::from(vec![
+        "a cat catch a fish",
+        "a fish catch a cat",
+        "dog fish",
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+        vec![text_col],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let params = WriteParams {
+        data_storage_version: Some(LanceFileVersion::Legacy),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(stream, "memory://", Some(params))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .max_token_length(None)
+                .stem(false)
+                // Not a built-in stop word, so only the index's own list drops it.
+                .custom_stop_words(Some(vec!["cat".to_string()])),
+            true,
+        )
+        .await
+        .unwrap();
+
+    for query in ["cat", "a"] {
+        let results = execute_sql(
+            &format!("select * from foo where contains_tokens(text, '{query}')"),
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        assert_results(
+            results,
+            &StringArray::from(vec!["a cat catch a fish", "a fish catch a cat"]),
+        );
+    }
+
+    // 'cat' reaches the index because the parser cannot see the custom stop
+    // words, so this covers the rechecked AtLeast materialization path.
+    let results = execute_sql(
+        "explain select * from foo where contains_tokens(text, 'cat')",
+        "foo".to_string(),
+        Arc::new(dataset.clone()),
+    )
+    .await
+    .unwrap();
+    let plan = format!("{:?}", results);
+    assert_contains!(&plan, "MaterializeIndex");
 }
 
 #[tokio::test]

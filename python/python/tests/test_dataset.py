@@ -33,8 +33,9 @@ import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest
 from helper import ProgressForTest
+from lance._dataset.optimize import AutoCleanupConfig
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
-from lance.dataset import LANCE_COMMIT_MESSAGE_KEY, AutoCleanupConfig
+from lance.dataset import LANCE_COMMIT_MESSAGE_KEY
 from lance.debug import format_fragment
 from lance.file import LanceFileWriter, stable_version
 from lance.schema import LanceSchema
@@ -2526,7 +2527,7 @@ def test_nonzero_clustering_reference_reaches_rust_validation(tmp_path: Path):
     """
     import dataclasses
 
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     table = pa.Table.from_pydict({"a": range(10)})
     base_dir = tmp_path / "clustering_reference"

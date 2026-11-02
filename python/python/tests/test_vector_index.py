@@ -21,7 +21,8 @@ import pyarrow.compute as pc
 import pytest
 from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
 from lance import LanceDataset, LanceFragment
-from lance.dataset import ScannerBuilder, VectorIndexReader, VectorSearchQuery
+from lance._dataset.index import VectorIndexReader
+from lance._dataset.scanner import ScannerBuilder, VectorSearchQuery
 from lance.indices import IndexFileVersion, IndicesBuilder
 from lance.query import MatchQuery, PhraseQuery
 from lance.util import (  # noqa: E402
@@ -500,8 +501,9 @@ def test_batch_flat_query_matches_repeated_single_queries(dataset, queries):
 
 @pytest.mark.parametrize("metric", ["l2", "cosine"])
 @pytest.mark.parametrize("query_count", [3, 1], ids=["three_queries", "single_query"])
+@pytest.mark.parametrize("refine_factor", [None, 1, 4])
 def test_batch_indexed_query_matches_repeated_single_queries(
-    dataset, metric, query_count
+    dataset, metric, query_count, refine_factor
 ):
     indexed = dataset.create_index(
         "vector",
@@ -520,6 +522,8 @@ def test_batch_indexed_query_matches_repeated_single_queries(
     # nprobes covers every partition so the shared-scan batch path and the
     # repeated single-query path search the same partitions deterministically.
     nearest_kwargs = {"use_index": True, "nprobes": 4}
+    if refine_factor is not None:
+        nearest_kwargs["refine_factor"] = refine_factor
     _assert_batch_matches_single_queries(
         indexed,
         queries,

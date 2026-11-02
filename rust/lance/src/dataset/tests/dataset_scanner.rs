@@ -349,13 +349,18 @@ async fn test_vector_filter_fts_search() {
         approx_mode: Default::default(),
     };
 
+    // Refine the approximate IVF-PQ distances so adjacent vectors have a
+    // deterministic distance order for the strict assertion below.
+    let mut case1_vector_query = vector_query.clone();
+    case1_vector_query.refine_factor = Some(1);
+
     // Case 1: search with prefilter=true, query_filter=vector([300,300,300,300])
     let mut scanner = dataset.scan();
     let stream = scanner
         .full_text_search(FullTextSearchQuery::new("text".to_string()))
         .unwrap()
         .prefilter(true)
-        .filter_query(QueryFilter::Vector(vector_query.clone()))
+        .filter_query(QueryFilter::Vector(case1_vector_query))
         .unwrap()
         .try_into_stream()
         .await

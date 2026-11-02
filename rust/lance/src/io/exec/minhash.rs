@@ -48,7 +48,7 @@ use super::PreFilterSource;
 use super::knn::KNN_INDEX_SCHEMA;
 use super::utils::{IndexMetrics, PreFilterMasks, build_prefilter};
 use crate::Dataset;
-use crate::index::{DatasetIndexInternalExt, validate_segment_params_compatible};
+use crate::index::{loading::DatasetIndexInternalExt, segment::validate_segment_params_compatible};
 
 async fn open_minhash_segment(
     dataset: &Dataset,
