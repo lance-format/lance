@@ -1026,6 +1026,15 @@ impl ResidentAddressProjection {
     /// dataset carries a fragment reuse index, even when it retains every
     /// document, so liveness has to be decided on cardinality.
     fn dense_and_strictly_ascending(&self) -> bool {
+        // `try_ordered_row_addresses` rebuilds full diagnostics by rescanning the
+        // documents when the cached verdict is invalid. This boolean only needs the
+        // category, so answer from the cache instead of paying that scan per call.
+        if matches!(
+            self.cached_row_address_order(),
+            CachedRowAddressOrder::Duplicate | CachedRowAddressOrder::OutOfOrder
+        ) {
+            return false;
+        }
         match self.try_ordered_row_addresses() {
             Ok(ordered) => !ordered.has_sparse_live_docs(),
             Err(_) => false,
@@ -2921,6 +2930,45 @@ mod tests {
             expected
         );
         assert_eq!(projection.ordered_validation_visited_docs(), 6);
+    }
+
+    #[test]
+    fn dense_and_strictly_ascending_trusts_cached_invalid_verdict() {
+        let projection = resident_row_address_projection_for_test(vec![10, 20, 20, 30]);
+        assert!(!projection.dense_and_strictly_ascending());
+        assert_eq!(
+            projection.cached_row_address_order(),
+            CachedRowAddressOrder::Duplicate
+        );
+        let visited = projection.ordered_validation_visited_docs();
+        assert_eq!(visited, 3);
+
+        // The cached category answers the boolean; no diagnostic rebuild or rescan.
+        assert!(!projection.dense_and_strictly_ascending());
+        assert!(!projection.dense_and_strictly_ascending());
+        assert_eq!(projection.ordered_validation_visited_docs(), visited);
+    }
+
+    #[test]
+    fn dense_and_strictly_ascending_requires_dense_ordered_projection() {
+        let dense = resident_row_address_projection_for_test(vec![10, 20, 30]);
+        assert!(dense.dense_and_strictly_ascending());
+
+        let projection = Arc::new(VersionAddressProjection {
+            addresses: AddressValues::Owned(Arc::new(vec![10, 20, 30])),
+            live_docs: Some(RoaringBitmap::from_iter([0, 2])),
+            doc_ids_by_address: OnceCell::new(),
+            ordered_validation: AtomicU8::new(CachedRowAddressOrder::Unknown as u8),
+            materialized_candidate_cost: AtomicUsize::new(0),
+            ordered_validation_visited_docs: AtomicUsize::new(0),
+        });
+        let projection = projection.resident(None).unwrap();
+        assert!(!projection.dense_and_strictly_ascending());
+        assert_eq!(
+            projection.cached_row_address_order(),
+            CachedRowAddressOrder::Ordered
+        );
+        assert_eq!(projection.ordered_validation_visited_docs(), 2);
     }
 
     #[tokio::test]
