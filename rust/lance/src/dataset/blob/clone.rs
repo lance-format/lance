@@ -20,9 +20,9 @@ use lance_table::format::{Fragment, Manifest};
 use object_store::path::Path;
 use uuid::Uuid;
 
+use super::BlobV2BatchRewritePlan;
 use super::locate::{BlobV2DescriptorColumns, join_base_and_relative_path};
 use super::managed::{field_contains_blob, managed_references};
-use crate::dataset::optimize::BlobV2BatchRewritePlan;
 use crate::dataset::{BLOBS_DIR, Dataset};
 
 type BlobCopies = HashMap<(Option<u32>, String), String>;
