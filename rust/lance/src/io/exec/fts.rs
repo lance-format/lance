@@ -104,7 +104,7 @@ mod tests {
         dataset::index::{DatasetIndexRemapperOptions, frag_reuse::cleanup_frag_reuse_index},
         dataset::optimize::{CompactionOptions, CompactionTask, TaskData, commit_compaction},
         dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched},
-        index::DatasetIndexInternalExt,
+        index::loading::DatasetIndexInternalExt,
         io::exec::PreFilterSource,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
     };

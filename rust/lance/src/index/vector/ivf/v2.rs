@@ -3948,4 +3948,4 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
