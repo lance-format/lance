@@ -61,7 +61,7 @@ use crate::index::scalar::inverted::{
     load_segments, transform_fts_document_stream,
 };
 use crate::index::segment_coverage::{SegmentCoverage, SegmentRowDomain};
-use crate::{Dataset, index::DatasetIndexInternalExt};
+use crate::{Dataset, index::loading::DatasetIndexInternalExt};
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
@@ -6796,7 +6796,7 @@ mod tests {
         dataset::optimize::{CompactionOptions, CompactionTask, TaskData, commit_compaction},
         dataset::transaction::{Operation, TransactionBuilder},
         dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched},
-        index::DatasetIndexInternalExt,
+        index::loading::DatasetIndexInternalExt,
         io::exec::PreFilterSource,
         utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture},
     };

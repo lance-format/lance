@@ -107,7 +107,7 @@ use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_f
 use crate::dataset::row_offsets_to_row_addresses;
 use crate::dataset::rowids::{live_row_addrs_to_row_ids, translate_addr_treemap_to_row_ids};
 use crate::dataset::utils::SchemaAdapter;
-use crate::index::DatasetIndexInternalExt;
+use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::scalar::inverted::{
     fts_index_fragment_bitmap, load_segment_details, load_segments, normalize_inverted_details,
     resolve_fts_field, resolve_query_document_granularity, validate_combined_fields_target_column,
@@ -7326,7 +7326,8 @@ impl Scanner {
                 // older writers drop, so it would widen to the carried columns exactly
                 // when the declaration is lost.
                 let candidates = indices.iter().filter(|i| {
-                    i.fields.first() == Some(&column_id) && crate::index::index_type_is_known(i)
+                    i.fields.first() == Some(&column_id)
+                        && crate::index::segment::index_type_is_known(i)
                 });
 
                 // A column may carry several vector indices with different metrics. The
@@ -8772,7 +8773,8 @@ impl Scanner {
             let column_id = self.dataset.schema().field_id(&q.column)?;
             let indices = self.dataset.load_indices().await?;
             if let Some(index) = indices.iter().find(|index| {
-                index.fields.first() == Some(&column_id) && crate::index::index_type_is_known(index)
+                index.fields.first() == Some(&column_id)
+                    && crate::index::segment::index_type_is_known(index)
             }) {
                 let index_metric = if let Some(metric) =
                     crate::index::vector::details::metric_type_from_index_metadata(index)

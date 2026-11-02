@@ -112,7 +112,8 @@ use crate::dataset::utils::CapturedRowIds;
 use crate::index::frag_reuse_with_stable_row_ids::ensure_frag_reuse_recording_allowed;
 use crate::index::vector::details::needs_vector_details_inference;
 use crate::index::{
-    DatasetIndexInternalExt, index_is_usable, load_all_indices, segment_has_vector_details,
+    loading::DatasetIndexInternalExt, loading::load_all_indices, segment::index_is_usable,
+    segment::segment_has_vector_details,
 };
 use crate::io::commit::{commit_transaction, default_commit_retry_timeout, migrate_fragments};
 use arrow::array::AsArray;
@@ -1608,7 +1609,7 @@ pub async fn compact_files_with_planner(
         && dataset.manifest.writer_feature_flags
             & lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX
             != 0
-        && crate::index::load_all_indices(dataset)
+        && crate::index::loading::load_all_indices(dataset)
             .await?
             .iter()
             .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
@@ -6307,7 +6308,7 @@ mod tests {
             .await
             .unwrap();
         // Tag the table: the sticky flag decides the entry's form.
-        let indices: Vec<IndexMetadata> = crate::index::load_all_indices(&dataset)
+        let indices: Vec<IndexMetadata> = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .as_ref()
@@ -6357,7 +6358,9 @@ mod tests {
 
         let committed = fresh(uri).await.unwrap();
         assert_eq!(committed.fragments().len(), 2);
-        let stored = crate::index::load_all_indices(&committed).await.unwrap();
+        let stored = crate::index::loading::load_all_indices(&committed)
+            .await
+            .unwrap();
         let entry = stored
             .iter()
             .find(|idx| idx.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME)

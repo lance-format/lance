@@ -82,7 +82,7 @@ use crate::{
         versions,
         write::merge_insert::logical_plan::{MergeInsertPlanner, WriteSink},
     },
-    index::DatasetIndexInternalExt,
+    index::loading::DatasetIndexInternalExt,
     io::exec::{
         Planner, RowAddrMaskFilterExec, project,
         scalar_index::{IndexLookup, MapIndexExec},
