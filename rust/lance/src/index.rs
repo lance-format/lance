@@ -111,7 +111,8 @@ use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data
 pub use crate::index::vector::{LogicalIvfView, LogicalVectorIndex};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::session::index_caches::{
-    DerivedIndexListingKey, FragReuseIndexKey, IndexMetadataKey, write_index_identity,
+    DerivedIndexListingKey, FragReuseIndexKey, IndexMetadataKey, QueryIndexListing,
+    QueryIndexListingKey, write_index_identity,
 };
 use crate::{Error, Result, dataset::Dataset};
 pub use create::CreateIndexBuilder;
@@ -2762,64 +2763,80 @@ impl DatasetIndexExt for Dataset {
     }
 
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
-        let indices = load_all_indices(self).await?;
-        // Readers apply the fragment reuse index to every index they open.
-        let indices = if has_frag_reuse_with_stable_row_ids(&self.manifest, &indices)
-            && indices.iter().any(is_hidden_by_frag_reuse)
-        {
-            Arc::new(
+        let derived_key = QueryIndexListingKey(DerivedIndexListingKey {
+            version: self.manifest.version,
+            store_identity: &self.object_store.store_prefix,
+            e_tag: self.manifest_location.e_tag.as_deref(),
+        });
+        let derive = || async {
+            let indices = load_all_indices(self).await?;
+            // Failed legacy inference is best-effort. Preserve retries on later calls
+            // instead of treating an incomplete listing as final for this snapshot.
+            let retry_inference = indices
+                .iter()
+                .any(|idx| needs_vector_details_inference(idx, self.schema()));
+            // Readers apply the fragment reuse index to every index they open.
+            let indices = if has_frag_reuse_with_stable_row_ids(&self.manifest, &indices)
+                && indices.iter().any(is_hidden_by_frag_reuse)
+            {
+                Arc::new(
+                    indices
+                        .iter()
+                        .filter(|idx| !is_hidden_by_frag_reuse(idx))
+                        .cloned()
+                        .collect(),
+                )
+            } else {
                 indices
-                    .iter()
-                    .filter(|idx| !is_hidden_by_frag_reuse(idx))
-                    .cloned()
-                    .collect(),
-            )
-        } else {
-            indices
-        };
-        if let Some(fri) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
-            match fri.index_version {
-                // Legacy FRI index version 0 already had its fragment coverage
-                // remapped in load_all_indices().
-                0 => {}
-                1 => {
-                    // Cache the coverage-rewritten listing per snapshot identity:
-                    // load_indices sits on the query-planning and merge_insert
-                    // per-batch paths, and the derivation (segment_coverage plus
-                    // the per-index bitmap rewrites) is otherwise redone on every
-                    // call. The raw ledger and mapping readers are already cached
-                    // by frag_reuse_reader; this caches its derived output.
-                    let derived_key = DerivedIndexListingKey {
-                        version: self.manifest.version,
-                        store_identity: &self.object_store.store_prefix,
-                        e_tag: self.manifest_location.e_tag.as_deref(),
-                    };
-                    return self
-                        .index_cache
-                        .get_or_insert_with_key(derived_key, || async {
-                            let derived =
-                                frag_reuse_reader::load_indices(self, fri, &indices).await?;
-                            Ok(derived.as_ref().clone())
-                        })
-                        .await;
-                }
-                version => {
-                    return Err(Error::not_supported(format!(
-                        "FRI index_version {version} is unsupported. Please upgrade to a newer version",
-                    )));
+            };
+            if let Some(fri) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
+                match fri.index_version {
+                    // Legacy FRI index version 0 already had its fragment coverage
+                    // remapped in load_all_indices().
+                    0 => {}
+                    1 => {
+                        let derived = frag_reuse_reader::load_indices(self, fri, &indices).await?;
+                        return Ok(QueryIndexListing {
+                            indices: derived,
+                            retry_inference,
+                        });
+                    }
+                    version => {
+                        return Err(Error::not_supported(format!(
+                            "FRI index_version {version} is unsupported. Please upgrade to a newer version",
+                        )));
+                    }
                 }
             }
+            if indices.iter().all(index_is_usable) {
+                return Ok(QueryIndexListing {
+                    indices,
+                    retry_inference,
+                });
+            }
+            Ok(QueryIndexListing {
+                indices: Arc::new(
+                    indices
+                        .iter()
+                        .filter(|idx| index_is_usable(idx))
+                        .cloned()
+                        .collect(),
+                ),
+                retry_inference,
+            })
+        };
+        let (listing, was_cached) = self
+            .index_cache
+            .get_or_insert_with_key_hit(derived_key, derive)
+            .await?;
+        if was_cached && listing.retry_inference {
+            let refreshed = Arc::new(derive().await?);
+            self.index_cache
+                .insert_with_key(&derived_key, refreshed.clone())
+                .await;
+            return Ok(refreshed.indices.clone());
         }
-        if indices.iter().all(index_is_usable) {
-            return Ok(indices);
-        }
-        Ok(Arc::new(
-            indices
-                .iter()
-                .filter(|idx| index_is_usable(idx))
-                .cloned()
-                .collect(),
-        ))
+        Ok(listing.indices.clone())
     }
 
     async fn merge_existing_index_segments(
@@ -8786,8 +8803,109 @@ mod tests {
         assert!(results.iter().all(|result| result.is_ok()));
         let after = session.index_cache_stats().await;
 
-        assert_eq!(after.misses - before.misses, 1);
+        // One raw manifest listing and one query-visible listing are populated.
+        assert_eq!(after.misses - before.misses, 2);
         assert_eq!(after.hits - before.hits, 31);
+        let first = results[0].as_ref().unwrap();
+        assert!(
+            results
+                .iter()
+                .all(|result| Arc::ptr_eq(first, result.as_ref().unwrap()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_query_listing_retries_failed_legacy_inference() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = gen_batch()
+            .col("vec", array::rand_vec::<Float32Type>(16.into()))
+            .into_reader_rows(RowCount::from(512), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, directory.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        let params = VectorIndexParams::with_ivf_flat_params(
+            lance_linalg::distance::DistanceType::L2,
+            IvfBuildParams::new(2),
+        );
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        let mut indices = dataset.load_indices().await.unwrap().as_ref().clone();
+        indices[0].index_details = Some(Arc::new(vector_index_details_default()));
+        let index_file = directory
+            .path()
+            .join("_indices")
+            .join(indices[0].uuid.to_string())
+            .join(INDEX_FILE_NAME);
+        let hidden_file = index_file.with_extension("hidden");
+        std::fs::rename(&index_file, &hidden_file).unwrap();
+        dataset.index_cache.clear().await;
+        let raw_key = IndexMetadataKey {
+            version: dataset.manifest.version,
+            store_identity: &dataset.object_store.store_prefix,
+            e_tag: dataset.manifest_location.e_tag.as_deref(),
+        };
+        dataset
+            .index_cache
+            .insert_with_key(&raw_key, Arc::new(indices))
+            .await;
+
+        let incomplete = dataset.load_indices().await.unwrap();
+        assert!(
+            incomplete[0]
+                .index_details
+                .as_ref()
+                .unwrap()
+                .value
+                .is_empty()
+        );
+        std::fs::rename(&hidden_file, &index_file).unwrap();
+        let recovered = dataset.load_indices().await.unwrap();
+        assert!(
+            !recovered[0]
+                .index_details
+                .as_ref()
+                .unwrap()
+                .value
+                .is_empty()
+        );
+        assert!(Arc::ptr_eq(
+            &recovered,
+            &dataset.load_indices().await.unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_query_listing_changes_after_index_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(2));
+        let mut dataset = Dataset::write(data, directory.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        assert!(dataset.load_indices().await.unwrap().is_empty());
+        dataset
+            .create_index(
+                &["value"],
+                IndexType::BTree,
+                Some("value_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let before = dataset.load_indices().await.unwrap();
+        assert_eq!(before.len(), 1);
+        let indexed_version = dataset.version().version;
+        dataset.drop_index("value_idx").await.unwrap();
+        assert!(dataset.load_indices().await.unwrap().is_empty());
+        assert_eq!(before.len(), 1, "the previous snapshot remains immutable");
+        let historical = dataset.checkout_version(indexed_version).await.unwrap();
+        let historical_indices = historical.load_indices().await.unwrap();
+        assert_eq!(historical_indices.len(), 1);
+        assert_eq!(historical_indices[0].uuid, before[0].uuid);
     }
 
     #[tokio::test]
@@ -9065,6 +9183,8 @@ mod tests {
                 .any(|idx| idx.uuid == index_uuid && idx.covering_fields.len() > idx.fields.len()),
             "test setup should have produced a malformed entry"
         );
+        // The test replaces raw metadata without committing a new snapshot.
+        dataset.index_cache.clear().await;
         let metadata_key = crate::session::index_caches::IndexMetadataKey {
             version: dataset.version().version,
             store_identity: &dataset.object_store.store_prefix,
@@ -9480,6 +9600,7 @@ mod tests {
         }
         // Write back via a no-op commit that carries the cleared indices.
         // We commit by doing a delete("false") after replacing the cached indices.
+        dataset.index_cache.clear().await;
         let metadata_key = crate::session::index_caches::IndexMetadataKey {
             version: dataset.version().version,
             store_identity: &dataset.object_store.store_prefix,
