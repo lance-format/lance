@@ -28,10 +28,9 @@
 //!
 //! # Stability
 //!
-//! Transaction V2 is an experimental format feature: breaking changes may be
-//! made to it without a separate vote, and it is removed outright if its
-//! stabilization vote does not pass. Nothing in this module is a
-//! compatibility contract.
+//! Transaction V2 is experimental until its action vocabulary is complete: the
+//! Rust API here may change, and some operations cannot be expressed as
+//! actions yet. The wire format is not experimental.
 //!
 //! Any reader can open a table version committed as a [`CompositeOperation`],
 //! since the inline transaction lives in a manifest field older readers ignore
@@ -296,8 +295,8 @@ impl std::fmt::Display for FieldId {
 /// ```
 ///
 /// Committing one goes through
-/// `CommitBuilder::with_experimental_composite_operations`, which is the
-/// caller's acknowledgement that this is an experimental format (see
+/// `CommitBuilder::with_experimental_composite_operations`, the caller's
+/// acknowledgement that this API is experimental (see
 /// [Stability](self#stability)).
 #[derive(Debug, Clone, PartialEq, DeepSizeOf, Default)]
 pub struct CompositeOperation {
