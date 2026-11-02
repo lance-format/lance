@@ -264,7 +264,13 @@ impl OverlayWriter {
                 source,
             }
         })?;
-        if let Some(blob) = schema.fields_pre_order().find(|field| field.is_blob_v2()) {
+        // Blob v1 columns are stored as Blob v2 from 2.2 on, and the Blob v2
+        // writer only accepts whole batches.
+        let blob_v2_file = versions::writes_blob_v2(file_version);
+        if let Some(blob) = schema
+            .fields_pre_order()
+            .find(|field| field.is_blob_v2() || (blob_v2_file && field.is_blob()))
+        {
             return Err(WriteOverlayError::BlobField {
                 fragment_id,
                 name: blob.name.clone(),

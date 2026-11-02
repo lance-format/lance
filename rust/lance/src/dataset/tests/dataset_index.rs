@@ -5011,18 +5011,26 @@ async fn test_fts_9058_modest_indexed_corpus_with_tail(
 async fn test_fts_9058_reuses_optimized_physical_plan(
     #[values(false, true)] stable_row_ids: bool,
     #[values(false, true)] select_fragment: bool,
+    #[values(false, true)] combined: bool,
 ) {
     let fragments = restricted_match_fragments(&[&[0, 1, 2], &[3, 4], &[5, 6, 7]]);
     let dataset = restricted_match_dataset(&fragments, 1, stable_row_ids).await;
-    let query = MatchQuery::new("alpha beta".to_owned())
-        .with_column(Some("text".to_owned()))
-        .with_fuzziness(Some(0))
-        .with_document_granularity(DocumentGranularity::Row);
+    let query = if combined {
+        FtsQuery::CombinedFields(
+            CombinedFieldsQuery::try_new("alpha beta".to_owned(), vec!["text".to_owned()]).unwrap(),
+        )
+    } else {
+        MatchQuery::new("alpha beta".to_owned())
+            .with_column(Some("text".to_owned()))
+            .with_fuzziness(Some(0))
+            .with_document_granularity(DocumentGranularity::Row)
+            .into()
+    };
     let mut scanner = dataset.scan();
     scanner
         .project(&["id"])
         .unwrap()
-        .full_text_search(FullTextSearchQuery::new_query(query.into()))
+        .full_text_search(FullTextSearchQuery::new_query(query))
         .unwrap()
         .limit(Some(1), None)
         .unwrap();
@@ -5040,14 +5048,22 @@ async fn test_fts_9058_reuses_optimized_physical_plan(
     let explanation = DisplayableExecutionPlan::new(plan.as_ref())
         .indent(false)
         .to_string();
-    assert!(explanation.contains("MatchCorpus"), "{explanation}");
-    assert!(
-        explanation
-            .lines()
-            .any(|line| line.trim_start().starts_with("MatchQuery:")),
-        "{explanation}"
-    );
-    assert!(explanation.contains("FlatMatchQuery:"), "{explanation}");
+    if combined {
+        assert!(
+            explanation.contains("CombinedFieldsCorpus"),
+            "{explanation}"
+        );
+        assert!(explanation.contains("FlatCombinedFields:"), "{explanation}");
+    } else {
+        assert!(explanation.contains("MatchCorpus"), "{explanation}");
+        assert!(
+            explanation
+                .lines()
+                .any(|line| line.trim_start().starts_with("MatchQuery:")),
+            "{explanation}"
+        );
+        assert!(explanation.contains("FlatMatchQuery:"), "{explanation}");
+    }
     let context = get_session_context(&LanceExecutionOptions::default()).task_ctx();
     let (_, mut expected) = raw_match_oracle(&RESTRICTED_MATCH_CORPUS, "alpha beta");
     expected.retain(|(id, _)| *id < if select_fragment { 3 } else { 2 });
@@ -5097,7 +5113,7 @@ enum RestrictedMatchControl {
 
 #[rstest]
 #[tokio::test]
-async fn test_fts_9058_other_query_paths_keep_candidate_filtering(
+async fn test_fts_9058_match_planner_domains(
     #[values(
         RestrictedMatchControl::Unfiltered,
         RestrictedMatchControl::Postfilter,
@@ -5168,13 +5184,31 @@ async fn test_fts_9058_other_query_paths_keep_candidate_filtering(
         "ids": ids.as_ref(),
         "scores": scores.as_ref(),
     });
+    if matches!(
+        control,
+        RestrictedMatchControl::Unfiltered | RestrictedMatchControl::Postfilter
+    ) {
+        assert!(explanation.contains("MatchCorpus"), "{evidence:#}");
+        let (_, mut expected) = raw_match_oracle(&RESTRICTED_MATCH_CORPUS, "alpha beta");
+        expected.truncate(1);
+        if matches!(control, RestrictedMatchControl::Postfilter) {
+            expected.retain(|(id, _)| *id < 2);
+        }
+        assert_eq!(batch.num_rows(), expected.len(), "{evidence:#}");
+        for ((id, score), (expected_id, expected_score)) in ids.iter().zip(scores).zip(expected) {
+            assert_eq!(*id, expected_id, "{evidence:#}");
+            assert!(
+                (f64::from(*score) - expected_score).abs() < 1e-5,
+                "{evidence:#}"
+            );
+        }
+        return;
+    }
     assert!(
         !explanation.contains("MatchCorpus"),
         "unrelated query acquired restricted corpus execution: {evidence:#}"
     );
-    // The original flat paths have one input and apply any candidate predicate
-    // before scoring. A separate emission-selection child belongs only to the
-    // corrected restricted exact root Match path.
+    // Fuzzy and Boolean queries keep their existing candidate filtering paths.
     assert!(
         !flat_child_counts.is_empty(),
         "missing flat path: {evidence:#}"
@@ -5183,22 +5217,9 @@ async fn test_fts_9058_other_query_paths_keep_candidate_filtering(
         flat_child_counts.iter().all(|count| *count == 1),
         "unrelated query acquired corpus emission filtering: {evidence:#}"
     );
-    // Postfiltering happens after global top-k. In this unchanged mixed path,
-    // residual id 6 wins that top-k and is then excluded by id < 2.
-    let expected_rows = usize::from(!matches!(control, RestrictedMatchControl::Postfilter));
-    assert_eq!(
-        batch.num_rows(),
-        expected_rows,
-        "wrong candidates: {evidence:#}"
-    );
+    assert_eq!(batch.num_rows(), 1, "wrong candidates: {evidence:#}");
     assert!(scores.iter().all(|score| score.is_finite()), "{evidence:#}");
-    if !matches!(control, RestrictedMatchControl::Unfiltered) {
-        assert!(ids.iter().all(|id| *id < 2), "filter leaked: {evidence:#}");
-    }
-    if matches!(control, RestrictedMatchControl::Unfiltered) {
-        assert!(explanation.contains("MatchQuery:"), "{evidence:#}");
-        assert!(!explanation.contains("CompoundFtsScorer"), "{evidence:#}");
-    }
+    assert!(ids.iter().all(|id| *id < 2), "filter leaked: {evidence:#}");
 }
 
 #[tokio::test]
@@ -8626,6 +8647,153 @@ async fn test_sql_contains_tokens() {
     let plan = format!("{:?}", results);
     assert_contains!(&plan, "ScalarIndexQuery");
     assert_eq!(count_null_query_matches(dataset.clone()).await, 0);
+
+    // The index drops stop words, and a query with no tokens left must still
+    // match the rows the scan matches.
+    for (query, expected) in [
+        (
+            "a",
+            vec![
+                "a cat catch a fish",
+                "a fish catch a cat",
+                "a white cat catch a big fish",
+            ],
+        ),
+        (
+            "",
+            vec![
+                "a cat catch a fish",
+                "a fish catch a cat",
+                "a white cat catch a big fish",
+                "cat catchup fish",
+                "cat fish catch",
+            ],
+        ),
+    ] {
+        let results = execute_sql(
+            &format!("select * from foo where contains_tokens(text, '{query}')"),
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        assert_results(results, &StringArray::from(expected));
+
+        // The index cannot narrow such a query, so the plan leaves it to the scan.
+        let results = execute_sql(
+            &format!("explain select * from foo where contains_tokens(text, '{query}')"),
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        let plan = format!("{:?}", results);
+        assert_not_contains!(&plan, "ScalarIndexQuery");
+    }
+
+    // Counting reads the index result directly unless it needs a recheck, and
+    // the index lowercases and drops stop words.
+    for (query, expected) in [("a cat", 3), ("A", 0), ("cat catch fish", 4)] {
+        let count = dataset
+            .count_rows(Some(format!("contains_tokens(text, '{query}')")))
+            .await
+            .unwrap();
+        assert_eq!(
+            count, expected,
+            "count_rows of contains_tokens(text, '{query}')"
+        );
+    }
+
+    let appended = arrow_array::record_batch!(("text", Utf8, ["cat catch fish", "dog"])).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema());
+    dataset.append(reader, None).await.unwrap();
+
+    let index_name = dataset.load_indices().await.unwrap()[0].name.clone();
+    let mut scanner = dataset.scan();
+    scanner
+        .filter("contains_tokens(text, 'cat catch fish')")
+        .unwrap()
+        .with_ignored_scalar_indices([index_name]);
+    let plan = scanner.explain_plan(true).await.unwrap();
+    assert_not_contains!(&plan, "ScalarIndexQuery");
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_results(
+        vec![batch],
+        &StringArray::from(vec![
+            "a cat catch a fish",
+            "a fish catch a cat",
+            "a white cat catch a big fish",
+            "cat fish catch",
+            "cat catch fish",
+        ]),
+    );
+}
+
+/// On legacy storage the index result is materialized before the recheck. The
+/// query parser does not see the index's custom stop words: 'cat' reaches the
+/// index, which drops it, and 'a' is dropped by the parser but not the index.
+/// Both must match the rows the scan matches.
+#[tokio::test]
+async fn test_sql_contains_tokens_custom_stop_words_on_legacy_storage() {
+    let text_col = Arc::new(StringArray::from(vec![
+        "a cat catch a fish",
+        "a fish catch a cat",
+        "dog fish",
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+        vec![text_col],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let params = WriteParams {
+        data_storage_version: Some(LanceFileVersion::Legacy),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(stream, "memory://", Some(params))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .max_token_length(None)
+                .stem(false)
+                // Not a built-in stop word, so only the index's own list drops it.
+                .custom_stop_words(Some(vec!["cat".to_string()])),
+            true,
+        )
+        .await
+        .unwrap();
+
+    for query in ["cat", "a"] {
+        let results = execute_sql(
+            &format!("select * from foo where contains_tokens(text, '{query}')"),
+            "foo".to_string(),
+            Arc::new(dataset.clone()),
+        )
+        .await
+        .unwrap();
+        assert_results(
+            results,
+            &StringArray::from(vec!["a cat catch a fish", "a fish catch a cat"]),
+        );
+    }
+
+    // 'cat' reaches the index because the parser cannot see the custom stop
+    // words, so this covers the rechecked AtLeast materialization path.
+    let results = execute_sql(
+        "explain select * from foo where contains_tokens(text, 'cat')",
+        "foo".to_string(),
+        Arc::new(dataset.clone()),
+    )
+    .await
+    .unwrap();
+    let plan = format!("{:?}", results);
+    assert_contains!(&plan, "MaterializeIndex");
 }
 
 #[tokio::test]
