@@ -105,7 +105,9 @@ pub(super) async fn load_indices(
             .into_iter()
             .zip(mapping.segment_coverage(&provenance))
         {
-            if coverage.is_empty() {
+            // FTS needs the index's tokenizer settings even when all live
+            // fragments are uncovered and must be searched with a scan.
+            if coverage.is_empty() && !super::segment_has_inverted_details(index) {
                 continue;
             }
             let mut index = index.clone();

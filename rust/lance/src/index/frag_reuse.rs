@@ -2558,7 +2558,8 @@ mod tests {
     use crate::utils::test::DatagenExt;
     use arrow_array::cast::AsArray;
     use arrow_array::types::Int32Type;
-    use arrow_array::{Int32Array, RecordBatch};
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, record_batch};
+    use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
     use lance_table::format::Fragment;
     use lance_table::format::pb::fragment_reuse_index_details::{
@@ -3444,6 +3445,142 @@ mod tests {
         assert_eq!(sorted_values(&dataset).await, before);
         assert_eq!(filtered_values(&dataset, "i = 3").await, vec![3]);
         assert_eq!(filtered_values(&dataset, "i >= 4").await, vec![4, 5, 6, 7]);
+    }
+
+    #[rstest::rstest]
+    #[case::ordered_with_append(false, true)]
+    #[case::partition_with_append(true, true)]
+    #[case::ordered_without_append(false, false)]
+    #[case::partition_without_append(true, false)]
+    #[tokio::test]
+    async fn inverted_search_after_chained_tagged_rewrite(
+        #[case] is_final_partition: bool,
+        #[case] has_unindexed_append: bool,
+    ) {
+        let batch = record_batch!(
+            ("i", Int32, [0, 1, 2, 3, 4, 5, 6, 7]),
+            (
+                "text",
+                Utf8,
+                [
+                    Some("running"),
+                    None,
+                    Some("walking"),
+                    Some("running"),
+                    None,
+                    Some("walking"),
+                    Some("running"),
+                    Some("walking")
+                ]
+            )
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.fragments().len(), 4);
+        let mut expected = vec![0, 3, 6];
+
+        for round in 0..2 {
+            if round == 0 || is_final_partition {
+                reserve_fragments(&mut dataset, 20).await;
+                let old_fragments = dataset.fragments().as_ref().clone();
+                let source_ids = old_fragments
+                    .iter()
+                    .map(|fragment| fragment.id)
+                    .collect::<Vec<_>>();
+                let (transition, destinations) =
+                    reader_tests::prepare_partition(&dataset, &source_ids, 10 + round * 20).await;
+                let frag_reuse_index = Some(entry_appending(&dataset, vec![transition]).await);
+                let read_version = dataset.manifest.version;
+                dataset = crate::dataset::write::CommitBuilder::new(Arc::new(dataset))
+                    .execute(Transaction::new(
+                        read_version,
+                        Operation::Rewrite {
+                            groups: vec![RewriteGroup {
+                                old_fragments,
+                                new_fragments: destinations,
+                            }],
+                            rewritten_indices: vec![],
+                            frag_reuse_index,
+                        },
+                        None,
+                    ))
+                    .await
+                    .unwrap();
+            }
+            if round == 0 {
+                dataset
+                    .create_index(
+                        &["text"],
+                        lance_index::IndexType::Inverted,
+                        Some("text_idx".into()),
+                        &InvertedIndexParams::default().stem(true),
+                        false,
+                    )
+                    .await
+                    .unwrap();
+            }
+            if round == 0 || !is_final_partition {
+                crate::dataset::optimize::compact_files(
+                    &mut dataset,
+                    crate::dataset::optimize::CompactionOptions {
+                        target_rows_per_fragment: 100,
+                        defer_index_remap: true,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+
+            // "run" matches "running" only with the index's nondefault stemmer,
+            // including when every row must be searched without the index.
+            let mut scan = dataset.scan();
+            scan.full_text_search(FullTextSearchQuery::new("run".into()))
+                .unwrap();
+            let hits = scan.try_into_batch().await.unwrap();
+            let mut values = hits["i"].as_primitive::<Int32Type>().values().to_vec();
+            values.sort_unstable();
+            assert_eq!(values, expected);
+            let listing = dataset.load_indices().await.unwrap();
+            let segment = listing
+                .iter()
+                .find(|index| index.name == "text_idx")
+                .unwrap();
+            if round == 1 && has_unindexed_append {
+                assert!(segment.fragment_bitmap.as_ref().unwrap().is_empty());
+            } else {
+                assert_eq!(
+                    segment.fragment_bitmap.as_ref().unwrap(),
+                    dataset.fragment_bitmap.as_ref()
+                );
+            }
+
+            if round == 0 && has_unindexed_append {
+                let appended = record_batch!(
+                    ("i", Int32, [8, 9]),
+                    ("text", Utf8, [Some("running"), None])
+                )
+                .unwrap();
+                dataset
+                    .append(
+                        RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                expected.push(8);
+            }
+        }
     }
 
     async fn filtered_values(dataset: &Dataset, predicate: &str) -> Vec<i32> {
