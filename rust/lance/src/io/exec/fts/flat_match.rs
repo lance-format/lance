@@ -1063,7 +1063,7 @@ mod tests {
     use super::*;
     use crate::dataset::transaction::{Operation, TransactionBuilder};
     use crate::index::DatasetIndexExt;
-    use crate::index::DatasetIndexInternalExt;
+    use crate::index::loading::DatasetIndexInternalExt;
     use crate::io::exec::fts::tests::StatsHolder;
     use crate::io::exec::utils::IndexMetrics;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};

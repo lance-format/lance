@@ -4,5 +4,4 @@
 # Do not add new entries: split the module instead.
 rust/lance-index/src/scalar/inverted/wand.rs
 rust/lance/src/dataset/mem_wal/write.rs
-rust/lance/src/index.rs
 rust/lance/src/io/commit/conflict_resolver.rs

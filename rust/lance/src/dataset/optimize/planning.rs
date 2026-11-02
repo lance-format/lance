@@ -36,7 +36,8 @@ use crate::dataset::versions;
 use crate::index::frag_reuse_with_stable_row_ids::ensure_frag_reuse_recording_allowed;
 use crate::index::vector::details::needs_vector_details_inference;
 use crate::index::{
-    DatasetIndexInternalExt, index_is_usable, load_all_indices, segment_has_vector_details,
+    loading::{DatasetIndexInternalExt, load_all_indices},
+    segment::{index_is_usable, segment_has_vector_details},
 };
 
 /// Controls how data is rewritten during compaction.
