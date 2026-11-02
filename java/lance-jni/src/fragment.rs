@@ -762,7 +762,7 @@ const DATA_FILE_CONSTRUCTOR_SIG: &str =
     "(Ljava/lang/String;[I[IIILjava/lang/Long;Ljava/lang/Integer;)V";
 const DELETE_FILE_CLASS: &str = "org/lance/fragment/DeletionFile";
 const DELETE_FILE_CONSTRUCTOR_SIG: &str =
-    "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
+    "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;[B)V";
 const DELETE_FILE_TYPE_CLASS: &str = "org/lance/fragment/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "org/lance/FragmentMetadata";
 const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/VersionMeta;Ljava/util/List;Ljava/lang/Long;Ljava/util/Map;)V";
@@ -861,6 +861,10 @@ impl IntoJava for &DeletionFile {
         };
         let file_type = self.file_type.into_java(env)?;
         let base_id = convert_to_java_integer(env, self.base_id)?;
+        let inline = match &self.inline {
+            Some(bytes) => env.byte_array_from_slice(bytes)?.into(),
+            None => JObject::null(),
+        };
         Ok(env.new_object(
             DELETE_FILE_CLASS,
             DELETE_FILE_CONSTRUCTOR_SIG,
@@ -870,6 +874,7 @@ impl IntoJava for &DeletionFile {
                 JValueGen::Object(&num_deleted_rows),
                 JValueGen::Object(&file_type),
                 JValueGen::Object(&base_id),
+                JValueGen::Object(&inline),
             ],
         )?)
     }
@@ -1094,12 +1099,19 @@ impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
             .l()?
             .extract_object(env)?;
         let base_id = get_base_id(env, self)?;
+        let inline = env.call_method(self, "getInline", "()[B", &[])?.l()?;
+        let inline = if inline.is_null() {
+            None
+        } else {
+            Some(env.convert_byte_array(JByteArray::from(inline))?.into())
+        };
         Ok(DeletionFile {
             read_version,
             id,
             num_deleted_rows,
             file_type,
             base_id,
+            inline,
         })
     }
 }

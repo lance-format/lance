@@ -17,6 +17,7 @@ use std::time::Instant;
 use arrow_array::{Float32Array, RecordBatch, UInt32Array};
 use async_trait::async_trait;
 use lance_core::cache::WeakLanceCache;
+use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_index::metrics::MetricsCollector;
 use lance_index::prefilter::PreFilter;
@@ -112,7 +113,8 @@ pub struct RabitSignPartition {
     _in_flight: PreparedPartitionGuard,
     /// Binary inner products and lower bounds in partition row order.
     pub stage: SignStage,
-    /// Accepted partition offsets; `None` accepts every row.
+    /// Accepted physical partition offsets, excluding FRI tombstones as well
+    /// as rows rejected by the query prefilter. `None` accepts every row.
     pub accept: Option<Vec<bool>>,
 }
 
@@ -173,7 +175,8 @@ impl RabitScanContext {
         self.index
             .prepare_partition_without_prefilter_wait(
                 partition_id,
-                &query,
+                Arc::new(query),
+                dist_q_c,
                 self.pre_filter.clone(),
                 self.metrics.as_ref(),
                 self.raw_query.clone(),
@@ -248,11 +251,17 @@ impl RabitScanContext {
                 scan_stats::counters().stage1_cpu_ns.add_elapsed(computing);
                 return Ok(None);
             }
-            let accept = (!pre_filter.is_empty()).then(|| {
+            // FRI deletions must be excluded even when there is no query
+            // filter: their slots remain so ex gathers keep file offsets.
+            let needs_mask = !pre_filter.is_empty()
+                || storage
+                    .row_ids()
+                    .any(|&row_id| row_id == RowAddress::TOMBSTONE_ROW);
+            let accept = needs_mask.then(|| {
                 let mask = pre_filter.mask();
                 storage
                     .row_ids()
-                    .map(|&row_id| mask.selected(row_id))
+                    .map(|&row_id| row_id != RowAddress::TOMBSTONE_ROW && mask.selected(row_id))
                     .collect()
             });
             scan_stats::counters().stage1_cpu_ns.add_elapsed(computing);

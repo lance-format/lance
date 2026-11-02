@@ -377,8 +377,8 @@ impl StructuralPrimitiveFieldScheduler {
                 let def_meaning = constant_layout
                     .layers
                     .iter()
-                    .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
-                    .collect::<Vec<_>>();
+                    .map(|l| EncodingUtils::try_repdef_layer_to_def_interp(*l))
+                    .collect::<Result<Vec<_>>>()?;
                 let has_scalar_value = constant_layout.inline_value.is_some()
                     || page_info.buffer_offsets_and_sizes.len() == 1
                     || page_info.buffer_offsets_and_sizes.len() == 3;
@@ -426,8 +426,8 @@ impl StructuralPrimitiveFieldScheduler {
                 let def_meaning = blob
                     .layers
                     .iter()
-                    .map(|l| EncodingUtils::repdef_layer_to_def_interp(*l))
-                    .collect::<Vec<_>>();
+                    .map(|l| EncodingUtils::try_repdef_layer_to_def_interp(*l))
+                    .collect::<Result<Vec<_>>>()?;
                 if matches!(target_field.data_type(), DataType::Struct(_)) {
                     // User wants to decode blob into struct
                     Box::new(BlobDescriptionPageScheduler::new(
@@ -984,7 +984,13 @@ impl StructuralPrimitiveFieldDecoder {
                 page.num_rows()
             };
             let take = available.min(remaining);
-            total += page.decoded_bytes(take)?;
+            total = total
+                .checked_add(page.decoded_bytes(take)?)
+                .ok_or_else(|| {
+                    lance_core::Error::not_supported(
+                        "plan_decoded_bytes: decoded byte count overflowed u64".to_string(),
+                    )
+                })?;
             remaining -= take;
         }
         if remaining > 0 {
@@ -1098,7 +1104,7 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
             return Ok([0u64; 8]);
         }
 
-        // Variable-width: walk page decoders for exact byte counts.
+        // Variable-width: walk page decoders for exact counts or conservative bounds.
         let mut out = [0u64; 8];
         for (i, &c) in CANDIDATE_BATCH_SIZES.iter().enumerate() {
             let rows = (c as u64).min(rows_remaining);

@@ -261,6 +261,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_config_rejects_policy_with_legacy_filters() {
+        let data = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+        let error = dataset
+            .update_config([
+                ("lance.auto_cleanup.policy_interval", "1"),
+                (
+                    "lance.auto_cleanup.policy",
+                    r#"{"rules":[{"type":"remove_all","older_than":"30days"}]}"#,
+                ),
+                ("lance.auto_cleanup.older_than", "7days"),
+            ])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("cannot be combined"));
+        assert_eq!(dataset.version_id(), 1);
+    }
+
+    #[tokio::test]
     async fn test_update_table_metadata() {
         let data = gen_batch()
             .col("i", array::step::<Int32Type>())

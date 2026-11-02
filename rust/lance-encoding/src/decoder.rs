@@ -3039,8 +3039,9 @@ impl RequestBatch {
         pending
             .iter()
             .flat_map(|read| &read.ranges)
-            .map(|range| range.end - range.start)
-            .sum()
+            .fold(0u64, |total, range| {
+                total.saturating_add(range.end.saturating_sub(range.start))
+            })
     }
 
     /// Bytes requested by the reads collected so far.
@@ -3137,16 +3138,24 @@ impl RequestBatch {
         priority: u64,
         is_nested_step: bool,
     ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
+        if let Some(invalid) = ranges.iter().find(|range| range.start > range.end) {
+            return futures::future::ready(Err(Error::invalid_input(format!(
+                "Invalid read range {}..{}: start is after end",
+                invalid.start, invalid.end
+            ))))
+            .boxed();
+        }
         let mut state = self.shared.state.lock().unwrap();
         let is_scheduling_finished = state.is_scheduling_finished;
         let pending = &mut state.reads;
         // Keep every batch within the budget: a page that shards its reads
         // must not have all its shards collapse into one unbounded read.
-        let bytes = ranges
-            .iter()
-            .map(|range| range.end - range.start)
-            .sum::<u64>();
-        if !pending.is_empty() && Self::queued_bytes(pending) + bytes > IO_REQUEST_BATCH_BYTES {
+        let bytes = ranges.iter().fold(0u64, |total, range| {
+            total.saturating_add(range.end.saturating_sub(range.start))
+        });
+        if !pending.is_empty()
+            && Self::queued_bytes(pending).saturating_add(bytes) > IO_REQUEST_BATCH_BYTES
+        {
             // Until the run finishes, the queued reads belong to its current
             // step, so they go where the step's flush sends them.
             let io = if is_scheduling_finished {
@@ -3493,8 +3502,9 @@ pub trait StructuralPageDecoder: std::fmt::Debug + Send {
 
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>>;
     fn num_rows(&self) -> u64;
-    /// Returns the exact decoded byte count for the next `num_rows` rows
-    /// from this decoder's current position, without consuming any rows.
+    /// Returns an exact count or conservative upper bound on the decoded byte count
+    /// for the next `num_rows` rows from this decoder's current position, without
+    /// consuming any rows.
     fn decoded_bytes(&self, _num_rows: u64) -> Result<u64> {
         Err(Error::not_supported(
             "decoded_bytes is not implemented for this page decoder".to_string(),
@@ -4521,5 +4531,30 @@ mod tests {
                 "third batch should be near 50 rows, got {third_batch_rows}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn submit_request_rejects_inverted_range() {
+        use crate::testing::SimulatedScheduler;
+
+        let batch = super::RequestBatch::new(std::sync::Arc::new(SimulatedScheduler::new(
+            bytes::Bytes::new(),
+        )));
+        // Build the range at runtime: clippy rejects an inverted literal, but the
+        // point of the test is that malformed metadata can produce one.
+        let start = 10u64;
+        let end = 5u64;
+        let error = batch
+            .submit_request(vec![start..end], 0)
+            .await
+            .expect_err("an inverted read range must fail");
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("start is after end"),
+            "unexpected error: {error}"
+        );
     }
 }

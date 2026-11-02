@@ -8985,6 +8985,7 @@ mod tests {
 
         // Seeded at open, before anything has been written.
         assert_no_drift(&writer, "open").await;
+        let initial_generation = writer.memtable_stats().await.unwrap().generation;
 
         for i in 0..24 {
             writer
@@ -8995,15 +8996,19 @@ mod tests {
         }
 
         // Freezes happened above; make sure at least one did, or this test proves
-        // nothing about the freeze path.
+        // nothing about the freeze path. Generation is monotonic, unlike the
+        // current frozen handle count, which zero grace removes on flush commit.
+        let after_puts = writer.memtable_stats().await.unwrap();
         assert!(
-            writer.memory().frozen_bytes() > 0
-                || writer.memtable_stats().await.unwrap().frozen_count > 0,
-            "the loop must have frozen at least once for this to cover freeze"
+            after_puts.generation > initial_generation,
+            "the loop must have advanced the active generation to cover freeze: \
+             {initial_generation} -> {}",
+            after_puts.generation
         );
 
         writer.wait_for_flush_drain().await.unwrap();
         assert_no_drift(&writer, "flush drain").await;
+        let after_drain = writer.memtable_stats().await.unwrap();
 
         // A long grace keeps the flushed handles in the read view and a zero
         // grace evicts them on commit — two different publish paths. Either way
@@ -9013,6 +9018,17 @@ mod tests {
             0,
             "flushed memtables are reclaimable and must stop metering (grace {grace:?})"
         );
+        if grace.is_zero() {
+            assert_eq!(
+                after_drain.frozen_count, 0,
+                "zero grace must evict flushed handles on commit"
+            );
+        } else {
+            assert!(
+                after_drain.frozen_count > 0,
+                "long grace must retain flushed handles in the read view"
+            );
+        }
 
         for i in 24..32 {
             writer

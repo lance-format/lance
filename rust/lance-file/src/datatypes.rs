@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use arrow_schema::DataType;
 use lance_arrow::ARROW_EXT_NAME_KEY;
 use lance_core::datatypes::{Dictionary, Encoding, Field, LogicalType, Schema};
 use lance_core::{Error, Result};
@@ -237,11 +238,68 @@ impl TryFrom<&Fields> for Schema {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        // The logical types come from the file, so reject anything that cannot be
+        // converted to an Arrow type here instead of panicking later in
+        // `Field::data_type`.
+        for field in &fields {
+            validate_field_logical_type(field)?;
+        }
+
         Ok(Self {
             fields,
             metadata: HashMap::default(),
         })
     }
+}
+
+/// Validates that a field and its descendants can be converted to an Arrow type.
+///
+/// Mirrors the special cases in [`Field::data_type`]: lists, maps and
+/// fixed-size-list-structs derive their type from a child field, so only their
+/// children need to be validated.
+fn validate_field_logical_type(field: &Field) -> Result<()> {
+    let logical_type = &field.logical_type;
+    if logical_type.is_list()
+        || logical_type.is_large_list()
+        || logical_type.is_map()
+        || logical_type.is_fixed_size_list_struct()
+    {
+        if field.children.is_empty() {
+            return Err(Error::schema(format!(
+                "Logical type '{}' on field '{}' requires a child field",
+                logical_type.as_str(),
+                field.name
+            )));
+        }
+        if logical_type.is_fixed_size_list_struct() {
+            let size = logical_type
+                .as_str()
+                .split(':')
+                .next_back()
+                .unwrap_or_default();
+            size.parse::<i32>().map_err(|error| {
+                Error::schema(format!(
+                    "Invalid fixed_size_list size '{}' on field '{}': {}",
+                    logical_type.as_str(),
+                    field.name,
+                    error
+                ))
+            })?;
+        }
+    } else if !logical_type.is_struct() {
+        DataType::try_from(logical_type).map_err(|error| {
+            Error::schema(format!(
+                "Invalid logical type '{}' on field '{}': {}",
+                logical_type.as_str(),
+                field.name,
+                error
+            ))
+        })?;
+    }
+    for child in &field.children {
+        validate_field_logical_type(child)?;
+    }
+    Ok(())
 }
 
 pub struct FieldsWithMeta {
@@ -561,5 +619,38 @@ mod tests {
         // Non-clustering-key field should not have position
         let value_field = restored.field("value").unwrap();
         assert!(!value_field.is_unenforced_clustering_key());
+    }
+
+    #[test]
+    fn test_schema_rejects_unsupported_logical_type() {
+        let fields = Fields(vec![proto_field(0, -1, "bad".to_string(), "int;2")]);
+        let error = Schema::try_from(&fields).expect_err("unsupported logical type must fail");
+        assert!(
+            error.to_string().contains("Invalid logical type"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_schema_rejects_container_without_child() {
+        let fields = Fields(vec![proto_field(0, -1, "bad".to_string(), "list")]);
+        let error = Schema::try_from(&fields).expect_err("list without a child must fail");
+        assert!(
+            error.to_string().contains("requires a child field"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_schema_rejects_fixed_size_list_without_size() {
+        let fields = Fields(vec![
+            proto_field(0, -1, "bad".to_string(), "fixed_size_list:struct:nope"),
+            proto_field(1, 0, "item".to_string(), "int32"),
+        ]);
+        let error = Schema::try_from(&fields).expect_err("invalid fixed_size_list size must fail");
+        assert!(
+            error.to_string().contains("Invalid fixed_size_list size"),
+            "unexpected error: {error}"
+        );
     }
 }

@@ -23,14 +23,18 @@ from .blob import (
     blob_field,
 )
 from .dataset import (
+    CleanupPolicy,
+    CleanupRule,
     DataStatistics,
     FieldStatistics,
     Index,
     IndexFile,
+    KeepOne,
     LanceDataset,
     LanceOperation,
     LanceScanner,
     MergeInsertBuilder,
+    RemoveAll,
     Session,
     Transaction,
     __version__,
@@ -93,6 +97,10 @@ __all__ = [
     "CleanupExplanation",
     "CleanupReferencedBranch",
     "CleanupStats",
+    "CleanupPolicy",
+    "CleanupRule",
+    "KeepOne",
+    "RemoveAll",
     "DatasetBasePath",
     "DataStatistics",
     "FieldStatistics",
@@ -188,6 +196,9 @@ def dataset(
     storage_options : optional, dict
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
+        Set ``scheduler_error_mode`` to ``"fail_fast"`` to cancel the remaining
+        physical reads in a logical scheduler request after one read fails. The
+        default is ``"best_effort"``.
 
         For datasets with additional registered base paths, a key of the form
         ``base_<id>.<key>`` applies ``<key>`` only to the base path with that

@@ -318,12 +318,12 @@ impl ScalarIndex for LabelListIndex {
         Ok(SearchResult::Exact(row_ids))
     }
 
-    fn can_remap(&self) -> bool {
-        true
-    }
-
     fn results_are_row_addresses(&self) -> bool {
         self.values_index.results_are_row_addresses()
+    }
+
+    fn can_remap(&self) -> bool {
+        true
     }
 
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
@@ -1108,6 +1108,10 @@ impl BasicTrainer for LabelListIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for LabelListIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(true)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
