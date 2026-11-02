@@ -53,17 +53,12 @@ from .udf import BatchUDF, normalize_transform
 if TYPE_CHECKING:
     from pyarrow._compute import Expression
 
-    from .dataset import (
-        ColumnOrdering,
-        DatasetBasePath,
-        LanceDataset,
-        LanceOperation,
-        LanceScanner,
-        ReaderLike,
-        Transaction,
-    )
-    from .lance import LanceSchema
+    from ._dataset.scanner import ColumnOrdering, LanceScanner
+    from ._dataset.transaction import LanceOperation, Transaction
+    from .dataset import LanceDataset
+    from .lance import DatasetBasePath, LanceSchema, ScanStatistics
     from .namespace import LanceNamespace
+    from .types import ReaderLike
 
 
 DEFAULT_MAX_BYTES_PER_FILE = 90 * 1024 * 1024 * 1024
@@ -221,7 +216,7 @@ class FragmentMetadata:
         overlays = []
         overlays_json = json_data.get("overlays")
         if overlays_json:
-            from .dataset import LanceOperation
+            from ._dataset.transaction import LanceOperation
 
             overlays = [
                 LanceOperation.DataOverlayFile(
@@ -484,11 +479,11 @@ class LanceFragment(pa.dataset.Fragment):
 
         See Also
         --------
-        lance.dataset.LanceOperation.Overwrite :
+        lance.LanceOperation.Overwrite :
             The operation used to create a new dataset or overwrite one using
             fragments created with this API. See the doc page for an example of
             using this API.
-        lance.dataset.LanceOperation.Append :
+        lance.LanceOperation.Append :
             The operation used to append fragments created with this API to an
             existing dataset. See the doc page for an example of using this API.
 
@@ -602,14 +597,24 @@ class LanceFragment(pa.dataset.Fragment):
         ] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[List[str]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         include_deleted_rows: Optional[bool] = None,
         batch_size_bytes: Optional[int] = None,
         strict_batch_size: Optional[bool] = None,
+        scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
     ) -> "LanceScanner":
-        """See Dataset::scanner for details"""
-        from .dataset import LanceScanner, _serialize_expression
+        """See Dataset::scanner for details
+
+        Parameters
+        ----------
+        scan_stats_callback: Callable[[ScanStatistics], None], default None
+            A callback function that will be called with the scan statistics after the
+            scan is complete.  Errors raised by the callback will be logged but not
+            re-raised.
+        """
+        from ._dataset.scanner import LanceScanner, _serialize_expression
 
         if isinstance(filter, pa.compute.Expression):
             filter_str = None
@@ -637,11 +642,13 @@ class LanceFragment(pa.dataset.Fragment):
             blob_handling=blob_handling,
             order_by=order_by,
             use_scalar_index=use_scalar_index,
+            ignored_scalar_indices=ignored_scalar_indices,
             io_buffer_size=io_buffer_size,
             late_materialization=late_materialization,
             include_deleted_rows=include_deleted_rows,
             batch_size_bytes=batch_size_bytes,
             strict_batch_size=strict_batch_size,
+            scan_stats_callback=scan_stats_callback,
             **columns_arg,
         )
         snapshot = {
@@ -671,8 +678,9 @@ class LanceFragment(pa.dataset.Fragment):
             "_fast_search": False,
             "_full_text_query": None,
             "_use_scalar_index": use_scalar_index,
+            "_ignored_scalar_indices": ignored_scalar_indices,
             "_include_deleted_rows": include_deleted_rows,
-            "_scan_stats_callback": None,
+            "_scan_stats_callback": scan_stats_callback,
             "_strict_batch_size": (
                 strict_batch_size if strict_batch_size is not None else False
             ),
@@ -727,6 +735,7 @@ class LanceFragment(pa.dataset.Fragment):
         ] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[List[str]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         include_deleted_rows: Optional[bool] = None,
@@ -745,6 +754,7 @@ class LanceFragment(pa.dataset.Fragment):
             blob_handling=blob_handling,
             order_by=order_by,
             use_scalar_index=use_scalar_index,
+            ignored_scalar_indices=ignored_scalar_indices,
             io_buffer_size=io_buffer_size,
             late_materialization=late_materialization,
             include_deleted_rows=include_deleted_rows,
@@ -770,6 +780,7 @@ class LanceFragment(pa.dataset.Fragment):
         include_deleted_rows: Optional[bool] = None,
         batch_size_bytes: Optional[int] = None,
         strict_batch_size: Optional[bool] = None,
+        ignored_scalar_indices: Optional[List[str]] = None,
     ) -> pa.Table:
         return self.scanner(
             columns=columns,
@@ -781,6 +792,7 @@ class LanceFragment(pa.dataset.Fragment):
             blob_handling=blob_handling,
             order_by=order_by,
             use_scalar_index=use_scalar_index,
+            ignored_scalar_indices=ignored_scalar_indices,
             io_buffer_size=io_buffer_size,
             late_materialization=late_materialization,
             include_deleted_rows=include_deleted_rows,
@@ -914,6 +926,11 @@ class LanceFragment(pa.dataset.Fragment):
         schema=None,
         *,
         with_offsets: Literal[False] = False,
+        strategy: Literal["auto", "hash", "sort_merge"] = "auto",
+        max_hash_rows: Optional[int] = None,
+        max_hash_bytes: Optional[int] = None,
+        external_memory_pool_bytes: Optional[int] = None,
+        max_temp_directory_bytes: Optional[int] = None,
     ) -> Tuple[FragmentMetadata, List[int]]: ...
 
     @overload
@@ -925,6 +942,11 @@ class LanceFragment(pa.dataset.Fragment):
         schema=None,
         *,
         with_offsets: Literal[True],
+        strategy: Literal["auto", "hash", "sort_merge"] = "auto",
+        max_hash_rows: Optional[int] = None,
+        max_hash_bytes: Optional[int] = None,
+        external_memory_pool_bytes: Optional[int] = None,
+        max_temp_directory_bytes: Optional[int] = None,
     ) -> Tuple[FragmentMetadata, List[int], bytes]: ...
 
     def update_columns(
@@ -935,6 +957,11 @@ class LanceFragment(pa.dataset.Fragment):
         schema=None,
         *,
         with_offsets: bool = False,
+        strategy: Literal["auto", "hash", "sort_merge"] = "auto",
+        max_hash_rows: Optional[int] = None,
+        max_hash_bytes: Optional[int] = None,
+        external_memory_pool_bytes: Optional[int] = None,
+        max_temp_directory_bytes: Optional[int] = None,
     ) -> Union[
         Tuple[FragmentMetadata, List[int]],
         Tuple[FragmentMetadata, List[int], bytes],
@@ -942,7 +969,7 @@ class LanceFragment(pa.dataset.Fragment):
         """
         Update existing columns in this fragment.
 
-        This operation performs a left-outer-hash-join with the right table (new data)
+        This operation performs a left-outer join with the right table (new data)
         on the column specified by left_on and right_on. For every row in the current
         fragment, the updated column value is:
 
@@ -972,6 +999,23 @@ class LanceFragment(pa.dataset.Fragment):
             ``updated_fragment_offsets`` with ``update_mode="rewrite_columns"``
             so a commit over stable row ids refreshes row-level version
             metadata for the matched rows only.
+        strategy: {"auto", "hash", "sort_merge"}, default "auto"
+            The update join algorithm. ``auto`` selects an algorithm using the row and
+            estimated-memory thresholds.
+        max_hash_rows: int, optional
+            The largest right-side row count eligible for the hash path in ``auto``
+            mode. Must be specified together with ``max_hash_bytes``. The default is
+            250,000 rows.
+        max_hash_bytes: int, optional
+            The largest estimated right-side allocation eligible for the hash path in
+            ``auto`` mode. Must be specified together with ``max_hash_rows``. The
+            default is 1 GiB.
+        external_memory_pool_bytes: int, optional
+            The DataFusion memory-pool size for the spillable sort-merge path. This does
+            not bound total process memory. If unset, the operation uses the
+            ``LANCE_MEM_POOL_SIZE`` environment variable or defaults to 256 MiB.
+        max_temp_directory_bytes: int, optional
+            The maximum temporary spill-directory usage for the sort-merge path.
 
         Returns
         -------
@@ -1031,8 +1075,13 @@ class LanceFragment(pa.dataset.Fragment):
         Notes
         -----
         - The columns to update must already exist in the fragment
-        - The join column (left_on/right_on) will not be updated
+        - ``right_on`` is removed from the replacement payload and cannot be updated
+        - When ``left_on`` and ``right_on`` differ, a replacement column named
+          ``left_on`` can update the left join key
         - Metadata columns (_rowid, _rowaddr) cannot be updated
+        - Large update inputs may use temporary spill storage
+        - If the right side contains duplicate join keys, which matching row is
+          selected is undefined
         - This is a low-level API; for most use cases, use Dataset.update() instead
         """
         if right_on is None:
@@ -1040,7 +1089,15 @@ class LanceFragment(pa.dataset.Fragment):
 
         reader = _coerce_reader(data_obj, schema)
         metadata, fields_modified, matched_offsets = self._fragment.update_columns(
-            reader, left_on, right_on, with_offsets
+            reader,
+            left_on,
+            right_on,
+            with_offsets,
+            strategy,
+            max_hash_rows,
+            max_hash_bytes,
+            external_memory_pool_bytes,
+            max_temp_directory_bytes,
         )
         if matched_offsets is not None:
             return metadata, fields_modified, matched_offsets
@@ -1069,7 +1126,7 @@ class LanceFragment(pa.dataset.Fragment):
             Internal API. This method is not intended to be used by end users.
 
         The parameters and their interpretation are the same as in the
-        :meth:`lance.dataset.LanceDataset.add_columns` operation.
+        :meth:`lance.LanceDataset.add_columns` operation.
 
         The only difference is that, instead of modifying the dataset, a new
         fragment is created.  The new schema of the fragment is returned as well.
@@ -1083,7 +1140,7 @@ class LanceFragment(pa.dataset.Fragment):
 
         See Also
         --------
-        lance.dataset.LanceOperation.Merge :
+        lance.LanceOperation.Merge :
             The operation used to commit these changes to the dataset. See the
             doc page for an example of using this API.
 
@@ -1152,7 +1209,7 @@ class LanceFragment(pa.dataset.Fragment):
 
         See Also
         --------
-        lance.dataset.LanceOperation.Delete :
+        lance.LanceOperation.Delete :
             The operation used to commit these changes to a dataset. See the
             doc page for an example of using this API.
         """

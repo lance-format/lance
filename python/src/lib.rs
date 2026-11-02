@@ -37,15 +37,17 @@ use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use datafusion_ffi::table_provider::FFI_TableProvider;
 #[cfg(feature = "datagen")]
 use datagen::register_datagen;
+use dataset::base_path::DatasetBasePath;
 use dataset::blob::LanceBlobFile;
 use dataset::cleanup::{
     CleanupCandidateFile, CleanupExplanation, CleanupReferencedBranch, CleanupStats,
 };
 use dataset::io_stats::IoStats;
+use dataset::merge_insert::MergeInsertBuilder;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
-use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery, PySearchFilter};
+use dataset::write::write_dataset;
 use env_logger::{Builder, Env};
 use file::{
     LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
@@ -56,7 +58,7 @@ use pyo3::exceptions::PyIOError;
 use pyo3::ffi::c_str;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
-use scanner::ScanStatistics;
+use scanner::{PyFullTextQuery, PySearchFilter, ScanStatistics};
 use session::Session;
 use std::ptr::NonNull;
 
@@ -95,8 +97,6 @@ pub use crate::tracing::{TraceGuard, trace_to_chrome};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
 pub use dataset::Dataset;
-pub use dataset::serialize_row_addrs;
-pub use dataset::write_dataset;
 use fragment::{
     FileFragment, FragmentAddColumnsCleanup, PyDeletionFile, PyRowDatasetVersionMeta, PyRowIdMeta,
 };
@@ -104,6 +104,7 @@ pub use indices::register_indices;
 pub use reader::LanceReader;
 use rowids::{PyRowIdSequence, PyRowIdSequenceIterator};
 pub use scanner::Scanner;
+pub use scanner::serialize_row_addrs;
 
 use crate::blob::{
     PyBlobDescriptor, PyBlobDescriptorArrayBuilder, PyDedicatedBlobWriter, PyManagedBlobWriter,

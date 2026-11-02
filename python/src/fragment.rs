@@ -25,7 +25,9 @@ use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::fragment::FragmentAddColumnsCleanup as LanceFragmentAddColumnsCleanup;
 use lance::dataset::scanner::{ColumnOrdering, MaterializationStyle};
 use lance::dataset::transaction::{Operation, Transaction};
-use lance::dataset::{InsertBuilder, NewColumnTransform, WriteParams};
+use lance::dataset::{
+    InsertBuilder, NewColumnTransform, UpdateJoinOptions, UpdateJoinStrategy, WriteParams,
+};
 use lance_core::datatypes::BlobHandling;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::overlay::DataOverlayFile;
@@ -39,7 +41,7 @@ use pyo3::types::{PyList, PyTuple};
 use pyo3::{exceptions::*, types::PyDict};
 use pyo3::{intern, prelude::*};
 
-use crate::dataset::{PyWriteDest, get_write_params, transforms_from_python};
+use crate::dataset::write::{PyWriteDest, get_write_params, transforms_from_python};
 use crate::error::PythonErrorExt;
 use crate::schema::{LanceSchema, logical_schema_from_lance};
 use crate::utils::{PyLance, export_vec, extract_vec};
@@ -270,7 +272,7 @@ impl FileFragment {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None, use_scalar_index=None, io_buffer_size=None, late_materialization=None, include_deleted_rows=None, batch_size_bytes=None, strict_batch_size=None, substrait_filter=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None, use_scalar_index=None, ignored_scalar_indices=None, io_buffer_size=None, late_materialization=None, include_deleted_rows=None, batch_size_bytes=None, strict_batch_size=None, substrait_filter=None, scan_stats_callback=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -285,12 +287,14 @@ impl FileFragment {
         blob_handling: Option<Bound<PyAny>>,
         order_by: Option<Vec<PyLance<ColumnOrdering>>>,
         use_scalar_index: Option<bool>,
+        ignored_scalar_indices: Option<Vec<String>>,
         io_buffer_size: Option<u64>,
         late_materialization: Option<Bound<PyAny>>,
         include_deleted_rows: Option<bool>,
         batch_size_bytes: Option<u64>,
         strict_batch_size: Option<bool>,
         substrait_filter: Option<Vec<u8>>,
+        scan_stats_callback: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Scanner> {
         let mut scanner = self_.fragment.scan();
 
@@ -373,6 +377,9 @@ impl FileFragment {
         if let Some(use_scalar_index) = use_scalar_index {
             scanner.use_scalar_index(use_scalar_index);
         }
+        if let Some(ignored_scalar_indices) = ignored_scalar_indices {
+            scanner.with_ignored_scalar_indices(ignored_scalar_indices);
+        }
         if let Some(late_materialization) = late_materialization {
             if let Ok(style_as_bool) = late_materialization.extract::<bool>() {
                 if style_as_bool {
@@ -399,6 +406,10 @@ impl FileFragment {
         }
         if let Some(strict_batch_size) = strict_batch_size {
             scanner.strict_batch_size(strict_batch_size);
+        }
+        if let Some(scan_stats_callback) = scan_stats_callback {
+            let callback = Dataset::make_scan_stats_callback(scan_stats_callback.clone())?;
+            scanner.scan_stats_callback(callback);
         }
         let scn = Arc::new(scanner);
         Ok(Scanner::new(scn))
@@ -470,18 +481,54 @@ impl FileFragment {
         Ok((PyLance(fragment), LanceSchema(schema)))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature=(reader, left_on, right_on, with_offsets=false, strategy="auto", max_hash_rows=None, max_hash_bytes=None, external_memory_pool_bytes=None, max_temp_directory_bytes=None))]
     fn update_columns(
         &mut self,
         reader: PyArrowType<ArrowArrayStreamReader>,
         left_on: String,
         right_on: String,
         with_offsets: bool,
+        strategy: &str,
+        max_hash_rows: Option<usize>,
+        max_hash_bytes: Option<usize>,
+        external_memory_pool_bytes: Option<u64>,
+        max_temp_directory_bytes: Option<u64>,
     ) -> PyResult<UpdateColumnsResult> {
+        let strategy = match strategy {
+            "auto" => UpdateJoinStrategy::Auto,
+            "hash" => UpdateJoinStrategy::Hash,
+            "sort_merge" => UpdateJoinStrategy::SortMerge,
+            value => {
+                return Err(PyValueError::new_err(format!(
+                    "strategy must be one of 'auto', 'hash', or 'sort_merge', got '{value}'"
+                )));
+            }
+        };
+        let mut options = UpdateJoinOptions::default().with_strategy(strategy);
+        match (max_hash_rows, max_hash_bytes) {
+            (Some(max_rows), Some(max_bytes)) => {
+                options = options.with_hash_thresholds(max_rows, max_bytes);
+            }
+            (None, None) => {}
+            _ => {
+                return Err(PyValueError::new_err(
+                    "max_hash_rows and max_hash_bytes must be specified together",
+                ));
+            }
+        }
+        if let Some(bytes) = external_memory_pool_bytes {
+            options = options.with_external_memory_pool_bytes(bytes);
+        }
+        if let Some(bytes) = max_temp_directory_bytes {
+            options = options.with_max_temp_directory_bytes(bytes);
+        }
+
         let mut fragment = self.fragment.clone();
         let result = rt()
             .spawn(None, async move {
                 fragment
-                    .update_columns_with_offsets(reader.0, &left_on, &right_on)
+                    .update_columns_with_options(reader.0, &left_on, &right_on, options)
                     .await
             })?
             .infer_error()?;
