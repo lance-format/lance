@@ -117,6 +117,17 @@ fn validate_compressive_encoding(
             }
             Ok(())
         }
+        Some(Compression::Pcodec(_)) => {
+            if position != EncodingPosition::MiniBlock {
+                return Err(Error::invalid_input(format!(
+                    "pcodec is not supported in {} positions",
+                    position.name()
+                )));
+            }
+            DefaultDecompressionStrategy::default()
+                .create_miniblock_decompressor(encoding, &DefaultDecompressionStrategy::default())
+                .map(|_| ())
+        }
         Some(Compression::AxisDelta(_)) => {
             if position != EncodingPosition::PerValue {
                 return Err(Error::invalid_input(format!(

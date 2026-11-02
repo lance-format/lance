@@ -91,8 +91,8 @@ impl<'a> ExRows<'a> {
 }
 
 /// Stage-1 output of a lazy full-precision scan over every row of the
-/// original sign plane: binary inner products in the partition's own
-/// SIMD/tail layout and the native lower bounds derived from them.
+/// original sign plane. Positions remain physical file offsets; surviving
+/// rows use the eager scan's SIMD/tail precision after FRI deletes are removed.
 #[derive(Debug, Default, Clone)]
 pub struct SignStage {
     pub binary_ips: Vec<f32>,
@@ -282,8 +282,8 @@ impl RabitQuantizationStorage {
 }
 
 impl<'a> RabitDistCalculator<'a> {
-    /// Calculate the original partition's binary inner products with the
-    /// same SIMD blocks, tail and LUT precision as the full scan.
+    /// Calculate binary inner products at physical offsets with the full
+    /// scan's LUT precision, including its live-row tail after FRI deletions.
     pub fn binary_inner_products(&self) -> Vec<f32> {
         let code_len = rabit_binary_code_bytes(self.dim);
         let n = self.codes.len() / code_len;
@@ -302,7 +302,9 @@ impl<'a> RabitDistCalculator<'a> {
         dists
     }
 
-    /// Compute sign inner products and native lower bounds in partition order.
+    /// Compute sign inner products and native lower bounds at physical offsets.
+    /// FRI tombstones retain their slots; surviving rows match the full scan's
+    /// precision after those slots are removed.
     /// Returns the full scan's gating reason without changing `out` when
     /// Fast mode, the estimator or missing error factors prevent pruning.
     pub fn full_sign_stage_with_scratch(

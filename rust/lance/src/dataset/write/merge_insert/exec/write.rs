@@ -1232,7 +1232,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let input_stream = if has_blob_v2_columns {
             let input_schema = input_stream.schema();
             let rewrite_plan = Arc::new(
-                crate::dataset::optimize::BlobV2BatchRewritePlan::try_new(
+                crate::dataset::blob::BlobV2BatchRewritePlan::try_new(
                     self.dataset.schema(),
                     input_schema.as_ref(),
                     true,
