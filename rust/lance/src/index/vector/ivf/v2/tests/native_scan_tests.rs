@@ -432,6 +432,239 @@ async fn controlled_partition_stream_releases_pending_source(#[values(false, tru
 }
 
 #[rstest]
+#[tokio::test]
+async fn test_rabit_raw_cache_survives_fragment_reuse(
+    #[values(false, true)] resident: bool,
+    #[values(false, true)] tagged: bool,
+) {
+    let dir = TempStrDir::default();
+    let (dataset, batch) = native_fixture(dir.as_str()).await;
+    let uuid = dataset.load_indices().await.unwrap()[0].uuid;
+    let query = lazy_test_query(batch["vector"].as_fixed_size_list().value(7), 8, 4);
+    let session = Session::default()
+        .with_index_resident_columns(if resident {
+            crate::session::ResidentColumnsSetting::On
+        } else {
+            crate::session::ResidentColumnsSetting::Off
+        })
+        .with_rabit_scan_factory(Arc::new(SurvivorScanFactory {
+            index: ExIndex::Compact,
+        }));
+    let mut dataset = open_with_session(dir.as_str(), session).await;
+    let original = dataset
+        .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let native = lazy_index(&original);
+    let mut planes = Vec::new();
+    for partition in 0..4 {
+        for plane in 0..2 {
+            planes.push(
+                native
+                    .storage
+                    .load_plane_entry(partition, plane, &native.raw_cache, None)
+                    .await
+                    .unwrap(),
+            );
+        }
+    }
+    let mut snapshots = Vec::new();
+    for (predicate, target_rows) in [("i % 17 = 7", 100), ("i = 8", 1024)] {
+        dataset.delete(predicate).await.unwrap();
+        if tagged && snapshots.is_empty() {
+            let old_fragments = dataset.fragments().clone();
+            let source_ids = old_fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect::<Vec<_>>();
+            let (transition, new_fragments) =
+                crate::index::frag_reuse_reader::tests::prepare_partition(
+                    &dataset,
+                    &source_ids,
+                    10,
+                )
+                .await;
+            let fri =
+                crate::index::frag_reuse::frag_reuse_entry_appending(&dataset, vec![transition])
+                    .await
+                    .unwrap();
+            let transaction = Transaction::new(
+                dataset.version().version,
+                Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments: old_fragments.as_ref().clone(),
+                        new_fragments,
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: Some(fri),
+                },
+                None,
+            );
+            dataset = crate::dataset::write::CommitBuilder::new(Arc::new(dataset))
+                .execute(transaction)
+                .await
+                .unwrap();
+        } else {
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment: target_rows,
+                    defer_index_remap: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let index = dataset
+            .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let native = lazy_index(&index);
+        let io = lance_io::scheduler::IoStats::new();
+        for partition in 0..4 {
+            for plane in 0..2 {
+                let loaded = native
+                    .storage
+                    .load_plane_entry(partition, plane, &native.raw_cache, Some(io.clone()))
+                    .await
+                    .unwrap();
+                assert!(
+                    Arc::ptr_eq(&planes[partition * 2 + usize::from(plane)], &loaded),
+                    "FRI changes must retain immutable plane entries"
+                );
+            }
+        }
+        assert_eq!(io.snapshot().bytes_read, 0);
+        let mut sign_addresses = Vec::new();
+        for partition in 0..4 {
+            let sign = native
+                .storage
+                .load_sign_stage(partition, &native.raw_cache, None)
+                .await
+                .unwrap();
+            let again = native
+                .storage
+                .load_sign_stage(partition, &native.raw_cache, None)
+                .await
+                .unwrap();
+            assert_eq!(sign.len(), planes[partition * 2].0.num_rows());
+            assert_eq!(
+                sign.row_ids().next().map(std::ptr::from_ref),
+                again.row_ids().next().map(std::ptr::from_ref),
+                "repeated translation must reuse the charged address buffer"
+            );
+            sign_addresses.push(sign.row_ids().copied().collect::<Vec<_>>());
+        }
+        let eager = open_with_session(dir.as_str(), Session::default()).await;
+        let eager_index = eager
+            .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let expected = search_global(&eager_index, &query, Arc::new(NoFilter))
+            .await
+            .unwrap();
+        let result = search_global(&index, &query, Arc::new(NoFilter))
+            .await
+            .unwrap();
+        assert_eq!(result_bits(&result), result_bits(&expected));
+        let truth =
+            super::ground_truth(&dataset, "vector", query.key.as_ref(), 8, DistanceType::L2).await;
+        assert!(
+            result_bits(&result)
+                .0
+                .iter()
+                .filter(|id| truth.contains(id))
+                .count()
+                >= 4
+        );
+        snapshots.push((dataset.clone(), sign_addresses));
+    }
+    assert_ne!(snapshots[0].1, snapshots[1].1);
+    // The clone shares source files but develops a different translation.
+    // Its cached addresses must not leak back into the source snapshots.
+    let clone_dir = TempStrDir::default();
+    let mut source = snapshots[0].0.clone();
+    let source_version = source.version().version;
+    source
+        .shallow_clone(clone_dir.as_str(), source_version, None)
+        .await
+        .unwrap();
+    // Shallow cloning creates a new session. Reopen in the same cache pool
+    // before checking whether physical file entries are shared.
+    let mut cloned = crate::DatasetBuilder::from_uri(clone_dir.as_str())
+        .with_session(source.session.clone())
+        .load()
+        .await
+        .unwrap();
+    cloned.delete("i > 127").await.unwrap();
+    compact_files(
+        &mut cloned,
+        CompactionOptions {
+            target_rows_per_fragment: 1024,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let clone_index = cloned
+        .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let native_clone = lazy_index(&clone_index);
+    for partition in 0..4 {
+        for plane in 0..2 {
+            let loaded = native_clone
+                .storage
+                .load_plane_entry(partition, plane, &native_clone.raw_cache, None)
+                .await
+                .unwrap();
+            assert!(
+                Arc::ptr_eq(&planes[partition * 2 + usize::from(plane)], &loaded),
+                "a shallow clone must share entries for the same physical file"
+            );
+        }
+    }
+    let eager_clone = open_with_session(clone_dir.as_str(), Session::default()).await;
+    let eager_clone_index = eager_clone
+        .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(
+        result_bits(
+            &search_global(&clone_index, &query, Arc::new(NoFilter))
+                .await
+                .unwrap()
+        ),
+        result_bits(
+            &search_global(&eager_clone_index, &query, Arc::new(NoFilter))
+                .await
+                .unwrap()
+        )
+    );
+    // Reopening an earlier snapshot must reuse its own translation, even
+    // after the same raw planes were queried through a newer mapping.
+    for (snapshot, expected) in snapshots {
+        let index = snapshot
+            .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let native = lazy_index(&index);
+        for (partition, expected) in expected.into_iter().enumerate() {
+            let sign = native
+                .storage
+                .load_sign_stage(partition, &native.raw_cache, None)
+                .await
+                .unwrap();
+            assert_eq!(sign.row_ids().copied().collect::<Vec<_>>(), expected);
+        }
+    }
+}
+
+#[rstest]
 #[case::compaction(false)]
 #[case::stable_partition(true)]
 #[tokio::test]
