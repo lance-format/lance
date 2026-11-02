@@ -11,6 +11,7 @@ mod plans;
 mod semantics;
 mod spilled_lineage;
 mod subcols;
+mod subcols_indexed;
 mod types;
 mod units;
 

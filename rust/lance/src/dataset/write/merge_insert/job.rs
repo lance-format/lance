@@ -687,7 +687,7 @@ impl MergeInsertJob {
     ///
     /// A stream can only be read once, so when `conflict_retries > 0` the stream is
     /// spilled (in memory, then to disk) so it can be replayed on each retry. See
-    /// [`MergeInsertBuilder::spill_for_retry`] to fail fast instead, and
+    /// [`super::MergeInsertBuilder::spill_for_retry`] to fail fast instead, and
     /// [`Self::execute_batches`] / [`Self::execute_provider`] for sources that can
     /// be scanned again on each retry.
     pub async fn execute(

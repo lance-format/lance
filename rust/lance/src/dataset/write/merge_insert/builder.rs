@@ -266,7 +266,7 @@ impl MergeInsertBuilder {
     }
 
     /// Set the write parameters for the data files this merge insert writes,
-    /// as [`InsertBuilder::with_params`](super::InsertBuilder::with_params)
+    /// as [`InsertBuilder::with_params`](crate::dataset::InsertBuilder::with_params)
     /// does for an insert.
     ///
     /// Every path that writes rows applies them: file size limits, file writer
@@ -311,7 +311,7 @@ impl MergeInsertBuilder {
     /// New data files are distributed across the target bases round-robin,
     /// the same way a normal write with [`WriteParams::target_bases`] routes
     /// them. The IDs must be registered in the dataset manifest, or
-    /// [`super::PRIMARY_BASE_ID`] (0) to include the dataset's primary
+    /// [`crate::dataset::write::PRIMARY_BASE_ID`] (0) to include the dataset's primary
     /// storage in the rotation (e.g. `vec![0, 1, 2]` spreads across primary
     /// plus bases 1 and 2). Data files that patch existing fragments and
     /// deletion files are always written to the dataset's primary storage.
