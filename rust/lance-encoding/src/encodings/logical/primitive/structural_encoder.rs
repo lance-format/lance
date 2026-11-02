@@ -1688,6 +1688,15 @@ impl PrimitiveStructuralEncoder {
         policy: DictionaryEncodingPolicy,
         num_fallback_values: u64,
     ) -> Result<Option<(DataBlock, DataBlock)>> {
+        // pcodec encodes repeated values cheaply and compresses far better than a
+        // dictionary of float vectors, so an explicit pcodec request wins.
+        if field
+            .metadata
+            .get(COMPRESSION_META_KEY)
+            .is_some_and(|scheme| scheme == PCODEC_COMPRESSION)
+        {
+            return Ok(None);
+        }
         if policy == DictionaryEncodingPolicy::Planar
             && let DataBlock::FixedSizeList(fsl) = data
         {
@@ -1761,16 +1770,6 @@ impl PrimitiveStructuralEncoder {
     ) -> Option<DictEncodingBudget> {
         const DEFAULT_SAMPLE_SIZE: usize = 4096;
         const DEFAULT_SAMPLE_UNIQUE_RATIO: f64 = 0.98;
-
-        // pcodec encodes repeated values cheaply and compresses far better than a
-        // dictionary of float vectors, so an explicit pcodec request wins.
-        if field
-            .metadata
-            .get(COMPRESSION_META_KEY)
-            .is_some_and(|scheme| scheme == PCODEC_COMPRESSION)
-        {
-            return None;
-        }
 
         // Since we only dictionary encode FixedWidth and VariableWidth blocks for now, we skip
         // estimating the size for other types.
