@@ -25,8 +25,9 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::DeletionVector;
 use lance_io::ReadBatchParams;
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::pb;
-use lance_table::rowids::FragmentRowIdIndex;
+use lance_table::rowids::{FragmentRowIdIndex, segment::U64Segment};
 use lance_table::{
     rowids::{RowIdIndex, RowIdSequence, read_row_ids, write_row_ids},
     utils::stream::{RowIdAndDeletesConfig, apply_row_id_and_deletes},
@@ -65,6 +66,36 @@ fn make_frag_sequences(
             );
             start += rows_per_frag;
             (i as u32, Arc::new(sequence))
+        })
+        .collect()
+}
+
+fn make_clustered_range_frag_sequences(num_rows: u64) -> Vec<FragmentRowIdIndex> {
+    let rows_per_fragment = num_rows / 100;
+    (0_u32..100)
+        .map(|fragment_id| {
+            let start = fragment_id as u64 * rows_per_fragment;
+            let end = start + rows_per_fragment;
+            let mut ranges = Vec::new();
+            let mut row_id = start;
+            while row_id < end {
+                let present_end = (row_id + 250).min(end);
+                ranges.push(row_id..present_end);
+                row_id = present_end.saturating_add(250);
+            }
+            let wire_sequence = pb::RowIdSequence {
+                segments: ranges
+                    .into_iter()
+                    .map(|range| pb::U64Segment::from(U64Segment::Range(range)))
+                    .collect(),
+            };
+            // Decode the wire ranges into the compact form used after PR #9311.
+            let sequence = read_row_ids(&wire_sequence.encode_to_vec()).unwrap();
+            FragmentRowIdIndex {
+                fragment_id,
+                row_id_sequence: Arc::new(sequence),
+                deletion_vector: Arc::new(DeletionVector::default()),
+            }
         })
         .collect()
 }
@@ -197,6 +228,11 @@ fn bench_creation(c: &mut Criterion) {
             },
         );
     }
+
+    let clustered_indices = make_clustered_range_frag_sequences(num_rows());
+    group.bench_function("BuildIndexClusteredRanges", |b| {
+        b.iter(|| std::hint::black_box(RowIdIndex::new(&clustered_indices).unwrap()));
+    });
 
     group.finish();
 }
@@ -413,8 +449,10 @@ fn sample_segment(segment: &pb::U64Segment, rng: &mut SmallRng) -> Option<u64> {
             };
             let is_hole = array
                 .offsets
-                .chunks_exact(4)
-                .any(|hole| u32::from_le_bytes(hole.try_into().unwrap()) == offset);
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|hole| u32::from_le_bytes(*hole) == offset);
             (!is_hole).then_some(holes.start + offset as u64)
         }
         _ => unreachable!(),
@@ -456,8 +494,8 @@ fn shot_table_like(
             })
             .collect();
         slices.shuffle(&mut rng);
-        for pair in slices.chunks_exact(2) {
-            let mut pair = [pair[0], pair[1]];
+        for pair in slices.as_chunks::<2>().0 {
+            let mut pair = *pair;
             pair.sort_unstable();
             let segments = pair
                 .iter()
@@ -529,17 +567,95 @@ fn bench_shot_table(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_bitmap_mask_density(c: &mut Criterion) {
+    let span = 1_000_000_u64;
+    let live: Vec<u64> = (0..span).filter(|id| id % 17 != 0).collect();
+    let sequence = RowIdSequence::from(live.as_slice());
+    assert!(matches!(
+        sequence.segments(),
+        [lance_table::rowids::segment::U64Segment::RangeWithBitmap { .. }]
+    ));
+
+    let mut group = c.benchmark_group("bitmap_mask_density");
+    group.sample_size(15);
+    group.warm_up_time(std::time::Duration::from_millis(250));
+    group.measurement_time(std::time::Duration::from_secs(1));
+    for hits in [
+        1_usize,
+        1_000,
+        10_000,
+        20_000,
+        50_000,
+        100_000,
+        200_000,
+        400_000,
+        800_000,
+        live.len(),
+    ] {
+        let ids: Vec<u64> = if hits == live.len() {
+            live.clone()
+        } else {
+            (0..hits)
+                .map(|index| live[(index + 1) * (live.len() - 1) / hits])
+                .collect()
+        };
+        let mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(ids.as_slice()));
+        group.bench_with_input(BenchmarkId::from_parameter(hits), &mask, |b, mask| {
+            b.iter(|| std::hint::black_box(sequence.mask_to_offset_ranges(mask)));
+        });
+    }
+    group.finish();
+}
+
+fn bench_broad_dataset_wide_mask(c: &mut Criterion) {
+    // Regression scenario: a dataset-wide allow-list applied to one
+    // small-span fragment. The selection is far broader than the span, so
+    // the call must keep the old range-based path instead of scanning ~10M
+    // selected ids for a 100k-span segment.
+    let frag_start = 5_000_000_u64;
+    let span = 100_000_u64;
+    let live: Vec<u64> = (frag_start..frag_start + span)
+        .filter(|id| id % 17 != 0)
+        .collect();
+    let sequence = RowIdSequence::from(live.as_slice());
+    assert!(matches!(
+        sequence.segments(),
+        [lance_table::rowids::segment::U64Segment::RangeWithBitmap { .. }]
+    ));
+
+    let mut wide: Vec<u64> = (0..10_000_000)
+        .filter(|id| id % 17 != 0 && (*id < frag_start || *id >= frag_start + span))
+        .collect();
+    wide.extend(live.iter().copied());
+    let wide_mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(wide.as_slice()));
+    let local_mask = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(live.as_slice()));
+
+    let mut group = c.benchmark_group("broad_mask_fragment");
+    group.sample_size(10);
+    group.warm_up_time(std::time::Duration::from_millis(300));
+    group.measurement_time(std::time::Duration::from_secs(2));
+    group.bench_function("fragment-only", |b| {
+        b.iter(|| std::hint::black_box(sequence.mask_to_offset_ranges(&local_mask)));
+    });
+    group.bench_function("dataset-wide", |b| {
+        b.iter(|| std::hint::black_box(sequence.mask_to_offset_ranges(&wide_mask)));
+    });
+    group.finish();
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name = benches;
     config=Criterion::default().with_profiler(lance_testing::pprof::PProfProfiler::new(100, lance_testing::pprof::Output::Flamegraph(None)));
-    targets=bench_creation, bench_get_single, bench_apply_row_id, bench_shot_table);
+    targets=bench_creation, bench_get_single, bench_apply_row_id, bench_shot_table, bench_bitmap_mask_density, bench_broad_dataset_wide_mask);
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     benches,
     bench_creation,
     bench_get_single,
     bench_apply_row_id,
-    bench_shot_table
+    bench_shot_table,
+    bench_bitmap_mask_density,
+    bench_broad_dataset_wide_mask
 );
 criterion_main!(benches);

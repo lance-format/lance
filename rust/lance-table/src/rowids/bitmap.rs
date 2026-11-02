@@ -11,16 +11,12 @@ pub struct Bitmap {
 
 /// Set bits in `data`, counted a word at a time.
 pub(super) fn count_ones(data: &[u8]) -> usize {
-    let mut words = data.chunks_exact(8);
+    let (words, tail) = data.as_chunks::<8>();
     let full: usize = words
-        .by_ref()
-        .map(|word| u64::from_le_bytes(word.try_into().unwrap()).count_ones() as usize)
-        .sum();
-    let tail: usize = words
-        .remainder()
         .iter()
-        .map(|byte| byte.count_ones() as usize)
+        .map(|word| u64::from_le_bytes(*word).count_ones() as usize)
         .sum();
+    let tail: usize = tail.iter().map(|byte| byte.count_ones() as usize).sum();
     full + tail
 }
 
@@ -74,6 +70,25 @@ impl Bitmap {
 
     pub fn clear(&mut self, i: usize) {
         self.data[i / 8] &= !(1 << (i % 8));
+    }
+
+    /// Clear the bits in `range`, whole bytes at a time where it spans them.
+    pub fn clear_range(&mut self, range: std::ops::Range<usize>) {
+        if range.is_empty() {
+            return;
+        }
+        let (first, last) = (range.start / 8, (range.end - 1) / 8);
+        // Bits at or above the range start within its first byte, and bits at
+        // or below the range end within its last byte.
+        let head = (0xFFu16 << (range.start % 8)) as u8;
+        let tail = (0xFFu16 >> (7 - (range.end - 1) % 8)) as u8;
+        if first == last {
+            self.data[first] &= !(head & tail);
+            return;
+        }
+        self.data[first] &= !head;
+        self.data[first + 1..last].fill(0);
+        self.data[last] &= !tail;
     }
 
     pub fn get(&self, i: usize) -> bool {

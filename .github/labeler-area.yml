@@ -30,20 +30,23 @@ A-encoding:
           - "rust/lance-file/**"
 
 # On-disk format: persisted proto definitions and the format spec docs. Keep the
-# explicit proto lists here in sync. Execution-plan schemas (ann,
-# filtered_read, and table_identifier) are intentionally excluded. Format docs
-# are excluded from A-docs (see below) so format changes get A-format only.
+# explicit proto lists here in sync. Execution-plan schemas (ann, filtered_read,
+# fts, and table_identifier) are intentionally excluded. Format docs are
+# excluded from A-docs (see below) so format changes get A-format only.
 A-format:
   - changed-files:
       - any-glob-to-any-file:
+          - "protos/clustering.proto"
           - "protos/encodings_v2_0.proto"
           - "protos/encodings_v2_1.proto"
+          - "protos/encodings_v2_3.proto"
           - "protos/file.proto"
           - "protos/file2.proto"
           - "protos/index.proto"
           - "protos/index_old.proto"
           - "protos/rowids.proto"
           - "protos/table.proto"
+          - "protos/fragment_metadata.proto"
           - "protos/transaction.proto"
           - "docs/src/format/**"
 
@@ -54,14 +57,17 @@ A-format:
 format-change:
   - changed-files:
       - any-glob-to-any-file:
+          - "protos/clustering.proto"
           - "protos/encodings_v2_0.proto"
           - "protos/encodings_v2_1.proto"
+          - "protos/encodings_v2_3.proto"
           - "protos/file.proto"
           - "protos/file2.proto"
           - "protos/index.proto"
           - "protos/index_old.proto"
           - "protos/rowids.proto"
           - "protos/table.proto"
+          - "protos/fragment_metadata.proto"
           - "protos/transaction.proto"
           - "docs/src/format/**"
 

@@ -91,8 +91,8 @@ async fn test_prewarm_with_positions_populates_separate_position_cache() {
         TokenSetFormat::default(),
         InvertedListFormatVersion::V1,
     );
-    builder.tokens.add("hello".to_owned());
-    builder.tokens.add("world".to_owned());
+    builder.tokens.get_or_add("hello");
+    builder.tokens.get_or_add("world");
     builder
         .posting_lists
         .push(PostingListBuilder::new_with_posting_tail_codec(
@@ -239,8 +239,8 @@ async fn test_best_effort_prewarm_reports_missing_requested_positions() {
         format_version,
         params.posting_block_size(),
     );
-    builder.tokens.add("alpha".to_owned());
-    builder.tokens.add("beta".to_owned());
+    builder.tokens.get_or_add("alpha");
+    builder.tokens.get_or_add("beta");
     for token_id in 0..2 {
         let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
             true,
@@ -294,7 +294,7 @@ async fn test_prewarm_with_v2_positions_preserves_shared_stream_codec() {
     let posting_tail_codec = format_version.posting_tail_codec();
     let mut builder =
         InnerBuilder::new_with_format_version(0, true, TokenSetFormat::default(), format_version);
-    builder.tokens.add("body".to_owned());
+    builder.tokens.get_or_add("body");
 
     let mut posting_list =
         PostingListBuilder::new_with_posting_tail_codec(true, posting_tail_codec);

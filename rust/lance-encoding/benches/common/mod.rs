@@ -5,15 +5,17 @@ use std::sync::Arc;
 
 use arrow_schema::DataType;
 use lance_core::{Error, Result, datatypes::Field};
+use lance_encoding::compression::PerValueGeneralCompression;
 use lance_encoding::{
     compression::{
         BlockCompressor, CompressionStrategy, field_metadata_params, finalize_miniblock_compressor,
         reject_packed_struct_per_value, try_bitpacking_block, try_bitpacking_miniblock,
-        try_byte_stream_split_miniblock, try_fixed_packed_struct_miniblock, try_fixed_u8_rle_block,
-        try_fixed_u8_rle_miniblock, try_general_block, try_raw_block,
-        try_raw_fixed_size_list_miniblock, try_raw_fixed_width_miniblock, try_raw_per_value,
-        try_uncompressed_fixed_width_miniblock, try_variable_packed_struct_per_value,
-        try_variable_width_miniblock, try_variable_width_per_value,
+        try_byte_stream_split_miniblock, try_child_rle_miniblock,
+        try_fixed_packed_struct_miniblock, try_fixed_u8_rle_block, try_fixed_u8_rle_miniblock,
+        try_general_block, try_raw_block, try_raw_fixed_size_list_miniblock,
+        try_raw_fixed_width_miniblock, try_raw_per_value, try_uncompressed_fixed_width_miniblock,
+        try_variable_packed_struct_per_value, try_variable_rle_block, try_variable_width_miniblock,
+        try_variable_width_miniblock_with_generic_offsets, try_variable_width_per_value,
     },
     compression_config::{CompressionFieldParams, CompressionParams},
     data::DataBlock,
@@ -33,6 +35,7 @@ pub enum BenchEncoding {
     Array,
     StructuralU16,
     StructuralU32,
+    StructuralSparse,
 }
 
 impl std::fmt::Display for BenchEncoding {
@@ -41,6 +44,7 @@ impl std::fmt::Display for BenchEncoding {
             Self::Array => "array",
             Self::StructuralU16 => "structural-u16",
             Self::StructuralU32 => "structural-u32",
+            Self::StructuralSparse => "structural-sparse",
         })
     }
 }
@@ -81,13 +85,22 @@ impl CompressionStrategy for BenchCompressionStrategy {
                 compressor
             } else if let Some(compressor) = try_byte_stream_split_miniblock(data, &params) {
                 compressor
-            } else if let Some(compressor) = try_fixed_u8_rle_miniblock(data, &params) {
+            } else if let Some(compressor) = match self.encoding {
+                BenchEncoding::StructuralSparse => try_child_rle_miniblock(data, &params),
+                BenchEncoding::Array
+                | BenchEncoding::StructuralU16
+                | BenchEncoding::StructuralU32 => try_fixed_u8_rle_miniblock(data, &params),
+            } {
                 compressor
             } else if let Some(compressor) = try_bitpacking_miniblock(data) {
                 compressor
             } else if let Some(compressor) = try_raw_fixed_width_miniblock(data) {
                 compressor
-            } else if let Some(compressor) = try_variable_width_miniblock(field, data, &params)? {
+            } else if let Some(compressor) = if self.encoding == BenchEncoding::StructuralSparse {
+                try_variable_width_miniblock_with_generic_offsets(field, data, &params)?
+            } else {
+                try_variable_width_miniblock(field, data, &params)?
+            } {
                 compressor
             } else if let Some(compressor) = try_fixed_packed_struct_miniblock(data)? {
                 compressor
@@ -116,7 +129,7 @@ impl CompressionStrategy for BenchCompressionStrategy {
         }
         let packed = match self.encoding {
             BenchEncoding::StructuralU16 => reject_packed_struct_per_value(field, data)?,
-            BenchEncoding::StructuralU32 => {
+            BenchEncoding::StructuralU32 | BenchEncoding::StructuralSparse => {
                 try_variable_packed_struct_per_value(Arc::new(self.clone()), field, data)?
             }
             BenchEncoding::Array => unreachable!(),
@@ -124,7 +137,12 @@ impl CompressionStrategy for BenchCompressionStrategy {
         if let Some(compressor) = packed {
             return Ok(compressor);
         }
-        if let Some(compressor) = try_variable_width_per_value(field, data, &params)? {
+        if let Some(compressor) = try_variable_width_per_value(
+            field,
+            data,
+            &params,
+            PerValueGeneralCompression::ZstdOnly,
+        )? {
             return Ok(compressor);
         }
         Err(Error::not_supported_source(
@@ -142,16 +160,21 @@ impl CompressionStrategy for BenchCompressionStrategy {
         data: &DataBlock,
     ) -> Result<Box<dyn BlockCompressor>> {
         let params = self.field_params(field);
-        if self.encoding == BenchEncoding::StructuralU32
-            && let Some(compressor) = try_fixed_u8_rle_block(data, &params)?
-        {
+        let rle = match self.encoding {
+            BenchEncoding::Array | BenchEncoding::StructuralU16 => None,
+            BenchEncoding::StructuralU32 => try_fixed_u8_rle_block(data, &params)?,
+            BenchEncoding::StructuralSparse => try_variable_rle_block(data, &params)?,
+        };
+        if let Some(compressor) = rle {
             return Ok(compressor);
         }
         if let Some(compressor) = try_bitpacking_block(data) {
             return Ok(compressor);
         }
-        if self.encoding == BenchEncoding::StructuralU32
-            && let Some(compressor) = try_general_block(data, &params)?
+        if matches!(
+            self.encoding,
+            BenchEncoding::StructuralU32 | BenchEncoding::StructuralSparse
+        ) && let Some(compressor) = try_general_block(data, &params)?
         {
             return Ok(compressor);
         }
@@ -181,14 +204,27 @@ impl FieldEncodingStrategy for BenchFieldEncodingStrategy {
         column_index: &mut ColumnIndexSequence,
         context: &FieldEncodingContext<'_>,
     ) -> Result<Box<dyn FieldEncoder>> {
+        if matches!(self.encoding, BenchEncoding::StructuralSparse)
+            && field.is_blob()
+            && matches!(
+                field.data_type(),
+                arrow_schema::DataType::Binary | arrow_schema::DataType::LargeBinary
+            )
+        {
+            return Err(Error::invalid_input(
+                "Lance 2.3 requires Blob v2 descriptor structs",
+            ));
+        }
         if let Some(encoder) =
             try_create_binary_blob(&self.primitive, field, column_index, context)?
         {
             return Ok(encoder);
         }
-        if self.encoding == BenchEncoding::StructuralU32
-            && let Some(encoder) =
-                try_create_structural_blob(&self.primitive, field, column_index, context)?
+        if matches!(
+            self.encoding,
+            BenchEncoding::StructuralU32 | BenchEncoding::StructuralSparse
+        ) && let Some(encoder) =
+            try_create_structural_blob(&self.primitive, field, column_index, context)?
         {
             return Ok(encoder);
         }
@@ -202,7 +238,10 @@ impl FieldEncodingStrategy for BenchFieldEncodingStrategy {
                 .into(),
             ));
         }
-        if self.encoding == BenchEncoding::StructuralU32 {
+        if matches!(
+            self.encoding,
+            BenchEncoding::StructuralU32 | BenchEncoding::StructuralSparse
+        ) {
             if let Some(encoder) = try_create_map(field, column_index, context)? {
                 return Ok(encoder);
             }
@@ -258,6 +297,16 @@ pub fn encoding_strategy(encoding: BenchEncoding) -> Box<dyn FieldEncodingStrate
         encoding,
         params: CompressionParams::default(),
     });
+    encoding_strategy_with_compression(encoding, compression)
+}
+
+/// Build a structural field encoding strategy that uses a caller-provided
+/// compression strategy. Benchmarks use this to force a single scheme so the
+/// same data can be compared across codecs through the real encode path.
+pub fn encoding_strategy_with_compression(
+    encoding: BenchEncoding,
+    compression: Arc<dyn CompressionStrategy>,
+) -> Box<dyn FieldEncodingStrategy> {
     let page_encodings = match encoding {
         BenchEncoding::StructuralU16 => vec![
             PrimitivePageEncoding::reject_sparse(),
@@ -268,6 +317,7 @@ pub fn encoding_strategy(encoding: BenchEncoding) -> Box<dyn FieldEncodingStrate
             PrimitivePageEncoding::constant(),
             PrimitivePageEncoding::dense_u32(compression),
         ],
+        BenchEncoding::StructuralSparse => vec![PrimitivePageEncoding::planar(compression)],
         BenchEncoding::Array => unreachable!(),
     };
     Box::new(BenchFieldEncodingStrategy {

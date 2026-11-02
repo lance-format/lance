@@ -5,33 +5,85 @@
 //!
 //! This module contains execution nodes for:
 //! - `MemTableScanExec` - Full table scan with MVCC visibility
-//! - `BTreeIndexExec` - BTree index queries
+//! - `ScalarMemIndexExec` - Filters answered from the memtable's indexes
 //! - `VectorIndexExec` - HNSW vector search
 //! - `MemTableBruteForceVectorExec` - KNN over the active memtable without an HNSW
 //! - `FtsIndexExec` - Full-text search
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
+use arrow_schema::{Fields, Schema};
 use datafusion::common::ScalarValue;
-use datafusion::error::Result as DataFusionResult;
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use lance_arrow::RecordBatchExt;
 
 mod brute_force_vector;
-mod btree;
 mod dedup_scan;
 mod fts;
+mod scalar_index;
 mod scan;
 mod vector;
 
+use crate::dataset::blob::prepared_blob_batch_to_descriptors;
 use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
 use crate::dataset::mem_wal::write::BatchStore;
 
 pub use brute_force_vector::MemTableBruteForceVectorExec;
-pub use btree::BTreeIndexExec;
 pub use dedup_scan::MemTableDedupScanExec;
 pub use fts::{FtsIndexExec, SCORE_COLUMN};
+pub use scalar_index::ScalarMemIndexExec;
+#[cfg(test)]
+pub use scalar_index::{FALLBACK_READS_METRIC, NEWEST_CHECKS_METRIC};
 pub use scan::{MemTableScanExec, ROW_ADDRESS_COLUMN};
 pub use vector::VectorIndexExec;
+
+pub(super) fn scan_record_batch(batch: &RecordBatch) -> DataFusionResult<RecordBatch> {
+    prepared_blob_batch_to_descriptors(batch)
+        .map_err(|error| DataFusionError::External(Box::new(error)))
+}
+
+/// Take `indices` out of `source_columns` and trim each to the shape
+/// `output_schema` promises for that column name.
+///
+/// A projected struct leaf (`meta.a`) is served by taking the whole `meta`
+/// column — the memtable stores columns whole — and narrowing it here.
+/// `project_by_schema` recurses through structs, lists and maps and preserves
+/// null buffers. Columns whose type already matches are passed through
+/// untouched, so a projection with no nested paths costs nothing.
+pub(super) fn take_projected_columns(
+    source_columns: &[ArrayRef],
+    source_fields: &Fields,
+    indices: &[usize],
+    output_schema: &Schema,
+    num_rows: usize,
+) -> DataFusionResult<Vec<ArrayRef>> {
+    let mut out = Vec::with_capacity(indices.len());
+    for &i in indices {
+        let field = &source_fields[i];
+        let column = source_columns[i].clone();
+        let Ok(target) = output_schema.field_with_name(field.name()) else {
+            out.push(column);
+            continue;
+        };
+        if target.data_type() == field.data_type() {
+            out.push(column);
+            continue;
+        }
+        let src = RecordBatch::try_new_with_options(
+            Arc::new(Schema::new(vec![field.clone()])),
+            vec![column],
+            &RecordBatchOptions::new().with_row_count(Some(num_rows)),
+        )
+        .map_err(DataFusionError::from)?;
+        let narrowed = src
+            .project_by_schema(&Schema::new(vec![Arc::new(target.clone())]))
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        out.push(narrowed.column(0).clone());
+    }
+    Ok(out)
+}
 
 pub(super) fn newest_pk_positions(
     batch_store: &BatchStore,

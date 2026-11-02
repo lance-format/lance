@@ -36,6 +36,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -123,7 +124,19 @@ public class OverwriteTest extends OperationTestBase {
             Schema schemaRes = scanner.schema();
             assertEquals(testDataset.getSchema(), schemaRes);
           }
-          assertEquals(retryTxn, dataset.readTransaction().orElse(null));
+          try (Transaction committedTxn = dataset.readTransaction().orElseThrow()) {
+            assertEquals(retryTxn.readVersion(), committedTxn.readVersion());
+            assertEquals(retryTxn.uuid(), committedTxn.uuid());
+            assertEquals(retryTxn.transactionProperties(), committedTxn.transactionProperties());
+            Overwrite committedOverwrite = (Overwrite) committedTxn.operation();
+            assertEquals(testDataset.getSchema(), committedOverwrite.schema());
+            assertEquals(
+                Collections.singletonMap("config_key", "config_value"),
+                committedOverwrite.configUpsertValues().orElseThrow());
+            assertArrayEquals(
+                new int[] {0, 1},
+                committedOverwrite.fragments().get(0).getFiles().get(0).getFields());
+          }
         }
       }
     }

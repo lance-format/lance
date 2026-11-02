@@ -167,7 +167,7 @@ impl BatchStreamGrouper {
             // end of group, so we should return the current.
             Some((
                 vec![self.current_partition.take().unwrap()],
-                self.buffer.drain(..).collect(),
+                std::mem::take(&mut self.buffer),
             ))
         } else {
             // If there is no data in the unprocessed buffer, return None as we aren't finished.
