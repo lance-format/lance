@@ -658,27 +658,6 @@ impl SubstraitConsumer for FilterConsumer<'_> {
         self.inner.consume_extension_multi(rel).await
     }
 
-    fn push_lambda_parameters(
-        &self,
-        lambda_parameters: &[Type],
-        input_schema: &DFSchema,
-    ) -> datafusion_common::Result<Vec<String>> {
-        self.inner
-            .push_lambda_parameters(lambda_parameters, input_schema)
-    }
-
-    fn pop_lambda_parameters(&self) {
-        self.inner.pop_lambda_parameters()
-    }
-
-    fn lambda_variable(
-        &self,
-        steps_out: usize,
-        field_idx: usize,
-    ) -> datafusion_common::Result<Expr> {
-        self.inner.lambda_variable(steps_out, field_idx)
-    }
-
     async fn consume_field_reference(
         &self,
         field_ref: &FieldReference,

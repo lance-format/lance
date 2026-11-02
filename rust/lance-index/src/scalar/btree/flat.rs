@@ -13,7 +13,6 @@ use arrow_array::{
 
 use datafusion_common::DFSchema;
 use datafusion_expr::execution_props::ExecutionProps;
-use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use lance_arrow::RecordBatchExt;
 use lance_core::Result;
@@ -182,12 +181,7 @@ impl FlatIndex {
         }
         let query = SargableQuery::IsIn(needles.iter().map(|v| v.0.clone()).collect());
         let expr = query.to_expr(BTREE_VALUES_COLUMN.to_string());
-        let expr = create_physical_expr(
-            &expr,
-            &self.df_schema,
-            &ExecutionProps::default(),
-            &PhysicalPlanningContext::default(),
-        )?;
+        let expr = create_physical_expr(&expr, &self.df_schema, &ExecutionProps::default())?;
         let predicate = expr.evaluate(&self.data)?;
         let predicate = predicate.into_array(self.data.num_rows())?;
         let predicate = predicate
@@ -334,12 +328,7 @@ impl FlatIndex {
 
         // No shortcut possible, need to actually evaluate the query
         let expr = query.to_expr(BTREE_VALUES_COLUMN.to_string());
-        let expr = create_physical_expr(
-            &expr,
-            &self.df_schema,
-            &ExecutionProps::default(),
-            &PhysicalPlanningContext::default(),
-        )?;
+        let expr = create_physical_expr(&expr, &self.df_schema, &ExecutionProps::default())?;
         self.eval_expr(&expr, track_nulls)
     }
 

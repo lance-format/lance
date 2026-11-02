@@ -2,9 +2,10 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{
-    io::{BufReader, BufWriter, Write},
+    collections::HashMap,
+    io::{BufReader, BufWriter},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
@@ -13,7 +14,8 @@ use arrow_schema::{ArrowError, Schema, SchemaRef};
 use datafusion::{
     catalog::{TableProvider, streaming::StreamingTable},
     execution::{
-        SendableRecordBatchStream, SpillFile, TaskContext, disk_manager::DiskManager,
+        SendableRecordBatchStream, TaskContext,
+        disk_manager::{DiskManager, RefCountedTempFile},
         runtime_env::RuntimeEnv,
     },
     physical_plan::{
@@ -27,6 +29,22 @@ use datafusion_common::DataFusionError;
 use futures::StreamExt;
 use lance_arrow::memory::MemoryAccumulator;
 use lance_core::error::LanceOptionExt;
+
+fn disk_manager_accounting_lock(disk_manager: &Arc<DiskManager>) -> Arc<Mutex<()>> {
+    static ACCOUNTING_LOCKS: OnceLock<Mutex<HashMap<usize, Weak<Mutex<()>>>>> = OnceLock::new();
+    let locks = ACCOUNTING_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().unwrap_or_else(|error| error.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+
+    let key = Arc::as_ptr(disk_manager) as usize;
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
 
 /// Start a spill of Arrow data to a file that can be read later multiple times.
 ///
@@ -76,7 +94,7 @@ enum MaterializedStreamStorage {
     Memory(Arc<[RecordBatch]>),
     Spill {
         manager: SpillManager,
-        file: Arc<dyn SpillFile>,
+        file: RefCountedTempFile,
     },
 }
 
@@ -153,37 +171,51 @@ pub async fn materialize_replayable_stream(
     let schema = source.schema();
     let metrics = ExecutionPlanMetricsSet::new();
     let spill_metrics = SpillMetrics::new(&metrics, 0);
-    let spill_manager = SpillManager::new(runtime, spill_metrics, schema.clone())
+    let spill_manager = SpillManager::new(runtime.clone(), spill_metrics.clone(), schema.clone())
         .with_batch_read_buffer_capacity(1);
     let mut buffered_batches = Vec::new();
     let mut buffered_memory = MemoryAccumulator::default();
-    let mut spill_file = spill_manager.create_in_progress_file(request_description)?;
-    let mut is_spilled = false;
+    let file = runtime.disk_manager.create_tmp_file(request_description)?;
+    let mut spill_writer: Option<TrackedStreamWriter> = None;
 
     while let Some(batch) = source.next().await {
         let batch = batch?;
-        if is_spilled {
-            spill_file.append_batch(&batch)?;
+        if let Some(writer) = spill_writer.as_mut() {
+            writer.write(&batch)?;
+            spill_metrics.spilled_rows.add(batch.num_rows());
             continue;
         }
 
         buffered_memory.record_batch(&batch);
         buffered_batches.push(batch);
         if buffered_memory.total() > memory_limit {
+            let managed_spill = ManagedSpillFile {
+                file: file.clone(),
+                disk_manager: runtime.disk_manager.clone(),
+                accounting_lock: disk_manager_accounting_lock(&runtime.disk_manager),
+            };
+            let mut writer = TrackedStreamWriter::try_new(
+                file.inner().reopen()?,
+                schema.as_ref(),
+                Some(managed_spill),
+            )?;
+            spill_metrics.spill_file_count.add(1);
             for buffered_batch in buffered_batches.drain(..) {
-                spill_file.append_batch(&buffered_batch)?;
+                writer.write(&buffered_batch)?;
+                spill_metrics.spilled_rows.add(buffered_batch.num_rows());
             }
-            is_spilled = true;
+            spill_writer = Some(writer);
         }
     }
 
-    let storage = if is_spilled {
-        match spill_file.finish()? {
-            Some(file) => MaterializedStreamStorage::Spill {
-                manager: spill_manager,
-                file,
-            },
-            None => MaterializedStreamStorage::Memory(Arc::new([])),
+    let storage = if let Some(mut writer) = spill_writer {
+        writer.finish()?;
+        spill_metrics
+            .spilled_bytes
+            .add(file.current_disk_usage() as usize);
+        MaterializedStreamStorage::Spill {
+            manager: spill_manager,
+            file,
         }
     } else {
         MaterializedStreamStorage::Memory(buffered_batches.into())
@@ -219,8 +251,9 @@ pub async fn materialize_stream(
 /// unfinished background drain of the source.
 ///
 /// The manager must belong to one operation and must be discarded if any spill
-/// reports an error. Operation-scoped ownership prevents failed accounting from
-/// affecting a later job.
+/// reports an error. DataFusion 54.1.0 can retain a rejected operator charge;
+/// operation-scoped ownership prevents that failed accounting from affecting a
+/// later job.
 ///
 /// # Examples
 ///
@@ -264,16 +297,14 @@ pub async fn spilling_table_provider_with_job_disk_manager(
 ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
     let schema = source.schema();
     let spill_file = disk_manager.create_tmp_file("writing replay spill")?;
-    let spill_path = spill_file
-        .path()
-        .ok_or_else(|| {
-            DataFusionError::NotImplemented(
-                "replay spills require a DiskManager with local file paths".to_string(),
-            )
-        })?
-        .to_owned();
+    let spill_path = spill_file.path().to_owned();
     let (mut sender, receiver) = create_replay_spill(spill_path, schema.clone(), memory_limit);
-    sender.managed_spill = Some(spill_file.clone());
+    let accounting_lock = disk_manager_accounting_lock(&disk_manager);
+    sender.managed_spill = Some(ManagedSpillFile {
+        file: spill_file.clone(),
+        disk_manager,
+        accounting_lock,
+    });
 
     // Drain the one-shot source into the spill once, in the background. The spill
     // tees to memory/disk so the first reader can consume batches as they arrive
@@ -311,7 +342,7 @@ pub async fn spilling_table_provider_with_job_disk_manager(
         schema: schema.clone(),
         receiver,
         _drain_handle: Arc::new(AbortOnDropHandle::new(drain_handle)),
-        _spill_file: spill_file,
+        _spill_file: Arc::new(spill_file),
     });
     Ok(Arc::new(StreamingTable::try_new(schema, vec![partition])?))
 }
@@ -346,7 +377,7 @@ struct SpillPartition {
     // cancellation is requested before spill cleanup begins.
     _drain_handle: Arc<AbortOnDropHandle<SpillSender>>,
     // Keeps the DiskManager-owned spill file alive and accounts its disk usage.
-    _spill_file: Arc<dyn SpillFile>,
+    _spill_file: Arc<RefCountedTempFile>,
 }
 
 impl std::fmt::Debug for SpillPartition {
@@ -502,7 +533,7 @@ impl SpillReader {
 /// spill. Otherwise, they will return an error.
 pub struct SpillSender {
     memory_limit: usize,
-    managed_spill: Option<Arc<dyn SpillFile>>,
+    managed_spill: Option<ManagedSpillFile>,
     schema: Arc<Schema>,
     path: PathBuf,
     state: SpillState,
@@ -789,19 +820,15 @@ impl AsyncStreamWriter {
     pub async fn open(
         path: PathBuf,
         schema: Arc<Schema>,
-        managed_spill: Option<Arc<dyn SpillFile>>,
+        managed_spill: Option<ManagedSpillFile>,
     ) -> Result<Self, ArrowError> {
         let writer = tokio::task::spawn_blocking(move || {
-            let writer: Box<dyn Write + Send> = if let Some(spill) = managed_spill {
-                Box::new(
-                    spill
-                        .open_writer()
-                        .map_err(|error| ArrowError::ExternalError(Box::new(error)))?,
-                )
+            let file = if let Some(spill) = managed_spill.as_ref() {
+                spill.file.inner().reopen().map_err(ArrowError::from)?
             } else {
-                Box::new(std::fs::File::create(&path).map_err(ArrowError::from)?)
+                std::fs::File::create(&path).map_err(ArrowError::from)?
             };
-            TrackedStreamWriter::try_new(writer, &schema)
+            TrackedStreamWriter::try_new(file, &schema, managed_spill)
         })
         .await
         .unwrap()?;
@@ -830,30 +857,93 @@ impl AsyncStreamWriter {
     }
 }
 
+#[derive(Clone)]
+struct ManagedSpillFile {
+    file: RefCountedTempFile,
+    disk_manager: Arc<DiskManager>,
+    accounting_lock: Arc<Mutex<()>>,
+}
+
+impl ManagedSpillFile {
+    fn update_disk_usage(&mut self) -> Result<(), ArrowError> {
+        // Keep replay-file checks and mutations atomic with respect to other
+        // replay files. A mixed operator/replay failure aborts the owning job,
+        // which then discards this operation-scoped disk manager.
+        let _accounting_guard = self
+            .accounting_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let new_file_usage = self
+            .file
+            .inner()
+            .as_file()
+            .metadata()
+            .map_err(ArrowError::from)?
+            .len();
+        let old_file_usage = self.file.current_disk_usage();
+        let used_without_file = self
+            .disk_manager
+            .used_disk_space()
+            .checked_sub(old_file_usage)
+            .ok_or_else(|| {
+                ArrowError::ExternalError(Box::new(DataFusionError::Internal(format!(
+                    "replay spill accounting is inconsistent: used_disk_space={} is less than current_file_disk_usage={old_file_usage}",
+                    self.disk_manager.used_disk_space()
+                ))))
+            })?;
+        if used_without_file
+            .checked_add(new_file_usage)
+            .is_none_or(|usage| usage > self.disk_manager.max_temp_directory_size())
+        {
+            return Err(ArrowError::ExternalError(Box::new(
+                DataFusionError::ResourcesExhausted(format!(
+                    "The used disk space during the spilling process has exceeded the allowable limit of {} bytes. Please try increasing the config: `datafusion.runtime.max_temp_directory_size`.",
+                    self.disk_manager.max_temp_directory_size()
+                )),
+            )));
+        }
+
+        self.file
+            .update_disk_usage()
+            .map_err(|error| ArrowError::ExternalError(Box::new(error)))
+    }
+}
+
 struct TrackedStreamWriter {
-    writer: StreamWriter<BufWriter<Box<dyn Write + Send>>>,
+    writer: StreamWriter<BufWriter<std::fs::File>>,
+    managed_spill: Option<ManagedSpillFile>,
 }
 
 impl TrackedStreamWriter {
-    fn try_new(writer: Box<dyn Write + Send>, schema: &Schema) -> Result<Self, ArrowError> {
-        let writer = StreamWriter::try_new(BufWriter::new(writer), schema)?;
-        let mut tracked = Self { writer };
-        tracked.flush()?;
+    fn try_new(
+        file: std::fs::File,
+        schema: &Schema,
+        managed_spill: Option<ManagedSpillFile>,
+    ) -> Result<Self, ArrowError> {
+        let writer = StreamWriter::try_new(BufWriter::new(file), schema)?;
+        let mut tracked = Self {
+            writer,
+            managed_spill,
+        };
+        tracked.flush_and_update_disk_usage()?;
         Ok(tracked)
     }
 
     fn write(&mut self, batch: &RecordBatch) -> Result<(), ArrowError> {
         self.writer.write(batch)?;
-        self.flush()
+        self.flush_and_update_disk_usage()
     }
 
     fn finish(&mut self) -> Result<(), ArrowError> {
         self.writer.finish()?;
-        self.flush()
+        self.flush_and_update_disk_usage()
     }
 
-    fn flush(&mut self) -> Result<(), ArrowError> {
+    fn flush_and_update_disk_usage(&mut self) -> Result<(), ArrowError> {
         self.writer.flush()?;
+        if let Some(spill) = self.managed_spill.as_mut() {
+            spill.update_disk_usage()?;
+        }
         Ok(())
     }
 }
@@ -956,6 +1046,38 @@ mod tests {
 
         let replayed = stream.try_collect::<Vec<_>>().await.unwrap();
         assert_eq!(replayed, batches);
+        let progress = runtime.disk_manager.spilling_progress();
+        assert_eq!(progress.active_files_count, 0);
+        assert_eq!(progress.current_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn test_materialization_quota_failure_releases_disk_usage() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "a",
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as Arc<dyn arrow_array::Array>,
+        )])
+        .unwrap();
+        let source = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter(vec![Ok(batch)]),
+        ));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_disk_manager_builder(
+                DiskManagerBuilder::default().with_max_temp_directory_size(1),
+            )
+            .build_arc()
+            .unwrap();
+
+        let result = materialize_replayable_stream(source, runtime.clone(), 0, "quota test").await;
+        let Err(error) = result else {
+            panic!("materialization must respect its disk quota");
+        };
+        assert!(
+            matches!(error, DataFusionError::ArrowError(..)),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("exceeded the allowable limit"));
         let progress = runtime.disk_manager.spilling_progress();
         assert_eq!(progress.active_files_count, 0);
         assert_eq!(progress.current_bytes, 0);
@@ -1373,23 +1495,20 @@ mod tests {
             .await
             .unwrap();
 
-        let operator_spill = failed_job_manager
+        let mut operator_spill = failed_job_manager
             .create_tmp_file("testing mixed spill accounting")
             .unwrap();
-        let mut writer = operator_spill.open_writer().unwrap();
-        let error = writer.write_all(&[0]).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("used disk space during the spilling process has exceeded")
-        );
-        drop(writer);
+        operator_spill.inner().as_file().set_len(1).unwrap();
+        assert!(matches!(
+            operator_spill.update_disk_usage(),
+            Err(DataFusionError::ResourcesExhausted(_))
+        ));
         drop(operator_spill);
         drop(provider);
         drop(failed_job_manager);
 
         // A quota error terminates the operation and discards its manager. The
-        // next job starts with independent accounting.
+        // next job starts with independent accounting even on DataFusion 54.1.0.
         let next_job_manager = Arc::new(
             DiskManager::builder()
                 .with_max_temp_directory_size(serialized_size)

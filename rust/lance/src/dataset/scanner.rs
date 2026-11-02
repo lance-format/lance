@@ -40,7 +40,6 @@ use datafusion::physical_plan::{
 use datafusion::scalar::ScalarValue;
 use datafusion_expr::ExprSchemable;
 use datafusion_expr::execution_props::ExecutionProps;
-use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_physical_expr::aggregate::LoweredAggregateBuilder;
 use datafusion_physical_expr::expressions::{Column, Literal};
@@ -3149,13 +3148,7 @@ impl Scanner {
             // Convert logical to physical expression
             let df_schema = Arc::new(DFSchema::try_from(arrow_schema.clone())?);
             let execution_props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
-            create_physical_expr(
-                &expr,
-                &df_schema,
-                &execution_props,
-                &PhysicalPlanningContext::default(),
-            )
-            .map_err(|e| {
+            create_physical_expr(&expr, &df_schema, &execution_props).map_err(|e| {
                 Error::internal(format!(
                     "Failed to create physical expression for nested field '{}': {}",
                     column_name, e
@@ -3521,12 +3514,8 @@ impl Scanner {
             .iter()
             .map(|expr| {
                 let name = expr.schema_name().to_string();
-                let physical_expr = create_physical_expr(
-                    expr,
-                    &df_schema,
-                    &ExecutionProps::default(),
-                    &PhysicalPlanningContext::default(),
-                )?;
+                let physical_expr =
+                    create_physical_expr(expr, &df_schema, &ExecutionProps::default())?;
                 Ok((physical_expr, name))
             })
             .collect::<Result<_>>()?;
@@ -3577,13 +3566,11 @@ impl Scanner {
             _ => (None, String::new()),
         };
         let execution_props = ExecutionProps::default();
-        let planning_ctx = PhysicalPlanningContext::default();
         let mut builder = LoweredAggregateBuilder::new(
             &coerced_expr,
             df_schema,
             input_schema.as_ref(),
             &execution_props,
-            &planning_ctx,
         )
         .with_human_display(human_display);
         if let Some(name) = name {
@@ -8831,12 +8818,7 @@ impl Scanner {
                 let logical = col(DIST_COL).gt_eq(lit(v));
                 let schema = flat_dist.schema();
                 let df_schema = DFSchema::try_from(schema)?;
-                let physical = create_physical_expr(
-                    &logical,
-                    &df_schema,
-                    &ExecutionProps::new(),
-                    &PhysicalPlanningContext::default(),
-                )?;
+                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())?;
                 Ok::<(Expr, Arc<dyn PhysicalExpr>), _>((logical, physical))
             })
             .transpose()?;
@@ -8847,12 +8829,7 @@ impl Scanner {
                 let logical = col(DIST_COL).lt(lit(v));
                 let schema = flat_dist.schema();
                 let df_schema = DFSchema::try_from(schema)?;
-                let physical = create_physical_expr(
-                    &logical,
-                    &df_schema,
-                    &ExecutionProps::new(),
-                    &PhysicalPlanningContext::default(),
-                )?;
+                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())?;
                 Ok::<(Expr, Arc<dyn PhysicalExpr>), _>((logical, physical))
             })
             .transpose()?;
@@ -8862,12 +8839,7 @@ impl Scanner {
                 let logical = llog.and(ulog);
                 let schema = flat_dist.schema();
                 let df_schema = DFSchema::try_from(schema)?;
-                let physical = create_physical_expr(
-                    &logical,
-                    &df_schema,
-                    &ExecutionProps::new(),
-                    &PhysicalPlanningContext::default(),
-                )?;
+                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())?;
                 Some((logical, physical))
             }
             (Some((llog, lphys)), None) => Some((llog, lphys)),

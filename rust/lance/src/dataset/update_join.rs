@@ -17,7 +17,7 @@ use arrow_schema::{
     ArrowError, DataType, Field as ArrowField, FieldRef, Schema as ArrowSchema, SchemaRef,
     SortOptions,
 };
-use datafusion::common::{JoinType, NullEquality, config::ConfigNonZeroUsize};
+use datafusion::common::{JoinType, NullEquality};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricValue};
@@ -806,12 +806,13 @@ async fn run_external_update(
         .options_mut()
         .execution
         .sort_spill_reservation_bytes = sort_spill_reservation_bytes;
-    state.config_mut().options_mut().execution.batch_size =
-        ConfigNonZeroUsize::try_new(execution_batch_size).map_err(|_| {
-            Error::invalid_input(format!(
-                "UpdateColumnsOptions.execution_batch_size must be greater than zero, got {execution_batch_size}"
-            ))
-        })?;
+    if execution_batch_size == 0 {
+        return Err(Error::invalid_input(
+            "UpdateColumnsOptions.execution_batch_size must be greater than zero, got 0"
+                .to_string(),
+        ));
+    }
+    state.config_mut().options_mut().execution.batch_size = execution_batch_size;
     let task_context = state.task_ctx();
 
     let right_schema = right_stream.schema();
@@ -2655,7 +2656,14 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            matches!(error, Error::Arrow { .. }),
+            matches!(
+                &error,
+                Error::External { source }
+                    if matches!(
+                        source.downcast_ref::<DataFusionError>(),
+                        Some(DataFusionError::ResourcesExhausted(_))
+                    )
+            ),
             "unexpected low-disk error: {error:?}"
         );
         assert!(error.to_string().contains("exceeded the allowable limit"));

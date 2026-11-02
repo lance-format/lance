@@ -108,10 +108,7 @@ pub fn deep_copy_array_data_sliced(data: &ArrayData) -> ArrayData {
         DataType::Boolean => 0,
         _ => data.offset(),
     };
-    // The copy holds no more data than the valid source array, so offsets cannot overflow.
-    mutable
-        .try_extend(0, start, start + data.len())
-        .expect("copying a slice of a valid array cannot overflow its offsets");
+    mutable.extend(0, start, start + data.len());
 
     // Freeze into immutable ArrayData
     mutable.freeze()

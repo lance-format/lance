@@ -9,11 +9,8 @@ use std::sync::Arc;
 use arrow_array::{BooleanArray, RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
 use datafusion::common::stats::Precision;
-use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_plan::apply_expression_roots;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -202,13 +199,6 @@ impl ExecutionPlan for MemTableScanExec {
         vec![]
     }
 
-    fn apply_expressions(
-        &self,
-        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
-    ) -> DataFusionResult<TreeNodeRecursion> {
-        apply_expression_roots(&self.filter_predicate, f)
-    }
-
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -386,8 +376,6 @@ mod tests {
     use super::*;
     use arrow_array::{Int32Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::physical_plan::StatisticsArgs;
-    use datafusion::physical_plan::StatisticsContext;
     use futures::TryStreamExt;
 
     fn create_test_schema() -> Arc<Schema> {
@@ -509,9 +497,7 @@ mod tests {
         // max_readable=1 means positions 0 and 1 are visible
         let exec = MemTableScanExec::new(batch_store, 2, None, schema, false);
 
-        let stats = StatisticsContext::new()
-            .compute(&exec, &StatisticsArgs::new())
-            .unwrap();
+        let stats = exec.partition_statistics(None).unwrap();
         // Statistics are Absent to avoid DataFusion analysis bugs
         assert_eq!(stats.num_rows, Precision::Absent);
         assert_eq!(stats.column_statistics.len(), exec.schema().fields().len());
@@ -535,9 +521,7 @@ mod tests {
         let other: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(scan.schema()));
 
         let union = UnionExec::try_new(vec![scan, other]).unwrap();
-        StatisticsContext::new()
-            .compute(union.as_ref(), &StatisticsArgs::new())
-            .unwrap();
+        union.partition_statistics(None).unwrap();
     }
 
     #[tokio::test]
