@@ -2087,15 +2087,17 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
         other => panic!("the sibling translates: {other:?}"),
     };
     assert_ne!(planned, no_coverage);
-    let refused = open_row_id_remapping(&dataset, &siblings[1], &NoOpMetricsCollector)
+    // The pruned plan derives nothing for the sibling: a query opens it as
+    // contributing nothing, its fragments being scanned.
+    match open_row_id_remapping(&dataset, &siblings[1], &NoOpMetricsCollector)
         .await
-        .unwrap_err();
-    assert!(
-        refused
-            .to_string()
-            .contains("excludes it from the index listing"),
-        "{refused}"
-    );
+        .unwrap()
+    {
+        Some((_, ResolvedRemapping::V1Translate { fingerprint, .. })) => {
+            assert_eq!(fingerprint, no_coverage);
+        }
+        other => panic!("expected an empty translation, got {other:?}"),
+    }
     match open_row_id_remapping_with_plan(
         &dataset,
         &siblings[1],
@@ -4444,15 +4446,29 @@ async fn segment_state_matrix_at_the_open_layer() {
             Cell::Serves,
             Cell::Serves,
         ),
+        // Segments that derive no coverage stay listed with none: their
+        // fragments are scanned, and they open as contributing nothing.
         (
             "partially withdrawn",
             &partial,
-            None,
-            Cell::Error,
+            Some(RoaringBitmap::new()),
+            Cell::Serves,
             Cell::Empty,
         ),
-        ("empty last", &empty_last, None, Cell::Error, Cell::Empty),
-        ("superseded", &superseded, None, Cell::Error, Cell::Empty),
+        (
+            "empty last",
+            &empty_last,
+            Some(RoaringBitmap::new()),
+            Cell::Serves,
+            Cell::Empty,
+        ),
+        (
+            "superseded",
+            &superseded,
+            Some(RoaringBitmap::new()),
+            Cell::Serves,
+            Cell::Empty,
+        ),
         ("bitmap None", &unknown, None, Cell::Error, Cell::Skip),
         ("corrupt", &corrupt, None, Cell::Error, Cell::Error),
     ];

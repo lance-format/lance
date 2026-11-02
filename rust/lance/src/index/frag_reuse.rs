@@ -363,6 +363,8 @@ async fn fri_query_plan(
                         SegmentRemappingPlan::Identity
                     } else if let Some(entry) = filtered_by_uuid.get(&source.uuid)
                         && let Some(bitmap) = &entry.fragment_bitmap
+                        // Listed with empty coverage: it derives none.
+                        && !bitmap.is_empty()
                     {
                         let coverage = bitmap & dataset.fragment_bitmap.as_ref();
                         // Other selected segments own their direct coverage.
@@ -448,6 +450,9 @@ pub(crate) async fn resolve_query_segment_coverages(
                 direct(stored)
             }
             Some(SegmentRemappingPlan::Translate { coverage, .. }) => Ok(coverage.clone()),
+            Some(SegmentRemappingPlan::MissingCoverage(
+                MissingCoverageReason::Withdrawn | MissingCoverageReason::NoDerivedCoverage,
+            )) => Ok(RoaringBitmap::new()),
             Some(SegmentRemappingPlan::MissingCoverage(reason)) => {
                 Err(Error::not_supported(format!(
                     "FRI query coverage is unavailable for segment {} ({reason})",
@@ -665,19 +670,18 @@ pub(super) async fn open_row_id_remapping_with_plan(
     };
     match plan {
         SegmentRemappingPlan::Identity => Ok(Some((fri.uuid, ResolvedRemapping::V1Identity))),
-        // No derivable coverage (withdrawn or unresolvable). A query must not
-        // open such a segment: the listing excludes it, so no scan was
-        // scheduled for its rows, and an empty answer would silently drop
-        // them. Maintenance reads it as an empty segment (every stored row
-        // translates to nothing) and replaces it.
-        SegmentRemappingPlan::MissingCoverage(reason) if purpose == OpenPurpose::Query => {
-            Err(Error::not_supported(format!(
-                "FRI query coverage is unavailable for segment {} ({reason}): the reader \
+        // A segment that derives no coverage is listed with empty coverage,
+        // so every one of its fragments is scanned; it opens as an empty
+        // segment (every stored row translates to nothing), and maintenance
+        // replaces it. Segments this build cannot translate stay refused.
+        SegmentRemappingPlan::MissingCoverage(
+            reason @ (MissingCoverageReason::Unsupported | MissingCoverageReason::Corrupt),
+        ) if purpose == OpenPurpose::Query => Err(Error::not_supported(format!(
+            "FRI query coverage is unavailable for segment {} ({reason}): the reader \
                  excludes it from the index listing on this snapshot; open it through the \
                  listing, not by uuid",
-                index.uuid
-            )))
-        }
+            index.uuid
+        ))),
         SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Unsupported) => {
             Err(Error::not_supported(format!(
                 "segment {} cannot be translated by this build under the tagged fragment reuse \

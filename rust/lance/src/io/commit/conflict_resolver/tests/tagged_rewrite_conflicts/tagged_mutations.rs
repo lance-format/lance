@@ -2121,34 +2121,26 @@ async fn tagged_table_withdraws_a_mixed_provenance_whole() {
         "{:?}",
         v_idx.fragment_bitmap
     );
-    // The withdrawn segment is out of the listing. Opening it by uuid through
-    // the query entry is an error (no scan covers its rows, so an empty
-    // answer would drop them); the maintenance entry opens it as contributing
-    // nothing so it can be rebuilt.
+    // The withdrawn segment stays listed with no coverage, so its fragments
+    // are scanned, and both entries open it as contributing nothing.
     {
         use crate::index::DatasetIndexInternalExt;
         use lance_index::metrics::NoOpMetricsCollector;
-        assert!(
-            !dataset
+        assert_eq!(
+            dataset
                 .load_indices()
                 .await
                 .unwrap()
                 .iter()
-                .any(|idx| idx.uuid == v_idx.uuid),
-            "excluded from the listing"
+                .find(|idx| idx.uuid == v_idx.uuid)
+                .and_then(|idx| idx.fragment_bitmap.clone()),
+            Some(roaring::RoaringBitmap::new()),
+            "listed with no coverage"
         );
-        let refused = dataset
+        dataset
             .open_scalar_index("v", &v_idx.uuid, &NoOpMetricsCollector)
             .await
-            .unwrap_err();
-        assert!(refused.to_string().contains("does not exist"), "{refused}");
-        let Err(refused) = dataset
-            .open_generic_index("v", &v_idx.uuid, &NoOpMetricsCollector)
-            .await
-        else {
-            panic!("the query entry opened a withdrawn segment")
-        };
-        assert!(refused.to_string().contains("does not exist"), "{refused}");
+            .unwrap();
         dataset
             .open_scalar_index_for_maintenance("v", &v_idx.uuid, &NoOpMetricsCollector)
             .await

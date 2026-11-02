@@ -105,9 +105,10 @@ pub(super) async fn load_indices(
             .into_iter()
             .zip(mapping.segment_coverage(&provenance))
         {
-            if coverage.is_empty() {
-                continue;
-            }
+            // A segment that derives no coverage stays listed with empty
+            // coverage: its fragments are scanned, and consumers that need the
+            // index itself (full text search takes its tokenizer from it)
+            // still find it.
             let mut index = index.clone();
             index.fragment_bitmap = Some(coverage);
             result[position] = Some(index);

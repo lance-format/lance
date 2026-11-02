@@ -2766,13 +2766,15 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert!(
-                !dataset
+            assert_eq!(
+                dataset
                     .load_indices()
                     .await
                     .unwrap()
                     .iter()
-                    .any(|idx| idx.uuid == superseded.uuid),
+                    .find(|idx| idx.uuid == superseded.uuid)
+                    .and_then(|idx| idx.fragment_bitmap.clone()),
+                Some(RoaringBitmap::new()),
                 "the direct sibling supersedes the translating segment"
             );
             let version = dataset.manifest.version;
