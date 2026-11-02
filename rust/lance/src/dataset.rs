@@ -2090,7 +2090,7 @@ impl Dataset {
         let mut scan = self.scan();
         scan.with_row_address();
         let batches = scan.try_into_stream().await?;
-        let plan = Arc::new(optimize::BlobV2BatchRewritePlan::try_new(
+        let plan = Arc::new(blob::BlobV2BatchRewritePlan::try_new(
             self.schema(),
             lance_io::stream::RecordBatchStream::schema(&batches).as_ref(),
             false,
