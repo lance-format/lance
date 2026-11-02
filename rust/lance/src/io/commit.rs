@@ -81,7 +81,8 @@ use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use prost::Message;
 
-pub mod conflict_matrix;
+#[cfg(test)]
+mod conflict_matrix;
 pub mod conflict_resolver;
 #[cfg(all(feature = "dynamodb_tests", test))]
 mod dynamodb;

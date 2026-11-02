@@ -79,7 +79,7 @@ use crate::Error;
 /// dataset may not corrupt itself at any level.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Isolation {
+enum Isolation {
     /// Whatever the pre-Transaction-V2 rules do. Measured, not specified.
     Legacy,
 }
@@ -87,7 +87,7 @@ pub(crate) enum Isolation {
 /// What committing `ours` over a concurrent `theirs` does today.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Outcome {
+enum Outcome {
     /// Rejected, but the writer may rebuild against the new version and retry.
     Retryable,
     /// Rejected outright; retrying cannot help.

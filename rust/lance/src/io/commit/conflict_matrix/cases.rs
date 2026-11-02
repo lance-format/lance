@@ -34,22 +34,22 @@ use crate::{Dataset, Error};
 /// levels become configurable this grows a grid per level.
 const MATRIX: &str = "\
                           | ap dl df ur uc ov dr pj pa mg ma ci rw ow rs cf
-append                    | L  L  L  L  L  L  L  L  R  L  R  L  L  X  X  L
+append                    | L  L  L  L  L  L  L  L  R  R  R  L  L  X  X  L
 delete                    | L  R  R  L  R  L  R  L  L  R  R  L  R  X  X  L
 delete_whole_fragment     | L  R  R  R  R  L  R  L  L  R  R  L  R  X  X  L
 update_rewrite_rows       | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L
 update_rewrite_columns    | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L
-data_overlay              | L  L  R  R  L  L  L  !  R  R  R  L  R  X  X  L
+data_overlay              | L  L  R  R  L  L  L  R  R  R  R  L  R  X  X  L
 data_replacement          | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L
-project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  L
-project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  L
+project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  R
+project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  R
 merge                     | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R
 merge_alter_nullability   | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R
 create_index              | L  L  L  L  L  L  L  L  L  L  L  R  R  X  X  L
 rewrite                   | L  R  R  R  R  R  R  L  L  R  R  R  R  X  X  L
 overwrite                 | L  L  L  L  L  L  L  L  L  L  L  L  L  R  L  L
 restore                   | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  X
-update_config             | L  L  L  L  L  L  L  L  L  R  R  L  L  X  X  X
+update_config             | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  X
 ";
 
 /// The level [`MATRIX`] was observed under.
@@ -146,12 +146,7 @@ fn render_matrix(symbol: impl Fn(Scenario, Scenario) -> char) -> String {
 ///
 /// When a fix lands, remove the pair from here, un-`#[ignore]` its test, which
 /// stays as a regression test, and re-run `discover` to pick the cell back up.
-const KNOWN_BUGS: &[(Scenario, Scenario, &str)] = &[(
-    Scenario::DataOverlay,
-    Scenario::Project,
-    "an overlay rebased over a project keeps a column the project dropped: \
-     https://github.com/lance-format/lance/issues/9724",
-)];
+const KNOWN_BUGS: &[(Scenario, Scenario, &str)] = &[];
 
 pub(super) fn known_bug(ours: Scenario, theirs: Scenario) -> Option<&'static str> {
     KNOWN_BUGS
@@ -528,7 +523,6 @@ async fn project_must_drop_the_overlays_of_dropped_columns() {
 /// lands supplying only a dropped field. Either outcome is correct: a retryable
 /// conflict, or a commit without that overlay.
 #[tokio::test]
-#[ignore = "bug: https://github.com/lance-format/lance/issues/9724"]
 async fn overlay_must_not_keep_a_concurrently_dropped_column() {
     let base = fixture().await;
     let staged = Scenario::DataOverlay.stage(&base).await.unwrap();

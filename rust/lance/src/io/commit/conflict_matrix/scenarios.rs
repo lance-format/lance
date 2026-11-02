@@ -470,6 +470,7 @@ async fn stage_update_rewrite_columns(
             new_fragments: vec![],
             fields_modified: vec![field_id as u32],
             compacted_sstables: Vec::new(),
+            mem_wal_dir_id: None,
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
             inserted_rows_filter: None,
