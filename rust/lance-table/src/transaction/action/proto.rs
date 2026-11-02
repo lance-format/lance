@@ -294,7 +294,10 @@ mod tests {
         let message = pb_actions::Action {
             action: Some(pb_actions::action::Action::RefreshRowVersionMetadata(
                 pb_actions::RefreshRowVersionMetadata {
-                    fragment_ids: vec![1],
+                    rows: vec![pb_actions::RowSelection {
+                        fragment_id: 1,
+                        coverage: Some(pb_actions::row_selection::Coverage::Full(())),
+                    }],
                 },
             )),
         };
