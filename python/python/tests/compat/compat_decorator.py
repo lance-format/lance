@@ -11,14 +11,13 @@ for testing forward and backward compatibility across Lance versions.
 import inspect
 import json
 import os
-import subprocess
 import sys
 import urllib.request
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
 import pytest
-from packaging.version import Version
+from packaging.version import InvalidVersion, Version
 
 
 def _fetch_stable_versions() -> List[Version]:
@@ -29,11 +28,14 @@ def _fetch_stable_versions() -> List[Version]:
         ) as response:
             data = json.loads(response.read())
             releases = data["releases"].keys()
-            stable_versions = [
-                Version(v)
-                for v in releases
-                if not any(c in v for c in ["a", "b", "rc"])
-            ]
+            stable_versions = []
+            for release in releases:
+                try:
+                    version = Version(release)
+                except InvalidVersion:
+                    continue
+                if not version.is_prerelease and not version.is_devrelease:
+                    stable_versions.append(version)
             stable_versions.sort()
             return stable_versions
     except Exception as e:
@@ -65,62 +67,6 @@ def recent_major_versions(n: int) -> List[str]:
     return major_versions
 
 
-def _fetch_last_beta_release():
-    """Returns the latest beta version available on fury.io.
-
-    Uses pip to query the fury.io index for pre-release versions of pylance.
-    """
-    try:
-        # Use pip index to get versions from fury.io
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "index",
-                "versions",
-                "pylance",
-                "--pre",
-                "--extra-index-url",
-                "https://pypi.fury.io/lance-format/",
-                "--extra-index-url",
-                "https://pypi.fury.io/lancedb/",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-
-        if result.returncode == 0:
-            # Parse output to find available versions
-            # Output format: "pylance (x.y.z)"
-            # Available versions: x.y.z.betaN, x.y.z, ...
-            for line in result.stdout.splitlines():
-                if "Available versions:" in line:
-                    versions_str = line.split("Available versions:")[1].strip()
-                    versions = [v.strip() for v in versions_str.split(",")]
-                    # Return the first beta/pre-release version
-                    for v in versions:
-                        if "beta" in v or "rc" in v or "a" in v or "b" in v:
-                            return v
-                    # If no pre-release found, return the first version
-                    if versions:
-                        return versions[0]
-
-        print(
-            "Warning: Could not fetch latest beta release from fury.io",
-            file=sys.stderr,
-        )
-        return None
-
-    except Exception as e:
-        print(
-            f"Warning: Could not fetch latest beta release from fury.io: {e}",
-            file=sys.stderr,
-        )
-        return None
-
-
 _SNAPSHOT: Optional[Dict[str, Any]] = None
 
 
@@ -129,17 +75,14 @@ def version_snapshot() -> Dict[str, Any]:
 
     Every process collecting these tests has to agree on this, because it
     decides the `version` parameters and pytest-xdist aborts a run whose workers
-    collected different tests. Resolving it takes two network queries, so it is
+    collected different tests. Resolving it takes a network query, so it is
     resolved once per process -- and once per run on the xdist controller, then
     handed down to the workers by `pytest_configure_node` in the root tests
     conftest.
     """
     global _SNAPSHOT
     if _SNAPSHOT is None:
-        _SNAPSHOT = {
-            "stable": [str(v) for v in _fetch_stable_versions()],
-            "beta": _fetch_last_beta_release(),
-        }
+        _SNAPSHOT = {"stable": [str(v) for v in _fetch_stable_versions()]}
     return _SNAPSHOT
 
 
@@ -154,12 +97,8 @@ def pylance_stable_versions() -> List[Version]:
 
 
 def compat_versions() -> List[str]:
-    """The pylance versions every compat test is parametrized over."""
-    versions = recent_major_versions(3)
-    beta = version_snapshot()["beta"]
-    if beta is not None:
-        versions.append(beta)
-    return versions
+    """The stable pylance versions every compat test is parametrized over."""
+    return recent_major_versions(3)
 
 
 class UpgradeDowngradeTest:
