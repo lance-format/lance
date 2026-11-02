@@ -618,6 +618,9 @@ same id, name, or path.
     on the unrecognized operation. For conflict checking that failure aborts
     the older writer's commit, which is the safe outcome.
 
+    Writers commit a `CompositeOperation` only when the calling code opts in
+    per commit.
+
 Every operation above is a single named verb. A transaction may instead carry a
 `CompositeOperation`: an ordered list of granular *actions* that apply
 atomically as one manifest change. This lets one commit express a change no
