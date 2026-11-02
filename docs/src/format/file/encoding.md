@@ -898,9 +898,10 @@ hold a single value. pco stores bins and delta state per chunk, so it needs a fe
 numbers per list position to amortize that metadata. A random read of one value decodes one chunk.
 
 Pcodec is selected only when a field requests it with `lance-encoding:compression=pcodec`. Such a field is not
-dictionary encoded, since pcodec stores repeated values cheaply. Values wider than the mini-block threshold also
-use the mini-block layout, because full zip compresses each value on its own and cannot exploit similarity
-between rows.
+dictionary encoded, since pcodec stores repeated values cheaply. Values wider than the mini-block threshold and
+mostly-null pages also use the dense mini-block layout, because full zip compresses each value on its own and
+cannot exploit similarity between rows; a request that also sets `lance-encoding:structural-encoding=fullzip`
+is rejected. Pages of fixed-size lists with null items are stored without pcodec.
 
 ### General
 
