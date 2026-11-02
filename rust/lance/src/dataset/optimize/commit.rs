@@ -630,7 +630,7 @@ pub async fn commit_compaction(
 
 /// Materialize the counts the fragment reuse digests and conservation
 /// validation depend on, without changing the fragment list. Unlike
-/// [`migrate_fragments`], fully-deleted fragments are KEPT: the rewrite
+/// `migrate_fragments`, fully-deleted fragments are KEPT: the rewrite
 /// group must still remove them from the manifest and the recorded
 /// transition must still consume them (they contribute zero live rows), so
 /// a silently shortened list would desynchronize the digests, the group and

@@ -99,7 +99,7 @@ impl TryFrom<&str> for IndexRemapMode {
     }
 }
 
-/// Options to be passed to [compact_files].
+/// Options to be passed to [`crate::dataset::optimize::compact_files`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompactionOptions {
     /// Target number of rows per file. Defaults to 1 million.
@@ -118,7 +118,7 @@ pub struct CompactionOptions {
     /// This does not affect which frgamnets need compaction, but does affect
     /// how they are re-written if selected.
     ///
-    /// If not specified then the default (see [`WriteParams`]) will be used.
+    /// If not specified then the default (see [`crate::dataset::WriteParams`]) will be used.
     pub max_bytes_per_file: Option<usize>,
     /// Whether to compact fragments with deletions so there are no deletions.
     /// Defaults to true.
@@ -261,7 +261,7 @@ pub struct CompactionOptions {
     ///
     /// The budget is divided evenly across columns. The default is 8 MiB per
     /// column.
-    /// See [`FileWriterOptions::data_cache_bytes`].
+    /// See [`lance_file::writer::FileWriterOptions::data_cache_bytes`].
     pub data_cache_bytes: Option<u64>,
 }
 
@@ -631,7 +631,7 @@ impl DefaultCompactionPlanner {
 
     /// Select the publication contract used by this plan. Without an explicit
     /// remapper, planning preserves physical index boundaries. Distributed callers
-    /// using [`DatasetIndexRemapperOptions`] at commit may opt into atomic merges.
+    /// using [`crate::dataset::index::DatasetIndexRemapperOptions`] at commit may opt into atomic merges.
     ///
     /// ```
     /// use lance::dataset::index::DatasetIndexRemapperOptions;
@@ -1703,7 +1703,7 @@ async fn unremappable_index_coverage(dataset: &Dataset) -> Result<Vec<(String, R
 /// [`DefaultCompactionPlanner`] keeps those fragments out of the plan, but
 /// nothing forces a caller through it: `compact_files_with_planner` takes any
 /// planner, [`CompactionPlan`] is public and serializable, and a distributed
-/// driver hands [`commit_compaction`] results planned elsewhere. Committing such
+/// driver hands [`crate::dataset::optimize::commit_compaction`] results planned elsewhere. Committing such
 /// a plan strands the index on fragment ids the rewrite deleted, so the commit
 /// boundary refuses it rather than the planner alone. Only relevant without
 /// stable row ids; see [`unremappable_index_coverage`].

@@ -46,7 +46,7 @@ use lance_table::rowids::RowIdSequence;
 use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 
-/// Metrics returned by [compact_files].
+/// Metrics returned by [`crate::dataset::optimize::compact_files`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactionMetrics {
     /// The number of fragments that have been overwritten.
@@ -325,7 +325,8 @@ pub struct CompactionTask {
 impl CompactionTask {
     /// Run the compaction task and return the result.
     ///
-    /// This result should be later passed to [commit_compaction()] to commit
+    /// This result should be later passed to
+    /// [`crate::dataset::optimize::commit_compaction`] to commit
     /// the changes to the dataset.
     ///
     /// Note: you should pass the version of the dataset that is the same as
@@ -371,7 +372,8 @@ impl CompactionPlan {
 
 /// The result of a single compaction task.
 ///
-/// This should be passed to [commit_compaction()] to commit the operation.
+/// This should be passed to [`crate::dataset::optimize::commit_compaction`] to
+/// commit the operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RewriteResult {
     pub metrics: CompactionMetrics,
@@ -968,7 +970,8 @@ async fn compute_row_lineage(
 /// the path for tables that cannot spill, and for binary copy, whose output
 /// files cannot take the lineage as extra columns.
 ///
-/// Visible to the crate so tests that assemble an [`Operation::Rewrite`] by hand
+/// Visible to the crate so tests that assemble an
+/// [`crate::dataset::transaction::Operation::Rewrite`] by hand
 /// can transfer row lineage the way compaction does, rather than reimplementing it.
 pub async fn rechunk_row_lineage(
     dataset: &Dataset,
