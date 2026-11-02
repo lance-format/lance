@@ -53,7 +53,7 @@ pub mod inserted_rows;
 use assign_action::{
     condition_reads_target, merge_insert_action, parse_delete_condition, parse_update_condition,
 };
-use inserted_rows::KeyExistenceFilter;
+use inserted_rows::{KeyExistenceFilter, KeyExistenceFilterBuilder, extract_key_value_from_batch};
 
 use super::cleanup_data_fragments;
 use super::retry::{RetryConfig, RetryExecutor, execute_with_retry};
@@ -720,6 +720,21 @@ struct MergeInsertParams {
 }
 
 impl MergeInsertParams {
+    /// Return ON field IDs only when they match the declared primary key.
+    fn primary_key_field_ids(&self, schema: &lance_core::datatypes::Schema) -> Option<Vec<i32>> {
+        let field_ids: Vec<i32> = self
+            .on
+            .iter()
+            .filter_map(|name| schema.field(name).map(|field| field.id))
+            .collect();
+        let pk_field_ids: Vec<i32> = schema
+            .unenforced_primary_key()
+            .iter()
+            .map(|field| field.id)
+            .collect();
+        (!pk_field_ids.is_empty() && field_ids == pk_field_ids).then_some(field_ids)
+    }
+
     fn write_version(&self, dataset: &Dataset) -> ConcreteFileVersion {
         self.data_storage_version
             .map(|version| version.0)
@@ -3626,16 +3641,23 @@ impl MergeInsertJob {
         let joined = self
             .create_joined_stream(provider, source_mode, source_projection)
             .await?;
+        let inserted_rows_filter = self
+            .params
+            .primary_key_field_ids(full_schema)
+            .filter(|_| self.params.insert_not_matched)
+            .map(KeyExistenceFilterBuilder::new);
         let merger = Merger::try_new(
             self.params.clone(),
             source_schema,
             joined.schema().as_ref(),
             !is_full_schema,
             self.dataset.manifest.uses_stable_row_ids(),
+            inserted_rows_filter,
         )?;
         let merge_statistics = merger.merge_stats.clone();
         let deleted_rows = merger.deleted_rows.clone();
         let updating_row_ids = merger.updating_row_ids.clone();
+        let inserted_rows_filter = merger.inserted_rows_filter.clone();
         let order_updates_first = merger.with_row_id;
         let merger_schema = merger.output_schema().clone();
         let stream = joined
@@ -3673,7 +3695,7 @@ impl MergeInsertJob {
         let is_delete_only = matches!(self.params.when_matched, WhenMatched::Delete)
             && !self.params.insert_not_matched;
 
-        let (operation, affected_rows) = if is_delete_only {
+        let (operation, affected_rows, inserted_rows_filter) = if is_delete_only {
             // Consume the stream so the merger records the matched row ids in
             // `deleted_rows`; it produces no batches.
             let drained: Vec<RecordBatch> = stream.try_collect().await?;
@@ -3709,12 +3731,12 @@ impl MergeInsertJob {
                     .map(|f| f.id as u32)
                     .collect(),
                 update_mode: Some(RewriteRows),
-                inserted_rows_filter: None, // not implemented for v1
+                inserted_rows_filter: None,
                 updated_fragment_offsets: None,
             };
 
             let affected_rows = Some(RowAddrTreeMap::from(removed_row_addrs));
-            (operation, affected_rows)
+            (operation, affected_rows, None)
         } else if !is_full_schema {
             // Non-delete partial-schema merge: patch the provided columns into
             // existing fragments in place. (Delete is handled above; a wider
@@ -3748,6 +3770,11 @@ impl MergeInsertJob {
             )
             .await?;
 
+            let inserted_rows_filter = inserted_rows_filter
+                .lock()
+                .map_err(|_| Error::internal("Merge insert key filter lock poisoned"))?
+                .as_ref()
+                .map(KeyExistenceFilterBuilder::build);
             let operation = Operation::Update {
                 removed_fragment_ids: Vec::new(),
                 updated_fragments,
@@ -3757,7 +3784,7 @@ impl MergeInsertJob {
                 mem_wal_dir_id: self.params.mem_wal_dir_id.clone(),
                 fields_for_preserving_frag_bitmap: vec![], // in-place update do not affect preserving frag bitmap
                 update_mode: Some(RewriteColumns),
-                inserted_rows_filter: None, // not implemented for v1
+                inserted_rows_filter: inserted_rows_filter.clone(),
                 // The version stamped above is a guess; carry the patched offsets
                 // so `build_manifest` can re-stamp them at the real commit
                 // version after a rebase.
@@ -3765,7 +3792,7 @@ impl MergeInsertJob {
             };
             // We have rewritten the fragments, not just the deletion files, so
             // we can't use affected rows here.
-            (operation, None)
+            (operation, None, inserted_rows_filter)
         } else {
             let cleanup_bases = target_bases_info.clone();
             let (mut new_fragments, _) = write_fragments_internal(
@@ -3858,6 +3885,11 @@ impl MergeInsertJob {
             };
 
             // Commit updated and new fragments
+            let inserted_rows_filter = inserted_rows_filter
+                .lock()
+                .map_err(|_| Error::internal("Merge insert key filter lock poisoned"))?
+                .as_ref()
+                .map(KeyExistenceFilterBuilder::build);
             let operation = Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: old_fragments,
@@ -3872,12 +3904,12 @@ impl MergeInsertJob {
                     .map(|f| f.id as u32)
                     .collect(),
                 update_mode: Some(RewriteRows),
-                inserted_rows_filter: None, // not implemented for v1
+                inserted_rows_filter: inserted_rows_filter.clone(),
                 updated_fragment_offsets: None,
             };
 
             let affected_rows = Some(RowAddrTreeMap::from(removed_row_addrs));
-            (operation, affected_rows)
+            (operation, affected_rows, inserted_rows_filter)
         };
 
         let stats = Arc::into_inner(merge_statistics)
@@ -3891,7 +3923,7 @@ impl MergeInsertJob {
             transaction,
             affected_rows,
             stats,
-            inserted_rows_filter: None, // not implemented for v1
+            inserted_rows_filter,
         })
     }
 
@@ -4356,6 +4388,8 @@ struct Merger {
     processed_row_ids: Arc<Mutex<HashSet<u64>>>,
     /// Set to track non-null keys of rows inserted by FirstSeen mode
     processed_insert_keys: Arc<Mutex<InsertedKeyTracker>>,
+    /// Inserted keys for declared primary-key conflict detection; absent otherwise.
+    inserted_rows_filter: Arc<Mutex<Option<KeyExistenceFilterBuilder>>>,
 }
 
 impl Merger {
@@ -4366,6 +4400,7 @@ impl Merger {
         joined_schema: &Schema,
         with_row_addr: bool,
         enable_stable_row_ids: bool,
+        inserted_rows_filter: Option<KeyExistenceFilterBuilder>,
     ) -> Result<Self> {
         let delete_expr = if let WhenNotMatchedBySource::DeleteIf(expr) =
             &params.delete_not_matched_by_source
@@ -4438,6 +4473,7 @@ impl Merger {
             enable_stable_row_ids,
             processed_row_ids: Arc::new(Mutex::new(HashSet::new())),
             processed_insert_keys: Arc::new(Mutex::new(InsertedKeyTracker::default())),
+            inserted_rows_filter: Arc::new(Mutex::new(inserted_rows_filter)),
         })
     }
 
@@ -4682,6 +4718,21 @@ impl Merger {
                 if keep_indices.len() != not_matched.num_rows() {
                     not_matched =
                         take_record_batch(&not_matched, &UInt32Array::from(keep_indices))?;
+                }
+            }
+            // Track only rows that will actually be inserted, after source deduplication.
+            if let Some(filter) = self
+                .inserted_rows_filter
+                .lock()
+                .map_err(|_| Error::internal("Merge insert key filter lock poisoned"))?
+                .as_mut()
+            {
+                for row_idx in 0..not_matched.num_rows() {
+                    if let Some(key) =
+                        extract_key_value_from_batch(&not_matched, row_idx, &self.params.on)
+                    {
+                        filter.insert(key)?;
+                    }
                 }
             }
             let not_matched = not_matched.project(&output_cols)?;
@@ -12952,60 +13003,102 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::scan(false, false, true, "id")]
+    #[case::indexed(false, true, true, "id")]
+    #[case::indexed_partial(true, true, true, "id")]
+    #[case::undeclared(false, true, false, "id")]
+    #[case::undeclared_partial(true, true, false, "id")]
+    #[case::other_key(false, true, true, "value")]
     #[tokio::test]
-    async fn test_transaction_inserted_rows_filter_roundtrip() {
-        // Create dataset with unenforced primary key on "id" column
+    async fn test_transaction_inserted_rows_filter_roundtrip(
+        #[case] is_partial: bool,
+        #[case] use_index: bool,
+        #[case] has_primary_key: bool,
+        #[case] on: &str,
+    ) {
+        let mut id_field = Field::new("id", DataType::UInt32, false);
+        if has_primary_key {
+            id_field = id_field.with_metadata(HashMap::from([(
+                "lance-schema:unenforced-primary-key".to_string(),
+                "true".to_string(),
+            )]));
+        }
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::UInt32, false).with_metadata(
-                vec![(
-                    "lance-schema:unenforced-primary-key".to_string(),
-                    "true".to_string(),
-                )]
-                .into_iter()
-                .collect(),
-            ),
+            id_field,
             Field::new("value", DataType::UInt32, false),
+            Field::new("extra", DataType::UInt32, true),
         ]));
         let initial = RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(UInt32Array::from(vec![0, 1, 2])),
                 Arc::new(UInt32Array::from(vec![0, 0, 0])),
+                Arc::new(UInt32Array::from(vec![Some(10), None, Some(30)])),
             ],
         )
         .unwrap();
-        let dataset = InsertBuilder::new("memory://")
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            })
             .execute(vec![initial])
             .await
             .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        if use_index {
+            dataset
+                .create_index(
+                    &[on],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
         let dataset = Arc::new(dataset);
 
-        // Source with overlapping key 1
+        // Only key 3 is inserted; key 1 is updated and must not enter the filter.
         let new_batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![
                 Arc::new(UInt32Array::from(vec![1, 3])),
                 Arc::new(UInt32Array::from(vec![2, 2])),
+                Arc::new(UInt32Array::from(vec![None, Some(40)])),
             ],
         )
         .unwrap();
-        let stream = RecordBatchStreamAdapter::new(
-            schema.clone(),
-            futures::stream::iter(vec![Ok(new_batch)]),
-        );
+        let new_batch = if is_partial {
+            // Omit the nullable payload and put the key after the value.
+            new_batch.project(&[1, 0]).unwrap()
+        } else {
+            new_batch
+        };
+        let mut expected =
+            KeyExistenceFilterBuilder::new(vec![dataset.schema().field(on).unwrap().id]);
+        expected
+            .insert(extract_key_value_from_batch(&new_batch, 1, &[on.to_string()]).unwrap())
+            .unwrap();
+        let expected = (has_primary_key && on == "id").then(|| expected.build());
 
-        let UncommittedMergeInsert { transaction, .. } =
-            MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
-                .unwrap()
-                .when_matched(WhenMatched::UpdateAll)
-                .when_not_matched(WhenNotMatched::InsertAll)
-                .try_build()
-                .unwrap()
-                .execute_uncommitted(Box::pin(stream) as SendableRecordBatchStream)
-                .await
-                .unwrap();
+        let UncommittedMergeInsert {
+            transaction,
+            inserted_rows_filter,
+            ..
+        } = MergeInsertBuilder::try_new(dataset.clone(), vec![on.to_string()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_uncommitted_batches(vec![new_batch])
+            .await
+            .unwrap();
+        assert_eq!(inserted_rows_filter, expected);
 
-        // Commit and read back transaction file
         let committed = CommitBuilder::new(dataset.clone())
             .execute(transaction)
             .await
@@ -13014,19 +13107,14 @@ mod tests {
         let tx_read = read_transaction_file(dataset.object_store.as_ref(), &dataset.base, &tx_path)
             .await
             .unwrap();
-        // Check that inserted_rows_filter is present in the Operation::Update
-        if let Operation::Update {
+        let Operation::Update {
             inserted_rows_filter,
             ..
         } = &tx_read.operation
-        {
-            assert!(inserted_rows_filter.is_some());
-            let filter = inserted_rows_filter.as_ref().unwrap();
-            // Field IDs are assigned by Lance schema; check that we tracked exactly 1 key field
-            assert_eq!(filter.field_ids.len(), 1);
-        } else {
+        else {
             panic!("Expected Operation::Update");
-        }
+        };
+        assert_eq!(inserted_rows_filter, &expected);
     }
 
     /// Test that two merge insert operations on the same existing key conflict.
@@ -13117,93 +13205,131 @@ mod tests {
         );
     }
 
-    /// Test that two merge insert operations inserting the same NEW key conflict.
-    /// First merge insert commits successfully (inserts id=100), second one fails
-    /// with conflict error because both inserted the same new key (detected via bloom filter).
+    /// Stale writers must detect an overlapping insert regardless of which
+    /// writer uses the scalar index, then re-run the merge if retries are enabled.
+    #[rstest::rstest]
+    #[case::single_key(false, false)]
+    #[case::composite_key(true, false)]
+    #[case::partial_source(false, true)]
+    #[case::partial_composite_source(true, true)]
     #[tokio::test]
-    async fn test_concurrent_insert_same_new_key() {
-        // Create schema with unenforced primary key on "id" column
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::UInt32, false).with_metadata(
-                vec![(
-                    "lance-schema:unenforced-primary-key".to_string(),
-                    "true".to_string(),
-                )]
-                .into_iter()
-                .collect(),
-            ),
+    async fn test_concurrent_insert_same_new_key(
+        #[case] is_composite: bool,
+        #[case] is_partial: bool,
+        #[values(false, true)] first_uses_index: bool,
+        #[values(false, true)] second_uses_index: bool,
+        #[values(0, 1)] conflict_retries: u32,
+    ) {
+        let key_metadata = HashMap::from([(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        )]);
+        let mut fields = vec![
+            Field::new("id", DataType::UInt32, false).with_metadata(key_metadata.clone()),
             Field::new("value", DataType::UInt32, false),
-        ]));
-        // Initial dataset with ids 0, 1, 2, 3 - NOT containing id=100
-        let initial = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from(vec![0, 1, 2, 3])),
-                Arc::new(UInt32Array::from(vec![0, 0, 0, 0])),
-            ],
-        )
-        .unwrap();
-
-        let dataset = InsertBuilder::new("memory://")
-            .execute(vec![initial])
+            Field::new("extra", DataType::UInt32, true),
+        ];
+        let mut on = vec!["id".to_string()];
+        if is_composite {
+            fields.push(Field::new("key2", DataType::UInt32, false).with_metadata(key_metadata));
+            on.push("key2".to_string());
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let make_batch = |ids: Vec<u32>, value: u32| {
+            let len = ids.len();
+            let mut columns: Vec<ArrayRef> = vec![
+                Arc::new(UInt32Array::from(ids)),
+                Arc::new(UInt32Array::from(vec![value; len])),
+                Arc::new(UInt32Array::from(vec![None; len])),
+            ];
+            if is_composite {
+                columns.push(Arc::new(UInt32Array::from(vec![7; len])));
+            }
+            RecordBatch::try_new(schema.clone(), columns).unwrap()
+        };
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            })
+            .execute(vec![make_batch(vec![0, 1, 2, 3], 0)])
             .await
             .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        for key in &on {
+            dataset
+                .create_index(
+                    &[key.as_str()],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
         let dataset = Arc::new(dataset);
+        let source_batch = |value| {
+            let batch = make_batch(vec![100], value);
+            if is_partial {
+                let columns = if is_composite {
+                    vec![1, 3, 0]
+                } else {
+                    vec![1, 0]
+                };
+                batch.project(&columns).unwrap()
+            } else {
+                batch
+            }
+        };
+        let build_job = |use_index, retries| {
+            MergeInsertBuilder::try_new(dataset.clone(), on.clone())
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .use_index(use_index)
+                .conflict_retries(retries)
+                .try_build()
+                .unwrap()
+        };
 
-        // Both jobs try to INSERT the same NEW key id=100 (doesn't exist in initial data)
-        let batch1 = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from(vec![100])), // NEW key id=100
-                Arc::new(UInt32Array::from(vec![1])),
-            ],
-        )
-        .unwrap();
-        let batch2 = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(UInt32Array::from(vec![100])), // Same NEW key id=100
-                Arc::new(UInt32Array::from(vec![2])),
-            ],
-        )
-        .unwrap();
-
-        // Create second merge insert job based on version 1 with 0 retries
-        let b2 = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
-            .unwrap()
-            .when_matched(WhenMatched::UpdateAll)
-            .when_not_matched(WhenNotMatched::InsertAll)
-            .conflict_retries(0)
-            .try_build()
-            .unwrap();
-
-        // First merge insert commits (creates version 2, inserts id=100)
-        let s1 = RecordBatchStreamAdapter::new(
-            schema.clone(),
-            futures::stream::iter(vec![Ok(batch1.clone())]),
+        // Both jobs read the same version, making the conflict deterministic.
+        let b1 = build_job(first_uses_index, 0);
+        let b2 = build_job(second_uses_index, conflict_retries);
+        assert_eq!(
+            b1.can_use_create_plan(source_batch(1).schema().as_ref())
+                .await
+                .unwrap(),
+            !first_uses_index,
         );
-        let b1 = MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
-            .unwrap()
-            .when_matched(WhenMatched::UpdateAll)
-            .when_not_matched(WhenNotMatched::InsertAll)
-            .try_build()
-            .unwrap();
-        let result1 = b1.execute(Box::pin(s1) as SendableRecordBatchStream).await;
-        assert!(result1.is_ok(), "First merge insert should succeed");
-
-        // Second merge insert tries to commit based on version 1, needs to rebase against version 2
-        let s2 = RecordBatchStreamAdapter::new(
-            schema.clone(),
-            futures::stream::iter(vec![Ok(batch2.clone())]),
+        assert_eq!(
+            b2.can_use_create_plan(source_batch(2).schema().as_ref())
+                .await
+                .unwrap(),
+            !second_uses_index,
         );
-        let result2 = b2.execute(Box::pin(s2) as SendableRecordBatchStream).await;
-
-        // Second merge insert should fail because bloom filters show both inserted key 100
-        assert!(
-            matches!(result2, Err(crate::Error::TooMuchWriteContention { .. })),
-            "Expected TooMuchWriteContention (retryable conflict exhausted), got: {:?}",
-            result2
-        );
+        let (_, stats) = b1.execute_batches(vec![source_batch(1)]).await.unwrap();
+        assert_eq!(stats.num_inserted_rows, 1);
+        let result = b2.execute_batches(vec![source_batch(2)]).await;
+        if conflict_retries == 0 {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::TooMuchWriteContention { .. }));
+            assert!(error.to_string().contains("Attempted 0 retries"));
+        } else {
+            let (dataset, stats) = result.unwrap();
+            assert_eq!(stats.num_attempts, 2);
+            assert_eq!(stats.num_inserted_rows, 0);
+            assert_eq!(stats.num_updated_rows, 1);
+            let found = dataset
+                .scan()
+                .filter("id = 100")
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(found.num_rows(), 1);
+            assert_eq!(found["value"].as_primitive::<UInt32Type>().value(0), 2);
+        }
     }
 
     /// Concurrency regression for lance-format/lance#6441: two concurrent
