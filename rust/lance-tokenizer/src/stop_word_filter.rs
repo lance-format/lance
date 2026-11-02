@@ -7,6 +7,28 @@
 #[path = "stop_word_filter/stopwords.rs"]
 mod stopwords;
 
+#[path = "stop_word_filter/greek.rs"]
+mod greek;
+
+#[path = "stop_word_filter/cjk.rs"]
+mod cjk;
+
+#[cfg(test)]
+#[path = "stop_word_filter/russian_tests.rs"]
+mod russian_tests;
+
+#[path = "stop_word_filter/latin.rs"]
+mod latin;
+
+#[path = "stop_word_filter/tamil.rs"]
+mod tamil;
+
+#[path = "stop_word_filter/arabic.rs"]
+mod arabic;
+
+#[path = "stop_word_filter/korean.rs"]
+mod korean;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -14,35 +36,35 @@ use crate::{Language, Token, TokenFilter, TokenStream, Tokenizer};
 
 fn all_stop_words() -> impl Iterator<Item = &'static str> {
     [
-        stop_words::get("ar"),
+        arabic::ARABIC,
         stopwords::DANISH,
         stopwords::DUTCH,
-        // Use the fuller `stop-words` crate English list (~198 words) rather
-        // than the local Tantivy-style list (~33 words), which omits extremely
-        // common pronouns/function words (you, my, your, we, she, what, ...).
-        // Those omissions let the highest-frequency English tokens through the
-        // ICU stop-word path and build pathologically large posting lists.
-        stop_words::get("en"),
+        // Keep the full list's pronoun coverage while preserving meaningful terms.
+        latin::ENGLISH,
         stopwords::FINNISH,
         stopwords::FRENCH,
         stopwords::GERMAN,
-        stop_words::get("el"),
+        greek::GREEK,
         stopwords::HUNGARIAN,
         stopwords::ITALIAN,
         stopwords::NORWEGIAN,
         stopwords::PORTUGUESE,
-        stop_words::get("ro"),
+        latin::ROMANIAN,
         stopwords::RUSSIAN,
         stopwords::SPANISH,
         stopwords::SWEDISH,
-        stop_words::get("ta"),
-        stop_words::get("tr"),
-        stop_words::get("zh"),
-        stop_words::get("ja"),
-        stop_words::get("ko"),
+        tamil::TAMIL,
+        latin::TURKISH,
+        cjk::CHINESE,
+        cjk::JAPANESE,
+        korean::KOREAN,
     ]
     .into_iter()
     .flat_map(|words| words.iter().copied())
+    .filter(|word| !cjk::UNION_EXCLUSIONS.contains(word))
+    .filter(|word| !latin::UNION_EXCLUSIONS.contains(word))
+    .filter(|word| !arabic::UNION_EXCLUSIONS.contains(word))
+    .filter(|word| !greek::UNION_EXCLUSIONS.contains(word))
 }
 
 #[derive(Clone)]
@@ -53,28 +75,25 @@ pub struct StopWordFilter {
 impl StopWordFilter {
     pub fn new(language: Language) -> Option<Self> {
         let words = match language {
-            Language::Arabic => stop_words::get("ar"),
+            Language::Arabic => arabic::ARABIC,
             Language::Danish => stopwords::DANISH,
             Language::Dutch => stopwords::DUTCH,
-            // Use the fuller `stop-words` crate English list (~198 words); the
-            // local Tantivy-style list (~33 words) omits common pronouns/function
-            // words (you, my, your, we, ...) that would otherwise leak through
-            // stop-word removal and build pathologically large posting lists.
-            Language::English => stop_words::get("en"),
+            // Retain common pronouns without dropping content and negation.
+            Language::English => latin::ENGLISH,
             Language::Finnish => stopwords::FINNISH,
             Language::French => stopwords::FRENCH,
             Language::German => stopwords::GERMAN,
-            Language::Greek => stop_words::get("el"),
+            Language::Greek => greek::GREEK,
             Language::Hungarian => stopwords::HUNGARIAN,
             Language::Italian => stopwords::ITALIAN,
             Language::Norwegian => stopwords::NORWEGIAN,
             Language::Portuguese => stopwords::PORTUGUESE,
-            Language::Romanian => stop_words::get("ro"),
+            Language::Romanian => latin::ROMANIAN,
             Language::Russian => stopwords::RUSSIAN,
             Language::Spanish => stopwords::SPANISH,
             Language::Swedish => stopwords::SWEDISH,
-            Language::Tamil => stop_words::get("ta"),
-            Language::Turkish => stop_words::get("tr"),
+            Language::Tamil => tamil::TAMIL,
+            Language::Turkish => latin::TURKISH,
         };
         Some(Self::remove(words.iter().map(|word| (*word).to_owned())))
     }

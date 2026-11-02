@@ -7,5 +7,6 @@ mod count_pushdown;
 mod mem_wal;
 #[cfg(feature = "slow_tests")]
 mod query;
+mod topk_late_materialization;
 #[cfg(feature = "slow_tests")]
 mod utils;

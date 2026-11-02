@@ -141,6 +141,10 @@ struct DirectDictionaryPageDecoder {
 }
 
 impl PrimitivePageDecoder for DirectDictionaryPageDecoder {
+    fn dictionary_len(&self) -> Option<u64> {
+        Some(self.decoded_dict.num_values())
+    }
+
     fn variable_width_bytes(&self, _rows_to_skip: u64, _num_rows: u64) -> Result<Option<u64>> {
         // The decoded batch shares this page's dictionary values; Arrow
         // concatenation may merge each page's values into one array, so charge

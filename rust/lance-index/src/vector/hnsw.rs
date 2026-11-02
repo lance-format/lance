@@ -18,6 +18,7 @@ use super::storage::VectorStore;
 pub mod builder;
 pub mod index;
 pub mod online;
+pub mod remap;
 
 pub use builder::HNSW;
 pub use index::HNSWIndex;

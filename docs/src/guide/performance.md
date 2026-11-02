@@ -4,10 +4,11 @@ This guide provides tips and tricks for optimizing the performance of your Lance
 
 ## Logging
 
-Lance uses the `log` crate to log messages. Displaying these log messages will depend on the client
-library you are using. For rust, you will need to configure a logging subscriber. For more details
-ses the [log](https://docs.rs/log/latest/log/) docs. The Python and Java clients configure a default
-logging subscriber that logs to stderr.
+Lance emits log messages through the `log` crate and structured events through the `tracing` crate.
+Rust applications configure their own logger and tracing subscriber, including filtering and output
+destinations; the Rust library does not install either globally. See the
+[log](https://docs.rs/log/latest/log/) and [tracing](https://docs.rs/tracing/latest/tracing/) docs.
+The Python and Java clients configure a default logger that logs to stderr.
 
 The Python/Java logger can be configured with several environment variables:
 
@@ -244,15 +245,15 @@ over environment variables:
 | ------------------ | ------------------------------- | ------------------------------- | ------- |
 | Initial rate       | `lance_aimd_initial_rate`       | `LANCE_AIMD_INITIAL_RATE`       | 2000    |
 | Min rate           | `lance_aimd_min_rate`           | `LANCE_AIMD_MIN_RATE`           | 1       |
-| Max rate           | `lance_aimd_max_rate`           | `LANCE_AIMD_MAX_RATE`           | 5000    |
+| Max rate           | `lance_aimd_max_rate`           | `LANCE_AIMD_MAX_RATE`           | 10000   |
 | Decrease factor    | `lance_aimd_decrease_factor`    | `LANCE_AIMD_DECREASE_FACTOR`    | 0.5     |
 | Additive increment | `lance_aimd_additive_increment` | `LANCE_AIMD_ADDITIVE_INCREMENT` | 300     |
 | Burst capacity     | `lance_aimd_burst_capacity`     | `LANCE_AIMD_BURST_CAPACITY`     | 100     |
 
-These initial settings are balanced and should work for most
-use cases. For example, S3 can typically get up to 5000
-req/s and with these settings we should get there in about
-10 seconds.
+Under sustained success, the default rate grows from 2000 to 10000 requests/s
+in about 27 seconds. Each operation category has its own rate controller.
+The ceiling is a client-side tuning parameter, not a storage-provider limit;
+override it to match the workload and the store's throttling behavior.
 
 ## Fragment Sizing
 

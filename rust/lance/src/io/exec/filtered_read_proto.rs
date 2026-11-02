@@ -22,11 +22,14 @@ use datafusion::physical_plan::ExecutionPlan;
 use lance_core::datatypes::{BlobHandling, Projection};
 use lance_core::{Error, Result};
 use lance_datafusion::pb;
-use lance_datafusion::substrait::{encode_substrait, parse_substrait, prune_schema_for_substrait};
+use lance_datafusion::substrait::{
+    encode_substrait, parse_substrait, prune_schema_for_substrait, validate_substrait_expr,
+};
 use lance_select::RowAddrTreeMap;
 use lance_table::format::Fragment;
 
 use crate::Dataset;
+use crate::dataset::fragment_slice::validate_physical_rows;
 
 use super::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadPlan, FilteredReadThreadingMode,
@@ -39,6 +42,10 @@ use super::table_identifier::{resolve_dataset, table_identifier_from_dataset};
 
 /// Convert a [`FilteredReadExec`] to proto for serialization.
 ///
+/// Sliced plans require coordinated planner/executor upgrades. Older executors
+/// can ignore the physical allowlist and read outside the requested slices;
+/// this wire protocol does not negotiate capabilities.
+///
 /// Uses `table_identifier_from_dataset` by default (no manifest bytes).
 /// The caller can replace the `table` field with
 /// [`table_identifier_from_dataset_with_manifest`] if desired.
@@ -46,7 +53,38 @@ pub async fn filtered_read_exec_to_proto(
     exec: &FilteredReadExec,
     state: &SessionState,
 ) -> Result<pb::FilteredReadExecProto> {
+    let dataset_schema: ArrowSchema = exec.dataset().schema().into();
+    let plan = exec.plan();
+    let filter_exprs = exec
+        .options()
+        .refine_filter
+        .iter()
+        .chain(exec.options().full_filter.iter())
+        .chain(
+            plan.iter()
+                .flat_map(|plan| plan.filters.values().map(AsRef::as_ref)),
+        );
+    for expr in filter_exprs {
+        validate_substrait_expr(expr, &dataset_schema)?;
+    }
+
     let table = table_identifier_from_dataset(exec.dataset()).await?;
+    filtered_read_exec_to_proto_with_table(exec, state, table)
+}
+
+/// Encode a [`FilteredReadExec`] whose table identifier the caller has already
+/// resolved.
+///
+/// [`filtered_read_exec_to_proto`] is async only because it resolves the
+/// dataset's latest storage options into the identifier. A caller that holds
+/// the identifier (or the storage options) can encode synchronously, for
+/// example from a DataFusion `PhysicalExtensionCodec`, whose `try_encode` is
+/// not async.
+pub fn filtered_read_exec_to_proto_with_table(
+    exec: &FilteredReadExec,
+    state: &SessionState,
+    table: pb::TableIdentifier,
+) -> Result<pb::FilteredReadExecProto> {
     // Use the pruned dataset schema for filter encoding — filters can reference columns
     // outside the projection (e.g. SELECT name WHERE age > 10), and some dataset columns
     // may have types that Substrait cannot serialize (e.g. FixedSizeList, Float16).
@@ -66,6 +104,10 @@ pub async fn filtered_read_exec_to_proto(
 }
 
 /// Reconstruct a [`FilteredReadExec`] from proto.
+///
+/// A supplied dataset must be the snapshot used to plan the scan. Sliced plans
+/// require the planner and all executors to support physical row selections;
+/// mixed-version execution with older executors is unsupported.
 pub async fn filtered_read_exec_from_proto(
     proto: pb::FilteredReadExecProto,
     dataset: Option<Arc<Dataset>>,
@@ -125,6 +167,18 @@ fn fr_options_to_proto(
         None
     };
 
+    let physical_row_addr_allowlist = options
+        .physical_row_addr_prefilter
+        .as_ref()
+        .map(|rows| {
+            let mut rows = rows.as_ref().clone();
+            rows.optimize();
+            let mut bytes = Vec::with_capacity(rows.serialized_size());
+            rows.serialize_into(&mut bytes)?;
+            Ok::<Vec<u8>, Error>(bytes)
+        })
+        .transpose()?;
+
     Ok(pb::FilteredReadOptionsProto {
         scan_range_before_filter: options
             .scan_range_before_filter
@@ -150,6 +204,7 @@ fn fr_options_to_proto(
             .file_reader_options
             .as_ref()
             .and_then(|o| o.batch_size_bytes),
+        physical_row_addr_allowlist,
     })
 }
 
@@ -170,11 +225,17 @@ async fn fr_options_from_proto(
         options = options.with_fragments(Arc::new(fragments));
     }
 
+    // Physical row selection must remain an option until local planning. In
+    // particular, a serialized exec may not have a pre-computed plan yet.
+    if let Some(bytes) = proto.physical_row_addr_allowlist {
+        let rows = RowAddrTreeMap::deserialize_from(Cursor::new(bytes))?;
+        validate_physical_rows(dataset, &rows).await?;
+        options = options.with_physical_row_addr_prefilter(Arc::new(rows));
+    }
+
     // Scan ranges
     if let Some(range) = proto.scan_range_before_filter {
-        options = options
-            .with_scan_range_before_filter(range_from_proto(&range))
-            .map_err(|e| Error::internal(e.to_string()))?;
+        options = options.with_scan_range_before_filter(range_from_proto(&range))?;
     }
     if let Some(range) = proto.scan_range_after_filter {
         options = options
@@ -217,6 +278,14 @@ async fn fr_options_from_proto(
     // Filters — require filter_schema_ipc when filters are present
     let has_filters =
         proto.refine_filter_substrait.is_some() || proto.full_filter_substrait.is_some();
+    // The same pairing `FilteredReadOptions::with_filter` rejects. The two fields
+    // are assigned independently below, so without this a wire message carrying a
+    // refine filter alone would build options that setter would have refused.
+    if proto.refine_filter_substrait.is_some() && proto.full_filter_substrait.is_none() {
+        return Err(Error::invalid_input_source(
+            "refine_filter is set but full_filter is not".into(),
+        ));
+    }
     if has_filters {
         let filter_schema =
             schema_from_bytes(proto.filter_schema_ipc.as_ref().ok_or_else(|| {
@@ -250,8 +319,10 @@ pub fn plan_to_proto(
     filter_schema: &Arc<ArrowSchema>,
     state: &SessionState,
 ) -> Result<pb::FilteredReadPlanProto> {
-    let mut buf = Vec::with_capacity(plan.rows.serialized_size());
-    plan.rows.serialize_into(&mut buf)?;
+    let mut rows = plan.rows.clone();
+    rows.optimize();
+    let mut buf = Vec::with_capacity(rows.serialized_size());
+    rows.serialize_into(&mut buf)?;
 
     // Deduplicate filter expressions by Arc pointer identity.
     let mut ptr_to_id: HashMap<*const Expr, u32> = HashMap::new();
@@ -457,21 +528,21 @@ fn range_from_proto(proto: &pb::U64Range) -> Range<u64> {
     proto.start..proto.end
 }
 
-fn fragments_from_proto(fragment_ids: &[u64], dataset: &Arc<Dataset>) -> Result<Vec<Fragment>> {
+fn fragments_from_proto(fragment_ids: &[u64], dataset: &Dataset) -> Result<Vec<Fragment>> {
+    let fragments = dataset.manifest.fragments.as_slice();
+    // Duplicate IDs in legacy manifests must resolve to their first stored fragment.
+    let ids_are_unique = dataset.fragment_bitmap.len() == fragments.len() as u64;
     fragment_ids
         .iter()
         .map(|id| {
-            dataset
-                .manifest
-                .fragments
-                .iter()
-                .find(|f| f.id == *id)
-                .cloned()
-                .ok_or_else(|| {
-                    Error::invalid_input_source(
-                        format!("Fragment {} not found in dataset", id).into(),
-                    )
-                })
+            let fragment = if ids_are_unique && u32::try_from(*id).is_ok() {
+                dataset.find_fragment(*id)
+            } else {
+                fragments.iter().find(|f| f.id == *id)
+            };
+            fragment.cloned().ok_or_else(|| {
+                Error::invalid_input_source(format!("Fragment {} not found in dataset", id).into())
+            })
         })
         .collect()
 }
@@ -499,13 +570,15 @@ fn schema_from_bytes(bytes: &[u8]) -> Result<Arc<ArrowSchema>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::types::UInt32Type;
+    use arrow_array::types::{Float32Type, UInt32Type};
     use arrow_schema::{DataType, Field};
+    use datafusion::execution::TaskContext;
     use datafusion::prelude::SessionContext;
     use lance_core::datatypes::OnMissing;
-    use lance_datagen::{array, gen_batch};
+    use lance_datagen::{ArrayGeneratorExt, Dimension, array, gen_batch};
     use lance_select::RowAddrTreeMap;
     use roaring::RoaringBitmap;
+    use rstest::rstest;
     use std::collections::HashMap;
     use std::collections::HashSet;
 
@@ -723,6 +796,35 @@ mod tests {
         assert!(back.projection.with_row_id);
     }
 
+    /// Proto decoding must enforce the same filter pairing as `with_filter`.
+    #[tokio::test]
+    async fn test_options_from_proto_reject_refine_without_full_filter() {
+        let dataset = make_test_dataset().await;
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let filter_schema = Arc::new(prune_schema_for_substrait(&dataset.schema().into()));
+
+        let projection = dataset
+            .empty_projection()
+            .union_column("x", OnMissing::Error)
+            .unwrap();
+        let mut options = FilteredReadOptions::new(projection);
+        options.full_filter = Some(datafusion_expr::col("x").gt(datafusion_expr::lit(5i32)));
+        options.refine_filter = Some(datafusion_expr::col("x").lt(datafusion_expr::lit(100i32)));
+
+        let mut proto = fr_options_to_proto(&options, &filter_schema, &state).unwrap();
+        proto.full_filter_substrait = None;
+
+        let err = fr_options_from_proto(proto, &dataset, &state)
+            .await
+            .expect_err("a refine filter without a full filter is not a readable plan");
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(
+            err.to_string().contains("refine_filter"),
+            "the error should name the field, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_options_roundtrip_with_fragments() {
         let dataset = make_test_dataset().await;
@@ -746,6 +848,82 @@ mod tests {
         assert_eq!(
             back.fragments.as_ref().unwrap()[0].id,
             options.fragments.as_ref().unwrap()[0].id
+        );
+    }
+
+    // Physical row counts distinguish fragments with the same ID.
+    async fn make_test_dataset_with_stored_ids(stored_ids: &[u64]) -> Dataset {
+        let fragments: Vec<_> = stored_ids
+            .iter()
+            .enumerate()
+            .map(|(position, id)| {
+                let mut fragment = Fragment::new(*id);
+                fragment.physical_rows = Some(position);
+                fragment
+            })
+            .collect();
+        let mut dataset = (*make_test_dataset().await).clone();
+        dataset.fragment_bitmap = Arc::new(
+            fragments
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .collect(),
+        );
+        Arc::make_mut(&mut dataset.manifest).fragments = Arc::new(fragments);
+        dataset
+    }
+
+    #[rstest]
+    #[case::sorted(&[0, 1, 2, 5, 8])]
+    #[case::unsorted(&[5, 0, 8, 2, 1])]
+    #[case::sorted_repeated(&[0, 1, 2, 2, 5, 8])]
+    // A binary search for 2 lands on the copy at position 3 of this list.
+    #[case::unsorted_repeated(&[2, 0, 1, 2, 5, 8])]
+    #[tokio::test]
+    async fn fragments_from_proto_returns_first_stored_fragment_in_request_order(
+        #[case] stored_ids: &[u64],
+    ) {
+        let dataset = make_test_dataset_with_stored_ids(stored_ids).await;
+        let requested_ids = [8, 2, 5, 0, 2, 1];
+
+        let resolved = fragments_from_proto(&requested_ids, &dataset).unwrap();
+
+        let first_stored = requested_ids
+            .iter()
+            .map(|id| {
+                dataset
+                    .manifest
+                    .fragments
+                    .iter()
+                    .find(|f| f.id == *id)
+                    .unwrap()
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(resolved, first_stored);
+    }
+
+    #[tokio::test]
+    async fn fragments_from_proto_preserves_wide_fragment_ids() {
+        let id = u64::from(u32::MAX) + 1;
+        let dataset = make_test_dataset_with_stored_ids(&[id]).await;
+        let resolved = fragments_from_proto(&[id], &dataset).unwrap();
+        assert_eq!(resolved, dataset.manifest.fragments.as_ref().clone());
+    }
+
+    #[rstest]
+    #[case::sorted(&[0, 1, 2, 5, 8])]
+    #[case::unsorted_repeated(&[2, 0, 1, 2, 5, 8])]
+    #[tokio::test]
+    async fn fragments_from_proto_rejects_missing_id(#[case] stored_ids: &[u64]) {
+        let dataset = make_test_dataset_with_stored_ids(stored_ids).await;
+
+        let err = fragments_from_proto(&[1, 3], &dataset).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+
+        assert!(
+            err.to_string().contains("Fragment 3 not found"),
+            "unexpected error: {err}"
         );
     }
 
@@ -783,6 +961,214 @@ mod tests {
         assert_eq!(
             exec.options().projection.field_ids,
             back.options().projection.field_ids
+        );
+    }
+
+    /// The synchronous encoder produces what the async one does, with the
+    /// caller's table identifier carried verbatim.
+    #[tokio::test]
+    async fn test_exec_to_proto_with_table_matches_async_encoding() {
+        let dataset = make_test_dataset().await;
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let filter = datafusion_expr::col("x").gt(datafusion_expr::lit(10_i32));
+        let options = FilteredReadOptions::basic_full_read(&dataset)
+            .with_filter(Some(filter.clone()), Some(filter))
+            .unwrap()
+            .with_scan_range_after_filter(5..30)
+            .unwrap();
+        let exec = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
+
+        let from_async = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
+        let table = pb::TableIdentifier {
+            uri: dataset.uri().to_string(),
+            version: dataset.manifest.version,
+            manifest_etag: dataset.manifest_location.e_tag.clone(),
+            serialized_manifest: None,
+            storage_options: [("region".to_string(), "test".to_string())].into(),
+        };
+        let from_sync =
+            filtered_read_exec_to_proto_with_table(&exec, &state, table.clone()).unwrap();
+
+        assert_eq!(from_sync.options, from_async.options);
+        assert_eq!(from_sync.plan, from_async.plan);
+        assert_eq!(from_sync.table, Some(table));
+
+        let back = filtered_read_exec_from_proto(from_sync, Some(dataset.clone()), None, &state)
+            .await
+            .unwrap();
+        assert_eq!(
+            exec.options().scan_range_after_filter,
+            back.options().scan_range_after_filter
+        );
+        assert_eq!(exec.options().full_filter, back.options().full_filter);
+    }
+
+    #[tokio::test]
+    async fn test_exec_to_proto_rejects_fixed_size_list_filter() {
+        let dataset = Arc::new(
+            gen_batch()
+                .col("before", array::step::<UInt32Type>())
+                .col(
+                    "vector",
+                    array::cycle_vec(array::step::<Float32Type>(), Dimension::from(4))
+                        .with_nulls(&[true, false]),
+                )
+                .col("after", array::step::<UInt32Type>())
+                .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(2))
+                .await
+                .unwrap(),
+        );
+        let mut options = FilteredReadOptions::basic_full_read(&dataset);
+        let unsupported_expr = datafusion_expr::col("before")
+            .gt(datafusion_expr::lit(0_u32))
+            .and(datafusion_expr::col("vector").is_null())
+            .and(datafusion_expr::col("after").lt(datafusion_expr::lit(10_u32)));
+        options.full_filter = Some(unsupported_expr.clone());
+        let exec = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
+        let state = SessionContext::new().state();
+
+        let error = filtered_read_exec_to_proto(&exec, &state)
+            .await
+            .expect_err("FixedSizeList predicates must stay on another execution path");
+
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(
+            error.to_string().contains("'vector' (FixedSizeList"),
+            "unexpected error: {error}"
+        );
+
+        let mut rows = RowAddrTreeMap::new();
+        rows.insert_fragment(0);
+        let plan = FilteredReadPlan {
+            rows,
+            filters: HashMap::from([(0, Arc::new(unsupported_expr))]),
+            scan_range_after_filter: None,
+        };
+        let exec = FilteredReadExec::try_new(
+            dataset.clone(),
+            FilteredReadOptions::basic_full_read(&dataset),
+            None,
+        )
+        .unwrap()
+        .with_plan(plan)
+        .await
+        .unwrap();
+
+        let error = filtered_read_exec_to_proto(&exec, &state)
+            .await
+            .expect_err("precomputed FixedSizeList predicates must not use Substrait transport");
+        assert!(matches!(error, Error::NotSupported { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_unplanned_physical_row_addr_prefilter_roundtrip() {
+        let dataset = make_test_dataset().await;
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let rows = RowAddrTreeMap::from_iter(0..10);
+        let options = FilteredReadOptions::basic_full_read(&dataset)
+            .with_physical_row_addr_prefilter(Arc::new(rows.clone()));
+        let exec = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
+        assert!(exec.plan().is_none());
+
+        let proto = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
+        assert!(proto.plan.is_none());
+        let serialized_rows = proto
+            .options
+            .as_ref()
+            .unwrap()
+            .physical_row_addr_allowlist
+            .as_ref()
+            .unwrap();
+        assert!(serialized_rows.len() < 1024);
+
+        let back = filtered_read_exec_from_proto(proto, Some(dataset), None, &state)
+            .await
+            .unwrap();
+        assert_eq!(
+            back.options().physical_row_addr_prefilter.as_deref(),
+            Some(&rows)
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::missing_fragment(42, 0, "not present")]
+    #[case::invalid_offset(0, 1_000_000, "physical_row_count")]
+    #[tokio::test]
+    async fn test_physical_selection_decode_validation(
+        #[case] fragment_id: u32,
+        #[case] row_offset: u32,
+        #[case] message: &str,
+    ) {
+        let dataset = make_test_dataset().await;
+        let state = SessionContext::new().state();
+        let exec = FilteredReadExec::try_new(
+            dataset.clone(),
+            FilteredReadOptions::basic_full_read(&dataset),
+            None,
+        )
+        .unwrap();
+        let mut proto = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
+        let rows = RowAddrTreeMap::from_iter([u64::from(
+            lance_core::utils::address::RowAddress::new_from_parts(fragment_id, row_offset),
+        )]);
+        let mut bytes = Vec::new();
+        rows.serialize_into(&mut bytes).unwrap();
+        proto.options.as_mut().unwrap().physical_row_addr_allowlist = Some(bytes);
+        let error = filtered_read_exec_from_proto(proto, Some(dataset), None, &state)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(message), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_physical_selection_rejects_prefilter_range() {
+        let dataset = make_test_dataset().await;
+        let state = SessionContext::new().state();
+        let rows = Arc::new(RowAddrTreeMap::from_iter([0]));
+        let options = FilteredReadOptions::basic_full_read(&dataset)
+            .with_physical_row_addr_prefilter(rows.clone());
+        let error = options
+            .clone()
+            .with_scan_range_before_filter(0..1)
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("cannot be combined"));
+        let reversed = FilteredReadOptions::basic_full_read(&dataset)
+            .with_scan_range_before_filter(0..1)
+            .unwrap()
+            .with_physical_row_addr_prefilter(rows);
+        let error = FilteredReadExec::try_new(dataset.clone(), reversed, None).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("cannot be combined"));
+        let exec = FilteredReadExec::try_new(dataset.clone(), options, None).unwrap();
+        let mut proto = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
+        proto.options.as_mut().unwrap().scan_range_before_filter = Some(range_to_proto(&(0..1)));
+        let error = filtered_read_exec_from_proto(proto, Some(dataset), None, &state)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn test_physical_selection_plan_compression() {
+        let state = SessionContext::new().state();
+        let plan = FilteredReadPlan {
+            rows: RowAddrTreeMap::from_iter(0..1_000_000),
+            filters: HashMap::new(),
+            scan_range_after_filter: None,
+        };
+        let proto = plan_to_proto(&plan, &Arc::new(ArrowSchema::empty()), &state).unwrap();
+        assert!(proto.row_addr_tree_map.len() < 1024);
+        assert!(proto.row_addr_tree_map.len() * 10 < plan.rows.serialized_size());
+        assert_eq!(
+            RowAddrTreeMap::deserialize_from(Cursor::new(proto.row_addr_tree_map)).unwrap(),
+            plan.rows
         );
     }
 
@@ -885,5 +1271,29 @@ mod tests {
         assert!(back.filters.contains_key(&1));
         // After roundtrip, the decoded expressions should be shared via Arc too
         assert!(Arc::ptr_eq(&back.filters[&0], &back.filters[&1]));
+    }
+
+    /// A planned read hands every fragment the same filter, so the encoded
+    /// plan carries the filter once rather than once per fragment
+    #[tokio::test]
+    async fn test_planned_filter_encoded_once() {
+        let dataset = make_test_dataset().await;
+        let state = SessionContext::new().state();
+        let filter = datafusion_expr::col("x").gt(datafusion_expr::lit(5u32));
+        let options = FilteredReadOptions::basic_full_read(&dataset)
+            .with_filter(None, Some(filter))
+            .unwrap();
+        let exec = FilteredReadExec::try_new(dataset, options, None).unwrap();
+        exec.get_or_create_plan(Arc::new(TaskContext::default()))
+            .await
+            .unwrap();
+
+        let plan = filtered_read_exec_to_proto(&exec, &state)
+            .await
+            .unwrap()
+            .plan
+            .unwrap();
+        assert_eq!(plan.fragment_filter_ids.len(), 2);
+        assert_eq!(plan.filter_expressions.len(), 1);
     }
 }

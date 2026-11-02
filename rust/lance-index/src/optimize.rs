@@ -10,7 +10,7 @@ use crate::progress::{IndexBuildProgress, noop_progress};
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct OptimizeOptions {
-    /// Number of delta indices to merge for one column. Default: 1.
+    /// Number of delta indices to merge for one column. Default: None.
     ///
     /// If `num_indices_to_merge` is None, lance will create a new delta index if no partition is split, otherwise it will merge all delta indices.
     /// If `num_indices_to_merge` is Some(N), the delta updates and latest N indices
@@ -22,6 +22,17 @@ pub struct OptimizeOptions {
     /// A common usage pattern will be that, the caller can keep a large snapshot of the index of the base version,
     /// and accumulate a few delta indices, then merge them into the snapshot.
     pub num_indices_to_merge: Option<usize>,
+
+    /// Allow automatic IVF partition splitting and joining with an explicit merge count.
+    /// Default: false.
+    ///
+    /// Rebalancing is restricted to the latest `num_indices_to_merge` segments.
+    /// If no partition needs adjustment, those segments are still merged with new data.
+    /// With an unset merge count, automatic rebalancing remains enabled regardless of
+    /// this option. An explicit merge count of zero is incompatible with this option.
+    /// It also cannot be combined with [`Self::max_rows_per_task`] or
+    /// [`Self::max_rows_per_segment`]: split builds must retain their reference model.
+    pub enable_partition_rebalancing: bool,
 
     /// the index names to optimize. If None, all indices will be optimized.
     pub index_names: Option<Vec<String>>,
@@ -48,16 +59,52 @@ pub struct OptimizeOptions {
 
     /// Progress callback for index building during optimization.
     pub progress: Arc<dyn IndexBuildProgress>,
+
+    /// Upper bound on the rows one build task covers. Default: unbounded.
+    ///
+    /// Unindexed fragments are packed into tasks of at most this many rows,
+    /// and of at most `max_rows_per_segment`, since a task's output is never
+    /// split (nor is a fragment); with neither set each index is one task.
+    ///
+    /// Setting either bound splits the build of every index that can merge
+    /// segments, in `optimize_indices` as in the distributed plan; the
+    /// `lance::index::optimize` module documents how that differs.
+    pub max_rows_per_task: Option<u64>,
+
+    /// Upper bound on the rows one committed segment holds. Default: unbounded.
+    ///
+    /// Existing segments and new tasks are packed into output segments of at
+    /// most this many rows; `None` merges everything into one segment. See
+    /// `max_rows_per_task` for what setting it changes.
+    pub max_rows_per_segment: Option<u64>,
+
+    /// Consolidate the newest vector segments within this physical-row budget
+    /// per logical index. At least two complete segments must fit; older segments
+    /// and unindexed fragments are left untouched. Default: disabled.
+    ///
+    /// Compatible segments merge directly. Otherwise only the selected coverage
+    /// is re-encoded using the newest selected segment's full model, without
+    /// training. Each segment is charged the greater of its physical index
+    /// entries and its current covered fragments' physical rows, including
+    /// deleted rows. This bounds both direct merges and raw-vector scans.
+    /// Cannot be combined with retraining, partition rebalancing, an explicit
+    /// merge count, or `max_rows_per_segment`. `max_rows_per_task` may bound the
+    /// re-encoding tasks, but fragments are indivisible and must fit that bound.
+    pub max_rows_to_consolidate: Option<u64>,
 }
 
 impl Default for OptimizeOptions {
     fn default() -> Self {
         Self {
             num_indices_to_merge: None,
+            enable_partition_rebalancing: false,
             index_names: None,
             retrain: false,
             transaction_properties: None,
             progress: noop_progress(),
+            max_rows_per_task: None,
+            max_rows_per_segment: None,
+            max_rows_to_consolidate: None,
         }
     }
 }
@@ -83,6 +130,17 @@ impl OptimizeOptions {
         }
     }
 
+    /// Consolidate a bounded suffix of each vector index without training.
+    ///
+    /// Unindexed rows remain available to ordinary queries and can be indexed
+    /// separately with [`Self::append`]. A budget of zero is invalid.
+    pub fn consolidate(max_rows: u64) -> Self {
+        Self {
+            max_rows_to_consolidate: Some(max_rows),
+            ..Default::default()
+        }
+    }
+
     pub fn retrain() -> Self {
         Self {
             num_indices_to_merge: None,
@@ -94,6 +152,16 @@ impl OptimizeOptions {
 
     pub fn num_indices_to_merge(mut self, num: Option<usize>) -> Self {
         self.num_indices_to_merge = num;
+        self
+    }
+
+    /// Enable automatic IVF partition splitting and joining within the merge window.
+    ///
+    /// For example, `OptimizeOptions::merge(1).with_partition_rebalancing()` merges
+    /// new data into the latest segment and adjusts its partitions when needed.
+    /// Earlier segments keep their existing models and files.
+    pub fn with_partition_rebalancing(mut self) -> Self {
+        self.enable_partition_rebalancing = true;
         self
     }
 
@@ -111,6 +179,18 @@ impl OptimizeOptions {
     /// Set progress callback for index building during optimization.
     pub fn progress(mut self, progress: Arc<dyn IndexBuildProgress>) -> Self {
         self.progress = progress;
+        self
+    }
+
+    /// Bound the rows one build task covers.
+    pub fn max_rows_per_task(mut self, rows: Option<u64>) -> Self {
+        self.max_rows_per_task = rows;
+        self
+    }
+
+    /// Bound the rows one committed segment holds.
+    pub fn max_rows_per_segment(mut self, rows: Option<u64>) -> Self {
+        self.max_rows_per_segment = rows;
         self
     }
 }

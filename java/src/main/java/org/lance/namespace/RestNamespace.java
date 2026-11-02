@@ -129,6 +129,8 @@ import java.util.Optional;
  *   <li>tls.key_file (optional): Path to client key file
  *   <li>tls.ssl_ca_cert (optional): Path to CA certificate file
  *   <li>tls.assert_hostname (optional): "true" or "false" (default: true)
+ *   <li>tls.reload_interval_seconds (optional): How often the TLS files above are checked for
+ *       rotation (default: 300, "0" disables reloading)
  * </ul>
  *
  * <p>Example usage:

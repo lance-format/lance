@@ -15,6 +15,7 @@ package org.lance.operation;
 
 import org.lance.FragmentMetadata;
 import org.lance.memwal.CompactedSsTable;
+import org.lance.memwal.MemWalIndexDetails;
 
 import com.google.common.base.MoreObjects;
 
@@ -33,6 +34,7 @@ public class Update implements Operation {
   private final long[] fieldsForPreservingFragBitmap;
   private final Optional<UpdateMode> updateMode;
   private final List<CompactedSsTable> compactedSstables;
+  private final Optional<String> memWalDirId;
   private final Optional<KeyExistenceFilter> insertedRowsFilter;
 
   /**
@@ -53,6 +55,7 @@ public class Update implements Operation {
       Optional<UpdateMode> updateMode,
       Map<Long, byte[]> updatedFragmentOffsets,
       List<CompactedSsTable> compactedSstables,
+      String memWalDirId,
       KeyExistenceFilter insertedRowsFilter) {
     this.removedFragmentIds = removedFragmentIds;
     this.updatedFragments = updatedFragments;
@@ -63,6 +66,7 @@ public class Update implements Operation {
     this.updateMode = updateMode;
     this.updatedFragmentOffsets = updatedFragmentOffsets;
     this.compactedSstables = Objects.requireNonNull(compactedSstables);
+    this.memWalDirId = Optional.ofNullable(memWalDirId);
     this.insertedRowsFilter = Optional.ofNullable(insertedRowsFilter);
   }
 
@@ -113,6 +117,16 @@ public class Update implements Operation {
     return compactedSstables;
   }
 
+  /** The {@code dirId} of the MemWAL {@link #compactedSstables()} belongs to. */
+  public Optional<String> memWalDirId() {
+    return memWalDirId;
+  }
+
+  /** Same as {@link #memWalDirId()}; the getter the JNI layer reads. */
+  public Optional<String> getMemWalDirId() {
+    return memWalDirId;
+  }
+
   public Optional<KeyExistenceFilter> insertedRowsFilter() {
     return insertedRowsFilter;
   }
@@ -136,6 +150,7 @@ public class Update implements Operation {
         .add("updateMode", updateMode)
         .add("updatedFragmentOffsets", updatedFragmentOffsets)
         .add("compactedSstables", compactedSstables)
+        .add("memWalDirId", memWalDirId)
         .add("insertedRowsFilter", insertedRowsFilter)
         .toString();
   }
@@ -152,6 +167,7 @@ public class Update implements Operation {
         && Arrays.equals(fieldsForPreservingFragBitmap, that.fieldsForPreservingFragBitmap)
         && Objects.equals(updateMode, that.updateMode)
         && compactedSstablesEqual(compactedSstables, that.compactedSstables)
+        && Objects.equals(memWalDirId, that.memWalDirId)
         && Objects.equals(insertedRowsFilter, that.insertedRowsFilter)
         && offsetMapsEqual(updatedFragmentOffsets, that.updatedFragmentOffsets);
   }
@@ -184,7 +200,12 @@ public class Update implements Operation {
   public int hashCode() {
     int h =
         Objects.hash(
-            removedFragmentIds, updatedFragments, newFragments, updateMode, insertedRowsFilter);
+            removedFragmentIds,
+            updatedFragments,
+            newFragments,
+            updateMode,
+            memWalDirId,
+            insertedRowsFilter);
     for (CompactedSsTable sstable : compactedSstables) {
       h = 31 * h + Objects.hash(sstable.getShardId(), sstable.getGeneration());
     }
@@ -213,6 +234,7 @@ public class Update implements Operation {
     private Optional<UpdateMode> updateMode = Optional.empty();
     private Map<Long, byte[]> updatedFragmentOffsets = Collections.emptyMap();
     private List<CompactedSsTable> compactedSstables = Collections.emptyList();
+    private String memWalDirId;
     private KeyExistenceFilter insertedRowsFilter;
 
     private Builder() {}
@@ -270,11 +292,22 @@ public class Update implements Operation {
       return this;
     }
 
+    /**
+     * Set the {@link MemWalIndexDetails#dirId() dirId} of the MemWAL the {@link
+     * #compactedSstables(List) compacted SSTables} belong to; required when they are non-empty. The
+     * commit fails if that MemWAL has since been disabled or replaced.
+     */
+    public Builder memWalDirId(String memWalDirId) {
+      this.memWalDirId = memWalDirId;
+      return this;
+    }
+
     public Builder insertedRowsFilter(KeyExistenceFilter insertedRowsFilter) {
       this.insertedRowsFilter = insertedRowsFilter;
       return this;
     }
 
+    /** Build the {@link Update}. */
     public Update build() {
       return new Update(
           removedFragmentIds,
@@ -285,6 +318,7 @@ public class Update implements Operation {
           updateMode,
           updatedFragmentOffsets,
           compactedSstables,
+          memWalDirId,
           insertedRowsFilter);
     }
   }

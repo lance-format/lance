@@ -228,6 +228,11 @@ pub struct QuantizationMetadata {
 pub trait QuantizerMetadata:
     fmt::Debug + Clone + Sized + DeepSizeOf + for<'a> Deserialize<'a> + Serialize
 {
+    /// Whether code bytes are laid out column-major across a whole partition.
+    fn is_transposed(&self) -> bool {
+        false
+    }
+
     // the extra metadata index in global buffer
     fn buffer_index(&self) -> Option<u32> {
         None
@@ -279,6 +284,18 @@ pub trait QuantizerStorage: Clone + Sized + DeepSizeOf + VectorStore {
             ));
         }
         Self::try_from_batch(batch, metadata, distance_type, None)
+    }
+
+    /// Prepare sign bounds without reading native RaBitQ ex columns.
+    /// Other quantizers do not provide this partial-storage capability.
+    fn try_from_sign_plane_for_full(
+        _batch: RecordBatch,
+        _metadata: &Self::Metadata,
+        _distance_type: DistanceType,
+    ) -> Result<Self> {
+        Err(Error::not_supported(
+            "sign-only preparation requires current native RaBitQ storage".to_string(),
+        ))
     }
 
     fn metadata(&self) -> &Self::Metadata;

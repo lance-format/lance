@@ -144,9 +144,15 @@ fn check_field(
         expected: expected.clone(),
         actual: actual.clone(),
     };
+    // Blob v2 has no serialized extension parameters. PyArrow serializes an
+    // empty string, while Rust's logical and prepared field builders omit it.
+    let expected_metadata = expected.extension_type_metadata();
+    let actual_metadata = actual.extension_type_metadata();
+    let metadata_matches = expected_metadata == actual_metadata
+        || (expected.extension_type_name() == Some(BLOB_V2_EXT_NAME)
+            && expected_metadata.unwrap_or_default() == actual_metadata.unwrap_or_default());
     if compare_extension
-        && (expected.extension_type_name() != actual.extension_type_name()
-            || expected.extension_type_metadata() != actual.extension_type_metadata())
+        && (expected.extension_type_name() != actual.extension_type_name() || !metadata_matches)
     {
         return Err(mismatch());
     }
@@ -190,4 +196,75 @@ fn check_field(
         })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::new_empty_array;
+    use arrow_schema::Schema as ArrowSchema;
+    use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
+    use lance_core::datatypes::{BLOB_V2_LOGICAL_MINIMAL_FIELDS, BLOB_V2_PREPARED_TYPE};
+    use rstest::rstest;
+    use std::collections::HashMap;
+
+    #[rstest]
+    #[case::python_to_rust(BLOB_V2_EXT_NAME, BLOB_V2_EXT_NAME, Some(""), None, true)]
+    #[case::rust_to_python(BLOB_V2_EXT_NAME, BLOB_V2_EXT_NAME, None, Some(""), true)]
+    #[case::nonempty_expected(BLOB_V2_EXT_NAME, BLOB_V2_EXT_NAME, Some("parameters"), None, false)]
+    #[case::nonempty_actual(BLOB_V2_EXT_NAME, BLOB_V2_EXT_NAME, None, Some("parameters"), false)]
+    #[case::different_name(BLOB_V2_EXT_NAME, "other.extension", None, None, false)]
+    #[case::other_extension("other.extension", "other.extension", Some(""), None, false)]
+    fn blob_extension_metadata(
+        #[case] expected_name: &str,
+        #[case] actual_name: &str,
+        #[case] expected_metadata: Option<&str>,
+        #[case] actual_metadata: Option<&str>,
+        #[case] accepted: bool,
+    ) {
+        let nested_field = |data_type, name: &str, metadata: Option<&str>| {
+            let mut values = HashMap::from([(ARROW_EXT_NAME_KEY.to_string(), name.to_string())]);
+            if let Some(metadata) = metadata {
+                values.insert(ARROW_EXT_META_KEY.to_string(), metadata.to_string());
+            }
+            ArrowField::new(
+                "parent",
+                DataType::Struct(
+                    vec![ArrowField::new("blob", data_type, true).with_metadata(values)].into(),
+                ),
+                true,
+            )
+        };
+        let expected = nested_field(
+            DataType::Struct(BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone()),
+            expected_name,
+            expected_metadata,
+        );
+        let actual_type = if expected_name == BLOB_V2_EXT_NAME {
+            BLOB_V2_PREPARED_TYPE.clone()
+        } else {
+            DataType::Struct(BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone())
+        };
+        let actual = nested_field(actual_type, actual_name, actual_metadata);
+        let schema = Schema::try_from(&ArrowSchema::new(vec![expected])).unwrap();
+        let array = new_empty_array(actual.data_type());
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![actual])),
+            vec![array.clone()],
+        )
+        .unwrap();
+        let mut expected_types = ExpectedTypes::new(&schema);
+        for result in [
+            expected_types.check_batch(&batch),
+            expected_types.check_column(0, &array),
+        ] {
+            if accepted {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }));
+                assert!(error.to_string().contains("parent.blob"), "{error}");
+            }
+        }
+    }
 }
