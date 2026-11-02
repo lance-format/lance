@@ -28,7 +28,8 @@ pub use boolean::{
 };
 pub use combined_fields::CombinedFieldsQueryExec;
 pub use compound::{CompoundQueryExec, CrossColumnCompoundQueryExec, HybridCompoundQueryExec};
-pub(crate) use corpus::{SharedFtsScorer, SharedFtsScorerExec};
+pub(crate) use corpus::SharedFtsScorer;
+pub use corpus::{FtsCorpusBinding, SharedFtsScorerExec};
 pub use document::FtsDocumentExec;
 pub use flat_combined_fields::{FlatCombinedFieldsExec, FlatStatsCoverage, FlatStatsScope};
 pub use flat_match::{FlatMatchFilterExec, FlatMatchQueryExec};

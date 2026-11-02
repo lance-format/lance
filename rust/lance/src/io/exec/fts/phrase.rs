@@ -266,6 +266,10 @@ impl PhraseQueryExec {
         self
     }
 
+    pub(super) fn has_shared_scorer(&self) -> bool {
+        self.shared_scorer.is_some()
+    }
+
     pub fn query(&self) -> &PhraseQuery {
         &self.query
     }

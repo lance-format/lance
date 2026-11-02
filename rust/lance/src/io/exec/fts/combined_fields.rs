@@ -165,6 +165,14 @@ impl CombinedFieldsQueryExec {
         self
     }
 
+    pub(super) fn has_shared_scorer(&self) -> bool {
+        self.shared_scorer.is_some()
+    }
+
+    pub(super) fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
     pub(super) fn uses_shared_scorer(
         &self,
         scorer: &Arc<SharedFtsScorer<CombinedFieldsBM25Scorer>>,
