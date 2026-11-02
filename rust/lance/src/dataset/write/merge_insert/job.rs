@@ -1021,7 +1021,7 @@ impl MergeInsertJob {
             .iter()
             .filter(|field| {
                 source_field_names.contains(&field.name)
-                    && crate::dataset::optimize::field_contains_blob_v2(field)
+                    && crate::dataset::blob::field_contains_blob_v2(field)
             })
             .map(|field| field.name.clone())
             .collect();
