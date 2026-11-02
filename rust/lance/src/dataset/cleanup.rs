@@ -3246,14 +3246,14 @@ mod tests {
 
     mod branch_source;
 
+    mod detached;
+    use detached::commit_detached_delete;
+
     mod retention;
 
     mod concurrency;
 
     mod auto_cleanup;
-
-    mod detached;
-    use detached::commit_detached_delete;
 
     #[rstest]
     #[case::zero(0)]
