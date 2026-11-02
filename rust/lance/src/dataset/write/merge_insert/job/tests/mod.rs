@@ -48,4 +48,5 @@ pub(super) use lance_index::IndexType;
 pub(super) use lance_index::scalar::ScalarIndexParams;
 pub(super) use lance_table::format::RowIdMeta;
 pub(super) use lance_table::rowids::version::RowDatasetVersionMeta;
+pub(super) use std::collections::HashMap;
 pub(super) use std::io::Write;

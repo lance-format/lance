@@ -7,6 +7,9 @@ For experienced developers, the issues you can work on run the gamut from warm-u
 
 If you have any questions, please join our [Discord](https://discord.gg/zMM32dvNtd) for real-time support. Your feedback is always welcome!
 
+For a map of the repository's domains, dependency direction, and test
+locations, start with [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Getting Started
 
 1. Join our Discord and say hi

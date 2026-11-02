@@ -431,7 +431,7 @@ To address this, Lance provides methods for optimizing dataset layout.
 ### Compact data files
 
 Data files can be rewritten so there are fewer files. When passing a
-`target_rows_per_fragment` to `lance.dataset.DatasetOptimizer.compact_files`,
+`target_rows_per_fragment` to `dataset.optimize.compact_files(...)`,
 Lance will skip any fragments that are already above that row count, and rewrite
 others. Fragments will be merged according to their fragment ids, so the inherent
 ordering of the data will be preserved.
@@ -647,7 +647,7 @@ Auto cleanup can be enabled when creating a new dataset:
 ```python
 import lance
 import pyarrow as pa
-from lance.dataset import AutoCleanupConfig
+from lance import AutoCleanupConfig
 
 table = pa.table({"id": range(100)})
 ds = lance.write_dataset(

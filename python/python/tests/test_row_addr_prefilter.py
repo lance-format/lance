@@ -22,7 +22,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from lance.dataset import ScannerBuilder, serialize_row_addrs
+from lance._dataset.scanner import ScannerBuilder, serialize_row_addrs
 from lance.file import LanceFileWriter
 
 if TYPE_CHECKING:

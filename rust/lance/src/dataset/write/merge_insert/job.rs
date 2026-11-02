@@ -4,7 +4,7 @@
 use super::assign_action::{
     condition_reads_target, merge_insert_action, parse_delete_condition, parse_update_condition,
 };
-use super::inserted_rows::KeyExistenceFilter;
+use super::inserted_rows::{KeyExistenceFilter, KeyExistenceFilterBuilder};
 
 use super::merger::Merger;
 use super::row_ids;
@@ -1410,16 +1410,23 @@ impl MergeInsertJob {
         let joined = self
             .create_joined_stream(provider, source_mode, source_projection)
             .await?;
+        let inserted_rows_filter = self
+            .params
+            .primary_key_field_ids(full_schema)
+            .filter(|_| self.params.insert_not_matched)
+            .map(KeyExistenceFilterBuilder::new);
         let merger = Merger::try_new(
             self.params.clone(),
             source_schema,
             joined.schema().as_ref(),
             !is_full_schema,
             self.dataset.manifest.uses_stable_row_ids(),
+            inserted_rows_filter,
         )?;
         let merge_statistics = merger.merge_stats.clone();
         let deleted_rows = merger.deleted_rows.clone();
         let updating_row_ids = merger.updating_row_ids.clone();
+        let inserted_rows_filter = merger.inserted_rows_filter.clone();
         let order_updates_first = merger.with_row_id;
         let merger_schema = merger.output_schema().clone();
         let stream = joined
@@ -1457,7 +1464,7 @@ impl MergeInsertJob {
         let is_delete_only = matches!(self.params.when_matched, WhenMatched::Delete)
             && !self.params.insert_not_matched;
 
-        let (operation, affected_rows) = if is_delete_only {
+        let (operation, affected_rows, inserted_rows_filter) = if is_delete_only {
             // Consume the stream so the merger records the matched row ids in
             // `deleted_rows`; it produces no batches.
             let drained: Vec<RecordBatch> = stream.try_collect().await?;
@@ -1493,12 +1500,12 @@ impl MergeInsertJob {
                     .map(|f| f.id as u32)
                     .collect(),
                 update_mode: Some(RewriteRows),
-                inserted_rows_filter: None, // not implemented for v1
+                inserted_rows_filter: None,
                 updated_fragment_offsets: None,
             };
 
             let affected_rows = Some(RowAddrTreeMap::from(removed_row_addrs));
-            (operation, affected_rows)
+            (operation, affected_rows, None)
         } else if !is_full_schema {
             // Non-delete partial-schema merge: patch the provided columns into
             // existing fragments in place. (Delete is handled above; a wider
@@ -1532,6 +1539,11 @@ impl MergeInsertJob {
             )
             .await?;
 
+            let inserted_rows_filter = inserted_rows_filter
+                .lock()
+                .map_err(|_| Error::internal("Merge insert key filter lock poisoned"))?
+                .as_ref()
+                .map(KeyExistenceFilterBuilder::build);
             let operation = Operation::Update {
                 removed_fragment_ids: Vec::new(),
                 updated_fragments,
@@ -1541,7 +1553,7 @@ impl MergeInsertJob {
                 mem_wal_dir_id: self.params.mem_wal_dir_id.clone(),
                 fields_for_preserving_frag_bitmap: vec![], // in-place update do not affect preserving frag bitmap
                 update_mode: Some(RewriteColumns),
-                inserted_rows_filter: None, // not implemented for v1
+                inserted_rows_filter: inserted_rows_filter.clone(),
                 // The version stamped above is a guess; carry the patched offsets
                 // so `build_manifest` can re-stamp them at the real commit
                 // version after a rebase.
@@ -1549,7 +1561,7 @@ impl MergeInsertJob {
             };
             // We have rewritten the fragments, not just the deletion files, so
             // we can't use affected rows here.
-            (operation, None)
+            (operation, None, inserted_rows_filter)
         } else {
             let cleanup_bases = target_bases_info.clone();
             let (mut new_fragments, _) = write_fragments_internal(
@@ -1642,6 +1654,11 @@ impl MergeInsertJob {
             };
 
             // Commit updated and new fragments
+            let inserted_rows_filter = inserted_rows_filter
+                .lock()
+                .map_err(|_| Error::internal("Merge insert key filter lock poisoned"))?
+                .as_ref()
+                .map(KeyExistenceFilterBuilder::build);
             let operation = Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: old_fragments,
@@ -1656,12 +1673,12 @@ impl MergeInsertJob {
                     .map(|f| f.id as u32)
                     .collect(),
                 update_mode: Some(RewriteRows),
-                inserted_rows_filter: None, // not implemented for v1
+                inserted_rows_filter: inserted_rows_filter.clone(),
                 updated_fragment_offsets: None,
             };
 
             let affected_rows = Some(RowAddrTreeMap::from(removed_row_addrs));
-            (operation, affected_rows)
+            (operation, affected_rows, inserted_rows_filter)
         };
 
         let stats = Arc::into_inner(merge_statistics)
@@ -1675,7 +1692,7 @@ impl MergeInsertJob {
             transaction,
             affected_rows,
             stats,
-            inserted_rows_filter: None, // not implemented for v1
+            inserted_rows_filter,
         })
     }
 

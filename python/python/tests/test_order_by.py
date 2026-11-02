@@ -8,7 +8,7 @@ from pathlib import Path
 
 import lance
 import pyarrow as pa
-from lance.dataset import ColumnOrdering
+from lance._dataset.scanner import ColumnOrdering
 
 
 def test_one_column_order_by(tmp_path: Path):

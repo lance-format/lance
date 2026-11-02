@@ -16,7 +16,7 @@ from pathlib import Path
 import lance
 import pyarrow as pa
 import pytest
-from lance.dataset import ColumnOrdering
+from lance._dataset.scanner import ColumnOrdering
 
 
 class TestMixedCaseColumnNames:
