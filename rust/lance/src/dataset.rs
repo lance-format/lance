@@ -114,6 +114,11 @@ pub mod transaction {
     };
 }
 pub mod udtf;
+mod update_join;
+#[cfg(feature = "update-join-bench")]
+#[doc(hidden)]
+pub mod update_join_bench;
+mod update_join_options;
 pub mod updater;
 mod utils;
 pub(crate) mod versions;
@@ -164,6 +169,7 @@ pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
 pub use take::TakeBuilder;
+pub use update_join_options::{UpdateJoinOptions, UpdateJoinStrategy};
 use uuid::Uuid;
 pub use write::merge_insert::{
     MergeInsertBuilder, MergeInsertJob, MergeInsertWriteMode, MergeStats, SourceDedupeBehavior,
@@ -303,6 +309,14 @@ pub struct Version {
 
     /// Key-value pairs of metadata.
     pub metadata: BTreeMap<String, String>,
+
+    /// Size of the manifest file for this version, in bytes, if known.
+    ///
+    /// On wide tables (many columns and/or fragments) the manifest is rewritten
+    /// in full on every commit; exposing its size per version makes metadata
+    /// growth observable via [`Dataset::versions`].
+    #[serde(default)]
+    pub manifest_size: Option<u64>,
 }
 
 /// A lightweight reference to an attached dataset version, which could be used to uniquely identify a version.
@@ -320,6 +334,7 @@ impl From<&Manifest> for Version {
             version: m.version,
             timestamp: m.timestamp(),
             metadata: m.summary().into(),
+            manifest_size: None,
         }
     }
 }
@@ -1590,6 +1605,53 @@ impl Dataset {
         Ok(())
     }
 
+    /// Restore the currently checked out version if `expected_latest_version`
+    /// is still the dataset's latest version.
+    ///
+    /// Unlike [`Self::restore`], this method never rebases across commits that
+    /// landed after the caller inspected the table. If the latest version
+    /// changed, or another writer publishes while this restore is being built,
+    /// the commit fails with a retryable conflict and the caller must reload
+    /// and validate the new snapshot before trying again.
+    ///
+    /// The restore is published through this dataset's installed commit
+    /// handler, including namespace-managed version registration.
+    ///
+    /// # Arguments
+    ///
+    /// * `expected_latest_version` - The latest version the caller observed
+    ///   and validated before deciding to restore.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let expected_latest_version = dataset.latest_version_id().await?;
+    /// let mut restore_target = dataset.checkout_version(3).await?;
+    /// restore_target
+    ///     .restore_from(expected_latest_version)
+    ///     .await?;
+    /// # Ok(())
+    /// }
+    /// ```
+    pub async fn restore_from(&mut self, expected_latest_version: u64) -> Result<()> {
+        let transaction = Transaction::new(
+            expected_latest_version,
+            Operation::Restore {
+                version: self.manifest.version,
+            },
+            None,
+        );
+        self.apply_commit_with_expected_latest_version(
+            transaction,
+            &Default::default(),
+            &Default::default(),
+            Some(expected_latest_version),
+        )
+        .await
+    }
+
     /// Removes old versions of the dataset from disk
     ///
     /// This function will remove all versions of the dataset that are older than the provided
@@ -1806,6 +1868,22 @@ impl Dataset {
         write_config: &ManifestWriteConfig,
         commit_config: &CommitConfig,
     ) -> Result<()> {
+        self.apply_commit_with_expected_latest_version(
+            transaction,
+            write_config,
+            commit_config,
+            None,
+        )
+        .await
+    }
+
+    async fn apply_commit_with_expected_latest_version(
+        &mut self,
+        transaction: Transaction,
+        write_config: &ManifestWriteConfig,
+        commit_config: &CommitConfig,
+        expected_latest_version: Option<u64>,
+    ) -> Result<()> {
         // Keep the retry and rebase state machine out of every caller's future.
         let (manifest, manifest_location) = Box::pin(commit_transaction(
             self,
@@ -1817,6 +1895,7 @@ impl Dataset {
             default_commit_retry_timeout(),
             self.manifest_location.naming_scheme,
             None,
+            expected_latest_version,
         ))
         .await?;
 
@@ -2846,7 +2925,13 @@ impl Dataset {
     /// This constructs a full [Version], including summary metadata derived
     /// from the loaded manifest fragments.
     pub fn version(&self) -> Version {
-        Version::from(self.manifest.as_ref())
+        let mut version = Version::from(self.manifest.as_ref());
+        // `Version::from` only sees the manifest itself, not where it was read
+        // from. This dataset already knows the on-disk size, so report it here
+        // too; otherwise `get_version()` would disagree with `versions()`,
+        // which takes the size from the manifest location.
+        version.manifest_size = self.manifest_location().size;
+        version
     }
 
     /// Get the number of entries currently in the index cache.
@@ -2870,8 +2955,13 @@ impl Dataset {
             .commit_handler
             .list_manifest_locations(&self.base, &self.object_store, false)
             .try_filter_map(|location| async move {
-                match read_manifest(&self.object_store, &location.path, location.size).await {
-                    Ok(manifest) => Ok(Some(Version::from(&manifest))),
+                let manifest_size = location.size;
+                match read_manifest(&self.object_store, &location.path, manifest_size).await {
+                    Ok(manifest) => {
+                        let mut version = Version::from(&manifest);
+                        version.manifest_size = manifest_size;
+                        Ok(Some(version))
+                    }
                     Err(e) => Err(e),
                 }
             })
@@ -3443,9 +3533,9 @@ impl Dataset {
         Ok(())
     }
 
-    /// Assign stable row ID sequences to fragments that do not yet have them,
-    /// contiguously from `start`, and return the resulting `next_row_id`
-    /// high-water mark.
+    /// Assign a stable row ID sequence to every fragment, contiguously from
+    /// `start`, and return the resulting `next_row_id` high-water mark. Only
+    /// reached when the feature is off, so no fragment has a sequence yet.
     fn assign_stable_row_ids_for_migration(fragments: &mut [Fragment], start: u64) -> Result<u64> {
         let mut next_row_id = start;
         for fragment in fragments.iter_mut() {
@@ -3467,9 +3557,14 @@ impl Dataset {
 
     /// Migrate a table to use stable row IDs.
     ///
-    /// Stable row IDs assign a persistent identifier to each row that remains
-    /// stable across compaction operations. This enables more efficient updates
-    /// to secondary indices.
+    /// Afterwards a row keeps the same id for its lifetime: compaction, update
+    /// and merge insert relocate or rewrite the row without changing its id.
+    ///
+    /// Migration assigns a fresh id to every physical row position, in fragment
+    /// order, starting from the dataset's `next_row_id` high-water mark. Before
+    /// migration `_rowid` is a row address, a different namespace from the ids
+    /// assigned here, so a `_rowid` recorded beforehand must not be reused as a
+    /// row id afterwards.
     ///
     /// A single Merge commit assigns row ID sequences to all fragments and
     /// activates the stable row ID feature flag atomically. Because `Merge`

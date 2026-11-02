@@ -93,8 +93,9 @@ impl<'a> CommitBuilder<'a> {
         }
     }
 
-    /// Whether to use stable row ids. This makes the `_rowid` column stable
-    /// after compaction, but not updates.
+    /// Whether to use stable row ids. A row then keeps the same `_rowid` for
+    /// its lifetime, even when compaction, an update or a merge insert
+    /// rewrites it.
     ///
     /// This is only used for new datasets. Existing datasets will use their
     /// existing setting.
@@ -546,6 +547,7 @@ impl<'a> CommitBuilder<'a> {
                     self.retry_timeout,
                     manifest_naming_scheme,
                     self.affected_rows.as_ref(),
+                    None,
                 )
                 .await?
             }

@@ -953,6 +953,7 @@ fn version_to_py(py: Python<'_>, version: &Version) -> PyResult<Py<PyAny>> {
     )?;
     let tup: Vec<(&String, &String)> = version.metadata.iter().collect();
     dict.set_item("metadata", tup.into_py_dict(py)?)?;
+    dict.set_item("manifest_size", version.manifest_size)?;
     dict.into_py_any(py)
 }
 
@@ -1274,7 +1275,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, index_segments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None, row_addr_allowlist=None, row_addr_blocklist=None, minhash_query=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, search_filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, batch_size_bytes=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, index_segments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, blob_handling=None, use_scalar_index=None, ignored_scalar_indices=None, include_deleted_rows=None, scan_stats_callback=None, strict_batch_size=None, order_by=None, disable_scoring_autoprojection=None, substrait_aggregate=None, row_addr_allowlist=None, row_addr_blocklist=None, minhash_query=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -1302,6 +1303,7 @@ impl Dataset {
         late_materialization: Option<Bound<PyAny>>,
         blob_handling: Option<Bound<PyAny>>,
         use_scalar_index: Option<bool>,
+        ignored_scalar_indices: Option<Vec<String>>,
         include_deleted_rows: Option<bool>,
         scan_stats_callback: Option<&Bound<'_, PyAny>>,
         strict_batch_size: Option<bool>,
@@ -1568,6 +1570,10 @@ impl Dataset {
             scanner.use_scalar_index(use_scalar_index);
         }
 
+        if let Some(ignored_scalar_indices) = ignored_scalar_indices {
+            scanner.with_ignored_scalar_indices(ignored_scalar_indices);
+        }
+
         if let Some(strict_batch_size) = strict_batch_size {
             scanner.strict_batch_size(strict_batch_size);
         }
@@ -1582,6 +1588,7 @@ impl Dataset {
                 maximum_nprobes,
                 metric_type,
                 refine_factor,
+                quantized_refine_factor,
                 use_index,
                 ef,
                 query_parallelism,
@@ -1649,6 +1656,9 @@ impl Dataset {
                     }
                     if let Some(factor) = refine_factor {
                         s = s.refine(factor);
+                    }
+                    if let Some(factor) = quantized_refine_factor {
+                        s = s.quantized_refine(factor);
                     }
                     if let Some(m) = metric_type {
                         s = s.distance_metric(m);
@@ -4923,7 +4933,9 @@ impl Dataset {
         .infer_error()
     }
 
-    fn make_scan_stats_callback(callback: Bound<'_, PyAny>) -> PyResult<ExecutionStatsCallback> {
+    pub(crate) fn make_scan_stats_callback(
+        callback: Bound<'_, PyAny>,
+    ) -> PyResult<ExecutionStatsCallback> {
         if !callback.is_callable() {
             return Err(PyValueError::new_err("Callback must be callable"));
         }
@@ -5831,6 +5843,7 @@ type VectorQueryParams = (
     Option<usize>,
     Option<MetricType>,
     Option<u32>,
+    Option<u32>,
     bool,
     Option<usize>,
     i32,
@@ -5970,6 +5983,23 @@ fn vector_query_params_from_dict(
         None
     };
 
+    let quantized_refine_factor: Option<u32> =
+        if let Some(factor) = dict.get_item("quantized_refine_factor")? {
+            if factor.is_none() {
+                None
+            } else {
+                let factor: u32 = factor.extract()?;
+                if factor == 0 {
+                    return Err(PyValueError::new_err(
+                        "quantized_refine_factor must be greater than zero",
+                    ));
+                }
+                Some(factor)
+            }
+        } else {
+            None
+        };
+
     let use_index: bool = if let Some(idx) = dict.get_item("use_index")? {
         idx.extract()?
     } else {
@@ -5997,6 +6027,7 @@ fn vector_query_params_from_dict(
         maximum_nprobes,
         metric_type,
         refine_factor,
+        quantized_refine_factor,
         use_index,
         ef,
         query_parallelism,
@@ -6035,12 +6066,19 @@ impl PySearchFilter {
             maximum_nprobes,
             metric_type_opt,
             refine_factor,
+            quantized_refine_factor,
             use_index,
             ef,
             query_parallelism,
             approx_mode,
             search_effort,
         ) = vector_query_params_from_dict(query, default_k)?;
+
+        if quantized_refine_factor.is_some() {
+            return Err(PyValueError::new_err(
+                "quantized_refine_factor is only supported on dataset scanners",
+            ));
+        }
 
         // Leave an unset metric to the core, which takes it from the index the
         // search picks, as the `nearest` path does.
