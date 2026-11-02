@@ -1352,6 +1352,7 @@ async fn rebuild_vector_segment(
         .replace(true)
         .fragments(fragment_bitmap.iter().collect())
         .progress(progress)
+        .without_memory_observation()
         .execute_uncommitted()
         .await
 }

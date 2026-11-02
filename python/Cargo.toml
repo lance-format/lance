@@ -48,7 +48,7 @@ lance = { path = "../rust/lance", features = [
     "metrics",
 ] }
 lance-arrow = { path = "../rust/lance-arrow" }
-lance-core = { path = "../rust/lance-core" }
+lance-core = { path = "../rust/lance-core", features = ["metrics"] }
 lance-datagen = { path = "../rust/lance-datagen", optional = true }
 lance-encoding = { path = "../rust/lance-encoding" }
 lance-file = { path = "../rust/lance-file" }
