@@ -893,7 +893,8 @@ reverses the transpose. Decoding is bit-exact, including NaN payloads and signed
 
 The writer sizes chunks by uncompressed bytes rather than the usual compressed mini-block budget: each chunk
 holds the largest power of two number of values whose uncompressed size is at most 32KiB, capped at the
-maximum number of mini-block values. pco stores bins and delta state per chunk, so it needs a few hundred
+maximum number of mini-block values, and never fewer than two values: only the final chunk of a page may
+hold a single value. pco stores bins and delta state per chunk, so it needs a few hundred
 numbers per list position to amortize that metadata. A random read of one value decodes one chunk.
 
 Pcodec is selected only when a field requests it with `lance-encoding:compression=pcodec`. Such a field is not
