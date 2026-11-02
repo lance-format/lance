@@ -27,8 +27,8 @@ mod scan;
 mod vector;
 
 use crate::dataset::blob::prepared_blob_batch_to_descriptors;
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
-use crate::dataset::mem_wal::write::BatchStore;
 
 pub use brute_force_vector::MemTableBruteForceVectorExec;
 pub use dedup_scan::MemTableDedupScanExec;
