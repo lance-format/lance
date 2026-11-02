@@ -3558,8 +3558,7 @@ impl Dataset {
     /// Migrate a table to use stable row IDs.
     ///
     /// Afterwards a row keeps the same id for its lifetime: compaction, update
-    /// and merge insert relocate or rewrite the row without changing its id,
-    /// which enables more efficient updates to secondary indices.
+    /// and merge insert relocate or rewrite the row without changing its id.
     ///
     /// Migration assigns a fresh id to every physical row position, in fragment
     /// order, starting from the dataset's `next_row_id` high-water mark. Before
