@@ -15637,7 +15637,7 @@ mod test {
 
             assert_eq!(
                 dataset.index_cache_entry_count().await,
-                2, // 2 for index metadata at version 1 and 2.
+                4, // Raw metadata and query listings at versions 1 and 2.
             );
             let results = scan
                 .try_into_stream()
@@ -15650,8 +15650,8 @@ mod test {
             assert_eq!(
                 dataset.index_cache_entry_count().await,
                 // the index, its partitions and the segment ownership mask, plus
-                // the index metadata of every version
-                6 + dataset.versions().await.unwrap().len()
+                // raw metadata and query listings of every version
+                6 + 2 * dataset.versions().await.unwrap().len()
             );
             assert_eq!(results.len(), 1);
             let batch = &results[0];

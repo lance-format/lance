@@ -780,6 +780,7 @@ pub mod tests {
                 .map(|f| f.id as u32)
                 .collect(),
         );
+        dataset.index_cache.clear().await;
         let key = IndexMetadataKey {
             version: dataset.manifest.version,
             store_identity: &dataset.object_store.store_prefix,

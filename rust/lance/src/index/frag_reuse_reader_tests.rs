@@ -11,7 +11,9 @@ use crate::index::create::CreateIndexBuilder;
 use crate::index::frag_reuse_remapping::vector_supports_batch_remapping;
 use crate::index::vector::dedup::{DuplicatePairsOptions, find_duplicate_pairs_with_options};
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
-use crate::session::index_caches::IndexMetadataKey;
+use crate::session::index_caches::{
+    DerivedIndexListingKey, IndexMetadataKey, QueryIndexListing, QueryIndexListingKey,
+};
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 use arrow_array::types::Int32Type;
 use arrow_array::{RecordBatch, RecordBatchIterator, cast::AsArray};
@@ -616,6 +618,7 @@ async fn projected_coverage_does_not_skip_address_translation() {
         .find(|index| index.name == "i_idx")
         .unwrap();
     index.fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());
+    dataset.index_cache.clear().await;
     let key = IndexMetadataKey {
         version: dataset.manifest.version,
         store_identity: &dataset.object_store.store_prefix,
@@ -1886,6 +1889,7 @@ async fn unsupported_scalar_type_is_not_advertised_for_rewritten_fragments() {
     indices[0].index_details = Some(Arc::new(
         prost_types::Any::from_msg(&lance_index::pb::FmIndexDetails::default()).unwrap(),
     ));
+    dataset.index_cache.clear().await;
     let key = IndexMetadataKey {
         version: dataset.manifest.version,
         store_identity: &dataset.object_store.store_prefix,
@@ -2131,6 +2135,21 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
     dataset
         .index_cache
         .insert_with_key(&metadata_key, Arc::new(vec![fri.clone()]))
+        .await;
+    let query_key = QueryIndexListingKey(DerivedIndexListingKey {
+        version: dataset.manifest.version,
+        store_identity: &dataset.object_store.store_prefix,
+        e_tag: dataset.manifest_location.e_tag.as_deref(),
+    });
+    dataset
+        .index_cache
+        .insert_with_key(
+            &query_key,
+            Arc::new(QueryIndexListing {
+                indices: Arc::new(vec![fri.clone()]),
+                retry_inference: false,
+            }),
+        )
         .await;
     let warm = open_row_id_remapping(&dataset, &siblings[1], &NoOpMetricsCollector)
         .await
@@ -2918,6 +2937,7 @@ async fn projected_bitmap_with_dropped_transition_scans_not_drops() {
         .find(|index| index.name == "i_idx")
         .unwrap();
     index.fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());
+    dataset.index_cache.clear().await;
     let key = IndexMetadataKey {
         version: dataset.manifest.version,
         store_identity: &dataset.object_store.store_prefix,

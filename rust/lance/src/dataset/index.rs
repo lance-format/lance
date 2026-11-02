@@ -784,6 +784,7 @@ mod tests {
                     .collect();
             }
         }
+        dataset.index_cache.clear().await;
         let metadata_key = crate::session::index_caches::IndexMetadataKey {
             version: dataset.version().version,
             store_identity: &dataset.object_store.store_prefix,
