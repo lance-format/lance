@@ -607,15 +607,6 @@ same id, name, or path.
 
 ## Action-Based Transactions (Transaction V2)
 
-!!! warning "Experimental"
-
-    Transaction V2 is an experimental format feature under the process in
-    [Voting](../../community/voting.md). Its protobuf field numbers are not a
-    stable contract, breaking changes may be made without a separate vote, and
-    the feature is removed from the specification and the codebase if its
-    stabilization vote does not pass. Discussion:
-    [#5960](https://github.com/lance-format/lance/discussions/5960).
-
 !!! note "Readers before v14.0.0 fail on a `CompositeOperation`"
 
     Any reader can open and scan a table version committed as a

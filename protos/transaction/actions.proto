@@ -12,15 +12,11 @@ import "google/protobuf/empty.proto";
 package lance.transaction;
 
 /*
- * Action-based transactions (Transaction V2) — EXPERIMENTAL.
+ * Action-based transactions (Transaction V2).
  *
  * A `CompositeOperation` replaces the legacy `Operation` (see
  * transaction.proto) with an ordered list of `UserStep`s, each expanding to
- * an ordered list of `Action`s, committing atomically as one manifest change. This is an experimental feature under
- * the process in docs/src/community/voting.md: the field numbers are not a
- * stable contract, may change without a separate vote, and are removed if
- * the stabilization vote does not pass. Support here is read-side
- * fail-closed — rejected on load, with no write path.
+ * an ordered list of `Action`s, committing atomically as one manifest change.
  *
  * COMPATIBILITY. Any reader can open a table version carrying one of these,
  * since the inline transaction is in a manifest field older readers ignore
