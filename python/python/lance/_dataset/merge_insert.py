@@ -500,7 +500,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             MemWAL without one. The commit fails if the table's MemWAL has
             since been disabled or replaced.
         """
-        from .mem_wal import _to_raw_compacted_sstables
+        from ..mem_wal import _to_raw_compacted_sstables
 
         raw_sstables = _to_raw_compacted_sstables(sstables)
         super(MergeInsertBuilder, self).mark_sstables_as_compacted(raw_sstables, dir_id)
