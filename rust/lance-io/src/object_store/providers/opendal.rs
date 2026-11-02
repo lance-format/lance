@@ -10,6 +10,11 @@ pub(in crate::object_store) fn finish_opendal_operator(
     operator: Operator,
     max_retries: usize,
 ) -> Operator {
+    // OpenDAL's auto-registration process constructor can emit an ARM64 branch
+    // outside the +/-128 MiB range in large dynamic libraries. Initialize the
+    // registry and default transport explicitly at the operator boundary.
+    opendal::install_default();
+
     if max_retries == 0 {
         return operator;
     }
@@ -43,6 +48,17 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[test]
+    fn test_finish_opendal_operator_installs_defaults() {
+        let operator = Operator::new(opendal::services::Memory::default())
+            .expect("memory operator should be created");
+        let _ = finish_opendal_operator(operator, 0);
+
+        let operator =
+            Operator::via_iter("memory", []).expect("memory service should be registered");
+        assert_eq!(operator.info().scheme(), "memory");
+    }
 
     #[derive(Debug, Clone)]
     struct RetryTestService {
