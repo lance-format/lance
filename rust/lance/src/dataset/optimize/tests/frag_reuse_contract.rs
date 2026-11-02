@@ -500,6 +500,28 @@ async fn staged_merge_racing_a_delete(dataset: &mut Dataset, kind: IndexKind, ne
     *dataset = concurrent;
 }
 
+/// Compacts eagerly while the history still has moves the index has not
+/// caught up with. Remapping must compose the pending translation with the
+/// compaction's own moves; refusing the compaction is also correct.
+async fn eager_compaction_over_pending_history(dataset: &mut Dataset, kind: IndexKind) {
+    dataset
+        .append(
+            rows(900..900 + ROWS_PER_FRAGMENT, false),
+            Some(write_params()),
+        )
+        .await
+        .unwrap();
+    let options = CompactionOptions {
+        target_rows_per_fragment: 1000,
+        defer_index_remap: false,
+        ..Default::default()
+    };
+    match compact_files(dataset, options, None).await {
+        Ok(_) | Err(Error::InvalidInput { .. } | Error::NotSupported { .. }) => {}
+        Err(error) => panic!("{kind:?}: eager compaction failed: {error}"),
+    }
+}
+
 async fn run_contract(kind: IndexKind, form: HistoryForm) {
     let dir = TempStrDir::default();
     let uri = dir.as_str();
@@ -542,6 +564,15 @@ async fn run_contract(kind: IndexKind, form: HistoryForm) {
     rewrite(&mut dataset, form).await;
     assert_contract(&dataset, kind, form, "chained rewrite").await;
 
+    eager_compaction_over_pending_history(&mut dataset, kind).await;
+    assert_contract(
+        &dataset,
+        kind,
+        form,
+        "eager compaction over a pending history",
+    )
+    .await;
+
     dataset
         .optimize_indices(&OptimizeOptions::default())
         .await
@@ -555,6 +586,58 @@ async fn run_contract(kind: IndexKind, form: HistoryForm) {
 
     cleanup_frag_reuse_index(&mut dataset).await.unwrap();
     assert_contract(&dataset, kind, form, "trim").await;
+}
+
+/// The shortest path to an eager compaction over a pending history: the
+/// index still holds the addresses it was built with, the history translates
+/// them once, and the eager compaction moves the translated rows again.
+async fn run_eager_after_deferred(kind: IndexKind) {
+    let dir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        rows(0..6 * ROWS_PER_FRAGMENT, false),
+        dir.as_str(),
+        Some(write_params()),
+    )
+    .await
+    .unwrap();
+    kind.create(&mut dataset).await;
+    // Six fragments become three, so the eager compaction rewrites rows the
+    // history has already moved once.
+    let deferred = CompactionOptions {
+        target_rows_per_fragment: 2 * ROWS_PER_FRAGMENT as usize,
+        defer_index_remap: true,
+        ..Default::default()
+    };
+    compact_files(&mut dataset, deferred, None).await.unwrap();
+    assert_eq!(dataset.fragments().len(), 3);
+    assert_contract(&dataset, kind, HistoryForm::V0, "deferred compaction").await;
+
+    eager_compaction_over_pending_history(&mut dataset, kind).await;
+    assert_contract(
+        &dataset,
+        kind,
+        HistoryForm::V0,
+        "eager compaction over a pending history",
+    )
+    .await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_eager_compaction_over_a_pending_history_matches_the_table(
+    #[values(
+        IndexKind::BTree,
+        IndexKind::Bitmap,
+        IndexKind::ZoneMap,
+        IndexKind::BloomFilter,
+        IndexKind::LabelList,
+        IndexKind::NGram,
+        IndexKind::Inverted,
+        IndexKind::IvfFlat
+    )]
+    kind: IndexKind,
+) {
+    run_eager_after_deferred(kind).await;
 }
 
 #[rstest]
