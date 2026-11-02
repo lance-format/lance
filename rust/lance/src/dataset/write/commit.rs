@@ -306,6 +306,10 @@ impl<'a> CommitBuilder<'a> {
     /// provide Configuration key-value pairs associated with this transaction.
     /// This is used to store metadata about the transaction, such as commit messages, engine information, etc.
     /// this properties map will be persisted as a part of the transaction object
+    ///
+    /// These are merged into the properties the committed transaction already
+    /// carries, which win a key conflict, so a property judged at commit time
+    /// (an expected table-metadata entry, say) holds whichever side set it.
     pub fn with_transaction_properties(
         mut self,
         transaction_properties: HashMap<String, String>,
@@ -375,6 +379,13 @@ impl<'a> CommitBuilder<'a> {
     }
 
     async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
+        // Properties set on the builder reach the transaction here, so that
+        // everything judged from them at commit time — an expected
+        // table-metadata entry, a run anchor — sees both sources. The
+        // transaction's own entries win a key conflict: it is the more
+        // specific of the two.
+        let transaction =
+            merge_transaction_properties(transaction, self.transaction_properties.as_deref());
         // A definitions list is a commit-time input for UpdateConfig alone. Every
         // other operation is refused here, before any path is chosen: the
         // new-dataset paths never reach the manifest builder's own check.
@@ -654,6 +665,7 @@ impl<'a> CommitBuilder<'a> {
         }
 
         let read_version = transactions.iter().map(|t| t.read_version).min().unwrap();
+        let transaction_properties = union_transaction_properties(&transactions)?;
 
         let merged = Transaction {
             uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
@@ -668,11 +680,59 @@ impl<'a> CommitBuilder<'a> {
             },
             read_version,
             tag: None,
-            transaction_properties: None,
+            transaction_properties,
         };
         let dataset = self.execute(merged.clone()).await?;
         Ok(BatchCommitResult { dataset, merged })
     }
+}
+
+/// Fold `builder` properties into `transaction`'s own, which win a key
+/// conflict. Returns the transaction untouched when there is nothing to add.
+fn merge_transaction_properties(
+    mut transaction: Transaction,
+    builder: Option<&HashMap<String, String>>,
+) -> Transaction {
+    let Some(builder) = builder.filter(|properties| !properties.is_empty()) else {
+        return transaction;
+    };
+    let mut merged = builder.clone();
+    if let Some(own) = &transaction.transaction_properties {
+        for (key, value) in own.iter() {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    transaction.transaction_properties = Some(Arc::new(merged));
+    transaction
+}
+
+/// Union the properties of the transactions a batch commit merges into one.
+///
+/// A property is a statement about the single commit that lands, so two
+/// inputs stating different values for the same key cannot both be honoured:
+/// that is refused here, before anything is written. Equal values agree and
+/// carry through.
+fn union_transaction_properties(
+    transactions: &[Transaction],
+) -> Result<Option<Arc<HashMap<String, String>>>> {
+    let mut union: HashMap<String, String> = HashMap::new();
+    for transaction in transactions {
+        let Some(properties) = &transaction.transaction_properties else {
+            continue;
+        };
+        for (key, value) in properties.iter() {
+            if let Some(existing) = union.get(key)
+                && existing != value
+            {
+                return Err(Error::invalid_input(format!(
+                    "batch commit refused: transactions disagree on property '{key}' \
+                     ('{existing}' and '{value}'); one commit cannot satisfy both"
+                )));
+            }
+            union.insert(key.clone(), value.clone());
+        }
+    }
+    Ok((!union.is_empty()).then(|| Arc::new(union)))
 }
 
 pub struct BatchCommitResult {
@@ -694,10 +754,11 @@ mod tests {
     use lance_io::utils::CachedFileSize;
     use lance_io::{assert_io_eq, assert_io_gt};
     use lance_table::format::{
-        DataFile, Fragment, IndexMetadata, Manifest, Transaction as TableTransaction,
+        COMMIT_EXPECT_TABLE_METADATA_PREFIX, DataFile, Fragment, IndexMetadata, Manifest,
+        Transaction as TableTransaction,
     };
     use lance_table::io::commit::{CommitError, ManifestLocation, ManifestWriter};
-    use lance_table::transaction::resolve_arrow_field_ids;
+    use lance_table::transaction::{UpdateMap, UpdateMapEntry, resolve_arrow_field_ids};
     use std::time::Duration;
 
     use object_store::throttle::ThrottleConfig;
@@ -1493,6 +1554,142 @@ mod tests {
             matches!(transaction.operation, Operation::Append { fragments } if fragments == expected_fragments)
         );
         assert_eq!(transaction.read_version, 1);
+    }
+
+    /// An expectation set through [`CommitBuilder::with_transaction_properties`]
+    /// is judged like one carried on the transaction: the builder's map has to
+    /// reach the transaction for that to hold.
+    #[tokio::test]
+    async fn builder_properties_carry_an_expectation_to_the_commit() {
+        let dataset = Arc::new(table_metadata_dataset("memory://builder-expect").await);
+        let dataset = Arc::new(set_table_metadata(&dataset, "published").await.unwrap());
+        // Another writer moves the state the first writer read.
+        let moved = Arc::new(set_table_metadata(&dataset, "retired").await.unwrap());
+
+        // Stale: the expectation stated only through the builder is enforced.
+        let error = CommitBuilder::new(moved.clone())
+            .with_transaction_properties(expect_state("published"))
+            .execute(sample_transaction(moved.manifest().version))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        let text = error.to_string();
+        assert!(text.contains(STATE_KEY), "{text}");
+        assert!(text.contains("'retired'"), "{text}");
+
+        // Current: the same path lands.
+        let landed = CommitBuilder::new(moved.clone())
+            .with_transaction_properties(expect_state("retired"))
+            .execute(sample_transaction(moved.manifest().version))
+            .await
+            .unwrap();
+        assert_eq!(landed.manifest().version, moved.manifest().version + 1);
+    }
+
+    /// A batch commit carries its inputs' properties, so an expectation stated
+    /// on any of them is judged; two inputs that disagree on a key cannot both
+    /// be honoured by the single commit and are refused before it is attempted.
+    #[tokio::test]
+    async fn execute_batch_unions_input_properties() {
+        let dataset = Arc::new(table_metadata_dataset("memory://batch-expect").await);
+        let dataset = Arc::new(set_table_metadata(&dataset, "published").await.unwrap());
+        let read = dataset.manifest().version;
+
+        // Two inputs agreeing on the expectation, which holds: it lands.
+        let result = CommitBuilder::new(dataset.clone())
+            .execute_batch(vec![
+                expecting_state(read, "published"),
+                expecting_state(read, "published"),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            result.merged.transaction_properties.as_deref(),
+            Some(&expect_state("published"))
+        );
+        let dataset = Arc::new(result.dataset);
+        let read = dataset.manifest().version;
+
+        // Two inputs disagreeing: refused, and nothing was written.
+        let error = CommitBuilder::new(dataset.clone())
+            .execute_batch(vec![
+                expecting_state(read, "published"),
+                expecting_state(read, "retired"),
+            ])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        let text = error.to_string();
+        assert!(text.contains(STATE_KEY), "{text}");
+        assert!(
+            text.contains("'published'") && text.contains("'retired'"),
+            "{text}"
+        );
+
+        // An expectation that no longer holds: refused.
+        let error = CommitBuilder::new(dataset.clone())
+            .execute_batch(vec![
+                expecting_state(read, "retired"),
+                sample_transaction(read),
+            ])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("'published'"), "{error}");
+
+        let mut latest = (*dataset).clone();
+        latest.checkout_latest().await.unwrap();
+        assert_eq!(latest.manifest().version, read, "nothing landed");
+    }
+
+    const STATE_KEY: &str = "org.example.state";
+
+    /// An append carrying the expectation `STATE_KEY == expected`.
+    fn expecting_state(read_version: u64, expected: &str) -> Transaction {
+        let mut transaction = sample_transaction(read_version);
+        transaction.transaction_properties = Some(Arc::new(expect_state(expected)));
+        transaction
+    }
+
+    /// The expectation `STATE_KEY == value`, as transaction properties.
+    fn expect_state(value: &str) -> HashMap<String, String> {
+        HashMap::from([(
+            format!("{COMMIT_EXPECT_TABLE_METADATA_PREFIX}{STATE_KEY}"),
+            value.to_string(),
+        )])
+    }
+
+    /// A one-row dataset whose fragment layout matches [`sample_fragment`], so
+    /// appending one is a valid commit.
+    async fn table_metadata_dataset(uri: &str) -> Dataset {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+        )
+        .unwrap();
+        InsertBuilder::new(uri).execute(vec![batch]).await.unwrap()
+    }
+
+    async fn set_table_metadata(dataset: &Arc<Dataset>, value: &str) -> Result<Dataset> {
+        CommitBuilder::new(dataset.clone())
+            .execute(Transaction::new_from_version(
+                dataset.manifest().version,
+                Operation::UpdateConfig {
+                    config_updates: None,
+                    table_metadata_updates: Some(UpdateMap {
+                        update_entries: vec![UpdateMapEntry::from((STATE_KEY, Some(value)))],
+                        replace: false,
+                    }),
+                    schema_metadata_updates: None,
+                    field_metadata_updates: HashMap::new(),
+                },
+            ))
+            .await
     }
 
     /// On non-lexically-ordered stores (e.g. S3 Express) a commit should use the
