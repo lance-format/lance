@@ -65,6 +65,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
           createScanner(
               dataset,
               options.getFragmentIds(),
+              options.getFragmentSlices(),
               options.getIndexSegments(),
               options.getColumns(),
               options.getSubstraitFilter(),
@@ -85,6 +86,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
               options.getLateMaterialization(),
               options.getColumnOrderings(),
               options.isUseScalarIndex(),
+              options.getIgnoredScalarIndices(),
               options.isFastSearch(),
               options.getSubstraitAggregate(),
               options.isCollectStats(),
@@ -101,6 +103,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
   static native LanceScanner createScanner(
       Dataset dataset,
       Optional<List<Integer>> fragmentIds,
+      Optional<List<FragmentSlice>> fragmentSlices,
       Optional<List<UUID>> indexSegments,
       Optional<List<String>> columns,
       Optional<ByteBuffer> substraitFilter,
@@ -121,6 +124,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
       Optional<MaterializationStyle> lateMaterialization,
       Optional<List<ColumnOrdering>> columnOrderings,
       boolean useScalarIndex,
+      Optional<List<String>> ignoredScalarIndices,
       boolean fastSearch,
       Optional<ByteBuffer> substraitAggregate,
       boolean collectStats,

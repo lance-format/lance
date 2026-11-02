@@ -3,6 +3,7 @@
 
 use crate::error::{Error, Result};
 use crate::traits::{IntoJava, export_vec};
+use crate::utils::to_java_map;
 use jni::JNIEnv;
 use jni::objects::{JObject, JValue};
 use jni::sys::jbyte;
@@ -46,37 +47,102 @@ fn u32_to_jint(field: &str, value: u32) -> Result<i32> {
     })
 }
 
+fn index_description_into_java<'a>(
+    description: &Arc<dyn IndexDescription>,
+    env: &mut JNIEnv<'a>,
+    include_metadata: bool,
+) -> Result<JObject<'a>> {
+    let field_ids = description
+        .field_ids()
+        .iter()
+        .map(|id| u32_to_jint("fieldIds", *id))
+        .collect::<Result<Vec<_>>>()?;
+    let field_ids_list = int_list(env, field_ids)?;
+    let name = env.new_string(description.name())?;
+    let type_url = env.new_string(description.type_url())?;
+    let index_type = env.new_string(description.index_type())?;
+    let rows_indexed = u64_to_jlong("rowsIndexed", description.rows_indexed())?;
+    let metadata_list = if include_metadata {
+        export_vec(env, description.metadata())?
+    } else {
+        env.call_static_method(
+            "java/util/Collections",
+            "emptyList",
+            "()Ljava/util/List;",
+            &[],
+        )?
+        .l()?
+    };
+    let details_json = description.details()?;
+    let details = env.new_string(details_json)?;
+    let total_size_bytes = if let Some(size) = description.total_size_bytes() {
+        env.new_object(
+            "java/lang/Long",
+            "(J)V",
+            &[JValue::Long(u64_to_jlong("totalSizeBytes", size)?)],
+        )?
+    } else {
+        JObject::null()
+    };
+    let fragment_coverage = if let Some(coverage) = description.fragment_coverage() {
+        let covered_fragment_count =
+            u64_to_jlong("coveredFragmentCount", coverage.covered_fragment_count)?;
+        let current_fragment_count =
+            u64_to_jlong("currentFragmentCount", coverage.current_fragment_count)?;
+        let missing_fragment_count =
+            u64_to_jlong("missingFragmentCount", coverage.missing_fragment_count)?;
+        let stale_fragment_count =
+            u64_to_jlong("staleFragmentCount", coverage.stale_fragment_count)?;
+        let fragment_bitmap_size_bytes = u64_to_jlong(
+            "fragmentBitmapSizeBytes",
+            coverage.fragment_bitmap_size_bytes,
+        )?;
+        env.new_object(
+            "org/lance/index/IndexFragmentCoverage",
+            "(JJJJJ)V",
+            &[
+                JValue::Long(covered_fragment_count),
+                JValue::Long(current_fragment_count),
+                JValue::Long(missing_fragment_count),
+                JValue::Long(stale_fragment_count),
+                JValue::Long(fragment_bitmap_size_bytes),
+            ],
+        )?
+    } else {
+        JObject::null()
+    };
+
+    let j_index_desc = env.new_object(
+        "org/lance/index/IndexDescription",
+        "(Ljava/lang/String;Ljava/util/List;Ljava/lang/String;Ljava/lang/String;JLjava/util/List;Ljava/lang/String;Ljava/lang/Long;Lorg/lance/index/IndexFragmentCoverage;)V",
+        &[
+            JValue::Object(&name),
+            JValue::Object(&field_ids_list),
+            JValue::Object(&type_url),
+            JValue::Object(&index_type),
+            JValue::Long(rows_indexed),
+            JValue::Object(&metadata_list),
+            JValue::Object(&details),
+            JValue::Object(&total_size_bytes),
+            JValue::Object(&fragment_coverage),
+        ],
+    )?;
+    Ok(j_index_desc)
+}
+
 impl IntoJava for &Arc<dyn IndexDescription> {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-        let field_ids_list = int_list(env, self.field_ids().iter().map(|id| *id as i32))?;
-        let name = env.new_string(self.name())?;
-        let type_url = env.new_string(self.type_url())?;
-        let index_type = env.new_string(self.index_type())?;
-        let rows_indexed = self.rows_indexed() as i64;
-        let metadata_list = export_vec(env, self.metadata())?;
-        let details_json = self.details()?;
-        let details = env.new_string(details_json)?;
-        let total_size_bytes = if let Some(size) = self.total_size_bytes() {
-            env.new_object("java/lang/Long", "(J)V", &[JValue::Long(size as i64)])?
-        } else {
-            JObject::null()
-        };
+        index_description_into_java(self, env, true)
+    }
+}
 
-        let j_index_desc = env.new_object(
-            "org/lance/index/IndexDescription",
-            "(Ljava/lang/String;Ljava/util/List;Ljava/lang/String;Ljava/lang/String;JLjava/util/List;Ljava/lang/String;Ljava/lang/Long;)V",
-            &[
-                JValue::Object(&name),
-                JValue::Object(&field_ids_list),
-                JValue::Object(&type_url),
-                JValue::Object(&index_type),
-                JValue::Long(rows_indexed),
-                JValue::Object(&metadata_list),
-                JValue::Object(&details),
-                JValue::Object(&total_size_bytes),
-            ],
-        )?;
-        Ok(j_index_desc)
+/// JNI conversion for the summary-only API, which deliberately omits segment
+/// metadata so fragment bitmaps are never expanded into Java collections.
+pub(crate) struct IndexDescriptionSummary<'a>(pub &'a Arc<dyn IndexDescription>);
+
+impl IntoJava for &IndexDescriptionSummary<'_> {
+    fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
+        index_description_into_java(self.0, env, false)
     }
 }
 
@@ -161,10 +227,18 @@ impl IntoJava for &IndexMetadata {
         // Determine index type from index_details type_url
         let index_type = determine_index_type(env, &self.index_details)?;
 
+        // A u32 id fits a Java long losslessly; `Integer` would fold the upper
+        // half of the range into negative values.
+        let clustering_id = match self.clustering_id {
+            Some(id) => env.new_object("java/lang/Long", "(J)V", &[JValue::Long(i64::from(id))])?,
+            None => JObject::null(),
+        };
+        let metadata = to_java_map(env, &self.metadata)?;
+
         // Create Index object
         Ok(env.new_object(
             "org/lance/index/Index",
-            "(Ljava/util/UUID;Ljava/util/List;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Ljava/lang/Long;Ljava/util/List;Lorg/lance/index/IndexType;)V",
+            "(Ljava/util/UUID;Ljava/util/List;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Ljava/lang/Long;Ljava/util/List;Lorg/lance/index/IndexType;Ljava/lang/Long;Ljava/util/Map;)V",
             &[
                 JValue::Object(&uuid),
                 JValue::Object(&fields),
@@ -179,6 +253,8 @@ impl IntoJava for &IndexMetadata {
                 JValue::Object(&size_bytes),
                 JValue::Object(&files),
                 JValue::Object(&index_type),
+                JValue::Object(&clustering_id),
+                JValue::Object(&metadata),
             ],
         )?)
     }
@@ -211,6 +287,10 @@ fn determine_index_type<'local>(
             Some("BLOOM_FILTER")
         } else if lower.contains("rtree") {
             Some("RTREE")
+        } else if lower.contains("minhashlsh") {
+            Some("MINHASH_LSH")
+        } else if lower.contains("fmindex") {
+            Some("FM")
         } else if lower.contains("ivfhnsw") {
             if lower.contains("sq") {
                 Some("IVF_HNSW_SQ")

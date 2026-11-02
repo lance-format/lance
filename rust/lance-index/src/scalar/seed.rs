@@ -42,14 +42,29 @@ pub trait IndexSeedWriter: Send + std::fmt::Debug {
     /// Create a string to store in the file's schema metadata. This will normally
     /// contain the buffer index (provided by the caller after `add_global_buffer`)
     /// as well as any other information needed to validate or understand the seed
-    /// (e.g. `rows_per_zone` for zone map seeds).
+    /// (zone map seeds append the `rows_per_zone` they were collected with).
     fn schema_metadata_value(&self, buf_index: u32) -> String;
+
+    /// The dataset feature flags a reader must support to interpret the seeds
+    /// this writer produces, as bits of both `reader_feature_flags` and
+    /// `writer_feature_flags`.
+    ///
+    /// The write path embeds a seed only when the dataset already carries
+    /// these bits, and the commit path sets them for every index that
+    /// requests such a writer, so a manifest never references a seed its bits
+    /// do not announce. Zero (the default) means the format needs no flag.
+    fn required_feature_flags(&self) -> u64 {
+        0
+    }
 }
 
 /// A pre-harvested seed buffer from a single fragment's data file.
 #[derive(Debug, Clone)]
 pub struct FragmentSeed {
     pub fragment_id: u64,
+    /// The fragment's physical row count: the rows the seed must cover
+    /// completely for its statistics to stand in for a scan.
+    pub physical_rows: u64,
     pub bytes: Bytes,
     /// The raw value that was stored in the data file's schema metadata under
     /// the seed key (i.e. the output of [`IndexSeedWriter::schema_metadata_value`]).

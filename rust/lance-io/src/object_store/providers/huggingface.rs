@@ -18,6 +18,8 @@ use crate::object_store::{
 };
 use lance_core::error::{Error, Result};
 
+use super::opendal::finish_opendal_operator;
+
 /// Hugging Face object store provider backed by OpenDAL.
 #[derive(Default, Debug)]
 pub struct HuggingfaceStoreProvider;
@@ -135,10 +137,27 @@ fn normalize_hf_config(options: &HashMap<String, String>) -> Result<HashMap<Stri
         normalize_download_mode(download_mode)?,
     );
 
+    if let Some(enabled) = options
+        .get("hf_enable_resolve_cache")
+        .or_else(|| options.get("enable_resolve_cache"))
+    {
+        config_map.insert("enable_resolve_cache".to_string(), enabled.clone());
+    }
+
+    if let Some((_, max_retries)) = options
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("client_max_retries"))
+    {
+        config_map.insert("client_max_retries".to_string(), max_retries.clone());
+    }
+
     Ok(config_map)
 }
 
 fn build_hf_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
+    let storage_options = StorageOptions(config_map);
+    let max_retries = storage_options.client_max_retries();
+    let config_map = &storage_options.0;
     let repo_type = config_map
         .get("repo_type")
         .ok_or_else(|| Error::invalid_input("Huggingface repo_type is required"))?;
@@ -159,10 +178,19 @@ fn build_hf_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
     if let Some(download_mode) = config_map.get("download_mode") {
         builder = builder.download_mode(download_mode);
     }
+    if let Some(enabled) = config_map.get("enable_resolve_cache") {
+        let enabled = enabled.parse::<bool>().map_err(|_| {
+            Error::invalid_input(format!(
+                "Invalid Huggingface enable_resolve_cache: {enabled:?}. Expected true or false"
+            ))
+        })?;
+        builder = builder.enable_resolve_cache(enabled);
+    }
 
     let operator = Operator::new(builder).map_err(|e| {
         Error::invalid_input(format!("Failed to create Huggingface operator: {:?}", e))
     })?;
+    let operator = finish_opendal_operator(operator, max_retries);
 
     Ok(OpendalStore::new(operator))
 }
@@ -175,7 +203,8 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
         } = parse_hf_url(&base_path)?;
 
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
-        let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
+        let storage_options =
+            StorageOptions::new(params.storage_options().cloned().unwrap_or_default());
         let download_retry_count = storage_options.download_retry_count();
 
         let mut base_options = build_hf_base_options(&repo_type, &repo_id, &storage_options);
@@ -208,12 +237,14 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
             scheme: "hf".to_string(),
             inner,
             local_dir_operations: None,
+            local_fsync: false,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,
             list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or(true),
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
+            scheduler_error_mode: Default::default(),
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
@@ -242,6 +273,7 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use std::sync::Arc;
 
     use crate::object_store::StorageOptionsAccessor;
@@ -338,6 +370,81 @@ mod tests {
         assert_eq!(config.get("download_mode").unwrap(), "http");
     }
 
+    #[rstest]
+    #[case::default(None, None, None)]
+    #[case::prefixed_enabled(Some("true"), None, Some("true"))]
+    #[case::prefixed_disabled(Some("false"), None, Some("false"))]
+    #[case::unprefixed_enabled(None, Some("true"), Some("true"))]
+    #[case::unprefixed_disabled(None, Some("false"), Some("false"))]
+    #[case::prefixed_takes_precedence(Some("false"), Some("true"), Some("false"))]
+    fn storage_option_resolve_cache(
+        #[case] prefixed: Option<&str>,
+        #[case] unprefixed: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        let mut options = HashMap::new();
+        if let Some(value) = prefixed {
+            options.insert("hf_enable_resolve_cache".to_string(), value.to_string());
+        }
+        if let Some(value) = unprefixed {
+            options.insert("enable_resolve_cache".to_string(), value.to_string());
+        }
+        let config = normalize_hf_config(&build_hf_base_options(
+            "dataset",
+            "acme/repo",
+            &StorageOptions(options),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            config.get("enable_resolve_cache").map(String::as_str),
+            expected
+        );
+        build_hf_store(config).unwrap();
+    }
+
+    #[rstest]
+    #[case::prefixed("hf_enable_resolve_cache", "invalid")]
+    #[case::unprefixed("enable_resolve_cache", "invalid")]
+    #[case::empty("hf_enable_resolve_cache", "")]
+    #[case::uppercase("hf_enable_resolve_cache", "TRUE")]
+    #[case::numeric("hf_enable_resolve_cache", "1")]
+    #[tokio::test]
+    async fn new_store_rejects_invalid_resolve_cache(#[case] key: &str, #[case] value: &str) {
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(key.to_string(), value.to_string())]),
+            ))),
+            ..Default::default()
+        };
+        let err = HuggingfaceStoreProvider
+            .new_store(
+                Url::parse("hf://datasets/acme/repo/table.lance").unwrap(),
+                &params,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("enable_resolve_cache"));
+        assert!(err.to_string().contains("Expected true or false"));
+    }
+
+    #[test]
+    fn storage_option_preserves_client_max_retries() {
+        let config = normalize_hf_config(&build_hf_base_options(
+            "dataset",
+            "acme/repo",
+            &crate::object_store::StorageOptions(HashMap::from([(
+                "CLIENT_MAX_RETRIES".to_string(),
+                "5".to_string(),
+            )])),
+        ))
+        .unwrap();
+
+        assert_eq!(config.get("client_max_retries").unwrap(), "5");
+    }
+
     #[test]
     fn storage_option_download_mode_rejects_invalid_value() {
         let err = normalize_hf_config(&build_hf_base_options(
@@ -417,7 +524,10 @@ mod tests {
         let parsed = parse_hf_url(&Url::parse("hf://datasets/acme/repo/path").unwrap()).unwrap();
         let accessor = Arc::new(StorageOptionsAccessor::with_provider(Arc::new(
             StaticMockStorageOptionsProvider {
-                options: HashMap::from([("hf_token".to_string(), "dynamic-token".to_string())]),
+                options: HashMap::from([
+                    ("hf_token".to_string(), "dynamic-token".to_string()),
+                    ("hf_enable_resolve_cache".to_string(), "true".to_string()),
+                ]),
             },
         )));
 

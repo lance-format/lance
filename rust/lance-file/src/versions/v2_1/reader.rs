@@ -30,10 +30,16 @@ fn validate_compressive_encoding(encoding: &pb21::CompressiveEncoding) -> Result
         Some(Compression::Flat(_))
         | Some(Compression::InlineBitpacking(_))
         | Some(Compression::Constant(_)) => Ok(()),
-        Some(Compression::Variable(variable)) => validate_compressive_encoding(required(
-            variable.offsets.as_deref(),
-            "variable offsets",
-        )?),
+        Some(Compression::Variable(variable)) => {
+            let offsets = required(variable.offsets.as_deref(), "variable offsets")?;
+            validate_compressive_encoding(offsets)?;
+            if !matches!(offsets.compression.as_ref(), Some(Compression::Flat(_))) {
+                return Err(Error::invalid_input_source(
+                    "Generic variable offsets require Lance v2.3; stable formats require Flat offsets".into(),
+                ));
+            }
+            Ok(())
+        }
         Some(Compression::OutOfLineBitpacking(bitpacking)) => {
             validate_compressive_encoding(required(
                 bitpacking.values.as_deref(),
@@ -149,9 +155,6 @@ fn validate_page_layout(layout: &pb21::PageLayout) -> Result<()> {
             })?;
             validate_page_layout(inner)
         }
-        Some(Layout::SparseLayout(_)) => Err(Error::invalid_input_source(
-            "Sparse page layout is not part of the Lance v2.1 grammar".into(),
-        )),
         None => Err(Error::invalid_input_source(
             "Lance v2.1 page is missing its page layout".into(),
         )),
@@ -299,6 +302,45 @@ mod grammar_tests {
             error
                 .to_string()
                 .contains("Variable packed struct compression is not part")
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::unknown_14(&[0x72, 0x00])]
+    #[case::unknown_15(&[0x7a, 0x00])]
+    fn rejects_unknown_compression(#[case] bytes: &[u8]) {
+        use prost::Message;
+        let encoding = CompressiveEncoding::decode(bytes).unwrap();
+        let error = validate_compressive_encoding(&encoding).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing its compression variant")
+        );
+    }
+    #[rstest::rstest]
+    #[case::constant(Compression::Constant(pb21::Constant {
+        value: Some(0_u32.to_le_bytes().to_vec().into()),
+    }))]
+    #[case::bitpacking(Compression::InlineBitpacking(pb21::InlineBitpacking {
+        uncompressed_bits_per_value: 32,
+        values: None,
+    }))]
+    fn rejects_generic_offsets_using_existing_codec_tags(#[case] compression: Compression) {
+        let variable = CompressiveEncoding {
+            compression: Some(Compression::Variable(Box::new(pb21::Variable {
+                offsets: Some(Box::new(CompressiveEncoding {
+                    compression: Some(compression),
+                })),
+                values: None,
+            }))),
+        };
+        let error = validate_compressive_encoding(&variable).unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Generic variable offsets require Lance v2.3")
         );
     }
 }
