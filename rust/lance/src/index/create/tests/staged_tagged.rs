@@ -161,7 +161,7 @@ async fn assert_queries_match_scans(dataset: &Dataset, indexed: bool) {
 }
 
 async fn stored_segment(dataset: &Dataset, name: &str) -> IndexMetadata {
-    crate::index::load_all_indices(dataset)
+    crate::index::loading::load_all_indices(dataset)
         .await
         .unwrap()
         .iter()
@@ -788,7 +788,7 @@ async fn withdrawn_vector_index_is_rebuilt_by_optimize() {
         "the new segment claims the live fragments"
     );
     assert!(
-        crate::index::load_all_indices(&dataset)
+        crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .iter()
@@ -875,7 +875,7 @@ async fn staged_segments_survive_a_same_name_optimize_in_the_window() {
         .await
         .unwrap();
     let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
-    let delta = crate::index::load_all_indices(&dataset)
+    let delta = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .iter()
@@ -898,7 +898,7 @@ async fn staged_segments_survive_a_same_name_optimize_in_the_window() {
         .await
         .unwrap();
     let dataset = Dataset::open(dir.as_str()).await.unwrap();
-    let remaining: Vec<Uuid> = crate::index::load_all_indices(&dataset)
+    let remaining: Vec<Uuid> = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .iter()
@@ -1030,7 +1030,7 @@ async fn staged_segments_refuse_a_history_with_a_cleaned_up_version() {
         "{error}"
     );
     assert!(
-        crate::index::load_all_indices(&dataset)
+        crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .iter()
@@ -1196,7 +1196,7 @@ fn fragment_ids(dataset: &Dataset) -> Vec<u32> {
 
 /// The stored segments of the logical index `name`, in manifest order.
 async fn stored_segments(dataset: &Dataset, name: &str) -> Vec<IndexMetadata> {
-    crate::index::load_all_indices(dataset)
+    crate::index::loading::load_all_indices(dataset)
         .await
         .unwrap()
         .iter()
@@ -1206,7 +1206,7 @@ async fn stored_segments(dataset: &Dataset, name: &str) -> Vec<IndexMetadata> {
 }
 
 async fn fri_entry(dataset: &Dataset) -> Option<IndexMetadata> {
-    crate::index::load_all_indices(dataset)
+    crate::index::loading::load_all_indices(dataset)
         .await
         .unwrap()
         .iter()
