@@ -34,6 +34,7 @@ use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::{
     Error, ROW_ID, Result,
+    datatypes::Schema as LanceSchema,
     utils::{
         futures::FinallyStreamExt,
         tokio::{get_num_compute_intensive_cpus, spawn_cpu},
@@ -58,7 +59,7 @@ use crate::dataset::mem_wal::index::{QueryLocalFtsIndex, QueryLocalFtsStats};
 use crate::index::prefilter::{DatasetPreFilter, prefilter_may_match_segment};
 use crate::index::scalar::inverted::{
     ResolvedFtsField, flatten_fts_document_column, fts_document_schema, load_segment_details,
-    load_segments, transform_fts_document_stream,
+    load_segments, resolve_fts_field, transform_fts_document_stream,
 };
 use crate::index::segment_coverage::{SegmentCoverage, SegmentRowDomain};
 use crate::{Dataset, index::DatasetIndexInternalExt};
@@ -81,6 +82,7 @@ use lance_index::scalar::inverted::{
     flat_bm25_search_stream_with_options_and_scorer, flat_combined_fields_search_stream,
     fts_schema, materialized_compound_top_k, prepare_bm25_query, validate_combined_tokenizers,
 };
+use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::{
     prefilter::{FilterLoader, PreFilter},
     scalar::inverted::query::BooleanQuery,
@@ -209,6 +211,82 @@ pub struct FtsDocumentExec {
 }
 
 impl FtsDocumentExec {
+    /// Expand a source field into row or list-element documents.
+    ///
+    /// `source_schema` describes the field before projection or aliasing. The
+    /// input must contain that field's complete root column (or the same column
+    /// aliased to `value`) and a UInt64 `_rowid`. Null row IDs are selection
+    /// masks and do not produce documents. List coordinates are derived from
+    /// the schema, including physical positions occupied by null elements.
+    ///
+    /// A plan codec needs only the column path and document granularity in
+    /// addition to its input and the schema of its pinned dataset snapshot:
+    ///
+    /// ```
+    /// # use lance::{io::exec::fts::FtsDocumentExec, Result};
+    /// # use lance_core::datatypes::Schema;
+    /// # use datafusion::physical_plan::ExecutionPlan;
+    /// # fn rebuild(plan: &FtsDocumentExec, schema: &Schema) -> Result<FtsDocumentExec> {
+    /// FtsDocumentExec::try_new(
+    ///     plan.children()[0].clone(),
+    ///     schema,
+    ///     plan.column(),
+    ///     plan.document_granularity(),
+    /// )
+    /// # }
+    /// ```
+    pub fn try_new(
+        input: Arc<dyn ExecutionPlan>,
+        source_schema: &LanceSchema,
+        column: &str,
+        document_granularity: DocumentGranularity,
+    ) -> Result<Self> {
+        let resolved = resolve_fts_field(source_schema, column, document_granularity)?;
+        let input_schema = input.schema();
+        let row_id = input_schema.field_with_name(ROW_ID).map_err(|_| {
+            Error::invalid_input("FTS document input is missing _rowid".to_string())
+        })?;
+        if row_id.data_type() != &DataType::UInt64 {
+            return Err(Error::invalid_input(format!(
+                "FTS document input _rowid must be UInt64, got {}",
+                row_id.data_type()
+            )));
+        }
+        let source = source_schema
+            .fields
+            .iter()
+            .find(|field| field.name == resolved.root_column)
+            .ok_or_else(|| Error::internal("Resolved FTS root field is missing"))?;
+        let input_field = input_schema
+            .field_with_name(&resolved.root_column)
+            .or_else(|_| input_schema.field_with_name(VALUE_COLUMN_NAME))
+            .map_err(|_| {
+                Error::invalid_input(format!(
+                    "FTS document input is missing root column '{}' or its {VALUE_COLUMN_NAME} alias",
+                    resolved.root_column
+                ))
+            })?;
+        if input_field.data_type() != &source.data_type() {
+            return Err(Error::invalid_input(format!(
+                "FTS document input column '{}' must have source type {}, got {}",
+                input_field.name(),
+                source.data_type(),
+                input_field.data_type()
+            )));
+        }
+        Ok(Self::new(input, resolved))
+    }
+
+    /// Canonical source field path, before the input root column is aliased.
+    pub fn column(&self) -> &str {
+        &self.resolved.canonical_path
+    }
+
+    /// Whether each row or each deepest list element is one document.
+    pub fn document_granularity(&self) -> DocumentGranularity {
+        self.resolved.document_granularity
+    }
+
     pub(crate) fn new(input: Arc<dyn ExecutionPlan>, resolved: ResolvedFtsField) -> Self {
         let schema = fts_document_schema(resolved.coordinate_rank());
         let properties = Arc::new(PlanProperties::new(
@@ -6734,12 +6812,14 @@ mod tests {
     use std::time::Duration;
 
     use crate::index::DatasetIndexExt;
+    use arrow::buffer::NullBuffer;
     use arrow::datatypes::{Float32Type, UInt64Type};
+    use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::cast::AsArray;
     use arrow_array::types::Int32Type;
     use arrow_array::{
         ArrayRef, Float32Array, Int32Array, RecordBatch, RecordBatchIterator, StringArray,
-        UInt64Array, record_batch,
+        StructArray, UInt32Array, UInt64Array, record_batch,
     };
     use arrow_schema::DataType;
     use datafusion::datasource::memory::MemorySourceConfig;
@@ -6752,9 +6832,10 @@ mod tests {
     };
     use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan};
     use futures::{FutureExt, TryStreamExt, stream};
+    use lance_core::datatypes::Schema as LanceSchema;
     use lance_core::utils::futures::StreamOnDropExt;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_core::{ROW_ID, utils::address::RowAddress};
+    use lance_core::{Error, ROW_ID, utils::address::RowAddress};
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datafusion::exec::{
         ExecutionStatsCallback, ExecutionSummaryCounts, collect_execution_metrics,
@@ -6777,6 +6858,7 @@ mod tests {
         InvertedListFormatVersion, Language, MemBM25Scorer, SCORE_COL, build_combined_bm25_scorer,
         build_global_bm25_scorer, prepare_bm25_query,
     };
+    use lance_index::scalar::registry::VALUE_COLUMN_NAME;
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{IndexCriteria, IndexType};
     use lance_select::{
@@ -6805,7 +6887,7 @@ mod tests {
         BoolSlot, BoostQueryExec, CombinedFieldsQueryExec, CompoundQueryExec,
         CrossColumnCompoundQueryExec, FTS_SEGMENT_BIND_DURATION_METRIC, FlatCombinedFieldsExec,
         FlatMatchFilterExec, FlatMatchQueryExec, FlatStatsCoverage, FlatStatsScope,
-        HybridCompoundQueryExec, MatchQueryExec, PhraseQueryExec, SharedFtsScorer,
+        FtsDocumentExec, HybridCompoundQueryExec, MatchQueryExec, PhraseQueryExec, SharedFtsScorer,
         SharedFtsScorerExec, WAND_TIE_COMPLETION_BUDGET, WandExactnessCertificate,
         build_boolean_query_children, classify_wand_exactness_certificate, open_fts_segments,
         tokenizer_for_match_query,
@@ -7373,6 +7455,214 @@ mod tests {
 
     fn memory_input(batch: RecordBatch) -> Arc<dyn ExecutionPlan> {
         MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], batch.schema(), None).unwrap()
+    }
+
+    #[rstest]
+    #[case::rows(DocumentGranularity::Row)]
+    #[case::elements(DocumentGranularity::ListElement)]
+    #[tokio::test]
+    async fn fts_document_plan_reconstruction(
+        #[case] granularity: DocumentGranularity,
+        #[values(false, true)] aliased: bool,
+        #[values(false, true)] large_lists: bool,
+    ) {
+        let mut lists = ListBuilder::new(ListBuilder::new(StringBuilder::new()));
+        for row in [
+            Some(vec![
+                Some(vec![Some("alpha"), None, Some("beta")]),
+                Some(vec![]),
+                None,
+                Some(vec![Some("gamma")]),
+            ]),
+            Some(vec![Some(vec![Some("hidden by null struct")])]),
+            Some(vec![]),
+            Some(vec![Some(vec![Some("masked")])]),
+            Some(vec![Some(vec![Some("delta")])]),
+            None,
+            Some(vec![None, Some(vec![None])]),
+        ] {
+            if let Some(row) = row {
+                for list in row {
+                    if let Some(values) = list {
+                        for value in values {
+                            lists.values().values().append_option(value);
+                        }
+                        lists.values().append(true);
+                    } else {
+                        lists.values().append(false);
+                    }
+                }
+                lists.append(true);
+            } else {
+                lists.append(false);
+            }
+        }
+        let lists = Arc::new(lists.finish()) as ArrayRef;
+        let lists = if large_lists {
+            arrow_cast::cast(
+                &lists,
+                &DataType::LargeList(Arc::new(arrow_schema::Field::new(
+                    "item",
+                    DataType::LargeList(Arc::new(arrow_schema::Field::new(
+                        "item",
+                        DataType::Utf8,
+                        true,
+                    ))),
+                    true,
+                ))),
+            )
+            .unwrap()
+        } else {
+            lists
+        };
+        let groups = Arc::new(StructArray::new(
+            vec![
+                Arc::new(arrow_schema::Field::new("unused", DataType::Int32, false)),
+                Arc::new(arrow_schema::Field::new(
+                    "docs",
+                    lists.data_type().clone(),
+                    true,
+                )),
+            ]
+            .into(),
+            vec![Arc::new(Int32Array::from(vec![0; 7])), lists],
+            Some(NullBuffer::from(vec![
+                true, false, true, true, true, true, true,
+            ])),
+        )) as ArrayRef;
+        let source_schema = arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "groups",
+            groups.data_type().clone(),
+            true,
+        )]);
+        let source_schema = LanceSchema::try_from(&source_schema).unwrap();
+        let input_schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new(
+                if aliased { VALUE_COLUMN_NAME } else { "groups" },
+                groups.data_type().clone(),
+                true,
+            ),
+            lance_core::ROW_ID_FIELD.clone(),
+        ]));
+        let batch = RecordBatch::try_new(
+            input_schema.clone(),
+            vec![
+                groups,
+                Arc::new(UInt64Array::from(vec![
+                    Some(0),
+                    Some(20),
+                    Some(30),
+                    None,
+                    Some(50),
+                    Some(60),
+                    Some(70),
+                ])),
+            ],
+        )
+        .unwrap();
+        let input = MemorySourceConfig::try_new_exec(
+            &[vec![batch.slice(0, 4)], vec![batch.slice(4, 3)]],
+            input_schema,
+            None,
+        )
+        .unwrap();
+        let original =
+            FtsDocumentExec::try_new(input, &source_schema, "GROUPS.docs", granularity).unwrap();
+        assert_eq!(original.column(), "groups.docs");
+        let rebuilt = FtsDocumentExec::try_new(
+            original.children()[0].clone(),
+            &source_schema,
+            original.column(),
+            original.document_granularity(),
+        )
+        .unwrap();
+        assert_eq!(
+            rebuilt.properties().output_partitioning().partition_count(),
+            2
+        );
+        let expected_names = if granularity.is_list_element() {
+            vec!["value", "_rowid", "_doc_index_0", "_doc_index_1"]
+        } else {
+            vec!["value", "_rowid"]
+        };
+        assert_eq!(
+            rebuilt
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            expected_names,
+        );
+        let (texts, ids) = match granularity {
+            DocumentGranularity::Row => (
+                vec!["alpha beta gamma", "", "", "delta", "", ""],
+                vec![0, 20, 30, 50, 60, 70],
+            ),
+            DocumentGranularity::ListElement => (
+                // A null deepest element is an empty document, unlike a null
+                // parent container, which has no elements to expand.
+                vec!["alpha", "", "beta", "gamma", "delta", ""],
+                vec![0, 0, 0, 0, 50, 70],
+            ),
+        };
+        let mut expected_columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(texts)),
+            Arc::new(UInt64Array::from(ids)),
+        ];
+        if granularity.is_list_element() {
+            expected_columns.extend([
+                Arc::new(UInt32Array::from(vec![0, 0, 0, 3, 0, 1])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![0, 1, 2, 0, 0, 0])) as ArrayRef,
+            ]);
+        }
+        let expected = RecordBatch::try_new(rebuilt.schema(), expected_columns).unwrap();
+        for plan in [original, rebuilt] {
+            // Re-execution must preserve row IDs and physical list coordinates.
+            for _ in 0..2 {
+                let mut batches = Vec::new();
+                for partition in 0..2 {
+                    batches.extend(
+                        plan.execute(partition, Arc::new(TaskContext::default()))
+                            .unwrap()
+                            .try_collect::<Vec<_>>()
+                            .await
+                            .unwrap(),
+                    );
+                }
+                let actual =
+                    arrow_select::concat::concat_batches(&plan.schema(), &batches).unwrap();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::missing_row_id(vec![("text", DataType::Utf8)], "missing _rowid")]
+    #[case::wrong_row_id(vec![("text", DataType::Utf8), (ROW_ID, DataType::Int64)], "_rowid must be UInt64")]
+    #[case::missing_source(vec![("other", DataType::Utf8), (ROW_ID, DataType::UInt64)], "missing root column")]
+    #[case::wrong_source(vec![("text", DataType::Int32), (ROW_ID, DataType::UInt64)], "must have source type")]
+    fn fts_document_plan_rejects_invalid_input(
+        #[case] fields: Vec<(&str, DataType)>,
+        #[case] message: &str,
+    ) {
+        let source =
+            LanceSchema::try_from(&arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "text",
+                DataType::Utf8,
+                true,
+            )]))
+            .unwrap();
+        let input = Arc::new(EmptyExec::new(Arc::new(arrow_schema::Schema::new(
+            fields
+                .into_iter()
+                .map(|(name, dtype)| arrow_schema::Field::new(name, dtype, true))
+                .collect::<Vec<_>>(),
+        ))));
+        let error =
+            FtsDocumentExec::try_new(input, &source, "text", DocumentGranularity::Row).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains(message), "{error}");
     }
 
     fn candidate_input(row_ids: Vec<u64>, is_scalar_index_query: bool) -> PreFilterSource {
