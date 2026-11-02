@@ -12,7 +12,6 @@ use arrow_schema::{Field, Fields, Schema};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
-use datafusion_physical_plan::ExecutionPlanProperties;
 use lance_datafusion::exec::execute_plan;
 use rstest::rstest;
 
@@ -119,7 +118,10 @@ async fn flat_filter_binding_preserves_alias(#[case] is_large: bool) {
     );
     let rebuilt = restore(&native, input(&batch));
     assert_eq!(rebuilt.schema(), batch.schema());
-    assert_eq!(rebuilt.output_partitioning().partition_count(), 2);
+    assert_eq!(
+        rebuilt.properties().output_partitioning().partition_count(),
+        2
+    );
     let actual = rows(Arc::new(rebuilt)).await.unwrap();
     assert_eq!(actual, rows(Arc::new(native)).await.unwrap());
     assert_eq!(actual["id"].as_primitive::<Int32Type>().values(), &[2]);
