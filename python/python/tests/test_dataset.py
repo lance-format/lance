@@ -479,6 +479,36 @@ def test_get_version(tmp_path: Path):
     assert dataset.checkout_version(1).get_version() == dataset.versions()[0]
 
 
+def _manifest_file_size(base_dir: Path, version: int) -> int:
+    """Return the on-disk size of the manifest file for ``version``.
+
+    Manifest files may use V1 (``_versions/{version}.manifest``) or V2
+    (``_versions/{u64::MAX - version:020}.manifest``) naming, so resolve by
+    parsing the version back out of the file name rather than guessing.
+    """
+    candidates = []
+    for path in (base_dir / "_versions").glob("*.manifest"):
+        try:
+            number = int(path.stem)
+        except ValueError:
+            # Detached versions are named ``d{version}.manifest``; they are not
+            # part of the attached version history, so skip them.
+            continue
+        # V2 stores the bitwise-inverted version so that the newest version
+        # sorts first lexicographically.
+        candidates.append(
+            (number if number < (1 << 63) else (1 << 64) - 1 - number, path)
+        )
+
+    matches = [
+        path for candidate_version, path in candidates if candidate_version == version
+    ]
+    assert len(matches) == 1, (
+        f"expected exactly one manifest file for version {version}"
+    )
+    return matches[0].stat().st_size
+
+
 def test_versions(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"
@@ -506,6 +536,23 @@ def test_versions(tmp_path: Path):
     assert v1["timestamp"] < v2["timestamp"]
     assert isinstance(v1["metadata"], dict)
     assert isinstance(v2["metadata"], dict)
+
+    # manifest_size must be pinned to the on-disk manifest file for each version.
+    for version in (v1, v2):
+        manifest_size = version["manifest_size"]
+        assert manifest_size is not None
+        assert manifest_size > 0
+        # The key is always present, but the value is optional by contract.
+        assert version.get("manifest_size") == _manifest_file_size(
+            base_dir, version["version"]
+        )
+
+    # `get_version()` returns the checked-out version, which must agree with the
+    # last entry of `versions()` - including the manifest size, even though the
+    # two take it from different places.
+    current = lance.dataset(base_dir).get_version()
+    assert current["manifest_size"] == v2["manifest_size"]
+    assert current["manifest_size"] == _manifest_file_size(base_dir, 2)
 
 
 def test_version_id(tmp_path: Path):
@@ -6439,6 +6486,24 @@ def test_use_scalar_index(tmp_path: Path):
     assert "ScalarIndexQuery" not in dataset.scanner(
         filter="filter = 10", use_scalar_index=False
     ).explain_plan(True)
+
+
+def test_ignored_scalar_indices(tmp_path: Path):
+    table = pa.table({"a": range(100), "b": range(100)})
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset.create_scalar_index("a", "ZONEMAP", name="a_zonemap")
+    dataset.create_scalar_index("b", "BTREE", name="b_btree")
+
+    scanner = dataset.scanner(
+        filter="a < 50 AND b < 50", ignored_scalar_indices=["a_zonemap"]
+    )
+    plan = scanner.explain_plan(True)
+    assert "@a_zonemap(ZoneMap)" not in plan
+    assert "@b_btree(BTree)" in plan
+    assert scanner.to_table().num_rows == 50
+
+    with pytest.raises(ValueError, match="must contain non-empty strings"):
+        dataset.scanner(ignored_scalar_indices=[""])
 
 
 def test_fast_search_scalar_index_skips_unindexed_fragments(tmp_path: Path):

@@ -41,6 +41,27 @@ impl HashJoiner {
     /// Returns an input error if the right-side join column contains duplicate keys,
     /// including duplicate nulls.
     pub async fn try_new(reader: Box<dyn RecordBatchReader + Send>, on: &str) -> Result<Self> {
+        Self::try_new_impl(reader, on, true).await
+    }
+
+    /// Create a new `HashJoiner` that permits duplicate right-side keys.
+    ///
+    /// When a key occurs more than once, which matching row is selected is
+    /// undefined. This is used by the fragment update path, whose low-level
+    /// contract permits duplicates; merge-insert keeps the stricter
+    /// [`Self::try_new`] behavior.
+    pub(crate) async fn try_new_allow_duplicates(
+        reader: Box<dyn RecordBatchReader + Send>,
+        on: &str,
+    ) -> Result<Self> {
+        Self::try_new_impl(reader, on, false).await
+    }
+
+    async fn try_new_impl(
+        reader: Box<dyn RecordBatchReader + Send>,
+        on: &str,
+        reject_duplicates: bool,
+    ) -> Result<Self> {
         // Check column exist
         let schema = reader.schema();
         schema.field_with_name(on)?;
@@ -88,7 +109,9 @@ impl HashJoiner {
                     let task_result = task::spawn_blocking(move || {
                         let rows = column_to_rows(column.clone())?;
                         for (row_i, row) in rows.iter().enumerate() {
-                            if map.insert(row.owned(), (batch_i, row_i)).is_some() {
+                            if map.insert(row.owned(), (batch_i, row_i)).is_some()
+                                && reject_duplicates
+                            {
                                 let options = FormatOptions::default().with_null("NULL");
                                 let formatter = ArrayFormatter::try_new(column.as_ref(), &options)?;
                                 let key = formatter.value(row_i);
