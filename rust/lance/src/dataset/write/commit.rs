@@ -362,19 +362,14 @@ impl<'a> CommitBuilder<'a> {
     ///
     /// # Compatibility
     ///
-    /// Committing one is a durable compatibility break. A dataset version
-    /// written this way **cannot be opened** by Lance before v12.0.0 -- not
-    /// merely read as history. Those releases decode the manifest's inline
-    /// transaction while opening the dataset, and an operation they do not
-    /// know decodes to no operation at all, which fails the open. The fix
-    /// shipped in v12.0.0 and is not expected to be backported to earlier
-    /// release lines ([#9454]), so a dataset with one anywhere in its history
-    /// has a minimum reader version of v12.0.0 from then on.
+    /// Any reader can open and scan a dataset version committed this way: the
+    /// inline transaction lives in a manifest field older readers ignore
+    /// ([#9482]). Lance before v14.0.0 fails only when it decodes the
+    /// transaction itself, to read the transaction history or to check a
+    /// concurrent commit for conflicts. For conflict checking, that failure
+    /// aborts the older writer's commit, which is the safe outcome.
     ///
-    /// That is why this is opt-in per caller rather than something a version
-    /// of the library turns on.
-    ///
-    /// [#9454]: https://github.com/lance-format/lance/issues/9454
+    /// [#9482]: https://github.com/lance-format/lance/pull/9482
     ///
     /// Without it, [`Self::execute`] rejects such a transaction with
     /// [`Error::NotSupported`]. It has no effect on any other operation.
