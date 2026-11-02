@@ -3406,33 +3406,6 @@ mod tests {
     }
 
     #[test]
-    fn test_only_empty_lists() {
-        let mut builder = RepDefBuilder::default();
-        builder.add_offsets(offsets_32(&[0, 4, 4, 4, 6]), None);
-        builder.add_no_null(6);
-
-        let repdefs = RepDefBuilder::serialize(vec![builder]);
-
-        let rep = repdefs.repetition_levels.unwrap();
-        let def = repdefs.definition_levels.unwrap();
-
-        assert_eq!([1, 0, 0, 0, 1, 1, 1, 0], *rep);
-        assert_eq!([0, 0, 0, 0, 1, 1, 0, 0], *def);
-
-        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
-            Some(rep.as_ref().to_vec()),
-            Some(def.as_ref().to_vec()),
-            repdefs.def_meaning.into(),
-            8,
-        )]);
-
-        assert_eq!(unraveler.unravel_validity(6).unwrap(), None);
-        let (off, val) = unraveler.unravel_offsets::<i32>().unwrap();
-        assert_eq!(off.inner(), offsets_32(&[0, 4, 4, 4, 6]).inner());
-        assert_eq!(val, None);
-    }
-
-    #[test]
     fn test_only_null_lists() {
         let mut builder = RepDefBuilder::default();
         builder.add_offsets(

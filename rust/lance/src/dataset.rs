@@ -913,7 +913,7 @@ impl Dataset {
                 .into_iter()
                 .map(IndexMetadata::try_from)
                 .collect::<Result<Vec<_>>>()?;
-            crate::index::warn_about_unsupported_indices(&indices);
+            crate::index::loading::warn_about_unsupported_indices(&indices);
             let ds_index_cache = session.index_cache.for_dataset(uri);
             let metadata_key = crate::session::index_caches::IndexMetadataKey {
                 version: manifest_location.version,
@@ -2090,7 +2090,7 @@ impl Dataset {
         let mut scan = self.scan();
         scan.with_row_address();
         let batches = scan.try_into_stream().await?;
-        let plan = Arc::new(optimize::BlobV2BatchRewritePlan::try_new(
+        let plan = Arc::new(blob::BlobV2BatchRewritePlan::try_new(
             self.schema(),
             lance_io::stream::RecordBatchStream::schema(&batches).as_ref(),
             false,
@@ -3452,7 +3452,7 @@ impl Dataset {
         // uuids or overlapping coverage are no less corrupt for involving an
         // index this build has no reader for. `migrate_indices` already runs the
         // same overlap check over the complete list on every commit.
-        let indices = crate::index::load_all_indices(self).await?;
+        let indices = crate::index::loading::load_all_indices(self).await?;
         self.validate_indices(&indices)?;
 
         Ok(())

@@ -13,17 +13,16 @@ Let's setup our environment by doing all the necessary imports and defining a fe
 ```python
 import numpy as np
 import lance
+from lance.torch.data import get_safe_loader
 
 import torch
-from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.utils.data import Dataset
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm.auto import tqdm
 
 # We'll be training the pre-trained GPT2 model in this example
 model_name = 'gpt2'
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(model_name)
 
 # Also define some hyperparameters
 lr = 3e-4
@@ -34,21 +33,26 @@ device = 'cuda:0'
 dataset_path = 'wikitext_500K.lance'
 ```
 
-Now that the basic setup is out of the way, let's define our custom Dataset and a Sampler for streaming the tokens from our Lance dataset.
+Now that the basic setup is out of the way, let's define our custom PyTorch `Dataset` for loading batches of tokenized sequences from our Lance dataset.
 
 ## Data-loading Setup
 
-We start by defining a utility function that will help us load any number of tokens from our lance dataset in a 'chunk'.
+We start by defining a utility function that pads or truncates each tokenized sample to `block_size` and masks padding positions with `-100` in `labels` so they do not contribute to the causal language modeling loss.
 
 ```python
-def from_indices(dataset, indices):
-    """Load the elements on given indices from the dataset"""
-    chunk = dataset.take(indices).to_pylist()
-    chunk = list(map(lambda x: x['input_ids'], chunk))
-    return chunk
+def format_sequence(tokens, block_size, pad_token_id):
+    """Truncate or right-pad a token sequence to `block_size`."""
+    seq = tokens[:block_size]
+    pad_len = block_size - len(seq)
+    input_ids = seq + [pad_token_id] * pad_len
+    labels = seq + [-100] * pad_len
+    return {
+        "input_ids": torch.tensor(input_ids, dtype=torch.long),
+        "labels": torch.tensor(labels, dtype=torch.long),
+    }
 ```
 
-Now let's define our custom dataset and sampler for loading the tokens.
+Now let's define a process-safe custom dataset. Because Lance uses an internal multi-threaded runtime, opening a `LanceDataset` in the main process and forking DataLoader workers is not safe. Instead, we read the row count once during initialization, open the dataset lazily inside each worker, and implement `__getitems__` so each batch performs a single vectorized `ds.take(indices)` call rather than one random read per sample.
 
 ```python
 class LanceDataset(Dataset):
@@ -56,125 +60,96 @@ class LanceDataset(Dataset):
         self,
         dataset_path,
         block_size,
+        pad_token_id,
     ):
-        # Load the lance dataset from the saved path
-        self.ds = lance.dataset(dataset_path)
+        self.dataset_path = dataset_path
         self.block_size = block_size
+        self.pad_token_id = pad_token_id
+        self._ds = None
 
-        # Doing this so the sampler never asks for an index at the end of text
-        self.length = self.ds.count_rows() - block_size
+        ds = lance.dataset(dataset_path)
+        self.length = ds.count_rows()
+        del ds
+
+    def _get_ds(self):
+        if self._ds is None:
+            self._ds = lance.dataset(self.dataset_path)
+        return self._ds
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
-        """
-        Generate a window of indices starting from the current idx to idx+block_size
-        and return the tokens at those indices
-        """
-        window = np.arange(idx, idx + self.block_size)
-        sample = from_indices(self.ds, window)
+        return self.__getitems__([idx])[0]
 
-        return {"input_ids": torch.tensor(sample), "labels": torch.tensor(sample)}
+    def __getitems__(self, indices):
+        """Fetch a full batch of rows in a single Lance `take` call."""
+        rows = self._get_ds().take(indices, columns=["input_ids"]).to_pylist()
+        return [
+            format_sequence(row["input_ids"], self.block_size, self.pad_token_id)
+            for row in rows
+        ]
 ```
 
-When given a random index by the sampler, the dataset will load the next `block_size` number of tokens starting from current index.
-This would in-essence form a sample as the loaded tokens would be causal.
+Because each row in `wikitext_500K.lance` already holds a distinct tokenized sample (`list<int64>`), PyTorch's DataLoader can pass a batch of row indices directly to `__getitems__`. We pair the dataset with `lance.torch.data.get_safe_loader`, which configures the `"spawn"` multiprocessing context and persistent workers automatically.
 
-However we also need to make sure that the tokens we get from the dataset aren't overlapping. Let's understand this from an example:
-
-Let's say, for some arbitrary block size, during the training loop the dataset return the following tokens:
-
-`"Vienna is the capital of Austria"` at index = 12 for sample #1, and,
-
-`"is the capital of Austria and"` at index = 13 for sample #2, and so on
-
-The problem here is that if we allow the dataloader to fetch the 'samples' for any arbitrary number of indices, they may overlap (as we see above).
-This is not good for the model as it may start to overfit after seeing sufficient overlapping tokens.
-
-To solve this problem, we define a custom Sampler that only returns the indices that are 'block_size' apart from each other, ensuring that we don't see any overlapping samples.
-
-```python
-class LanceSampler(Sampler):
-    r"""Samples tokens randomly but `block_size` indices apart.
-
-    Args:
-        data_source (Dataset): dataset to sample from
-        block_size (int): minimum index distance between each random sample
-    """
-
-    def __init__(self, data_source, block_size=512):
-        self.data_source = data_source
-        self.num_samples = len(self.data_source)
-        self.available_indices = list(range(0, self.num_samples, block_size))
-        np.random.shuffle(self.available_indices)
-
-    def __iter__(self):
-        yield from self.available_indices
-
-    def __len__(self) -> int:
-        return len(self.available_indices)
-```
-
-Now when we fetch the tokens from our dataset with sampler being the `LanceSampler`, all samples in all
-the batches that our model sees during the training are guaranteed to be non-overlapping.
-
-This is done by generating a list of indices starting from 0 to the end of the dataset (which if you remember is lance dataset length - block size) with each index 'block_size' apart from the other.
-We then shuffle this list and yield indices from it.
-
-And that's basically it for the Dataloading! Now all we are left is to train the model!
+And that's it for data loading! Now all that is left is to train the model.
 
 ## Model Training
 
 Now you train the model just like you would with any other dataset!
 
 ```python
-# Define the dataset, sampler and dataloader
-dataset = LanceDataset(dataset_path, block_size)
-sampler = LanceSampler(dataset, block_size)
-dataloader = DataLoader(
-    dataset,
-    shuffle=False,
-    batch_size=batch_size,
-    sampler=sampler,
-    pin_memory=True
-)
+if __name__ == "__main__":
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(model_name)
 
-# Define the optimizer, training loop and train the model!
-model = model.to(device)
-model.train()
-optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    # Define the dataset and process-safe dataloader
+    dataset = LanceDataset(dataset_path, block_size, tokenizer.pad_token_id)
+    dataloader = get_safe_loader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+    )
 
-for epoch in range(nb_epochs):
-    print(f"========= Epoch: {epoch+1} / {nb_epochs} =========")
-    epoch_loss = []
-    prog_bar = tqdm(dataloader, total=len(dataloader))
-    for batch in prog_bar:
-        optimizer.zero_grad(set_to_none=True)
+    # Define the optimizer, training loop and train the model!
+    model = model.to(device)
+    model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
-        # Put both input_ids and labels to the device
-        for k, v in batch.items():
-            batch[k] = v.to(device)
+    for epoch in range(nb_epochs):
+        print(f"========= Epoch: {epoch+1} / {nb_epochs} =========")
+        epoch_loss = []
+        prog_bar = tqdm(dataloader, total=len(dataloader))
+        for batch in prog_bar:
+            optimizer.zero_grad(set_to_none=True)
 
-        # Perform one forward pass and get the loss
-        outputs = model(**batch)
-        loss = outputs.loss
+            # Put both input_ids and labels to the device
+            for k, v in batch.items():
+                batch[k] = v.to(device)
 
-        # Perform backward pass
-        loss.backward()
-        optimizer.step()
+            # Perform one forward pass and get the loss
+            outputs = model(**batch)
+            loss = outputs.loss
 
-        prog_bar.set_description(f"loss: {loss.item():.4f}")
+            # Perform backward pass
+            loss.backward()
+            optimizer.step()
 
-        epoch_loss.append(loss.item())
+            prog_bar.set_description(f"loss: {loss.item():.4f}")
 
-    # Calculate training perplexity for this epoch
-    try:
-        perplexity = np.exp(np.mean(epoch_loss))
-    except OverflowError:
-        perplexity = float("-inf")
+            epoch_loss.append(loss.item())
 
-    print(f"train_perplexity: {perplexity}")
+        # Calculate training perplexity for this epoch
+        try:
+            perplexity = np.exp(np.mean(epoch_loss))
+        except OverflowError:
+            perplexity = float("-inf")
+
+        print(f"train_perplexity: {perplexity}")
 ```
 
 One tip: If your lance dataset is huge (like the wikitext_500K is), and you want to debug the model to look out for errors, you may want to wrap the dataloader in an `iter()` function and only run it for a couple batches.
