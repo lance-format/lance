@@ -9058,6 +9058,21 @@ async fn test_manifest_read_recovers_from_stale_size() {
         .expect("read_manifest_indexes should recover from a stale manifest size");
     assert_eq!(indices.len(), 1);
     assert_eq!(indices[0].name, "id_idx");
+
+    // Long enough for a footer, but what ends there is not one: this is not a damaged file.
+    let short_location = ManifestLocation {
+        size: real_location.size.map(|size| size - 1),
+        ..real_location.clone()
+    };
+    let manifest = Dataset::load_manifest(
+        dataset.object_store.as_ref(),
+        &short_location,
+        test_uri.as_ref(),
+        &session,
+    )
+    .await
+    .expect("load_manifest should recover from a stale manifest size");
+    assert_eq!(manifest.version, real_location.version);
 }
 
 #[rstest]
