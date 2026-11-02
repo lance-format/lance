@@ -21,7 +21,10 @@ pub use clustering::{
     refuse_key_fields_that_changed_identity, same_field_identity, validate_clustering,
 };
 pub use fragment::*;
-pub use index::{IndexFile, IndexMetadata, index_metadata_codec, list_index_files_with_sizes};
+pub use index::{
+    IndexFile, IndexMetadata, index_details_are_row_addrs, index_metadata_codec,
+    list_index_files_with_sizes,
+};
 
 pub use manifest::{
     BasePath, DETACHED_VERSION_MASK, DataStorageFormat, Manifest, ManifestBuildConfig,

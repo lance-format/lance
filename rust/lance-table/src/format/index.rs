@@ -122,6 +122,51 @@ pub struct IndexMetadata {
     pub metadata: HashMap<String, String>,
 }
 
+/// True when an index segment with these details, persisted at `index_version`,
+/// reports matches as physical row addresses rather than row ids.
+///
+/// See [`IndexMetadata::results_are_row_addrs`]. Exposed separately so a wrapper
+/// index (e.g. JSON) can classify the target index it holds, which has details and
+/// a version but no [`IndexMetadata`] of its own.
+pub fn index_details_are_row_addrs(details: &prost_types::Any, index_version: i32) -> bool {
+    let is_fm = details
+        .type_url
+        .rsplit_once('/')
+        .is_some_and(|(_, details_type_name)| {
+            details_type_name.eq_ignore_ascii_case("lance.index.pb.FMIndexDetails")
+        });
+    // A BTree segment stores row addresses only from format version 1
+    // onward (`lance_index::scalar::btree::BTREE_ROW_ADDR_DOMAIN_VERSION`,
+    // kept in sync with this literal). A segment persisted before that
+    // by an older Lance version stores row ids directly and must not be
+    // reinterpreted as addresses.
+    let is_btree_addr_domain =
+        details.type_url.ends_with("BTreeIndexDetails") && index_version >= 1;
+    // Likewise for Bitmap, from format version 1 onward
+    // (`lance_index::scalar::bitmap::BITMAP_ROW_ADDR_DOMAIN_VERSION`).
+    let is_bitmap_addr_domain =
+        details.type_url.ends_with("BitmapIndexDetails") && index_version >= 1;
+    // Likewise for LabelList, from format version 2 onward
+    // (`lance_index::scalar::label_list::LABEL_LIST_ROW_ADDR_DOMAIN_VERSION`).
+    // Version 1 is the row-id-domain floor for list-null metadata
+    // support (`LABEL_LIST_NULLS_MIN_VERSION`), not address domain.
+    let is_label_list_addr_domain =
+        details.type_url.ends_with("LabelListIndexDetails") && index_version >= 2;
+    // A JSON index takes its domain from the target index it wraps. It is
+    // stamped with format version 1
+    // (`lance_index::scalar::json::JSON_ROW_ADDR_DOMAIN_VERSION`) exactly
+    // when that target stores row addresses, so the wrapper's own version
+    // answers this without decoding the nested target details.
+    let is_json_addr_domain = details.type_url.ends_with("JsonIndexDetails") && index_version >= 1;
+    details.type_url.ends_with("ZoneMapIndexDetails")
+        || details.type_url.ends_with("BloomFilterIndexDetails")
+        || is_fm
+        || is_btree_addr_domain
+        || is_bitmap_addr_domain
+        || is_label_list_addr_domain
+        || is_json_addr_domain
+}
+
 impl IndexMetadata {
     /// Returns the run-optimized serialized size of this fragment bitmap.
     ///
@@ -190,20 +235,9 @@ impl IndexMetadata {
     /// likely turn from an allow-list into a block-list.
     /// A false result does not prove that an unrecognized plugin stores stable row IDs.
     pub fn results_are_row_addrs(&self) -> bool {
-        self.index_details.as_ref().is_some_and(|details| {
-            let is_fm = details
-                .type_url
-                .rsplit_once('/')
-                .is_some_and(|(_, details_type_name)| {
-                    details_type_name.eq_ignore_ascii_case("lance.index.pb.FMIndexDetails")
-                });
-            details.type_url.ends_with("ZoneMapIndexDetails")
-                || details.type_url.ends_with("BloomFilterIndexDetails")
-                || is_fm
-                || Self::is_btree_addr_domain(details, self.index_version)
-                || Self::is_bitmap_addr_domain(details, self.index_version)
-                || Self::is_label_list_addr_domain(details, self.index_version)
-        })
+        self.index_details
+            .as_ref()
+            .is_some_and(|details| index_details_are_row_addrs(details, self.index_version))
     }
 
     /// Whether the metadata proves that stored identifiers survive a physical
@@ -1087,6 +1121,27 @@ mod tests {
         assert!(
             metadata.supports_eager_remap(),
             "BitmapIndex and LabelListIndex both support remapping, same as BTree"
+        );
+    }
+
+    #[test]
+    fn test_results_are_row_addrs_json_is_version_gated() {
+        let mut metadata = index_metadata_with(vec![0], vec![]);
+        metadata.index_details = Some(Arc::new(prost_types::Any {
+            type_url: "type.googleapis.com/lance.index.pb.JsonIndexDetails".to_string(),
+            value: Vec::new(),
+        }));
+
+        metadata.index_version = 0;
+        assert!(
+            !metadata.results_are_row_addrs(),
+            "a version 0 JSON segment wraps a target that stores row ids"
+        );
+
+        metadata.index_version = 1;
+        assert!(
+            metadata.results_are_row_addrs(),
+            "a version 1 JSON segment wraps a target that stores row addresses"
         );
     }
 
