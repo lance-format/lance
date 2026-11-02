@@ -23,6 +23,8 @@
 
 use std::fmt::Debug;
 
+use arrow_array::ArrowPrimitiveType;
+use arrow_array::types::Float16Type;
 use arrow_buffer::ArrowNativeType;
 use lance_core::{Error, Result};
 use pco::ChunkConfig;
@@ -52,7 +54,10 @@ const TARGET_CHUNK_BYTES: u64 = 32 * 1024;
 /// The highest pco compression level; pco 1.0 does not export it.
 const MAX_PCODEC_LEVEL: usize = 12;
 
-/// Compresses float32/float64 mini-blocks with pco.
+/// Arrow's float16 is `half::f16`, the same type pco compresses natively.
+type F16 = <Float16Type as ArrowPrimitiveType>::Native;
+
+/// Compresses float16/float32/float64 mini-blocks with pco.
 #[derive(Debug, Clone)]
 pub struct PcodecMiniBlockEncoder {
     config: ChunkConfig,
@@ -103,9 +108,10 @@ impl MiniBlockCompressor for PcodecMiniBlockEncoder {
         };
         let shape = ValueShape::try_from_values(&values)?;
         let compressed = match shape.bits_per_item {
+            16 => compress_page::<F16>(&data, shape.dimension, &self.config)?,
             32 => compress_page::<f32>(&data, shape.dimension, &self.config)?,
             64 => compress_page::<f64>(&data, shape.dimension, &self.config)?,
-            _ => unreachable!("ValueShape only accepts 32 and 64-bit items"),
+            _ => unreachable!("ValueShape only accepts 16, 32 and 64-bit items"),
         };
         Ok((compressed, EncodingUtils::pcodec(values)))
     }
@@ -186,9 +192,9 @@ impl ValueShape {
         loop {
             match encoding.compression.as_ref() {
                 Some(Compression::Flat(flat)) => {
-                    if !matches!(flat.bits_per_value, 32 | 64) || flat.data.is_some() {
+                    if !matches!(flat.bits_per_value, 16 | 32 | 64) || flat.data.is_some() {
                         return Err(Error::invalid_input(format!(
-                            "pcodec requires plain 32 or 64-bit Flat items, got {} bits{}",
+                            "pcodec requires plain 16, 32 or 64-bit Flat items, got {} bits{}",
                             flat.bits_per_value,
                             if flat.data.is_some() {
                                 " with buffer compression"
@@ -313,9 +319,10 @@ impl MiniBlockDecompressor for PcodecMiniBlockDecompressor {
             )));
         };
         let items = match self.shape.bits_per_item {
+            16 => self.decompress_items::<F16>(compressed, num_values)?,
             32 => self.decompress_items::<f32>(compressed, num_values)?,
             64 => self.decompress_items::<f64>(compressed, num_values)?,
-            _ => unreachable!("ValueShape only accepts 32 and 64-bit items"),
+            _ => unreachable!("ValueShape only accepts 16, 32 and 64-bit items"),
         };
         MiniBlockDecompressor::decompress(&self.values, vec![items], num_values)
     }
@@ -354,10 +361,18 @@ mod tests {
             j if j < special.len() => special[j],
             _ => (i as f64 * 0.37).sin() * 1e3,
         });
+        // Narrowing an f64 NaN drops its payload, so narrow widths write their own.
         match bits_per_item {
+            16 => values
+                .flat_map(|v| match v.to_bits() {
+                    0x7ff8_dead_beef_0001 => 0x7e5b_u16.to_le_bytes(),
+                    // The f64 subnormal underflows to zero, so use the smallest f16 subnormal.
+                    _ if v == f64::MIN_POSITIVE / 4.0 => 1_u16.to_le_bytes(),
+                    _ => F16::from_f64(v).to_bits().to_le_bytes(),
+                })
+                .collect(),
             32 => values
                 .flat_map(|v| match v.to_bits() {
-                    // f64 -> f32 drops the payload, so write an f32 NaN payload directly.
                     0x7ff8_dead_beef_0001 => 0x7fc0_beef_u32.to_le_bytes(),
                     _ => (v as f32).to_bits().to_le_bytes(),
                 })
@@ -369,6 +384,7 @@ mod tests {
     fn page(bits_per_item: u64, dims: &[i32], num_rows: usize) -> DataBlock {
         let dimension = dims.iter().product::<i32>() as u64;
         let mut data_type = match bits_per_item {
+            16 => DataType::Float16,
             32 => DataType::Float32,
             _ => DataType::Float64,
         };
@@ -424,6 +440,8 @@ mod tests {
     }
 
     #[rstest]
+    #[case::scalar_f16(16, vec![], 5000)]
+    #[case::vector_f16(16, vec![6], 3000)]
     #[case::scalar_f32(32, vec![], 5000)]
     #[case::scalar_f64(64, vec![], 5000)]
     #[case::vector_f32(32, vec![3], 2049)]
@@ -486,8 +504,8 @@ mod tests {
     fn test_rejects_unsupported_descriptors() {
         let nullable_items =
             EncodingUtils::pcodec(EncodingUtils::fsl(3, true, EncodingUtils::flat(32, None)));
-        let half_floats = EncodingUtils::pcodec(EncodingUtils::flat(16, None));
-        for encoding in [nullable_items, half_floats] {
+        let byte_items = EncodingUtils::pcodec(EncodingUtils::flat(8, None));
+        for encoding in [nullable_items, byte_items] {
             let Some(Compression::Pcodec(description)) = encoding.compression.as_ref() else {
                 unreachable!()
             };

@@ -704,7 +704,7 @@ pub fn try_alp_miniblock(
 
 /// Select pcodec compression when the field requests `compression=pcodec`.
 ///
-/// pcodec applies to float32/float64 values and fixed-size lists of them. A
+/// pcodec applies to float16/float32/float64 values and fixed-size lists of them. A
 /// request for any other type is rejected instead of silently ignored.
 pub fn try_pcodec_miniblock(
     field: &Field,
@@ -718,9 +718,12 @@ pub fn try_pcodec_miniblock(
     while let DataType::FixedSizeList(item, _) = item_type {
         item_type = item.data_type().clone();
     }
-    if !matches!(item_type, DataType::Float32 | DataType::Float64) {
+    if !matches!(
+        item_type,
+        DataType::Float16 | DataType::Float32 | DataType::Float64
+    ) {
         return Err(Error::invalid_input(format!(
-            "pcodec compression requires float32 or float64 values or fixed-size lists of them, \
+            "pcodec compression requires float16, float32 or float64 values or fixed-size lists of them, \
              but field '{}' has type {}",
             field.name,
             field.data_type()
