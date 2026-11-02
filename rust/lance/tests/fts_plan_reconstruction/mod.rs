@@ -19,7 +19,7 @@ async fn bm25f_quoted_root_reconstruction() {
     builder.values().append_value("alpha");
     builder.append(true);
     let documents = Arc::new(builder.finish());
-    let root = Field::new("docs.with.dot", documents.data_type().clone(), true);
+    let root = Field::new("docs`raw", documents.data_type().clone(), true);
     let schema = Arc::new(Schema::new(vec![root.clone()]));
     let batch = RecordBatch::try_new(schema.clone(), vec![documents]).unwrap();
     let dataset = Dataset::write(
@@ -34,7 +34,7 @@ async fn bm25f_quoted_root_reconstruction() {
     // The query encodes a path, while the decoded input carries its literal root.
     FlatCombinedFieldsExec::try_new(
         Arc::new(dataset),
-        CombinedFieldsQuery::try_new("alpha".into(), vec!["`docs.with.dot`".into()]).unwrap(),
+        CombinedFieldsQuery::try_new("alpha".into(), vec!["`docs``raw`".into()]).unwrap(),
         FtsSearchParams::default(),
         Arc::new(EmptyExec::new(input_schema)),
         RoaringBitmap::from_iter([0]),
