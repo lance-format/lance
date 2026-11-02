@@ -4,7 +4,7 @@
 use std::{
     collections::{HashMap, HashSet},
     ops::Range,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use arrow::array::AsArray;
@@ -39,6 +39,59 @@ use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 pub(super) const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
 const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
 const PACK_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GiB per .pack sidecar
+
+/// The `_blobs/<uuid>.blob` payload objects a write created.
+///
+/// Nothing else records them: they are not part of any fragment's file list,
+/// and a descriptor scan over the written fragments cannot tell a payload this
+/// write created from a reused Managed descriptor that points at a live one.
+/// A caller that discards the write's result uses this inventory to delete
+/// exactly what the write created. Clones share the same inventory.
+#[derive(Debug, Clone, Default)]
+pub struct BlobPayloadInventory(Arc<Mutex<Vec<(ObjectStore, Path)>>>);
+
+impl BlobPayloadInventory {
+    fn record(&self, object_store: &ObjectStore, path: &Path) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((object_store.clone(), path.clone()));
+    }
+
+    /// Delete every recorded payload and clear the inventory.
+    ///
+    /// Failures are logged rather than returned: the payloads are unreferenced
+    /// either way, so ordinary garbage collection still reclaims them.
+    pub async fn delete_all(&self) {
+        let payloads = std::mem::take(&mut *self.0.lock().unwrap());
+        for (object_store, path) in payloads {
+            match object_store.delete(&path).await {
+                // A path is recorded before its writer opens, so a writer that
+                // failed to open leaves nothing behind.
+                Ok(()) | Err(Error::NotFound { .. }) => {}
+                Err(e) => {
+                    log::warn!("Failed to clean up orphaned blob payload '{}': {}", path, e);
+                }
+            }
+        }
+    }
+}
+
+/// Allocate a fresh managed payload under `root`, recording it before any bytes
+/// are written so a partially uploaded payload is still accounted for.
+fn new_managed_payload(
+    base_id: Option<u32>,
+    root: &Path,
+    object_store: &ObjectStore,
+    created_payloads: Option<&BlobPayloadInventory>,
+) -> (ManagedBlobLocation, Path) {
+    let location = ManagedBlobLocation::new(base_id);
+    let path = location.path(root);
+    if let Some(created_payloads) = created_payloads {
+        created_payloads.record(object_store, &path);
+    }
+    (location, path)
+}
 
 pub(in crate::dataset) fn blob_inline_threshold_from_metadata(
     metadata: &HashMap<String, String>,
@@ -153,6 +206,7 @@ impl BlobPack {
 /// - Leaves small inline blobs and URI rows unchanged for compatibility.
 pub struct BlobPreprocessor {
     managed_base: Option<(Option<u32>, Path)>,
+    created_payloads: Option<BlobPayloadInventory>,
     object_store: ObjectStore,
     data_dir: Path,
     data_file_key: String,
@@ -362,6 +416,7 @@ impl BlobPreprocessor {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             managed_base: None,
+            created_payloads: None,
             object_store,
             data_dir,
             data_file_key,
@@ -384,6 +439,16 @@ impl BlobPreprocessor {
         root: Path,
     ) -> Self {
         self.managed_base = Some((base_id, root));
+        self
+    }
+
+    /// Record every managed payload object this preprocessor creates into
+    /// `created_payloads`.
+    pub(in crate::dataset) fn with_created_payloads(
+        mut self,
+        created_payloads: Option<BlobPayloadInventory>,
+    ) -> Self {
+        self.created_payloads = created_payloads;
         self
     }
 
@@ -417,9 +482,13 @@ impl BlobPreprocessor {
 
     async fn write_dedicated(&mut self, source: BlobWriteSource<'_>) -> Result<BlobDescriptor> {
         if let Some((base_id, root)) = &self.managed_base {
-            let location = ManagedBlobLocation::new(*base_id);
-            let mut writer =
-                BlobObjectWriter::try_new(self.object_store.clone(), location.path(root)).await?;
+            let (location, path) = new_managed_payload(
+                *base_id,
+                root,
+                &self.object_store,
+                self.created_payloads.as_ref(),
+            );
+            let mut writer = BlobObjectWriter::try_new(self.object_store.clone(), path).await?;
             let range = match source {
                 BlobWriteSource::Bytes(data) => writer.write_blob(data).await?,
                 BlobWriteSource::External(source) => {
@@ -475,8 +544,12 @@ impl BlobPreprocessor {
                 pack.writer.finish().await?;
             }
             let (address, path) = if let Some((base_id, root)) = &self.managed_base {
-                let location = ManagedBlobLocation::new(*base_id);
-                let path = location.path(root);
+                let (location, path) = new_managed_payload(
+                    *base_id,
+                    root,
+                    &self.object_store,
+                    self.created_payloads.as_ref(),
+                );
                 (BlobPackAddress::Managed(location), path)
             } else {
                 let blob_id = self.blob_id_allocator.next()?;

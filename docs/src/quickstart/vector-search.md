@@ -1,6 +1,6 @@
 ---
 title: Vector Search
-description: High-performance vector search with ANN indices, including IVF_PQ, IVF_HNSW_PQ, and IVF_HNSW_SQ
+description: High-performance vector search with the recommended IVF_RQ ANN index, plus IVF_PQ and HNSW alternatives
 ---
 
 # Vector Indexing and Vector Search With Lance
@@ -25,7 +25,6 @@ import lance
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-import duckdb
 ```
 
 ## Prepare Your Vector Embeddings
@@ -75,9 +74,7 @@ You'll perform vector search without an index to see the baseline performance, t
 First, let's sample some query vectors:
 
 ```python
-import duckdb
-# Make sure DuckDB v0.7+ is installed
-samples = duckdb.query("SELECT vector FROM sift1m USING SAMPLE 100").to_df().vector
+samples = sift1m.sample(100, columns=["vector"]).to_pandas().vector
 ```
 
 ```
@@ -118,48 +115,33 @@ Time(sec): 0.10735273361206055
 ...
 ```
 
-Without the index, the search will scan throughout the whole dataset to compute the distance between each data point. For practical real-time performance with, you will get much better performance with an ANN index.
+Without the index, the search will scan throughout the whole dataset to compute the distance between each data point. For practical real-time performance on large datasets, you will get much better performance with an ANN index.
 
 ## Build the Search Index
 
-If you build an ANN index - you can dramatically speed up vector search operations while maintaining high accuracy. In this example, we will build the `IVF_PQ` index: 
+If you build an ANN index, you can dramatically speed up vector search operations while maintaining high accuracy. We recommend starting with the `IVF_RQ` index for most workloads:
 
 ```python
 sift1m.create_index(
     "vector",
-    index_type="IVF_PQ", # specify the IVF_PQ index type
-    num_partitions=256,  # IVF
-    num_sub_vectors=16,  # PQ
+    index_type="IVF_RQ", # recommended for most use cases
+    num_partitions=256,  # number of IVF partitions
 )
 ```
+
+The default 5-bit RaBitQ configuration provides compact storage and multi-bit distance estimates. Set `num_bits=1` to reduce index size and build I/O, then measure recall because searches cannot use the multi-bit distance estimate.
 
 The sample response should look like this:
 
 ```
-Building vector index: IVF256,PQ16
+Building vector index: IVF256,RQ
 CPU times: user 2min 23s, sys: 2.77 s, total: 2min 26s
 Wall time: 22.7 s
 Sample 65536 out of 1000000 to train kmeans of 128 dim, 256 clusters
-Sample 65536 out of 1000000 to train kmeans of 8 dim, 256 clusters
-Sample 65536 out of 1000000 to train kmeans of 8 dim, 256 clusters
-Sample 65536 out of 1000000 to train kmeans of 8 dim, 256 clusters
-Sample 65536 out of 1000000 to train kmeans of 8 dim, 256 clusters
-Sample 65536 out of 1000000 to train kmeans of 8 dim, 256 clusters
-Sample 65536 out of 1000000 to train kmeans of 8 dim, 256 clusters
-Sample 65536 out of 1000000 to train kmeans of 8 dim, 256 clusters
-Sample 65536 out of 1000000 to train kmeans of 8 dim, 256 clusters
-Sample 65536 out of 1000000 to train kmeans of 8 dim, 256 clusters
-Sample 65536 out of 1000000 to train kmeans of 8 dim, 256 clusters
-Sample 65536 out of 1000000 to train kmeans of 8 dim, 256 clusters
-Sample 65536 out of 1000000 to train kmeans of 8 dim, 256 clusters
-Sample 65536 out of 1000000 to train kmeans of 8 dim, 256 clusters
-Sample 65536 out of 1000000 to train kmeans of 8 dim, 256 clusters
-Sample 65536 out of 1000000 to train kmeans of 8 dim, 256 clusters
-Sample 65536 out of 1000000 to train kmeans of 8 dim, 256 clusters
+Sample 65536 out of 1000000 to train kmeans of 128 dim, 256 clusters
 ```
 
-!!! warning "Index Creation Performance"
-    If you're trying this on your own data, make sure your vector (dimensions / num_sub_vectors) % 8 == 0, or else index creation will take much longer than expected due to SIMD misalignment.
+The exact build log depends on the Lance version and training configuration.
 
 ## Vector Search with the ANN Index
 
@@ -277,4 +259,4 @@ print(result.to_pandas())
 
 ## Next Steps
 
-Check out **[Full-text Search](../quickstart/full-text-search.md)**, where we show how to create and query a BM25 index for keyword-based search in Lance.
+Continue with the **[Vector Search User Guide](../guide/vector_search.md)** for index selection, filtering, recall tuning, and index maintenance. You can also explore **[Full-text Search](../quickstart/full-text-search.md)** to create and query a BM25 index for keyword-based search in Lance.

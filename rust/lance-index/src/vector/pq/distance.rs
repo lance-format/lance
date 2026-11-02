@@ -6,7 +6,7 @@ use core::panic;
 use super::utils::get_sub_vector_centroids;
 use lance_core::assume_eq;
 use lance_linalg::distance::{
-    Dot, L2, dot_distance_batch_into, l2::L2Prepared, l2_distance_batch_into,
+    Dot, L2, dot::DotPrepared, dot_distance_batch_into, l2::L2Prepared, l2_distance_batch_into,
 };
 use lance_linalg::simd::dist_table::{
     sum_4bit_dist_table_f32_row, sum_4bit_dist_table_f32_rows, sum_4bit_dist_table_f32_transposed,
@@ -73,6 +73,23 @@ pub fn build_distance_table_l2_prepared(l2_targets: &[L2Prepared], query: &[f32]
     result
 }
 
+/// Prepare one transposed L2 target set per PQ sub-vector.
+pub(super) fn prepare_l2_targets(
+    codebook: &[f32],
+    num_bits: u32,
+    num_sub_vectors: usize,
+    dimension: usize,
+) -> Vec<L2Prepared> {
+    let sub_dim = dimension / num_sub_vectors;
+    let block_size = sub_dim * 2_usize.pow(num_bits);
+    (0..num_sub_vectors)
+        .map(|sub_idx| {
+            let block_start = sub_idx * block_size;
+            L2Prepared::new(&codebook[block_start..block_start + block_size], sub_dim)
+        })
+        .collect()
+}
+
 /// Build a Distance Table from the query to each PQ centroid
 /// using Dot distance.
 pub fn build_distance_table_dot<T: Dot>(
@@ -111,6 +128,41 @@ pub fn build_distance_table_dot_impl<const NUM_BITS: u32, T: Dot>(
         dot_distance_batch_into(sub_vec, subvec_centroids, sub_vector_length, distances);
     }
     result
+}
+
+/// Build a Dot distance table from pre-transposed targets.
+pub fn build_distance_table_dot_prepared(dot_targets: &[DotPrepared], query: &[f32]) -> Vec<f32> {
+    let sub_dim = query.len() / dot_targets.len();
+    let num_targets = dot_targets[0].num_targets();
+    let mut result = vec![0.0; dot_targets.len() * num_targets];
+
+    for (sub_vector, (target, query)) in dot_targets
+        .iter()
+        .zip(query.chunks_exact(sub_dim))
+        .enumerate()
+    {
+        target.distances_into(
+            query,
+            &mut result[sub_vector * num_targets..][..num_targets],
+        );
+    }
+    result
+}
+
+/// Prepare one transposed Dot target set per PQ sub-vector.
+pub(super) fn prepare_dot_targets(
+    codebook: &[f32],
+    num_bits: u32,
+    num_sub_vectors: usize,
+    dimension: usize,
+) -> Vec<DotPrepared> {
+    let sub_dim = dimension / num_sub_vectors;
+    let block_size = sub_dim * 2_usize.pow(num_bits);
+    codebook
+        .chunks_exact(block_size)
+        .take(num_sub_vectors)
+        .map(|block| DotPrepared::new(block, sub_dim))
+        .collect()
 }
 
 /// Compute L2 distance from the query to all code.
@@ -296,7 +348,13 @@ pub(super) fn quantize_4bit_distance_table(
     let mut max_sum = 0u32;
     for table in tables {
         let min = reduce_16(table, min_of);
-        let codes = table.map(|d| ((d - min) * scale + 0.5).floor().min(u8::MAX as f32) as u8);
+        // A loop rather than `table.map(..)`: with several codegen units the
+        // `array::map` instance can be left out of line, which cost up to 5%
+        // of a 1024-row partition scan.
+        let mut codes = [0u8; NUM_CENTROIDS];
+        for (code, &d) in codes.iter_mut().zip(table) {
+            *code = ((d - min) * scale + 0.5).floor().min(u8::MAX as f32) as u8;
+        }
         // The minimum entry quantizes to 0 with no error, so the largest error
         // is `>= 0` and the smallest `<= 0`. `code * step` and, short of a
         // 29-bit exponent gap, `d - min` are exact in `f64`.
@@ -543,6 +601,62 @@ mod tests {
     use super::*;
     use arrow_array::UInt8Array;
     use rand::{Rng, SeedableRng, rngs::StdRng};
+
+    #[rstest::rstest]
+    #[case::four_bit(4)]
+    #[case::eight_bit(8)]
+    fn test_prepared_l2_table_matches_aos(#[case] num_bits: u32) {
+        const DIMENSION: usize = 128;
+        const NUM_SUB_VECTORS: usize = 16;
+        let num_centroids = 2_usize.pow(num_bits);
+        let codebook = (0..num_centroids * DIMENSION)
+            .map(|idx| ((idx * 17 + 5) % 251) as f32 / 251.0 - 0.5)
+            .collect::<Vec<_>>();
+        let query = (0..DIMENSION)
+            .map(|idx| ((idx * 11 + 3) % 127) as f32 / 127.0 - 0.5)
+            .collect::<Vec<_>>();
+
+        let expected = build_distance_table_l2(&codebook, num_bits, NUM_SUB_VECTORS, &query);
+        let targets = prepare_l2_targets(&codebook, num_bits, NUM_SUB_VECTORS, DIMENSION);
+        let actual = build_distance_table_l2_prepared(&targets, &query);
+
+        assert_eq!(targets.len(), NUM_SUB_VECTORS);
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                approx::relative_eq!(actual, expected, epsilon = 1e-5, max_relative = 1e-5),
+                "distance table value {idx}: prepared={actual}, expected={expected}"
+            );
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::four_bit(4)]
+    #[case::eight_bit(8)]
+    fn test_prepared_dot_table_matches_aos(#[case] num_bits: u32) {
+        const DIMENSION: usize = 128;
+        const NUM_SUB_VECTORS: usize = 16;
+        let num_centroids = 2_usize.pow(num_bits);
+        let codebook = (0..num_centroids * DIMENSION)
+            .map(|idx| ((idx * 17 + 5) % 251) as f32 / 251.0 - 0.5)
+            .collect::<Vec<_>>();
+        let query = (0..DIMENSION)
+            .map(|idx| ((idx * 11 + 3) % 127) as f32 / 127.0 - 0.5)
+            .collect::<Vec<_>>();
+
+        let expected = build_distance_table_dot(&codebook, num_bits, NUM_SUB_VECTORS, &query);
+        let targets = prepare_dot_targets(&codebook, num_bits, NUM_SUB_VECTORS, DIMENSION);
+        let actual = build_distance_table_dot_prepared(&targets, &query);
+
+        assert_eq!(targets.len(), NUM_SUB_VECTORS);
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                approx::relative_eq!(actual, expected, epsilon = 1e-5, max_relative = 1e-5),
+                "distance table value {idx}: prepared={actual}, expected={expected}"
+            );
+        }
+    }
 
     #[test]
     fn test_compute_on_transposed_codes() {

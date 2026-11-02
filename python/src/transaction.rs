@@ -16,7 +16,7 @@ use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
 use lance_table::system_index::mem_wal::CompactedSsTable;
 use pyo3::exceptions::PyValueError;
-use pyo3::types::PyList;
+use pyo3::types::{PyDict, PyList};
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
 use pyo3::{intern, prelude::*};
 use roaring::RoaringBitmap;
@@ -100,6 +100,17 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
             Err(_) => Vec::new(),
         };
 
+        // Tolerate objects predating these attributes; absent means no
+        // clustering reference and no generic metadata.
+        let clustering_id: Option<u32> = match ob.getattr("clustering_id") {
+            Ok(value) => value.extract::<Option<u32>>()?,
+            Err(_) => None,
+        };
+        let metadata: HashMap<String, String> = match ob.getattr("metadata") {
+            Ok(value) => value.extract()?,
+            Err(_) => HashMap::new(),
+        };
+
         Ok(Self(IndexMetadata {
             uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
             name,
@@ -112,6 +123,8 @@ impl FromPyObject<'_, '_> for PyLance<IndexMetadata> {
             created_at,
             base_id,
             files,
+            clustering_id,
+            metadata,
         }))
     }
 }
@@ -150,19 +163,27 @@ impl<'py> IntoPyObject<'py> for PyLance<&IndexMetadata> {
         let cls = namespace
             .getattr("Index")
             .expect("Failed to get Index class");
-        cls.call1((
-            uuid,
-            name.clone(),
-            fields.clone(),
-            dataset_version,
-            fragment_ids,
-            index_version,
-            created_at,
-            base_id,
-            files,
-            index_details,
-            covering_fields.clone(),
-        ))
+        // PyO3 accepts at most twelve positional arguments in one tuple; the
+        // two trailing dataclass fields go by keyword.
+        let kwargs = PyDict::new(py);
+        kwargs.set_item(intern!(py, "clustering_id"), self.0.clustering_id)?;
+        kwargs.set_item(intern!(py, "metadata"), self.0.metadata.clone())?;
+        cls.call(
+            (
+                uuid,
+                name.clone(),
+                fields.clone(),
+                dataset_version,
+                fragment_ids,
+                index_version,
+                created_at,
+                base_id,
+                files,
+                index_details,
+                covering_fields.clone(),
+            ),
+            Some(&kwargs),
+        )
     }
 }
 
@@ -544,12 +565,15 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     Err(_) => Vec::new(),
                 };
 
+                let mem_wal_dir_id: Option<String> = ob.getattr("mem_wal_dir_id")?.extract()?;
+
                 let op = Operation::Update {
                     removed_fragment_ids,
                     updated_fragments,
                     new_fragments,
                     fields_modified,
                     compacted_sstables,
+                    mem_wal_dir_id,
                     fields_for_preserving_frag_bitmap,
                     update_mode,
                     inserted_rows_filter: None,
@@ -696,7 +720,11 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     Ok(value) => import_compacted_sstables(&value)?,
                     Err(_) => Vec::new(),
                 };
-                Ok(Self(Operation::UpdateMemWalState { compacted_sstables }))
+                let dir_id: String = ob.getattr("dir_id")?.extract()?;
+                Ok(Self(Operation::UpdateMemWalState {
+                    compacted_sstables,
+                    dir_id,
+                }))
             }
             unsupported => Err(PyValueError::new_err(format!(
                 "Unsupported operation: {unsupported}",
@@ -761,6 +789,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 update_mode,
                 updated_fragment_offsets,
                 compacted_sstables,
+                mem_wal_dir_id,
                 ..
             } => {
                 let removed_fragment_ids = removed_fragment_ids.into_pyobject(py)?;
@@ -806,6 +835,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     update_mode,
                     updated_fragment_offsets,
                     compacted_sstables,
+                    mem_wal_dir_id,
                 ))
             }
             Operation::DataReplacement { replacements } => {
@@ -954,12 +984,15 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     base_op.call0()
                 }
             }
-            Operation::UpdateMemWalState { compacted_sstables } => {
+            Operation::UpdateMemWalState {
+                compacted_sstables,
+                dir_id,
+            } => {
                 let compacted_sstables = export_compacted_sstables(py, compacted_sstables)?;
                 let cls = namespace
                     .getattr("UpdateMemWalState")
                     .expect("Failed to get UpdateMemWalState class");
-                cls.call1((compacted_sstables,))
+                cls.call1((compacted_sstables, dir_id))
             }
             unsupported => Err(PyValueError::new_err(format!(
                 "Unsupported operation: {}",

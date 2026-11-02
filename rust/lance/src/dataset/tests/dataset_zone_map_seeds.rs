@@ -316,6 +316,79 @@ async fn test_zone_map_seed_harvest_after_column_name_swap() {
     assert_eq!(indexed.try_into_batch().await.unwrap().num_rows(), expected);
 }
 
+/// A zone map on a blob column itself is built from what the scan yields
+/// (the blob descriptor), on creation and on a later update.
+#[tokio::test]
+async fn test_zone_map_on_blob_column() {
+    let dir = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        blob_field("blob", true),
+    ]));
+    let make_batch = |start: i32| {
+        let mut blobs = BlobArrayBuilder::new(10);
+        for i in 0..10 {
+            if i % 3 == 0 {
+                blobs.push_null().unwrap();
+            } else {
+                blobs.push_bytes(b"blob").unwrap();
+            }
+        }
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(start..start + 10)),
+                blobs.finish().unwrap(),
+            ],
+        )
+        .unwrap()
+    };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(make_batch(0))], schema.clone()),
+        dir.as_str(),
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["blob"],
+            IndexType::ZoneMap,
+            None,
+            &zone_map_params(true),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+        .append(RecordBatchIterator::new([Ok(make_batch(10))], schema), None)
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    for filter in ["blob IS NULL", "blob IS NOT NULL"] {
+        let mut flat = dataset.scan();
+        flat.use_scalar_index(false)
+            .project(&["id"])
+            .unwrap()
+            .filter(filter)
+            .unwrap();
+        let expected = flat.try_into_batch().await.unwrap().num_rows();
+        let mut indexed = dataset.scan();
+        indexed.project(&["id"]).unwrap().filter(filter).unwrap();
+        assert_eq!(
+            indexed.try_into_batch().await.unwrap().num_rows(),
+            expected,
+            "{filter}"
+        );
+    }
+}
+
 #[rstest::rstest]
 #[case::blob_first(true, false)]
 #[case::blob_last(false, false)]
@@ -1130,41 +1203,6 @@ use crate::dataset::optimize::{
 };
 use lance_table::feature_flags::FLAG_ZONE_WRITE_SEEDS;
 
-/// Counts `plan_run` execution events while it is the default subscriber. A
-/// seed harvest never executes a plan; the fallback column scan does, so the
-/// count tells which path an index update took.
-#[derive(Clone, Default)]
-struct BinaryCopyPlanRunCounter(Arc<std::sync::atomic::AtomicUsize>);
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for BinaryCopyPlanRunCounter {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        use lance_core::utils::tracing::{EXECUTION_PLAN_RUN, TRACE_EXECUTION};
-
-        #[derive(Default)]
-        struct TypeField(Option<String>);
-        impl tracing::field::Visit for TypeField {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "type" {
-                    self.0 = Some(format!("{value:?}").trim_matches('"').to_string());
-                }
-            }
-        }
-
-        if event.metadata().target() != TRACE_EXECUTION {
-            return;
-        }
-        let mut ty = TypeField::default();
-        event.record(&mut ty);
-        if ty.0.as_deref() == Some(EXECUTION_PLAN_RUN) {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-}
-
 fn assert_seed_flags_set(dataset: &Dataset) {
     assert_ne!(
         dataset.manifest.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS,
@@ -1375,9 +1413,10 @@ async fn test_binary_copy_single_source_output_carries_seed_verbatim() {
 }
 
 /// Ragged inputs (short tail zones) concatenate into a seed with short zones
-/// mid file: version 1 records are self-describing, the merged seed feeds the
-/// next index update without a scan, and indexed queries match unindexed
-/// scans.
+/// mid file: version 1 records are self-describing, the next index update
+/// reuses every record that lies inside one configured zone and scans only
+/// the intervals of the records that cross a zone boundary, and indexed
+/// queries match unindexed scans.
 #[tokio::test]
 async fn test_binary_copy_merges_ragged_seeds_and_feeds_index_update() {
     use arrow::array::AsArray;
@@ -1404,24 +1443,27 @@ async fn test_binary_copy_merges_ragged_seeds_and_feeds_index_update() {
     assert_eq!(before, after);
     assert_seed_flags_set(&dataset);
 
-    // The compacted fragment is unindexed; the update must integrate the
-    // merged seed (its granularity differs from a fresh collection) without
-    // scanning the column.
-    use tracing_subscriber::layer::SubscriberExt as _;
-    let plan_runs = BinaryCopyPlanRunCounter::default();
-    let subscriber = tracing_subscriber::registry().with(plan_runs.clone());
-    let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
-    {
-        let _guard = tracing::subscriber::set_default(subscriber);
-        dataset
-            .optimize_indices(&OptimizeOptions::default())
-            .await
-            .unwrap();
-    }
-    assert_eq!(
-        plan_runs.0.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "the index update must come from the merged seed, not a column scan"
+    // The compacted fragment is unindexed. Its merged seed holds records
+    // [0,4) [4,8) [8,10) [10,14) [14,18) [18,20) for 4-row zones: the four
+    // records inside one zone are reused, the two that cross a zone
+    // boundary ([10,14) over 12, [14,18) over 16) are scanned by interval.
+    use crate::index::scalar::zonemap::SEED_REUSE_REPORTS;
+    let reports = SEED_REUSE_REPORTS
+        .scope(std::sync::Mutex::new(Vec::new()), async {
+            dataset
+                .optimize_indices(&OptimizeOptions::default())
+                .await
+                .unwrap();
+            SEED_REUSE_REPORTS.with(|reports| reports.lock().unwrap().clone())
+        })
+        .await;
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0].partial_fragments, vec![fragment.id]);
+    assert_eq!(reports[0].reused_records, 4);
+    assert_eq!(reports[0].scanned_rows, 8);
+    assert!(
+        reports[0].masked,
+        "the crossing intervals are scanned through a mask"
     );
 
     for filter in ["val >= 10 AND val < 15", "val IS NULL", "val = 23"] {
@@ -1449,6 +1491,77 @@ async fn test_binary_copy_merges_ragged_seeds_and_feeds_index_update() {
             .values()
             .to_vec();
         assert_eq!(indexed_ids, expected_ids, "filter {filter}");
+    }
+}
+
+/// A binary copy carries seed records unchanged under a locator that
+/// declares the column's current zone size, which can be smaller than those
+/// records; a later index whose zones fit the records still reuses them
+/// instead of scanning.
+#[tokio::test]
+async fn test_binary_copy_keeps_large_carried_records_reusable_after_config_change() {
+    use crate::index::scalar::zonemap::SEED_REUSE_REPORTS;
+
+    fn params(rows_per_zone: u64) -> ScalarIndexParams {
+        ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
+            .with_params(&serde_json::json!({"rows_per_zone": rows_per_zone, "use_seeds": true}))
+    }
+    async fn locator_rows_per_zone(dataset: &Dataset, fragment: &Fragment) -> u64 {
+        let file = serving_file(fragment, field_id(dataset, "val"));
+        let reader = open_data_file(dataset, &file.path).await;
+        let value = reader
+            .metadata()
+            .file_schema
+            .metadata
+            .get(&format!("{SEED_META_KEY_PREFIX}val"))
+            .unwrap()
+            .clone();
+        value.split_once(':').unwrap().1.parse().unwrap()
+    }
+
+    let dir = TempStrDir::default();
+    // Three 8-row fragments with 4-row seed records.
+    let mut dataset = all_seeded_dataset(dir.as_str(), 3, 8).await;
+    // The column's index now wants 2-row records: the copy's output
+    // declares that locator while carrying the 4-row records verbatim.
+    dataset
+        .create_index(&["val"], IndexType::ZoneMap, None, &params(2), true)
+        .await
+        .unwrap();
+    let metrics = force_binary_copy(&mut dataset, 1_000_000).await;
+    assert_eq!(metrics.fragments_added, 1);
+    let output = dataset.fragments()[0].clone();
+    assert_eq!(output.physical_rows, Some(24));
+    assert_eq!(locator_rows_per_zone(&dataset, &output).await, 2);
+
+    // Eight-row zones fit every carried 4-row record: reuse, no scan.
+    let reports = SEED_REUSE_REPORTS
+        .scope(std::sync::Mutex::new(Vec::new()), async {
+            dataset
+                .create_index(&["val"], IndexType::ZoneMap, None, &params(8), true)
+                .await
+                .unwrap();
+            SEED_REUSE_REPORTS.with(|reports| reports.lock().unwrap().clone())
+        })
+        .await;
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].reused_fragments, vec![output.id]);
+    assert_eq!(reports[0].reused_records, 6);
+    assert_eq!(reports[0].scanned_rows, 0);
+
+    for filter in ["val >= 10 AND val < 15", "val IS NULL", "val = 23"] {
+        let mut indexed = dataset.scan();
+        indexed.filter(filter).unwrap().project(&["id"]).unwrap();
+        let indexed = indexed.try_into_batch().await.unwrap();
+        let mut unindexed = dataset.scan();
+        unindexed
+            .use_scalar_index(false)
+            .filter(filter)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let expected = unindexed.try_into_batch().await.unwrap();
+        assert_eq!(indexed, expected, "filter {filter}");
     }
 }
 

@@ -28,6 +28,8 @@ use crate::object_store::{
 use lance_core::error::{Error, Result};
 use lance_core::utils::parse::str_is_truthy;
 
+use super::opendal::finish_opendal_operator;
+
 #[derive(Default, Debug)]
 pub struct AzureBlobStoreProvider;
 
@@ -93,6 +95,7 @@ impl AzureBlobStoreProvider {
         // Start with all storage options as the config map
         // OpenDAL will handle environment variables through its default credentials chain
         let mut config_map = Self::normalize_opendal_azure_options(&storage_options.0);
+        let max_retries = storage_options.client_max_retries();
 
         match base_path.scheme() {
             "az" => {
@@ -108,9 +111,14 @@ impl AzureBlobStoreProvider {
                     config_map.insert("root".to_string(), format!("/{}", prefix));
                 }
 
-                Operator::from_iter::<Azblob>(config_map).map_err(|e| {
-                    Error::invalid_input(format!("Failed to create Azure Blob operator: {:?}", e))
-                })
+                Operator::from_iter::<Azblob>(config_map)
+                    .map_err(|e| {
+                        Error::invalid_input(format!(
+                            "Failed to create Azure Blob operator: {:?}",
+                            e
+                        ))
+                    })
+                    .map(|operator| finish_opendal_operator(operator, max_retries))
             }
             "abfss" => {
                 let filesystem = base_path.username();
@@ -136,12 +144,14 @@ impl AzureBlobStoreProvider {
                     config_map.insert("root".to_string(), format!("/{}", root_path));
                 }
 
-                Operator::from_iter::<Azdls>(config_map).map_err(|e| {
-                    Error::invalid_input(format!(
-                        "Failed to create Azure DFS (ADLS Gen2) operator: {:?}",
-                        e
-                    ))
-                })
+                Operator::from_iter::<Azdls>(config_map)
+                    .map_err(|e| {
+                        Error::invalid_input(format!(
+                            "Failed to create Azure DFS (ADLS Gen2) operator: {:?}",
+                            e
+                        ))
+                    })
+                    .map(|operator| finish_opendal_operator(operator, max_retries))
             }
             _ => Err(Error::invalid_input(format!(
                 "Unsupported Azure scheme: {}",
@@ -296,14 +306,15 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
         Ok(ObjectStore {
             inner,
             local_dir_operations: None,
+            local_fsync: false,
             scheme,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: false,
-            supports_conditional_multipart_put: false,
             list_is_lexically_ordered: true,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
+            scheduler_error_mode: Default::default(),
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,

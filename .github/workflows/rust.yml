@@ -59,14 +59,11 @@ jobs:
       # Catches manifest problems that only surface at publish time (missing
       # readme/license files, path dependencies without a version, excluded
       # files a crate needs). `--no-verify` skips building each packaged crate,
-      # which the other jobs already cover. Keep the excludes in sync with
-      # .github/workflows/cargo-publish.yml.
+      # which the other jobs already cover. Package the Arrow-versioned helper
+      # crates too even though releases publish them separately.
       - name: Package crates
         run: |
-          cargo package --workspace --no-verify \
-            --exclude lance-arrow-stats \
-            --exclude lance-arrow-scalar \
-            --all-features
+          cargo package --workspace --no-verify --all-features
 
   rustdoc:
     runs-on: ubuntu-24.04
@@ -530,7 +527,7 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        msrv: ["1.94.0"] # This should match up with rust-version in Cargo.toml
+        msrv: ["1.95.0"] # This should match up with rust-version in Cargo.toml
     env:
       # Need up-to-date compilers for kernels
       CC: clang
