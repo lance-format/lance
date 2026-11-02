@@ -87,9 +87,15 @@ impl PcodecMiniBlockEncoder {
 impl MiniBlockCompressor for PcodecMiniBlockEncoder {
     fn compress(
         &self,
-        _context: MiniBlockCompressionContext,
+        context: MiniBlockCompressionContext,
         page: DataBlock,
     ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+        // Chunks target 32 KiB before compression, beyond 16-bit chunk sizes.
+        if !context.supports_large_chunk() {
+            return Err(Error::invalid_input(
+                "pcodec requires 32-bit mini-block chunk sizes, which Lance 2.3 provides",
+            ));
+        }
         let (values, data) = match page {
             DataBlock::FixedWidth(data) => (EncodingUtils::flat(data.bits_per_value, None), data),
             DataBlock::FixedSizeList(fsl) => {
@@ -118,9 +124,9 @@ impl MiniBlockCompressor for PcodecMiniBlockEncoder {
 }
 
 /// Number of rows per chunk: the largest power of two whose uncompressed size
-/// fits [`TARGET_CHUNK_BYTES`], at least two rows and at most
-/// [`MAX_MINIBLOCK_VALUES`]. A non-final chunk cannot hold one row because
-/// `log_num_values == 0` marks the final chunk.
+/// fits [`TARGET_CHUNK_BYTES`] and that does not exceed
+/// [`MAX_MINIBLOCK_VALUES`], but never fewer than two rows. A non-final chunk
+/// cannot hold one row because `log_num_values == 0` marks the final chunk.
 fn rows_per_chunk(bytes_per_row: u64) -> u64 {
     let mut rows = 2;
     while rows * 2 * bytes_per_row <= TARGET_CHUNK_BYTES && rows * 2 <= *MAX_MINIBLOCK_VALUES {
@@ -296,7 +302,7 @@ impl PcodecMiniBlockDecompressor {
                 ),
             ));
         }
-        if dimension == 1 {
+        if dimension == 1 || num_items == 0 {
             return Ok(LanceBuffer::reinterpret_vec(items));
         }
         let rows = num_items / dimension;
@@ -495,9 +501,38 @@ mod tests {
         let err = decompressor.decompress(vec![truncated], 100).unwrap_err();
         assert!(matches!(err, Error::CorruptFile { .. }), "{err}");
 
-        let err = decompressor.decompress(vec![chunk], 99).unwrap_err();
+        let err = decompressor
+            .decompress(vec![chunk.clone()], 99)
+            .unwrap_err();
         assert!(matches!(err, Error::CorruptFile { .. }), "{err}");
         assert!(err.to_string().contains("expected 297"), "{err}");
+
+        let err = decompressor.decompress(vec![chunk], 0).unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err}");
+
+        // A chunk that really holds no values decodes to no values.
+        let mut empty = Vec::new();
+        simple_compress_into(&[] as &[f64], &ChunkConfig::default(), &mut empty).unwrap();
+        let decoded = decompressor
+            .decompress(vec![LanceBuffer::from(empty)], 0)
+            .unwrap();
+        assert_eq!(decoded.num_values(), 0);
+    }
+
+    #[test]
+    fn test_rejects_small_chunk_context() {
+        let err = PcodecMiniBlockEncoder::try_new(None)
+            .unwrap()
+            .compress(
+                MiniBlockCompressionContext::new(0, false, true),
+                page(32, &[3], 10),
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        assert!(
+            err.to_string().contains("32-bit mini-block chunk sizes"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -3,6 +3,8 @@
 
 //! The 2.3 writer chooses structure independently from value storage.
 
+use std::collections::HashMap;
+
 use super::structural_encoder::{
     ComplexNullEncoding, ConstantPrimitiveEncoding, DictionaryEncodingPolicy, MiniblockChunkSize,
     PrimitiveEncodeAttempt, PrimitiveEncodeContext, PrimitivePageData,
@@ -11,8 +13,8 @@ use super::structural_encoder::{
 use super::*;
 use crate::compression::CompressionStrategy;
 use crate::constants::{
-    COMPRESSION_META_KEY, PCODEC_COMPRESSION, STRUCTURAL_ENCODING_META_KEY,
-    STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_SPARSE,
+    COMPRESSION_META_KEY, PCODEC_COMPRESSION, STRUCTURAL_ENCODING_FULLZIP,
+    STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_SPARSE,
 };
 use crate::decoder::{PageEncoding, PageInfo};
 use crate::format::planar::from_dense_execution;
@@ -74,6 +76,28 @@ fn is_narrow(arrays: &[ArrayRef], num_values: u64) -> bool {
         }
         _ => PrimitiveStructuralEncoder::is_narrow(&DataBlock::from_arrays(arrays, num_values)),
     }
+}
+
+fn requests_pcodec(encoding_metadata: &HashMap<String, String>) -> bool {
+    encoding_metadata
+        .get(COMPRESSION_META_KEY)
+        .is_some_and(|scheme| scheme == PCODEC_COMPRESSION)
+}
+
+/// Whether pcodec can store these leaf arrays: it rejects fixed-size lists
+/// with null items, which then keep the usual layout choice.
+fn pcodec_applies(encoding_metadata: &HashMap<String, String>, arrays: &[ArrayRef]) -> bool {
+    requests_pcodec(encoding_metadata)
+        && arrays.iter().all(|array| {
+            let mut array = array.as_ref();
+            while let Some(fsl) = array.as_fixed_size_list_opt() {
+                array = fsl.values().as_ref();
+                if array.null_count() > 0 {
+                    return false;
+                }
+            }
+            true
+        })
 }
 
 #[derive(Debug)]
@@ -151,7 +175,9 @@ impl PrimitivePageEncodingBehavior for PlanarPrimitiveEncoding {
             );
         // Wide mostly-null leaves benefit from per-value addressing even when the
         // dense level stream fits a page. Explicit dense requests remain authoritative.
+        // pcodec values stay dense so their chunks can be compressed.
         let sparse_wide = requested.is_none()
+            && !pcodec_applies(ctx.encoding_metadata, arrays)
             && validity
                 .as_ref()
                 .is_some_and(|v| v.count_set_bits() < v.len() / 2)
@@ -250,14 +276,18 @@ impl PrimitivePageEncodingBehavior for PlanarPrimitiveEncoding {
         }
         // pcodec compresses runs of rows, which the per-value full-zip layout
         // cannot provide, so wide pcodec values use mini-block as well.
-        if dense_ctx
+        let requested = dense_ctx
             .encoding_metadata
-            .get(COMPRESSION_META_KEY)
-            .is_some_and(|v| v == PCODEC_COMPRESSION)
-            && !dense_ctx
-                .encoding_metadata
-                .contains_key(STRUCTURAL_ENCODING_META_KEY)
+            .get(STRUCTURAL_ENCODING_META_KEY);
+        if requests_pcodec(&dense_ctx.encoding_metadata)
+            && requested.is_some_and(|v| v.eq_ignore_ascii_case(STRUCTURAL_ENCODING_FULLZIP))
         {
+            return Err(Error::invalid_input(format!(
+                "Field '{}' requests pcodec compression, which cannot be used with {}={}",
+                dense_ctx.field.name, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_FULLZIP
+            )));
+        }
+        if requested.is_none() && pcodec_applies(&dense_ctx.encoding_metadata, &page.arrays) {
             let mut metadata = (*dense_ctx.encoding_metadata).clone();
             metadata.insert(
                 STRUCTURAL_ENCODING_META_KEY.to_string(),
