@@ -24,6 +24,22 @@ from .compat_decorator import (
 )
 from .util import safe_data_storage_version
 
+# The writer capability for row-address indices landed in #10352 and first
+# shipped in 15.0.0b7. Later releases understand the flag and may continue
+# writing these datasets; only releases that predate that fence must reject
+# them.
+_ROW_ADDRESS_WRITER_SUPPORT_VERSION = Version("15.0.0b7")
+
+
+def _writer_supports_row_address_indices(compat_version):
+    return Version(compat_version) >= _ROW_ADDRESS_WRITER_SUPPORT_VERSION
+
+
+def test_row_address_writer_support_starts_with_beta_7():
+    assert not _writer_supports_row_address_indices("15.0.0b6")
+    assert _writer_supports_row_address_indices("15.0.0b7")
+    assert _writer_supports_row_address_indices("15.0.0")
+
 
 def _assert_row_address_writes_fenced(dataset, data, compat_version):
     version = dataset.version
@@ -199,7 +215,9 @@ class BTreeRowAddressDomainIndex(UpgradeDowngradeTest):
                 "btree": pa.array([1000]),
             }
         )
-        if self._running_in_old_venv:
+        if self._running_in_old_venv and not _writer_supports_row_address_indices(
+            self.compat_version
+        ):
             _assert_row_address_writes_fenced(ds, data, self.compat_version)
             return
         ds.insert(data)
@@ -508,7 +526,9 @@ class BitmapRowAddressDomainIndex(UpgradeDowngradeTest):
                 "bitmap": pa.array([1000]),
             }
         )
-        if self._running_in_old_venv:
+        if self._running_in_old_venv and not _writer_supports_row_address_indices(
+            self.compat_version
+        ):
             _assert_row_address_writes_fenced(ds, data, self.compat_version)
             return
         ds.insert(data)
@@ -695,7 +715,9 @@ class LabelListRowAddressDomainIndex(UpgradeDowngradeTest):
                 "label_list": pa.array([["label1000"]]),
             }
         )
-        if self._running_in_old_venv:
+        if self._running_in_old_venv and not _writer_supports_row_address_indices(
+            self.compat_version
+        ):
             _assert_row_address_writes_fenced(ds, data, self.compat_version)
             return
         ds.insert(data)
