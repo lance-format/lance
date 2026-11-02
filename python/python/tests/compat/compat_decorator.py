@@ -11,9 +11,11 @@ for testing forward and backward compatibility across Lance versions.
 import inspect
 import json
 import os
+import re
 import sys
 import urllib.request
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -46,9 +48,21 @@ def _fetch_stable_versions() -> List[Version]:
         return []
 
 
+def _source_version() -> Version:
+    """The version of the Lance checkout these tests run from."""
+    cargo_toml = Path(__file__).resolve().parents[3] / "Cargo.toml"
+    match = re.search(r'^version = "(.+)"$', cargo_toml.read_text(), re.MULTILINE)
+    return Version(match.group(1))
+
+
 def recent_major_versions(n: int) -> List[str]:
-    """Returns the n most recent major versions of pylance as strings."""
-    stable_versions = pylance_stable_versions()
+    """Returns the n most recent major versions of pylance as strings.
+
+    Releases newer than this checkout are skipped: an older build is not
+    expected to write data that a newer release created.
+    """
+    source = _source_version()
+    stable_versions = [v for v in pylance_stable_versions() if v <= source]
     major_versions = []
     seen_majors = set()
 
