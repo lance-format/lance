@@ -8782,6 +8782,18 @@ async fn test_sql_contains_tokens_custom_stop_words_on_legacy_storage() {
             &StringArray::from(vec!["a cat catch a fish", "a fish catch a cat"]),
         );
     }
+
+    // 'cat' reaches the index because the parser cannot see the custom stop
+    // words, so this covers the rechecked AtLeast materialization path.
+    let results = execute_sql(
+        "explain select * from foo where contains_tokens(text, 'cat')",
+        "foo".to_string(),
+        Arc::new(dataset.clone()),
+    )
+    .await
+    .unwrap();
+    let plan = format!("{:?}", results);
+    assert_contains!(&plan, "MaterializeIndex");
 }
 
 #[tokio::test]
