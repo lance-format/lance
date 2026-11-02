@@ -2393,7 +2393,7 @@ impl FileFragment {
         }
         let stream = scanner.try_into_stream().await?;
         if has_blob_columns {
-            let rewrite_plan = Arc::new(super::optimize::BlobV2BatchRewritePlan::try_new(
+            let rewrite_plan = Arc::new(super::blob::BlobV2BatchRewritePlan::try_new(
                 projection,
                 stream.schema().as_ref(),
                 false,
