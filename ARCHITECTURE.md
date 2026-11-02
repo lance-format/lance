@@ -4,17 +4,6 @@ This guide maps the main ownership boundaries in the Lance repository. Use it to
 find the module that owns a behavior before changing an implementation, its
 persistent representation, or its language binding.
 
-> **Review dependency.** The layout below describes the focused refactors in
-> [#10597](https://github.com/lance-format/lance/pull/10597),
-> [#10072](https://github.com/lance-format/lance/pull/10072),
-> [#10598](https://github.com/lance-format/lance/pull/10598),
-> [#10600](https://github.com/lance-format/lance/pull/10600),
-> [#10074](https://github.com/lance-format/lance/pull/10074),
-> [#10602](https://github.com/lance-format/lance/pull/10602),
-> [#10601](https://github.com/lance-format/lance/pull/10601), and the companion
-> MemWAL write refactor. Until those changes are integrated, `main` still
-> contains some of this behavior in the pre-refactor files.
-
 ## Repository layers
 
 Lance has three visible surfaces and a layered Rust core:
@@ -40,11 +29,6 @@ and preserve lifetime semantics; they do not define table behavior. The
 crates own durable metadata, index algorithms, physical file I/O, encoding,
 expression evaluation, and row-selection primitives.
 
-Do not duplicate a lower-layer invariant in a binding or coordinator. For
-example, stable `RowId` values, physical `RowAddress` values, fragment metadata,
-and index coverage keep their existing owners even when several APIs expose
-them.
-
 ## Repository map
 
 The tree below shows the main code entry points. It is intentionally a
@@ -52,42 +36,42 @@ navigation map, not an exhaustive file inventory.
 
 ```text
 lance/
-├── rust/
-│   ├── lance/                         # Dataset API and orchestration
-│   │   └── src/
-│   │       ├── dataset/
-│   │       │   ├── scanner.rs         # Scanner state and public query entry
-│   │       │   ├── scanner/           # builder, plan, source, FTS, vector, ...
-│   │       │   ├── optimize.rs        # compaction workflow entry
-│   │       │   ├── optimize/          # planning, execution, commit
-│   │       │   ├── blob/              # Blob v2 codec and batch rewrite
-│   │       │   ├── write/merge_insert.rs
-│   │       │   ├── write/merge_insert/ # builder, job, merger, fragment update
-│   │       │   ├── mem_wal/write.rs   # MemWAL shard-writer entry
-│   │       │   └── mem_wal/write/     # coordination, replay, handlers, tests
-│   │       └── index/
-│   │           ├── api.rs             # Dataset index public trait
-│   │           ├── lifecycle.rs       # create/drop/merge/commit/optimize entry
-│   │           ├── provenance.rs      # source freshness and coverage
-│   │           ├── loading.rs         # raw listing, cache keys, opening
-│   │           ├── statistics.rs      # descriptions and statistics
-│   │           ├── prewarm.rs         # cache residency and diagnostics
-│   │           ├── segment.rs         # segment metadata/capability rules
-│   │           └── remap.rs           # streaming row-address remapping
-│   ├── lance-table/                   # manifests, transactions, format metadata
-│   ├── lance-index/                   # index formats, builders, scorers, search
-│   ├── lance-file/                    # Lance file reader/writer
-│   ├── lance-encoding/                # column encodings and decoders
-│   ├── lance-io/                      # object stores, scheduling, file I/O
-│   ├── lance-datafusion*/             # DataFusion planning and execution glue
-│   └── lance-select/                  # row addresses, masks, selection plans
-├── python/
-│   ├── python/lance/_dataset/         # Python dataset capability modules
-│   └── src/dataset/                   # PyO3 objects grouped by capability
-├── java/
-│   ├── src/main/java/org/lance/       # public Java API
-│   └── lance-jni/src/blocking_dataset/ # JNI adapters grouped by capability
-└── docs/                              # user and format documentation
+|-- rust/
+|   |-- lance/                         # Dataset API and orchestration
+|   |   `-- src/
+|   |       |-- dataset/
+|   |       |   |-- scanner.rs         # Scanner state and public query entry
+|   |       |   |-- scanner/           # builder, plan, source, FTS, vector, ...
+|   |       |   |-- optimize.rs        # compaction workflow entry
+|   |       |   |-- optimize/          # planning, execution, commit
+|   |       |   |-- blob/              # Blob v2 codec and batch rewrite
+|   |       |   |-- write/merge_insert.rs
+|   |       |   |-- write/merge_insert/ # builder, job, merger, fragment update
+|   |       |   |-- mem_wal/write.rs   # MemWAL shard-writer entry
+|   |       |   `-- mem_wal/write/     # coordination, replay, handlers, tests
+|   |       `-- index/
+|   |           |-- api.rs             # Dataset index public trait
+|   |           |-- lifecycle.rs       # create/drop/merge/commit/optimize entry
+|   |           |-- provenance.rs      # source freshness and coverage
+|   |           |-- loading.rs         # raw listing, cache keys, opening
+|   |           |-- statistics.rs      # descriptions and statistics
+|   |           |-- prewarm.rs         # cache residency and diagnostics
+|   |           |-- segment.rs         # segment metadata/capability rules
+|   |           `-- remap.rs           # streaming row-address remapping
+|   |-- lance-table/                   # manifests, transactions, format metadata
+|   |-- lance-index/                   # index formats, builders, scorers, search
+|   |-- lance-file/                    # Lance file reader/writer
+|   |-- lance-encoding/                # column encodings and decoders
+|   |-- lance-io/                      # object stores, scheduling, file I/O
+|   |-- lance-datafusion*/             # DataFusion planning and execution glue
+|   `-- lance-select/                  # row addresses, masks, selection plans
+|-- python/
+|   |-- python/lance/_dataset/         # Python dataset capability modules
+|   `-- src/dataset/                   # PyO3 objects grouped by capability
+|-- java/
+|   |-- src/main/java/org/lance/       # public Java API
+|   `-- lance-jni/src/blocking_dataset/ # JNI adapters grouped by capability
+`-- docs/                              # user and format documentation
 ```
 
 ## Shared types and invariants
@@ -127,10 +111,9 @@ entry points. The child modules divide the query pipeline by responsibility:
   uncovered-row fallback.
 - `scanner/aggregate.rs` owns aggregate expression construction and lowering.
 
-The scanner chooses among these plans; `io::exec` nodes perform the chosen
-physical work. Query state, row identity, deletion visibility, and overlay
-correctness must be validated in the scanner before an index-backed source
-replaces a scan.
+The scanner selects and composes a source with the coverage, row identity,
+deletion, and overlay handling required by the query. `io::exec` nodes execute
+the selected plan and apply row filters and masks while streaming.
 
 ### FTS execution
 
@@ -222,8 +205,8 @@ Adjacent modules own independent parts of one persistent writer lifecycle:
   admission control.
 - `tasks.rs` and `handlers.rs` own ordered background dispatch and WAL, index,
   and memtable-flush handlers.
-- `schema.rs` derives the storage schema and validates incoming or replayed
-  batches before they can become durable.
+- `schema.rs` derives the storage schema, validates incoming writes, and shapes
+  rows and tombstones for persistence.
 - `replay.rs` reconstructs memtables and resumes cursors from the WAL.
 - `stats.rs` exposes snapshots of write, WAL, and memtable state.
 
@@ -277,7 +260,7 @@ Tests stay with the contract they protect:
 | Compaction | `dataset/optimize/tests/` grouped by planning, execution, commit, overlays, lineage, indexes, vectors, and Blob behavior |
 | Blob rewrite | Unit tests in `dataset/blob/rewrite.rs` and compaction-path tests in `dataset/optimize/tests/blob.rs` |
 | Dataset indexes | Private-state tests beside each index owner module; cross-module behavior in `index/tests/` grouped by create, lifecycle, loading, merge, nested fields, optimize, and statistics |
-| Merge-insert | `dataset/write/merge_insert/tests/` grouped by basic semantics, concurrency, plans, indexed paths, subcolumns, types, and lineage |
+| Merge-insert | Job-owned planning, unit-state, indexed, and lineage tests in `dataset/write/merge_insert/job/tests/`; public operation, concurrency, semantics, deferred-condition, subcolumn, and type tests in `dataset/write/merge_insert/tests/` |
 | MemWAL writes | Tests beside owner modules plus `dataset/mem_wal/write/tests/` for end-to-end writes, WAL replay, schema evolution, and integration |
 | Python API and PyO3 | Python tests grouped by user capability, plus Rust binding tests where FFI conversion or lifetime behavior is the contract |
 | Java API and JNI | Java suites by capability, plus JNI-local tests for native conversion and error behavior |
