@@ -3154,28 +3154,58 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let prepare_parallelism = get_num_compute_intensive_cpus().max(1);
         let raw_query_context = self.prepare_rq_raw_query_context(&query.key)?;
 
-        if control.is_none() && S::supports_global_topk_heap() {
-            if let Some(strategy) = &self.rabit_scan {
-                let erased: Arc<dyn std::any::Any + Send + Sync> = self.clone();
-                if let Ok(index) = erased.downcast::<IVFIndex<FlatIndex, RabitQuantizer>>() {
-                    let context = Arc::new(RabitScanContext::new(
-                        index,
-                        raw_query_context.clone(),
-                        query.clone(),
-                        partitions.clone(),
-                        q_c_dists.clone(),
-                        start_idx..end_idx,
-                        pre_filter.clone(),
-                        metrics.clone(),
-                    ));
-                    if let Some(batch) = strategy.search(context).await? {
+        if S::supports_global_topk_heap()
+            && let Some(strategy) = &self.rabit_scan
+        {
+            let erased: Arc<dyn std::any::Any + Send + Sync> = self.clone();
+            if let Ok(index) = erased.downcast::<IVFIndex<FlatIndex, RabitQuantizer>>() {
+                let context = Arc::new(RabitScanContext::new(
+                    index,
+                    raw_query_context.clone(),
+                    query.clone(),
+                    partitions.clone(),
+                    q_c_dists.clone(),
+                    start_idx..end_idx,
+                    pre_filter.clone(),
+                    metrics.clone(),
+                ));
+                if let Some(control) = &control {
+                    if control.should_stop() {
                         return Ok(Box::pin(RecordBatchStreamAdapter::new(
                             VECTOR_RESULT_SCHEMA.clone(),
-                            stream::once(async move { Ok(batch) }),
+                            stream::empty(),
                         )));
                     }
+                    let factor = query.refine_factor.unwrap_or(1);
+                    if factor == 0 {
+                        return Err(Error::invalid_input(
+                            "refine_factor must be positive, got 0",
+                        ));
+                    }
+                    let candidate_limit =
+                        query.k.checked_mul(factor as usize).ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "RaBitQ candidate count overflow: k={}, refine_factor={factor}",
+                                query.k
+                            ))
+                        })?;
+                    if let Some(batches) = strategy.search_partition_stream(context)? {
+                        return rabit_scan::controlled_partition_stream(
+                            batches,
+                            end_idx - start_idx,
+                            candidate_limit,
+                            control.clone(),
+                        );
+                    }
+                } else if let Some(batch) = strategy.search(context).await? {
+                    return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                        VECTOR_RESULT_SCHEMA.clone(),
+                        stream::once(async move { Ok(batch) }),
+                    )));
                 }
             }
+        }
+        if control.is_none() && S::supports_global_topk_heap() {
             let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
             {
                 let _wait_timer = IndexTimer::new(metrics.as_ref(), IndexTiming::PrefilterWait);
