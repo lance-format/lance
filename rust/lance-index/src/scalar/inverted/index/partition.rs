@@ -474,21 +474,18 @@ struct PositionMatchSummary {
 
 #[derive(Debug, Clone, Copy)]
 pub(in super::super) struct PostingLoadOptions {
-    force_global_scorer: bool,
     read_policy: PostingReadPolicy,
 }
 
 impl PostingLoadOptions {
-    pub(super) const fn read_ahead(force_global_scorer: bool) -> Self {
+    pub(super) const fn read_ahead() -> Self {
         Self {
-            force_global_scorer,
             read_policy: PostingReadPolicy::ReadAhead,
         }
     }
 
-    pub(in super::super) const fn cache_aware_exact(force_global_scorer: bool) -> Self {
+    pub(in super::super) const fn cache_aware_exact() -> Self {
         Self {
-            force_global_scorer,
             read_policy: PostingReadPolicy::CacheAwareExact,
         }
     }
@@ -1344,10 +1341,8 @@ impl InvertedPartition {
     // return the doc info and the doc length
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
     //
-    // `force_global_scorer` is used by compound search, where leaf scores and
-    // bounds must share corpus-level statistics before the global collector
-    // can safely propagate its threshold. Standard leaf search also routes
-    // no-impact postings through scorer-derived corpus-global upper bounds.
+    // Query weights always come from `impact_scorer`, which holds corpus-global
+    // statistics, so compound leaves and standard leaves agree on IDF.
     pub(in super::super) async fn load_posting_lists(
         &self,
         tokens: &Tokens,
@@ -1355,7 +1350,6 @@ impl InvertedPartition {
         operator: Operator,
         impact_scorer: &MemBM25Scorer,
         metrics: &dyn MetricsCollector,
-        force_global_scorer: bool,
     ) -> Result<LoadedPostings> {
         self.load_posting_lists_with_policy(
             tokens,
@@ -1363,7 +1357,7 @@ impl InvertedPartition {
             operator,
             impact_scorer,
             metrics,
-            PostingLoadOptions::read_ahead(force_global_scorer),
+            PostingLoadOptions::read_ahead(),
         )
         .await
     }
@@ -1402,7 +1396,6 @@ impl InvertedPartition {
         term_ids: Option<PartitionTermIds<'_>>,
     ) -> Result<Option<FetchedPostings>> {
         let PostingLoadOptions {
-            force_global_scorer,
             read_policy: requested_read_policy,
         } = options;
         let is_phrase_query = params.phrase_slop.is_some();
@@ -1518,7 +1511,6 @@ impl InvertedPartition {
             is_and_query,
             is_phrase_query,
             exact_scoring_required,
-            force_global_scorer,
             docs_for_union,
         }))
     }
@@ -1696,7 +1688,6 @@ pub(super) struct FetchedPostings {
     is_and_query: bool,
     is_phrase_query: bool,
     exact_scoring_required: bool,
-    force_global_scorer: bool,
     /// Scoring lengths for unioning same-position postings, when any exist.
     docs_for_union: Option<LoadedDocLengths>,
 }
@@ -1715,7 +1706,6 @@ impl FetchedPostings {
             is_and_query,
             is_phrase_query,
             exact_scoring_required,
-            force_global_scorer,
             docs_for_union,
         } = self;
         if docs_for_union.is_none() {
@@ -1740,12 +1730,7 @@ impl FetchedPostings {
                     .map(|(token_id, token_index, position, posting)| {
                         let token = tokens.get_token(token_index);
                         let needs_scorer_upper_bound = !posting.has_impacts();
-                        let query_weight =
-                            if impact_safe || exact_scoring_required || force_global_scorer {
-                                impact_scorer.query_weight(token)
-                            } else {
-                                idf(posting.len(), num_docs)
-                            };
+                        let query_weight = impact_scorer.query_weight(token);
                         let posting = PostingIterator::with_query_weight(
                             token.to_owned(),
                             token_id,
