@@ -19,7 +19,7 @@ mod match_query;
 mod matches;
 mod phrase;
 mod query_tokens;
-mod segments;
+pub(crate) mod segments;
 mod selection;
 
 pub use boolean::{
@@ -34,7 +34,6 @@ pub use flat_combined_fields::{FlatCombinedFieldsExec, FlatStatsCoverage, FlatSt
 pub use flat_match::{FlatMatchFilterExec, FlatMatchQueryExec};
 pub use match_query::MatchQueryExec;
 pub use phrase::PhraseQueryExec;
-pub(crate) use segments::open_fts_segments_without_coverage;
 pub use selection::{FTS_SEGMENT_BIND_DURATION_METRIC, FtsIndexMetrics};
 
 #[cfg(test)]

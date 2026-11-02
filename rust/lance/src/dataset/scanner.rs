@@ -120,11 +120,12 @@ use crate::index::vector::utils::{
 use crate::io::exec::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadThreadingMode, filter_read_columns,
 };
+use crate::io::exec::fts::segments::open_fts_segments_without_coverage;
 use crate::io::exec::fts::{
     BoostQueryExec, CombinedFieldsQueryExec, CompoundQueryExec, CrossColumnCompoundQueryExec,
     FlatCombinedFieldsExec, FlatMatchFilterExec, FlatMatchQueryExec, FlatStatsCoverage,
     FlatStatsScope, FtsDocumentExec, HybridCompoundQueryExec, MatchQueryExec, PhraseQueryExec,
-    SharedFtsScorer, SharedFtsScorerExec, open_fts_segments_without_coverage,
+    SharedFtsScorer, SharedFtsScorerExec,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
