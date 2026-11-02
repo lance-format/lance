@@ -567,6 +567,77 @@ mod tests {
         assert_eq!(blobs[3].as_ref().unwrap().size(), 0);
     }
 
+    /// Blob v2 nests only in Struct and List, so legacy blob input in a Map or
+    /// FixedSizeList, which 2.2 promotes to Blob v2, is rejected as unsupported
+    /// instead of failing on the unprepared array.
+    #[rstest]
+    #[case::map(true)]
+    #[case::fixed_size_list(false)]
+    #[tokio::test]
+    async fn test_legacy_blob_in_map_or_fixed_size_list_is_rejected_at_v2_2(#[case] map: bool) {
+        use arrow_array::{FixedSizeListArray, LargeBinaryArray, MapArray, StructArray};
+        use arrow_buffer::OffsetBuffer;
+
+        let blob = ArrowField::new("value", DataType::LargeBinary, true).with_metadata(
+            std::collections::HashMap::from([(
+                lance_arrow::BLOB_META_KEY.to_string(),
+                "true".to_string(),
+            )]),
+        );
+        let blobs = Arc::new(LargeBinaryArray::from(vec![Some(b"v".as_slice())]));
+        let column: arrow_array::ArrayRef = if map {
+            let key = ArrowField::new("key", DataType::Utf8, false);
+            let fields: arrow_schema::Fields = vec![key, blob].into();
+            Arc::new(MapArray::new(
+                Arc::new(ArrowField::new(
+                    "entries",
+                    DataType::Struct(fields.clone()),
+                    false,
+                )),
+                OffsetBuffer::from_lengths([1]),
+                StructArray::new(
+                    fields,
+                    vec![Arc::new(StringArray::from(vec!["k"])), blobs],
+                    None,
+                ),
+                None,
+                false,
+            ))
+        } else {
+            let fields: arrow_schema::Fields = vec![blob].into();
+            Arc::new(FixedSizeListArray::new(
+                Arc::new(ArrowField::new(
+                    "item",
+                    DataType::Struct(fields.clone()),
+                    true,
+                )),
+                1,
+                Arc::new(StructArray::new(fields, vec![blobs], None)),
+                None,
+            ))
+        };
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "nested",
+            column.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+        let params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        let test_dir = TempStrDir::default();
+        let err = FragmentCreateBuilder::new(&test_dir)
+            .write_params(&params)
+            .write(RecordBatchIterator::new([Ok(batch)], schema), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::NotSupported { .. }) && err.to_string().contains("'nested'"),
+            "{err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_fragment_write_with_schema() {
         // Uses provided schema. Field ids are correct in fragment metadata.

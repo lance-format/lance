@@ -315,6 +315,25 @@ impl BlobPreprocessField {
             }
         }
 
+        // Blob v2 nests only in Struct and List: the readers, the external URI
+        // checks and the Managed reference scans walk no other container. Every
+        // 2.2+ data file writer prepares its input here, so reject the column up front
+        // rather than let the writer fail on an unprepared array or commit a
+        // column the rest of the format cannot read.
+        let container = match field.data_type() {
+            ArrowDataType::Map(child, _) => Some(("Map", child)),
+            ArrowDataType::FixedSizeList(child, _) => Some(("FixedSizeList", child)),
+            _ => None,
+        };
+        if let Some((container, child)) = container
+            && Self::new(child.as_ref())?.requires_preprocessing()
+        {
+            return Err(Error::not_supported(format!(
+                "Blob v2 fields nested in {container} field '{}' are not supported; Blob v2 can be nested only in Struct, List and LargeList (legacy blob input is stored as Blob v2 from file version 2.2)",
+                field.name()
+            )));
+        }
+
         Ok(Self {
             kind: BlobPreprocessFieldKind::Passthrough,
         })
