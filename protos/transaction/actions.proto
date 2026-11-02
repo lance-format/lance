@@ -410,10 +410,16 @@ message AddOverlays {
 }
 
 /*
- * Restamp every row of each listed fragment as updated by this commit: every
- * row's last_updated_at_version becomes the commit version, replacing an
- * inline or spilled sequence with an inline uniform one. created_at versions
- * are untouched.
+ * Restamp the selected rows as updated by this commit: each selected row's
+ * last_updated_at_version becomes the commit version. created_at versions are
+ * untouched.
+ *
+ * A full selection replaces the fragment's sequence, inline or spilled, with
+ * an inline uniform one. An offsets selection keeps every unselected row's
+ * version and writes the result inline; a fragment with no sequence gets one,
+ * with unselected rows at version 1, the version a reader assumes for a row
+ * with no sequence. Offsets must be below the fragment's physical row count,
+ * and an offsets selection must not be empty.
  *
  * Explicit because how many rows a change restamps is not implied by the
  * file it writes: a partial update can write a whole-fragment column file
@@ -421,7 +427,8 @@ message AddOverlays {
  * no file at all.
  */
 message RefreshRowVersionMetadata {
-  repeated uint64 fragment_ids = 1;
+  // The rows to restamp, one entry per committed fragment.
+  repeated RowSelection rows = 1;
 }
 
 /*
