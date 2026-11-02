@@ -112,10 +112,11 @@ impl MiniBlockCompressor for PcodecMiniBlockEncoder {
 }
 
 /// Number of rows per chunk: the largest power of two whose uncompressed size
-/// fits [`TARGET_CHUNK_BYTES`], at least one row and at most
-/// [`MAX_MINIBLOCK_VALUES`].
+/// fits [`TARGET_CHUNK_BYTES`], at least two rows and at most
+/// [`MAX_MINIBLOCK_VALUES`]. A non-final chunk cannot hold one row because
+/// `log_num_values == 0` marks the final chunk.
 fn rows_per_chunk(bytes_per_row: u64) -> u64 {
-    let mut rows = 1;
+    let mut rows = 2;
     while rows * 2 * bytes_per_row <= TARGET_CHUNK_BYTES && rows * 2 <= *MAX_MINIBLOCK_VALUES {
         rows *= 2;
     }
@@ -445,7 +446,7 @@ mod tests {
         assert_eq!(rows_per_chunk(4), *MAX_MINIBLOCK_VALUES);
         assert_eq!(rows_per_chunk(3 * 4), 2048);
         assert_eq!(rows_per_chunk(64 * 8), 64);
-        assert_eq!(rows_per_chunk(TARGET_CHUNK_BYTES + 1), 1);
+        assert_eq!(rows_per_chunk(TARGET_CHUNK_BYTES + 1), 2);
 
         let (compressed, _) = compress(page(64, &[64], 130));
         let log_rows: Vec<u8> = compressed.chunks.iter().map(|c| c.log_num_values).collect();
