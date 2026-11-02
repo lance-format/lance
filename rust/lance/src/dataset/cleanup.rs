@@ -62,7 +62,7 @@ use lance_table::{
     feature_flags::{
         ensure_can_read_manifest, ensure_can_write_manifest, validate_auto_cleanup_config,
     },
-    format::{BasePath, IndexMetadata, Manifest, is_detached_version},
+    format::{BasePath, Fragment, IndexMetadata, Manifest, is_detached_version},
     io::{
         commit::{ManifestLocation, ManifestNamingScheme, read_version_hint},
         deletion::deletion_file_path,
@@ -485,6 +485,8 @@ struct CleanupInspection {
     /// entry uuid so each is decoded at most once; the flag records whether
     /// some retained (working-set) manifest carries the entry.
     frag_reuse_entries: HashMap<uuid::Uuid, (IndexMetadata, bool)>,
+    /// The `frag_reuse_entries` some attached manifest carries.
+    attached_frag_reuse_entries: HashSet<uuid::Uuid>,
     /// Set when a branch manifest's FRI history could not be interpreted:
     /// `_fri/` garbage collection is skipped for the run rather than risking
     /// row maps the branch references invisibly.
@@ -524,6 +526,94 @@ impl CleanupInspection {
             (Some(retained), Some(deleted)) if deleted > retained => None,
             (retained, _) => retained,
         }
+    }
+}
+
+/// Whether `error` reading the manifest at `location` under `base` means a
+/// detached version was removed after it was listed. Nothing removes a detached
+/// manifest at its canonical path but its owner, and a detached version without
+/// one cannot be checked out, so none of its files need keeping.
+fn is_removed_detached_version(location: &ManifestLocation, base: &Path, error: &Error) -> bool {
+    is_detached_version(location.version)
+        && location.path == ManifestNamingScheme::V2.manifest_path(base, location.version)
+        && error.is_not_found()
+}
+
+/// The files a scan of a fragment's blob descriptors reads from the dataset's own
+/// base: its deletion file and every data file holding a blob field. A file in
+/// another base is `None`.
+struct BlobDescriptorFiles {
+    deletion: Option<Path>,
+    data: Vec<Option<Path>>,
+}
+
+impl BlobDescriptorFiles {
+    fn new(dataset: &Dataset, fragment: &Fragment, blob_field_ids: &[i32]) -> Self {
+        let deletion = fragment
+            .deletion_file
+            .as_ref()
+            .filter(|deletion| deletion.base_id.is_none() && deletion.inline.is_none())
+            .map(|deletion| deletion_file_path(&dataset.base, fragment.id, deletion));
+        let data = fragment
+            .files
+            .iter()
+            .filter(|file| file.fields.iter().any(|id| blob_field_ids.contains(id)))
+            .map(|file| {
+                file.base_id
+                    .is_none()
+                    .then(|| dataset.data_dir().join(file.path.as_str()))
+            })
+            .collect();
+        Self { deletion, data }
+    }
+
+    /// Whether the descriptors can no longer be read: the deletion file is gone, or
+    /// so is every data file holding a blob field. A file in another base counts
+    /// as present.
+    async fn removed(&self, store: &ObjectStore) -> Result<bool> {
+        if let Some(deletion) = &self.deletion
+            && !store.exists(deletion).await?
+        {
+            return Ok(true);
+        }
+        if self.data.is_empty() {
+            return Ok(false);
+        }
+        for path in &self.data {
+            match path {
+                Some(path) if !store.exists(path).await? => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// A file missing from the managed blob scan of a detached version. Removing the
+/// version's manifest drops the version and lets cleanup run. Reported as an IO
+/// error; `is_not_found()` still sees the missing file through its source.
+#[derive(Debug)]
+struct DetachedBlobScanError {
+    version: u64,
+    fragment_id: usize,
+    manifest: Path,
+    source: Error,
+}
+
+impl std::fmt::Display for DetachedBlobScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot read the managed blobs of fragment {} of detached version {}: {}. \
+             Remove {} if the version is no longer needed",
+            self.fragment_id, self.version, self.source, self.manifest
+        )
+    }
+}
+
+impl std::error::Error for DetachedBlobScanError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }
 
@@ -984,9 +1074,7 @@ impl<'a> CleanupTask<'a> {
     ) -> Result<CleanupInspection> {
         let branch_versions = inspection.branch_referenced_versions.clone();
         let inspection = Mutex::new(inspection);
-        self.dataset
-            .commit_handler
-            .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
+        self.manifest_locations(&self.dataset.base)
             .try_filter(|location| future::ready(!self.ignored_manifests.contains(&location.path)))
             .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
                 self.process_manifest_file(
@@ -1016,6 +1104,32 @@ impl<'a> CleanupTask<'a> {
             )
             .await?;
         Ok(inspection.into_inner().unwrap())
+    }
+
+    /// The manifests under `base`, detached ones included. A detached version is
+    /// outside the version history, so it never expires, but whoever committed it
+    /// can still check it out.
+    fn manifest_locations<'b>(
+        &'b self,
+        base: &'b Path,
+    ) -> stream::BoxStream<'b, Result<ManifestLocation>> {
+        let commit_handler = &self.dataset.commit_handler;
+        let object_store = &self.dataset.object_store;
+        // A staging copy of a detached manifest shares its name prefix and is deleted
+        // once the commit is finalized, so only the canonical path is read. A version
+        // that exists only as a staging copy named by its external store record is
+        // protected only if the store lists it with the attached manifests.
+        let detached = commit_handler
+            .list_detached_manifest_locations(base, object_store)
+            .try_filter(move |location| {
+                future::ready(
+                    location.path == ManifestNamingScheme::V2.manifest_path(base, location.version),
+                )
+            });
+        commit_handler
+            .list_manifest_locations(base, object_store, false)
+            .chain(detached)
+            .boxed()
     }
 
     async fn inspect_managed_blobs(
@@ -1049,6 +1163,11 @@ impl<'a> CleanupTask<'a> {
             .collect::<Vec<_>>();
         bases.sort_unstable();
         let owner_base_ids = self.parent_base_ids(&dataset.manifest);
+        // Earlier releases removed files that only detached versions referenced. When
+        // a detached fragment's blob descriptors cannot be read, this version stops
+        // protecting that fragment's managed blobs instead of failing every cleanup.
+        let detached_manifest = is_detached_version(dataset.manifest.version)
+            .then(|| dataset.manifest_location().path.clone());
         stream::iter(dataset.get_fragments())
             .map(|fragment| {
                 let key = ManagedScanKey {
@@ -1070,6 +1189,13 @@ impl<'a> CleanupTask<'a> {
                     .or_default()
                     .clone();
                 let scan_owner_base_ids = owner_base_ids.clone();
+                let descriptor_files = detached_manifest
+                    .is_some()
+                    .then(|| BlobDescriptorFiles::new(dataset, &fragment.metadata, &field_ids));
+                let detached_manifest = detached_manifest.clone();
+                let version = dataset.manifest.version;
+                let fragment_id = fragment.id();
+                let store = dataset.object_store.clone();
                 async move {
                     let scanned = cell
                         .get_or_try_init(|| async {
@@ -1118,12 +1244,36 @@ impl<'a> CleanupTask<'a> {
                             }
                             Ok::<_, Error>(found)
                         })
-                        .await;
+                        .await
+                        .copied();
                     match scanned {
-                        Ok(has_paths) => Ok(*has_paths),
+                        Ok(has_paths) => Ok(has_paths),
                         // An expired descriptor can disappear during concurrent cleanup.
                         // Leave failed cells uninitialized so subsequent scans can retry.
                         Err(error) if !retained && error.is_not_found() => Ok(false),
+                        Err(error) if error.is_not_found() => {
+                            match (descriptor_files, detached_manifest) {
+                                (Some(files), _) if files.removed(&store).await? => {
+                                    warn!(
+                                        version,
+                                        fragment_id,
+                                        error = %error,
+                                        "Not protecting the managed blobs of a detached version's \
+                                         fragment whose blob descriptors cannot be read"
+                                    );
+                                    Ok(false)
+                                }
+                                (_, Some(manifest)) => {
+                                    Err(Error::io_source(Box::new(DetachedBlobScanError {
+                                        version,
+                                        fragment_id,
+                                        manifest,
+                                        source: error,
+                                    })))
+                                }
+                                _ => Err(error),
+                            }
+                        }
                         Err(error) => Err(error),
                     }
                 }
@@ -1194,6 +1344,14 @@ impl<'a> CleanupTask<'a> {
         .await;
         let (manifest, indexes) = match manifest_and_indexes {
             Ok(manifest_and_indexes) => manifest_and_indexes,
+            Err(error) if is_removed_detached_version(&location, &self.dataset.base, &error) => {
+                debug!(
+                    manifest_version = location.version,
+                    manifest_path = %location.path,
+                    "Skipping detached manifest removed after it was listed"
+                );
+                return Ok(());
+            }
             Err(error) if location.version < self.read_version && error.is_not_found() => {
                 // Another cleanup may remove an old manifest after this cleanup lists it.
                 // The current manifest is never safe to skip because it anchors our snapshot.
@@ -1217,11 +1375,14 @@ impl<'a> CleanupTask<'a> {
         };
         // Don't delete the latest version, even if it is old. Don't delete tagged versions,
         // regardless of age. Don't delete manifests if their version is newer than the dataset
-        // version.  These are either in-progress or newly added since we started.
+        // version.  These are either in-progress or newly added since we started. Detached
+        // versions never expire.
+        let is_detached = is_detached_version(manifest.version);
         let is_latest = self.read_version <= manifest.version;
         let (hard_expired, thinning_candidate) = self.cleanup_candidates(&manifest);
         let is_tagged = tagged_versions.contains(&manifest.version);
-        let in_working_set = retain_bucket_survivor
+        let in_working_set = is_detached
+            || retain_bucket_survivor
             || is_latest
             || !(hard_expired || thinning_candidate.is_some())
             || is_tagged
@@ -1282,9 +1443,13 @@ impl<'a> CleanupTask<'a> {
                 inspection.old_manifests.remove(&location.path);
                 inspection.retired_records.remove(&manifest.version);
             }
-            match inspection.earliest_retained_manifest_time {
-                Some(ts) if commit_ts >= ts => {}
-                _ => inspection.earliest_retained_manifest_time = Some(commit_ts),
+            // Detached versions do not move the retained-manifest cutoff; their own
+            // files are referenced either way.
+            if !is_detached {
+                match inspection.earliest_retained_manifest_time {
+                    Some(ts) if commit_ts >= ts => {}
+                    _ => inspection.earliest_retained_manifest_time = Some(commit_ts),
+                }
             }
         }
         Ok(())
@@ -1344,6 +1509,9 @@ impl<'a> CleanupTask<'a> {
                     .entry(index.uuid)
                     .or_insert_with(|| (index.clone(), false));
                 entry.1 |= in_working_set;
+                if !is_detached_version(manifest.version) {
+                    inspection.attached_frag_reuse_entries.insert(index.uuid);
+                }
             }
         }
         Ok(())
@@ -1407,6 +1575,20 @@ impl<'a> CleanupTask<'a> {
                         &mut inspection.verified_files
                     };
                     target.frag_reuse_map_ids.extend(map_ids);
+                }
+                // Earlier releases removed files that only detached versions referenced.
+                // A detached version cannot read an entry whose content is gone, so its
+                // row maps need no protection from it.
+                Err(error)
+                    if error.is_not_found()
+                        && !inspection.attached_frag_reuse_entries.contains(uuid) =>
+                {
+                    warn!(
+                        entry_uuid = %uuid,
+                        error = %error,
+                        "Skipping a fragment reuse index entry of detached versions whose \
+                         content is missing"
+                    );
                 }
                 Err(error) => {
                     warn!(
@@ -2203,9 +2385,7 @@ impl<'a> CleanupTask<'a> {
             // This avoids creating a dataset instance and prevents manifest deletion
             // during the retain operation.
             let branch_location = self.dataset.branch_location().find_branch(Some(branch))?;
-            self.dataset
-                .commit_handler
-                .list_manifest_locations(&branch_location.path, &self.dataset.object_store, false)
+            self.manifest_locations(&branch_location.path)
                 .try_filter(|location| {
                     future::ready(!removed_branch_manifests.contains(&location.path))
                 })
@@ -2364,7 +2544,18 @@ impl<'a> CleanupTask<'a> {
         inspection: &Mutex<CleanupInspection>,
     ) -> Result<()> {
         let manifest =
-            read_manifest(&self.dataset.object_store, &location.path, location.size).await?;
+            match read_manifest(&self.dataset.object_store, &location.path, location.size).await {
+                Ok(manifest) => manifest,
+                Err(error) if is_removed_detached_version(&location, branch_root, &error) => {
+                    debug!(
+                        manifest_version = location.version,
+                        manifest_path = %location.path,
+                        "Skipping branch detached manifest removed after it was listed"
+                    );
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
         ensure_can_read_manifest(&manifest)?;
         ensure_can_write_manifest(&manifest)?;
         let managed_referenced = if manifest.has_managed_blobs() {
@@ -2401,6 +2592,14 @@ impl<'a> CleanupTask<'a> {
                     .await
                 {
                     Ok(map_ids) => branch_parent_map_ids.extend(map_ids),
+                    Err(error) if is_detached_version(manifest.version) && error.is_not_found() => {
+                        warn!(
+                            entry_uuid = %index.uuid,
+                            error = %error,
+                            "Skipping a fragment reuse index entry of a branch's detached \
+                             version whose content is missing"
+                        );
+                    }
                     Err(error) => {
                         warn!(
                             entry_uuid = %index.uuid,
@@ -3015,8 +3214,8 @@ mod tests {
     use crate::{
         dataset::transaction::{Operation, Transaction},
         dataset::{
-            AutoCleanupParams, CommitBuilder, DeleteBuilder, ReadParams, WriteMode, WriteParams,
-            builder::DatasetBuilder,
+            AutoCleanupParams, CommitBuilder, DeleteBuilder, InsertBuilder, NewColumnTransform,
+            ReadParams, WriteMode, WriteParams, builder::DatasetBuilder,
         },
         index::vector::VectorIndexParams,
     };
@@ -3562,6 +3761,7 @@ mod tests {
     #[case::unprotected(None)]
     #[case::tag(Some("tag"))]
     #[case::branch(Some("branch"))]
+    #[case::detached(Some("detached"))]
     #[tokio::test]
     async fn managed_cleanup_preserves_protected_rows(
         #[case] protection: Option<&str>,
@@ -3598,6 +3798,10 @@ mod tests {
                     .await
                     .unwrap(),
             ),
+            Some("detached") => {
+                let version = commit_detached_delete(&Arc::new(dataset.clone()), "id = 1").await;
+                Some(dataset.checkout_version(version).await.unwrap())
+            }
             _ => None,
         };
         dataset.delete("id = 0").await.unwrap();
@@ -6476,6 +6680,485 @@ mod tests {
             fixture.open().await.unwrap().version_id(),
             dataset.version_id()
         );
+    }
+
+    fn id_batch(start: i32) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "id",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from_iter_values(start..start + 100))],
+        )
+        .unwrap()
+    }
+
+    /// Commits a detached version of `dataset` that deletes the rows matching
+    /// `predicate`, returning its version.
+    async fn commit_detached_delete(dataset: &Arc<Dataset>, predicate: &str) -> u64 {
+        let delete = DeleteBuilder::new(dataset.clone(), predicate)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        CommitBuilder::new(dataset.clone())
+            .with_detached(true)
+            .execute(delete.transaction)
+            .await
+            .unwrap()
+            .version_id()
+    }
+
+    async fn scanned_rows(dataset: &Dataset, version: u64) -> usize {
+        let checked_out = dataset.checkout_version(version).await.unwrap();
+        checked_out
+            .scan()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows()
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn cleanup_keeps_files_of_detached_versions(
+        #[values(false, true)] delete_unverified: bool,
+        #[values(false, true)] by_version: bool,
+    ) {
+        MockClock::set_system_time(std::time::Duration::ZERO);
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let batch = id_batch(0);
+        fixture
+            .create_with_data(RecordBatchIterator::new(
+                [Ok(batch.clone())],
+                batch.schema(),
+            ))
+            .await
+            .unwrap();
+        let dataset = Arc::new(*fixture.open().await.unwrap());
+
+        // One detached version deletes rows of the first version's data file, so
+        // it also needs a deletion file; the other appends a data file of its own.
+        let deleted = commit_detached_delete(&dataset, "id < 10").await;
+        let append = InsertBuilder::new(dataset.clone())
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![id_batch(100)])
+            .await
+            .unwrap();
+        let appended = CommitBuilder::new(dataset.clone())
+            .with_detached(true)
+            .execute(append)
+            .await
+            .unwrap()
+            .version_id();
+        assert!(is_detached_version(deleted) && is_detached_version(appended));
+
+        // The first version expires, and every file is past the age threshold.
+        fixture.overwrite_some_data().await.unwrap();
+        MockClock::set_system_time(TimeDelta::days(10).to_std().unwrap());
+        // A version cutoff above every detached version lets an unverified cleanup
+        // expire manifests from the listing alone.
+        let policy = CleanupPolicy {
+            before_timestamp: (!by_version).then(utc_now),
+            before_version: by_version.then_some(u64::MAX),
+            delete_unverified,
+            ..Default::default()
+        };
+        let removed = fixture.run_cleanup_with_policy(policy).await.unwrap();
+        assert_eq!(removed.old_versions, 1);
+
+        assert_eq!(scanned_rows(&dataset, deleted).await, 90);
+        assert_eq!(scanned_rows(&dataset, appended).await, 200);
+        assert_eq!(dataset.list_detached_manifests().await.unwrap().len(), 2);
+    }
+
+    /// A detached version only adds files to keep: it does not move the cutoff of
+    /// the `_transactions/` and `_deletions/` listings, even when it is older than
+    /// every retained version.
+    #[rstest]
+    #[tokio::test]
+    async fn cleanup_with_a_detached_version_only_keeps_more(
+        #[values(false, true)] delete_unverified: bool,
+    ) {
+        let day = |days: f64| std::time::Duration::from_secs_f64(days * 86_400.0);
+        MockClock::set_system_time(day(0.0));
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let dataset = Arc::new(*fixture.open().await.unwrap());
+        let detached = commit_detached_delete(&dataset, "true").await;
+        MockClock::set_system_time(day(1.0));
+        fixture.overwrite_some_data().await.unwrap();
+        MockClock::set_system_time(day(2.0));
+        fixture.overwrite_some_data().await.unwrap();
+        // Orphans newer than the oldest retained version.
+        MockClock::set_system_time(day(2.5));
+        for path in [
+            dataset.deletions_dir().join("0-9-99.arrow"),
+            dataset.transactions_dir().join("9-orphan.txn"),
+        ] {
+            dataset.object_store.put(&path, b"orphan").await.unwrap();
+        }
+
+        MockClock::set_system_time(day(10.0));
+        let policy = CleanupPolicy {
+            before_timestamp: Some(DateTime::UNIX_EPOCH + day(1.5)),
+            delete_unverified,
+            ..Default::default()
+        };
+        let candidates = || async {
+            let dataset = fixture.open().await.unwrap();
+            dataset
+                .cleanup(policy.clone())
+                .with_max_candidate_files(usize::MAX)
+                .explain()
+                .await
+                .unwrap()
+                .candidate_files
+                .into_iter()
+                .map(|file| file.path)
+                .collect::<BTreeSet<_>>()
+        };
+        let with_detached = candidates().await;
+        dataset
+            .object_store
+            .delete(&ManifestNamingScheme::V2.manifest_path(&dataset.base, detached))
+            .await
+            .unwrap();
+        let without_detached = candidates().await;
+        assert!(
+            with_detached.is_subset(&without_detached) && with_detached != without_detached,
+            "{with_detached:?} is not a strict subset of {without_detached:?}"
+        );
+    }
+
+    /// A data file an earlier release removed: cleanup still runs when only a
+    /// detached version holds it, and fails when the latest version does, including
+    /// a fragment the latest version shares with a detached one.
+    #[rstest]
+    #[case::detached(true, false)]
+    #[case::latest(false, false)]
+    #[case::shared(true, true)]
+    #[tokio::test]
+    async fn managed_cleanup_with_missing_files(#[case] detached: bool, #[case] shared: bool) {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let params = || WriteParams {
+            mode: WriteMode::Append,
+            store_params: Some(fixture.os_params()),
+            data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        let batch = managed_blob_batch();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                &fixture.dataset_path,
+                Some(WriteParams {
+                    mode: WriteMode::Create,
+                    ..params()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let append = InsertBuilder::new(dataset.clone())
+            .with_params(&params())
+            .execute_uncommitted(vec![managed_blob_batch()])
+            .await
+            .unwrap();
+        let appended = CommitBuilder::new(dataset.clone())
+            .with_detached(detached)
+            .execute(append)
+            .await
+            .unwrap();
+        let fragments = &appended.manifest.fragments;
+        let fragment = if shared {
+            fragments.first()
+        } else {
+            fragments.last()
+        }
+        .unwrap();
+        dataset
+            .object_store
+            .delete(&dataset.data_dir().join(fragment.files[0].path.as_str()))
+            .await
+            .unwrap();
+
+        let result = fixture.run_cleanup(utc_now()).await;
+        if detached && !shared {
+            result.unwrap();
+            let values = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+            assert_eq!(
+                values[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+                b"first"
+            );
+            assert_eq!(dataset.list_detached_manifests().await.unwrap().len(), 1);
+        } else {
+            assert!(result.unwrap_err().is_not_found());
+        }
+    }
+
+    /// A detached version's fragment whose blob columns sit in two data files, after
+    /// an earlier release removed some of them: cleanup runs once both are gone, and
+    /// fails naming the detached version while one of them can still be read.
+    #[rstest]
+    #[case::added_column(&[1])]
+    #[case::first_column(&[0])]
+    #[case::both(&[0, 1])]
+    #[tokio::test]
+    async fn managed_cleanup_with_split_blob_files(#[case] removed: &[usize]) {
+        MockClock::set_system_time(std::time::Duration::ZERO);
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let batch = managed_blob_batch();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &fixture.dataset_path,
+            Some(WriteParams {
+                store_params: Some(fixture.os_params()),
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut blobs = BlobArrayBuilder::new(2);
+        blobs.push_bytes(b"third").unwrap();
+        blobs.push_bytes(b"fourth").unwrap();
+        let later = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                batch.schema().field(1).clone().with_name("later"),
+            ])),
+            vec![blobs.finish().unwrap()],
+        )
+        .unwrap();
+        dataset
+            .add_columns(
+                NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                    [Ok(later.clone())],
+                    later.schema(),
+                ))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let files = dataset.manifest.fragments[0].files.clone();
+        assert_eq!(files.len(), 2);
+        let detached = commit_detached_delete(&Arc::new(dataset.clone()), "id = 1").await;
+        // From here on only the detached version references the fragment.
+        dataset.delete("id >= 0").await.unwrap();
+        assert!(dataset.manifest.fragments.is_empty());
+        for index in removed {
+            dataset
+                .object_store
+                .delete(&dataset.data_dir().join(files[*index].path.as_str()))
+                .await
+                .unwrap();
+        }
+
+        // Every attached version but the latest expires.
+        MockClock::set_system_time(TimeDelta::days(10).to_std().unwrap());
+        let result = fixture.run_cleanup(utc_now()).await;
+        if removed.len() == files.len() {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.is_not_found(), "{error}");
+            assert!(matches!(error, Error::IO { .. }), "{error}");
+            assert_contains!(error.to_string(), format!("detached version {detached}"));
+        }
+        assert_eq!(dataset.list_detached_manifests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn blob_descriptors_are_removed_only_when_every_file_is_gone() {
+        use lance_table::format::{DataFile, DeletionFile, DeletionFileType};
+
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+        let mut fragment = Fragment::new(9);
+        for (path, field) in [("first.lance", 1), ("second.lance", 2), ("other.lance", 3)] {
+            fragment
+                .files
+                .push(DataFile::new_legacy_from_fields(path, vec![field], None));
+            dataset
+                .object_store
+                .put(&dataset.data_dir().join(path), b"data")
+                .await
+                .unwrap();
+        }
+        async fn removed(dataset: &Dataset, fragment: &Fragment) -> bool {
+            BlobDescriptorFiles::new(dataset, fragment, &[1, 2])
+                .removed(&dataset.object_store)
+                .await
+                .unwrap()
+        }
+        let data_path = |path: &str| dataset.data_dir().join(path);
+
+        // One blob column's file is gone and the other's is not.
+        dataset
+            .object_store
+            .delete(&data_path("first.lance"))
+            .await
+            .unwrap();
+        assert!(!removed(&dataset, &fragment).await);
+        // A file in another base counts as present.
+        let mut external = fragment.clone();
+        external.files[1].base_id = Some(1);
+        dataset
+            .object_store
+            .delete(&data_path("second.lance"))
+            .await
+            .unwrap();
+        assert!(!removed(&dataset, &external).await);
+        assert!(removed(&dataset, &fragment).await);
+
+        // A missing deletion file makes the fragment unreadable on its own.
+        let mut deleted = Fragment::new(10);
+        deleted.files.push(DataFile::new_legacy_from_fields(
+            "other.lance",
+            vec![1],
+            None,
+        ));
+        assert!(!removed(&dataset, &deleted).await);
+        deleted.deletion_file = Some(DeletionFile {
+            read_version: 1,
+            id: 1,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            inline: None,
+        });
+        assert!(removed(&dataset, &deleted).await);
+    }
+
+    #[tokio::test]
+    async fn cleanup_skips_staging_detached_manifests() {
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let dataset = fixture.open().await.unwrap();
+        let committed = ManifestNamingScheme::V2.manifest_path(
+            &dataset.base,
+            lance_table::format::DETACHED_VERSION_MASK | 7,
+        );
+        let partial = Path::from(format!("{committed}-0b6e3c2a-1d8f-4f0e-9a51-3c7d2e8b4f10"));
+        dataset
+            .object_store
+            .put(&partial, b"partial")
+            .await
+            .unwrap();
+
+        fixture.run_cleanup(utc_now()).await.unwrap();
+        assert!(dataset.object_store.exists(&partial).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_parent_files_of_a_branch_detached_version() {
+        MockClock::set_system_time(std::time::Duration::ZERO);
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        let batch = id_batch(0);
+        fixture
+            .create_with_data(RecordBatchIterator::new(
+                [Ok(batch.clone())],
+                batch.schema(),
+            ))
+            .await
+            .unwrap();
+        let mut dataset = *fixture.open().await.unwrap();
+        let version = dataset.version_id();
+        let branch = Arc::new(
+            fixture
+                .create_branch_and_load(&mut dataset, "branch", version)
+                .await
+                .unwrap(),
+        );
+        // The detached version reads the parent's data file through the branch.
+        let detached = commit_detached_delete(&branch, "id < 10").await;
+
+        // Once the branch's own history stops referencing the parent's data file,
+        // only the detached version does.
+        let branch_head = InsertBuilder::new(branch.clone())
+            .with_params(&WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            })
+            .execute(vec![id_batch(100)])
+            .await
+            .unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        MockClock::set_system_time(TimeDelta::days(10).to_std().unwrap());
+        cleanup_old_versions(
+            &branch_head,
+            CleanupPolicyBuilder::default()
+                .before_timestamp(utc_now())
+                .build(),
+        )
+        .await
+        .unwrap();
+        fixture.run_cleanup(utc_now()).await.unwrap();
+
+        assert_eq!(scanned_rows(&branch, detached).await, 90);
+    }
+
+    /// A detached manifest that is listed but gone when read, on the dataset or on a
+    /// referenced branch, is skipped.
+    #[rstest]
+    #[tokio::test]
+    async fn cleanup_skips_removed_detached_manifests(#[values(false, true)] on_branch: bool) {
+        MockClock::set_system_time(std::time::Duration::ZERO);
+        let fixture = MockDatasetFixture::try_new().unwrap();
+        fixture.create_some_data().await.unwrap();
+        let mut dataset = *fixture.open().await.unwrap();
+        let version = dataset.version_id();
+        let branch = fixture
+            .create_branch_and_load(&mut dataset, "branch", version)
+            .await
+            .unwrap();
+        fixture.overwrite_some_data().await.unwrap();
+        let base = if on_branch {
+            &branch.base
+        } else {
+            &dataset.base
+        };
+        let placeholder = base.clone().join("_versions").join("removed");
+        dataset
+            .object_store
+            .put(&placeholder, b"removed")
+            .await
+            .unwrap();
+        // The listing reports the placeholder as a detached manifest that no longer
+        // exists.
+        let removed = ManifestNamingScheme::V2
+            .manifest_path(base, lance_table::format::DETACHED_VERSION_MASK | 7);
+        fixture
+            .mock_store
+            .policy
+            .lock()
+            .unwrap()
+            .set_obj_meta_policy(
+                "removed_detached_manifest",
+                Arc::new(move |_, mut meta: ObjectMeta| {
+                    if meta.location == placeholder {
+                        meta.location = removed.clone();
+                    }
+                    Ok(meta)
+                }),
+            );
+        let listed = dataset
+            .commit_handler
+            .list_detached_manifest_locations(base, &dataset.object_store)
+            .map_ok(|location| location.version)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(listed, vec![lance_table::format::DETACHED_VERSION_MASK | 7]);
+
+        // The branch's source version expires, so cleanup also walks the branch.
+        MockClock::set_system_time(TimeDelta::days(10).to_std().unwrap());
+        fixture.run_cleanup(utc_now()).await.unwrap();
     }
 
     #[rstest]
@@ -9445,7 +10128,7 @@ mod tests {
                     type_url: "/lance.table.FragmentReuseIndexDetails".into(),
                     value: reader_tests::field(1, &unknown_content),
                 })),
-                ..entry
+                ..entry.clone()
             };
             let mut inspection = CleanupInspection::default();
             inspection
@@ -9455,6 +10138,25 @@ mod tests {
                 !task.resolve_frag_reuse_map_ids(&mut inspection).await,
                 "an unknown envelope record must disable _fri collection"
             );
+
+            // An entry whose content an earlier release removed is skipped when
+            // only detached versions carry it, and still disables `_fri`
+            // collection when an attached version does.
+            dataset.object_store.delete(&details_path).await.unwrap();
+            for attached in [false, true] {
+                let mut inspection = CleanupInspection::default();
+                inspection
+                    .frag_reuse_entries
+                    .insert(uuid, (entry.clone(), true));
+                if attached {
+                    inspection.attached_frag_reuse_entries.insert(uuid);
+                }
+                assert_eq!(
+                    task.resolve_frag_reuse_map_ids(&mut inspection).await,
+                    !attached
+                );
+                assert!(inspection.referenced_files.frag_reuse_map_ids.is_empty());
+            }
         }
 
         /// E: the full lifecycle, asserting every stage. A stable-partition
