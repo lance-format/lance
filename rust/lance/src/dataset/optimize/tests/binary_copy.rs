@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::dataset::NewColumnTransform;
+use crate::dataset::optimize::execution::can_use_binary_copy;
 use arrow_array::{Decimal128Array, UInt64Array};
 
 const NON_LEGACY_VERSIONS: [LanceFileVersion; 4] = [

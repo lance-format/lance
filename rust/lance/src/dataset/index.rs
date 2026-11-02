@@ -16,7 +16,7 @@ use crate::Dataset;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::index::DatasetIndexExt;
-use crate::index::remap_index;
+use crate::index::remap::remap_index;
 use crate::index::scalar::{IndexDetails, infer_scalar_index_details};
 use arrow_schema::DataType;
 use async_trait::async_trait;
@@ -187,7 +187,7 @@ impl DatasetIndexRemapper {
         let mut segment_results = Vec::with_capacity(segments.len());
         for segment in segments {
             // See the call-site note in `remap_indices` about boxing this future.
-            let result = Box::pin(crate::index::remap_index(
+            let result = Box::pin(crate::index::remap::remap_index(
                 &self.dataset,
                 &segment.uuid,
                 mapping,
@@ -427,7 +427,7 @@ mod tests {
     use crate::dataset::transaction::{Operation, Transaction};
     use crate::index::frag_reuse::build_frag_reuse_index_metadata;
     use crate::index::vector::VectorIndexParams;
-    use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, IntoIndexSegment};
+    use crate::index::{DatasetIndexExt, IntoIndexSegment, loading::DatasetIndexInternalExt};
     use futures::TryStreamExt;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_index::IndexType;
@@ -642,7 +642,7 @@ mod tests {
         // Both files store all fragments, but metadata assigns each only one.
         // Independent remaps retain stored rows; staging remaps enforce ownership.
         for owned_fragments in [None, committed[0].fragment_bitmap.as_ref()] {
-            let result = crate::index::remap_index(
+            let result = crate::index::remap::remap_index(
                 &dataset,
                 &committed[0].uuid,
                 &RowAddrTranslator::sync(RowAddrRemap::empty()),

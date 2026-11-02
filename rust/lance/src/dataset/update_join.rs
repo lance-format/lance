@@ -427,7 +427,7 @@ impl BlobUpdateContext {
         batch: &RecordBatch,
     ) -> Result<RecordBatch> {
         if self.has_blob_v2 {
-            super::optimize::transform_blob_v2_batch(
+            super::blob::transform_blob_v2_batch(
                 &self.dataset,
                 fragment.schema(),
                 batch.clone(),
