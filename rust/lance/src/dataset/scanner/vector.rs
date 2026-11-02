@@ -49,8 +49,8 @@ use crate::index::vector::utils::{
 };
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use crate::io::exec::knn::{
-    KnnBatchParams, MultivectorScoringExec, QUERY_INDEX_COL, knn_empty_result_schema,
-    new_knn_batch_exec, new_knn_exec,
+    BatchRefineExec, KnnBatchParams, MultivectorScoringExec, QUERY_INDEX_COL,
+    knn_empty_result_schema, new_knn_batch_exec, new_knn_exec,
 };
 use crate::io::exec::scalar_index::ScalarIndexExec;
 use crate::io::exec::{
@@ -521,7 +521,7 @@ impl Scanner {
     /// search per query vector.
     ///
     /// Requires all of:
-    /// - no exact or quantized refine step (the batch path does not yet rerank);
+    /// - no quantized refine step (exact refinement is supported);
     /// - fixed nprobes (`minimum_nprobes == maximum_nprobes`) — see below;
     /// - every segment an IVF index with a flat-style sub-index (i.e. not HNSW);
     /// - every target fragment covered by the *selected* `index_segments` (or
@@ -546,13 +546,9 @@ impl Scanner {
         index_segments: &[IndexMetadata],
         q: &Query,
     ) -> Result<bool> {
-        // Any exact or quantized refine factor sends the query onto a reranking
-        // path that the shared batch scan does not implement. Exact refinement
-        // reranks with the original vectors even when the factor is 1, while
-        // quantized refinement overfetches and reranks with Accurate RQ scores.
-        // The batch path does neither, so fall back to the per-query loop for
-        // every configured refinement.
-        if q.refine_factor.is_some() || self.quantized_refine_factor.is_some() {
+        // Quantized refinement reranks with Accurate RQ scores, which the shared
+        // batch path does not implement. Fall back to the per-query loop.
+        if self.quantized_refine_factor.is_some() {
             return Ok(false);
         }
         // Only fixed nprobes is provably equivalent to single-query search; see
@@ -667,24 +663,56 @@ impl Scanner {
         // Fast path: when every index segment is an IVF index with a flat-style
         // sub-index (IVF_FLAT/PQ/SQ/RQ), search all query vectors in a single
         // pass that reads each partition's storage once and shares the prefilter
-        // across the batch. HNSW, refine, and mixed indexed/unindexed scans fall
+        // across the batch. HNSW and mixed indexed/unindexed scans fall
         // back to the per-query loop below, which never regresses behavior.
+        if q.refine_factor == Some(0) {
+            return Err(Error::invalid_input("Refine factor cannot be zero"));
+        }
         if self
             .batch_index_search_supported(index_name, index_segments, q)
             .await?
         {
             let mut batch_query = q.clone();
             batch_query.metric_type = Some(index_metric);
+            batch_query.k =
+                q.k.checked_mul(q.refine_factor.unwrap_or(1) as usize)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "Candidate count overflows usize: k={}, refine_factor={:?}",
+                            q.k, q.refine_factor
+                        ))
+                    })?;
+            if q.refine_factor.is_some() {
+                // Refinement applies the range to exact distances, while the
+                // ANN stage ranks on the index's own scale. Transform only the
+                // candidate bounds; BatchRefineExec receives the original query.
+                let scale = index_distance_scale(index_metric, index_segments);
+                batch_query.lower_bound = q.lower_bound.map(|bound| bound * scale);
+                batch_query.upper_bound = q.upper_bound.map(|bound| bound * scale);
+            }
+            batch_query.refine_factor = None;
             let prefilter_source = self
                 .ann_prefilter_source(filter_plan, index_segments)
                 .await?;
-            return new_knn_batch_exec(
+            let input = new_knn_batch_exec(
                 self.dataset.clone(),
                 index_segments,
                 &batch_query,
                 self.nearest_query_count,
                 prefilter_source,
-            );
+            )?;
+            return if q.refine_factor.is_some() {
+                let mut refine_query = q.clone();
+                refine_query.metric_type = Some(index_metric);
+                Ok(Arc::new(BatchRefineExec::try_new(
+                    self.dataset.clone(),
+                    input,
+                    refine_query,
+                    self.nearest_query_count,
+                )?))
+            } else {
+                Ok(input)
+            };
         }
 
         let query_dim = q.key.len() / self.nearest_query_count;
