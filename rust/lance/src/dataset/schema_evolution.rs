@@ -14,7 +14,7 @@ use super::{
     write::cleanup_data_fragments,
 };
 use crate::dataset::mem_wal::DatasetMemWalExt;
-use crate::index::load_all_indices;
+use crate::index::loading::load_all_indices;
 use crate::{Error, Result, io::exec::Planner};
 use arrow::compute::CastOptions;
 use arrow::compute::can_cast_types;

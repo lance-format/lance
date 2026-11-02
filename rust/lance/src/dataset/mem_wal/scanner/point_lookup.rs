@@ -1693,8 +1693,8 @@ mod tests {
         // `FilterExec → LIMIT 1` over an insert-ordered scan returned the
         // first (oldest) match. The plan-path active arm now sorts `_rowid`
         // DESC and keeps the first row (largest `_rowid` = newest insert).
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::BatchStore;
         use futures::TryStreamExt;
 
         let schema = create_pk_schema();
@@ -1767,8 +1767,9 @@ mod tests {
         // auto-creates a BTree on the primary key (the production default). The
         // fast probe must resolve the newest visible version through that
         // collision-free BTree rather than falling back to the plan path.
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
         let schema = create_pk_schema();
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1860,10 +1861,11 @@ mod tests {
     async fn test_indexed_visibility_reads_the_undurable_prefix(
         #[case] projection: Option<Vec<String>>,
     ) {
+        use crate::dataset::mem_wal::index::IndexStore;
         use crate::dataset::mem_wal::index::MemTableVisibility;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::wal::WriterCursors;
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
         let schema = create_pk_schema();
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1983,7 +1985,7 @@ mod tests {
         let lance = lance_core::datatypes::Schema::try_from(schema).unwrap();
         let field_id = lance.field("id").unwrap().id;
         IndexStore::from_specs(
-            &[crate::dataset::mem_wal::write::MemIndexSpec::btree(
+            &[crate::dataset::mem_wal::index::MemIndexSpec::btree(
                 "id_idx", field_id, "id",
             )],
             &lance,

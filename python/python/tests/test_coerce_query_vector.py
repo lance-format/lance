@@ -41,36 +41,19 @@ class TestCoerceQueryVectorInvalidTypes:
             _coerce_query_vector(None)
 
 
-class TestCoerceQueryVectorValidTypes:
-    """Valid vector inputs should be coerced successfully."""
-
-    def test_list_of_floats(self):
-        result, dim = _coerce_query_vector([1.0, 2.0, 3.0])
-        assert isinstance(result, pa.FloatingPointArray)
-        assert dim == 3
-
-    def test_tuple_of_floats(self):
-        result, dim = _coerce_query_vector((1.0, 2.0, 3.0))
-        assert isinstance(result, pa.FloatingPointArray)
-        assert dim == 3
-
-    def test_numpy_array(self):
-        result, dim = _coerce_query_vector(np.array([1.0, 2.0, 3.0]))
-        assert isinstance(result, pa.FloatingPointArray)
-        assert dim == 3
-
-    def test_pa_float_array(self):
-        result, dim = _coerce_query_vector(pa.array([1.0, 2.0, 3.0]))
-        assert isinstance(result, pa.FloatingPointArray)
-        assert dim == 3
-
-    def test_pa_int_array_cast_to_float(self):
-        result, dim = _coerce_query_vector(pa.array([1, 2, 3]))
-        assert isinstance(result, pa.FloatingPointArray)
-        assert dim == 3
-
-    def test_pa_chunked_array(self):
-        chunked = pa.chunked_array([[1.0, 2.0, 3.0]])
-        result, dim = _coerce_query_vector(chunked)
-        assert isinstance(result, pa.FloatingPointArray)
-        assert dim == 3
+@pytest.mark.parametrize(
+    "value",
+    [
+        [1.0, 2.0, 3.0],
+        (1.0, 2.0, 3.0),
+        np.array([1.0, 2.0, 3.0]),
+        pa.array([1.0, 2.0, 3.0]),
+        pa.array([1, 2, 3]),
+        pa.chunked_array([[1.0, 2.0, 3.0]]),
+    ],
+    ids=["list", "tuple", "numpy", "pa_float", "pa_int", "pa_chunked"],
+)
+def test_valid_vector_inputs(value):
+    result, dim = _coerce_query_vector(value)
+    assert isinstance(result, pa.FloatingPointArray)
+    assert dim == 3

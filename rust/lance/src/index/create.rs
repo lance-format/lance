@@ -8,18 +8,18 @@ use crate::{
         transaction::{Operation, TransactionBuilder},
     },
     index::{
-        DatasetIndexExt, DatasetIndexInternalExt, IntoIndexSegment,
-        build_index_metadata_from_segments,
+        DatasetIndexExt, IntoIndexSegment,
         frag_reuse_with_stable_row_ids::{
             ensure_index_allowed_with_frag_reuse, ensure_index_kind_allowed_with_frag_reuse,
         },
-        load_all_indices,
+        lifecycle::build_index_metadata_from_segments,
+        loading::{DatasetIndexInternalExt, load_all_indices},
         scalar::{build_bitmap_index_segment, build_scalar_index},
+        vector::details::{vector_index_details, vector_index_details_default},
         vector::{
             LANCE_VECTOR_INDEX, StageParams, VectorIndexParams, build_distributed_vector_index,
             build_empty_vector_index, build_filtered_vector_index, build_vector_index,
         },
-        vector_index_details, vector_index_details_default,
     },
 };
 use futures::{FutureExt, future::BoxFuture};
@@ -2859,7 +2859,7 @@ mod tests {
                 .indices_dir()
                 .clone()
                 .join(segment.uuid.to_string())
-                .join(crate::index::INDEX_FILE_NAME);
+                .join(lance_index::INDEX_FILE_NAME);
             assert!(
                 dataset
                     .object_store
