@@ -376,6 +376,12 @@ and timestamp_col = timestamp '2021-01-01 00:00:00'
 and decimal_col = decimal(8,3) '1.000'
 ```
 
+A plain number in a comparison, `BETWEEN` or `IN` with a decimal column, such as
+`decimal_col < 0.055`, is compared exactly with the digits as written; it is not
+rounded to the column's scale or converted to a float. A number whose digits as
+written do not fit a 256-bit decimal, such as `1e-80` or `1e200`, is not
+supported.
+
 For timestamp columns, the precision can be specified as a number in the type
 parameter. Microsecond precision (6) is the default.
 
@@ -431,7 +437,7 @@ To address this, Lance provides methods for optimizing dataset layout.
 ### Compact data files
 
 Data files can be rewritten so there are fewer files. When passing a
-`target_rows_per_fragment` to `lance.dataset.DatasetOptimizer.compact_files`,
+`target_rows_per_fragment` to `dataset.optimize.compact_files(...)`,
 Lance will skip any fragments that are already above that row count, and rewrite
 others. Fragments will be merged according to their fragment ids, so the inherent
 ordering of the data will be preserved.
@@ -647,7 +653,7 @@ Auto cleanup can be enabled when creating a new dataset:
 ```python
 import lance
 import pyarrow as pa
-from lance.dataset import AutoCleanupConfig
+from lance import AutoCleanupConfig
 
 table = pa.table({"id": range(100)})
 ds = lance.write_dataset(

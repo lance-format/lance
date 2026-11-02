@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::bitmap::{PyBitmap, bitmap_from_iterable, is_int, value_from_py};
-use crate::dataset::DatasetBasePath;
+use crate::dataset::base_path::DatasetBasePath;
 use crate::schema::LanceSchema;
 use crate::utils::{PyLance, class_name, export_vec, extract_vec};
 use arrow::pyarrow::PyArrowType;
@@ -767,7 +767,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     .expect("Failed to get Overwrite class");
 
                 let initial_bases_py = if let Some(bases) = initial_bases {
-                    use crate::dataset::DatasetBasePath;
+                    use crate::dataset::base_path::DatasetBasePath;
                     // Convert each Rust BasePath to a Python DatasetBasePath object
                     let bases_py: Vec<DatasetBasePath> = bases
                         .iter()
@@ -972,7 +972,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
             }
             Operation::UpdateBases { new_bases } => {
                 if let Ok(cls) = namespace.getattr("UpdateBases") {
-                    use crate::dataset::DatasetBasePath;
+                    use crate::dataset::base_path::DatasetBasePath;
                     let new_bases_py: Vec<DatasetBasePath> = new_bases
                         .iter()
                         .map(|bp| DatasetBasePath::from(bp.clone()))
