@@ -1392,8 +1392,8 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         });
         // Omitted rather than reported as null when the index records no type,
         // so the details of an index built before the field existed read the
-        // same as they always have. An unrecognized value is reported as its
-        // raw number so an operator can still see that a type is recorded.
+        // same as they always have. An unrecognized value keeps its raw number
+        // in the string, so the field's JSON type does not depend on the writer.
         if json_details.target_data_type != crate::pb::JsonTargetDataType::Unspecified as i32 {
             let reported = JsonIndexTargetType::from_pb(json_details.target_data_type)
                 .map(|target_type| target_type.as_json_name().to_string())
@@ -2222,10 +2222,12 @@ mod tests {
         );
     }
 
+    fn decode_details(details: &prost_types::Any) -> crate::pb::JsonIndexDetails {
+        crate::pb::JsonIndexDetails::decode(details.value.as_slice()).unwrap()
+    }
+
     fn decode_target_data_type(details: &prost_types::Any) -> i32 {
-        crate::pb::JsonIndexDetails::decode(details.value.as_slice())
-            .unwrap()
-            .target_data_type
+        decode_details(details).target_data_type
     }
 
     /// Rewrite `target_data_type` in `details`.
@@ -2304,7 +2306,12 @@ mod tests {
         )
         .await;
 
-        assert_eq!(decode_target_data_type(&details), expected as i32);
+        let decoded = decode_details(&details);
+        assert_eq!(decoded.target_data_type, expected as i32);
+        assert!(
+            decoded.target_index_version.is_some(),
+            "a fresh build must record the target index version"
+        );
 
         let registry = IndexPluginRegistry::with_default_plugins();
         let details_json = registry
@@ -2336,6 +2343,8 @@ mod tests {
             decode_target_data_type(&details),
             crate::pb::JsonTargetDataType::Utf8 as i32
         );
+        let original_target_version = decode_details(&details).target_index_version;
+        assert!(original_target_version.is_some());
 
         let (dest_store, _dest_dir) = local_json_index_store();
         let remapped = index
@@ -2346,6 +2355,10 @@ mod tests {
         assert_eq!(
             decode_target_data_type(&remapped.index_details),
             crate::pb::JsonTargetDataType::Utf8 as i32
+        );
+        assert_eq!(
+            decode_details(&remapped.index_details).target_index_version,
+            original_target_version
         );
     }
 
@@ -2476,6 +2489,10 @@ mod tests {
         assert_eq!(
             decode_target_data_type(&updated.index_details),
             FUTURE_VARIANT
+        );
+        assert_eq!(
+            decode_details(&updated.index_details).target_index_version,
+            decode_details(&details).target_index_version
         );
     }
 
