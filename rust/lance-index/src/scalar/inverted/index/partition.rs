@@ -624,10 +624,11 @@ fn effective_posting_read_policy(
         return PostingReadPolicy::CacheAwareExact;
     };
     let demand_count = group_demand_counts.get(&group).copied();
-    debug_assert!(
-        demand_count.is_some(),
-        "posting group {group:?} must have a demand count for token {token_id}"
-    );
+    // Prewarm may publish byte boundaries after this query counted demand
+    // using the unplanned ranges. Exact loading remains safe across that transition.
+    if demand_count.is_none() {
+        return PostingReadPolicy::CacheAwareExact;
+    }
     // Keep alternatives coalesced, even when a fuzzy expansion covers only a
     // small part of a group. Ordinary sparse terms need no such read ahead.
     if demand_count.is_some_and(|count| {

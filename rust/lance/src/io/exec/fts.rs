@@ -4816,7 +4816,43 @@ impl ExecutionPlan for FlatMatchFilterExec {
     }
 }
 
-/// Calculates the FTS score for each row in the input
+/// Calculates the FTS score for each row in the input.
+///
+/// A plan codec must preserve the corpus input, the candidate filter, and the
+/// document column separately. Candidates restrict the emitted rows, while
+/// every corpus row still contributes to the BM25 statistics. A node publishing
+/// a shared scorer must stay with its consumers; it cannot be reconstructed as
+/// an independent node.
+///
+/// ```
+/// use std::sync::Arc;
+/// use datafusion::physical_plan::ExecutionPlan;
+/// use lance::io::exec::fts::FlatMatchQueryExec;
+///
+/// fn rebuild_independent(
+///     exec: &FlatMatchQueryExec,
+///     corpus: Arc<dyn ExecutionPlan>,
+/// ) -> Option<FlatMatchQueryExec> {
+///     if exec.has_shared_scorer() {
+///         return None;
+///     }
+///     let mut rebuilt = match exec.preset_segments() {
+///         Some(segments) => FlatMatchQueryExec::new_with_segments_and_document_granularity(
+///             exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+///             corpus, segments.to_vec(), exec.document_granularity(),
+///             exec.document_column().to_owned(),
+///         ),
+///         None => FlatMatchQueryExec::new_with_document_granularity(
+///             exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+///             corpus, exec.document_granularity(), exec.document_column().to_owned(),
+///         ),
+///     }.with_candidate_filter(exec.candidate_filter().clone());
+///     if let Some(scorer) = exec.base_scorer() {
+///         rebuilt = rebuilt.with_base_scorer(scorer.clone());
+///     }
+///     Some(rebuilt)
+/// }
+/// ```
 #[derive(Debug)]
 pub struct FlatMatchQueryExec {
     dataset: Arc<Dataset>,
@@ -4989,11 +5025,43 @@ impl FlatMatchQueryExec {
         self
     }
 
-    /// Keep corpus collection independent of the candidate domain, including
-    /// when no input rows are eligible to appear in the search results.
-    pub(crate) fn with_candidate_filter(mut self, candidate_filter: PreFilterSource) -> Self {
+    /// Restrict emitted rows after collecting statistics from the complete corpus.
+    ///
+    /// An empty candidate set still collects corpus statistics and publishes any
+    /// shared scorer. [`PreFilterSource::None`] emits every matching corpus row.
+    /// See [`Self`] for an example that preserves this filter when rebuilding a plan.
+    pub fn with_candidate_filter(mut self, candidate_filter: PreFilterSource) -> Self {
         self.candidate_filter = candidate_filter;
         self
+    }
+
+    /// The filter applied after corpus statistics and scores have been computed.
+    ///
+    /// This is separate from the corpus input. See [`Self`] for a reconstruction
+    /// example; applying it to the corpus scan instead would change BM25 scores.
+    pub fn candidate_filter(&self) -> &PreFilterSource {
+        &self.candidate_filter
+    }
+
+    /// The input column containing documents, which may be an alias of the
+    /// indexed field in [`Self::query`]. See [`Self`] for a reconstruction example.
+    pub fn document_column(&self) -> &str {
+        &self.document_column
+    }
+
+    /// The logical document boundary used for scoring and output coordinates.
+    /// See [`Self`] for a reconstruction example that preserves this boundary.
+    pub fn document_granularity(&self) -> DocumentGranularity {
+        self.document_granularity
+    }
+
+    /// Whether this node publishes statistics for other nodes in the same plan.
+    ///
+    /// A codec or optimizer that cannot preserve that producer/consumer binding
+    /// must keep the complete shared-scoring subtree intact. See [`Self`] for an
+    /// example that declines independent reconstruction in this case.
+    pub fn has_shared_scorer(&self) -> bool {
+        self.shared_scorer.is_some()
     }
 
     pub fn query(&self) -> &MatchQuery {
@@ -7349,37 +7417,66 @@ mod tests {
     }
 
     #[rstest]
-    #[case::row_ids(false)]
-    #[case::selection_vector(true)]
+    #[case::row_ids(false, "text")]
+    #[case::row_ids_alias(false, "body")]
+    #[case::selection_vector(true, "text")]
+    #[case::selection_vector_alias(true, "body")]
     #[tokio::test]
-    async fn test_9058_flat_candidates_preserve_corpus(#[case] is_scalar_index_query: bool) {
+    async fn test_9058_flat_candidates_preserve_corpus(
+        #[case] is_scalar_index_query: bool,
+        #[case] document_column: &str,
+    ) {
         let dataset = indexed_match_dataset().await;
         let query = MatchQuery::new("alpha beta".to_string())
             .with_column(Some("text".to_string()))
             .with_document_granularity(DocumentGranularity::Row);
         let corpus = memory_input(
             record_batch!(
-                ("text", Utf8, ["alpha", "beta", "alpha"]),
+                (document_column, Utf8, ["alpha", "beta", "alpha"]),
                 (ROW_ID, UInt64, [100, 101, 102])
             )
             .unwrap(),
         );
-        let unfiltered = FlatMatchQueryExec::new(
+        let unfiltered = FlatMatchQueryExec::new_with_document_granularity(
             dataset.clone(),
             query.clone(),
             FtsSearchParams::default(),
             corpus.clone(),
-        )
-        .unwrap();
+            DocumentGranularity::Row,
+            document_column.to_owned(),
+        );
+        assert!(!unfiltered.has_shared_scorer());
         let expected = execute_results(&unfiltered).await.unwrap();
         let shared = Arc::new(SharedFtsScorer::new());
         let filtered = Arc::new(
-            FlatMatchQueryExec::new(dataset, query, FtsSearchParams::default(), corpus.clone())
-                .unwrap()
-                .with_shared_scorer(shared.clone())
-                .with_candidate_filter(candidate_input(vec![101], is_scalar_index_query)),
+            FlatMatchQueryExec::new_with_document_granularity(
+                dataset,
+                query,
+                FtsSearchParams::default(),
+                corpus.clone(),
+                DocumentGranularity::Row,
+                document_column.to_owned(),
+            )
+            .with_shared_scorer(shared.clone())
+            .with_candidate_filter(candidate_input(vec![101], is_scalar_index_query)),
         );
 
+        assert!(filtered.has_shared_scorer());
+        // An independent reconstruction must keep the candidate domain separate
+        // from the corpus, including when the input column is aliased.
+        let independent = FlatMatchQueryExec::new_with_document_granularity(
+            filtered.dataset().clone(),
+            filtered.query().clone(),
+            filtered.params().clone(),
+            corpus.clone(),
+            filtered.document_granularity(),
+            filtered.document_column().to_owned(),
+        )
+        .with_candidate_filter(filtered.candidate_filter().clone());
+        assert_eq!(
+            execute_results(&independent).await.unwrap(),
+            vec![expected[1]]
+        );
         assert_eq!(filtered.children().len(), 2);
         assert!(
             filtered
@@ -7407,7 +7504,7 @@ mod tests {
         let empty = candidate_input(vec![], is_scalar_index_query);
         let expanded_corpus = memory_input(
             record_batch!(
-                ("text", Utf8, ["alpha", "beta", "alpha", "beta"]),
+                (document_column, Utf8, ["alpha", "beta", "alpha", "beta"]),
                 (ROW_ID, UInt64, [100, 101, 102, 103])
             )
             .unwrap(),

@@ -563,9 +563,18 @@ fn dot_membership_amx_f16(
 ) -> Option<Vec<Option<(u32, f32)>>> {
     let k = centroids.len() / dimension;
     // Under one full 32-wide k-pass the GEMM degenerates to the kernel's scalar
-    // cleanup, and under one full 32-centroid block most of its work would be
-    // the zero padding. Neither is worth leaving the per-vector path for.
-    if dimension < 32 || k < 32 {
+    // cleanup, so `dimension` still has to clear 32.
+    //
+    // `k` only has to clear 16, not the kernel's 32-centroid block width. The
+    // hierarchical k-means splitter caps every sub-clustering at
+    // `hierarchical_k` (16 by default), so a 32-centroid floor kept the GEMM out
+    // of every one of those sub-clusterings -- inside `train_ivf` it only ever
+    // ran for the closing assignment against the full centroid set, and during
+    // shuffle. A 16-centroid block half-fills the kernel's 32-wide pass with the
+    // zero padding `PackedCentroidsF16` already appends. The kernel accepts a
+    // half-filled block, which lets those sub-clusterings use the GEMM instead
+    // of scoring one vector at a time, at the cost of wasting half the columns.
+    if dimension < 32 || k < 16 {
         return None;
     }
     let packed = PackedCentroidsF16::new(centroids, k, dimension)?;
@@ -2953,35 +2962,60 @@ mod tests {
     /// Here every real dot product is negative, so every real distance exceeds
     /// 1.0 and a reduction over the padded row width would hand *every* vector
     /// a cluster id past the end of the centroid set.
+    ///
+    /// `k = 16` is the worst case the training path actually runs at: half the
+    /// block is padding, so half of every scored row is a column that must
+    /// never win.
     #[test]
     fn test_dot_amx_padding_columns_never_win() {
         if !amx_fp16_supported() {
             return;
         }
-        const K: usize = 100;
         const DIM: usize = 64;
         const N: usize = 128;
 
         let mut rng = SmallRng::seed_from_u64(0xBAD5);
-        let negate = |v: &f16| f16::from_f32(-v.to_f32().abs() - 0.1);
-        let centroids = random_f16(K * DIM, &mut rng)
-            .iter()
-            .map(negate)
-            .collect::<Vec<_>>();
-        let data = random_f16(N * DIM, &mut rng)
-            .iter()
-            .map(|v| f16::from_f32(v.to_f32().abs() + 0.1))
-            .collect::<Vec<_>>();
+        for k in [100usize, 16] {
+            let negate = |v: &f16| f16::from_f32(-v.to_f32().abs() - 0.1);
+            let centroids = random_f16(k * DIM, &mut rng)
+                .iter()
+                .map(negate)
+                .collect::<Vec<_>>();
+            let data = random_f16(N * DIM, &mut rng)
+                .iter()
+                .map(|v| f16::from_f32(v.to_f32().abs() + 0.1))
+                .collect::<Vec<_>>();
 
-        let mut distances = vec![0.0; centroids.len() / DIM];
-        for vector in data.chunks(DIM) {
-            dot_distance_batch_into(vector, &centroids, DIM, &mut distances);
+            let mut distances = vec![0.0; k];
+            for vector in data.chunks(DIM) {
+                dot_distance_batch_into(vector, &centroids, DIM, &mut distances);
+                assert!(
+                    distances.iter().all(|&dist| dist > 1.0),
+                    "premise broken: a real centroid is nearer than the zero padding"
+                );
+            }
+            assert_dot_paths_agree(&centroids, &data, DIM, 0.0, None, &format!("padding k={k}"));
+        }
+    }
+
+    /// Shapes the kernel is not worth entering for must decline before touching
+    /// it, so this needs no AMX host to run.
+    ///
+    /// The `k` bound is 16 -- half the kernel's 32-centroid block -- and
+    /// `prefers_flat_amx_assignment` in `utils.rs` mirrors it; the two have to
+    /// move together or a build could take the exact-assignment route with no
+    /// GEMM under it.
+    #[test]
+    fn test_dot_amx_declines_shapes_below_half_a_block() {
+        let mut rng = SmallRng::seed_from_u64(0x5A11);
+        for (k, dimension) in [(15usize, 64usize), (64, 31), (15, 31)] {
+            let centroids = random_f16(k * dimension, &mut rng);
+            let data = random_f16(64 * dimension, &mut rng);
             assert!(
-                distances.iter().all(|&dist| dist > 1.0),
-                "premise broken: a real centroid is nearer than the zero padding"
+                dot_membership_amx_f16(&centroids, &data, dimension, 0.0, None).is_none(),
+                "k={k} dim={dimension}"
             );
         }
-        assert_dot_paths_agree(&centroids, &data, DIM, 0.0, None, "padding");
     }
 
     /// The bias path. `argmin_value_float_with_bias` minimizes `distance +
