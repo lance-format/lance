@@ -59,15 +59,14 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
 
     /// Build the sub-index query params for one IVF partition.
     ///
-    /// `dist_q_c` is the distance from the query to that partition's centroid.
-    /// Callers share one [`Query`] across probes and pass the per-partition
-    /// distance here. The default goes through `From<&Query>` and therefore
-    /// still clones the query once per probe; implementations that can build
-    /// their params directly should override it to avoid that clone.
-    fn query_params(query: &Query, dist_q_c: f32) -> Self::QueryParams {
-        let mut query = query.clone();
-        query.dist_q_c = dist_q_c;
-        Self::QueryParams::from(&query)
+    /// `query_key` is the partition-processed key and `dist_q_c` is the
+    /// distance from the query to that partition's centroid. Callers share one
+    /// [`Query`] across probes and pass both per-partition values here. The
+    /// default goes through `From<&Query>` and therefore still clones the query
+    /// once per probe; implementations that can build their params directly
+    /// should override it to avoid that clone.
+    fn query_params(query: &Query, query_key: &ArrayRef, dist_q_c: f32) -> Self::QueryParams {
+        query_params_from_processed(query, query_key, dist_q_c)
     }
 
     /// Search the sub index for nearest neighbors.
@@ -174,6 +173,16 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     fn to_batch(&self) -> Result<RecordBatch>;
 }
 
+fn query_params_from_processed<P>(query: &Query, query_key: &ArrayRef, dist_q_c: f32) -> P
+where
+    P: for<'a> From<&'a Query>,
+{
+    let mut query = query.clone();
+    query.key = query_key.clone();
+    query.dist_q_c = dist_q_c;
+    P::from(&query)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum SubIndexType {
     Flat,
@@ -198,5 +207,65 @@ impl TryFrom<&str> for SubIndexType {
             "HNSW" => Ok(Self::Hnsw),
             _ => Err(Error::index(format!("unknown sub index type {}", value))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::Float32Array;
+    use lance_linalg::distance::DistanceType;
+
+    use super::*;
+    use crate::vector::ApproxMode;
+
+    #[derive(Debug)]
+    struct CapturedParams {
+        key: ArrayRef,
+        dist_q_c: f32,
+        k: usize,
+    }
+
+    impl From<&Query> for CapturedParams {
+        fn from(query: &Query) -> Self {
+            Self {
+                key: query.key.clone(),
+                dist_q_c: query.dist_q_c,
+                k: query.k,
+            }
+        }
+    }
+
+    #[test]
+    fn default_query_params_receive_the_processed_key() {
+        let original_key = Arc::new(Float32Array::from(vec![1.0, 2.0])) as ArrayRef;
+        let processed_key = Arc::new(Float32Array::from(vec![3.0, 4.0])) as ArrayRef;
+        let query = Query {
+            column: "vector".to_owned(),
+            key: original_key.clone(),
+            k: 7,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 1,
+            maximum_nprobes: None,
+            search_effort: 0.5,
+            ef: None,
+            refine_factor: None,
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            query_parallelism: 0,
+            dist_q_c: 0.0,
+            approx_mode: ApproxMode::Normal,
+        };
+
+        let params: CapturedParams = query_params_from_processed(&query, &processed_key, 9.5);
+
+        assert!(Arc::ptr_eq(&params.key, &processed_key));
+        assert!(!Arc::ptr_eq(&params.key, &original_key));
+        assert_eq!(params.dist_q_c, 9.5);
+        assert_eq!(params.k, 7);
+        assert!(Arc::ptr_eq(&query.key, &original_key));
+        assert_eq!(query.dist_q_c, 0.0);
     }
 }

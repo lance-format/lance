@@ -363,7 +363,9 @@ pub struct DistanceCalculatorOptions {
 /// together with the map that turns kernel sums back into distances.
 #[derive(Debug)]
 pub struct QuantizedDistTable {
+    /// Quantized lookup table consumed by the FastScan kernel.
     pub table: Vec<u8>,
+    /// Affine map from kernel sums back to distances.
     pub dequant: DistTableDequant,
     /// Number of 16-entry segments in the source f32 table. The accurate LUT is
     /// widened during transfer, so its byte length no longer reports this.
@@ -373,24 +375,31 @@ pub struct QuantizedDistTable {
 /// Per-query state derived from a raw query vector for RaBitQ residual
 /// quantization.
 ///
-/// This is an internal cross-crate plumbing type, hidden from the public docs:
-/// `lance-index` builds it (`IvfRqIndex::prepare_raw_query_context`) and `lance`
-/// holds/forwards it as an opaque handle — neither side exposes the fields to
-/// downstream users, and no downstream crate can meaningfully construct it via
-/// a struct literal (the fields are RaBitQ internals). It is `pub` only so the
-/// type can cross the `lance-index` → `lance` crate boundary. Its private
-/// `normal_lut`/`accurate_lut` fields are lazily-built per-query FastScan
-/// lookup tables (read through [`RabitRawQueryContext::normal_lut`] /
-/// [`RabitRawQueryContext::accurate_lut`]), which is why construction goes
-/// through [`RabitRawQueryContext::new`] rather than a struct literal.
-#[doc(hidden)]
+/// Earlier releases exposed this as a six-field record that callers could
+/// construct directly. The private `normal_lut`/`accurate_lut` fields added for
+/// per-query FastScan reuse make struct literals invalid in this release; use
+/// [`RabitRawQueryContext::new`] with the same six arguments instead.
+///
+/// ```
+/// use lance_index::vector::storage::RabitRawQueryContext;
+///
+/// let context = RabitRawQueryContext::new(
+///     8,
+///     1,
+///     vec![0.0; 8],
+///     vec![0.0; 32],
+///     Vec::new(),
+///     0.0,
+/// );
+/// assert_eq!(context.dist_table().len(), 32);
+/// ```
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct RabitRawQueryContext {
     pub code_dim: usize,
     pub ex_bits: u8,
     pub rotated_query: Vec<f32>,
-    pub dist_table: Vec<f32>,
+    dist_table: Vec<f32>,
     /// The rotated query zero-padded to a 64-dim multiple for the ex-dot
     /// kernels; empty when `code_dim` is already aligned (the kernels then
     /// read `rotated_query` directly).
@@ -405,6 +414,10 @@ pub struct RabitRawQueryContext {
 }
 
 impl RabitRawQueryContext {
+    /// Construct a raw-query context from the six values previously supplied
+    /// directly to the record fields. `dist_table` is private because the
+    /// memoized LUTs are derived from it; read it through
+    /// [`RabitRawQueryContext::dist_table`].
     pub fn new(
         code_dim: usize,
         ex_bits: u8,
@@ -423,6 +436,11 @@ impl RabitRawQueryContext {
             normal_lut: OnceLock::new(),
             accurate_lut: OnceLock::new(),
         }
+    }
+
+    /// The query distance table from which the FastScan LUTs are derived.
+    pub fn dist_table(&self) -> &[f32] {
+        &self.dist_table
     }
 
     /// The `u8` FastScan LUT used by the fast and normal approx modes.

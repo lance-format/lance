@@ -1119,7 +1119,7 @@ impl<'a> RabitDistCalculator<'a> {
                 simd_len,
                 code_len,
                 self.codes,
-                quantized_dists_table,
+                dist_table,
                 &mut hacc_quantized_dists.spare_capacity_mut()[..simd_len],
             );
             // SAFETY: the kernel initialized every SIMD output slot.
@@ -1131,7 +1131,7 @@ impl<'a> RabitDistCalculator<'a> {
                 simd_len,
                 code_len,
                 self.codes,
-                quantized_dists_table,
+                dist_table,
                 &mut quantized_dists.spare_capacity_mut()[..simd_len],
             );
             // SAFETY: the kernel initialized every SIMD output slot.
@@ -2307,7 +2307,7 @@ impl VectorStore for RabitQuantizationStorage {
                 self.raw_query_factors(dist_q_c, &raw_query.rotated_query, rotated_centroid);
             return self.distance_calculator_from_parts(RabitDistCalculatorParts {
                 dim: code_dim,
-                dist_table: Cow::Borrowed(&raw_query.dist_table),
+                dist_table: Cow::Borrowed(raw_query.dist_table()),
                 ex_query: Cow::Borrowed(kernel_query(
                     &raw_query.rotated_query,
                     &raw_query.ex_query,
@@ -4523,36 +4523,38 @@ mod tests {
         let rotated_centroid = vec![0.25; code_dim];
         let raw_query = metadata.prepare_raw_query_context(query.as_ref()).unwrap();
 
-        let mut fallback_scratch = Vec::new();
-        let expected = storage
-            .dist_calculator_with_scratch(
-                query.clone(),
-                123.0,
-                Some(QueryResidual::RabitRawQuery {
-                    rotated_centroid: Some(&rotated_centroid),
-                    query: None,
-                }),
-                &mut fallback_scratch,
-                DistanceCalculatorOptions::default(),
-            )
-            .distance_all(0);
+        for approx_mode in [ApproxMode::Normal, ApproxMode::Accurate] {
+            let mut fallback_scratch = Vec::new();
+            let expected = storage
+                .dist_calculator_with_scratch(
+                    query.clone(),
+                    123.0,
+                    Some(QueryResidual::RabitRawQuery {
+                        rotated_centroid: Some(&rotated_centroid),
+                        query: None,
+                    }),
+                    &mut fallback_scratch,
+                    DistanceCalculatorOptions { approx_mode },
+                )
+                .distance_all(0);
 
-        let mut prepared_scratch = Vec::new();
-        let actual = storage
-            .dist_calculator_with_scratch(
-                query,
-                456.0,
-                Some(QueryResidual::RabitRawQuery {
-                    rotated_centroid: Some(&rotated_centroid),
-                    query: Some(&raw_query),
-                }),
-                &mut prepared_scratch,
-                DistanceCalculatorOptions::default(),
-            )
-            .distance_all(0);
+            let mut prepared_scratch = Vec::new();
+            let actual = storage
+                .dist_calculator_with_scratch(
+                    query.clone(),
+                    456.0,
+                    Some(QueryResidual::RabitRawQuery {
+                        rotated_centroid: Some(&rotated_centroid),
+                        query: Some(&raw_query),
+                    }),
+                    &mut prepared_scratch,
+                    DistanceCalculatorOptions { approx_mode },
+                )
+                .distance_all(0);
 
-        assert_eq!(actual, expected);
-        assert!(prepared_scratch.is_empty());
+            assert_eq!(actual, expected);
+            assert!(prepared_scratch.is_empty());
+        }
     }
 
     #[rstest]

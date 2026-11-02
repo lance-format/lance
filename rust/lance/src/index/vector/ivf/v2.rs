@@ -38,7 +38,7 @@ use futures::{Stream, StreamExt};
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
-    KeyBuilder, LanceCache, PrecomputedCacheKey, WeakLanceCache,
+    KeyBuilder, LanceCache, WeakLanceCache,
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
@@ -108,61 +108,6 @@ pub mod rabit_scan;
 use rabit_scan::{RabitCacheLayout, RabitScan, RabitScanContext, RabitScanFactory};
 
 pub(crate) type RabitSearchCacheCell = Arc<Mutex<Option<Option<Arc<RabitSearchCache>>>>>;
-
-/// A reconstructed IVF index held as its own capacity-accounted cache entry.
-///
-/// The live index owns file readers bound to one object store, a row-id
-/// remapper derived from one fragment-reuse index, and per-index scratch pools.
-/// Holding it in a dedicated entry lets the cache account that memory against
-/// its eviction weight — the entry is sized on insert, so the retained bytes
-/// stay under the configured capacity. An in-state field would instead be
-/// mutated after the state entry was already inserted, silently growing past
-/// the cache limit without increasing its weight.
-#[derive(Debug, lance_core::deepsize::DeepSizeOf)]
-pub(crate) struct CachedReconstructedIndex(pub(crate) Arc<dyn VectorIndex>);
-
-/// Cache key for [`CachedReconstructedIndex`], keyed by the object-store and
-/// fragment-reuse identities that shaped the reconstructed index.
-///
-/// Comparing `Arc` pointer identity (rather than a derived value) keeps a memo
-/// alive only while its inputs are: a different store or a different remapper
-/// would hand the caller an index whose readers/remapping point at the wrong
-/// files. The entry itself holds both `Arc`s, so their addresses stay stable
-/// for the entry's lifetime and cannot be reused by a stale memo.
-pub(crate) struct ReconstructedIndexCacheKey {
-    object_store_ptr: usize,
-    frag_reuse_ptr: usize,
-}
-
-impl ReconstructedIndexCacheKey {
-    pub(crate) fn new(
-        object_store: &Arc<ObjectStore>,
-        frag_reuse_index: Option<&Arc<CompactFragReuseIndex>>,
-    ) -> Self {
-        Self {
-            object_store_ptr: Arc::as_ptr(object_store) as usize,
-            frag_reuse_ptr: frag_reuse_index
-                .map(|fri| Arc::as_ptr(fri) as usize)
-                .unwrap_or(0),
-        }
-    }
-}
-
-impl CacheKey for ReconstructedIndexCacheKey {
-    type ValueType = CachedReconstructedIndex;
-
-    fn key(&self) -> Cow<'_, str> {
-        format!("{}-{}", self.object_store_ptr, self.frag_reuse_ptr).into()
-    }
-
-    fn type_name() -> &'static str {
-        "CachedReconstructedIndex"
-    }
-
-    fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.index.ivf-reconstructed-key", 1)
-    }
-}
 
 /// Serializable state of an IVF index, sufficient to reconstruct the index
 /// without re-reading global buffers from object storage.
@@ -1082,9 +1027,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndexCacheEntry
 #[derive(Debug, Clone)]
 pub struct IVFPartitionKey<S: IvfSubIndex, Q: Quantization> {
     pub partition_id: usize,
-    /// When set, cache lookups in the namespace that produced this digest
-    /// reuse it and skip BLAKE3.
-    physical: Option<PrecomputedCacheKey>,
     _marker: PhantomData<(S, Q)>,
 }
 
@@ -1092,15 +1034,6 @@ impl<S: IvfSubIndex, Q: Quantization> IVFPartitionKey<S, Q> {
     pub fn new(partition_id: usize) -> Self {
         Self {
             partition_id,
-            physical: None,
-            _marker: PhantomData,
-        }
-    }
-
-    fn with_physical(partition_id: usize, physical: PrecomputedCacheKey) -> Self {
-        Self {
-            partition_id,
-            physical: Some(physical),
             _marker: PhantomData,
         }
     }
@@ -1131,10 +1064,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartit
             QuantizationType::Rabit => 4,
         });
         builder.write_u64(self.partition_id as u64);
-    }
-
-    fn precomputed_physical_key(&self) -> Option<PrecomputedCacheKey> {
-        self.physical
     }
 
     fn codec() -> Option<CacheCodec> {
@@ -1231,9 +1160,6 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     distance_type: DistanceType,
 
     index_cache: WeakLanceCache,
-    /// Precomputed BLAKE3 digests for [`IVFPartitionKey`], one per partition.
-    /// Built once at open so per-probe cache lookups skip `KeyBuilder`.
-    partition_cache_keys: Arc<[PrecomputedCacheKey]>,
 
     io_parallelism: usize,
     /// Cumulative I/O performed while opening this index (file footers, IVF
@@ -1267,7 +1193,6 @@ impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
                 .as_ref()
                 .map(|cache| cache.rotated_centroids.len() * std::mem::size_of::<f32>())
                 .unwrap_or_default()
-            + self.partition_cache_keys.len() * std::mem::size_of::<PrecomputedCacheKey>()
         // Skipping session since it is a weak ref
     }
 }
@@ -1285,29 +1210,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .transpose()
     }
 
-    fn build_partition_cache_keys(
-        index_cache: &WeakLanceCache,
-        num_partitions: usize,
-    ) -> Arc<[PrecomputedCacheKey]> {
-        (0..num_partitions)
-            .map(|partition_id| {
-                index_cache.physical_key(&IVFPartitionKey::<S, Q>::new(partition_id))
-            })
-            .collect()
-    }
-
-    fn partition_cache_key(&self, partition_id: usize) -> IVFPartitionKey<S, Q> {
-        debug_assert!(
-            partition_id < self.partition_cache_keys.len(),
-            "partition_id {partition_id} out of bounds for {} partitions",
-            self.partition_cache_keys.len()
-        );
-        IVFPartitionKey::with_physical(partition_id, self.partition_cache_keys[partition_id])
-    }
-
     async fn cache_partition_rows(
         index_cache: &WeakLanceCache,
-        cache_key: &IVFPartitionKey<S, Q>,
+        partition_id: usize,
         partition: &Arc<PartitionEntry<S, Q>>,
     ) -> Result<Arc<RowAddrTreeMap>> {
         let rows = partition.partition_rows();
@@ -1322,17 +1227,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             if index_cache
                 .insert_with_key(&cache_key, partition.clone())
                 .await
-        {
-            partition
-                .partition_rows_accounted
-                .store(true, Ordering::Release);
+            {
+                partition
+                    .partition_rows_accounted
+                    .store(true, Ordering::Release);
+            }
         }
         Ok(rows)
     }
 
     async fn prefilter_for_partition(
         index_cache: &WeakLanceCache,
-        cache_key: &IVFPartitionKey<S, Q>,
+        partition_id: usize,
         partition: &Arc<PartitionEntry<S, Q>>,
         pre_filter: Arc<dyn PreFilter>,
     ) -> Result<Arc<dyn PreFilter>> {
@@ -1342,7 +1248,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         if !pre_filter.needs_partition_row_ids() {
             return Ok(pre_filter);
         }
-        let rows = Self::cache_partition_rows(index_cache, cache_key, partition).await?;
+        let rows = Self::cache_partition_rows(index_cache, partition_id, partition).await?;
         if pre_filter.is_empty_for(rows.as_ref()) {
             Ok(Arc::new(NoFilter))
         } else {
@@ -1520,7 +1426,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             partition_centroid.as_ref(),
             query.key.clone(),
         )?;
-        let param = S::query_params(query.as_ref(), dist_q_c);
+        let param = S::query_params(query.as_ref(), &query_key, dist_q_c);
         let refine_factor = query.refine_factor.unwrap_or(1) as usize;
         let k = query.k * refine_factor;
         let batch = part_entry.index.search_with_scratch(
@@ -1608,7 +1514,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             partition_centroid.as_ref(),
             query.key.clone(),
         )?;
-        let param = S::query_params(query.as_ref(), dist_q_c);
+        let param = S::query_params(query.as_ref(), &query_key, dist_q_c);
         let refine_factor = query.refine_factor.unwrap_or(1) as usize;
         let k = query.k * refine_factor;
         part_entry.index.accumulate_topk_with_scratch(
@@ -1672,6 +1578,23 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         query: &Query,
     ) -> Result<Query> {
         let mut query = query.clone();
+        query.key = Self::preprocess_partition_query_key(
+            use_query_residual,
+            use_residual_scratch,
+            partition_id,
+            partition_centroid,
+            query.key,
+        )?;
+        Ok(query)
+    }
+
+    fn preprocess_partition_query_owned(
+        use_query_residual: bool,
+        use_residual_scratch: bool,
+        partition_id: usize,
+        partition_centroid: Option<&ArrayRef>,
+        mut query: Query,
+    ) -> Result<Query> {
         query.key = Self::preprocess_partition_query_key(
             use_query_residual,
             use_residual_scratch,
@@ -1911,9 +1834,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let open_io_stats = scheduler.stats();
 
         let read_projection = Self::read_projection(&index_reader)?;
-        let index_cache = WeakLanceCache::from(&index_cache);
-        let partition_cache_keys =
-            Self::build_partition_cache_keys(&index_cache, ivf.num_partitions());
         Ok(Self {
             uri: to_local_path(&uri),
             index_path: uri.as_ref().to_string(),
@@ -1928,8 +1848,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             storage,
             sub_index_metadata,
             distance_type,
-            index_cache,
-            partition_cache_keys,
+            index_cache: WeakLanceCache::from(&index_cache),
             io_parallelism,
             open_io_stats,
             prepared_partitions: Arc::default(),
@@ -1961,9 +1880,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let use_query_residual = Self::use_query_residual(&storage, distance_type);
         let use_residual_scratch = Self::use_residual_scratch(&ivf, use_query_residual);
         let read_projection = Self::read_projection(&reader)?;
-        let index_cache = WeakLanceCache::from(&index_cache);
-        let partition_cache_keys =
-            Self::build_partition_cache_keys(&index_cache, ivf.num_partitions());
         Ok(Self {
             uri,
             index_path,
@@ -1978,8 +1894,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             storage,
             sub_index_metadata,
             distance_type,
-            index_cache,
-            partition_cache_keys,
+            index_cache: WeakLanceCache::from(&index_cache),
             io_parallelism,
             // Reconstruction from cached state re-opens readers on its own path;
             // the open-time I/O is not attributed here (it is a one-time cost,
@@ -2498,7 +2413,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let storage_schema = Arc::new(self.storage.reader().schema().as_ref().into());
         let mut partition_id = partitions.start;
         while partition_id < partitions.end {
-            let leader_key = self.partition_cache_key(partition_id);
+            let leader_key = IVFPartitionKey::<S, Q>::new(partition_id);
             if self.index_cache.get_with_key(&leader_key).await.is_some() {
                 partition_id += 1;
                 continue;
@@ -2509,7 +2424,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             // partitions are cold.
             let mut run_end = partition_id + 1;
             while run_end < partitions.end {
-                let key = self.partition_cache_key(run_end);
+                let key = IVFPartitionKey::<S, Q>::new(run_end);
                 if self.index_cache.get_with_key(&key).await.is_some() {
                     break;
                 }
@@ -2560,7 +2475,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     for (offset, batches) in payloads.enumerate() {
                         let follower_id = run.start + offset + 1;
                         follower_loads.push(async move {
-                            let key = self.partition_cache_key(follower_id);
+                            let key = IVFPartitionKey::<S, Q>::new(follower_id);
                             self.index_cache
                                 .get_or_insert_with_key(key, || async move {
                                     let entry = self
@@ -3289,8 +3204,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     let pre_filter = pre_filter.clone();
                     let metrics = prepare_metrics.clone();
                     let raw_query_context = prepare_raw_query_context.clone();
-                    // Box so `buffered` / FuturesOrdered moves a pointer instead
-                    // of the large prepare-partition state machine on every poll.
+                    // Box the large prepare-partition future before handing it to
+                    // FuturesOrdered; polling goes through the pinned boxed pointer.
                     async move {
                         index
                             .prepare_partition_without_prefilter_wait(
@@ -3390,7 +3305,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     let pre_filter = pre_filter.clone();
                     let metrics = prepare_metrics.clone();
                     let raw_query_context = prepare_raw_query_context.clone();
-                    // See the global-heap path: box to shrink FuturesOrdered moves.
+                    // See the global-heap path: box the large prepare-partition future.
                     async move {
                         index
                             .prepare_partition(
@@ -3618,6 +3533,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         }
         // Shared across every chunk's scoring dispatch below, so wrap once in an
         // `Arc` instead of cloning the whole `Vec` per chunk.
+        let base_queries = base_queries.into_iter().map(Arc::new).collect::<Vec<_>>();
         let base_queries = Arc::new(base_queries);
         let raw_query_contexts = Arc::new(raw_query_contexts);
 
@@ -3720,7 +3636,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                         let partition_centroid = index.ivf.centroid(*part_id);
                         for (query_index, dist_q_c) in probing_queries {
                             let prepared = PreparedPartitionSearch::<S, Q> {
-                                query: Arc::new(base_queries[*query_index].clone()),
+                                query: base_queries[*query_index].clone(),
                                 dist_q_c: *dist_q_c,
                                 pre_filter: pre_filter.clone(),
                                 partition_id: *part_id,
@@ -3901,21 +3817,6 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     frag_reuse_index: Option<ResolvedRemapping>,
     context: IvfOpenContext,
 ) -> Result<Arc<dyn VectorIndex>> {
-    // Reconstruction is pure CPU work over already-cached state, but it is not
-    // free: it opens two file readers and copies the IVF models, the quantizer
-    // metadata, and the per-partition sub-index metadata. Repeating it for every
-    // query on a warm cache is measurable, so reuse the index built by the
-    // previous reconstruction whenever it is still bound to the same store.
-    //
-    // The reconstructed index is held in its own cache entry (keyed by object
-    // store + fragment-reuse identity) so its live readers and scratch pools
-    // count against the index cache's eviction weight.
-    let reconstructed_key =
-        ReconstructedIndexCacheKey::new(&object_store, frag_reuse_index.as_ref());
-    if let Some(cached) = index_cache.get_with_key(&reconstructed_key).await {
-        return Ok(cached.0.clone());
-    }
-
     let io_parallelism = object_store.io_parallelism();
     let origin_latency =
         IVFIndex::<S, Q>::origin_latency_at_open(&object_store, context.origin_latency_hint)?;
@@ -3934,7 +3835,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     // shared across dataset opens. Reuse only portable file metadata and bind
     // fresh readers to the object store supplied for this reconstruction.
     let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-    let scheduler = ScanScheduler::new(object_store.clone(), scheduler_config);
+    let scheduler = ScanScheduler::new(object_store, scheduler_config);
     let index_reader = open_reader_cached(
         &scheduler,
         &index_path,
@@ -4007,7 +3908,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         storage,
         state.sub_index_metadata.clone(),
         state.distance_type,
-        index_cache.clone(),
+        index_cache,
         io_parallelism,
         rq_search_cache,
         origin_latency,

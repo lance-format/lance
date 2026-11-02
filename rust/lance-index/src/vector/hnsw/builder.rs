@@ -1519,6 +1519,10 @@ impl IvfSubIndex for HNSW {
     type BuildParams = HnswBuildParams;
     type QueryParams = HnswQueryParams;
 
+    fn query_params(query: &Query, _query_key: &ArrayRef, dist_q_c: f32) -> Self::QueryParams {
+        Self::QueryParams::from_query(query, dist_q_c)
+    }
+
     fn empty_partition_metadata(build_params: Option<&Self::BuildParams>) -> Option<String> {
         let params = build_params.cloned().unwrap_or_default();
         let max_level = params.max_level;

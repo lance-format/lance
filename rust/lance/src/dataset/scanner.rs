@@ -16136,8 +16136,6 @@ mod test {
                 .await
                 .unwrap();
 
-            // 1 IVF state + 4 partition entries + 1 reconstructed index, plus
-            // index metadata (one per dataset version).
             assert_eq!(
                 dataset.index_cache_entry_count().await,
                 // the index, its partitions and the segment ownership mask, plus

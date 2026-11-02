@@ -214,7 +214,7 @@ impl IvfSubIndex for FlatIndex {
     type QueryParams = FlatQueryParams;
     type BuildParams = ();
 
-    fn query_params(query: &Query, dist_q_c: f32) -> Self::QueryParams {
+    fn query_params(query: &Query, _query_key: &ArrayRef, dist_q_c: f32) -> Self::QueryParams {
         Self::QueryParams::from_query(query, dist_q_c)
     }
 
