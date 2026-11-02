@@ -7,8 +7,8 @@ use crate::dataset::index::frag_reuse::{
 };
 use crate::index::DatasetIndexExt;
 use crate::index::frag_reuse::{
-    build_frag_reuse_index_metadata, build_frag_reuse_rewrite_entry, legacy_version_transitions,
-    load_frag_reuse_index_details, load_frag_reuse_records, records_added_since,
+    build_frag_reuse_rewrite_entry, encode_frag_reuse_entry, legacy_version_transitions,
+    load_frag_reuse_history, load_frag_reuse_index_details, load_proposed_frag_reuse_history,
 };
 use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use crate::io::deletion::read_dataset_deletion_file;
@@ -24,8 +24,9 @@ use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
 use lance_table::format::overlay::OverlayCoverage;
 use lance_table::format::overlay::staleness::{field_affects_index, overlay_affects_index};
-use lance_table::format::pb::fragment_reuse_index_details::{InlineContent, Transition};
+use lance_table::format::pb::fragment_reuse_index_details::{self as pb_fri, Transition};
 use lance_table::system_index::frag_reuse::FragReuseVersion;
+use lance_table::system_index::frag_reuse::history::{FragReuseHistory, Record};
 use lance_table::system_index::frag_reuse::lineage::TaggedLineage;
 use lance_table::system_index::frag_reuse::metadata::is_tagged;
 use lance_table::system_index::is_system_index;
@@ -555,7 +556,7 @@ impl<'a> TransactionRebase<'a> {
             return Ok(());
         };
         let ledger = crate::index::frag_reuse::decode_frag_reuse_ledger(dataset, entry).await?;
-        self.current_lineage = Some(TaggedLineage::new(entry, Some(Arc::new(ledger))));
+        self.current_lineage = Some(TaggedLineage::new(entry, Some(ledger)));
         self.current_live = Some(dataset.fragment_bitmap.as_ref().clone());
         self.current_schema = Some(dataset.schema().clone());
         Ok(())
@@ -3152,31 +3153,32 @@ impl<'a> TransactionRebase<'a> {
                     );
                 if current_uses_tagged {
                     let base = match self.reuse.read_entry.as_ref() {
-                        Some(entry) => load_frag_reuse_records(dataset, entry).await?,
-                        None => InlineContent::default(),
+                        Some(entry) => load_frag_reuse_history(dataset, entry).await?,
+                        None => FragReuseHistory::empty(0)?,
                     };
-                    let added = records_added_since(
-                        &base,
-                        &load_frag_reuse_records(dataset, proposed).await?,
-                    )?;
-                    if !added.transitions.is_empty() {
-                        return Err(Error::invalid_input(
-                            "a v0 fragment reuse entry cannot carry tagged transitions",
-                        ));
+                    let added = load_proposed_frag_reuse_history(dataset, proposed)
+                        .await?
+                        .records_added_since(&base)?;
+                    let mut transitions = Vec::new();
+                    for record in &added {
+                        match record {
+                            Record::LegacyVersion(version) => {
+                                transitions.extend(legacy_version_transitions(version));
+                            }
+                            Record::Transition(_) | Record::Uninterpretable { .. } => {
+                                return Err(Error::invalid_input(
+                                    "a v0 fragment reuse entry cannot carry tagged transitions",
+                                ));
+                            }
+                        }
                     }
-                    if added.legacy_versions.is_empty() {
+                    if transitions.is_empty() {
                         return Err(Error::internal(
                             "a rewrite carrying a fragment reuse entry appended no reuse version"
                                 .to_string(),
                         ));
                     }
-                    self.reuse.added_transitions = Some(
-                        added
-                            .legacy_versions
-                            .iter()
-                            .flat_map(legacy_version_transitions)
-                            .collect(),
-                    );
+                    self.reuse.added_transitions = Some(transitions);
                 }
             }
 
@@ -3222,11 +3224,14 @@ impl<'a> TransactionRebase<'a> {
                 let mut new_fri_details =
                     Arc::unwrap_or_clone(load_frag_reuse_index_details(dataset, new_fri).await?);
                 let mut own = new_fri_details.versions.pop();
+                // Stored history is compared as repaired, the form the
+                // rewrite's own entry was built on.
                 let base_versions = match &base.entry {
-                    Some(entry) => load_frag_reuse_index_details(dataset, entry)
-                        .await?
-                        .versions
-                        .clone(),
+                    Some(entry) => repaired_legacy_versions(
+                        &load_frag_reuse_index_details(dataset, entry)
+                            .await?
+                            .versions,
+                    )?,
                     None => Vec::new(),
                 };
                 let shape_err = || {
@@ -3245,12 +3250,11 @@ impl<'a> TransactionRebase<'a> {
                     // A cleanup only drops versions, so publishing the current ones
                     // plus our own keeps every mapping.
                     let current_versions = match (&base.entry, &current) {
-                        (Some(_), Some(current_entry)) => {
-                            load_frag_reuse_index_details(dataset, current_entry)
+                        (Some(_), Some(current_entry)) => repaired_legacy_versions(
+                            &load_frag_reuse_index_details(dataset, current_entry)
                                 .await?
-                                .versions
-                                .clone()
-                        }
+                                .versions,
+                        )?,
                         _ => Vec::new(),
                     };
                     if base.entry.is_none()
@@ -3279,20 +3283,27 @@ impl<'a> TransactionRebase<'a> {
                     }
                     _ => false,
                 };
-                new_fri_details.versions.extend(own);
-                if !is_trimmed && !is_restamped {
+                // The recorded versions are stored history and are repaired if
+                // an older writer left them invalid; the rewrite's own version is
+                // this caller's input and must be valid as given.
+                let (mut history, dropped) = FragReuseHistory::repair_legacy_versions(
+                    new_fri_details.versions.iter().map(pb_fri::Version::from),
+                )?;
+                if !dropped.is_empty() {
+                    log::warn!(
+                        "dropping invalid fragment reuse versions {dropped:?}; rows they \
+                         translated are scanned until their indices are rebuilt"
+                    );
+                }
+                if let Some(own) = &own {
+                    history = history.insert_legacy_version(pb_fri::Version::from(own))?;
+                }
+                if !is_trimmed && !is_restamped && dropped.is_empty() {
                     return Ok((self.transaction, None));
                 }
 
-                let new_frag_bitmap = new_fri_details.new_frag_bitmap();
-
-                let new_frag_reuse_index_meta = build_frag_reuse_index_metadata(
-                    dataset,
-                    Some(new_fri),
-                    new_fri_details,
-                    new_frag_bitmap,
-                )
-                .await?;
+                let new_frag_reuse_index_meta =
+                    encode_frag_reuse_entry(dataset, &history, dataset.manifest.version).await?;
 
                 *new_fri = new_frag_reuse_index_meta;
                 Ok((self.transaction, None))
@@ -3346,17 +3357,25 @@ async fn rewrite_reuse_state(
             )));
         }
         let base = match read_entry.as_ref() {
-            Some(entry) => load_frag_reuse_records(&read_version, entry).await?,
-            None => InlineContent::default(),
+            Some(entry) => load_frag_reuse_history(&read_version, entry).await?,
+            None => FragReuseHistory::empty(1)?,
         };
-        let added = records_added_since(&base, &load_frag_reuse_records(dataset, proposed).await?)?;
-        if !added.legacy_versions.is_empty() {
-            return Err(Error::invalid_input(
-                "a tagged fragment reuse entry appends transitions; it cannot add legacy \
-                 compaction versions",
-            ));
+        let added = load_proposed_frag_reuse_history(dataset, proposed)
+            .await?
+            .records_added_since(&base)?;
+        let mut transitions = Vec::with_capacity(added.len());
+        for record in added {
+            match record {
+                Record::Transition(transition) => transitions.push(transition),
+                Record::LegacyVersion(_) | Record::Uninterpretable { .. } => {
+                    return Err(Error::invalid_input(
+                        "a tagged fragment reuse entry appends transitions; it cannot add \
+                         legacy compaction versions",
+                    ));
+                }
+            }
         }
-        Some(added.transitions)
+        Some(transitions)
     } else {
         None
     };
@@ -3364,6 +3383,19 @@ async fn rewrite_reuse_state(
         read_entry,
         added_transitions,
     })
+}
+
+/// `versions` as [`FragReuseHistory::repair_legacy_versions`] keeps them.
+fn repaired_legacy_versions(versions: &[FragReuseVersion]) -> Result<Vec<FragReuseVersion>> {
+    let (history, _) =
+        FragReuseHistory::repair_legacy_versions(versions.iter().map(pb_fri::Version::from))?;
+    history
+        .records()
+        .filter_map(|record| match record {
+            Record::LegacyVersion(version) => Some(FragReuseVersion::try_from(version.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 async fn initial_fragments_for_rebase(
@@ -3707,7 +3739,7 @@ mod tests {
         let Err(error) = TransactionRebase::try_new(&dataset, transaction, None).await else {
             panic!("a tagged entry without details is refused");
         };
-        assert!(matches!(error, Error::Index { .. }), "{error}");
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains("details"), "{error}");
     }
 
@@ -7736,10 +7768,7 @@ mod tests {
         use super::*;
         use crate::dataset::builder::DatasetBuilder;
         use crate::index::DatasetIndexExt;
-        use crate::index::frag_reuse::{
-            build_frag_reuse_index_metadata, build_new_frag_reuse_index, decode_frag_reuse_ledger,
-            load_raw_frag_reuse_content,
-        };
+        use crate::index::frag_reuse::{build_new_frag_reuse_index, decode_frag_reuse_ledger};
         use crate::index::frag_reuse_reader::tests::{
             field, persist_fixture, prepare, prepare_partition,
         };
@@ -7842,7 +7871,7 @@ mod tests {
                 .await
         }
 
-        async fn fri_ledger(dataset: &Dataset) -> (IndexMetadata, FragReuseLedger) {
+        async fn fri_ledger(dataset: &Dataset) -> (IndexMetadata, Arc<FragReuseLedger>) {
             let stored = crate::index::load_all_indices(dataset).await.unwrap();
             let entry = stored
                 .iter()
@@ -7944,7 +7973,6 @@ mod tests {
                     old_frags: old_fragments.iter().map(FragDigest::from).collect(),
                     new_frags: fragments.iter().map(FragDigest::from).collect(),
                 }],
-                RoaringBitmap::from_iter([dest_id as u32]),
                 dataset.manifest.version,
             )
             .await
@@ -8139,7 +8167,7 @@ mod tests {
             let (their_entry, their_ledger) = fri_ledger(&writer_a).await;
             assert_eq!(their_entry.index_version, 0);
             assert_eq!(count_mappings(&their_ledger), (0, 1));
-            let their_content = load_raw_frag_reuse_content(&writer_a, &their_entry)
+            let their_content = crate::utils::test::frag_reuse_content(&writer_a, &their_entry)
                 .await
                 .unwrap();
 
@@ -8156,7 +8184,7 @@ mod tests {
             assert_eq!(count_mappings(&ledger), (1, 1));
             assert!(ledger.consumer(appended_id as u32).is_some());
             assert!(ledger.consumer(0).is_some());
-            let content = load_raw_frag_reuse_content(&committed, &entry)
+            let content = crate::utils::test::frag_reuse_content(&committed, &entry)
                 .await
                 .unwrap();
             assert!(content.starts_with(&their_content));
@@ -8202,7 +8230,7 @@ mod tests {
             let dest_id = writer_a.manifest.max_fragment_id.unwrap() as u64;
             commit_v0_compaction(&mut writer_a, &[appended_id], dest_id).await;
             let (their_entry, _) = fri_ledger(&writer_a).await;
-            let their_content = load_raw_frag_reuse_content(&writer_a, &their_entry)
+            let their_content = crate::utils::test::frag_reuse_content(&writer_a, &their_entry)
                 .await
                 .unwrap();
 
@@ -8221,7 +8249,9 @@ mod tests {
             let (entry, ledger) = fri_ledger(&verify).await;
             assert_eq!(entry.index_version, 1);
             assert_eq!(count_mappings(&ledger), (1, 1));
-            let content = load_raw_frag_reuse_content(&verify, &entry).await.unwrap();
+            let content = crate::utils::test::frag_reuse_content(&verify, &entry)
+                .await
+                .unwrap();
             assert!(content.starts_with(&their_content));
             let mut expected: Vec<i32> = (0..8).collect();
             expected.extend(100..104);
@@ -8383,9 +8413,8 @@ mod tests {
             let full = FragReuseIndexDetails {
                 versions: vec![legacy_version(1, 100, 110), legacy_version(2, 200, 210)],
             };
-            let entry = build_frag_reuse_index_metadata(
+            let entry = crate::utils::test::legacy_frag_reuse_entry(
                 &dataset,
-                None,
                 full,
                 RoaringBitmap::from_iter([110u32, 210]),
             )
@@ -8423,9 +8452,8 @@ mod tests {
             let trimmed = FragReuseIndexDetails {
                 versions: vec![legacy_version(2, 200, 210)],
             };
-            let new_entry = build_frag_reuse_index_metadata(
+            let new_entry = crate::utils::test::legacy_frag_reuse_entry(
                 &writer_a,
-                Some(&old_entry),
                 trimmed,
                 RoaringBitmap::from_iter([210u32]),
             )

@@ -748,9 +748,7 @@ mod tests {
     use crate::dataset::write::{CommitBuilder, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::index::append::fragment_reuse_affects_segments;
-    use crate::index::frag_reuse::{
-        build_frag_reuse_index_metadata, build_new_frag_reuse_index, open_frag_reuse_index,
-    };
+    use crate::index::frag_reuse::{build_new_frag_reuse_index, open_frag_reuse_index};
     use crate::index::frag_reuse_with_stable_row_ids::apply_frag_reuse_with_stable_row_ids_flag;
     use crate::session::Session;
     use crate::session::caches::TransactionKey;
@@ -860,7 +858,7 @@ mod tests {
             versions: padding_reuse_versions(count as u64),
         };
         let new_fragments = (0..count as u32).map(|i| 100_000 + i).collect();
-        let entry = build_frag_reuse_index_metadata(dataset, None, details, new_fragments)
+        let entry = crate::utils::test::legacy_frag_reuse_entry(dataset, details, new_fragments)
             .await
             .unwrap();
         let mut manifest = dataset.manifest.as_ref().clone();
@@ -1044,7 +1042,7 @@ mod tests {
         let current = frag_reuse_entry(dataset).await;
         let details = FragReuseIndexDetails { versions };
         let bitmap = details.new_frag_bitmap();
-        let entry = build_frag_reuse_index_metadata(dataset, Some(&current), details, bitmap)
+        let entry = crate::utils::test::legacy_frag_reuse_entry(dataset, details, bitmap)
             .await
             .unwrap();
         Operation::CreateIndex {
@@ -1259,9 +1257,19 @@ mod tests {
         groups[0] = recorded;
         let bitmap = RoaringBitmap::from_iter(group.new_fragments.iter().map(|f| f.id as u32));
         let version = dataset.manifest.version;
-        let mut entry = build_new_frag_reuse_index(&mut dataset, groups, bitmap.clone(), version)
-            .await
-            .unwrap();
+        // Planted: the recording may be one the writer refuses to build, and
+        // the commit path is what must refuse it.
+        let mut versions = history(&dataset).await;
+        versions.push(FragReuseVersion {
+            dataset_version: version,
+            groups,
+        });
+        let details = FragReuseIndexDetails { versions };
+        let fragment_bitmap = details.new_frag_bitmap();
+        let mut entry =
+            crate::utils::test::legacy_frag_reuse_entry(&dataset, details, fragment_bitmap)
+                .await
+                .unwrap();
         if let Some(extra) = extra_version {
             let mut versions = history(&dataset).await;
             versions.extend([
@@ -1274,9 +1282,8 @@ mod tests {
                     .clone(),
                 extra,
             ]);
-            entry = build_frag_reuse_index_metadata(
+            entry = crate::utils::test::legacy_frag_reuse_entry(
                 &dataset,
-                Some(&frag_reuse_entry(&dataset).await),
                 FragReuseIndexDetails { versions },
                 bitmap,
             )
@@ -1301,6 +1308,20 @@ mod tests {
             }
             Recording::SourcesOutOfOrder => {
                 assert_refused(result, "recorded moves need ascending source ids")
+            }
+            // On the main chain the rebase validates the recorded version
+            // against the history first.
+            Recording::MovedRowMissing
+            | Recording::DeletedRowMoved
+            | Recording::SourceDigest
+            | Recording::DestinationDigest
+            | Recording::ExtraGroup
+                if !detached =>
+            {
+                assert_refused(
+                    result,
+                    "the records added to the fragment reuse history are invalid",
+                )
             }
             Recording::ExtraGroup => assert_refused(result, "records 2 group(s)"),
             // On the main chain the rebase's shape check refuses it first.
@@ -1400,9 +1421,8 @@ mod tests {
         let (mut dataset, _) = recording_table(dir.as_str(), Storage::Inline).await;
         let read = dataset.clone();
         let (group, recorded) = rewrite_of(&mut dataset, &[6, 7]).await;
-        let bitmap = RoaringBitmap::from_iter(group.new_fragments.iter().map(|f| f.id as u32));
         let version = dataset.manifest.version;
-        let entry = build_new_frag_reuse_index(&mut dataset, vec![recorded], bitmap, version)
+        let entry = build_new_frag_reuse_index(&mut dataset, vec![recorded], version)
             .await
             .unwrap();
         let base = commit(
@@ -1624,8 +1644,7 @@ mod tests {
             dataset_version: own_stamp,
             groups: vec![moves],
         };
-        let bitmap = RoaringBitmap::from_iter(group.new_fragments.iter().map(|f| f.id as u32));
-        let entry = build_new_frag_reuse_index(&mut dataset, own.groups.clone(), bitmap, own_stamp)
+        let entry = build_new_frag_reuse_index(&mut dataset, own.groups.clone(), own_stamp)
             .await
             .unwrap();
         let versions = recorded.iter().cloned().chain([own]).collect::<Vec<_>>();
@@ -1741,8 +1760,7 @@ mod tests {
         let recorded = history(&dataset).await;
         let (group, moves) = rewrite_of(&mut dataset, &[6, 7]).await;
         let stamp = DETACHED_VERSION_MASK | 5;
-        let bitmap = RoaringBitmap::from_iter(group.new_fragments.iter().map(|f| f.id as u32));
-        let entry = build_new_frag_reuse_index(&mut dataset, vec![moves], bitmap, stamp)
+        let entry = build_new_frag_reuse_index(&mut dataset, vec![moves], stamp)
             .await
             .unwrap();
         let rewrite = Operation::Rewrite {
@@ -1845,8 +1863,7 @@ mod tests {
         let recorded = history(&dataset).await;
         let (group, moves) = rewrite_of(&mut dataset, &[6, 7]).await;
         let stamp = dataset.manifest.version;
-        let bitmap = RoaringBitmap::from_iter(group.new_fragments.iter().map(|f| f.id as u32));
-        let entry = build_new_frag_reuse_index(&mut dataset, vec![moves], bitmap, stamp)
+        let entry = build_new_frag_reuse_index(&mut dataset, vec![moves], stamp)
             .await
             .unwrap();
         let rewrite = Operation::Rewrite {

@@ -563,17 +563,109 @@ pub fn padding_reuse_versions(count: u64) -> Vec<lance_index::frag_reuse::FragRe
         .collect()
 }
 
+/// Plant a version 0 FRI entry holding `details` and `fragment_bitmap`
+/// exactly as given. Nothing is validated, so a test can plant histories the
+/// writers refuse to build and check that readers and the commit path refuse
+/// them. Details above the inline limit spill to `details.binpb` as a writer
+/// would.
+pub async fn legacy_frag_reuse_entry(
+    dataset: &Dataset,
+    details: lance_index::frag_reuse::FragReuseIndexDetails,
+    fragment_bitmap: roaring::RoaringBitmap,
+) -> lance_core::Result<lance_table::format::IndexMetadata> {
+    use lance_table::format::pb::fragment_reuse_index_details::{Content, InlineContent};
+    use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
+    use prost::Message;
+    use tokio::io::AsyncWriteExt;
+
+    const INLINE_LIMIT: usize = 204800;
+    let mut versions = details.versions;
+    versions.sort_by_key(|version| version.dataset_version);
+    let content = InlineContent::from(&lance_index::frag_reuse::FragReuseIndexDetails { versions });
+    let uuid = uuid::Uuid::new_v4();
+    let content = if content.encoded_len() > INLINE_LIMIT {
+        let file_name = lance_index::frag_reuse::FRAG_REUSE_DETAILS_FILE_NAME;
+        let path = dataset.indices_dir().join(uuid.to_string()).join(file_name);
+        let mut writer = dataset.object_store.create(&path).await?;
+        writer.write_all(&content.encode_to_vec()).await?;
+        writer.shutdown().await?;
+        Content::External(ExternalFile {
+            path: file_name.to_owned(),
+            offset: 0,
+            size: content.encoded_len() as u64,
+        })
+    } else {
+        Content::Inline(content)
+    };
+    let details = FragmentReuseIndexDetails {
+        content: Some(content),
+    };
+    Ok(lance_table::format::IndexMetadata {
+        uuid,
+        name: lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME.to_string(),
+        fields: vec![],
+        covering_fields: vec![],
+        dataset_version: dataset.manifest.version,
+        fragment_bitmap: Some(fragment_bitmap),
+        index_details: Some(Arc::new(prost_types::Any::from_msg(&details)?)),
+        index_version: 0,
+        created_at: Some(chrono::Utc::now()),
+        base_id: None,
+        files: None,
+        clustering_id: None,
+        metadata: Default::default(),
+    })
+}
+
+/// The serialized history an FRI entry holds.
+pub async fn frag_reuse_content(
+    dataset: &Dataset,
+    entry: &lance_table::format::IndexMetadata,
+) -> lance_core::Result<Vec<u8>> {
+    Ok(
+        crate::index::frag_reuse::load_frag_reuse_history(dataset, entry)
+            .await?
+            .content()
+            .to_vec(),
+    )
+}
+
+/// The records an FRI entry holds, decoded as protobuf.
+pub async fn frag_reuse_records(
+    dataset: &Dataset,
+    entry: &lance_table::format::IndexMetadata,
+) -> lance_core::Result<lance_table::format::pb::fragment_reuse_index_details::InlineContent> {
+    use prost::Message;
+    let content = frag_reuse_content(dataset, entry).await?;
+    lance_table::format::pb::fragment_reuse_index_details::InlineContent::decode(content.as_slice())
+        .map_err(|e| lance_core::Error::corrupt_file_named("FRI details", e.to_string()))
+}
+
+/// The lineage view of serialized history `content`.
+pub fn frag_reuse_ledger_from_content(
+    index_version: i32,
+    content: &[u8],
+) -> lance_core::Result<Arc<lance_table::system_index::frag_reuse::ledger::FragReuseLedger>> {
+    Ok(
+        lance_table::system_index::frag_reuse::history::FragReuseHistory::from_content(
+            index_version,
+            bytes::Bytes::copy_from_slice(content),
+        )?
+        .ledger()
+        .clone(),
+    )
+}
+
 /// Commits `count` padding versions as the dataset's fragment reuse history.
 pub async fn commit_padding_reuse_history(
     dataset: &mut Dataset,
     count: usize,
 ) -> lance_table::format::IndexMetadata {
-    use crate::index::frag_reuse::build_frag_reuse_index_metadata;
     let details = lance_index::frag_reuse::FragReuseIndexDetails {
         versions: padding_reuse_versions(count as u64),
     };
     let new_fragments = (0..count as u32).map(|i| 100_000 + i).collect();
-    let entry = build_frag_reuse_index_metadata(dataset, None, details, new_fragments)
+    let entry = legacy_frag_reuse_entry(dataset, details, new_fragments)
         .await
         .unwrap();
     dataset

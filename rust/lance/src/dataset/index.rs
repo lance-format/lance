@@ -425,7 +425,6 @@ mod tests {
     use super::*;
     use crate::dataset::WriteParams;
     use crate::dataset::transaction::{Operation, Transaction};
-    use crate::index::frag_reuse::build_frag_reuse_index_metadata;
     use crate::index::vector::VectorIndexParams;
     use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, IntoIndexSegment};
     use futures::TryStreamExt;
@@ -448,9 +447,8 @@ mod tests {
 
         assert!(options.create_remapper(&dataset).await.unwrap().is_none());
 
-        let frag_reuse_index = build_frag_reuse_index_metadata(
+        let frag_reuse_index = crate::utils::test::legacy_frag_reuse_entry(
             &dataset,
-            None,
             FragReuseIndexDetails {
                 versions: Vec::new(),
             },

@@ -2084,27 +2084,19 @@ pub mod tests {
 
         let dataset = fixture().await;
         let details = FragReuseIndexDetails { versions: vec![] };
-        let meta = crate::index::frag_reuse::build_frag_reuse_index_metadata(
-            &dataset,
-            None,
-            details,
-            RoaringBitmap::new(),
-        )
-        .await
-        .unwrap();
+        let meta =
+            crate::utils::test::legacy_frag_reuse_entry(&dataset, details, RoaringBitmap::new())
+                .await
+                .unwrap();
         assert_eq!(meta.index_version, 0);
         assert!(!is_tagged(&meta));
 
         // Carrying an existing v0 entry forward preserves version 0.
         let details = FragReuseIndexDetails { versions: vec![] };
-        let carried = crate::index::frag_reuse::build_frag_reuse_index_metadata(
-            &dataset,
-            Some(&meta),
-            details,
-            RoaringBitmap::new(),
-        )
-        .await
-        .unwrap();
+        let carried =
+            crate::utils::test::legacy_frag_reuse_entry(&dataset, details, RoaringBitmap::new())
+                .await
+                .unwrap();
         assert_eq!(carried.index_version, 0);
         assert!(!is_tagged(&carried));
     }

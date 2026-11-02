@@ -1655,9 +1655,9 @@ async fn prepare_attempt(
             .iter()
             .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))
         {
-            Some(entry) => Some(Arc::new(
-                crate::index::frag_reuse::decode_frag_reuse_ledger(dataset, entry).await?,
-            )),
+            Some(entry) => {
+                Some(crate::index::frag_reuse::decode_frag_reuse_ledger(dataset, entry).await?)
+            }
             None => None,
         }
     } else {

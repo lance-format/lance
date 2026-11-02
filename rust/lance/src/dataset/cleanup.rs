@@ -1370,15 +1370,10 @@ impl<'a> CleanupTask<'a> {
         let entries = std::mem::take(&mut inspection.frag_reuse_entries);
         for (uuid, (entry, in_working_set)) in entries.iter() {
             let map_ids = async {
-                let content =
-                    crate::index::frag_reuse::load_raw_frag_reuse_content(self.dataset, entry)
-                        .await?;
-                let ledger = crate::index::frag_reuse::decode_frag_reuse_ledger_from_content(
-                    entry.index_version,
-                    &content,
-                )
-                .await?;
-                if ledger.has_unsupported_transitions() {
+                let history =
+                    crate::index::frag_reuse::load_frag_reuse_history(self.dataset, entry).await?;
+                let ledger = history.ledger();
+                if !history.is_fully_interpretable() {
                     return Err(Error::not_supported(
                         "the tagged FRI history carries transitions this client cannot interpret",
                     ));
@@ -2277,8 +2272,10 @@ impl<'a> CleanupTask<'a> {
             .as_ref()
             .filter(|details| details.type_url.ends_with("FragmentReuseIndexDetails"))
             .ok_or_else(|| Error::index("Index details is not for the fragment reuse index"))?;
-        let content =
-            crate::index::frag_reuse::extract_raw_frag_reuse_content(details, |file| async move {
+        let history = lance_table::system_index::frag_reuse::history::FragReuseHistory::decode(
+            entry.index_version,
+            details,
+            |file| async move {
                 let end = file
                     .offset
                     .checked_add(file.size)
@@ -2331,14 +2328,11 @@ impl<'a> CleanupTask<'a> {
                     .get_range(file.offset as usize..end)
                     .await
                     .map_err(Error::from)
-            })
-            .await?;
-        let ledger = crate::index::frag_reuse::decode_frag_reuse_ledger_from_content(
-            entry.index_version,
-            &content,
+            },
         )
         .await?;
-        if ledger.has_unsupported_transitions() {
+        let ledger = history.ledger();
+        if !history.is_fully_interpretable() {
             return Err(Error::not_supported(
                 "the branch's tagged FRI history carries transitions this client cannot interpret",
             ));

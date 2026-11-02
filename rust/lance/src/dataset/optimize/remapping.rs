@@ -1215,7 +1215,6 @@ pub async fn remap_column_index(
 mod tests {
     use super::*;
     use crate::index::DatasetIndexInternalExt;
-    use crate::index::frag_reuse::build_frag_reuse_index_metadata;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::types::Int32Type;
     use lance_core::utils::tempfile::TempStrDir;
@@ -1295,15 +1294,13 @@ mod tests {
             }
         }
 
-        async fn ledger(transitions: Vec<pb_fri::Transition>) -> FragReuseLedger {
+        async fn ledger(transitions: Vec<pb_fri::Transition>) -> Arc<FragReuseLedger> {
             let content = pb_fri::InlineContent {
                 legacy_versions: vec![],
                 transitions,
             }
             .encode_to_vec();
-            crate::index::frag_reuse::decode_frag_reuse_ledger_from_content(1, &content)
-                .await
-                .unwrap()
+            crate::utils::test::frag_reuse_ledger_from_content(1, &content).unwrap()
         }
 
         fn coverage(fragments: &[u32]) -> RoaringBitmap {
@@ -1403,15 +1400,13 @@ mod tests {
         async fn ledger_with_legacy(
             legacy_versions: Vec<pb_fri::Version>,
             transitions: Vec<pb_fri::Transition>,
-        ) -> FragReuseLedger {
+        ) -> Arc<FragReuseLedger> {
             let content = pb_fri::InlineContent {
                 legacy_versions,
                 transitions,
             }
             .encode_to_vec();
-            crate::index::frag_reuse::decode_frag_reuse_ledger_from_content(1, &content)
-                .await
-                .unwrap()
+            crate::utils::test::frag_reuse_ledger_from_content(1, &content).unwrap()
         }
 
         /// Two lifted v0 rounds (v10 `{2,3} -> D`, v12 `{0,1,D} -> X`) and a
@@ -3549,7 +3544,7 @@ mod tests {
             .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) else {
                 return vec![];
             };
-            crate::index::frag_reuse::load_frag_reuse_records(dataset, &entry)
+            crate::utils::test::frag_reuse_records(dataset, &entry)
                 .await
                 .unwrap()
                 .legacy_versions
@@ -5146,7 +5141,7 @@ mod tests {
             }],
         };
         let frag_reuse_index =
-            build_frag_reuse_index_metadata(&clone, None, details, RoaringBitmap::new())
+            crate::utils::test::legacy_frag_reuse_entry(&clone, details, RoaringBitmap::new())
                 .await
                 .unwrap();
         clone

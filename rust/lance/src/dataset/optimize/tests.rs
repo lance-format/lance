@@ -811,9 +811,8 @@ fn eager_compaction_excluding(excluded_fragment_ids: &[u32]) -> CompactionOption
 }
 
 async fn commit_empty_frag_reuse_index(dataset: &mut Dataset) {
-    let entry = crate::index::frag_reuse::build_frag_reuse_index_metadata(
+    let entry = crate::utils::test::legacy_frag_reuse_entry(
         dataset,
-        None,
         lance_table::system_index::frag_reuse::FragReuseIndexDetails { versions: vec![] },
         RoaringBitmap::new(),
     )

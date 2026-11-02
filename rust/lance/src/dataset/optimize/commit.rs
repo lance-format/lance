@@ -254,7 +254,6 @@ pub async fn commit_compaction(
     let mut remap_group_inputs: Vec<GroupInput> = Vec::new();
     let mut direct_row_id_map: HashMap<u64, Option<u64>> = HashMap::default();
     let mut frag_reuse_groups: Vec<FragReuseGroup> = Vec::new();
-    let mut new_fragment_bitmap: RoaringBitmap = RoaringBitmap::new();
 
     // Write an FRI only when the compaction touches data an index must later
     // remap: a rewrite group covered by a data index, or by the existing FRI's new
@@ -421,12 +420,12 @@ pub async fn commit_compaction(
                     .collect::<Result<_>>()?,
             });
             for frag in task.new_fragments.iter() {
-                new_fragment_bitmap.insert(u32::try_from(frag.id).map_err(|_| {
+                u32::try_from(frag.id).map_err(|_| {
                     Error::invalid_input(format!(
                         "compacted fragment id {} is outside the row-address range",
                         frag.id
                     ))
-                })?);
+                })?;
             }
         }
         rewrite_groups.push(rewrite_group);
@@ -573,15 +572,7 @@ pub async fn commit_compaction(
             // The rewrite publishes right after the reservation unless another commit
             // lands in between, in which case `finish_rewrite` restamps it.
             let dataset_version = reserved_version.unwrap_or(dataset.manifest.version);
-            Some(
-                build_new_frag_reuse_index(
-                    dataset,
-                    frag_reuse_groups,
-                    new_fragment_bitmap,
-                    dataset_version,
-                )
-                .await?,
-            )
+            Some(build_new_frag_reuse_index(dataset, frag_reuse_groups, dataset_version).await?)
         }
     } else {
         if records_row_addrs {

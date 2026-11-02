@@ -1,16 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod entry;
+
+pub(crate) use entry::{
+    EncodedEntry, current_frag_reuse_history, encode_frag_reuse_entry, encode_frag_reuse_entry_at,
+    encode_inline_frag_reuse_entry, load_frag_reuse_history, load_proposed_frag_reuse_history,
+};
+
 use crate::Dataset;
 use crate::index::frag_reuse_reader::SegmentPlanParts;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
-use crate::session::index_caches::FragReuseDetailsKey;
+use crate::session::index_caches::{FragReuseContent, FragReuseContentKey, FragReuseDetailsKey};
 use lance_core::Error;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
 use lance_core::deepsize::DeepSizeOf;
 use lance_index::frag_reuse::{
-    CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_DETAILS_FILE_NAME,
-    FRAG_REUSE_INDEX_NAME, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion,
+    CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_INDEX_NAME, FragReuseGroup,
+    FragReuseIndexDetails, FragReuseVersion,
 };
 use lance_index::scalar::{BatchRowIdRemapper, MetricsCollector, RowIdRemapper};
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
@@ -20,13 +27,14 @@ use lance_table::format::pb::fragment_reuse_index_details::{
 use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
 use lance_table::format::{Fragment, IndexMetadata, Manifest};
 use lance_table::system_index::frag_reuse::gate::{BareRewriteRefusal, covered_bare_rewrite};
+use lance_table::system_index::frag_reuse::history::{FragReuseHistory, Record};
+use lance_table::system_index::frag_reuse::ledger::FragReuseLedger;
 use lance_table::transaction::RewriteGroup;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 /// The remapper resolved for one index open.
@@ -759,7 +767,7 @@ pub async fn load_frag_reuse_index_details(
                         size: external_file.size,
                     },
                     || async {
-                        let data = read_fri_external_range(&store, &path, external_file).await?;
+                        let data = read_fri_external_file(dataset, index, external_file).await?;
                         FragReuseIndexDetails::try_from(InlineContent::decode(data)?)
                     },
                 )
@@ -802,14 +810,30 @@ async fn read_fri_external_range(
         .map_err(Error::from)
 }
 
-/// An FRI entry's raw external details bytes, read from storage.
+/// An FRI entry's raw external details bytes, read once per session.
 async fn read_fri_external_file(
     dataset: &Dataset,
     index: &IndexMetadata,
     file: &ExternalFile,
 ) -> lance_core::Result<bytes::Bytes> {
     let (store, path) = fri_external_location(dataset, index, file).await?;
-    read_fri_external_range(&store, &path, file).await
+    let content = dataset
+        .index_cache
+        .get_or_insert_with_key(
+            FragReuseContentKey {
+                store_identity: &store.store_prefix,
+                path: &path,
+                offset: file.offset,
+                size: file.size,
+            },
+            || async {
+                read_fri_external_range(&store, &path, file)
+                    .await
+                    .map(FragReuseContent)
+            },
+        )
+        .await?;
+    Ok(content.0.clone())
 }
 
 /// open fragment reuse index based on its metadata details
@@ -820,11 +844,12 @@ pub(crate) async fn open_frag_reuse_index(
     CompactFragReuseIndex::try_new(uuid, details.clone())
 }
 
-/// `dataset_version` stamps both the new reuse version and the entry, which must agree.
+/// Append a compaction version to the table's version 0 history.
+/// `dataset_version` stamps both the new reuse version and the entry, which
+/// must agree.
 pub(crate) async fn build_new_frag_reuse_index(
     dataset: &mut Dataset,
     frag_reuse_groups: Vec<FragReuseGroup>,
-    new_fragment_bitmap: RoaringBitmap,
     dataset_version: u64,
 ) -> lance_core::Result<IndexMetadata> {
     let new_version = FragReuseVersion {
@@ -832,243 +857,21 @@ pub(crate) async fn build_new_frag_reuse_index(
         dataset_version,
         groups: frag_reuse_groups,
     };
-
-    let index_meta = dataset.load_indices().await.map(|indices| {
-        indices
-            .iter()
-            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-            .cloned()
-    })?;
-
-    let (new_index_details, fragment_bitmap) = match &index_meta {
-        None => (
-            FragReuseIndexDetails {
-                versions: Vec::from([new_version]),
-            },
-            new_fragment_bitmap,
-        ),
-        Some(index_meta) => {
-            let current_details = load_frag_reuse_index_details(dataset, index_meta).await?;
-            // Every version's new fragments, as a rebuild in `finish_rewrite` or a cleanup
-            // publishes, so the entry is the same whether or not its commit is restamped.
-            let fragment_bitmap = current_details.new_frag_bitmap() | new_fragment_bitmap;
-            let mut versions = current_details.versions.clone();
-            versions.push(new_version);
-            (FragReuseIndexDetails { versions }, fragment_bitmap)
-        }
-    };
-
-    let mut entry = build_frag_reuse_index_metadata(
-        dataset,
-        index_meta.as_ref(),
-        new_index_details,
-        fragment_bitmap,
-    )
-    .await?;
-    entry.dataset_version = dataset_version;
-    Ok(entry)
+    let (_, history) = current_frag_reuse_history(dataset, 0).await?;
+    let history = history.insert_legacy_version(pb_fri::Version::from(&new_version))?;
+    encode_frag_reuse_entry(dataset, &history, dataset_version).await
 }
 
-pub(crate) async fn build_frag_reuse_index_metadata(
-    dataset: &Dataset,
-    index_meta: Option<&IndexMetadata>,
-    mut new_index_details: FragReuseIndexDetails,
-    new_fragment_bitmap: RoaringBitmap,
-) -> lance_core::Result<IndexMetadata> {
-    // The encoding orders versions by stamp; the cached copy must match a read of the file.
-    new_index_details
-        .versions
-        .sort_by_key(|version| version.dataset_version);
-    let index_id = uuid::Uuid::new_v4();
-    let new_index_details_proto = InlineContent::from(&new_index_details);
-    let proto = if new_index_details_proto.encoded_len() > FRAG_REUSE_INLINE_DETAILS_LIMIT {
-        let file_path = dataset
-            .indices_dir()
-            .join(index_id.to_string())
-            .join(FRAG_REUSE_DETAILS_FILE_NAME);
-        let mut writer = dataset.object_store.create(&file_path).await?;
-        writer
-            .write_all(new_index_details_proto.encode_to_vec().as_slice())
-            .await?;
-        writer.shutdown().await?;
-        let external_file = ExternalFile {
-            path: FRAG_REUSE_DETAILS_FILE_NAME.to_owned(),
-            offset: 0,
-            size: new_index_details_proto.encoded_len() as u64,
-        };
-        FragmentReuseIndexDetails {
-            content: Some(Content::External(external_file)),
-        }
-    } else {
-        FragmentReuseIndexDetails {
-            content: Some(Content::Inline(new_index_details_proto)),
-        }
-    };
-
-    let entry = IndexMetadata {
-        uuid: index_id,
-        name: FRAG_REUSE_INDEX_NAME.to_string(),
-        fields: vec![],
-        covering_fields: vec![],
-        dataset_version: dataset.manifest.version,
-        fragment_bitmap: Some(new_fragment_bitmap),
-        index_details: Some(Arc::new(prost_types::Any::from_msg(&proto)?)),
-        index_version: index_meta.map_or(0, |index_meta| index_meta.index_version),
-        created_at: Some(chrono::Utc::now()),
-        base_id: None,
-        // Fragment reuse index is inline (no files)
-        files: None,
-        clustering_id: None,
-        metadata: Default::default(),
-    };
-    // Spares the commit's history check from reading the file back.
-    if let Some(Content::External(file)) = &proto.content {
-        let (store, path) = fri_external_location(dataset, &entry, file).await?;
-        dataset
-            .index_cache
-            .insert_with_key(
-                &FragReuseDetailsKey {
-                    store_identity: &store.store_prefix,
-                    path: &path,
-                    offset: file.offset,
-                    size: file.size,
-                },
-                Arc::new(new_index_details),
-            )
-            .await;
-    }
-    Ok(entry)
-}
-
-/// One length-delimited protobuf field, the unit both the inline details
-/// payload and appended transitions are spliced with.
-fn encode_length_delimited_field(tag: u32, bytes: &[u8]) -> Vec<u8> {
-    let mut output = Vec::with_capacity(bytes.len() + 8);
-    prost::encoding::encode_key(tag, prost::encoding::WireType::LengthDelimited, &mut output);
-    prost::encoding::encode_varint(bytes.len() as u64, &mut output);
-    output.extend_from_slice(bytes);
-    output
-}
-
-/// Decode a committed FRI entry into its transition ledger, resolving
-/// external content through [`read_fri_external_file`]. The entry's original
-/// `Any` is decoded directly, so the envelope is parsed exactly once, by the
-/// ledger. Works for v0 entries too: legacy versions decode as lifted
-/// transitions.
-// The sp-x-sp manifest diff caller went away when it was replaced by
-// merge-through-reassembly; the maintenance stack (trim derivation, tagged
-// remap planning) and the commit-path tests call it now.
+/// The lineage view of a committed FRI entry's history. Works for version 0
+/// entries too: legacy versions decode as lifted transitions.
 pub(crate) async fn decode_frag_reuse_ledger(
     dataset: &Dataset,
     entry: &IndexMetadata,
-) -> lance_core::Result<lance_table::system_index::frag_reuse::ledger::FragReuseLedger> {
-    let details = entry
-        .index_details
-        .as_ref()
-        .ok_or_else(|| Error::index("Index details is not for the fragment reuse index"))?;
-    lance_table::system_index::frag_reuse::ledger::FragReuseLedger::decode(
-        entry.index_version,
-        details,
-        |file| async move { read_fri_external_file(dataset, entry, &file).await },
-    )
-    .await
-}
-
-/// Decode already-loaded FRI content bytes into a transition ledger. Used by
-/// maintenance paths that hold the entry's verbatim content (the trim's
-/// splice inputs and outputs, cleanup's reference resolution) and by tests.
-pub(crate) async fn decode_frag_reuse_ledger_from_content(
-    index_version: i32,
-    content: &[u8],
-) -> lance_core::Result<lance_table::system_index::frag_reuse::ledger::FragReuseLedger> {
-    let inline = prost_types::Any {
-        type_url: "/lance.table.FragmentReuseIndexDetails".into(),
-        value: encode_length_delimited_field(1, content),
-    };
-    lance_table::system_index::frag_reuse::ledger::FragReuseLedger::decode(
-        index_version,
-        &inline,
-        |_| async {
-            Err(Error::invalid_input(
-                "re-wrapped FRI content is inline; no external read is possible",
-            ))
-        },
-    )
-    .await
-}
-
-/// Extract a committed FRI entry's `FragmentReuseIndexDetails` content bytes
-/// verbatim, resolving an external reference but never reinterpreting the
-/// content: existing legacy versions and transitions keep their exact wire
-/// form when an operation carries them forward. Works for index_version 0 and
-/// 1 alike (a 0 -> 1 lift is the same bytes reinterpreted under version 1),
-/// unlike [`load_frag_reuse_index_details`], which decodes v0 semantics.
-pub(crate) async fn load_raw_frag_reuse_content(
-    dataset: &Dataset,
-    index: &IndexMetadata,
-) -> lance_core::Result<Vec<u8>> {
-    let details = index
-        .index_details
-        .as_ref()
-        .filter(|details| details.type_url.ends_with("FragmentReuseIndexDetails"))
-        .ok_or_else(|| Error::index("Index details is not for the fragment reuse index"))?;
-    extract_raw_frag_reuse_content(details, |file| async move {
-        read_fri_external_file(dataset, index, &file).await
-    })
-    .await
-}
-
-/// [`load_raw_frag_reuse_content`] with the external read abstracted: callers
-/// outside a live `Dataset` (the shallow-clone relocation reads the SOURCE
-/// dataset's entry before the clone exists; the parent's cleanup reads a
-/// BRANCH manifest's entry) supply their own resolution.
-pub(crate) async fn extract_raw_frag_reuse_content<F, Fut>(
-    details: &prost_types::Any,
-    read_external: F,
-) -> lance_core::Result<Vec<u8>>
-where
-    F: FnOnce(ExternalFile) -> Fut,
-    Fut: std::future::Future<Output = lance_core::Result<bytes::Bytes>>,
-{
-    use bytes::Buf;
-    use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_field};
-
-    let corrupt = |message: &str| Error::corrupt_file_named("FRI details", message);
-    let mut wire = bytes::Bytes::copy_from_slice(&details.value);
-    let mut content: Option<(u32, bytes::Bytes)> = None;
-    while wire.has_remaining() {
-        let (tag, wire_type) = decode_key(&mut wire).map_err(|e| corrupt(&e.to_string()))?;
-        if wire_type == WireType::LengthDelimited {
-            let length = decode_varint(&mut wire).map_err(|e| corrupt(&e.to_string()))?;
-            if length > wire.remaining() as u64 {
-                return Err(corrupt("FRI details field length exceeds payload"));
-            }
-            let payload = wire.split_to(length as usize);
-            if matches!(tag, 1 | 2) && content.replace((tag, payload)).is_some() {
-                return Err(corrupt("multiple FRI content fields"));
-            }
-        } else {
-            skip_field(wire_type, tag, &mut wire, DecodeContext::default())
-                .map_err(|e| corrupt(&e.to_string()))?;
-        }
-    }
-    match content {
-        None => Err(corrupt("missing FRI content")),
-        Some((1, inline)) => Ok(inline.to_vec()),
-        Some((_, external)) => {
-            let external_file =
-                ExternalFile::decode(external).map_err(|e| corrupt(&e.to_string()))?;
-            let expected = external_file.size;
-            let data = read_external(external_file).await?;
-            if data.len() as u64 != expected {
-                return Err(corrupt(&format!(
-                    "external FRI size mismatch: expected {expected}, received {}",
-                    data.len()
-                )));
-            }
-            Ok(data.to_vec())
-        }
-    }
+) -> lance_core::Result<Arc<FragReuseLedger>> {
+    Ok(load_frag_reuse_history(dataset, entry)
+        .await?
+        .ledger()
+        .clone())
 }
 
 /// The source fragment's deleted row count as the manifest sees it right
@@ -1357,211 +1160,12 @@ pub async fn frag_reuse_entry_appending(
              stable-row-id datasets; this rewrite cannot carry transition intent here",
         ));
     }
-    let stored = super::load_all_indices(dataset).await?;
-    let existing = stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
-    let (mut content, mut fragment_bitmap) = match existing {
-        None => (Vec::new(), RoaringBitmap::new()),
-        Some(entry) => {
-            if !matches!(entry.index_version, 0 | 1) {
-                return Err(Error::not_supported(format!(
-                    "Cannot append a transition to FRI index_version {}; upgrade to a newer \
-                     version of Lance",
-                    entry.index_version
-                )));
-            }
-            (
-                load_raw_frag_reuse_content(dataset, entry).await?,
-                entry.fragment_bitmap.clone().unwrap_or_default(),
-            )
-        }
-    };
-    for transition in &transitions {
-        content.extend_from_slice(&encode_length_delimited_field(
-            2,
-            &transition.encode_to_vec(),
-        ));
-    }
-    let details = prost_types::Any {
-        type_url: "/lance.table.FragmentReuseIndexDetails".into(),
-        value: encode_length_delimited_field(1, &content),
-    };
-    let ledger = lance_table::system_index::frag_reuse::ledger::FragReuseLedger::decode(
-        1,
-        &details,
-        |_| async {
-            Err(Error::invalid_input(
-                "the assembled FRI content is inline; no external read is possible",
-            ))
-        },
-    )
-    .await?;
-    if ledger.has_unsupported_transitions() {
-        return Err(Error::not_supported(
-            "the fragment reuse history contains mappings this writer cannot maintain; \
-             upgrade to a newer version of Lance before rewriting this table",
-        ));
-    }
-    for transition in &transitions {
-        for digest in transition
-            .sources
-            .iter()
-            .chain(transition.destinations.iter())
-        {
-            fragment_bitmap.insert(digest.id as u32);
-        }
-    }
-    Ok(IndexMetadata {
-        uuid: Uuid::new_v4(),
-        name: FRAG_REUSE_INDEX_NAME.to_string(),
-        fields: vec![],
-        covering_fields: vec![],
-        dataset_version: dataset.manifest.version,
-        fragment_bitmap: Some(fragment_bitmap),
-        index_details: Some(Arc::new(details)),
-        index_version: 1,
-        created_at: Some(chrono::Utc::now()),
-        base_id: None,
-        files: None,
-        clustering_id: None,
-        metadata: Default::default(),
-    })
-}
-
-/// The records a fragment reuse entry holds, whatever its version: its
-/// legacy compaction versions and its tagged transitions.
-pub(crate) async fn load_frag_reuse_records(
-    dataset: &Dataset,
-    entry: &IndexMetadata,
-) -> lance_core::Result<InlineContent> {
-    let content = load_raw_frag_reuse_content(dataset, entry).await?;
-    decode_records(&content)
-}
-
-fn decode_records(content: &[u8]) -> lance_core::Result<InlineContent> {
-    InlineContent::decode(content).map_err(|err| {
-        Error::corrupt_file_named(
-            "FRI details",
-            format!("the fragment reuse content does not decode: {err}"),
-        )
-    })
-}
-
-/// What identifies a transition: the fragments it consumed and the ones it
-/// produced, in order. A source fragment is consumed by one transition only
-/// and destinations are freshly reserved, so two transitions with the same
-/// identity are the same record, and must then carry the same content.
-fn transition_identity(transition: &pb_fri::Transition) -> (Vec<u64>, Vec<u64>) {
-    (
-        transition.sources.iter().map(|digest| digest.id).collect(),
-        transition
-            .destinations
-            .iter()
-            .map(|digest| digest.id)
-            .collect(),
-    )
-}
-
-/// The records a rewrite's entry adds relative to the entry at its read
-/// version.
-#[derive(Debug, Default, Clone, PartialEq)]
-pub(crate) struct AddedRecords {
-    pub transitions: Vec<pb_fri::Transition>,
-    pub legacy_versions: Vec<pb_fri::Version>,
-}
-
-/// Work out what `proposed` (a rewrite's `frag_reuse_index`) adds relative
-/// to `base` (the entry at the rewrite's read version), both as records.
-///
-/// A rewrite only appends history. A record `base` holds must appear in
-/// `proposed` with the same content: one that is missing is a removal the
-/// rewrite is not allowed to make (history is retired through the reuse
-/// index cleanup, which proves nothing still depends on it), and one whose
-/// content differs would rewrite a record other indices may translate
-/// through. Transitions are identified by their source and destination
-/// fragments, legacy versions by their dataset version.
-pub(crate) fn records_added_since(
-    base: &InlineContent,
-    proposed: &InlineContent,
-) -> lance_core::Result<AddedRecords> {
-    let mut added = AddedRecords::default();
-
-    let proposed_transitions: HashMap<(Vec<u64>, Vec<u64>), &pb_fri::Transition> = proposed
-        .transitions
-        .iter()
-        .map(|transition| (transition_identity(transition), transition))
-        .collect();
-    if proposed_transitions.len() != proposed.transitions.len() {
-        return Err(Error::invalid_input(
-            "the fragment reuse entry records the same transition more than once",
-        ));
-    }
-    let mut base_transitions: HashMap<(Vec<u64>, Vec<u64>), &pb_fri::Transition> = HashMap::new();
-    for transition in &base.transitions {
-        let identity = transition_identity(transition);
-        match proposed_transitions.get(&identity) {
-            None => {
-                return Err(Error::invalid_input(format!(
-                    "the fragment reuse entry drops the recorded transition from fragments \
-                     {:?}; a rewrite only appends history, retire transitions through the \
-                     fragment reuse index cleanup instead",
-                    identity.0
-                )));
-            }
-            Some(proposed) if *proposed != transition => {
-                return Err(Error::invalid_input(format!(
-                    "the fragment reuse entry changes the recorded transition from fragments \
-                     {:?}; a recorded transition cannot be modified",
-                    identity.0
-                )));
-            }
-            Some(_) => {}
-        }
-        base_transitions.insert(identity, transition);
-    }
-    for transition in &proposed.transitions {
-        if !base_transitions.contains_key(&transition_identity(transition)) {
-            added.transitions.push(transition.clone());
-        }
-    }
-
-    let proposed_versions: HashMap<u64, &pb_fri::Version> = proposed
-        .legacy_versions
-        .iter()
-        .map(|version| (version.dataset_version, version))
-        .collect();
-    if proposed_versions.len() != proposed.legacy_versions.len() {
-        return Err(Error::invalid_input(
-            "the fragment reuse entry records the same compaction version more than once",
-        ));
-    }
-    let mut base_versions: HashSet<u64> = HashSet::new();
-    for version in &base.legacy_versions {
-        match proposed_versions.get(&version.dataset_version) {
-            None => {
-                return Err(Error::invalid_input(format!(
-                    "the fragment reuse entry drops the recorded compaction version {}; a \
-                     rewrite only appends history, retire versions through the fragment \
-                     reuse index cleanup instead",
-                    version.dataset_version
-                )));
-            }
-            Some(proposed) if *proposed != version => {
-                return Err(Error::invalid_input(format!(
-                    "the fragment reuse entry changes the recorded compaction version {}; a \
-                     recorded version cannot be modified",
-                    version.dataset_version
-                )));
-            }
-            Some(_) => {}
-        }
-        base_versions.insert(version.dataset_version);
-    }
-    for version in &proposed.legacy_versions {
-        if !base_versions.contains(&version.dataset_version) {
-            added.legacy_versions.push(version.clone());
-        }
-    }
-    Ok(added)
+    let (_, history) = current_frag_reuse_history(dataset, 1).await?;
+    let history = history.into_tagged()?.append_transitions(&transitions)?;
+    Ok(encode_inline_frag_reuse_entry(
+        &history,
+        dataset.manifest.version,
+    ))
 }
 
 /// A legacy compaction version as the tagged history records it: one
@@ -1904,364 +1508,42 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
         // ledger's digest conservation stands in for it at commit time.
     }
 
-    // Carry the current entry's content bytes over verbatim.
     let existing = stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
-    let (mut content, base_bitmap, base_entry_version) = match existing {
-        None => (Vec::new(), RoaringBitmap::new(), None),
-        Some(entry) => {
-            if !matches!(entry.index_version, 0 | 1) {
-                return Err(Error::not_supported(format!(
-                    "Cannot append a stable-partition transition to FRI index_version {}; \
-                     upgrade to a newer version of Lance",
-                    entry.index_version
-                )));
-            }
-            (
-                load_raw_frag_reuse_content(dataset, entry).await?,
-                entry.fragment_bitmap.clone().unwrap_or_default(),
-                Some(entry.dataset_version),
-            )
-        }
+    let (history, base_entry_version) = match existing {
+        None => (FragReuseHistory::empty(1)?, None),
+        Some(entry) => (
+            load_frag_reuse_history(dataset, entry)
+                .await?
+                .into_tagged()?,
+            Some(entry.dataset_version),
+        ),
     };
     // A transition is recorded once. The rewrite's intent was diffed against
     // the entry at its read version; the current entry may have moved on
     // (another writer's transitions, a trim), but it can only hold one of
     // ours if the same sources were consumed twice, which the resolver
     // refuses before this point. Check anyway rather than record it twice.
-    let recorded = decode_records(&content)?;
+    let source_ids = |transition: &pb_fri::Transition| -> Vec<u64> {
+        transition.sources.iter().map(|digest| digest.id).collect()
+    };
     for transition in transitions {
-        if recorded
-            .transitions
-            .iter()
-            .any(|existing| transition_identity(existing) == transition_identity(transition))
-        {
+        let is_recorded = history.records().any(|record| {
+            matches!(record, Record::Transition(existing)
+                if source_ids(existing) == source_ids(transition)
+                    && existing.destinations.iter().map(|d| d.id).eq(
+                        transition.destinations.iter().map(|d| d.id)))
+        });
+        if is_recorded {
             return Err(Error::invalid_input(format!(
                 "the fragment reuse history already records a transition from fragments {:?}; \
                  the rewrite's entry cannot append it again",
-                transition_identity(transition).0
+                source_ids(transition)
             )));
         }
     }
-    for transition in transitions {
-        // Another `InlineContent.transitions` (field 2) element; repeated
-        // protobuf fields concatenate, so appending preserves the existing
-        // wire form untouched.
-        content.extend_from_slice(&encode_length_delimited_field(
-            2,
-            &transition.encode_to_vec(),
-        ));
-    }
-
-    // Commit-side validation of the assembled entry: lineage order, digest
-    // conservation, single content field, mapping presence, unknown-mapping
-    // detection. Runs on the inline form before any spill.
-    let assembled = prost_types::Any {
-        type_url: "/lance.table.FragmentReuseIndexDetails".into(),
-        value: encode_length_delimited_field(1, &content),
-    };
-    let ledger = lance_table::system_index::frag_reuse::ledger::FragReuseLedger::decode(
-        1,
-        &assembled,
-        |_| async {
-            Err(Error::invalid_input(
-                "the assembled FRI content is inline; no external read is possible",
-            ))
-        },
-    )
-    .await?;
-    // The decode above uses READER semantics, which deliberately skip
-    // transitions with unknown mappings instead of failing; a writer must
-    // not maintain a history it cannot fully interpret (spec: "Writers must
-    // reject operations that require interpreting or maintaining unsupported
-    // mappings").
-    if ledger.has_unsupported_transitions() {
-        return Err(Error::not_supported(
-            "the fragment reuse history contains mappings this writer cannot maintain;              upgrade to a newer version of Lance before rewriting this table",
-        ));
-    }
-    // Every stable-partition transition must own its row map: a reused
-    // map_id would let maintenance of one transition delete or overwrite the
-    // map file another live transition still references (object-store
-    // writes are not create-if-absent, so nothing else catches the clash).
-    let mut seen_map_ids = HashSet::new();
-    for transition in ledger.transitions() {
-        if let lance_table::system_index::frag_reuse::ledger::Mapping::StablePartition(partition) =
-            transition.mapping()
-            && !seen_map_ids.insert(partition.map_id.clone())
-        {
-            return Err(Error::invalid_input(format!(
-                "stable-partition row-map id {} is referenced by more than one transition;                  each transition must own its row map",
-                partition.map_id
-            )));
-        }
-    }
-
-    // Provenance: the previous coverage plus every fragment this rewrite's
-    // transitions touch, retired sources deliberately included.
-    let mut fragment_bitmap = base_bitmap;
-    for transition in transitions {
-        for digest in transition
-            .sources
-            .iter()
-            .chain(transition.destinations.iter())
-        {
-            // In-range by construction: the ledger decode above already
-            // validated every digest id against the row-address fragment
-            // bound (the one authoritative enforcement point).
-            fragment_bitmap.insert(digest.id as u32);
-        }
-    }
-
-    let entry = build_tagged_frag_reuse_entry(dataset, content, fragment_bitmap).await?;
+    let history = history.append_transitions(transitions)?;
+    let entry = encode_frag_reuse_entry(dataset, &history, dataset.manifest.version).await?;
     Ok((entry, base_entry_version))
-}
-
-/// Package assembled tagged FRI content bytes into a fresh manifest entry,
-/// spilling to an external details file above the inline threshold. The
-/// content must already be validated (a decodable ledger); this only encodes.
-pub(crate) async fn build_tagged_frag_reuse_entry(
-    dataset: &Dataset,
-    content: Vec<u8>,
-    fragment_bitmap: RoaringBitmap,
-) -> lance_core::Result<IndexMetadata> {
-    let index_id = Uuid::new_v4();
-    let details_value = encode_tagged_frag_reuse_details(
-        &dataset.object_store,
-        dataset.indices_dir(),
-        index_id,
-        content,
-    )
-    .await?;
-
-    Ok(IndexMetadata {
-        uuid: index_id,
-        name: FRAG_REUSE_INDEX_NAME.to_string(),
-        fields: vec![],
-        covering_fields: vec![],
-        dataset_version: dataset.manifest.version,
-        fragment_bitmap: Some(fragment_bitmap),
-        index_details: Some(Arc::new(prost_types::Any {
-            type_url: "/lance.table.FragmentReuseIndexDetails".into(),
-            value: details_value,
-        })),
-        index_version: 1,
-        created_at: Some(chrono::Utc::now()),
-        base_id: None,
-        // The row-map files live in their own directories referenced from the
-        // transitions, not under this entry's uuid.
-        files: None,
-        clustering_id: None,
-        metadata: Default::default(),
-    })
-}
-
-/// Encode validated tagged FRI content bytes as an `index_details` value,
-/// spilling to `<indices_dir>/<index_id>/details.binpb` above the inline
-/// threshold.
-async fn encode_tagged_frag_reuse_details(
-    object_store: &ObjectStore,
-    indices_dir: Path,
-    index_id: Uuid,
-    content: Vec<u8>,
-) -> lance_core::Result<Vec<u8>> {
-    if content.len() > FRAG_REUSE_INLINE_DETAILS_LIMIT {
-        let file_path = indices_dir
-            .join(index_id.to_string())
-            .join(FRAG_REUSE_DETAILS_FILE_NAME);
-        let mut writer = object_store.create(&file_path).await?;
-        writer.write_all(&content).await?;
-        writer.shutdown().await?;
-        let external_file = ExternalFile {
-            path: FRAG_REUSE_DETAILS_FILE_NAME.to_owned(),
-            offset: 0,
-            size: content.len() as u64,
-        };
-        Ok(encode_length_delimited_field(
-            2,
-            &external_file.encode_to_vec(),
-        ))
-    } else {
-        Ok(encode_length_delimited_field(1, &content))
-    }
-}
-
-/// Details above this size spill to an external `details.binpb` file.
-pub(crate) const FRAG_REUSE_INLINE_DETAILS_LIMIT: usize = 204800;
-
-/// `InlineContent.Transition.stable_partition` (proto field 4).
-const STABLE_PARTITION_FIELD: u32 = 4;
-/// `StablePartition.base_id` (proto field 3, varint).
-const STABLE_PARTITION_BASE_ID_FIELD: u32 = 3;
-
-/// Rewrite each stable-partition mapping's `base_id` through `remap`, leaving
-/// every other byte in its exact wire form. The rewrite is a surgical
-/// wire-level patch (no protobuf decode/re-encode), so unknown NESTED fields
-/// -- extensions of `StablePartition` or `FragmentDigest` this writer does
-/// not know, exactly the shape `base_id` itself was added in -- survive
-/// byte-identically instead of being silently stripped. An unknown envelope
-/// record is still refused: it may participate in base resolution in ways
-/// this writer cannot see, so a history it cannot fully parse must not be
-/// relocated (mirrors the trim's obligation). Unknown fields INSIDE a
-/// transition are refused earlier, by the ledger gate the caller runs.
-fn relocate_stable_partition_bases(
-    content: &[u8],
-    remap: impl Fn(Option<u32>) -> lance_core::Result<Option<u32>>,
-) -> lance_core::Result<Vec<u8>> {
-    use bytes::Buf;
-    use prost::encoding::{WireType, decode_key, decode_varint};
-
-    let corrupt = |message: String| Error::corrupt_file_named("FRI details", message);
-    let total = content.len();
-    let mut buf = bytes::Bytes::copy_from_slice(content);
-    let mut output = Vec::with_capacity(content.len());
-    while buf.has_remaining() {
-        let start = total - buf.remaining();
-        let (tag, wire_type) = decode_key(&mut buf).map_err(|e| corrupt(e.to_string()))?;
-        if wire_type != WireType::LengthDelimited || !matches!(tag, 1 | 2) {
-            return Err(Error::not_supported(format!(
-                "the tagged FRI history carries an unknown record (field {tag}); \
-                 upgrade to a newer version of Lance before cloning this table"
-            )));
-        }
-        let length = decode_varint(&mut buf).map_err(|e| corrupt(e.to_string()))?;
-        if length > buf.remaining() as u64 {
-            return Err(corrupt(format!(
-                "field {tag} length {length} exceeds remaining {} bytes",
-                buf.remaining()
-            )));
-        }
-        let payload = buf.split_to(length as usize);
-        let end = total - buf.remaining();
-        if tag == 2
-            && let Some(patched) = patch_transition_stable_partition(&payload, &remap)?
-        {
-            output.extend_from_slice(&encode_length_delimited_field(2, &patched));
-        } else {
-            // Legacy versions and transitions without a stable-partition
-            // mapping (ordered compaction) reference no bases; verbatim.
-            output.extend_from_slice(&content[start..end]);
-        }
-    }
-    Ok(output)
-}
-
-/// Patch a transition's stable-partition submessage in place, copying every
-/// other field's bytes verbatim (whatever their field number or wire type).
-/// Returns `None` when the transition carries no stable-partition mapping.
-fn patch_transition_stable_partition(
-    raw: &[u8],
-    remap: &impl Fn(Option<u32>) -> lance_core::Result<Option<u32>>,
-) -> lance_core::Result<Option<Vec<u8>>> {
-    use bytes::Buf;
-    use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_field};
-
-    let corrupt = |message: String| Error::corrupt_file_named("FRI details", message);
-    let total = raw.len();
-    let mut buf = bytes::Bytes::copy_from_slice(raw);
-    let mut output = Vec::with_capacity(raw.len() + 8);
-    let mut found = false;
-    while buf.has_remaining() {
-        let start = total - buf.remaining();
-        let (tag, wire_type) = decode_key(&mut buf).map_err(|e| corrupt(e.to_string()))?;
-        if tag == STABLE_PARTITION_FIELD {
-            if wire_type != WireType::LengthDelimited {
-                return Err(corrupt("stable partition mapping must be a message".into()));
-            }
-            let length = decode_varint(&mut buf).map_err(|e| corrupt(e.to_string()))?;
-            if length > buf.remaining() as u64 {
-                return Err(corrupt(format!(
-                    "stable partition length {length} exceeds remaining {} bytes",
-                    buf.remaining()
-                )));
-            }
-            let payload = buf.split_to(length as usize);
-            if found {
-                // The ledger gate rejects this before relocation runs.
-                return Err(corrupt(
-                    "transition contains multiple stable-partition mappings".into(),
-                ));
-            }
-            found = true;
-            let patched = patch_stable_partition_base(&payload, remap)?;
-            output.extend_from_slice(&encode_length_delimited_field(
-                STABLE_PARTITION_FIELD,
-                &patched,
-            ));
-        } else {
-            if wire_type == WireType::LengthDelimited {
-                let length = decode_varint(&mut buf).map_err(|e| corrupt(e.to_string()))?;
-                if length > buf.remaining() as u64 {
-                    return Err(corrupt(format!(
-                        "field {tag} length {length} exceeds remaining {} bytes",
-                        buf.remaining()
-                    )));
-                }
-                buf.advance(length as usize);
-            } else {
-                skip_field(wire_type, tag, &mut buf, DecodeContext::default())
-                    .map_err(|e| corrupt(e.to_string()))?;
-            }
-            let end = total - buf.remaining();
-            output.extend_from_slice(&raw[start..end]);
-        }
-    }
-    Ok(found.then_some(output))
-}
-
-/// Drop the submessage's `base_id` field wherever it occurs (proto3
-/// last-one-wins yields the effective current value) and re-emit the
-/// remapped value at the end; every other byte is preserved verbatim.
-fn patch_stable_partition_base(
-    raw: &[u8],
-    remap: &impl Fn(Option<u32>) -> lance_core::Result<Option<u32>>,
-) -> lance_core::Result<Vec<u8>> {
-    use bytes::Buf;
-    use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_field};
-
-    let corrupt = |message: String| Error::corrupt_file_named("FRI details", message);
-    let total = raw.len();
-    let mut buf = bytes::Bytes::copy_from_slice(raw);
-    let mut output = Vec::with_capacity(raw.len() + 8);
-    let mut existing = None;
-    while buf.has_remaining() {
-        let start = total - buf.remaining();
-        let (tag, wire_type) = decode_key(&mut buf).map_err(|e| corrupt(e.to_string()))?;
-        if tag == STABLE_PARTITION_BASE_ID_FIELD {
-            if wire_type != WireType::Varint {
-                return Err(corrupt("stable partition base_id must be a varint".into()));
-            }
-            let value = decode_varint(&mut buf).map_err(|e| corrupt(e.to_string()))?;
-            existing =
-                Some(u32::try_from(value).map_err(|_| {
-                    corrupt(format!("stable partition base_id {value} overflows u32"))
-                })?);
-        } else {
-            if wire_type == WireType::LengthDelimited {
-                let length = decode_varint(&mut buf).map_err(|e| corrupt(e.to_string()))?;
-                if length > buf.remaining() as u64 {
-                    return Err(corrupt(format!(
-                        "field {tag} length {length} exceeds remaining {} bytes",
-                        buf.remaining()
-                    )));
-                }
-                buf.advance(length as usize);
-            } else {
-                skip_field(wire_type, tag, &mut buf, DecodeContext::default())
-                    .map_err(|e| corrupt(e.to_string()))?;
-            }
-            let end = total - buf.remaining();
-            output.extend_from_slice(&raw[start..end]);
-        }
-    }
-    if let Some(base_id) = remap(existing)? {
-        prost::encoding::encode_key(
-            STABLE_PARTITION_BASE_ID_FIELD,
-            WireType::Varint,
-            &mut output,
-        );
-        prost::encoding::encode_varint(u64::from(base_id), &mut output);
-    }
-    Ok(output)
 }
 
 /// How a clone restamps the stable-partition `base_id`s it relocates.
@@ -2312,7 +1594,7 @@ pub(crate) async fn relocate_tagged_entry_for_clone(
     // `Dataset`: the same rule as `read_fri_external_file`, against the
     // source manifest's `base_paths`.
     let registry = store_registry.clone();
-    let content = extract_raw_frag_reuse_content(details, |file| async move {
+    let history = FragReuseHistory::decode(entry.index_version, details, |file| async move {
         let end = file
             .offset
             .checked_add(file.size)
@@ -2362,27 +1644,16 @@ pub(crate) async fn relocate_tagged_entry_for_clone(
     })
     .await?;
 
-    // Full ledger validation before interpreting anything; reader semantics
-    // skip unknown mappings, and a writer must not relocate a history it
-    // cannot fully interpret.
-    let ledger = decode_frag_reuse_ledger_from_content(entry.index_version, &content).await?;
-    if ledger.has_unsupported_transitions() {
-        return Err(Error::not_supported(
-            "the fragment reuse history contains mappings this writer cannot relocate; \
-             upgrade to a newer version of Lance before cloning this table",
-        ));
-    }
-
     let relocated =
-        relocate_stable_partition_bases(&content, |base_id| match (&base_remap, base_id) {
+        history.remap_stable_partition_bases(|base_id| match (&base_remap, base_id) {
             // Deep clone materializes every referenced map into the clone's
             // own `_fri/`, so every stamp clears to unset.
             (CloneBaseRemap::Deep, _) => Ok(None),
             // The source's own base gets the id the clone assigned to it.
             (CloneBaseRemap::Shallow { new_base_id }, None) => Ok(Some(*new_base_id)),
             // The clone carries the source's `base_paths` entries over under
-            // the same ids, so a foreign-base reference keeps its id; it
-            // must exist.
+            // the same ids, so a foreign-base reference keeps its id; it must
+            // exist.
             (CloneBaseRemap::Shallow { .. }, Some(id)) => {
                 if source_manifest.base_paths.contains_key(&id) {
                     Ok(Some(id))
@@ -2394,42 +1665,19 @@ pub(crate) async fn relocate_tagged_entry_for_clone(
                 }
             }
         })?;
-    // The relocated history must still decode as a well-formed ledger.
-    decode_frag_reuse_ledger_from_content(entry.index_version, &relocated).await?;
 
-    let index_id = Uuid::new_v4();
-    let target_indices_dir = target_base.clone().join(crate::dataset::INDICES_DIR);
-    let spilled = (relocated.len() > FRAG_REUSE_INLINE_DETAILS_LIMIT).then(|| {
-        target_indices_dir
-            .clone()
-            .join(index_id.to_string())
-            .join(FRAG_REUSE_DETAILS_FILE_NAME)
-    });
-    let details_value =
-        encode_tagged_frag_reuse_details(target_store, target_indices_dir, index_id, relocated)
-            .await?;
-    Ok((
-        IndexMetadata {
-            uuid: index_id,
-            name: entry.name.clone(),
-            fields: entry.fields.clone(),
-            covering_fields: entry.covering_fields.clone(),
-            dataset_version: entry.dataset_version,
-            fragment_bitmap: entry.fragment_bitmap.clone(),
-            index_details: Some(Arc::new(prost_types::Any {
-                type_url: "/lance.table.FragmentReuseIndexDetails".into(),
-                value: details_value,
-            })),
-            index_version: entry.index_version,
-            created_at: entry.created_at,
-            // The relocated entry lives in the clone.
-            base_id: None,
-            files: entry.files.clone(),
-            clustering_id: None,
-            metadata: Default::default(),
-        },
+    let EncodedEntry {
+        entry: mut relocated_entry,
         spilled,
-    ))
+    } = encode_frag_reuse_entry_at(
+        target_store,
+        target_base.clone().join(crate::dataset::INDICES_DIR),
+        &relocated,
+        entry.dataset_version,
+    )
+    .await?;
+    relocated_entry.created_at = entry.created_at;
+    Ok((relocated_entry, spilled))
 }
 
 /// The copy work a deep clone owes a tagged FRI entry: every file of every
@@ -2587,15 +1835,19 @@ mod tests {
         let (mut content, mut bitmap) = match existing {
             None => (Vec::new(), RoaringBitmap::new()),
             Some(entry) => (
-                load_raw_frag_reuse_content(dataset, entry).await.unwrap(),
+                crate::utils::test::frag_reuse_content(dataset, entry)
+                    .await
+                    .unwrap(),
                 entry.fragment_bitmap.clone().unwrap_or_default(),
             ),
         };
         for transition in &transitions {
-            content.extend_from_slice(&encode_length_delimited_field(
-                2,
-                &transition.encode_to_vec(),
-            ));
+            content.extend_from_slice(
+                &lance_table::system_index::frag_reuse::history::length_delimited(
+                    2,
+                    &transition.encode_to_vec(),
+                ),
+            );
             for digest in transition
                 .sources
                 .iter()
@@ -2613,7 +1865,9 @@ mod tests {
             fragment_bitmap: Some(bitmap),
             index_details: Some(Arc::new(prost_types::Any {
                 type_url: "/lance.table.FragmentReuseIndexDetails".into(),
-                value: encode_length_delimited_field(1, &content),
+                value: lance_table::system_index::frag_reuse::history::length_delimited(
+                    1, &content,
+                ),
             })),
             index_version: 1,
             created_at: None,
@@ -2658,145 +1912,10 @@ mod tests {
             .unwrap()
     }
 
-    async fn decode_entry(dataset: &Dataset, entry: &IndexMetadata) -> FragReuseLedger {
+    async fn decode_entry(dataset: &Dataset, entry: &IndexMetadata) -> Arc<FragReuseLedger> {
         decode_frag_reuse_ledger(dataset, entry).await.unwrap()
     }
 
-    /// The commit path reads a rewrite's entry as what it adds relative to
-    /// the entry at the read version. Records the base holds must all be
-    /// there unchanged: a rewrite appends history, it never retires or
-    /// rewrites a recorded transition or compaction version.
-    #[test]
-    fn records_added_since_is_add_only() {
-        let digest = |id: u64| FragmentDigest {
-            id,
-            physical_rows: 4,
-            num_deleted_rows: 0,
-        };
-        let transition = |sources: &[u64], destinations: &[u64], map_id: &str| Transition {
-            sources: sources.iter().copied().map(digest).collect(),
-            destinations: destinations.iter().copied().map(digest).collect(),
-            mapping: Some(transition::Mapping::StablePartition(StablePartition {
-                map_id: map_id.to_string(),
-                map_size_bytes: 1,
-                base_id: None,
-            })),
-        };
-        let version = |dataset_version: u64| pb_fri::Version {
-            dataset_version,
-            groups: vec![pb_fri::Group {
-                changed_row_addrs: vec![],
-                old_fragments: vec![digest(100)],
-                new_fragments: vec![digest(110)],
-            }],
-        };
-        let t1 = transition(&[0, 1], &[10, 11], "a");
-        let t2 = transition(&[2, 3], &[12, 13], "b");
-        let base = InlineContent {
-            legacy_versions: vec![version(3)],
-            transitions: vec![t1.clone()],
-        };
-
-        // Appending: only the new records come back.
-        let added = records_added_since(
-            &base,
-            &InlineContent {
-                legacy_versions: vec![version(3), version(5)],
-                transitions: vec![t1.clone(), t2.clone()],
-            },
-        )
-        .unwrap();
-        assert_eq!(added.transitions, vec![t2.clone()]);
-        assert_eq!(added.legacy_versions, vec![version(5)]);
-
-        // Nothing added is fine here (the assembly refuses it later).
-        assert_eq!(
-            records_added_since(&base, &base).unwrap(),
-            AddedRecords::default()
-        );
-
-        // Dropping a recorded transition or version is refused.
-        let error = records_added_since(
-            &base,
-            &InlineContent {
-                legacy_versions: vec![version(3)],
-                transitions: vec![t2],
-            },
-        )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("drops the recorded transition"),
-            "{error}"
-        );
-        let error = records_added_since(
-            &base,
-            &InlineContent {
-                legacy_versions: vec![],
-                transitions: vec![t1.clone()],
-            },
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("drops the recorded compaction version"),
-            "{error}"
-        );
-
-        // Same identity, different content is refused.
-        let mut t1_changed = t1.clone();
-        t1_changed.mapping = Some(transition::Mapping::StablePartition(StablePartition {
-            map_id: "a".to_string(),
-            map_size_bytes: 2,
-            base_id: None,
-        }));
-        let error = records_added_since(
-            &base,
-            &InlineContent {
-                legacy_versions: vec![version(3)],
-                transitions: vec![t1_changed],
-            },
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("changes the recorded transition"),
-            "{error}"
-        );
-        let mut version_changed = version(3);
-        version_changed.groups.clear();
-        let error = records_added_since(
-            &base,
-            &InlineContent {
-                legacy_versions: vec![version_changed],
-                transitions: vec![t1.clone()],
-            },
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("changes the recorded compaction version"),
-            "{error}"
-        );
-
-        // A record listed twice cannot be diffed.
-        let error = records_added_since(
-            &base,
-            &InlineContent {
-                legacy_versions: vec![version(3)],
-                transitions: vec![t1.clone(), t1],
-            },
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("more than once"), "{error}");
-    }
-
-    /// A rewrite whose entry was built against an older snapshot than its
-    /// read version drops the transition recorded in between. The commit
-    /// refuses it instead of splicing the recorded history away: retiring
-    /// history is the reuse index cleanup's job.
     #[tokio::test]
     async fn rewrite_entry_dropping_a_recorded_transition_is_refused() {
         let mut dataset = reader_tests::fixture().await;
@@ -2817,7 +1936,7 @@ mod tests {
         let (transition, destinations) = reader_tests::prepare_partition(&dataset, &[1], 20).await;
         let stale_entry = entry_appending(&untagged, vec![transition]).await;
         assert_eq!(
-            load_frag_reuse_records(&dataset, &stale_entry)
+            crate::utils::test::frag_reuse_records(&dataset, &stale_entry)
                 .await
                 .unwrap()
                 .transitions
@@ -2866,7 +1985,9 @@ mod tests {
         reserve_fragments(&mut dataset, 40).await;
         let dataset = tag_fragment_zero(dataset).await;
         let entry = stored_fri(&crate::index::load_all_indices(&dataset).await.unwrap());
-        let mut records = load_frag_reuse_records(&dataset, &entry).await.unwrap();
+        let mut records = crate::utils::test::frag_reuse_records(&dataset, &entry)
+            .await
+            .unwrap();
         let Some(transition::Mapping::StablePartition(mapping)) =
             records.transitions[0].mapping.as_mut()
         else {
@@ -2879,7 +2000,10 @@ mod tests {
             dataset_version: read_version,
             index_details: Some(Arc::new(prost_types::Any {
                 type_url: "/lance.table.FragmentReuseIndexDetails".into(),
-                value: encode_length_delimited_field(1, &records.encode_to_vec()),
+                value: lance_table::system_index::frag_reuse::history::length_delimited(
+                    1,
+                    &records.encode_to_vec(),
+                ),
             })),
             ..entry.clone()
         };
@@ -2975,7 +2099,9 @@ mod tests {
 
         // A second stable-partition rewrite passes the tagged gate and
         // appends onto the v1 entry, preserving its bytes verbatim.
-        let first_content = load_raw_frag_reuse_content(&dataset, &entry).await.unwrap();
+        let first_content = crate::utils::test::frag_reuse_content(&dataset, &entry)
+            .await
+            .unwrap();
         reserve_fragments(&mut dataset, 20).await;
         let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
         let (mut transition, mut destinations) = reader_tests::prepare(&dataset).await;
@@ -3005,7 +2131,9 @@ mod tests {
         let stored = crate::index::load_all_indices(&dataset).await.unwrap();
         let entry = stored_fri(&stored);
         assert_eq!(entry.index_version, 1);
-        let second_content = load_raw_frag_reuse_content(&dataset, &entry).await.unwrap();
+        let second_content = crate::utils::test::frag_reuse_content(&dataset, &entry)
+            .await
+            .unwrap();
         assert!(second_content.starts_with(&first_content));
         let ledger = decode_entry(&dataset, &entry).await;
         assert_eq!(ledger.transitions().len(), 2);
@@ -3136,9 +2264,8 @@ mod tests {
                 }],
             }],
         };
-        let v0_entry = build_frag_reuse_index_metadata(
+        let v0_entry = crate::utils::test::legacy_frag_reuse_entry(
             &dataset,
-            None,
             details.clone(),
             RoaringBitmap::from_iter([110u32]),
         )
@@ -3162,7 +2289,7 @@ mod tests {
             .unwrap();
         let stored = crate::index::load_all_indices(&dataset).await.unwrap();
         let v0_entry = stored_fri(&stored);
-        let v0_content = load_raw_frag_reuse_content(&dataset, &v0_entry)
+        let v0_content = crate::utils::test::frag_reuse_content(&dataset, &v0_entry)
             .await
             .unwrap();
         assert_eq!(v0_content, InlineContent::from(&details).encode_to_vec());
@@ -3180,15 +2307,23 @@ mod tests {
                 .unwrap();
         assert_eq!(base_entry_version, Some(v0_entry.dataset_version));
         assert_eq!(entry.index_version, 1);
-        let lifted = load_raw_frag_reuse_content(&dataset, &entry).await.unwrap();
+        let lifted = crate::utils::test::frag_reuse_content(&dataset, &entry)
+            .await
+            .unwrap();
         assert!(lifted.starts_with(&v0_content));
         assert_eq!(
             &lifted[v0_content.len()..],
-            encode_length_delimited_field(2, &transition.encode_to_vec()).as_slice()
+            lance_table::system_index::frag_reuse::history::length_delimited(
+                2,
+                &transition.encode_to_vec()
+            )
+            .as_slice()
         );
+        // The tagged bitmap names every fragment in the retained lineage,
+        // the legacy version's source (100) included.
         assert_eq!(
             entry.fragment_bitmap.as_ref().unwrap(),
-            &RoaringBitmap::from_iter([0u32, 1, 10, 11, 110])
+            &RoaringBitmap::from_iter([0u32, 1, 10, 11, 100, 110])
         );
     }
 
@@ -3336,7 +2471,12 @@ mod tests {
         }
         let expected: Vec<u8> = transitions
             .iter()
-            .flat_map(|transition| encode_length_delimited_field(2, &transition.encode_to_vec()))
+            .flat_map(|transition| {
+                lance_table::system_index::frag_reuse::history::length_delimited(
+                    2,
+                    &transition.encode_to_vec(),
+                )
+            })
             .collect();
         assert!(expected.len() > 204800);
 
@@ -3351,10 +2491,15 @@ mod tests {
         let Some(Content::External(external)) = proto.content else {
             panic!("expected external content, got {proto:?}");
         };
-        assert_eq!(external.path, FRAG_REUSE_DETAILS_FILE_NAME);
+        assert_eq!(
+            external.path,
+            lance_index::frag_reuse::FRAG_REUSE_DETAILS_FILE_NAME
+        );
         assert_eq!(external.size, expected.len() as u64);
         assert_eq!(
-            load_raw_frag_reuse_content(&dataset, &entry).await.unwrap(),
+            crate::utils::test::frag_reuse_content(&dataset, &entry)
+                .await
+                .unwrap(),
             expected
         );
     }
@@ -3389,7 +2534,7 @@ mod tests {
             .unwrap();
         let stored = crate::index::load_all_indices(&dataset).await.unwrap();
         let sp_entry = stored_fri(&stored);
-        let sp_content = load_raw_frag_reuse_content(&dataset, &sp_entry)
+        let sp_content = crate::utils::test::frag_reuse_content(&dataset, &sp_entry)
             .await
             .unwrap();
 
@@ -3414,7 +2559,9 @@ mod tests {
         // Appended, not re-encoded: the stable-partition record is intact
         // byte for byte and the compaction rides a transition, not a legacy
         // version.
-        let content = load_raw_frag_reuse_content(&dataset, &entry).await.unwrap();
+        let content = crate::utils::test::frag_reuse_content(&dataset, &entry)
+            .await
+            .unwrap();
         assert!(content.starts_with(&sp_content));
         let ledger = decode_entry(&dataset, &entry).await;
         assert_eq!(ledger.transitions().len(), 2);
@@ -3476,7 +2623,7 @@ mod tests {
             fragment_bitmap: Some(RoaringBitmap::from_iter([0u32, 1])),
             index_details: Some(Arc::new(prost_types::Any {
                 type_url: "/lance.table.FragmentReuseIndexDetails".into(),
-                value: encode_length_delimited_field(1, &[]),
+                value: lance_table::system_index::frag_reuse::history::length_delimited(1, &[]),
             })),
             index_version: 1,
             created_at: None,
@@ -3652,7 +2799,7 @@ mod tests {
         }
         let details = FragReuseIndexDetails { versions };
         let bitmap: RoaringBitmap = (0..3500u32).map(|i| 100_000 + i).collect();
-        let entry = build_frag_reuse_index_metadata(&dataset, None, details, bitmap)
+        let entry = crate::utils::test::legacy_frag_reuse_entry(&dataset, details, bitmap)
             .await
             .unwrap();
         dataset
@@ -3672,7 +2819,7 @@ mod tests {
             .unwrap();
         let stored = crate::index::load_all_indices(&dataset).await.unwrap();
         let source_entry = stored_fri(&stored);
-        let source_content = load_raw_frag_reuse_content(&dataset, &source_entry)
+        let source_content = crate::utils::test::frag_reuse_content(&dataset, &source_entry)
             .await
             .unwrap();
         assert!(source_content.len() > 204800);
@@ -3722,7 +2869,9 @@ mod tests {
         let entry = stored_fri(&stored);
         assert_eq!(entry.index_version, 1);
         // The assembled entry carries the source's legacy content verbatim.
-        let content = load_raw_frag_reuse_content(&clone, &entry).await.unwrap();
+        let content = crate::utils::test::frag_reuse_content(&clone, &entry)
+            .await
+            .unwrap();
         assert!(content.starts_with(&source_content));
         let ledger = decode_entry(&clone, &entry).await;
         assert_eq!(ledger.transitions().len(), 3501);
@@ -3769,6 +2918,13 @@ mod tests {
             unreachable!()
         };
         mapping.map_id = first_map_id.clone();
+        // Refused both where the intent is built and, for a hand-built entry,
+        // at commit.
+        let error = frag_reuse_entry_appending(&dataset, vec![reused.clone()])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains(&first_map_id), "{error}");
         let error = crate::dataset::write::CommitBuilder::new(Arc::new(dataset.clone()))
             .execute(Transaction::new(
                 version,
@@ -3778,7 +2934,7 @@ mod tests {
                         new_fragments: new_destinations,
                     }],
                     rewritten_indices: vec![],
-                    frag_reuse_index: Some(entry_appending(&dataset, vec![reused]).await),
+                    frag_reuse_index: Some(hand_built_entry(&dataset, vec![reused]).await),
                 },
                 None,
             ))
@@ -3914,7 +3070,7 @@ mod tests {
             fragment_bitmap: Some(RoaringBitmap::from_iter([0u32, 1])),
             index_details: Some(Arc::new(prost_types::Any {
                 type_url: "/lance.table.FragmentReuseIndexDetails".into(),
-                value: encode_length_delimited_field(1, &[]),
+                value: lance_table::system_index::frag_reuse::history::length_delimited(1, &[]),
             })),
             index_version: 1,
             created_at: None,
@@ -3971,9 +3127,9 @@ mod tests {
         );
     }
 
-    /// Round 6 item 1: the commit path renumbers destination id 0
-    /// (`fragments_with_ids` treats it as unassigned), which would strand
-    /// the recorded destination id; assembly must reject it up front.
+    /// The commit path renumbers destination id 0 (`fragments_with_ids`
+    /// treats it as unassigned), which would strand the recorded destination
+    /// id. Here 0 is also a source, so the proposal's own lineage refuses it.
     #[tokio::test]
     async fn unassigned_destination_id_rejected_at_commit() {
         let mut dataset = reader_tests::fixture().await;
@@ -4000,13 +3156,13 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-        assert!(error.to_string().contains("unassigned"), "{error}");
+        assert!(error.to_string().contains("cycle"), "{error}");
         assert_eq!(dataset.latest_version_id().await.unwrap(), read_version);
     }
 
-    /// Round 6 item 1: a destination id colliding with a fragment that is
-    /// live in the manifest (here one of the rewrite's own sources) is
-    /// rejected; destinations must use freshly reserved ids.
+    /// A destination id colliding with one of the rewrite's own sources is
+    /// rejected by the proposal's lineage before assembly; destinations must
+    /// use freshly reserved ids.
     #[tokio::test]
     async fn live_destination_id_rejected_at_commit() {
         let mut dataset = reader_tests::fixture().await;
@@ -4033,7 +3189,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-        assert!(error.to_string().contains("already live"), "{error}");
+        assert!(error.to_string().contains("cycle"), "{error}");
     }
 
     async fn indexed_three_fragment_dataset() -> Dataset {
@@ -4330,7 +3486,7 @@ mod tests {
             }
             let details = FragReuseIndexDetails { versions };
             let bitmap: RoaringBitmap = (0..3500u32).map(|i| 100_000 + i).collect();
-            let entry = build_frag_reuse_index_metadata(dataset, None, details, bitmap)
+            let entry = crate::utils::test::legacy_frag_reuse_entry(dataset, details, bitmap)
                 .await
                 .unwrap();
             dataset
@@ -4349,7 +3505,7 @@ mod tests {
                 .await
                 .unwrap();
             let stored = crate::index::load_all_indices(dataset).await.unwrap();
-            load_raw_frag_reuse_content(dataset, &stored_fri(&stored))
+            crate::utils::test::frag_reuse_content(dataset, &stored_fri(&stored))
                 .await
                 .unwrap()
         }
@@ -4428,7 +3584,7 @@ mod tests {
             let stored = crate::index::load_all_indices(&dataset).await.unwrap();
             let source_entry = stored_fri(&stored);
             assert_eq!(source_entry.index_version, 1);
-            let source_content = load_raw_frag_reuse_content(&dataset, &source_entry)
+            let source_content = crate::utils::test::frag_reuse_content(&dataset, &source_entry)
                 .await
                 .unwrap();
             assert_eq!(source_content.len() > 204800, external);
@@ -4462,7 +3618,9 @@ mod tests {
 
             // The source's own base got the clone's freshly assigned id;
             // records without base references are carried verbatim.
-            let clone_content = load_raw_frag_reuse_content(&clone, &entry).await.unwrap();
+            let clone_content = crate::utils::test::frag_reuse_content(&clone, &entry)
+                .await
+                .unwrap();
             assert!(clone_content.starts_with(&v0_content));
             assert_ne!(clone_content, source_content);
             let ledger = decode_entry(&clone, &entry).await;
@@ -4504,9 +3662,10 @@ mod tests {
                 .await
                 .unwrap();
             let stored = crate::index::load_all_indices(&clone).await.unwrap();
-            let relocated_content = load_raw_frag_reuse_content(&clone, &stored_fri(&stored))
-                .await
-                .unwrap();
+            let relocated_content =
+                crate::utils::test::frag_reuse_content(&clone, &stored_fri(&stored))
+                    .await
+                    .unwrap();
 
             reserve_fragments(&mut clone, 40).await;
             let clone = commit_stable_partition(clone, &[10, 11], 20).await;
@@ -4515,7 +3674,9 @@ mod tests {
             let entry = stored_fri(&stored);
             assert_eq!(entry.base_id, None);
             // Appended onto the relocated entry, its bytes verbatim.
-            let content = load_raw_frag_reuse_content(&clone, &entry).await.unwrap();
+            let content = crate::utils::test::frag_reuse_content(&clone, &entry)
+                .await
+                .unwrap();
             assert!(content.starts_with(&relocated_content));
             let ledger = decode_entry(&clone, &entry).await;
             assert_eq!(ledger.transitions().len(), 2);
@@ -4622,9 +3783,8 @@ mod tests {
                     }],
                 }],
             };
-            let v0_entry = build_frag_reuse_index_metadata(
+            let v0_entry = crate::utils::test::legacy_frag_reuse_entry(
                 &dataset,
-                None,
                 details,
                 RoaringBitmap::from_iter([110u32]),
             )
@@ -4658,7 +3818,7 @@ mod tests {
                 .unwrap();
             let stored = crate::index::load_all_indices(&clone).await.unwrap();
             let pre_trim_entry = stored_fri(&stored);
-            let pre_trim_content = load_raw_frag_reuse_content(&clone, &pre_trim_entry)
+            let pre_trim_content = crate::utils::test::frag_reuse_content(&clone, &pre_trim_entry)
                 .await
                 .unwrap();
 
@@ -4668,7 +3828,9 @@ mod tests {
             let stored = crate::index::load_all_indices(&clone).await.unwrap();
             let entry = stored_fri(&stored);
             assert_ne!(entry.uuid, pre_trim_entry.uuid);
-            let trimmed_content = load_raw_frag_reuse_content(&clone, &entry).await.unwrap();
+            let trimmed_content = crate::utils::test::frag_reuse_content(&clone, &entry)
+                .await
+                .unwrap();
             // The legacy version is gone; the retained transition is the
             // exact byte suffix of the relocated entry, base stamp included.
             assert!(pre_trim_content.ends_with(&trimmed_content));
@@ -4974,7 +4136,9 @@ mod tests {
             let expected = build_transition(&expected_partition);
             let stored = crate::index::load_all_indices(&clone).await.unwrap();
             let entry = stored_fri(&stored);
-            let clone_content = load_raw_frag_reuse_content(&clone, &entry).await.unwrap();
+            let clone_content = crate::utils::test::frag_reuse_content(&clone, &entry)
+                .await
+                .unwrap();
             assert_eq!(clone_content, expected);
 
             // The relocated history still resolves and translates.
@@ -5246,7 +4410,7 @@ mod tests {
             let stored = crate::index::load_all_indices(&dataset).await.unwrap();
             let source_entry = stored_fri(&stored);
             assert_eq!(source_entry.index_version, 1);
-            let source_content = load_raw_frag_reuse_content(&dataset, &source_entry)
+            let source_content = crate::utils::test::frag_reuse_content(&dataset, &source_entry)
                 .await
                 .unwrap();
             assert_eq!(source_content.len() > 204800, external);
@@ -5280,7 +4444,9 @@ mod tests {
             } else {
                 assert!(matches!(proto.content, Some(Content::Inline(_))));
             }
-            let clone_content = load_raw_frag_reuse_content(&clone, &entry).await.unwrap();
+            let clone_content = crate::utils::test::frag_reuse_content(&clone, &entry)
+                .await
+                .unwrap();
             assert!(clone_content.starts_with(&v0_content));
             assert_eq!(clone_content, source_content);
 
@@ -5447,7 +4613,9 @@ mod tests {
             let entry = stored_fri(&stored);
             assert_eq!(entry, source_entry);
             assert_eq!(
-                load_raw_frag_reuse_content(&clone, &entry).await.unwrap(),
+                crate::utils::test::frag_reuse_content(&clone, &entry)
+                    .await
+                    .unwrap(),
                 v0_content
             );
             assert!(list_fri_map_dirs(&clone).await.is_empty());
@@ -6655,9 +5823,8 @@ mod tests {
                 }],
             }],
         };
-        let v0_entry = build_frag_reuse_index_metadata(
+        let v0_entry = crate::utils::test::legacy_frag_reuse_entry(
             &dataset,
-            None,
             details,
             RoaringBitmap::from_iter([110u32]),
         )
@@ -6699,7 +5866,7 @@ mod tests {
         let stored = crate::index::load_all_indices(&dataset).await.unwrap();
         let v0_entry = stored_fri(&stored);
         assert_eq!(v0_entry.index_version, 0);
-        let v0_content = load_raw_frag_reuse_content(&dataset, &v0_entry)
+        let v0_content = crate::utils::test::frag_reuse_content(&dataset, &v0_entry)
             .await
             .unwrap();
 
@@ -6721,7 +5888,9 @@ mod tests {
         assert_eq!(entry.index_version, 1);
         assert!(is_tagged(&entry));
         // The legacy content is lifted byte-verbatim ...
-        let lifted = load_raw_frag_reuse_content(&dataset, &entry).await.unwrap();
+        let lifted = crate::utils::test::frag_reuse_content(&dataset, &entry)
+            .await
+            .unwrap();
         assert!(lifted.starts_with(&v0_content));
         // ... and the compaction rides after it: the lifted legacy group
         // plus the new ordered-compaction transition.
@@ -6810,9 +5979,8 @@ mod tests {
                 }],
             }],
         };
-        let v0_entry = build_frag_reuse_index_metadata(
+        let v0_entry = crate::utils::test::legacy_frag_reuse_entry(
             &dataset,
-            None,
             details,
             RoaringBitmap::from_iter([30u32]),
         )
