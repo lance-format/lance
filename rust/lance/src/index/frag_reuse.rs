@@ -731,6 +731,48 @@ pub(super) async fn open_row_id_remapping_with_plan(
     }
 }
 
+/// The version 0 query listing: `indices` without the segments a version 0
+/// history still has to translate but whose type cannot apply the version 0
+/// remapper. Their rows are scanned instead of answered from the addresses the
+/// segment was built with. Commit and maintenance bookkeeping keep every
+/// segment.
+pub(crate) async fn exclude_untranslatable_v0_segments(
+    dataset: &Dataset,
+    fri: &IndexMetadata,
+    indices: Arc<Vec<IndexMetadata>>,
+) -> lance_core::Result<Arc<Vec<IndexMetadata>>> {
+    let untranslatable = |index: &IndexMetadata| {
+        if lance_table::system_index::is_system_index(index)
+            || super::segment_has_vector_details(index)
+        {
+            return false;
+        }
+        index.index_details.as_ref().is_some_and(|details| {
+            super::scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+                .get_plugin_by_details(details)
+                .is_ok_and(|plugin| !plugin.supports_legacy_row_id_remapping(details))
+        })
+    };
+    if !indices.iter().any(untranslatable) {
+        return Ok(indices);
+    }
+    let details = load_frag_reuse_index_details(dataset, fri).await?;
+    let chain = crate::dataset::index::frag_reuse::reuse_chain_frag_bitmap(&details.versions);
+    let needs_translation = |index: &IndexMetadata| {
+        details.versions.iter().any(|version| {
+            !crate::dataset::index::frag_reuse::is_index_remap_caught_up(version, index, &chain)
+                .unwrap_or(false)
+        })
+    };
+    Ok(Arc::new(
+        indices
+            .iter()
+            .filter(|index| !(untranslatable(index) && needs_translation(index)))
+            .cloned()
+            .collect(),
+    ))
+}
+
 /// Load fragment reuse index details from index metadata
 pub async fn load_frag_reuse_index_details(
     dataset: &Dataset,

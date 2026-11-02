@@ -4096,6 +4096,10 @@ impl BasicTrainer for BTreeIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BTreeIndexPlugin {
+    fn supports_legacy_row_id_remapping(&self, _index_details: &prost_types::Any) -> bool {
+        true
+    }
+
     fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
         Ok(true)
     }

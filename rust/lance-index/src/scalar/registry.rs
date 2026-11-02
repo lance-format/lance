@@ -210,6 +210,19 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>>;
 
+    /// Whether an index with `index_details` applies the version 0 fragment
+    /// reuse remapper that [`load_index`](Self::load_index) receives as
+    /// `frag_reuse_index`.
+    ///
+    /// Under a version 0 history, a segment whose rows a compaction moved is
+    /// served only when this returns `true`: otherwise it is left out of query
+    /// listings and its rows are scanned, rather than answered from the
+    /// addresses the index was built with. Return `true` only when the loaded
+    /// index translates every row address it reports through the remapper.
+    fn supports_legacy_row_id_remapping(&self, _index_details: &prost_types::Any) -> bool {
+        false
+    }
+
     /// Whether this plugin can await batch row-ID translation while loading its data.
     ///
     /// Returning `true` requires overriding

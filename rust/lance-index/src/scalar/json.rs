@@ -1276,6 +1276,23 @@ impl BasicTrainer for JsonIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for JsonIndexPlugin {
+    /// The JSON index forwards the remapper to its target index.
+    fn supports_legacy_row_id_remapping(&self, index_details: &prost_types::Any) -> bool {
+        let Ok(details) = crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())
+        else {
+            return false;
+        };
+        let Some(target_details) = details.target_details.as_ref() else {
+            return false;
+        };
+        let Ok(registry) = self.registry() else {
+            return false;
+        };
+        registry
+            .get_plugin_by_details(target_details)
+            .is_ok_and(|target| target.supports_legacy_row_id_remapping(target_details))
+    }
+
     fn can_remap(&self, details: &prost_types::Any) -> Result<bool> {
         let details = match crate::pb::JsonIndexDetails::decode(details.value.as_slice()) {
             Ok(details) => details,

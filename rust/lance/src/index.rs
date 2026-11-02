@@ -2836,10 +2836,10 @@ impl DatasetIndexExt for Dataset {
         Ok(results)
     }
 
-    /// From the derived listing only: a segment the tagged reader excludes
-    /// (it derives no coverage for it) is absent here, so a query opening it
-    /// by uuid fails instead of answering with nothing. Maintenance reaches
-    /// such a segment through `Dataset::load_index_with_purpose`.
+    /// From the derived listing only: a segment the reader cannot translate
+    /// is absent here, so a query opening it by uuid fails instead of
+    /// answering from stale addresses. Maintenance reaches such a segment
+    /// through `Dataset::load_index_with_purpose`.
     async fn load_index(&self, uuid: &Uuid) -> Result<Option<IndexMetadata>> {
         self.load_index_with_purpose(uuid, frag_reuse::OpenPurpose::Query)
             .await
@@ -2848,7 +2848,7 @@ impl DatasetIndexExt for Dataset {
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let indices = load_all_indices(self).await?;
         // Readers apply the fragment reuse index to every index they open.
-        let indices = if has_frag_reuse_with_stable_row_ids(&self.manifest, &indices)
+        let mut indices = if has_frag_reuse_with_stable_row_ids(&self.manifest, &indices)
             && indices.iter().any(is_hidden_by_frag_reuse)
         {
             Arc::new(
@@ -2861,11 +2861,19 @@ impl DatasetIndexExt for Dataset {
         } else {
             indices
         };
-        if let Some(fri) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
+        if let Some(fri) = indices
+            .iter()
+            .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+            .cloned()
+        {
             match fri.index_version {
                 // Legacy FRI index version 0 already had its fragment coverage
-                // remapped in load_all_indices().
-                0 => {}
+                // remapped in load_all_indices(); only segments that cannot
+                // apply that remapper are left for a scan.
+                0 => {
+                    indices =
+                        frag_reuse::exclude_untranslatable_v0_segments(self, &fri, indices).await?;
+                }
                 1 => {
                     // Cache the coverage-rewritten listing per snapshot identity:
                     // load_indices sits on the query-planning and merge_insert
@@ -2882,7 +2890,7 @@ impl DatasetIndexExt for Dataset {
                         .index_cache
                         .get_or_insert_with_key(derived_key, || async {
                             let derived =
-                                frag_reuse_reader::load_indices(self, fri, &indices).await?;
+                                frag_reuse_reader::load_indices(self, &fri, &indices).await?;
                             Ok(derived.as_ref().clone())
                         })
                         .await;

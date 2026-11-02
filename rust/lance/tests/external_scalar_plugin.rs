@@ -55,7 +55,92 @@ const ROWS_PER_ZONE: u64 = 2;
 // Every test registers before its first dataset operation, even when tests run concurrently.
 static REGISTRATION: LazyLock<()> = LazyLock::new(|| {
     register_scalar_index_plugin::<ExampleIndexDetails, ExampleIndexPlugin>().unwrap();
+    register_scalar_index_plugin::<StaleIndexDetails, StaleIndexPlugin>().unwrap();
 });
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct StaleIndexDetails {}
+
+impl Name for StaleIndexDetails {
+    const NAME: &'static str = "StaleIndexDetails";
+    const PACKAGE: &'static str = "example.index";
+}
+
+/// Like [`ExampleIndexPlugin`], but drops the fragment reuse remapper it is
+/// handed and does not declare that it applies one: it keeps answering with
+/// the row addresses it was built with.
+#[derive(Debug, Default)]
+struct StaleIndexPlugin;
+
+#[async_trait]
+impl BasicTrainer for StaleIndexPlugin {
+    fn new_training_request(
+        &self,
+        params: &str,
+        field: &Field,
+    ) -> Result<Box<dyn TrainingRequest>> {
+        ZoneMapIndexPlugin.new_training_request(params, field)
+    }
+
+    async fn train_index(
+        &self,
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn IndexBuildProgress>,
+    ) -> Result<CreatedIndex> {
+        let mut created = ZoneMapIndexPlugin
+            .train_index(data, index_store, request, fragment_ids, progress)
+            .await?;
+        created.index_details = prost_types::Any::from_msg(&StaleIndexDetails {})?;
+        Ok(created)
+    }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for StaleIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        "Stale"
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        false
+    }
+
+    fn version(&self) -> u32 {
+        ZoneMapIndexPlugin.version()
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        Some(Box::new(SargableQueryParser::new(
+            index_name,
+            self.name().to_string(),
+            true,
+        )))
+    }
+
+    async fn load_index(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        index_version: u32,
+        _frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        ZoneMapIndexPlugin
+            .load_index(index_store, index_details, index_version, None, cache)
+            .await
+    }
+}
 
 #[async_trait]
 impl BasicTrainer for ExampleIndexPlugin {
@@ -93,6 +178,11 @@ impl ScalarIndexPlugin for ExampleIndexPlugin {
 
     fn name(&self) -> &str {
         "Example"
+    }
+
+    /// The example hands the remapper to ZoneMap, which applies it.
+    fn supports_legacy_row_id_remapping(&self, _index_details: &prost_types::Any) -> bool {
+        true
     }
 
     fn provides_exact_answer(&self) -> bool {
@@ -567,4 +657,82 @@ async fn commit_external_segments_replaces_only_overlapping_coverage() {
         .open_scalar_index("value", &replaced.uuid, &NoOpMetricsCollector)
         .await
         .unwrap();
+}
+
+/// Under a version 0 fragment reuse history, a segment of a plugin that does
+/// not declare it applies the remapper leaves the query listing once its rows
+/// move, so they are scanned instead of answered from stale addresses. A
+/// plugin that declares support keeps serving its segment.
+#[tokio::test]
+async fn v0_fragment_reuse_scans_rows_of_plugins_that_cannot_translate() {
+    LazyLock::force(&REGISTRATION);
+    let directory = tempdir().unwrap();
+    let batch = record_batch!(
+        ("value", Int64, [1, 2, 3, 4]),
+        ("other", Int64, [10, 20, 30, 40])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        directory.path().to_str().unwrap(),
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    for (column, name, plugin) in [
+        ("value", "example_index", "example"),
+        ("other", "stale_index", "stale"),
+    ] {
+        dataset
+            .create_index(
+                &[column],
+                IndexType::Scalar,
+                Some(name.to_string()),
+                &ScalarIndexParams::new(plugin.to_string()),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    dataset.delete("value = 1").await.unwrap();
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 4,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 1);
+
+    let listed: Vec<String> = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .map(|index| index.name.clone())
+        .collect();
+    assert!(listed.contains(&"example_index".to_string()), "{listed:?}");
+    assert!(!listed.contains(&"stale_index".to_string()), "{listed:?}");
+
+    for filter in ["value = 3", "other = 30"] {
+        let mut full_scan = dataset.scan();
+        full_scan.filter(filter).unwrap().use_scalar_index(false);
+        let expected = full_scan.try_into_batch().await.unwrap();
+        assert_eq!(expected.num_rows(), 1, "{filter}");
+        let mut indexed_scan = dataset.scan();
+        indexed_scan.filter(filter).unwrap();
+        assert_eq!(
+            indexed_scan.try_into_batch().await.unwrap(),
+            expected,
+            "{filter}"
+        );
+    }
 }
