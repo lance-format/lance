@@ -75,7 +75,9 @@ async fn scoped_count_reads_only_scoped_deletions(
     #[values(false, true)] partial_index: bool,
 ) {
     let tmp = TempStrDir::default();
-    let uri = format!("file-object-store://{}", tmp.as_str());
+    let path = tmp.as_str();
+    let prefix = if path.starts_with('/') { "" } else { "/" };
+    let uri = format!("file-object-store://{prefix}{path}");
     let values = if all_null {
         vec![None; 12]
     } else {
