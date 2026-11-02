@@ -1246,8 +1246,8 @@ fn convert_to_java_operation_inner<'local>(
         Operation::Unknown { .. } => Err(Error::input_error(
             "Cannot convert an operation written by a newer version of Lance".to_string(),
         )),
-        // Transaction V2 is a pre-vote draft with no Java surface yet; a
-        // composite operation has no Java class to map onto.
+        // Transaction V2 is experimental for now and has no Java surface yet;
+        // a composite operation has no Java class to map onto.
         Operation::CompositeOperation(_) => Err(Error::unsupported_error(
             "CompositeOperation transactions are not exposed to the Java bindings".to_string(),
         )),

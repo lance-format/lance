@@ -148,12 +148,18 @@ macro_rules! define_action_proto {
                     // The specified vocabulary is larger than what is implemented.
                     // Reject rather than skip: silently dropping an action would
                     // apply a partial transaction.
-                    Some(other) => Err(Error::not_supported(format!(
-                        "the action-based transaction uses action {other:?}, which is specified \
-                         but not implemented by this version of Lance",
-                    ))),
+                    Some(other) => {
+                        // Debug-format only the variant name: the payload can
+                        // hold large filters or bitmaps.
+                        let debug = format!("{other:?}");
+                        let variant = debug.split('(').next().unwrap_or_default();
+                        Err(Error::not_supported(format!(
+                            "the action-based transaction uses action {variant}, which is \
+                             specified but not implemented by this version of Lance",
+                        )))
+                    }
                     None => Err(Error::invalid_input(
-                        "an Action in a user operation was empty",
+                        "an Action in a CompositeOperation was empty",
                     )),
                 }
             }

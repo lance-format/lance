@@ -28,9 +28,9 @@
 //!
 //! # Stability
 //!
-//! Transaction V2 is experimental until its action vocabulary is complete: the
-//! Rust API here may change, and some operations cannot be expressed as
-//! actions yet. The wire format is not experimental.
+//! Transaction V2 is experimental for now: the Rust API here may change, and
+//! some operations cannot be expressed as actions yet. The wire format is not
+//! experimental.
 //!
 //! Any reader can open a table version committed as a [`CompositeOperation`],
 //! since the inline transaction lives in a manifest field older readers ignore

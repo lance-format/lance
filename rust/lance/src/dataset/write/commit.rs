@@ -356,9 +356,12 @@ impl<'a> CommitBuilder<'a> {
     ///
     /// Transaction V2 -- a [`Transaction`] whose operation is a
     /// [`CompositeOperation`](lance_table::transaction::action::CompositeOperation)
-    /// -- is experimental until its action vocabulary is complete: this API
-    /// may change, and not every operation can be expressed as actions yet.
+    /// -- is experimental for now: this API may change, and not every
+    /// operation can be expressed as actions yet.
     /// The format it writes is not experimental.
+    ///
+    /// Without this opt-in, [`Self::execute`] rejects such a transaction with
+    /// [`Error::NotSupported`]. The opt-in has no effect on any other operation.
     ///
     /// # Compatibility
     ///
@@ -370,9 +373,6 @@ impl<'a> CommitBuilder<'a> {
     /// aborts the older writer's commit, which is the safe outcome.
     ///
     /// [#9482]: https://github.com/lance-format/lance/pull/9482
-    ///
-    /// Without it, [`Self::execute`] rejects such a transaction with
-    /// [`Error::NotSupported`]. It has no effect on any other operation.
     ///
     /// ```
     /// # use lance::dataset::CommitBuilder;
