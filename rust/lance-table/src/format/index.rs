@@ -566,13 +566,22 @@ impl IndexMetadata {
     /// lists the keys, then the carried fields.
     ///
     /// A transaction file records no covering contract, so it uses the layout
-    /// every released reader decodes. `TryFrom<pb::IndexMetadata>` reads the
+    /// every released reader decodes. [`Self::from_transaction_proto`] reads the
     /// entry back with the same keys and carried fields.
     pub(crate) fn to_transaction_proto(&self) -> Result<pb::IndexMetadata> {
         self.validate_covering_fields()?;
         let mut proto = pb::IndexMetadata::from(self);
         proto.fields = [self.keyed_fields(), &self.covering_fields].concat();
         Ok(proto)
+    }
+
+    /// Decode one entry of a transaction file, which holds only the suffix
+    /// layout. An entry in any other shape is refused rather than read as
+    /// keys-only.
+    pub(crate) fn from_transaction_proto(proto: pb::IndexMetadata) -> Result<Self> {
+        let metadata = Self::decode(proto)?;
+        metadata.validate_suffix_contract()?;
+        Ok(metadata)
     }
 }
 
@@ -614,9 +623,10 @@ impl DeepSizeOf for IndexMetadata {
     }
 }
 
-/// Decodes an entry outside a manifest, such as one in a transaction or a cache
+/// Decodes an entry outside a manifest or a transaction file, such as a cache
 /// entry, and reads its shape as [`IndexMetadata::covering_fields`] describes.
-/// Manifest entries go through [`IndexMetadata::from_manifest_proto`].
+/// Manifest entries go through [`IndexMetadata::from_manifest_proto`], and
+/// transaction entries through `IndexMetadata::from_transaction_proto`.
 impl TryFrom<pb::IndexMetadata> for IndexMetadata {
     type Error = Error;
 
@@ -1143,7 +1153,7 @@ mod tests {
 
     /// Without the flag a manifest may only hold suffix-layout entries, so an
     /// entry that names a key as carried is corrupt there: refused on read,
-    /// and never written. A transaction entry keeps its own shape and decodes.
+    /// and never written. A cache entry keeps its own shape and decodes.
     #[test]
     fn suffix_contract_rejects_a_non_tail_covering_declaration() {
         let metadata = index_metadata_with(vec![7, 11], vec![7]);

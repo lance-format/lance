@@ -189,11 +189,11 @@ impl TryFrom<pb::Transaction> for Transaction {
             })) => Operation::CreateIndex {
                 new_indices: new_indices
                     .into_iter()
-                    .map(IndexMetadata::try_from)
+                    .map(IndexMetadata::from_transaction_proto)
                     .collect::<Result<_>>()?,
                 removed_indices: removed_indices
                     .into_iter()
-                    .map(IndexMetadata::try_from)
+                    .map(IndexMetadata::from_transaction_proto)
                     .collect::<Result<_>>()?,
             },
             Some(pb::transaction::Operation::Merge(pb::transaction::Merge {
@@ -916,6 +916,53 @@ mod tests {
                 .contains("at least one field must remain indexed"),
             "unexpected error: {error}"
         );
+    }
+
+    /// A transaction file holds only the suffix layout, so decoding one refuses
+    /// an entry that only a manifest under the independent contract may store.
+    #[rstest::rstest]
+    #[case::keys_only(vec![7], vec![11], "covering fields [11] but [11] are not among its fields [7]")]
+    #[case::no_key(vec![11], vec![11], "covering fields [11] but its fields are [11]; at least one field must remain indexed")]
+    #[case::carried_field_not_last(vec![7, 11], vec![7], "covering fields [7] which are not the trailing entries of [7, 11]")]
+    fn test_create_index_entry_outside_the_suffix_layout_is_refused(
+        #[case] fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+        #[case] expected_error: &str,
+    ) {
+        let mut entry = pb::IndexMetadata::from(&sample_index_metadata("covered"));
+        entry.fields = fields.clone();
+        entry.covering_fields = covering_fields;
+        let manifest_entry =
+            IndexMetadata::from_manifest_proto(entry.clone(), CoveringContract::Independent)
+                .unwrap();
+        assert_eq!(manifest_entry.keyed_fields(), fields);
+
+        for create_index in [
+            pb::transaction::CreateIndex {
+                new_indices: vec![entry.clone()],
+                removed_indices: vec![],
+            },
+            pb::transaction::CreateIndex {
+                new_indices: vec![],
+                removed_indices: vec![entry],
+            },
+        ] {
+            let error = Transaction::try_from(pb::Transaction {
+                read_version: 1,
+                uuid: "test".to_string(),
+                operation: Some(pb::transaction::Operation::CreateIndex(create_index)),
+                ..Default::default()
+            })
+            .unwrap_err();
+            assert!(
+                matches!(error, Error::InvalidInput { .. }),
+                "expected InvalidInput, got {error:?}"
+            );
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected error: {error}"
+            );
+        }
     }
 
     #[test]
