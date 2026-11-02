@@ -11,8 +11,6 @@ use std::{
 
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
-use datafusion_common::config::ConfigNonZeroUsize;
-use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{DataFusionError, Statistics, utils::get_available_parallelism};
 use datafusion_execution::{
     TaskContext,
@@ -21,10 +19,10 @@ use datafusion_execution::{
     memory_pool::{FairSpillPool, TrackConsumersPool},
     runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
 };
-use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion_physical_plan::{
-    ChildStats, DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties,
-    PlanProperties, SendableRecordBatchStream, StatisticsArgs,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    SendableRecordBatchStream,
     coalesce_partitions::CoalescePartitionsExec,
     display::DisplayableExecutionPlan,
     execution_plan::{Boundedness, CardinalityEffect, EmissionType},
@@ -146,13 +144,6 @@ impl ExecutionPlan for OneShotExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
-    }
-
-    fn apply_expressions(
-        &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
-    ) -> datafusion_common::Result<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -373,12 +364,7 @@ pub fn new_runtime_env(options: &LanceExecutionOptions) -> Arc<RuntimeEnv> {
 pub fn new_task_context(options: &LanceExecutionOptions) -> Result<Arc<TaskContext>> {
     let mut session_config = new_session_config(options);
     if let Some(batch_size) = options.validated_batch_size()? {
-        session_config.options_mut().execution.batch_size = ConfigNonZeroUsize::try_new(batch_size)
-            .map_err(|_| {
-                Error::invalid_input(format!(
-                    "batch_size must be greater than 0, got {batch_size}"
-                ))
-            })?;
+        session_config.options_mut().execution.batch_size = batch_size;
     }
     Ok(Arc::new(
         TaskContext::default()
@@ -686,13 +672,6 @@ impl ExecutionPlan for StrictBatchSizeExec {
         vec![&self.input]
     }
 
-    fn apply_expressions(
-        &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
-    ) -> datafusion_common::Result<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
-    }
-
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -722,16 +701,11 @@ impl ExecutionPlan for StrictBatchSizeExec {
         vec![false]
     }
 
-    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
-        vec![ChildStats::At(partition)]
-    }
-
-    fn statistics_from_inputs(
+    fn partition_statistics(
         &self,
-        input_stats: &[Arc<Statistics>],
-        _args: &StatisticsArgs,
-    ) -> datafusion_common::Result<Arc<Statistics>> {
-        Ok(Arc::clone(&input_stats[0]))
+        partition: Option<usize>,
+    ) -> datafusion_common::Result<std::sync::Arc<Statistics>> {
+        self.input.partition_statistics(partition)
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
@@ -800,13 +774,6 @@ impl ExecutionPlan for HardCapBatchSizeExec {
         vec![&self.input]
     }
 
-    fn apply_expressions(
-        &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
-    ) -> datafusion_common::Result<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
-    }
-
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -853,16 +820,11 @@ impl ExecutionPlan for HardCapBatchSizeExec {
         vec![false]
     }
 
-    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
-        vec![ChildStats::At(partition)]
-    }
-
-    fn statistics_from_inputs(
+    fn partition_statistics(
         &self,
-        input_stats: &[Arc<Statistics>],
-        _args: &StatisticsArgs,
-    ) -> datafusion_common::Result<Arc<Statistics>> {
-        Ok(Arc::clone(&input_stats[0]))
+        partition: Option<usize>,
+    ) -> datafusion_common::Result<std::sync::Arc<Statistics>> {
+        self.input.partition_statistics(partition)
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {

@@ -49,10 +49,7 @@ pub fn project(input: Arc<dyn ExecutionPlan>, projection: &ArrowSchema) -> Resul
         exprs.push((expr, name));
     }
 
-    // Carry the requested schema's metadata rather than the input's, so the output
-    // schema is the one asked for. `UnionExec` relabels any input whose schema,
-    // metadata included, differs from the union's.
-    ProjectionExec::try_new_with_schema_metadata(exprs, input, projection)
+    ProjectionExec::try_new(exprs, input)
 }
 
 fn selection_as_expr(
