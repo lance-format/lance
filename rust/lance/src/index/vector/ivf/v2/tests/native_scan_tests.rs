@@ -8,7 +8,9 @@ use super::*;
 use crate::index::vector::ivf::v2::rabit_scan::RabitCacheLayout;
 use crate::session::Session;
 use async_trait::async_trait;
-use futures::FutureExt;
+use datafusion::error::DataFusionError;
+use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
+use futures::{FutureExt, StreamExt};
 use lance_core::Error;
 use lance_core::cache::QuickCacheBackend;
 use lance_index::vector::bq::builder::RabitQuantizer;
@@ -16,6 +18,7 @@ use lance_index::vector::bq::storage::{StagePruneCounts, select_full_survivors};
 use lance_index::vector::storage::{
     ExIndex, GatherPlan, GatheredRabitEx, IndexFileKey, OriginLatencyClass, PlaneSource,
 };
+use lance_index::vector::{PartitionSearchControl, VECTOR_RESULT_SCHEMA};
 use lance_table::transaction::{Operation, RewriteGroup, Transaction};
 
 fn lazy_index(index: &Arc<dyn VectorIndex>) -> &IVFIndex<FlatIndex, RabitQuantizer> {
@@ -23,6 +26,409 @@ fn lazy_index(index: &Arc<dyn VectorIndex>) -> &IVFIndex<FlatIndex, RabitQuantiz
         .as_any()
         .downcast_ref::<IVFIndex<FlatIndex, RabitQuantizer>>()
         .unwrap()
+}
+
+#[derive(Default)]
+struct RowBudget {
+    limit: usize,
+    rows: AtomicUsize,
+    batches: AtomicUsize,
+    stopped: AtomicBool,
+}
+
+impl PartitionSearchControl for RowBudget {
+    fn should_stop(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed) || self.rows.load(Ordering::Relaxed) >= self.limit
+    }
+
+    fn record_batch(&self, batch: &RecordBatch) {
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        self.rows.fetch_add(batch.num_rows(), Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PartitionScanFactory {
+    index: Arc<dyn VectorIndex>,
+    calls: Arc<AtomicUsize>,
+    produced: Arc<AtomicUsize>,
+}
+
+impl super::super::rabit_scan::RabitScanFactory for PartitionScanFactory {
+    fn create(
+        &self,
+        _: &IndexFileKey,
+        _: OriginLatencyClass,
+    ) -> Result<Arc<dyn super::super::rabit_scan::RabitScan>> {
+        Ok(Arc::new(self.clone()))
+    }
+}
+
+#[async_trait]
+impl super::super::rabit_scan::RabitScan for PartitionScanFactory {
+    async fn search(
+        &self,
+        _: Arc<super::super::rabit_scan::RabitScanContext>,
+    ) -> Result<Option<RecordBatch>> {
+        Err(Error::internal(
+            "controlled probes called the global-heap strategy",
+        ))
+    }
+
+    fn search_partition_stream(
+        &self,
+        context: Arc<super::super::rabit_scan::RabitScanContext>,
+    ) -> Result<Option<SendableRecordBatchStream>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let produced = self.produced.clone();
+        let index = self.index.clone();
+        let stream = futures::stream::iter(context.probes.clone()).then(move |rank| {
+            let context = context.clone();
+            let produced = produced.clone();
+            let index = index.clone();
+            async move {
+                let mut query = context.query.clone();
+                query.dist_q_c = context.centroid_distances.value(rank);
+                let batch = index
+                    .search_in_partition(
+                        context.partitions.value(rank) as usize,
+                        &query,
+                        context.pre_filter.clone(),
+                        context.metrics.as_ref(),
+                    )
+                    .await?;
+                produced.fetch_add(1, Ordering::Relaxed);
+                Ok(batch)
+            }
+        });
+        Ok(Some(Box::pin(RecordBatchStreamAdapter::new(
+            VECTOR_RESULT_SCHEMA.clone(),
+            stream,
+        ))))
+    }
+}
+
+#[rstest]
+#[case::all_probes(0, usize::MAX, false)]
+#[case::late_probes(1, 1, false)]
+#[case::already_stopped(1, 0, false)]
+#[case::compacted(1, 1, true)]
+#[tokio::test]
+async fn controlled_native_strategy_preserves_partition_batches(
+    #[case] start: usize,
+    #[case] limit: usize,
+    #[case] compact: bool,
+    #[values(false, true)] empty_filter: bool,
+) {
+    let dir = TempStrDir::default();
+    let (mut dataset, batch) = native_fixture(dir.as_str()).await;
+    let uuid = dataset.load_indices().await.unwrap()[0].uuid;
+    if compact {
+        dataset.delete("i % 7 = 0").await.unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let mut query = lazy_test_query(batch["vector"].as_fixed_size_list().value(0), 4, 4);
+    query.refine_factor = Some(3);
+    let ordinary = dataset
+        .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let strategy = Arc::new(PartitionScanFactory {
+        index: ordinary.clone(),
+        calls: Arc::default(),
+        produced: Arc::default(),
+    });
+    let configured = open_with_session(
+        dir.as_str(),
+        Session::default().with_rabit_scan_factory(strategy.clone()),
+    )
+    .await;
+    let selected = configured
+        .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let old_factory = Arc::new(RecordingScanFactory {
+        opens: Arc::default(),
+        searches: Arc::default(),
+        behavior: TestScanBehavior::SearchError,
+        cache_layout: RabitCacheLayout::Partition,
+    });
+    let fallback = open_with_session(
+        dir.as_str(),
+        Session::default().with_rabit_scan_factory(old_factory.clone()),
+    )
+    .await;
+    let fallback_index = fallback
+        .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let filter: Arc<dyn PreFilter> = if empty_filter {
+        Arc::new(DatasetPreFilter::new_with_filter_future(
+            Arc::new(dataset.clone()),
+            &dataset.load_indices().await.unwrap(),
+            Some(async { Ok(Arc::new(RowAddrMask::AllowList(RowAddrTreeMap::default()))) }.boxed()),
+        ))
+    } else {
+        Arc::new(NoFilter)
+    };
+    let mut outputs = Vec::new();
+    for index in [ordinary, selected, fallback_index] {
+        let budget = Arc::new(RowBudget {
+            limit,
+            ..Default::default()
+        });
+        let (partitions, distances) = index.find_partitions(&query).unwrap();
+        let batches = index
+            .search_partitions(
+                query.clone(),
+                Arc::new(partitions),
+                Arc::new(distances),
+                start,
+                4,
+                filter.clone(),
+                Some(budget.clone()),
+                Arc::new(NoOpMetricsCollector),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let count = if limit == 0 {
+            0
+        } else if empty_filter || limit == usize::MAX {
+            4 - start
+        } else {
+            1
+        };
+        assert_eq!(batches.len(), count);
+        assert_eq!(budget.batches.load(Ordering::Relaxed), count);
+        assert_eq!(
+            budget.rows.load(Ordering::Relaxed),
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>()
+        );
+        outputs.push(batches.iter().map(result_bits).collect::<Vec<_>>());
+    }
+    assert_eq!(outputs[0], outputs[1]);
+    assert_eq!(outputs[0], outputs[2]);
+    assert_eq!(old_factory.searches.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        strategy.calls.load(Ordering::Relaxed),
+        usize::from(limit != 0)
+    );
+    assert_eq!(strategy.produced.load(Ordering::Relaxed), outputs[1].len());
+    if start == 0 && !empty_filter {
+        let truth =
+            super::ground_truth(&dataset, "vector", query.key.as_ref(), 4, DistanceType::L2).await;
+        assert!(
+            outputs[1]
+                .iter()
+                .flat_map(|(ids, _)| ids)
+                .filter(|id| truth.contains(id))
+                .count()
+                >= 2
+        );
+    }
+}
+
+struct StreamDrop(Arc<AtomicBool>);
+
+impl Drop for StreamDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PartitionStreamCase {
+    EmptyBatch,
+    Short,
+    Extra,
+    OverBudget,
+    BatchError,
+    BatchSchema,
+    StreamSchema,
+    StopOnPoll,
+    StopWithError,
+}
+
+#[rstest]
+#[case::empty_batch(PartitionStreamCase::EmptyBatch, 2, 1, None)]
+#[case::short(
+    PartitionStreamCase::Short,
+    1,
+    1,
+    Some("ended after 1 batches; expected 2")
+)]
+#[case::extra(PartitionStreamCase::Extra, 2, 2, Some("more than 2 batches"))]
+#[case::over_budget(
+    PartitionStreamCase::OverBudget,
+    0,
+    0,
+    Some("exceeding candidate limit 1")
+)]
+#[case::batch_error(
+    PartitionStreamCase::BatchError,
+    1,
+    1,
+    Some("injected partition error")
+)]
+#[case::batch_schema(PartitionStreamCase::BatchSchema, 0, 0, Some("unexpected schema"))]
+#[case::stream_schema(
+    PartitionStreamCase::StreamSchema,
+    0,
+    0,
+    Some("partition stream schema")
+)]
+#[case::stop_during_poll(PartitionStreamCase::StopOnPoll, 0, 0, None)]
+#[case::error_during_stop(
+    PartitionStreamCase::StopWithError,
+    0,
+    0,
+    Some("injected partition error")
+)]
+#[tokio::test]
+async fn controlled_partition_stream_enforces_contract(
+    #[case] scenario: PartitionStreamCase,
+    #[case] expected_batches: usize,
+    #[case] expected_rows: usize,
+    #[case] expected_error: Option<&str>,
+) {
+    let two = RecordBatch::try_new(
+        VECTOR_RESULT_SCHEMA.clone(),
+        vec![
+            Arc::new(Float32Array::from(vec![0.0, 1.0])),
+            Arc::new(UInt64Array::from(vec![1, 2])),
+        ],
+    )
+    .unwrap();
+    let one = two.slice(0, 1);
+    let failure = || {
+        Err(DataFusionError::from(Error::internal(
+            "injected partition error",
+        )))
+    };
+    let items = match scenario {
+        PartitionStreamCase::EmptyBatch => vec![Ok(one.slice(0, 0)), Ok(one)],
+        PartitionStreamCase::Short => vec![Ok(one)],
+        PartitionStreamCase::Extra => vec![Ok(one.clone()), Ok(one.clone()), Ok(one)],
+        PartitionStreamCase::OverBudget => vec![Ok(two)],
+        PartitionStreamCase::BatchError => vec![Ok(one.clone()), failure(), Ok(one)],
+        PartitionStreamCase::BatchSchema => {
+            vec![Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))]
+        }
+        PartitionStreamCase::StopWithError => vec![failure()],
+        PartitionStreamCase::StreamSchema | PartitionStreamCase::StopOnPoll => vec![Ok(one)],
+    };
+    let control = Arc::new(RowBudget {
+        limit: usize::MAX,
+        ..Default::default()
+    });
+    let producer_control = control.clone();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let guard = StreamDrop(dropped.clone());
+    let source = futures::stream::iter(items).map(move |item| {
+        let _keep_alive = &guard;
+        if matches!(
+            scenario,
+            PartitionStreamCase::StopOnPoll | PartitionStreamCase::StopWithError
+        ) {
+            producer_control.stopped.store(true, Ordering::Relaxed);
+        }
+        item
+    });
+    let schema = if matches!(scenario, PartitionStreamCase::StreamSchema) {
+        Arc::new(Schema::empty())
+    } else {
+        VECTOR_RESULT_SCHEMA.clone()
+    };
+    let source = Box::pin(RecordBatchStreamAdapter::new(schema, source));
+    let result =
+        super::super::rabit_scan::controlled_partition_stream(source, 2, 1, control.clone());
+    let mut received = 0;
+    let mut failure = None;
+    match result {
+        Err(error) => {
+            assert!(matches!(&error, Error::Internal { .. }));
+            failure = Some(error.to_string());
+        }
+        Ok(mut batches) => {
+            while let Some(item) = batches.next().await {
+                match item {
+                    Ok(_) => received += 1,
+                    Err(error) => {
+                        assert!(matches!(&error, DataFusionError::External(_)));
+                        failure = Some(error.to_string());
+                        assert!(
+                            batches.next().await.is_none(),
+                            "errors must terminate the stream"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    match (failure, expected_error) {
+        (Some(error), Some(message)) => assert!(error.contains(message), "{error}"),
+        (None, None) => {}
+        actual => panic!("unexpected stream outcome: {actual:?}"),
+    }
+    assert_eq!(received, expected_batches);
+    assert_eq!(control.batches.load(Ordering::Relaxed), expected_batches);
+    assert_eq!(control.rows.load(Ordering::Relaxed), expected_rows);
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[rstest]
+#[tokio::test]
+async fn controlled_partition_stream_releases_pending_source(#[values(false, true)] stop: bool) {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let guard = StreamDrop(dropped.clone());
+    let batch = RecordBatch::try_new(
+        VECTOR_RESULT_SCHEMA.clone(),
+        vec![
+            Arc::new(Float32Array::from(vec![0.0])),
+            Arc::new(UInt64Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+    let source = futures::stream::iter(vec![Ok::<_, DataFusionError>(batch)])
+        .chain(futures::stream::pending())
+        .map(move |item| {
+            let _keep_alive = &guard;
+            item
+        });
+    let source = Box::pin(RecordBatchStreamAdapter::new(
+        VECTOR_RESULT_SCHEMA.clone(),
+        source,
+    ));
+    let control = Arc::new(RowBudget {
+        limit: if stop { 1 } else { usize::MAX },
+        ..Default::default()
+    });
+    let mut output =
+        super::super::rabit_scan::controlled_partition_stream(source, 2, 1, control.clone())
+            .unwrap();
+    assert_eq!(output.next().await.unwrap().unwrap().num_rows(), 1);
+    assert_eq!(dropped.load(Ordering::SeqCst), stop);
+    if stop {
+        assert!(output.next().await.is_none());
+    } else {
+        assert!(output.next().now_or_never().is_none());
+    }
+    drop(output);
+    assert!(dropped.load(Ordering::SeqCst));
+    assert_eq!(control.batches.load(Ordering::Relaxed), 1);
 }
 
 #[rstest]
