@@ -52,6 +52,8 @@ echo "started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "cargo=$(cargo --version)"
 echo "rustc=$(rustc --version)"
 echo "toolchain=$(rustup show active-toolchain)"
+echo "cc=${CC:-unset}"
+echo "cxx=${CXX:-unset}"
 echo "status_begin=$(git status --porcelain | wc -l) changes"
 
 if [[ -n $(git status --porcelain) ]]; then
