@@ -265,7 +265,16 @@ mod tests {
                 data_change: true,
             }),
             Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata {
-                fragment_ids: vec![4, 6],
+                rows: vec![
+                    RowSelection {
+                        fragment_id: 4,
+                        rows: SelectedRows::Full,
+                    },
+                    RowSelection {
+                        fragment_id: 6,
+                        rows: SelectedRows::Offsets(RoaringBitmap::from_iter([0u32, 2])),
+                    },
+                ],
             }),
             Action::AlterField(AlterField {
                 field: FieldRef::Committed(2),

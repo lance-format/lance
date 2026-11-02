@@ -205,8 +205,9 @@ pub(super) struct ApplyState<'a> {
     new_fragments: HashSet<u64>,
 
     /// Fragments the version applied onto already held that this operation
-    /// wrote changed data into, and the ones it refreshed. On a dataset with
-    /// stable row ids every changed fragment has to be refreshed.
+    /// wrote changed data into, and the ones it refreshed, wholly or in part.
+    /// On a dataset with stable row ids every changed fragment has to be
+    /// refreshed.
     data_changed_fragments: HashSet<u64>,
     refreshed_fragments: HashSet<u64>,
 
@@ -868,6 +869,11 @@ impl<'a> ApplyState<'a> {
     /// and a reader of changes since then would miss them. Checked once every
     /// action has been seen, because the refresh may come before or after the
     /// data it refreshes.
+    ///
+    /// Any selection of the fragment's rows satisfies it, down to one row: a
+    /// partial update rewrites a whole column file yet changes only its
+    /// matched rows, and which rows those are is exactly what the files cannot
+    /// say, so the writer's selection is taken as given.
     fn check_data_changes_are_refreshed(&self) -> Result<()> {
         if !self.uses_stable_row_ids() {
             return Ok(());
