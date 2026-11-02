@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Physical row sources used after scan planning.
+//!
+//! This module implements filtered reads, index-backed take inputs, scalar-index
+//! scans, overlays, stale-row exclusion, and distributed take plans. Every path
+//! must preserve physical/logical row identity, deletion masks, and visibility
+//! rules before returning a source plan. Tests live below and in
+//! `dataset/tests/dataset_scanner_rows.rs` and
+//! `dataset/tests/dataset_scanner_read.rs`.
+
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;

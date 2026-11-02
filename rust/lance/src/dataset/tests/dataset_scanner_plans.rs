@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arrow::datatypes::{Int32Type, Int64Type};
@@ -11,7 +11,7 @@ use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatch,
     RecordBatchIterator, StringArray, StructArray,
 };
-use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema, SchemaRef};
+use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 use futures::TryStreamExt;
 use lance_arrow::FixedSizeListArrayExt;
@@ -24,7 +24,9 @@ use lance_datagen::{
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::scalar::inverted::SCORE_COL;
-use lance_index::scalar::inverted::query::{MatchQuery, PhraseQuery};
+use lance_index::scalar::inverted::query::{
+    BooleanQuery, CombinedFieldsQuery, FtsQuery, MatchQuery, Occur, PhraseQuery,
+};
 use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 use lance_index::scalar::{FullTextSearchQuery, ScalarIndexParams};
 use lance_index::vector::DIST_COL;
@@ -33,13 +35,15 @@ use lance_index::vector::pq::PQBuildParams;
 use lance_io::assert_io_gt;
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::{DistanceType, MetricType};
+use prost::Message;
 use rstest::rstest;
 
 use crate::blob::{BlobArrayBuilder, blob_field};
-use crate::dataset::scanner::MaterializationStyle;
 use crate::dataset::scanner::test_dataset::{
-    TestVectorDataset, assert_plan_equals, assert_query_index_field,
+    TestVectorDataset, append_scalar_filter_test_data, assert_plan_equals,
+    assert_query_index_field, limit_offset_equivalency_test, make_scalar_filter_test_dataset,
 };
+use crate::dataset::scanner::{ColumnOrdering, MaterializationStyle};
 use crate::dataset::{Dataset, WriteParams};
 use crate::index::DatasetIndexExt;
 use crate::index::vector::{StageParams, VectorIndexParams};
@@ -2348,52 +2352,6 @@ async fn test_fast_search_scalar_index_skips_unindexed_fragments(
         project_first_scanner.try_into_batch().await.unwrap(),
         fast_batch
     );
-}
-
-fn make_scalar_filter_test_batch(schema: SchemaRef, start: i32, end: i32) -> RecordBatch {
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Int32Array::from_iter_values(start..end)),
-            Arc::new(Int32Array::from_iter_values(start..end)),
-        ],
-    )
-    .unwrap()
-}
-
-async fn make_scalar_filter_test_dataset(
-    data_storage_version: LanceFileVersion,
-) -> (TempStrDir, SchemaRef, Dataset) {
-    let tmp_dir = TempStrDir::default();
-    let schema = Arc::new(ArrowSchema::new(vec![
-        ArrowField::new("a", DataType::Int32, false),
-        ArrowField::new("b", DataType::Int32, false),
-    ]));
-    let batch = make_scalar_filter_test_batch(schema.clone(), 0, 100);
-    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-    let dataset = Dataset::write(
-        reader,
-        &tmp_dir,
-        Some(WriteParams {
-            max_rows_per_file: 100,
-            data_storage_version: Some(data_storage_version),
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
-    (tmp_dir, schema, dataset)
-}
-
-async fn append_scalar_filter_test_data(
-    dataset: &mut Dataset,
-    schema: SchemaRef,
-    start: i32,
-    end: i32,
-) {
-    let batch = make_scalar_filter_test_batch(schema.clone(), start, end);
-    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-    dataset.append(reader, None).await.unwrap();
 }
 
 async fn create_scalar_index(dataset: &mut Dataset, column: &str) {

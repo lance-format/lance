@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! MinHash similarity-search source planning.
+//!
+//! Indexed hits and uncovered fragments are combined without duplicating rows
+//! or exposing deleted rows. The selected plan must retain the scanner's limit,
+//! offset, filter, and row-identity contracts. Integration coverage lives in the
+//! `dataset_scanner_*` test modules.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

@@ -1,31 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arrow::array::as_primitive_array;
 use arrow::datatypes::Int32Type;
+use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, UInt32Type, UInt64Type};
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch,
-    RecordBatchIterator, StructArray, UInt8Array, UInt32Array,
+    Array, ArrayRef, BooleanArray, FixedSizeListArray, Float16Array, Float32Array, Float64Array,
+    Int32Array, ListArray, RecordBatch, RecordBatchIterator, StructArray, UInt8Array, UInt32Array,
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use futures::TryStreamExt;
+use half::f16;
 use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_core::{ROW_ADDR, ROW_ID};
-use lance_datagen::{ArrayGeneratorExt, Dimension, array, gen_batch};
+use lance_datagen::{ArrayGeneratorExt, BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
-use lance_index::vector::DIST_COL;
+use lance_index::vector::bq::builder::RabitQuantizer;
+use lance_index::vector::bq::{RQBuildParams, RQRotationType};
+use lance_index::vector::hnsw::builder::HnswBuildParams;
+use lance_index::vector::ivf::IvfBuildParams;
+use lance_index::vector::sq::builder::SQBuildParams;
+use lance_index::vector::{ApproxMode, DIST_COL};
 use lance_linalg::distance::{DistanceType, MetricType};
+use roaring::RoaringBitmap;
 use rstest::rstest;
 
 use crate::Error;
@@ -33,7 +42,8 @@ use crate::dataset::scanner::test_dataset::{
     TestVectorDataset, assert_query_index_field, batch_knn_two_queries, batch_row_ids,
     make_binary_vector_dataset,
 };
-use crate::dataset::scanner::{RowAddrMask, RowAddrTreeMap};
+use crate::dataset::scanner::{RowAddrMask, RowAddrTreeMap, Scanner};
+use crate::dataset::tests::dataset_scanner_segments::FragmentVectorFixture;
 use crate::dataset::{Dataset, WriteParams};
 use crate::index::DatasetIndexExt;
 use crate::index::vector::VectorIndexParams;

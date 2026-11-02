@@ -1,10 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Full-text query preparation and physical FTS planning.
+//!
+//! This module resolves query columns and document granularity, checks segment
+//! and fragment coverage, and chooses indexed, residual, hybrid, or flat plans.
+//! Statistics, overlay visibility, WAND bounds, prefilter masks, and score
+//! ordering must remain exact; unsupported coverage falls back without changing
+//! query semantics. Tests live below and in
+//! `dataset/tests/dataset_scanner_plans.rs`.
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow_schema::{Schema as ArrowSchema, SortOptions};
+use arrow_schema::{DataType, Schema as ArrowSchema, SortOptions};
 use async_recursion::async_recursion;
 use datafusion::common::{JoinType, NullEquality};
 use datafusion::functions_aggregate;
@@ -23,6 +32,7 @@ use lance_arrow::SchemaExt as ArrowSchemaExt;
 use lance_core::ROW_ID;
 use lance_core::datatypes::OnMissing;
 use lance_index::IndexCriteria;
+use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold::InvertedIndexDetails;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::query::{
@@ -39,6 +49,7 @@ use lance_select::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata};
 use prost::Message;
 use roaring::RoaringBitmap;
+use uuid::Uuid;
 
 use crate::dataset::Dataset;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
@@ -359,7 +370,7 @@ fn normalize_fts_zero_boosts(query: &mut FtsQuery) {
 /// unindexed rows. AUTO activation is deferred until OSS-2105 lands that
 /// current-row preparation atomically. Until then, recursively rewrite AUTO to
 /// exact while preserving explicit positive fuzziness.
-pub(crate) fn apply_dataset_planner_auto_fuzziness_compatibility_gate(query: &mut FtsQuery) {
+pub fn apply_dataset_planner_auto_fuzziness_compatibility_gate(query: &mut FtsQuery) {
     match query {
         FtsQuery::Match(query) => {
             query.fuzziness.get_or_insert(0);

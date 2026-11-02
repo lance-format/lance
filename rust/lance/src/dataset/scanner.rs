@@ -1,9 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Dataset scan configuration and orchestration.
+//!
+//! [`Scanner`] owns the user-visible query state. The child modules translate
+//! that state into projections, filters, query sources, and physical plans.
+//! Projection and filter schemas must agree, index coverage must be checked
+//! before it replaces a scan, and row identity and deletion masks must survive
+//! every specialized path. Tests live beside the owning submodules and in
+//! `dataset/tests/dataset_scanner_*.rs`.
+
 mod aggregate;
 mod builder;
-mod fts;
+pub(crate) mod fts;
 mod minhash;
 mod plan;
 mod source;
@@ -12,7 +21,6 @@ pub mod test_dataset;
 mod vector;
 
 pub use aggregate::{AggregateExpr, AggregateExprBuilder};
-pub(crate) use fts::apply_dataset_planner_auto_fuzziness_compatibility_gate;
 pub use source::TakeOperation;
 
 use std::collections::HashSet;
@@ -556,14 +564,14 @@ pub struct Scanner {
     /// will always be unordered since we are just going to reorder it anyways.
     ordering: Option<Vec<ColumnOrdering>>,
 
-    nearest: Option<Query>,
+    pub(super) nearest: Option<Query>,
     probe_params: ProbeParams,
     /// Candidate overfetch factor for RQ Fast-to-Accurate refinement.
     quantized_refine_factor: Option<u32>,
-    nearest_query_count: usize,
+    pub(super) nearest_query_count: usize,
     /// True when the query shape represents a batch of single-vector queries
     /// (list-like query on a fixed-size vector column, or multiple concatenated vectors).
-    is_batch_nearest: bool,
+    pub(super) is_batch_nearest: bool,
 
     /// If false, do not use any scalar indices for the scan
     ///

@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Schema validation, projection planning, and scan-plan assembly.
+//!
+//! This module validates cross-option invariants, selects the query source, and
+//! adds the final projection, ordering, and limit stages. Filter pushdown,
+//! scalar-index coverage, row identity, deletion masks, and overlay visibility
+//! must remain consistent with the source selected by the specialized modules.
+//! Tests live below and in `dataset/tests/dataset_scanner_plans.rs` and
+//! `dataset/tests/dataset_scanner_read.rs`.
+
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
@@ -18,7 +27,6 @@ use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, expressions};
-use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{Distribution, LexOrdering, PhysicalExpr};
 use futures::future::BoxFuture;
@@ -31,7 +39,6 @@ use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::exec::{
     LanceExecutionOptions, StrictBatchSizeExec, analyze_plan, execute_plan,
 };
-use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::expression::create_filter_plan;
 use lance_index::scalar::inverted::{
     DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity, SCORE_COL,
@@ -41,7 +48,6 @@ use lance_io::stream::RecordBatchStream;
 use tracing::instrument;
 
 use crate::datatypes::Schema;
-use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::filtered_read::filter_read_columns;
 use crate::io::exec::knn::{QUERY_INDEX_COL, query_index_field};
 use crate::io::exec::{
@@ -312,7 +318,7 @@ impl Scanner {
 
     /// Scan and return the number of matching rows
     ///
-    /// Note: calling [`Dataset::count_rows`] can be more efficient than calling this method
+    /// Note: calling [`Dataset::count_rows`](crate::dataset::Dataset::count_rows) can be more efficient than calling this method
     /// especially if there is no filter.
     #[instrument(skip_all)]
     pub fn count_rows(&self) -> BoxFuture<'_, Result<u64>> {
@@ -803,7 +809,7 @@ impl Scanner {
         log::trace!("creating scanner plan");
         self.validate_options()?;
         if let Some(rows) = &self.physical_row_addr_prefilter {
-            super::fragment_slice::validate_physical_rows(&self.dataset, rows).await?;
+            crate::dataset::fragment_slice::validate_physical_rows(&self.dataset, rows).await?;
         }
 
         let full_text_query = match &self.full_text_query {

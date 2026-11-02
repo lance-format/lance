@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use arrow::array::as_primitive_array;
-use arrow::datatypes::{Float64Type, Int32Type};
+use arrow::datatypes::{Float64Type, Int32Type, Int64Type};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, UInt64Type};
 use arrow_array::{
@@ -30,6 +30,7 @@ use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::query::{BooleanQuery, BoostQuery, FtsQuery, MatchQuery, Occur};
+use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use lance_index::vector::DIST_COL;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_io::stream::RecordBatchStream;

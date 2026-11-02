@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Builder methods and option validation for [`Scanner`].
+//!
+//! Setters only update scanner state. They must preserve the independence of
+//! batching, projection, progress, and query options; cross-option validation
+//! belongs with plan construction. Unit tests follow the related setters in
+//! this module.
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
-use arrow_array::{Array, Float32Array};
+use arrow_array::Array;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use chrono::Utc;
 use datafusion::common::DFSchema;
@@ -394,7 +401,8 @@ impl Scanner {
     /// # }
     /// ```
     pub async fn with_fragment_slices(&mut self, slices: &[FragmentSlice]) -> Result<&mut Self> {
-        let rows = super::fragment_slice::physical_rows_from_slices(&self.dataset, slices).await?;
+        let rows = crate::dataset::fragment_slice::physical_rows_from_slices(&self.dataset, slices)
+            .await?;
         Ok(self.with_physical_row_addr_prefilter(rows))
     }
 
@@ -919,7 +927,7 @@ impl Scanner {
     }
 
     #[cfg(test)]
-    fn nearest_mut(&mut self) -> Option<&mut Query> {
+    pub(super) fn nearest_mut(&mut self) -> Option<&mut Query> {
         self.nearest.as_mut()
     }
 
@@ -1359,6 +1367,7 @@ mod tests {
     use super::*;
 
     use arrow::datatypes::Int32Type;
+    use arrow_array::Float32Array;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{RecordBatch, StringArray, UInt8Array};
@@ -1369,12 +1378,17 @@ mod tests {
     use lance_arrow::SchemaExt;
     use lance_core::{ROW_ADDR, ROW_ID};
     use lance_file::version::LanceFileVersion;
+    use lance_index::IndexType;
     use lance_index::vector::DIST_COL;
+    use lance_linalg::distance::DistanceType;
     use rstest::rstest;
 
     use crate::dataset::scanner::test_dataset::{
-        TestVectorDataset, batch_knn_two_queries, make_binary_vector_dataset,
+        TestVectorDataset, batch_knn_two_queries, limit_offset_equivalency_test,
+        make_binary_vector_dataset,
     };
+    use crate::index::DatasetIndexExt;
+    use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     #[rstest]
@@ -1587,56 +1601,6 @@ mod tests {
             .as_primitive::<Float32Type>()
             .values();
         assert_eq!(distances, &[0.0, 2.0, 4.0]);
-    }
-
-    async fn limit_offset_equivalency_test(scanner: &Scanner) {
-        async fn test_one(
-            scanner: &Scanner,
-            full_result: &RecordBatch,
-            limit: Option<i64>,
-            offset: Option<i64>,
-        ) {
-            let mut new_scanner = scanner.clone();
-            new_scanner.limit(limit, offset).unwrap();
-            if let Some(nearest) = new_scanner.nearest_mut() {
-                nearest.k = offset.unwrap_or(0).saturating_add(limit.unwrap_or(10_000)) as usize;
-            }
-            let result = new_scanner.try_into_batch().await.unwrap();
-
-            let resolved_offset = offset.unwrap_or(0).min(full_result.num_rows() as i64);
-            let resolved_length = limit
-                .unwrap_or(i64::MAX)
-                .min(full_result.num_rows() as i64 - resolved_offset);
-
-            let expected = full_result.slice(resolved_offset as usize, resolved_length as usize);
-
-            if expected != result {
-                let plan = new_scanner.analyze_plan().await.unwrap();
-                assert_eq!(
-                    &expected, &result,
-                    "Limit: {:?}, Offset: {:?}, Plan: \n{}",
-                    limit, offset, plan
-                );
-            }
-        }
-
-        let mut scanner_full = scanner.clone();
-        if let Some(nearest) = scanner_full.nearest_mut() {
-            nearest.k = 500;
-        }
-        let full_results = scanner_full.try_into_batch().await.unwrap();
-
-        test_one(scanner, &full_results, Some(1), None).await;
-        test_one(scanner, &full_results, Some(1), Some(1)).await;
-        test_one(scanner, &full_results, Some(1), Some(2)).await;
-        test_one(scanner, &full_results, Some(1), Some(10)).await;
-
-        test_one(scanner, &full_results, Some(3), None).await;
-        test_one(scanner, &full_results, Some(3), Some(2)).await;
-        test_one(scanner, &full_results, Some(3), Some(4)).await;
-
-        test_one(scanner, &full_results, None, Some(3)).await;
-        test_one(scanner, &full_results, None, Some(10)).await;
     }
 
     #[tokio::test]

@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Aggregate expression construction and physical aggregation planning.
+//!
+//! [`AggregateExpr`] and [`AggregateExprBuilder`] keep grouping and aggregate
+//! expressions in one representation, while the `Scanner` implementation
+//! lowers them without changing null, empty-input, or ordering semantics.
+//! Integration coverage lives in `dataset/tests/dataset_aggregate.rs`.
+
 use std::sync::Arc;
 
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
@@ -11,6 +18,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use datafusion_expr::ExprSchemable;
 use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_physical_expr::aggregate::LoweredAggregateBuilder;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use futures::FutureExt;

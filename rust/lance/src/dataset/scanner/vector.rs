@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Vector-search source planning and index-to-flat fallback.
+//!
+//! This module maps nearest-neighbor queries to indexed or flat plans, applies
+//! fragment and segment coverage, combines prefilters, and preserves distance
+//! semantics during refinement. Stable-row-ID and deletion handling must match
+//! the selected source. Tests live below and in
+//! `dataset/tests/dataset_scanner_knn.rs` and
+//! `dataset/tests/dataset_scanner_segments.rs`.
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 

@@ -1,13 +1,18 @@
+//! Shared datasets and assertions for scanner integration tests.
+
 use super::*;
 
 use std::{collections::HashMap, vec};
 
 use arrow_array::{
     ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
-    StringArray, types::Float32Type,
+    StringArray, UInt8Array,
+    cast::AsArray,
+    types::{Float32Type, UInt64Type},
 };
-use arrow_schema::{ArrowError, DataType};
+use arrow_schema::{ArrowError, DataType, Field as ArrowField, SchemaRef};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::ROW_ID;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_file::version::LanceFileVersion;
 use lance_index::{
@@ -21,11 +26,14 @@ use lance_index::{
         sq::builder::SQBuildParams,
     },
 };
-use lance_linalg::distance::DistanceType;
+use lance_linalg::distance::{DistanceType, MetricType};
 use uuid::Uuid;
 
 use crate::dataset::WriteParams;
 use crate::index::vector::{StageParams, VectorIndexParams};
+use crate::io::exec::QUERY_INDEX_COL;
+use crate::io::exec::filtered_read::FilteredReadExec;
+use crate::utils::test::assert_plan_node_equals;
 
 // Creates a dataset with 5 batches where each batch has 80 rows
 //
@@ -459,4 +467,97 @@ pub fn batch_knn_two_queries() -> (FixedSizeListArray, Vec<f32>) {
         FixedSizeListArray::try_new_from_values(Float32Array::from(query_values.clone()), 32)
             .unwrap();
     (queries, query_values)
+}
+
+pub async fn limit_offset_equivalency_test(scanner: &Scanner) {
+    async fn test_one(
+        scanner: &Scanner,
+        full_result: &RecordBatch,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) {
+        let mut new_scanner = scanner.clone();
+        new_scanner.limit(limit, offset).unwrap();
+        if let Some(nearest) = new_scanner.nearest_mut() {
+            nearest.k = offset.unwrap_or(0).saturating_add(limit.unwrap_or(10_000)) as usize;
+        }
+        let result = new_scanner.try_into_batch().await.unwrap();
+
+        let resolved_offset = offset.unwrap_or(0).min(full_result.num_rows() as i64);
+        let resolved_length = limit
+            .unwrap_or(i64::MAX)
+            .min(full_result.num_rows() as i64 - resolved_offset);
+        let expected = full_result.slice(resolved_offset as usize, resolved_length as usize);
+
+        if expected != result {
+            let plan = new_scanner.analyze_plan().await.unwrap();
+            assert_eq!(
+                &expected, &result,
+                "Limit: {:?}, Offset: {:?}, Plan: \n{}",
+                limit, offset, plan
+            );
+        }
+    }
+
+    let mut scanner_full = scanner.clone();
+    if let Some(nearest) = scanner_full.nearest_mut() {
+        nearest.k = 500;
+    }
+    let full_results = scanner_full.try_into_batch().await.unwrap();
+
+    test_one(scanner, &full_results, Some(1), None).await;
+    test_one(scanner, &full_results, Some(1), Some(1)).await;
+    test_one(scanner, &full_results, Some(1), Some(2)).await;
+    test_one(scanner, &full_results, Some(1), Some(10)).await;
+    test_one(scanner, &full_results, Some(3), None).await;
+    test_one(scanner, &full_results, Some(3), Some(2)).await;
+    test_one(scanner, &full_results, Some(3), Some(4)).await;
+    test_one(scanner, &full_results, None, Some(3)).await;
+    test_one(scanner, &full_results, None, Some(10)).await;
+}
+
+fn make_scalar_filter_test_batch(schema: SchemaRef, start: i32, end: i32) -> RecordBatch {
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from_iter_values(start..end)),
+            Arc::new(Int32Array::from_iter_values(start..end)),
+        ],
+    )
+    .unwrap()
+}
+
+pub async fn make_scalar_filter_test_dataset(
+    data_storage_version: LanceFileVersion,
+) -> (TempStrDir, SchemaRef, Dataset) {
+    let tmp_dir = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("a", DataType::Int32, false),
+        ArrowField::new("b", DataType::Int32, false),
+    ]));
+    let batch = make_scalar_filter_test_batch(schema.clone(), 0, 100);
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let dataset = Dataset::write(
+        reader,
+        &tmp_dir,
+        Some(WriteParams {
+            max_rows_per_file: 100,
+            data_storage_version: Some(data_storage_version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    (tmp_dir, schema, dataset)
+}
+
+pub async fn append_scalar_filter_test_data(
+    dataset: &mut Dataset,
+    schema: SchemaRef,
+    start: i32,
+    end: i32,
+) {
+    let batch = make_scalar_filter_test_batch(schema.clone(), start, end);
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    dataset.append(reader, None).await.unwrap();
 }

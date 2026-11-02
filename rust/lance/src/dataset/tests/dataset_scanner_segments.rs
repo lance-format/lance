@@ -7,14 +7,16 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::Int32Type;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, UInt64Type};
-use arrow_array::{Array, FixedSizeListArray, Float32Array, Int32Array, RecordBatch};
+use arrow_array::{Array, BooleanArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch};
 use lance_arrow::FixedSizeListArrayExt;
-use lance_datagen::{array, gen_batch};
+use lance_core::{ROW_ADDR, ROW_ID};
+use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::DocumentGranularity;
 use lance_index::scalar::inverted::query::PhraseQuery;
+use lance_index::vector::DIST_COL;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_linalg::distance::{DistanceType, MetricType};
@@ -23,12 +25,15 @@ use roaring::RoaringBitmap;
 use rstest::rstest;
 use uuid::Uuid;
 
-use crate::dataset::Dataset;
-use crate::dataset::scanner::Scanner;
-use crate::dataset::scanner::test_dataset::TestVectorDataset;
+use crate::Error;
+use crate::dataset::optimize::{CompactionOptions, compact_files};
+use crate::dataset::scanner::test_dataset::{TestVectorDataset, assert_query_index_field};
+use crate::dataset::scanner::{RowAddrMask, RowAddrTreeMap, Scanner};
+use crate::dataset::{Dataset, WriteParams};
 use crate::index::DatasetIndexExt;
 use crate::index::scalar::inverted::fts_index_fragment_bitmap;
 use crate::index::vector::VectorIndexParams;
+use crate::io::exec::QUERY_INDEX_COL;
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
 #[rstest]
@@ -961,8 +966,8 @@ enum FragmentSearchPath {
     Empty,
 }
 
-struct FragmentVectorFixture {
-    dataset: Dataset,
+pub(super) struct FragmentVectorFixture {
+    pub(super) dataset: Dataset,
     segments: Vec<Uuid>,
     query: Float32Array,
 }
@@ -1450,7 +1455,7 @@ async fn test_vector_search_disjoint_index_segments_metric(
 
 impl FragmentVectorFixture {
     #[cfg_attr(coverage, coverage(off))]
-    async fn new(is_indexed: bool, enable_stable_row_ids: bool) -> Self {
+    pub(super) async fn new(is_indexed: bool, enable_stable_row_ids: bool) -> Self {
         // F0 is closer than every allowed row. F1/F2/F3 interleave by distance,
         // so even a small top-k must include both ANN and flat candidates.
         let mut values = Vec::with_capacity(64 * 4);

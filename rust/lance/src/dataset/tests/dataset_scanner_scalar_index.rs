@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::Int32Type;
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Float32Type, UInt64Type};
+use arrow_array::types::{Float32Type, UInt32Type, UInt64Type};
 use arrow_array::{
     Array, Int32Array, PrimitiveArray, RecordBatch, RecordBatchIterator, StringArray,
 };
@@ -23,7 +23,10 @@ use lance_linalg::distance::MetricType;
 use rstest::rstest;
 
 use crate::dataset::optimize::{CompactionOptions, compact_files};
-use crate::dataset::scanner::test_dataset::assert_plan_equals;
+use crate::dataset::scanner::test_dataset::{
+    append_scalar_filter_test_data, assert_plan_equals, make_scalar_filter_test_dataset,
+};
+use crate::dataset::scanner::{RowAddrMask, RowAddrTreeMap};
 use crate::dataset::{Dataset, WriteParams};
 use crate::index::DatasetIndexExt;
 use crate::index::vector::VectorIndexParams;
