@@ -413,9 +413,8 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .collect::<Result<Vec<_>>>()?,
             },
             Some(pb::transaction::Operation::CompositeOperation(composite_operation)) => {
-                // Action-based transactions (Transaction V2) are an experimental
-                // wire format (discussion #5960). Parsing is fail-closed: an action this build
-                // does not implement is an error, never a skipped element.
+                // Action-based transactions (Transaction V2, discussion #5960).
+                // Parsing is fail-closed: an action this build does not implement is an error, never a skipped element.
                 // load_and_sort_new_transactions collects concurrent transactions
                 // with try_collect, so such a transaction aborts the commit rather
                 // than being silently treated as a no-op. Do NOT make this lenient.
