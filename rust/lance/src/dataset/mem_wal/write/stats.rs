@@ -320,10 +320,10 @@ impl WriteStatsSnapshot {
 }
 
 /// Shared stats handle for use across components.
-pub(super) type SharedWriteStats = Arc<WriteStats>;
+pub type SharedWriteStats = Arc<WriteStats>;
 
 /// Create a new shared stats collector.
-pub(super) fn new_shared_stats() -> SharedWriteStats {
+pub fn new_shared_stats() -> SharedWriteStats {
     Arc::new(WriteStats::new())
 }
 

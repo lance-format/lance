@@ -13,7 +13,7 @@ mod config;
 mod handlers;
 mod replay;
 mod schema;
-mod stats;
+pub mod stats;
 pub mod tasks;
 mod writer;
 
