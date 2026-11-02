@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use super::MAX_FRAGMENT_UPDATE_BATCH_BYTES;
+use super::job::fragment_update_session_context;
 use super::{MergeInsertJob, PatchedFragments};
 use crate::dataset::rowids::load_spilled_row_lineage;
 use crate::dataset::utils::SchemaAdapter;
 use crate::dataset::write::cleanup_data_fragments;
 use crate::dataset::write::seeds::SeedCollector;
-use crate::dataset::write::{TargetBaseInfo, write_fragments_internal};
+use crate::dataset::write::{TargetBaseInfo, WriteParams, write_fragments_internal};
 use crate::{
     Dataset,
     datafusion::dataframe::SessionContextExt,
@@ -14,7 +16,10 @@ use crate::{
 };
 use arrow_array::{RecordBatch, RecordBatchIterator, UInt64Array};
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::physical_plan::replace_children_if_necessary;
 use datafusion::{
+    common::DataFusionError,
+    execution::context::SessionContext,
     execution::memory_pool::MemoryConsumer,
     physical_plan::{
         ExecutionPlan, SendableRecordBatchStream, sorts::sort::SortExec,
@@ -23,7 +28,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use futures::{
-    StreamExt,
+    StreamExt, TryStreamExt,
     stream::{self},
 };
 use lance_arrow::json::convert_json_columns;
@@ -32,12 +37,12 @@ use lance_core::utils::address::RowAddress;
 use lance_core::{
     Error, ROW_ADDR, ROW_ID, Result,
     datatypes::{OnMissing, OnTypeMismatch},
-    utils::tokio::get_num_compute_intensive_cpus,
 };
 use lance_datafusion::{
     chunker::chunk_stream,
     dataframe::BatchStreamGrouper,
-    exec::{HardCapBatchSizeExec, LanceExecutionOptions, get_session_context},
+    exec::{HardCapBatchSizeExec, LanceExecutionOptions, provider_to_stream},
+    spill::spilling_table_provider_with_job_disk_manager,
     utils::reader_to_stream,
 };
 use lance_file::version::ConcreteFileVersion;
@@ -133,14 +138,40 @@ impl MergeInsertJob {
     /// `source` must carry `_rowaddr` plus the columns to write. A null
     /// `_rowaddr` routes the row to a new fragment. Join columns in `on` are
     /// written for new rows but preserved in existing fragments.
-    pub(in crate::dataset::write) async fn update_fragments(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Partial updates carry operation-scoped spill resources and caller file-write parameters"
+    )]
+    pub(super) async fn update_fragments(
         dataset: Arc<Dataset>,
         source: SendableRecordBatchStream,
-        current_version: u64,
         target_bases_info: Option<Vec<TargetBaseInfo>>,
-        write_version: ConcreteFileVersion,
+        spill_session_context: &SessionContext,
+        spill_execution_options: &LanceExecutionOptions,
+        versions: (u64, ConcreteFileVersion),
         on: &[String],
+        write_params: Arc<WriteParams>,
     ) -> Result<PatchedFragments> {
+        let (current_version, write_version) = versions;
+        // Fully stage the joined updates before starting the fragment sort. An
+        // indexed join can keep merge streams for both sorted inputs live while
+        // its output is pulled; draining a disk-backed replay first releases
+        // those upstream reservations before the downstream sort allocates. The
+        // zero memory limit is deliberate: the staging buffer holds plain
+        // RecordBatches outside DataFusion's memory-pool accounting, so any
+        // in-memory allowance would weaken the operation's bounded-memory
+        // contract.
+        let staged_source = spilling_table_provider_with_job_disk_manager(
+            source,
+            0,
+            spill_session_context.runtime_env().disk_manager.clone(),
+        )
+        .await?;
+        provider_to_stream(staged_source.clone())
+            .await?
+            .try_for_each(|_| async { Ok::<(), DataFusionError>(()) })
+            .await?;
+        let source = provider_to_stream(staged_source).await?;
         let source_schema = source.schema();
         let update_projection: Vec<usize> = source_schema
             .fields()
@@ -159,17 +190,14 @@ impl MergeInsertJob {
         let target_bases_info = Arc::new(target_bases_info);
         // Expected source schema: _rowaddr, updated_cols*
         use datafusion::logical_expr::{col, lit};
-        let session_ctx = get_session_context(&LanceExecutionOptions {
-            use_spilling: true,
-            target_partition: Some(get_num_compute_intensive_cpus().min(8)),
-            ..Default::default()
-        });
+        let session_ctx =
+            fragment_update_session_context(spill_session_context, spill_execution_options);
         // Cap input batches at 25 MiB to leave room for DataFusion's per-batch
         // sort overhead and spill/merge reservation. SortExec must reserve an
         // entire input batch even when spilling is enabled. This cap reduces
         // reservation pressure but cannot guarantee success with a small pool
-        // or competing consumers; oversized single rows are rejected.
-        const MAX_BATCH_BYTES: usize = 25 * 1024 * 1024;
+        // or competing consumers; indivisible oversized rows pass through with
+        // a warning.
         let sorted = session_ctx
             .read_one_shot(source)?
             .with_column("_fragment_id", col(ROW_ADDR) >> lit(32))?
@@ -184,11 +212,13 @@ impl MergeInsertJob {
                     let new_children: Vec<Arc<dyn ExecutionPlan>> = children
                         .into_iter()
                         .map(|c| {
-                            Arc::new(HardCapBatchSizeExec::new(c.clone(), MAX_BATCH_BYTES))
-                                as Arc<dyn ExecutionPlan>
+                            Arc::new(HardCapBatchSizeExec::new(
+                                c.clone(),
+                                MAX_FRAGMENT_UPDATE_BATCH_BYTES,
+                            )) as Arc<dyn ExecutionPlan>
                         })
                         .collect();
-                    let new_node = node.with_new_children(new_children)?;
+                    let new_node = replace_children_if_necessary(node, new_children)?;
                     Ok(Transformed::yes(new_node))
                 } else {
                     Ok(Transformed::no(node))
@@ -509,6 +539,7 @@ impl MergeInsertJob {
                 reservation_size: usize,
                 target_bases_info: Arc<Option<Vec<TargetBaseInfo>>>,
                 write_version: ConcreteFileVersion,
+                write_params: Arc<WriteParams>,
             ) -> Result<usize> {
                 // Batches still have _rowaddr (used elsewhere to merge with existing data)
                 // We need to remove it before writing to Lance files.
@@ -540,7 +571,7 @@ impl MergeInsertJob {
                     &dataset.base,
                     write_schema,
                     stream,
-                    Default::default(), // TODO: support write params.
+                    write_params.as_ref().clone(),
                     (*target_bases_info).clone(),
                 )
                 .await?;
@@ -641,6 +672,7 @@ impl MergeInsertJob {
                         memory_size,
                         target_bases_info.clone(),
                         write_version,
+                        write_params.clone(),
                     );
                     tasks.spawn(fut);
                 }
@@ -730,10 +762,12 @@ impl MergeInsertJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::write::merge_insert::job::merge_insert_execution_options;
 
     use arrow_array::record_batch;
 
     use crate::dataset::InsertBuilder;
+    use lance_datafusion::exec::new_session_context;
 
     #[test]
     fn test_updated_row_addr_missing_between_target_rows() {

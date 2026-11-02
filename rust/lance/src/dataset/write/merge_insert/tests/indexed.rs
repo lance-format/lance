@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use async_trait::async_trait;
 
 #[tokio::test]
 async fn test_indexed_merge_insert() {

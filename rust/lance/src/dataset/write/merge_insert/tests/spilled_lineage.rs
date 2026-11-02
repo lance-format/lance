@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use rstest::rstest;
 
 async fn dataset(uri: &str) -> Dataset {
     let params = WriteParams {

@@ -45,6 +45,8 @@ use super::{
 };
 use crate::{
     Dataset,
+    dataset::blob::BlobPayloadInventory,
+    dataset::rowids::inline_row_lineage_max_bytes,
     dataset::transaction::{Transaction, UpdatedFragmentOffsets},
     io::exec::Planner,
 };
@@ -54,6 +56,7 @@ use datafusion::common::{Column as DFColumn, TableReference};
 use datafusion::error::DataFusionError;
 use datafusion::{
     catalog::{TableProvider, streaming::StreamingTable},
+    execution::context::SessionContext,
     logical_expr::{self, Expr},
     physical_plan::{
         ExecutionPlan, SendableRecordBatchStream, stream::RecordBatchStreamAdapter,
@@ -71,7 +74,7 @@ use lance_core::{
     datatypes::SchemaCompareOptions,
     error::{InvalidInputSnafu, box_error},
 };
-use lance_datafusion::exec::OneShotPartitionStream;
+use lance_datafusion::exec::{LanceExecutionOptions, OneShotPartitionStream};
 use lance_file::version::ConcreteFileVersion;
 use lance_index::mem_wal::CompactedSsTable;
 use lance_select::RowAddrTreeMap;

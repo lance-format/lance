@@ -10,7 +10,7 @@ use crate::io::exec::Planner;
 use arrow_array::{
     BooleanArray, RecordBatch, StructArray, UInt32Array, cast::AsArray, types::UInt64Type,
 };
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Fields, Schema};
 use arrow_select::take::take_record_batch;
 use datafusion::error::DataFusionError;
 use datafusion::{
@@ -22,7 +22,7 @@ use futures::{
     stream::{self},
 };
 use lance_arrow::SchemaExt;
-use lance_core::{Error, ROW_ADDR_FIELD, Result};
+use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD, Result};
 use std::{
     collections::HashSet,
     sync::{Arc, Mutex},
@@ -95,15 +95,15 @@ fn unzip_batch(batch: &RecordBatch, combined: &Schema) -> Result<RecordBatch> {
 // Note: we are not currently using parallelism but this still needs to be sync because it is
 //       held across an await boundary (and we might use parallelism someday)
 #[derive(Debug, Clone)]
-struct Merger {
+pub(super) struct Merger {
     // As the merger runs it will update the list of deleted rows
-    deleted_rows: Arc<Mutex<Vec<u64>>>,
+    pub(super) deleted_rows: Arc<Mutex<Vec<u64>>>,
     // Shared collection to capture row ids that need to be updated
-    updating_row_ids: Arc<Mutex<CapturedRowIds>>,
+    pub(super) updating_row_ids: Arc<Mutex<CapturedRowIds>>,
     // Physical delete expression, only set if params.delete_not_matched_by_source is DeleteIf
     delete_expr: Option<Arc<dyn PhysicalExpr>>,
     // User statistics for merging
-    merge_stats: Arc<Mutex<MergeStats>>,
+    pub(super) merge_stats: Arc<Mutex<MergeStats>>,
     // Only set if params.when_matched is UpdateIf
     match_filter: Option<MatchFilter>,
     // The parameters controlling the merge
@@ -111,7 +111,7 @@ struct Merger {
     /// Whether the output schema should include a row address column
     with_row_addr: bool,
     /// Carry row IDs until full-schema upsert output is ordered for writing.
-    with_row_id: bool,
+    pub(super) with_row_id: bool,
     /// The output schema of the stream.
     output_schema: Arc<Schema>,
     /// Whether to enable stable row ids
@@ -124,7 +124,7 @@ struct Merger {
 
 impl Merger {
     // Creates a new merger with an empty set of deleted rows, compiles expressions, if present
-    fn try_new(
+    pub(super) fn try_new(
         params: MergeInsertParams,
         schema: Arc<Schema>,
         joined_schema: &Schema,
@@ -205,7 +205,7 @@ impl Merger {
         })
     }
 
-    fn output_schema(&self) -> &Arc<Schema> {
+    pub(super) fn output_schema(&self) -> &Arc<Schema> {
         &self.output_schema
     }
 
@@ -263,7 +263,7 @@ impl Merger {
     //
     // Returns 0, 1, or 2 batches
     // Potentially updates (as a side-effect) the deleted rows vec
-    async fn execute_batch(
+    pub(super) async fn execute_batch(
         self,
         batch: RecordBatch,
     ) -> datafusion::common::Result<impl Stream<Item = datafusion::common::Result<RecordBatch>>>

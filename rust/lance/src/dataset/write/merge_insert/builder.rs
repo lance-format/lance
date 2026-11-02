@@ -5,8 +5,13 @@ use super::{
     MergeInsertBuilder, MergeInsertJob, MergeInsertParams, MergeInsertWriteMode, PlanFileVersion,
     SourceDedupeBehavior, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
 };
-use crate::{Dataset, dataset::versions};
+use crate::dataset::write::merge_insert::job::merge_insert_execution_options;
+use crate::{
+    Dataset,
+    dataset::{ExternalBlobMode, WriteMode, WriteParams, versions},
+};
 use lance_core::{Error, Result};
+use lance_datafusion::exec::new_session_context;
 use lance_file::version::LanceFileVersion;
 use lance_index::mem_wal::CompactedSsTable;
 use std::{sync::Arc, time::Duration};
