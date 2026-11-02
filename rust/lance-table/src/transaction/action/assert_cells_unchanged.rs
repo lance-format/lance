@@ -4,13 +4,12 @@
 //! Assert that the cells an operation read are unchanged.
 
 use super::apply::ApplyState;
-use super::{FieldRef, Footprint, Ref};
+use super::row_selection::row_selections_from_proto;
+use super::{FieldRef, Footprint, Ref, RowSelection};
 use crate::format::pb_actions;
 use arrow_schema::DataType;
-use lance_core::deepsize::{Context, DeepSizeOf};
+use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
-use roaring::RoaringBitmap;
-use std::collections::HashSet;
 
 /// A precondition rather than a delta: the declared cells -- every field in
 /// [`Self::fields`] at every row in [`Self::rows`] -- hold the values they held
@@ -35,7 +34,7 @@ use std::collections::HashSet;
 /// Only top-level columns, and packed structs, can be declared. A footprint has
 /// no schema to relate a struct to its children, so a write to a child would go
 /// unnoticed by an assertion over its parent, and the reverse.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, DeepSizeOf)]
 pub struct AssertCellsUnchanged {
     /// The fields read. Committed only: a field minted in the same operation
     /// has no value at the version read. Empty declares no cells.
@@ -43,22 +42,6 @@ pub struct AssertCellsUnchanged {
     /// The rows read, one selection per committed fragment. Empty declares no
     /// cells.
     pub rows: Vec<RowSelection>,
-}
-
-/// A selection of rows within one committed fragment.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RowSelection {
-    pub fragment_id: u32,
-    pub rows: SelectedRows,
-}
-
-/// Which rows of a fragment a [`RowSelection`] covers.
-#[derive(Debug, Clone, PartialEq)]
-pub enum SelectedRows {
-    /// Every row of the fragment.
-    Full,
-    /// The rows at these physical offsets.
-    Offsets(RoaringBitmap),
 }
 
 impl AssertCellsUnchanged {
@@ -120,45 +103,11 @@ impl AssertCellsUnchanged {
     }
 }
 
-impl DeepSizeOf for AssertCellsUnchanged {
-    fn deep_size_of_children(&self, context: &mut Context) -> usize {
-        // RoaringBitmap does not expose its allocation size; its serialized
-        // size is a close proxy.
-        self.fields.deep_size_of_children(context)
-            + self.rows.capacity() * std::mem::size_of::<RowSelection>()
-            + self
-                .rows
-                .iter()
-                .map(|selection| match &selection.rows {
-                    SelectedRows::Full => 0,
-                    SelectedRows::Offsets(offsets) => offsets.serialized_size(),
-                })
-                .sum::<usize>()
-    }
-}
-
 impl From<&AssertCellsUnchanged> for pb_actions::AssertCellsUnchanged {
     fn from(value: &AssertCellsUnchanged) -> Self {
         Self {
             fields: value.fields.iter().map(|field| (*field).into()).collect(),
-            rows: value
-                .rows
-                .iter()
-                .map(|selection| pb_actions::RowSelection {
-                    fragment_id: selection.fragment_id,
-                    coverage: Some(match &selection.rows {
-                        SelectedRows::Full => pb_actions::row_selection::Coverage::Full(()),
-                        SelectedRows::Offsets(offsets) => {
-                            let mut bytes = Vec::with_capacity(offsets.serialized_size());
-                            // Writing into a Vec cannot fail.
-                            offsets
-                                .serialize_into(&mut bytes)
-                                .expect("serializing a bitmap into memory");
-                            pb_actions::row_selection::Coverage::Bitmap(bytes)
-                        }
-                    }),
-                })
-                .collect(),
+            rows: value.rows.iter().map(Into::into).collect(),
         }
     }
 }
@@ -167,51 +116,13 @@ impl TryFrom<pb_actions::AssertCellsUnchanged> for AssertCellsUnchanged {
     type Error = Error;
 
     fn try_from(message: pb_actions::AssertCellsUnchanged) -> Result<Self> {
-        let mut seen = HashSet::with_capacity(message.rows.len());
-        let rows = message
-            .rows
-            .into_iter()
-            .map(|selection| {
-                if !seen.insert(selection.fragment_id) {
-                    return Err(Error::invalid_input(format!(
-                        "AssertCellsUnchanged selects rows of fragment {} more than once",
-                        selection.fragment_id
-                    )));
-                }
-                let rows = match selection.coverage {
-                    Some(pb_actions::row_selection::Coverage::Full(())) => SelectedRows::Full,
-                    Some(pb_actions::row_selection::Coverage::Bitmap(bytes)) => {
-                        SelectedRows::Offsets(RoaringBitmap::deserialize_from(&bytes[..]).map_err(
-                            |error| {
-                                Error::invalid_input(format!(
-                                    "AssertCellsUnchanged selects rows of fragment {} with a \
-                                     bitmap that is not a portable Roaring bitmap: {error}",
-                                    selection.fragment_id
-                                ))
-                            },
-                        )?)
-                    }
-                    None => {
-                        return Err(Error::invalid_input(format!(
-                            "AssertCellsUnchanged selects rows of fragment {} without saying \
-                             which",
-                            selection.fragment_id
-                        )));
-                    }
-                };
-                Ok(RowSelection {
-                    fragment_id: selection.fragment_id,
-                    rows,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             fields: message
                 .fields
                 .into_iter()
                 .map(FieldRef::try_from)
                 .collect::<Result<Vec<_>>>()?,
-            rows,
+            rows: row_selections_from_proto(message.rows, "AssertCellsUnchanged")?,
         })
     }
 }
@@ -221,6 +132,7 @@ mod tests {
     use super::*;
     use crate::format::DataFile;
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage};
+    use crate::transaction::action::SelectedRows;
     use crate::transaction::action::test_support::{
         added_field, apply, backed_manifest, footprint,
     };
@@ -230,6 +142,7 @@ mod tests {
     };
     use arrow_schema::{DataType, Field as ArrowField, Fields};
     use lance_file::version::ConcreteFileVersion;
+    use roaring::RoaringBitmap;
     use rstest::rstest;
     use std::sync::Arc;
 
