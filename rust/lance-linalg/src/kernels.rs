@@ -417,6 +417,7 @@ mod tests {
     use arrow_buffer::NullBuffer;
     use arrow_schema::Field;
     use half::f16;
+    use rstest::rstest;
 
     #[test]
     fn test_argmax() {
@@ -472,6 +473,26 @@ mod tests {
         let empty_vec: Vec<i16> = vec![];
         let empty = Int16Array::from(empty_vec);
         assert_eq!(argmin_opt(empty.iter()), None)
+    }
+
+    #[rstest]
+    #[case::no_bias(vec![5.0, 1.0, 3.0], None::<Vec<f32>>, (1, 1.0))]
+    #[case::biased_value(vec![5.0, 8.0], Some(vec![-1.0, -5.0]), (1, 8.0))]
+    // The unpaired value would win if the shorter iterator were not truncated.
+    #[case::shorter_bias(vec![5.0, 8.0, 1.0], Some(vec![-1.0, -5.0]), (1, 8.0))]
+    fn test_argmin_value_float_with_bias(
+        #[case] values: Vec<f32>,
+        #[case] bias: Option<Vec<f32>>,
+        #[case] expected: (u32, f32),
+    ) {
+        let f = Float32Array::from(values);
+        assert_eq!(
+            argmin_value_float_with_bias(
+                f.values().iter().copied(),
+                bias.map(|bias| bias.into_iter())
+            ),
+            Some(expected)
+        );
     }
 
     #[test]
