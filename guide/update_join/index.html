@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Update Join Strategies — Lance</title>
+
+
+<meta name="description" content="Documentation for Lance, an open lakehouse format for Multimodal AI">
+
+<link rel="canonical" href="https://lance.org/guide/update_join/">
+<link rel="icon" href="../../logo/logo.png">
+<link rel="stylesheet" href="../../assets/tokens.css">
+<link rel="stylesheet" href="../../assets/site.css">
+<script>
+/* Set the theme before first paint to avoid a light-mode flash. */
+(function () {
+  try {
+    var t = localStorage.getItem("ld-theme");
+    if (t !== "light" && t !== "dark") {
+      t = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    }
+    document.documentElement.dataset.theme = t;
+  } catch (e) { document.documentElement.dataset.theme = "light"; }
+})();
+</script>
+</head>
+<body>
+<div class="ld-shell">
+  <header class="ld-header">
+    <a class="ld-brand" href="../.." aria-label="Lance">
+      <img src="../../logo/wide.png" alt="Lance">
+    </a>
+    <nav class="ld-topnav" aria-label="Sections">
+      <a class="ld-toptab" href="../..">Home</a>
+      <a class="ld-toptab" href="../../quickstart/">Getting Started</a>
+      <a class="ld-toptab active" href="../read_and_write/">User Guide</a>
+      <a class="ld-toptab" href="../../format/">Specification</a>
+      <a class="ld-toptab" href="../../examples/python/llm_dataset_creation/">Examples</a>
+      <a class="ld-toptab" href="../../integrations/">Integrations</a>
+      <a class="ld-toptab" href="../../community/">Community</a>
+      <a class="ld-toptab" href="../../sdk_docs/">SDK Docs</a>
+    </nav>
+    <div class="ld-header__actions">
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="search-open" type="button" aria-label="Search docs" title="Search (/)">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--ghost" href="https://github.com/lance-format/lance" target="_blank" rel="noopener" aria-label="Lance on GitHub">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span class="ld-btn__label">GitHub</span>
+        <span class="ld-btn__count" id="gh-stars" hidden></span>
+      </a>
+      <a class="ld-btn ld-btn--ghost ld-btn--icon" href="https://discord.gg/lance" target="_blank" rel="noopener" aria-label="Join the Lance Discord" title="Discord">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true"><path d="M20.32 4.37a19.8 19.8 0 0 0-4.89-1.52.07.07 0 0 0-.08.04c-.21.38-.44.87-.61 1.25a18.27 18.27 0 0 0-5.48 0 12.64 12.64 0 0 0-.62-1.25.08.08 0 0 0-.08-.04c-1.71.3-3.35.81-4.88 1.52a.07.07 0 0 0-.04.03C.53 9.05-.32 13.58.1 18.06c0 .02.01.04.03.05a19.9 19.9 0 0 0 6 3.03c.03.01.06 0 .08-.02.46-.63.87-1.3 1.22-2a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1-.01-.13c.13-.09.25-.19.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01c.12.1.25.2.37.29a.08.08 0 0 1-.01.13c-.6.35-1.22.64-1.87.89a.08.08 0 0 0-.04.11c.36.7.77 1.36 1.22 2 .02.02.05.03.08.02a19.84 19.84 0 0 0 6.02-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03ZM8.02 15.33c-1.18 0-2.16-1.08-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.96 2.42-2.16 2.42Zm7.97 0c-1.18 0-2.15-1.08-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.34-.95 2.42-2.16 2.42Z"/></svg>
+      </a>
+      <button class="ld-btn ld-btn--ghost ld-btn--icon" id="theme-toggle" type="button" aria-label="Toggle light / dark theme" title="Toggle theme">
+        <svg class="ld-icon-sun" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg class="ld-icon-moon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      </button>
+      <a class="ld-btn ld-btn--primary" href="../../quickstart/">Get started</a>
+    </div>
+  </header>
+
+  
+
+  <main class="ld-docs">
+    <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
+      User Guide
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+    </button>
+    <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
+        <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">User Guide</div>
+    <a href="../read_and_write/">Read and Write</a>
+    <a href="../data_types/">Data Types</a>
+    <a href="../data_evolution/">Data Evolution</a>
+    <a href="../row_ids/">Stable Row IDs and Lineage</a>
+    <a href="../blob/">Blob API</a>
+    <a href="../json/">JSON Support</a>
+    <a href="../tags_and_branches/">Tags and Branches</a>
+      <div class="ld-sidenav__group">
+    <div class="ld-sidenav__label">Indexing and Search</div>
+    <a href="../indexing/">Overview</a>
+    <a href="../scalar_indexing/">Scalar Indexes</a>
+    <a href="../full_text_search/">Full-Text Search</a>
+    <a href="../vector_search/">Vector Search</a>
+    <a href="../tokenizer/">Tokenizers</a>
+  </div>
+    <a href="../object_store/">Object Store Configuration</a>
+    <a href="../observability/">Observability</a>
+    <a href="../distributed_write/">Distributed Write</a>
+    <a class="active" href="./">Update Join Strategies</a>
+    <a href="../distributed_indexing/">Distributed Indexing</a>
+    <a href="../migration/">Migration Guide</a>
+    <a href="../performance/">Performance Guide</a>
+    <a href="../arrays/">Extension Arrays</a>
+  </div>
+    </aside>
+
+    <div class="ld-article-col">
+      <div class="ld-crumbs">
+        <span>Docs</span>
+        <span>/</span><span>User Guide</span>
+        <span>/</span><b>Update Join Strategies</b>
+      </div>
+
+      <article class="ld-article">
+        <h1 id="update-join-strategies">Update Join Strategies<a class="headerlink" href="#update-join-strategies" title="Permanent link">&para;</a></h1>
+<p>Fragment updates join existing rows with an input containing replacement values. For a small
+update input, an in-memory hash join is usually fastest. For a large or wide input, retaining the
+entire input and its hash table can require too much memory. Lance therefore provides configurable
+update join strategies, including a spillable sort-merge join whose DataFusion memory use is
+bounded by a configurable pool.</p>
+<p>This is a low-level, fragment-oriented API. An update returns new fragment metadata and the IDs of
+the modified fields; the caller must commit those results to the dataset. See
+<a href="../distributed_write/#update-columns">Update Columns</a> for the complete distributed update and
+commit workflow.</p>
+<h2 id="choosing-a-strategy">Choosing a strategy<a class="headerlink" href="#choosing-a-strategy" title="Permanent link">&para;</a></h2>
+<p>The <code>strategy</code> option accepts the following values:</p>
+<table>
+<thead>
+<tr>
+<th>Python value</th>
+<th>Rust value</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>"auto"</code></td>
+<td><code>UpdateJoinStrategy::Auto</code></td>
+<td>Uses the hash join only while the right-hand side (RHS) is within both configured hash thresholds. Otherwise, uses the sort-merge join. This is the default.</td>
+</tr>
+<tr>
+<td><code>"hash"</code></td>
+<td><code>UpdateJoinStrategy::Hash</code></td>
+<td>Always builds the in-memory hash join. Hash thresholds, the external memory pool, and the temporary-disk limit do not constrain this strategy.</td>
+</tr>
+<tr>
+<td><code>"sort_merge"</code></td>
+<td><code>UpdateJoinStrategy::SortMerge</code></td>
+<td>Uses the spillable external plan for every non-empty update input.</td>
+</tr>
+</tbody>
+</table>
+<p>Use <code>auto</code> for most workloads. It retains the lower overhead of the hash join for small inputs and
+switches to the memory-bounded path for larger inputs.</p>
+<p>Use <code>hash</code> only when the RHS is known to fit comfortably in memory. This strategy reads all RHS
+batches into memory and builds a hash index; forcing it for a large input can exhaust process
+memory.</p>
+<p>Use <code>sort_merge</code> when predictable memory use is more important than avoiding temporary I/O. The
+external plan sorts the join keys, performs a sort-merge join, and spills intermediate data when
+necessary. It late-materializes update payload columns so wide values do not pass through every key
+sort and join stage.</p>
+<h2 id="automatic-selection">Automatic selection<a class="headerlink" href="#automatic-selection" title="Permanent link">&para;</a></h2>
+<p>In <code>auto</code> mode, Lance reads the RHS incrementally and keeps the hash strategy eligible only while
+both of these conditions are true:</p>
+<ul>
+<li>the RHS contains at most <code>max_hash_rows</code> rows; and</li>
+<li>the estimated RHS allocation is at most <code>max_hash_bytes</code> bytes.</li>
+</ul>
+<p>The defaults are 250,000 rows and 1 GiB. Exceeding either threshold selects sort-merge. The byte
+estimate includes Arrow buffers, join keys, and estimated per-row hash-table overhead, so it is not
+the serialized or on-disk size of the input. It is a selection estimate, not a hard memory limit.</p>
+<p>The external memory pool is not part of automatic strategy selection. Changing
+<code>external_memory_pool_bytes</code> controls the chosen sort-merge execution but does not change which
+strategy <code>auto</code> selects.</p>
+<h2 id="python-usage">Python usage<a class="headerlink" href="#python-usage" title="Permanent link">&para;</a></h2>
+<p>The options are keyword arguments on <code>LanceFragment.update_columns</code>:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="n">MIB</span> <span class="o">=</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="n">GIB</span> <span class="o">=</span> <span class="mi">1024</span> <span class="o">*</span> <span class="n">MIB</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="n">updated_fragment</span><span class="p">,</span> <span class="n">fields_modified</span> <span class="o">=</span> <span class="n">fragment</span><span class="o">.</span><span class="n">update_columns</span><span class="p">(</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>    <span class="n">updates</span><span class="p">,</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    <span class="n">left_on</span><span class="o">=</span><span class="s2">"id"</span><span class="p">,</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    <span class="n">right_on</span><span class="o">=</span><span class="s2">"id"</span><span class="p">,</span>
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>    <span class="n">strategy</span><span class="o">=</span><span class="s2">"auto"</span><span class="p">,</span>
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>    <span class="n">max_hash_rows</span><span class="o">=</span><span class="mi">250_000</span><span class="p">,</span>
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>    <span class="n">max_hash_bytes</span><span class="o">=</span><span class="n">GIB</span><span class="p">,</span>
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>    <span class="n">external_memory_pool_bytes</span><span class="o">=</span><span class="mi">256</span> <span class="o">*</span> <span class="n">MIB</span><span class="p">,</span>
+</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>    <span class="n">max_temp_directory_bytes</span><span class="o">=</span><span class="mi">20</span> <span class="o">*</span> <span class="n">GIB</span><span class="p">,</span>
+</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="p">)</span>
+</span></code></pre></div>
+<p>To require bounded external execution for every non-empty input:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="n">updated_fragment</span><span class="p">,</span> <span class="n">fields_modified</span> <span class="o">=</span> <span class="n">fragment</span><span class="o">.</span><span class="n">update_columns</span><span class="p">(</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>    <span class="n">updates</span><span class="p">,</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>    <span class="n">left_on</span><span class="o">=</span><span class="s2">"id"</span><span class="p">,</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>    <span class="n">right_on</span><span class="o">=</span><span class="s2">"id"</span><span class="p">,</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>    <span class="n">strategy</span><span class="o">=</span><span class="s2">"sort_merge"</span><span class="p">,</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>    <span class="n">external_memory_pool_bytes</span><span class="o">=</span><span class="mi">256</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span><span class="p">,</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>    <span class="n">max_temp_directory_bytes</span><span class="o">=</span><span class="mi">20</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span><span class="p">,</span>
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="p">)</span>
+</span></code></pre></div>
+<p><code>max_hash_rows</code> and <code>max_hash_bytes</code> must either both be omitted or both be specified in Python.</p>
+<h2 id="rust-usage">Rust usage<a class="headerlink" href="#rust-usage" title="Permanent link">&para;</a></h2>
+<p>Use <code>FileFragment::update_columns_with_options</code> to configure an individual update:</p>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="p">#</span><span class="w"> </span><span class="k">use</span><span class="w"> </span><span class="n">arrow_array</span><span class="p">::</span><span class="n">RecordBatchReader</span><span class="p">;</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="p">#</span><span class="w"> </span><span class="k">use</span><span class="w"> </span><span class="n">lance</span><span class="p">::</span><span class="nb">Result</span><span class="p">;</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="k">use</span><span class="w"> </span><span class="n">lance</span><span class="p">::</span><span class="n">dataset</span><span class="p">::{</span><span class="n">UpdateJoinOptions</span><span class="p">,</span><span class="w"> </span><span class="n">UpdateJoinStrategy</span><span class="p">};</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="k">use</span><span class="w"> </span><span class="n">lance</span><span class="p">::</span><span class="n">dataset</span><span class="p">::</span><span class="n">fragment</span><span class="p">::</span><span class="n">FileFragment</span><span class="p">;</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="p">#</span><span class="w"> </span><span class="k">async</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">update</span><span class="p">(</span>
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="p">#</span><span class="w">     </span><span class="n">fragment</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">FileFragment</span><span class="p">,</span>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="p">#</span><span class="w">     </span><span class="n">updates</span><span class="p">:</span><span class="w"> </span><span class="nc">impl</span><span class="w"> </span><span class="n">RecordBatchReader</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nb">Send</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="o">'</span><span class="nb">static</span><span class="p">,</span>
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="p">#</span><span class="w"> </span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="kd">let</span><span class="w"> </span><span class="n">options</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">UpdateJoinOptions</span><span class="p">::</span><span class="n">default</span><span class="p">()</span>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="w">    </span><span class="p">.</span><span class="n">with_strategy</span><span class="p">(</span><span class="n">UpdateJoinStrategy</span><span class="p">::</span><span class="n">Auto</span><span class="p">)</span>
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="w">    </span><span class="p">.</span><span class="n">with_hash_thresholds</span><span class="p">(</span><span class="mi">250_000</span><span class="p">,</span><span class="w"> </span><span class="mi">1024</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1024</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1024</span><span class="p">)</span>
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="w">    </span><span class="p">.</span><span class="n">with_external_memory_pool_bytes</span><span class="p">(</span><span class="mi">256</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1024</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1024</span><span class="p">)</span>
+</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="w">    </span><span class="p">.</span><span class="n">with_max_temp_directory_bytes</span><span class="p">(</span><span class="mi">20</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1024</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1024</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1024</span><span class="p">);</span>
+</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>
+</span><span id="__span-2-16"><a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a><span class="kd">let</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fragment</span>
+</span><span id="__span-2-17"><a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a><span class="w">    </span><span class="p">.</span><span class="n">update_columns_with_options</span><span class="p">(</span><span class="n">updates</span><span class="p">,</span><span class="w"> </span><span class="s">"id"</span><span class="p">,</span><span class="w"> </span><span class="s">"id"</span><span class="p">,</span><span class="w"> </span><span class="n">options</span><span class="p">)</span>
+</span><span id="__span-2-18"><a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+</span><span id="__span-2-19"><a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a>
+</span><span id="__span-2-20"><a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a><span class="c1">// Commit result.fragment and result.fields_modified to the dataset.</span>
+</span><span id="__span-2-21"><a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a><span class="p">#</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(())</span>
+</span><span id="__span-2-22"><a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a><span class="p">#</span><span class="w"> </span><span class="p">}</span>
+</span></code></pre></div>
+<p><code>FileFragment::update_columns</code> and <code>FileFragment::update_columns_with_offsets</code> use
+<code>UpdateJoinOptions::default()</code>.</p>
+<h2 id="configuration-reference">Configuration reference<a class="headerlink" href="#configuration-reference" title="Permanent link">&para;</a></h2>
+<p>All sizes are integer byte counts.</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th style="text-align: right;">Default</th>
+<th>Applies to</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>strategy</code></td>
+<td style="text-align: right;"><code>auto</code></td>
+<td>All inputs</td>
+<td>Selects automatic, hash, or sort-merge execution.</td>
+</tr>
+<tr>
+<td><code>max_hash_rows</code></td>
+<td style="text-align: right;">250,000</td>
+<td><code>auto</code></td>
+<td>Largest RHS row count still eligible for the hash join.</td>
+</tr>
+<tr>
+<td><code>max_hash_bytes</code></td>
+<td style="text-align: right;">1 GiB</td>
+<td><code>auto</code></td>
+<td>Largest estimated RHS allocation still eligible for the hash join.</td>
+</tr>
+<tr>
+<td><code>external_memory_pool_bytes</code></td>
+<td style="text-align: right;">See below</td>
+<td>Sort-merge</td>
+<td>Size of the DataFusion memory pool used by the external plan. It must be greater than zero.</td>
+</tr>
+<tr>
+<td><code>max_temp_directory_bytes</code></td>
+<td style="text-align: right;">See below</td>
+<td>Sort-merge</td>
+<td>Maximum temporary spill-directory usage. It must be greater than zero. The update fails with a resource-exhaustion error if the limit is insufficient.</td>
+</tr>
+</tbody>
+</table>
+<p>Per-operation settings take precedence over environment variables. If an external memory pool is
+not set on the operation, Lance uses <code>LANCE_MEM_POOL_SIZE</code>; if that is also unset, update joins use
+256 MiB per execution partition. The current update plan uses one execution partition.</p>
+<p>If a temporary-disk limit is not set on the operation, Lance uses
+<code>LANCE_MAX_TEMP_DIRECTORY_SIZE</code>; if that is also unset, the default is 100 GiB. Both environment
+variables contain plain integer byte counts, for example:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">LANCE_MEM_POOL_SIZE</span><span class="o">=</span><span class="m">268435456</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">LANCE_MAX_TEMP_DIRECTORY_SIZE</span><span class="o">=</span><span class="m">21474836480</span>
+</span></code></pre></div>
+<p>Spill files use the process's temporary filesystem and are removed after the execution releases
+them. Make sure that filesystem has enough free space before starting large updates. The temporary
+limit is an upper bound, not a reservation, and the external plan can write several intermediate
+representations of the input. Required spill capacity can therefore be larger than the RHS itself.</p>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p>Setting <code>LANCE_BYPASS_SPILLING</code> disables DataFusion spilling. If <code>auto</code> selects sort-merge, or
+<code>sort_merge</code> is explicitly selected, the update fails instead of falling back to an unbounded
+in-memory execution.</p>
+</div>
+<h2 id="memory-behavior">Memory behavior<a class="headerlink" href="#memory-behavior" title="Permanent link">&para;</a></h2>
+<p><code>external_memory_pool_bytes</code> bounds memory registered by DataFusion operators. It does not place a
+hard bound on total resident set size (RSS). The process also contains input and output Arrow
+buffers, fragment readers and writers, runtime state, and memory retained by the system allocator.</p>
+<p>On Linux systems using glibc, applications that need lower RSS can limit the number of allocator
+arenas before starting the process:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="nv">MALLOC_ARENA_MAX</span><span class="o">=</span><span class="m">4</span><span class="w"> </span>python<span class="w"> </span>update_fragments.py
+</span></code></pre></div>
+<p>This is a process-wide allocator setting, not a Lance setting. A smaller value can reduce retained
+heap memory during spill-heavy updates, but it can also affect unrelated concurrent allocation.
+Benchmark the complete application before adopting it. <code>MALLOC_ARENA_MAX=1</code> is a more aggressive
+choice when minimum RSS is the priority and allocation concurrency is low.</p>
+<p>When several fragment updates run concurrently, each operation has its own external pool and spill
+work. Plan memory and temporary-disk capacity for their combined usage.</p>
+<h2 id="tuning-guidance">Tuning guidance<a class="headerlink" href="#tuning-guidance" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Start with <code>auto</code> and the default thresholds.</li>
+<li>Lower the hash thresholds when input rows are unusually wide or the application has a tight
+  process-memory budget.</li>
+<li>Raise the hash thresholds only after measuring peak RSS with representative data.</li>
+<li>Keep the 256 MiB external pool unless benchmarks show that a different value is better for the
+  workload. A smaller pool can increase spill volume and merge passes; a larger pool can improve
+  throughput at the cost of memory.</li>
+<li>Set <code>max_temp_directory_bytes</code> from measured peak spill usage with headroom. Do not assume it can
+  be derived directly from the RHS size.</li>
+<li>Avoid duplicate RHS join keys. If duplicates are present, Lance selects one matching RHS row, but
+  which row is chosen is not defined.</li>
+</ul>
+<h2 id="update-semantics-and-constraints">Update semantics and constraints<a class="headerlink" href="#update-semantics-and-constraints" title="Permanent link">&para;</a></h2>
+<p>The strategy changes execution characteristics, not the logical update operation:</p>
+<ul>
+<li>Rows with a matching RHS key receive the supplied replacement column values.</li>
+<li>Rows without a match retain their existing values.</li>
+<li>The RHS must contain the join column and at least one existing fragment column to update.</li>
+<li>Left and right join-key types must match.</li>
+<li><code>right_on</code> is removed from the replacement payload, so it cannot be updated.</li>
+<li>When <code>left_on</code> and <code>right_on</code> are different, a replacement column named <code>left_on</code> is allowed
+  and updates the left join key.</li>
+<li>Reserved metadata columns such as <code>_rowid</code> and <code>_rowaddr</code> cannot be replacement columns.</li>
+<li>An empty RHS is a no-op and does not run either join algorithm.</li>
+</ul>
+      </article>
+
+      <div class="ld-pagenav">
+        <a href="../distributed_write/">
+          <div class="ld-pagenav__k">← Previous</div>
+          <div class="ld-pagenav__t">Distributed Write</div>
+        </a>
+        <a class="next" href="../distributed_indexing/">
+          <div class="ld-pagenav__k">Next →</div>
+          <div class="ld-pagenav__t">Distributed Indexing</div>
+        </a>
+      </div>
+    </div>
+
+    <aside class="ld-toc" aria-label="On this page">
+      <div class="ld-toc__label">On this page</div>
+      <a class="ld-toc__h2" href="#choosing-a-strategy">Choosing a strategy</a>
+      <a class="ld-toc__h2" href="#automatic-selection">Automatic selection</a>
+      <a class="ld-toc__h2" href="#python-usage">Python usage</a>
+      <a class="ld-toc__h2" href="#rust-usage">Rust usage</a>
+      <a class="ld-toc__h2" href="#configuration-reference">Configuration reference</a>
+      <a class="ld-toc__h2" href="#memory-behavior">Memory behavior</a>
+      <a class="ld-toc__h2" href="#tuning-guidance">Tuning guidance</a>
+      <a class="ld-toc__h2" href="#update-semantics-and-constraints">Update semantics and constraints</a>
+    </aside>
+  </main>
+
+
+  <footer class="ld-footer">
+    <div class="ld-footer__brand">
+      <img src="../../logo/wide.png" alt="Lance">
+      <p>Lance is an open-source columnar format for multimodal AI. Apache-2.0. © 2025 Lance Format. All rights reserved.</p>
+    </div>
+    <div class="ld-footer__cols">
+      <div class="ld-footer__col">
+        <h5>Format</h5>
+        <a href="../../format/">Specification</a>
+        <a href="../../format/file/">File format</a>
+        <a href="../../format/table/">Table format</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Develop</h5>
+        <a href="../../quickstart/">Getting started</a>
+        <a href="../read_and_write/">User guide</a>
+        <a href="../../sdk_docs/">SDK docs</a>
+      </div>
+      <div class="ld-footer__col">
+        <h5>Community</h5>
+        <a href="https://github.com/lance-format/lance" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://discord.gg/lance" target="_blank" rel="noopener">Discord</a>
+        <a href="https://groups.google.com/a/lance.org/g/dev" target="_blank" rel="noopener">Mailing list</a>
+        <a href="../../community/contributing/">Contributing</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<!-- Search overlay -->
+<div class="ld-search" id="search-overlay" hidden>
+  <div class="ld-search__scrim" data-search-close></div>
+  <div class="ld-search__panel" role="dialog" aria-label="Search documentation">
+    <div class="ld-search__bar">
+      <input class="ld-search__input" id="search-input" type="search" placeholder="Search documentation…" autocomplete="off" spellcheck="false">
+      <button class="ld-search__close" type="button" data-search-close aria-label="Close search">Esc</button>
+    </div>
+    <div class="ld-search__results" id="search-results"></div>
+  </div>
+</div>
+
+<script>window.LD_BASE = "../..";</script>
+<script src="../../assets/site.js" defer></script>
+</body>
+</html>
