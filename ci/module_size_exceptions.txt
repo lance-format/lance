@@ -1,0 +1,11 @@
+# Rust modules allowed to exceed the 400 KB limit in ci/check_module_size.py.
+# PRs that grow these get a warning instead of a failure. Remove a file once it
+# has been split below the limit; CI fails while a stale entry remains.
+# Do not add new entries: split the module instead.
+rust/lance-index/src/scalar/inverted/wand.rs
+rust/lance/src/dataset/mem_wal/write.rs
+rust/lance/src/dataset/optimize.rs
+rust/lance/src/dataset/scanner.rs
+rust/lance/src/dataset/write/merge_insert.rs
+rust/lance/src/index.rs
+rust/lance/src/io/commit/conflict_resolver.rs

@@ -14,7 +14,11 @@ use prost_types::Any;
 
 use crate::{format::pbfile, versions};
 
+mod field_types;
 pub(crate) mod structural;
+
+pub(crate) use field_types::ExpectedTypes;
+pub use field_types::FieldTypeMismatch;
 
 /// Page buffers in current Lance files are aligned to 64 bytes.
 pub(crate) const PAGE_BUFFER_ALIGNMENT: usize = 64;
@@ -72,15 +76,25 @@ pub enum FileWriter {
     V2_3(Box<versions::v2_3::Writer>),
 }
 
+/// Serialize an execution description using its format's wire grammar.
+pub(crate) fn encode_page_encoding(encoding: &PageEncoding) -> Result<Vec<u8>> {
+    let envelope = match encoding {
+        PageEncoding::Legacy(layout) => Any::from_msg(layout)?,
+        PageEncoding::Structural(layout) => {
+            let layout = lance_encoding::format::pb21::PageLayout::try_from(layout.clone())?;
+            Any::from_msg(&layout)?
+        }
+        PageEncoding::Planar(layout) => Any::from_msg(layout)?,
+    };
+    Ok(envelope.encode_to_vec())
+}
+
 fn column_info_to_metadata(column: &ColumnInfo) -> Result<pbfile::ColumnMetadata> {
     let pages = column
         .page_infos
         .iter()
         .map(|page| {
-            let encoding = match &page.encoding {
-                PageEncoding::Legacy(encoding) => Any::from_msg(encoding)?.encode_to_vec(),
-                PageEncoding::Structural(encoding) => Any::from_msg(encoding)?.encode_to_vec(),
-            };
+            let encoding = encode_page_encoding(&page.encoding)?;
             let (buffer_offsets, buffer_sizes) =
                 page.buffer_offsets_and_sizes.iter().copied().unzip();
             Ok(pbfile::column_metadata::Page {
@@ -171,6 +185,16 @@ impl FileWriter {
             Self::V2_1(writer) => writer.write_batch(batch).await,
             Self::V2_2(writer) => writer.write_batch(batch).await,
             Self::V2_3(writer) => writer.write_batch(batch).await,
+        }
+    }
+
+    /// Mark the next batch as ending the current file page.
+    pub fn prepare_for_flush(&mut self) {
+        match self {
+            Self::V2_0(writer) => writer.prepare_for_flush(),
+            Self::V2_1(writer) => writer.prepare_for_flush(),
+            Self::V2_2(writer) => writer.prepare_for_flush(),
+            Self::V2_3(writer) => writer.prepare_for_flush(),
         }
     }
 

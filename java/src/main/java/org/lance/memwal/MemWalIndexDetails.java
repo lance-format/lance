@@ -23,20 +23,27 @@ import java.util.Map;
 public class MemWalIndexDetails {
   private final long numShards;
   private final List<String> maintainedIndexes;
+  private final boolean maintainAllIndexes;
   private final Map<String, String> writerConfigDefaults;
   private final List<ShardingSpec> shardingSpecs;
+  private final String dirId;
 
+  /** Null collections and a null {@code dirId} are stored as empty. */
   public MemWalIndexDetails(
       long numShards,
       List<String> maintainedIndexes,
+      boolean maintainAllIndexes,
       Map<String, String> writerConfigDefaults,
-      List<ShardingSpec> shardingSpecs) {
+      List<ShardingSpec> shardingSpecs,
+      String dirId) {
     this.numShards = numShards;
     this.maintainedIndexes =
         maintainedIndexes == null ? Collections.emptyList() : maintainedIndexes;
+    this.maintainAllIndexes = maintainAllIndexes;
     this.writerConfigDefaults =
         writerConfigDefaults == null ? Collections.emptyMap() : writerConfigDefaults;
     this.shardingSpecs = shardingSpecs == null ? Collections.emptyList() : shardingSpecs;
+    this.dirId = dirId == null ? "" : dirId;
   }
 
   /** Number of shards tracked by the MemWAL index. */
@@ -44,9 +51,22 @@ public class MemWalIndexDetails {
     return numShards;
   }
 
-  /** Names of the indexes maintained through the MemWAL. */
+  /**
+   * Names of the indexes maintained through the MemWAL. Empty when {@link #maintainAllIndexes()} is
+   * set, which names no index because it covers every one.
+   */
   public List<String> maintainedIndexes() {
     return maintainedIndexes;
+  }
+
+  /**
+   * Whether every index the table has is maintained, including ones created later.
+   *
+   * <p>This is what separates maintaining everything from maintaining nothing: both leave {@link
+   * #maintainedIndexes()} empty.
+   */
+  public boolean maintainAllIndexes() {
+    return maintainAllIndexes;
   }
 
   /** Default {@link ShardWriterConfig} values persisted in the MemWAL index. */
@@ -59,13 +79,23 @@ public class MemWalIndexDetails {
     return shardingSpecs;
   }
 
+  /**
+   * Names this MemWAL incarnation's storage directory; empty for a legacy MemWAL. Commits recording
+   * compaction progress must name it.
+   */
+  public String dirId() {
+    return dirId;
+  }
+
   @Override
   public String toString() {
     return MoreObjects.toStringHelper(this)
         .add("numShards", numShards)
         .add("maintainedIndexes", maintainedIndexes)
+        .add("maintainAllIndexes", maintainAllIndexes)
         .add("writerConfigDefaults", writerConfigDefaults)
         .add("shardingSpecs", shardingSpecs)
+        .add("dirId", dirId)
         .toString();
   }
 }

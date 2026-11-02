@@ -46,8 +46,8 @@ def _write(tmp_path: Path, with_index: bool = False) -> lance.LanceDataset:
     )
     ds = lance.write_dataset(tbl, str(tmp_path / "t.lance"), mode="overwrite")
     if with_index:
-        # IVF_FLAT with nprobes == num_partitions is exact, so the masked result
-        # can be compared against brute force without recall slack.
+        # IVF_FLAT with both probe bounds set to num_partitions is exact, so the
+        # masked result can be compared against brute force without recall slack.
         ds.create_index("vector", index_type="IVF_FLAT", num_partitions=4, metric="l2")
     return ds
 
@@ -136,7 +136,13 @@ def test_knn_topk_is_computed_over_masked_rows(
     query = np.zeros(DIM, dtype=np.float32)
 
     got = ds.scanner(
-        nearest={"column": "vector", "q": query, "k": 5, "nprobes": 4},
+        nearest={
+            "column": "vector",
+            "q": query,
+            "k": 5,
+            "minimum_nprobes": 4,
+            "maximum_nprobes": 4,
+        },
         with_row_id=True,
         row_addr_allowlist=serialize_row_addrs(allowed),
     ).to_table()

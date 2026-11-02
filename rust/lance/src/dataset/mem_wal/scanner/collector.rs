@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use super::data_source::{LsmDataSource, LsmGeneration, ShardSnapshot};
 use crate::dataset::Dataset;
+use crate::dataset::mem_wal::util::sstable_uri;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// A point-in-time handle to one in-memory memtable, active or frozen —
@@ -33,7 +34,7 @@ impl InMemoryMemTableRef {
     /// Row-data bytes: the buffered batches.
     ///
     /// This is the **flush unit**, not the memtable's footprint — it drives the
-    /// `max_memtable_size` seal trigger, so it stays a function of the rows in
+    /// `max_memtable_size` freeze trigger, so it stays a function of the rows in
     /// it. Use [`Self::resident_bytes`] to budget memory.
     pub fn row_bytes(&self) -> usize {
         self.batch_store.row_bytes()
@@ -43,8 +44,9 @@ impl InMemoryMemTableRef {
     /// indexes plus the fixed PK bloom filter.
     ///
     /// Usually the term that explains an indexed table's footprint — an HNSW
-    /// index pre-allocates its whole graph on the first insert — so it can dwarf
-    /// row bytes while [`Self::row_bytes`] reads near zero.
+    /// index allocates a fixed part sized by `max_memtable_rows` on the first
+    /// insert — so it can dwarf row bytes while [`Self::row_bytes`] reads near
+    /// zero.
     pub fn index_bytes(&self) -> usize {
         self.index_store.resident_bytes()
             + crate::dataset::mem_wal::memtable::pk_bloom_filter_bytes()
@@ -91,7 +93,7 @@ pub struct InMemoryMemTables {
 /// When the base table is omitted (see [`Self::without_base_table`]), `collect`
 /// returns only SSTable and active-memtable sources. This is used
 /// by callers that own the base read path elsewhere and only need the WAL's
-/// fresh tier (active memtable ∪ L0 SSTables).
+/// fresh tier (active memtable ∪ SSTables).
 pub struct LsmDataSourceCollector {
     /// Base Lance table (None when scanning only the fresh tier).
     base_table: Option<Arc<Dataset>>,
@@ -101,6 +103,8 @@ pub struct LsmDataSourceCollector {
     shard_snapshots: Vec<ShardSnapshot>,
     /// In-memory memtables by shard (active + frozen-awaiting-flush).
     in_memory_memtables: HashMap<Uuid, InMemoryMemTables>,
+    /// The MemWAL's `dir_id`; SSTables resolve under its directory.
+    dir_id: String,
 }
 
 impl LsmDataSourceCollector {
@@ -119,6 +123,7 @@ impl LsmDataSourceCollector {
             base_path,
             shard_snapshots,
             in_memory_memtables: HashMap::new(),
+            dir_id: String::new(),
         }
     }
 
@@ -136,7 +141,15 @@ impl LsmDataSourceCollector {
             base_path: base_path.into().trim_end_matches('/').to_string(),
             shard_snapshots,
             in_memory_memtables: HashMap::new(),
+            dir_id: String::new(),
         }
+    }
+
+    /// Set the MemWAL `dir_id` the snapshots' SSTables live under. Defaults to
+    /// empty (legacy `_mem_wal`); without it a `dir_id` MemWAL's SSTables won't resolve.
+    pub fn with_mem_wal_dir_id(mut self, dir_id: impl Into<String>) -> Self {
+        self.dir_id = dir_id.into();
+        self
     }
 
     /// Set a shard's active memtable. Back-compat / test entry point; the
@@ -241,7 +254,7 @@ impl LsmDataSourceCollector {
     /// scan sources, in **ascending generation order**. The planner relies
     /// on this: it reverses sources to generation-DESC so the newest row
     /// wins the dedup tiebreaker (see `LsmScanPlanner::plan_scan`). Active
-    /// is the newest generation; frozen are older sealed ones — so without
+    /// is the newest generation; the frozen ones are older — so without
     /// this sort a stale frozen row could outrank a re-write in the active
     /// memtable for the same pk.
     fn in_memory_sources(shard_id: Uuid, mems: &InMemoryMemTables) -> Vec<LsmDataSource> {
@@ -256,8 +269,18 @@ impl LsmDataSourceCollector {
                 schema: m.schema.clone(),
                 shard_id,
                 generation: LsmGeneration::memtable(m.generation),
+                visible_batch_count: m.index_store.visible_count(),
             })
             .collect()
+    }
+
+    /// In-memory memtables sorted by shard id. The map's iteration order
+    /// changes between collectors, and a scan's output order (and so its
+    /// limit / offset paging) follows source order.
+    fn in_memory_memtables_by_shard(&self) -> Vec<(&Uuid, &InMemoryMemTables)> {
+        let mut by_shard: Vec<_> = self.in_memory_memtables.iter().collect();
+        by_shard.sort_by_key(|(shard_id, _)| **shard_id);
+        by_shard
     }
 
     /// True when `generation` for `shard_id` is still pinned in memory as a
@@ -278,7 +301,8 @@ impl LsmDataSourceCollector {
     /// Returns sources in a consistent order:
     /// 1. Base table (gen=0), if configured
     /// 2. SSTables per shard, ordered by generation
-    /// 3. In-memory memtables per shard (active + frozen-awaiting-flush)
+    /// 3. In-memory memtables per shard (active + frozen-awaiting-flush),
+    ///    by shard id
     pub fn collect(&self) -> Result<Vec<LsmDataSource>> {
         let mut sources = Vec::new();
 
@@ -302,7 +326,7 @@ impl LsmDataSourceCollector {
             }
         }
 
-        for (shard_id, mems) in &self.in_memory_memtables {
+        for (shard_id, mems) in self.in_memory_memtables_by_shard() {
             sources.extend(Self::in_memory_sources(*shard_id, mems));
         }
 
@@ -343,7 +367,7 @@ impl LsmDataSourceCollector {
             }
         }
 
-        for (shard_id, mems) in &self.in_memory_memtables {
+        for (shard_id, mems) in self.in_memory_memtables_by_shard() {
             if !shard_ids.contains(shard_id) {
                 continue;
             }
@@ -368,10 +392,10 @@ impl LsmDataSourceCollector {
 
     /// Resolve an SSTable path to an absolute path.
     ///
-    /// SSTables are stored at: `{base_path}/_mem_wal/{shard_id}/{folder_name}`
+    /// SSTables are stored at: `{base_path}/{mem_wal_dir}/{shard_id}/{folder_name}`
     /// The `folder_name` is what's stored in `SsTable.path`.
     fn resolve_sstable_path(&self, shard_id: &Uuid, folder_name: &str) -> String {
-        format!("{}/_mem_wal/{}/{}", self.base_path, shard_id, folder_name)
+        sstable_uri(&self.base_path, &self.dir_id, shard_id, folder_name)
     }
 }
 

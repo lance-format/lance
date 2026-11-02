@@ -19,7 +19,7 @@ arrow-select.workspace = true
 bytes.workspace = true
 datafusion-common.workspace = true
 datafusion-expr.workspace = true
-datafusion.workspace = true
+datafusion-execution.workspace = true
 futures.workspace = true
 lance-core.workspace = true
 lance-io.workspace = true
@@ -28,6 +28,7 @@ prost-types.workspace = true
 roaring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

@@ -144,10 +144,9 @@ fn build_queries(rows: usize, queries: usize, miss_ratio: f64, seed: u64) -> Vec
 /// watermark, pick the newest matching row position, and slice that one row
 /// out of the BatchStore. Returns `None` if the key isn't present/visible.
 ///
-/// This mirrors what `BTreeIndexExec` does internally, minus the plan/stream
-/// machinery — it is the lower bound on how fast the current MemTable index
-/// can answer a point lookup. Single-active-memtable only (the bench never
-/// flushes), `KEY_COL` BTree assumed present.
+/// A lower bound on a MemTable point lookup's latency, with no plan or
+/// stream. Single-active-memtable only (the bench never flushes); `KEY_COL`
+/// must have a B-tree.
 fn fast_lookup(active: &InMemoryMemTableRef, key: i64, key_type: KeyType) -> Option<RecordBatch> {
     use arrow_array::Array;
 
@@ -774,7 +773,7 @@ async fn run_lance(
 
     // No-flush config: every *memtable*-flush threshold is set above the
     // dataset so the single active MemTable holds all rows (no generation is
-    // sealed to disk). Read visibility is gated on the WAL durability
+    // frozen to disk). Read visibility is gated on the WAL durability
     // watermark (`max_visible_batch_position`), which only advances on a WAL
     // flush — so we use `durable_write=true`: each put flushes its batch to
     // the WAL and awaits, which both populates the maintained BTree and
@@ -801,7 +800,7 @@ async fn run_lance(
     let writer = dataset.mem_wal_writer(shard_id, config).await?;
 
     // --- write phase ---
-    // LSM: split rows into `generations+1` parts; seal+flush after each of the
+    // LSM: split rows into `generations+1` parts; freeze+flush after each of the
     // first `generations` parts (each becomes an on-disk generation) and leave
     // the last part in the active MemTable.
     let gens = args.generations;
@@ -827,7 +826,7 @@ async fn run_lance(
             lo = hi;
         }
         if g < gens {
-            writer.force_seal_active().await?;
+            writer.force_freeze_active().await?;
             for _ in 0..600 {
                 let n = writer
                     .manifest()
@@ -884,6 +883,7 @@ async fn run_lance(
     }
     let planner = Arc::new(
         LsmPointLookupPlanner::new(collector, vec![KEY_COL.to_string()], arrow_schema)
+            .unwrap()
             .with_session(dataset.session())
             .with_sstable_cache(sstable_cache),
     );

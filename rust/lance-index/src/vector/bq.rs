@@ -20,8 +20,16 @@ use crate::vector::quantizer::QuantizerBuildParams;
 pub mod builder;
 pub(crate) mod dist_table_quant;
 pub mod ex_dot;
+pub mod layered;
+pub(crate) mod pairwise;
+pub mod partition_codes;
+mod plane_cache;
+pub mod planes;
 pub mod prune;
+pub mod raw_body;
+pub(crate) mod resident;
 pub mod rotation;
+pub mod scan_stats;
 pub mod storage;
 pub mod transform;
 
@@ -67,8 +75,9 @@ impl BinaryQuantization {
 ///
 /// Use the sign bit of the float vector to represent the binary vector.
 fn binary_quantization<T: Float>(data: &[T]) -> impl Iterator<Item = u8> + '_ {
-    let iter = data.chunks_exact(8);
-    iter.clone()
+    let (chunks, remainder) = data.as_chunks::<8>();
+    chunks
+        .iter()
         .map(|c| {
             // Auto vectorized.
             // Before changing this code, please check the assembly output.
@@ -80,7 +89,7 @@ fn binary_quantization<T: Float>(data: &[T]) -> impl Iterator<Item = u8> + '_ {
         })
         .chain(once(0).map(move |_| {
             let mut bits: u8 = 0;
-            iter.remainder().iter().enumerate().for_each(|(idx, v)| {
+            remainder.iter().enumerate().for_each(|(idx, v)| {
                 bits |= (v.is_sign_positive() as u8) << idx;
             });
             bits
@@ -282,3 +291,6 @@ mod tests {
         assert_eq!(rabit_ex_code_bytes(129, 3).unwrap(), 49);
     }
 }
+
+#[cfg(test)]
+mod scan_tests;

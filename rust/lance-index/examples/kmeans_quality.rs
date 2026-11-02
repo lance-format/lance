@@ -37,7 +37,7 @@ use lance_index::vector::kmeans::{
     train_kmeans,
 };
 use lance_linalg::distance::DistanceType;
-use lance_linalg::distance::l2::l2_distance_batch;
+use lance_linalg::distance::l2::l2_distance_batch_into;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rayon::prelude::*;
@@ -174,8 +174,11 @@ impl Base {
                 while start < *rows {
                     let take = STREAM_CHUNK_ROWS.min(rows - start);
                     file.read_exact(&mut bytes[..take * dim * 4]).unwrap();
-                    for (v, b) in values[..take * dim].iter_mut().zip(bytes.chunks_exact(4)) {
-                        *v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                    for (v, b) in values[..take * dim]
+                        .iter_mut()
+                        .zip(bytes.as_chunks::<4>().0)
+                    {
+                        *v = f32::from_le_bytes(*b);
                     }
                     f(start, &values[..take * dim]);
                     start += take;
@@ -235,8 +238,10 @@ fn read_fbin(path: &Path, limit: Option<usize>) -> (Vec<f32>, usize, usize) {
         file.read_exact(&mut chunk[..take]).unwrap();
         values.extend(
             chunk[..take]
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b)),
         );
         remaining -= take;
     }
@@ -255,8 +260,10 @@ fn ground_truth(args: &Args, base: &Base, rows: usize, d: usize, queries: &[f32]
         file.read_to_end(&mut bytes).unwrap();
         if bytes.len() == args.num_queries * TOP_K * 4 {
             return bytes
-                .chunks_exact(4)
-                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| u32::from_le_bytes(*b))
                 .collect();
         }
     }
@@ -267,15 +274,19 @@ fn ground_truth(args: &Args, base: &Base, rows: usize, d: usize, queries: &[f32]
         queries
             .par_chunks(d)
             .zip(best.par_iter_mut())
-            .for_each(|(query, best)| {
-                for (i, dist) in l2_distance_batch(query, values, d).enumerate() {
-                    if best.len() < TOP_K || dist < best[TOP_K - 1].0 {
-                        let pos = best.partition_point(|(other, _)| *other <= dist);
-                        best.insert(pos, (dist, (chunk_start + i) as u32));
-                        best.truncate(TOP_K);
+            .for_each_init(
+                || vec![0.0; values.len() / d],
+                |distances, (query, best)| {
+                    l2_distance_batch_into(query, values, d, distances);
+                    for (i, &dist) in distances.iter().enumerate() {
+                        if best.len() < TOP_K || dist < best[TOP_K - 1].0 {
+                            let pos = best.partition_point(|(other, _)| *other <= dist);
+                            best.insert(pos, (dist, (chunk_start + i) as u32));
+                            best.truncate(TOP_K);
+                        }
                     }
-                }
-            });
+                },
+            );
     });
     let gt: Vec<u32> = best
         .into_iter()

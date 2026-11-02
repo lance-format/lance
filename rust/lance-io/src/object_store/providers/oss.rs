@@ -16,6 +16,8 @@ use crate::object_store::{
 };
 use lance_core::error::{Error, Result};
 
+use super::opendal::finish_opendal_operator;
+
 #[derive(Default, Debug)]
 pub struct OssStoreProvider;
 
@@ -94,8 +96,11 @@ impl OssStoreProvider {
     }
 
     fn build_oss_store(config_map: HashMap<String, String>) -> Result<OpendalStore> {
-        let operator = Operator::from_iter::<Oss>(config_map)
+        let storage_options = StorageOptions(config_map);
+        let max_retries = storage_options.client_max_retries();
+        let operator = Operator::from_iter::<Oss>(storage_options.0)
             .map_err(|e| Error::invalid_input(format!("Failed to create OSS operator: {:?}", e)))?;
+        let operator = finish_opendal_operator(operator, max_retries);
 
         Ok(OpendalStore::new(operator))
     }
@@ -105,7 +110,8 @@ impl OssStoreProvider {
 impl ObjectStoreProvider for OssStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
         let block_size = params.block_size.unwrap_or(DEFAULT_CLOUD_BLOCK_SIZE);
-        let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
+        let storage_options =
+            StorageOptions::new(params.storage_options().cloned().unwrap_or_default());
 
         let base_options = Self::base_oss_options(&base_path, &storage_options)?;
         let accessor = params.get_accessor();
@@ -137,12 +143,14 @@ impl ObjectStoreProvider for OssStoreProvider {
             scheme: "oss".to_string(),
             inner,
             local_dir_operations: None,
+            local_fsync: false,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,
             list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or(true),
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count: storage_options.download_retry_count(),
+            scheduler_error_mode: Default::default(),
             io_tracker: Default::default(),
             store_prefix: self.calculate_object_store_prefix(&url, params.storage_options())?,
             // Listed in full: no paginated lister covers OpenDAL yet.

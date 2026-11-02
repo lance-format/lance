@@ -12,22 +12,27 @@
 //! - [`FirstByPkExec`]: Keeps the first row per PK from an ordered stream (the cross-column collapse)
 //! - [`PkBlockFilterExec`]: Drops rows whose PK was superseded by a newer generation (the cross-generation block-list)
 //! - [`SchemaRelabelExec`]: Re-labels batches to an exact schema (the logical/storage nullability boundary)
+//! - [`OrderedConcatExec`]: Merges partitions into one in partition order (a deterministic union)
 
 mod bloom_guard;
 mod coalesce_first;
 mod first_by_pk;
 mod generation_tag;
+mod ordered_concat;
 mod pk;
 mod pk_block_filter;
+mod reconcile;
 mod schema_relabel;
 
 pub use bloom_guard::{BloomFilterGuardExec, compute_pk_hash_from_scalars};
 pub use coalesce_first::CoalesceFirstExec;
 pub use first_by_pk::FirstByPkExec;
 pub use generation_tag::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec};
+pub use ordered_concat::OrderedConcatExec;
 pub use pk::{
     ROW_ADDRESS_COLUMN, compute_pk_hash, is_supported_pk_type, resolve_pk_indices,
     validate_pk_types,
 };
 pub use pk_block_filter::PkBlockFilterExec;
+pub(crate) use reconcile::ReconcileExec;
 pub use schema_relabel::SchemaRelabelExec;

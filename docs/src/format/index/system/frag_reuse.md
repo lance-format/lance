@@ -202,6 +202,13 @@ trimmed. Cleanup must retain intermediate transitions still needed to translate
 old addresses. External mapping files can be deleted only when no retained
 dataset version references them.
 
+## Stable Row IDs
+
+Older readers and writers did not expect both stable row IDs and a Fragment Reuse Index but are
+not prevented from opening tables that have both. These older systems could silently corrupt such
+tables. A table version that has both sets `FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS` in the reader and
+writer [feature flags](../../table/versioning.md#current-feature-flags) to guard against this.
+
 ## Impacts
 
 ### Conflict Resolution
