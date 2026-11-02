@@ -123,6 +123,18 @@ pub struct IndexMetadata {
 }
 
 impl IndexMetadata {
+    /// Returns the run-optimized serialized size of this fragment bitmap.
+    ///
+    /// Fragment bitmaps are run-optimized before they are persisted. This method
+    /// applies the same optimization without serializing or exporting the
+    /// bitmap itself. The bitmap can be a query-time derived view, so this size
+    /// need not match the original manifest bytes.
+    pub fn fragment_bitmap_serialized_size(&self) -> Option<usize> {
+        let mut bitmap = self.fragment_bitmap.clone()?;
+        bitmap.optimize();
+        Some(bitmap.serialized_size())
+    }
+
     pub fn effective_fragment_bitmap(
         &self,
         existing_fragments: &RoaringBitmap,
@@ -691,6 +703,10 @@ mod tests {
         };
 
         let proto = pb::IndexMetadata::from(&metadata);
+        assert_eq!(
+            metadata.fragment_bitmap_serialized_size(),
+            Some(proto.fragment_bitmap.len())
+        );
         assert!(
             proto.fragment_bitmap.len() < unoptimized_size / 100,
             "expected run-optimized bitmap ({} bytes) to be <1% of the \

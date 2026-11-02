@@ -16,6 +16,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+from packaging.version import Version
 
 from .compat_decorator import (
     UpgradeDowngradeTest,
@@ -24,7 +25,7 @@ from .compat_decorator import (
 from .util import safe_data_storage_version
 
 
-@compat_test(min_version="0.29.1.beta2")
+@compat_test(min_version="0.30.0")
 class PqVectorIndex(UpgradeDowngradeTest):
     """Test PQ (Product Quantization) vector index compatibility."""
 
@@ -76,7 +77,7 @@ class PqVectorIndex(UpgradeDowngradeTest):
             indices = ds.describe_indices()
             assert len(indices) >= 1
             name = indices[0].name
-        elif self.compat_version >= "0.39.0":
+        elif Version(self.compat_version) >= Version("0.39.0"):
             indices = ds.list_indices()
             assert len(indices) >= 1
             name = indices[0]["name"]
@@ -262,9 +263,9 @@ class HnswSqVectorIndex(UpgradeDowngradeTest):
         ds.optimize.compact_files()
 
 
-@compat_test(min_version="4.0.0-beta.8")
+@compat_test(min_version="4.0.0")
 class IvfRqVectorIndex(UpgradeDowngradeTest):
-    """Test IVF_RQ vector index compatibility. V2 was introduced in v4.0.0-beta.8"""
+    """Test IVF_RQ vector index compatibility with V2 files."""
 
     def __init__(self, path: Path):
         self.path = path
