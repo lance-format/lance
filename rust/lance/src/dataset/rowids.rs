@@ -699,6 +699,83 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_visibility_retries_spilled_row_id_read() {
+        let batch = sequence_batch(0..8);
+        let directory = lance_core::utils::tempfile::TempStrDir::default();
+        let uri = format!("file-object-store://{}", directory.as_str());
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .update_config([
+                ("lance.row_lineage.spill", "true"),
+                ("lance.row_lineage.inline_max_bytes", "0"),
+            ])
+            .await
+            .unwrap();
+        let dataset = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id >= 4")
+            .unwrap()
+            .set("id", "id + 100")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap()
+            .new_dataset;
+        let mut dataset = dataset.as_ref().clone();
+        let fragment_id = dataset.fragments().last().unwrap().id as u32;
+        assert!(matches!(
+            dataset.fragments().last().unwrap().row_id_meta,
+            Some(RowIdMeta::Column)
+        ));
+        dataset.delete("id = 104 OR id = 106").await.unwrap();
+        drop(dataset);
+        let failing = Arc::new(FailingProxyStore::new());
+        let dataset = DatasetBuilder::from_uri(&uri)
+            .with_read_params(ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(failing.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+        let store = dataset.object_store(None).await.unwrap();
+        let visibility = IndexVisibility::from_physical_rows(
+            Arc::new(dataset),
+            HashMap::from([(fragment_id, [1, 2, 3].into_iter().collect())]),
+        );
+        failing.fail_when("get_opts", "data/", "injected row-id sequence failure");
+        let error = visibility.result_rows().await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("injected row-id sequence failure")
+        );
+        failing.clear_fail_when("get_opts", "data/");
+        store.io_stats_incremental();
+        let rows = visibility.result_rows().await.unwrap();
+        assert_eq!(rows, &RowAddrTreeMap::from_iter([5, 7]));
+        assert!(store.io_stats_incremental().read_iops > 0);
+        visibility.block_mask().await.unwrap();
+        assert!(std::ptr::eq(rows, visibility.result_rows().await.unwrap()));
+        assert_eq!(store.io_stats_incremental().read_iops, 0);
+    }
+
+    #[tokio::test]
     async fn test_row_id_index_propagates_deletion_vector_read_error() {
         let batch = sequence_batch(0..10);
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());

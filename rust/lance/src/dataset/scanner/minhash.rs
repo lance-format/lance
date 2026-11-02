@@ -8,7 +8,6 @@
 //! offset, filter, and row-identity contracts. Integration coverage lives in the
 //! `dataset_scanner_*` test modules.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::SortOptions;
@@ -25,12 +24,10 @@ use lance_index::IndexCriteria;
 use lance_index::scalar::minhash_lsh::{MinHashLshIndexParams, MinHashQuery};
 use lance_index::vector::DIST_COL;
 use lance_table::format::Fragment;
-use roaring::RoaringBitmap;
 
-use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::index::DatasetIndexExt;
-use crate::index::visibility::IndexVisibility;
 use crate::index::loading::DatasetIndexInternalExt;
+use crate::index::visibility::IndexVisibility;
 use crate::io::exec::knn::knn_empty_result_schema;
 use crate::io::exec::{
     FilterPlan as ExprFilterPlan, FlatMinHashExec, LanceFilterExec, MinHashSearchExec, Planner,

@@ -604,6 +604,63 @@ async fn test_index_retry_accounts_for_a_compaction_already_checked(#[case] raci
     }
 }
 
+/// A remap changes addresses without refreshing indexed values. An overlay
+/// racing its publication must survive as either invalidation or a retry.
+#[tokio::test]
+async fn test_remap_publication_races_overlay() {
+    let dir = TempStrDir::default();
+    let uri = dir.as_str().to_string();
+    let mut table = indexed_table(&uri, 4).await;
+    build_index(&mut table, "val", "val_idx", false)
+        .await
+        .unwrap();
+    compact_files(&mut table, deferred_compaction(2), None)
+        .await
+        .unwrap();
+    let hook_uri = uri.clone();
+    let hook: Hook = Box::pin(async move {
+        let table = open_in_new_session(&hook_uri).await;
+        let fragment = fragment_of(&hook_uri, 0).await as u64;
+        overlay_val(table, fragment, 999).await;
+    });
+    let (mut remapper, race) = builder_racing(&uri, hook).await;
+    let result =
+        remapping::remap_column_index(&mut remapper, &["val"], Some("val_idx".into())).await;
+    assert!(race.attempts.load(Ordering::SeqCst) >= 1);
+    if let Err(error) = result {
+        assert!(matches!(error, Error::RetryableCommitConflict { .. }));
+        assert!(error.to_string().contains("conflict"));
+    }
+    let mut current = open_in_new_session(&uri).await;
+    let published = current.clone();
+    assert_lookups_match_scan(&uri, probes(24, [999])).await;
+    remapping::remap_column_index(&mut current, &["val"], Some("val_idx".into()))
+        .await
+        .unwrap();
+    assert_lookups_match_scan(&uri, probes(24, [999])).await;
+    for snapshot in [&published, &current] {
+        let index = snapshot
+            .load_index_by_name("val_idx")
+            .await
+            .unwrap()
+            .unwrap();
+        for fragment in snapshot.fragments().iter() {
+            for overlay in &fragment.overlays {
+                // Remapping never reads current values. If its watermark
+                // passes this overlay, it must withdraw the fragment.
+                assert!(
+                    !index
+                        .fragment_bitmap
+                        .as_ref()
+                        .unwrap()
+                        .contains(fragment.id as u32)
+                        || index.dataset_version < overlay.committed_version
+                );
+            }
+        }
+    }
+}
+
 /// A retry keeps what the first attempt pruned for an update, even once the
 /// update's version is cleaned up. No compaction is involved.
 #[tokio::test]

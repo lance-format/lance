@@ -48,7 +48,7 @@ use crate::io::exec::filtered_read::{
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
     AddRowAddrExec, FilterPlan as ExprFilterPlan, LanceFilterExec, LancePushdownScanExec,
-    LanceScanConfig, LanceScanExec, Planner, ScanConfig, TakeExec, project,
+    LanceScanConfig, LanceScanExec, Planner, RowAddrMaskFilterExec, ScanConfig, TakeExec, project,
 };
 use crate::{Error, Result};
 
@@ -503,10 +503,31 @@ impl Scanner {
         let filter_cols = Planner::column_names_in_expr(filter);
         let take_projection = user_projection.union_columns(filter_cols, OnMissing::Error)?;
 
-        let stale_node = self.row_ids_take(
-            overlay_stale_rows.result_rows().await?.clone(),
-            take_projection,
-        )?;
+        // Replay in physical coordinates, which visibility already resolved.
+        // Taking by stable ID would serialize the selection and translate it
+        // back to addresses before reading the same current values.
+        let mut physical_rows = overlay_stale_rows.physical_selection();
+        if let Some(selection) = &self.physical_row_addr_prefilter {
+            physical_rows &= selection.as_ref();
+        }
+        let take_projection = if self.external_row_mask.is_some() {
+            take_projection.with_row_id()
+        } else {
+            take_projection
+        };
+        let mut stale_options = FilteredReadOptions::new(take_projection)
+            .with_physical_row_addr_prefilter(Arc::new(physical_rows));
+        if let Some(fragments) = &self.fragments {
+            stale_options = stale_options.with_fragments(Arc::new(fragments.clone()));
+        }
+        let mut stale_node: Arc<dyn ExecutionPlan> = Arc::new(FilteredReadExec::try_new(
+            self.dataset.clone(),
+            stale_options,
+            None,
+        )?);
+        if let Some(mask) = &self.external_row_mask {
+            stale_node = Arc::new(RowAddrMaskFilterExec::new(stale_node, mask.clone()));
+        }
         let planner = Planner::new(stale_node.schema());
         let optimized_filter = planner.optimize_expr(filter.clone())?;
         let filtered = Arc::new(match session {
@@ -779,7 +800,10 @@ impl Scanner {
     }
 
     /// Resolve stale vector entries within the requested fragment scope.
-    pub(super) fn overlay_stale_vector_rows(&self, segments: &[IndexMetadata]) -> Result<IndexVisibility> {
+    pub(super) fn overlay_stale_vector_rows(
+        &self,
+        segments: &[IndexMetadata],
+    ) -> Result<IndexVisibility> {
         let fragments = self
             .fragments
             .as_deref()

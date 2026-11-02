@@ -52,15 +52,14 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use crate::dataset::Dataset;
-use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::index::DatasetIndexExt;
-use crate::index::visibility::IndexVisibility;
 use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::scalar::fetch_index_details;
 use crate::index::scalar::inverted::{
     fts_index_fragment_bitmap, load_segment_details, load_segments, normalize_inverted_details,
     resolve_fts_field, resolve_query_document_granularity, validate_combined_fields_target_column,
 };
+use crate::index::visibility::IndexVisibility;
 use crate::io::exec::fts::segments::open_fts_segments_without_coverage;
 use crate::io::exec::fts::{
     BoolSlot, BooleanQueryExec, BoostQueryExec, CombinedFieldsQueryExec, CompoundQueryExec,
@@ -2565,7 +2564,12 @@ impl Scanner {
                 }
             })
             .collect::<Vec<_>>();
-        let mut plan = self
+        // Corpus statistics include documents outside the emission mask. In
+        // particular, stale-row takes must replace every invalidated indexed
+        // document, even when the query cannot return that document.
+        let mut corpus_scanner = self.clone();
+        corpus_scanner.external_row_mask = None;
+        let mut plan = corpus_scanner
             .plan_uncovered_rows_scan(fragments, stale_rows, columns, &ExprFilterPlan::default())
             .await?;
         // A nested target column needs a flat alias so the exec can resolve it by

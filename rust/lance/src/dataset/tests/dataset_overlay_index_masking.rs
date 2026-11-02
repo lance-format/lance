@@ -486,6 +486,133 @@ async fn test_overlay_replay_does_not_duplicate_uncovered_fragments(
 
 #[rstest]
 #[tokio::test]
+async fn test_overlay_mixed_coverage_replay(
+    #[values(false, true)] stable_row_ids: bool,
+    #[values(false, true)] fast_search: bool,
+) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
+    append_age_fragment(&mut dataset, 12..18).await;
+    for (column, fragments) in [("age", vec![0, 1]), ("id", vec![0, 2])] {
+        let name = format!("{column}_idx");
+        let segment = CreateIndexBuilder::new(
+            &mut dataset,
+            &[column],
+            IndexType::BTree,
+            &ScalarIndexParams::default(),
+        )
+        .name(name.clone())
+        .fragments(fragments)
+        .execute_uncommitted()
+        .await
+        .unwrap();
+        dataset
+            .commit_existing_index_segments(&name, column, vec![segment])
+            .await
+            .unwrap();
+    }
+    for fragment in 0..3 {
+        dataset = overlay_age(
+            dataset,
+            &format!("mixed_{fragment}"),
+            fragment,
+            &[(1, Some(999))],
+        )
+        .await;
+    }
+    let predicate = "age = 999 OR id = 2";
+    let expected = if fast_search {
+        vec![1, 2]
+    } else {
+        vec![1, 2, 7, 13]
+    };
+    assert_eq!(
+        ids_matching_opts(&dataset, predicate, fast_search).await,
+        expected
+    );
+    if !fast_search {
+        assert_ids_match_oracle(&dataset, predicate, &expected).await;
+    }
+    let mut scan = dataset.scan();
+    scan.with_fragments(
+        dataset
+            .fragments()
+            .iter()
+            .filter(|f| f.id != 2)
+            .cloned()
+            .collect(),
+    )
+    .with_physical_row_addr_prefilter(
+        [
+            u64::from(RowAddress::new_from_parts(0, 2)),
+            u64::from(RowAddress::new_from_parts(1, 1)),
+        ]
+        .into_iter()
+        .collect(),
+    )
+    .filter(predicate)
+    .unwrap()
+    .project(&["id"])
+    .unwrap();
+    if fast_search {
+        scan.fast_search();
+    }
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut ids = ids_from_batches(&[batch]);
+    ids.sort_unstable();
+    assert_eq!(ids, if fast_search { vec![2] } else { vec![2, 7] });
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_sparse_overlay_fields_and_precedence(#[values(false, true)] stable_row_ids: bool) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
+    build_age_index(&mut dataset).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset = commit_overlay(
+        dataset,
+        "sparse_columns",
+        1,
+        &[0, 1],
+        OverlayCoverage::sparse(vec![
+            [1].into_iter().collect(),
+            [2, 3].into_iter().collect(),
+        ]),
+        vec![i32_array([Some(777)]), i32_array([Some(999), Some(888)])],
+    )
+    .await;
+    dataset = overlay_age(dataset, "sparse_newest", 1, &[(2, None)]).await;
+    for compact in [false, true] {
+        if compact {
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment: 32,
+                    max_overlays_per_fragment: Some(0),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        assert_ids_match_oracle(&dataset, "age = 70", &[777]).await;
+        assert_ids_match_oracle(&dataset, "age = 999", &[]).await;
+        assert_ids_match_oracle(&dataset, "age IS NULL", &[8]).await;
+        assert_ids_match_oracle(&dataset, "age = 888 OR id = 777", &[9, 777]).await;
+    }
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_selected_scalar_segments_use_their_own_overlay_watermarks(
     #[values(false, true)] stable_row_ids: bool,
 ) {
@@ -982,6 +1109,121 @@ async fn test_vector_index_rescore_on_overlay(
     );
 }
 
+#[rstest]
+#[tokio::test]
+async fn test_vector_refine_with_overlaid_scalar_prefilter(
+    #[values(false, true)] stable_row_ids: bool,
+    #[values(false, true)] has_external_mask: bool,
+) {
+    let mut dataset = create_vector_overlay_dataset(stable_row_ids).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::Bitmap,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset = commit_overlay(
+        dataset,
+        "scalar_vector_filter",
+        1,
+        &[0],
+        OverlayCoverage::dense([8].into_iter().collect()),
+        vec![i32_array([Some(400)])],
+    )
+    .await;
+    let mut answers = Vec::new();
+    for use_index in [false, true] {
+        let mut scan = dataset.scan();
+        if has_external_mask {
+            let row_id = if stable_row_ids {
+                40
+            } else {
+                u64::from(RowAddress::new_from_parts(1, 8))
+            };
+            scan.with_row_id_prefilter(RowAddrMask::from_block([row_id].into_iter().collect()));
+        }
+        scan.nearest("vec", &arrow_array::Float32Array::from(vec_query()), 3)
+            .unwrap()
+            .nprobes(1)
+            .refine(2)
+            .prefilter(true)
+            .filter(if has_external_mask {
+                "id >= 32 AND id < 500"
+            } else {
+                "id >= 32 AND id < 50"
+            })
+            .unwrap()
+            .project(&["id"])
+            .unwrap()
+            .use_index(use_index);
+        let batch = scan.try_into_batch().await.unwrap();
+        let ids = ids_from_batches(std::slice::from_ref(&batch));
+        assert!(!ids.contains(&400));
+        assert!(!ids.contains(&35));
+        answers.push((
+            ids,
+            batch["_distance"]
+                .as_primitive::<Float32Type>()
+                .values()
+                .to_vec(),
+        ));
+    }
+    assert_eq!(answers[0], answers[1]);
+    let recall = answers[0]
+        .0
+        .iter()
+        .filter(|id| answers[1].0.contains(id))
+        .count() as f64
+        / 3.0;
+    assert!(recall >= 0.5);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_ranked_visibility_snapshots(#[values(false, true)] stable_row_ids: bool) {
+    let original = create_vector_index_dataset(stable_row_ids).await;
+    let updated = commit_overlay(
+        original.clone(),
+        "snapshot_vector",
+        1,
+        &[1],
+        OverlayCoverage::dense([3, 8].into_iter().collect()),
+        vec![fsl(vec![vec![0.0; VEC_DIM as usize], vec_query()], VEC_DIM)],
+    )
+    .await;
+    let mut deleted = updated.clone();
+    deleted.delete("id = 40").await.unwrap();
+    let before = vector_query_ids(&original, 3, false).await;
+    assert!(before.contains(&35));
+    let expected = [35, 0, 1];
+    let recall = expected.iter().filter(|id| before.contains(id)).count() as f64 / 3.0;
+    assert!(recall >= 0.5, "recall={recall}, ids={before:?}");
+    assert!(vector_query_ids(&updated, 3, false).await.contains(&40));
+    assert!(!vector_query_ids(&deleted, 3, false).await.contains(&40));
+    assert_eq!(vector_query_ids(&original, 3, false).await, before);
+    let mut original = create_text_dataset(stable_row_ids).await;
+    build_text_fts_index(&mut original).await;
+    let updated = commit_overlay(
+        original.clone(),
+        "snapshot_text",
+        1,
+        &[1],
+        OverlayCoverage::dense([1].into_iter().collect()),
+        vec![Arc::new(StringArray::from(vec!["apple"]))],
+    )
+    .await;
+    let mut deleted = updated.clone();
+    deleted.delete("id = 7").await.unwrap();
+    let before = fts_ids_matching(&original, "apple").await;
+    assert_eq!(fts_ids_matching(&updated, "apple").await, vec![0, 1, 7]);
+    assert_eq!(fts_ids_matching(&deleted, "apple").await, vec![0, 1]);
+    assert_eq!(fts_ids_matching(&original, "apple").await, before);
+}
+
 /// The ANN prefilter block that drops stale overlay rows runs regardless of `fast_search`;
 /// only the flat re-score is gated by it. So under `fast_search` id=35's stale hit must still
 /// be dropped, while id=40 (moved onto the query) is intentionally not re-scored — the same
@@ -1313,13 +1555,23 @@ async fn test_vector_batch_falls_back_on_overlay(#[values(false, true)] stable_r
     );
 }
 
-/// A compound boolean predicate (age AND id) exercises the ScalarIndexExpr tree-walk in
-/// `overlay_stale_index_rows`. An overlay on `age` marks fragment 0 stale from the `age`
-/// index's perspective, so the compound query must re-evaluate fragment 0 on the flat path.
+/// Each predicate keeps both index leaves after optimization. Stale entries
+/// must be blocked after Boolean composition, including NOT and SQL NULLs.
+#[rstest]
+#[case::and("age = 999 AND id > 0", vec![1])]
+#[case::or("age = 999 OR id = 2", vec![1, 2])]
+#[case::not("NOT (age = 10 OR id = 2)", vec![0, 1, 4, 5, 6, 7, 8, 9, 10, 11])]
+#[case::null("age IS NULL OR id = 2", vec![2, 3])]
+#[case::residual("(age = 999 OR id = 2) AND id % 2 = 1", vec![1])]
 #[tokio::test]
-async fn test_overlay_stale_with_compound_index_expression() {
-    let mut dataset = create_base_dataset().await;
-    // Build BTree indexes on both columns so a compound filter can use both.
+async fn test_overlay_stale_with_compound_index_expression(
+    #[values(false, true)] stable_row_ids: bool,
+    #[case] predicate: &str,
+    #[case] expected: Vec<i32>,
+) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
+    // Pin NULL-to-value as well as value-to-NULL transitions.
+    dataset = overlay_age(dataset, "initial_null", 0, &[(1, None)]).await;
     build_age_index(&mut dataset).await;
     dataset
         .create_index(
@@ -1331,25 +1583,139 @@ async fn test_overlay_stale_with_compound_index_expression() {
         )
         .await
         .unwrap();
+    let dataset = overlay_age(dataset, "compound", 0, &[(1, Some(999)), (3, None)]).await;
+    let plan = dataset
+        .scan()
+        .filter(predicate)
+        .unwrap()
+        .project(&["id"])
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    let index_query = plan
+        .lines()
+        .find(|line| line.contains("ScalarIndexQuery"))
+        .unwrap();
+    assert!(
+        index_query.contains("@age_idx") && index_query.contains("@id_idx"),
+        "{plan}"
+    );
+    assert_ids_match_oracle(&dataset, predicate, &expected).await;
+}
 
-    // Fragment 0 covers id=0..5, age=0..50. Overlay changes id=1's age from 10 to 999.
-    let dataset = commit_overlay(
-        dataset,
-        "age_compound",
-        0,
-        &[1],
-        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
-        vec![i32_array([Some(999)])],
+#[rstest]
+#[tokio::test]
+async fn test_nested_dependency_row_rewrite(
+    #[values(false, true)] replaces_parent: bool,
+    #[values(false, true)] has_carried_field: bool,
+) {
+    let nested = arrow_array::StructArray::from(vec![
+        (
+            Arc::new(ArrowField::new("a", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec!["ten", "twenty", "thirty", "forty"])) as ArrayRef,
+        ),
+        (
+            Arc::new(ArrowField::new("b", DataType::Int32, true)),
+            i32_array([Some(1), Some(2), Some(3), Some(4)]),
+        ),
+    ]);
+    let batch = RecordBatch::try_from_iter(vec![
+        ("id", i32_array([Some(0), Some(1), Some(2), Some(3)])),
+        ("s", Arc::new(nested) as ArrayRef),
+    ])
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["s.a"],
+            IndexType::NGram,
+            Some("nested_idx".into()),
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    if has_carried_field {
+        // No current writer emits carried values. Use the existing declaration
+        // fixture to exercise invalidation while projection reads current data.
+        crate::utils::test::covering::declare_covering(&mut dataset, "s.a", "id").await;
+    }
+    let Err(error) = UpdateBuilder::new(Arc::new(dataset.clone())).set("s.b", "99") else {
+        panic!("nested child updates must report their unsupported boundary");
+    };
+    assert!(matches!(error, crate::Error::NotSupported { .. }));
+    assert!(error.to_string().contains("Nested column references"));
+    let builder = UpdateBuilder::new(Arc::new(dataset))
+        .update_where("id = 2")
+        .unwrap();
+    let updated = if replaces_parent {
+        builder.set("s", "named_struct('a', 'new', 'b', 3)")
+    } else {
+        builder.set("id", "100")
+    }
+    .unwrap()
+    .build()
+    .unwrap()
+    .execute()
+    .await
+    .unwrap()
+    .new_dataset;
+    let mut dataset = updated.as_ref().clone();
+    let newest = dataset.fragments().last().unwrap().id as u32;
+    let indices = dataset.load_indices_by_name("nested_idx").await.unwrap();
+    assert_eq!(
+        indices[0]
+            .fragment_bitmap
+            .as_ref()
+            .unwrap()
+            .contains(newest),
+        !replaces_parent && !has_carried_field
+    );
+    assert_ids_match_oracle(
+        &dataset,
+        if replaces_parent {
+            "s.a LIKE '%new%'"
+        } else {
+            "s.a LIKE '%thirty%'"
+        },
+        if replaces_parent { &[2] } else { &[100] },
     )
     .await;
-
-    // Compound query: both the `age` and `id` index are involved. The overlay on `age`
-    // makes fragment 0 stale for the `age` index; it falls to the flat path, which uses
-    // the merged (overlay) value. Result: the stale age=10 hit is gone, age=999 appears.
-    assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
-    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
-    // A pure `id` query on an unaffected fragment still works correctly.
-    assert_eq!(ids_matching(&dataset, "id = 2").await, vec![2]);
+    if has_carried_field {
+        return;
+    }
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 8,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_ids_match_oracle(
+        &dataset,
+        if replaces_parent {
+            "s.a LIKE '%new%'"
+        } else {
+            "s.a LIKE '%thirty%'"
+        },
+        if replaces_parent { &[2] } else { &[100] },
+    )
+    .await;
 }
 
 /// A `RewriteRows` update (under stable row ids) that touches only a *non-indexed* column moves
@@ -2739,6 +3105,85 @@ async fn test_list_element_fts_overlay_uses_exact_index_and_flat_fallback() {
     );
 }
 
+#[rstest]
+#[case::null(0)]
+#[case::empty(1)]
+#[case::null_elements(2)]
+#[tokio::test]
+async fn test_list_element_overlay_null_collections(#[case] replacement: u8) {
+    let mut tags = ListBuilder::new(StringBuilder::new());
+    tags.values().append_value("old phrase");
+    tags.append(true);
+    tags.append(false);
+    tags.append(true);
+    tags.values().append_null();
+    tags.append(true);
+    tags.values().append_value("new phrase");
+    tags.values().append_value("new phrase");
+    tags.append(true);
+    tags.values().append_value("other");
+    tags.append(true);
+    let batch = RecordBatch::try_from_iter(vec![
+        ("id", i32_array((0..6).map(Some))),
+        ("tags", Arc::new(tags.finish()) as ArrayRef),
+    ])
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["tags"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default()
+                .with_position(true)
+                .document_granularity(DocumentGranularity::ListElement),
+            true,
+        )
+        .await
+        .unwrap();
+    let mut tags = ListBuilder::new(StringBuilder::new());
+    if replacement == 2 {
+        tags.values().append_null();
+    }
+    tags.append(replacement != 0);
+    let mut dataset = commit_overlay(
+        dataset,
+        "null_list",
+        0,
+        &[1],
+        OverlayCoverage::dense([0].into_iter().collect()),
+        vec![Arc::new(tags.finish())],
+    )
+    .await;
+    let query = |term: &str| {
+        FullTextSearchQuery::new_query(FtsQuery::Match(
+            MatchQuery::new(term.to_owned())
+                .with_column(Some("tags".into()))
+                .with_document_granularity(DocumentGranularity::ListElement),
+        ))
+    };
+    assert_eq!(fts_ids(&dataset, query("old")).await, Vec::<i32>::new());
+    assert_eq!(fts_ids(&dataset, query("new")).await, vec![4, 4]);
+    let phrase = FullTextSearchQuery::new_query(FtsQuery::Phrase(
+        PhraseQuery::new("new phrase".into())
+            .with_column(Some("tags".into()))
+            .with_document_granularity(DocumentGranularity::ListElement),
+    ));
+    assert_eq!(fts_ids(&dataset, phrase).await, vec![4, 4]);
+    dataset.delete("id = 4 OR id = 0").await.unwrap();
+    assert_eq!(fts_ids(&dataset, query("new")).await, Vec::<i32>::new());
+    assert_eq!(fts_ids(&dataset, query("old")).await, Vec::<i32>::new());
+}
+
 /// An overlay on a non-FTS field must not exclude the fragment from phrase search.
 #[tokio::test]
 async fn test_fts_phrase_overlay_unrelated_field_not_excluded() {
@@ -2806,6 +3251,7 @@ struct CombinedScan<'a> {
     fragment_ids: Option<&'a [u32]>,
     limit: Option<i64>,
     fast_search: bool,
+    row_mask: Option<RowAddrMask>,
 }
 
 /// `(id, score)` of every cross-field (BM25F) `combined_fields` hit, in score
@@ -2833,6 +3279,9 @@ async fn fts_combined_hits(
     }
     if scan.fast_search {
         scanner.fast_search();
+    }
+    if let Some(mask) = scan.row_mask {
+        scanner.with_row_id_prefilter(mask);
     }
     scanner
         .full_text_search(combined_fields_query(terms, columns).limit(scan.limit))
@@ -3019,6 +3468,88 @@ async fn create_text_dataset_with(columns: &[(&str, &[&str])], rows_per_file: us
     Dataset::write(reader, "memory://", Some(write_params))
         .await
         .unwrap()
+}
+
+#[rstest]
+#[case::allow(false)]
+#[case::block(true)]
+#[tokio::test]
+async fn test_fts_combined_fields_overlay_preserves_external_mask_corpus(
+    #[case] is_block: bool,
+    #[values(1, 4)] overwritten_row: u32,
+    #[values(false, true)] has_append: bool,
+) {
+    let texts = ["alpha", "beta", "alpha", "alpha", "alpha", "alpha"];
+    let mut dataset = create_text_dataset_with(&[("text", &texts)], 3).await;
+    build_text_fts_index(&mut dataset).await;
+    if has_append {
+        let batch =
+            arrow_array::record_batch!(("id", Int32, [6]), ("text", Utf8, ["beta"])).unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let source = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+    let ids = source["id"].as_primitive::<Int32Type>();
+    let row_ids = source["_rowid"].as_primitive::<UInt64Type>();
+    let selected: RowAddrTreeMap = (0..source.num_rows())
+        .filter(|row| ([0, 1, 6].contains(&ids.value(*row))) != is_block)
+        .map(|row| row_ids.value(row))
+        .collect();
+    let mask = if is_block {
+        RowAddrMask::from_block(selected)
+    } else {
+        RowAddrMask::from_allowed(selected)
+    };
+    let before = fts_combined_hits(
+        &dataset,
+        "alpha beta",
+        &["text"],
+        CombinedScan {
+            row_mask: Some(mask.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let value = if overwritten_row == 1 {
+        "beta"
+    } else {
+        "alpha"
+    };
+    let dataset = commit_overlay(
+        dataset,
+        "masked_corpus",
+        u64::from(overwritten_row / 3),
+        &[1],
+        OverlayCoverage::dense([overwritten_row % 3].into_iter().collect()),
+        vec![Arc::new(StringArray::from(vec![value]))],
+    )
+    .await;
+    let unmasked =
+        fts_combined_hits(&dataset, "alpha beta", &["text"], CombinedScan::default()).await;
+    let expected: Vec<_> = unmasked
+        .into_iter()
+        .filter(|(id, _)| [0, 1, 6].contains(id))
+        .collect();
+    let after = fts_combined_hits(
+        &dataset,
+        "alpha beta",
+        &["text"],
+        CombinedScan {
+            row_mask: Some(mask),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(after, expected);
+    assert_eq!(
+        after, before,
+        "same-value overlays must preserve every score"
+    );
 }
 
 /// A same-value overlay must not move top-k: it leaves every searchable value alone, so
@@ -4346,5 +4877,38 @@ async fn test_minhash_overlay_rows_are_rescored_unless_fast_search(
     assert_eq!(
         minhash_ids(&dataset, "mango sorbet", true).await.unwrap()[0],
         6
+    );
+    let mut dataset = commit_overlay(
+        dataset,
+        "minhash_second_fragment",
+        1,
+        &[1],
+        OverlayCoverage::dense([0, 1, 2].into_iter().collect()),
+        vec![Arc::new(StringArray::from(vec![
+            "exact text",
+            "exact text",
+            "exact text",
+        ]))],
+    )
+    .await;
+    dataset.delete("id = 6").await.unwrap();
+    let source = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+    let ids = source["id"].as_primitive::<Int32Type>();
+    let row_ids = source["_rowid"].as_primitive::<UInt64Type>();
+    let allowed = (0..source.num_rows())
+        .filter(|row| [7, 8].contains(&ids.value(*row)))
+        .map(|row| row_ids.value(row))
+        .collect();
+    let mut scan = dataset.scan();
+    scan.minhash_search(MinHashQuery::new("exact text", "text"))
+        .unwrap()
+        .with_row_id_prefilter(RowAddrMask::from_allowed(allowed))
+        .limit(Some(1), Some(1))
+        .unwrap()
+        .project(&["id"])
+        .unwrap();
+    assert_eq!(
+        ids_from_batches(&[scan.try_into_batch().await.unwrap()]),
+        vec![8]
     );
 }

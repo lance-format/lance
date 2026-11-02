@@ -3,6 +3,8 @@
 
 use super::*;
 use arrow_array::record_batch;
+use arrow_array::types::Int32Type;
+use lance_core::utils::address::RowAddress;
 
 #[rstest::rstest]
 #[case::first_key("key", false, true)]
@@ -257,4 +259,145 @@ async fn test_concurrent_insert_same_new_key(
         assert_eq!(found.num_rows(), 1);
         assert_eq!(found["value"].as_primitive::<UInt32Type>().value(0), 2);
     }
+}
+
+#[rstest::rstest]
+#[tokio::test]
+async fn test_indexed_merge_insert_overlay_partial_coverage(
+    #[values(false, true)] stable_row_ids: bool,
+    #[values(false, true)] partial_coverage: bool,
+) {
+    let mut results = Vec::new();
+    for use_index in [false, true] {
+        let initial = record_batch!(
+            ("key", Int32, [0, 1, 2, 3, 4, 5]),
+            ("other_key", Int32, [10, 20, 30, 40, 50, 60]),
+            ("value", Int32, [0, 1, 2, 3, 4, 5])
+        )
+        .unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(initial.clone())], initial.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids: stable_row_ids,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        for (column, fragments) in [
+            ("key", vec![0, 1]),
+            (
+                "other_key",
+                if partial_coverage {
+                    vec![0, 2]
+                } else {
+                    vec![0, 1, 2]
+                },
+            ),
+        ] {
+            let name = format!("{column}_idx");
+            let segment = crate::index::CreateIndexBuilder::new(
+                &mut dataset,
+                &[column],
+                IndexType::BTree,
+                &ScalarIndexParams::default(),
+            )
+            .name(name.clone())
+            .fragments(fragments)
+            .execute_uncommitted()
+            .await
+            .unwrap();
+            dataset
+                .commit_existing_index_segments(&name, column, vec![segment])
+                .await
+                .unwrap();
+        }
+        dataset.delete("key = 2").await.unwrap();
+        let field = dataset.schema().field("key").unwrap().id;
+        let schema = dataset.schema().project_by_ids(&[field], true);
+        let patch = record_batch!(
+            (
+                ROW_ADDR,
+                UInt64,
+                [u64::from(RowAddress::new_from_parts(1, 1))]
+            ),
+            ("key", Int32, [100])
+        )
+        .unwrap();
+        let mut writer = dataset
+            .get_fragment(1)
+            .unwrap()
+            .write_overlay(&schema)
+            .await
+            .unwrap();
+        writer.write_batch(&patch).await.unwrap();
+        let group = writer.finish().await.unwrap().unwrap();
+        let version = dataset.version().version;
+        let dataset = Dataset::commit(
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Operation::DataOverlay {
+                groups: vec![group],
+            },
+            Some(version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+        let source = record_batch!(
+            ("key", Int32, [100, 3, 0, 5]),
+            ("other_key", Int32, [40, 40, 10, 60]),
+            ("value", Int32, [900, 901, 902, 903])
+        )
+        .unwrap();
+        let job = MergeInsertBuilder::try_new(
+            Arc::new(dataset.clone()),
+            vec!["key".into(), "other_key".into()],
+        )
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .use_index(use_index)
+        .try_build()
+        .unwrap();
+        if use_index {
+            let keys = job.indexed_join_keys().await.unwrap();
+            assert_eq!(keys.len(), 2);
+            let stale = job.overlay_stale_rows_for_keys(&keys).await.unwrap();
+            assert_eq!(
+                stale.physical_selection(),
+                if partial_coverage {
+                    RowAddrTreeMap::new()
+                } else {
+                    RowAddrTreeMap::from_iter([u64::from(RowAddress::new_from_parts(1, 1))])
+                }
+            );
+        }
+        let (updated, stats) = job
+            .execute_reader(Box::new(RecordBatchIterator::new(
+                [Ok(source.slice(0, 2)), Ok(source.slice(2, 2))],
+                source.schema(),
+            )))
+            .await
+            .unwrap();
+        assert_eq!((stats.num_updated_rows, stats.num_inserted_rows), (3, 1));
+        let batch = updated.scan().try_into_batch().await.unwrap();
+        let mut rows: Vec<_> = (0..batch.num_rows())
+            .map(|row| {
+                (
+                    batch["key"].as_primitive::<Int32Type>().value(row),
+                    batch["other_key"].as_primitive::<Int32Type>().value(row),
+                    batch["value"].as_primitive::<Int32Type>().value(row),
+                )
+            })
+            .collect();
+        rows.sort_unstable();
+        results.push(rows);
+    }
+    assert_eq!(results[0], results[1]);
+    assert_eq!(results[1].len(), 6);
 }

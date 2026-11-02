@@ -10,7 +10,7 @@
 //! `dataset/tests/dataset_scanner_knn.rs` and
 //! `dataset/tests/dataset_scanner_segments.rs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::Array;
@@ -46,10 +46,10 @@ use roaring::RoaringBitmap;
 use crate::index::DatasetIndexExt;
 use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::scalar_logical::scalar_index_fragment_bitmap;
-use crate::index::visibility::IndexVisibility;
 use crate::index::vector::utils::{
     default_distance_type_for, get_vector_dim, get_vector_type, validate_distance_type_for,
 };
+use crate::index::visibility::IndexVisibility;
 use crate::io::exec::knn::{
     BatchRefineExec, KnnBatchParams, MultivectorScoringExec, QUERY_INDEX_COL,
     knn_empty_result_schema, new_knn_batch_exec, new_knn_exec,

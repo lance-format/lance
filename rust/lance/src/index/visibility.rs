@@ -251,4 +251,116 @@ mod tests {
         })
         .await;
     }
+    #[rstest::rstest]
+    #[case::inline(4)]
+    #[case::dense(4096)]
+    #[tokio::test]
+    async fn stable_selection_is_shared_and_excludes_deleted_slots(#[case] fragment_rows: u32) {
+        let reader = gen_batch()
+            .col("value", array::step::<UInt32Type>())
+            .into_reader_rows(
+                RowCount::from(u64::from(fragment_rows) * 2),
+                BatchCount::from(1),
+            );
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(crate::dataset::WriteParams {
+                max_rows_per_file: fragment_rows as usize,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .delete(&format!(
+                "value = {fragment_rows} OR value = {}",
+                fragment_rows + 2
+            ))
+            .await
+            .unwrap();
+        let offsets: RoaringBitmap = (0..fragment_rows).collect();
+        let plan = IndexVisibility::from_physical_rows(
+            Arc::new(dataset),
+            HashMap::from([(1, offsets.clone())]),
+        );
+        let mut physical = RowAddrTreeMap::new();
+        physical.insert_bitmap(1, offsets);
+        assert_eq!(plan.physical_selection(), physical);
+        poll_fn(|context| {
+            while let Poll::Ready(guard) = poll_proceed(context) {
+                guard.made_progress();
+            }
+            assert!(plan.result_rows().now_or_never().is_none());
+            Poll::Ready(())
+        })
+        .await;
+        let first = plan.result_rows().await.unwrap();
+        let expected: RowAddrTreeMap = (fragment_rows..fragment_rows * 2)
+            .filter(|id| *id != fragment_rows && *id != fragment_rows + 2)
+            .map(u64::from)
+            .collect();
+        assert_eq!(first, &expected);
+        let block = plan.block_mask().await.unwrap().unwrap();
+        assert!(!block.selected(u64::from(fragment_rows + 1)));
+        assert!(block.selected(u64::from(fragment_rows + 2)));
+        assert!(std::ptr::eq(first, plan.result_rows().await.unwrap()));
+        if fragment_rows >= 4096 {
+            let invalid = IndexVisibility::from_physical_rows(
+                plan.dataset.clone(),
+                HashMap::from([(1, (0..=fragment_rows).collect())]),
+            );
+            let error = invalid.result_rows().await.unwrap_err();
+            assert!(matches!(error, lance_core::Error::Internal { .. }));
+            assert!(error.to_string().contains("physical_offset=4096"));
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::unknown(None, true)]
+    #[case::empty(Some(RoaringBitmap::new()), false)]
+    #[case::covered(Some([0].into_iter().collect()), false)]
+    #[tokio::test]
+    async fn unknown_coverage_is_distinct_from_empty(
+        #[case] coverage: Option<RoaringBitmap>,
+        #[case] is_unknown: bool,
+    ) {
+        let reader = gen_batch()
+            .col("value", array::step::<UInt32Type>())
+            .into_reader_rows(RowCount::from(4), BatchCount::from(1));
+        let dataset = Arc::new(Dataset::write(reader, "memory://", None).await.unwrap());
+        let mut fragments = dataset.fragments().as_ref().clone();
+        fragments[0]
+            .overlays
+            .push(lance_table::format::overlay::DataOverlayFile {
+                data_file: lance_table::format::DataFile::new_legacy_from_fields(
+                    "unused.lance",
+                    vec![0],
+                    None,
+                ),
+                coverage: lance_table::format::overlay::OverlayCoverage::dense(
+                    [1].into_iter().collect(),
+                ),
+                committed_version: 2,
+            });
+        let segment = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "value_idx".into(),
+            fields: vec![0],
+            covering_fields: vec![],
+            dataset_version: 1,
+            fragment_bitmap: coverage.clone(),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            clustering_id: None,
+            metadata: Default::default(),
+        };
+        let plan = IndexVisibility::from_segments(dataset, &[segment], &fragments).unwrap();
+        assert_eq!(plan.has_stale_unknown_coverage(), is_unknown);
+        assert_eq!(plan.is_empty(), coverage.is_some_and(|c| c.is_empty()));
+    }
 }
