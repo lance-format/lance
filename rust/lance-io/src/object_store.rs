@@ -49,6 +49,7 @@ pub(crate) mod dynamic_credentials;
 #[cfg(any(feature = "oss", feature = "huggingface", feature = "tos"))]
 pub(crate) mod dynamic_opendal;
 mod list_retry;
+mod local_staging;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 #[cfg(any(
@@ -176,6 +177,7 @@ pub trait ObjectStoreExt {
 
 #[async_trait]
 pub(super) trait LocalDirOperations: std::fmt::Debug + Send + Sync {
+    fn directory_to_filesystem(&self, path: &Path) -> Result<PathBuf>;
     async fn remove_dir_all(&self, path: &Path) -> Result<()>;
     async fn canonicalize(&self, path: &Path) -> Result<Option<PathBuf>>;
 }
@@ -1228,7 +1230,27 @@ impl ObjectStore {
         }
     }
 
+    /// Delete an object, including a local staging file hidden from normal listings.
+    ///
+    /// See [`Self::read_local_staging_files`] for an example of finding and removing
+    /// old staging files after an interrupted write.
     pub async fn delete(&self, path: &Path) -> Result<()> {
+        if let Some(local_path) = self.local_staging_path(path)? {
+            // LocalFileSystem rejects its reserved staging names, even for deletion.
+            let metrics = self.io_tracker.begin_io("delete");
+            let result = tokio::fs::remove_file(&local_path).await.map_err(|error| {
+                if error.kind() == ErrorKind::NotFound {
+                    Error::not_found(path.to_string())
+                } else {
+                    Error::io(format!(
+                        "Failed to remove local staging file {}: {error}",
+                        local_path.display()
+                    ))
+                }
+            });
+            metrics.record(&result, 0);
+            return result;
+        }
         self.inner.delete(path).await?;
         Ok(())
     }
