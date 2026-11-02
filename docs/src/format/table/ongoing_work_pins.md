@@ -29,7 +29,7 @@ that time does not automatically remove it. Renewal changes only `expires_at`;
 the source version, creation time, and label stay fixed. No generation counter
 is needed because every extension strictly increases `expires_at`.
 
-The first registration sets writer feature bit 19, `FLAG_ONGOING_WORK_PINS`,
+The first registration sets writer feature bit 20, `FLAG_ONGOING_WORK_PINS`,
 in the same commit as the pin. A nonempty list without the bit is invalid.
 The bit is sticky on subsequent versions, including when the list becomes
 empty, and introduces no reader requirement solely for pins. Ordinary reads
@@ -278,7 +278,7 @@ pin operations do not add a combined publication-and-release transaction.
 
 ## Compatibility and implementation boundary
 
-Bit 19 is reserved and unsupported until this contract is implemented. Ordinary
+Bit 20 is reserved and unsupported until this contract is implemented. Ordinary
 writers that do not support it must refuse flagged manifests. Readers may still
 read data if they support the other reader flags. A flag check gates attempts
 that reach it; it does not cancel destructive operations already in flight.

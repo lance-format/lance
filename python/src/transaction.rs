@@ -565,12 +565,15 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     Err(_) => Vec::new(),
                 };
 
+                let mem_wal_dir_id: Option<String> = ob.getattr("mem_wal_dir_id")?.extract()?;
+
                 let op = Operation::Update {
                     removed_fragment_ids,
                     updated_fragments,
                     new_fragments,
                     fields_modified,
                     compacted_sstables,
+                    mem_wal_dir_id,
                     fields_for_preserving_frag_bitmap,
                     update_mode,
                     inserted_rows_filter: None,
@@ -717,7 +720,11 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
                     Ok(value) => import_compacted_sstables(&value)?,
                     Err(_) => Vec::new(),
                 };
-                Ok(Self(Operation::UpdateMemWalState { compacted_sstables }))
+                let dir_id: String = ob.getattr("dir_id")?.extract()?;
+                Ok(Self(Operation::UpdateMemWalState {
+                    compacted_sstables,
+                    dir_id,
+                }))
             }
             unsupported => Err(PyValueError::new_err(format!(
                 "Unsupported operation: {unsupported}",
@@ -782,6 +789,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 update_mode,
                 updated_fragment_offsets,
                 compacted_sstables,
+                mem_wal_dir_id,
                 ..
             } => {
                 let removed_fragment_ids = removed_fragment_ids.into_pyobject(py)?;
@@ -827,6 +835,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     update_mode,
                     updated_fragment_offsets,
                     compacted_sstables,
+                    mem_wal_dir_id,
                 ))
             }
             Operation::DataReplacement { replacements } => {
@@ -975,12 +984,15 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     base_op.call0()
                 }
             }
-            Operation::UpdateMemWalState { compacted_sstables } => {
+            Operation::UpdateMemWalState {
+                compacted_sstables,
+                dir_id,
+            } => {
                 let compacted_sstables = export_compacted_sstables(py, compacted_sstables)?;
                 let cls = namespace
                     .getattr("UpdateMemWalState")
                     .expect("Failed to get UpdateMemWalState class");
-                cls.call1((compacted_sstables,))
+                cls.call1((compacted_sstables, dir_id))
             }
             unsupported => Err(PyValueError::new_err(format!(
                 "Unsupported operation: {}",

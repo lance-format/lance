@@ -82,7 +82,7 @@ mod replay {
         base_path: &Path,
         shard_id: Uuid,
     ) -> Vec<u64> {
-        ShardManifestStore::new(store.clone(), base_path, shard_id, 10)
+        ShardManifestStore::new(store.clone(), base_path, "", shard_id, 10)
             .latest()
             .await
             .unwrap()
@@ -407,10 +407,11 @@ mod evolve {
             .iter()
             .find(|s| s.generation == frozen_generation)
             .expect("the frozen generation is in the manifest");
-        let generation = Dataset::open(&format!(
-            "{}/_mem_wal/{shard_id}/{}",
-            dataset.uri().trim_end_matches('/'),
-            sstable.path
+        let generation = Dataset::open(&crate::dataset::mem_wal::util::sstable_uri(
+            dataset.uri(),
+            &writer.config().dir_id,
+            &shard_id,
+            &sstable.path,
         ))
         .await
         .unwrap();
@@ -458,10 +459,11 @@ mod evolve {
             .iter()
             .find(|s| s.generation == generation)
             .expect("the frozen generation is flushed");
-        let flushed = Dataset::open(&format!(
-            "{}/_mem_wal/{shard_id}/{}",
-            dataset.uri().trim_end_matches('/'),
-            sstable.path
+        let flushed = Dataset::open(&crate::dataset::mem_wal::util::sstable_uri(
+            dataset.uri(),
+            &writer.config().dir_id,
+            &shard_id,
+            &sstable.path,
         ))
         .await
         .unwrap();
@@ -516,6 +518,7 @@ mod evolve {
                 vec!["id".to_string()],
             )
             .with_identity_schema(writer_schema_of(&dataset))
+            .with_mem_wal_dir_id(writer.config().dir_id.clone())
         };
         let rows = |batch: RecordBatch| -> Vec<(i64, String)> {
             let ids = batch["id"].as_primitive::<Int64Type>();

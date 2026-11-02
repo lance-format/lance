@@ -555,6 +555,103 @@ impl DeepSizeOf for SmallReader {
     }
 }
 
+/// A [`Reader`] that keeps no file descriptor open between reads.
+///
+/// Each read reopens the object through the [`ObjectStore`](crate::object_store::ObjectStore)
+/// and closes it when the read completes. Use this for readers that are stored
+/// inside long-lived cache entries: a reader holding an open file pins the
+/// inode even after the file is deleted, so cached readers would otherwise
+/// accumulate descriptors for files cleanup has already removed.
+///
+/// The trade-off is one extra open per read. Reads of a warm cache entry are
+/// served without touching the reader at all, so the cost only shows up when
+/// data is actually re-read.
+#[derive(Debug)]
+pub struct LazyReader {
+    object_store: Arc<crate::object_store::ObjectStore>,
+    path: Path,
+    size: OnceCell<usize>,
+    block_size: usize,
+    io_parallelism: usize,
+}
+
+impl LazyReader {
+    /// Create a lazy reader over `path` in `object_store`.
+    ///
+    /// `known_size`, when given, saves the HEAD request that the first
+    /// [`Reader::size`] call would otherwise make.
+    pub fn new(
+        object_store: Arc<crate::object_store::ObjectStore>,
+        path: Path,
+        known_size: Option<usize>,
+    ) -> Self {
+        Self {
+            block_size: object_store.block_size(),
+            io_parallelism: object_store.io_parallelism(),
+            object_store,
+            path,
+            size: OnceCell::new_with(known_size),
+        }
+    }
+}
+
+impl Reader for LazyReader {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    fn io_parallelism(&self) -> usize {
+        self.io_parallelism
+    }
+
+    fn size(&self) -> BoxFuture<'_, OSResult<usize>> {
+        Box::pin(async move {
+            self.size
+                .get_or_try_init(|| async {
+                    let meta = do_with_retry(|| Box::pin(self.object_store.inner.head(&self.path)))
+                        .await?;
+                    Ok(meta.size as usize)
+                })
+                .await
+                .cloned()
+        })
+    }
+
+    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
+        let object_store = self.object_store.clone();
+        let path = self.path.clone();
+        Box::pin(async move {
+            let reader = object_store
+                .open(&path)
+                .await
+                .map_err(object_store::Error::from)?;
+            reader.get_range(range).await
+        })
+    }
+
+    fn get_all(&self) -> BoxFuture<'_, OSResult<Bytes>> {
+        let object_store = self.object_store.clone();
+        let path = self.path.clone();
+        Box::pin(async move {
+            let reader = object_store
+                .open(&path)
+                .await
+                .map_err(object_store::Error::from)?;
+            reader.get_all().await
+        })
+    }
+}
+
+impl DeepSizeOf for LazyReader {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.path.as_ref().deep_size_of_children(context)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt::{Display, Formatter};

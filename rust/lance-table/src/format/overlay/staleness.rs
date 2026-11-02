@@ -135,11 +135,12 @@ pub fn collect_overlay_stale_frags(
     schema: &Schema,
 ) -> Result<()> {
     let coverage = segment.fragment_bitmap.as_ref();
+    let fields = segment.dependency_fields();
     for (&frag_id, fragment) in overlaid_frags {
         if stale.contains(frag_id) || !covers_fragment(coverage, frag_id) {
             continue;
         }
-        if !stale_offsets_for_fragment(fragment, &segment.fields, segment.dataset_version, schema)?
+        if !stale_offsets_for_fragment(fragment, &fields, segment.dataset_version, schema)?
             .is_empty()
         {
             stale.insert(frag_id);
@@ -162,17 +163,38 @@ pub fn collect_overlay_stale_rows_for_segment(
     schema: &Schema,
 ) -> Result<()> {
     let coverage = segment.fragment_bitmap.as_ref();
+    let fields = segment.dependency_fields();
     for (&frag_id, fragment) in overlaid_frags {
         if !covers_fragment(coverage, frag_id) {
             continue;
         }
         let excluded =
-            stale_offsets_for_fragment(fragment, &segment.fields, segment.dataset_version, schema)?;
+            stale_offsets_for_fragment(fragment, &fields, segment.dataset_version, schema)?;
         if !excluded.is_empty() {
             *stale.entry(frag_id).or_default() |= &excluded;
         }
     }
     Ok(())
+}
+
+/// Remove from `coverage` every fragment with an overlay that makes `index`
+/// stale ([`overlay_affects_index`]).
+pub fn remove_overlay_stale_frags(
+    coverage: &mut RoaringBitmap,
+    fragments: &[Fragment],
+    index: &IndexMetadata,
+    schema: &Schema,
+) {
+    let fields = index.dependency_fields();
+    for fragment in fragments {
+        if fragment
+            .overlays
+            .iter()
+            .any(|overlay| overlay_affects_index(overlay, &fields, index.dataset_version, schema))
+        {
+            coverage.remove(fragment.id as u32);
+        }
+    }
 }
 
 #[cfg(test)]

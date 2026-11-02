@@ -92,7 +92,7 @@ impl ExternalBaseResolver {
     }
 }
 
-fn arrow_field_contains_blob_v2(field: &ArrowField) -> bool {
+pub(super) fn arrow_field_contains_blob_v2(field: &ArrowField) -> bool {
     if field.is_blob_v2() {
         return true;
     }
