@@ -1,36 +1,31 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright The Lance Authors
-
 use super::*;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, vec};
 
-use arrow_array::cast::AsArray;
-use arrow_array::types::{Float32Type, UInt64Type};
 use arrow_array::{
     ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
-    StringArray, UInt8Array,
+    StringArray, types::Float32Type,
 };
-use arrow_schema::{ArrowError, DataType, Field as ArrowField};
+use arrow_schema::{ArrowError, DataType};
 use lance_arrow::FixedSizeListArrayExt;
-use lance_core::ROW_ID;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_file::version::LanceFileVersion;
-use lance_index::IndexType;
-use lance_index::scalar::ScalarIndexParams;
-use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
-use lance_index::vector::hnsw::builder::HnswBuildParams;
-use lance_index::vector::ivf::IvfBuildParams;
-use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
-use lance_index::vector::sq::builder::SQBuildParams;
-use lance_linalg::distance::{DistanceType, MetricType};
+use lance_index::{
+    IndexType,
+    scalar::{ScalarIndexParams, inverted::tokenizer::InvertedIndexParams},
+    vector::{
+        bq::{RQBuildParams, RQRotationType},
+        hnsw::builder::HnswBuildParams,
+        ivf::IvfBuildParams,
+        kmeans::{KMeansParams, train_kmeans},
+        sq::builder::SQBuildParams,
+    },
+};
+use lance_linalg::distance::DistanceType;
 use uuid::Uuid;
 
 use crate::dataset::WriteParams;
 use crate::index::vector::{StageParams, VectorIndexParams};
-use crate::io::exec::QUERY_INDEX_COL;
-use crate::io::exec::filtered_read::FilteredReadExec;
-use crate::utils::test::assert_plan_node_equals;
 
 // Creates a dataset with 5 batches where each batch has 80 rows
 //
@@ -124,6 +119,17 @@ impl TestVectorDataset {
     }
 
     pub async fn make_vector_index_with_metric(&mut self, metric: MetricType) -> Result<()> {
+        self.make_named_vector_index_with_metric("idx", metric)
+            .await
+    }
+
+    /// Build an IVF_PQ index on the `vec` column under an explicit name, so a
+    /// test can place several indices with different metrics on one column.
+    pub async fn make_named_vector_index_with_metric(
+        &mut self,
+        name: &str,
+        metric: MetricType,
+    ) -> Result<()> {
         let mut params = VectorIndexParams::ivf_pq(2, 8, 2, metric, 2);
         // Two partitions over 400 vectors only holds at a sample rate this
         // fixture can cover: the trained count is capped at the vectors
@@ -135,7 +141,7 @@ impl TestVectorDataset {
             .create_index(
                 &["vec"],
                 IndexType::Vector,
-                Some("idx".to_string()),
+                Some(name.to_string()),
                 &params,
                 true,
             )
@@ -149,6 +155,24 @@ impl TestVectorDataset {
             IvfBuildParams::new(2),
             HnswBuildParams::default(),
             SQBuildParams::default(),
+        );
+        self.dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("idx".to_string()),
+                &params,
+                true,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn make_rq_vector_index(&mut self, num_bits: u8) -> Result<()> {
+        let params = VectorIndexParams::with_ivf_rq_params(
+            MetricType::L2,
+            IvfBuildParams::new(2),
+            RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast),
         );
         self.dataset
             .create_index(
@@ -392,14 +416,6 @@ pub async fn assert_scan_slice_matches(
     Ok(())
 }
 
-pub fn batch_knn_two_queries() -> (FixedSizeListArray, Vec<f32>) {
-    let query_values = (32..96).map(|v| v as f32).collect::<Vec<_>>();
-    let queries =
-        FixedSizeListArray::try_new_from_values(Float32Array::from(query_values.clone()), 32)
-            .unwrap();
-    (queries, query_values)
-}
-
 pub fn assert_query_index_field(batch: &RecordBatch) {
     let schema = batch.schema();
     let field = schema.field(0);
@@ -435,4 +451,12 @@ pub fn find_filtered_read(plan: &dyn ExecutionPlan) -> Option<&FilteredReadExec>
         }
     }
     None
+}
+
+pub fn batch_knn_two_queries() -> (FixedSizeListArray, Vec<f32>) {
+    let query_values = (32..96).map(|v| v as f32).collect::<Vec<_>>();
+    let queries =
+        FixedSizeListArray::try_new_from_values(Float32Array::from(query_values.clone()), 32)
+            .unwrap();
+    (queries, query_values)
 }

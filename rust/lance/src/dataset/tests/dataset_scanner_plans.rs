@@ -976,13 +976,13 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[s@2 as s]
   Take: columns=\"i, _rowid, (s)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: i@0 > 10 AND i@0 < 20
-        LanceScan: uri..., projection=[i], row_id=true, row_addr=false, ordered=true, range=None"
+CoalesceBatchesExec: target_batch_size=8192
+  FilterExec: i@0 > 10 AND i@0 < 20
+    LanceScan: uri..., projection=[i], row_id=true, row_addr=false, ordered=true, range=None"
     } else {
         "ProjectionExec: expr=[s@2 as s]
   LanceRead: uri=..., projection=[s], source=stream(_rowid)
-    LanceRead: ..., projection=[i], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10) AND i < Int32(20), refine_filter=i > Int32(10) AND i < Int32(20)"
+LanceRead: ..., projection=[i], num_fragments=2, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10) AND i < Int32(20), refine_filter=i > Int32(10) AND i < Int32(20)"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1000,15 +1000,15 @@ async fn test_plans(
     log::info!("Test case: Late materialization");
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[i@0 as i, s@1 as s, vec@3 as vec]
-            Take: columns=\"i, s, _rowid, (vec)\"
-              CoalesceBatchesExec: target_batch_size=8192
-                FilterExec: s@1 IS NOT NULL
-                  LanceScan: uri..., projection=[i, s], row_id=true, row_addr=false, ordered=true, range=None"
+        Take: columns=\"i, s, _rowid, (vec)\"
+          CoalesceBatchesExec: target_batch_size=8192
+            FilterExec: s@1 IS NOT NULL
+              LanceScan: uri..., projection=[i, s], row_id=true, row_addr=false, ordered=true, range=None"
     } else {
         "ProjectionExec: expr=[i@0 as i, s@1 as s, vec@3 as vec]
   LanceRead: uri=..., projection=[vec], source=stream(_rowid)
-    LanceRead: uri=..., projection=[i, s], num_fragments=2, range_before=None, range_after=None, \
-    row_id=true, row_addr=false, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
+LanceRead: uri=..., projection=[i, s], num_fragments=2, range_before=None, range_after=None, \
+row_id=true, row_addr=false, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1022,7 +1022,7 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[i@0 as i, s@1 as s, vec@2 as vec]
   FilterExec: s@1 IS NOT NULL
-    LanceScan: uri..., projection=[i, s, vec], row_id=true, row_addr=false, ordered=true, range=None"
+LanceScan: uri..., projection=[i, s, vec], row_id=true, row_addr=false, ordered=true, range=None"
     } else {
         "ProjectionExec: expr=[i@0 as i, s@1 as s, vec@2 as vec]
   LanceRead: uri=..., projection=[i, s, vec], num_fragments=2, range_before=None, \
@@ -1043,14 +1043,14 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[i@2 as i, s@0 as s, vec@3 as vec]
   Take: columns=\"s, _rowid, (i), (vec)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: s@0 IS NOT NULL
-        LanceScan: uri..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None"
+CoalesceBatchesExec: target_batch_size=8192
+  FilterExec: s@0 IS NOT NULL
+    LanceScan: uri..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None"
     } else {
         "ProjectionExec: expr=[i@2 as i, s@0 as s, vec@3 as vec]
   LanceRead: uri=..., projection=[i, vec], source=stream(_rowid)
-    LanceRead: uri=..., projection=[s], num_fragments=2, range_before=None, \
-    range_after=None, row_id=true, row_addr=false, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
+LanceRead: uri=..., projection=[s], num_fragments=2, range_before=None, \
+range_after=None, row_id=true, row_addr=false, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1067,14 +1067,14 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[i@3 as i, s@0 as s, vec@1 as vec]
   Take: columns=\"s, vec, _rowid, (i)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: s@0 IS NOT NULL
-        LanceScan: uri..., projection=[s, vec], row_id=true, row_addr=false, ordered=true, range=None"
+CoalesceBatchesExec: target_batch_size=8192
+  FilterExec: s@0 IS NOT NULL
+    LanceScan: uri..., projection=[s, vec], row_id=true, row_addr=false, ordered=true, range=None"
     } else {
         "ProjectionExec: expr=[i@3 as i, s@0 as s, vec@1 as vec]
   LanceRead: uri=..., projection=[i], source=stream(_rowid)
-    LanceRead: uri=..., projection=[s, vec], num_fragments=2, range_before=None, range_after=None, \
-    row_id=true, row_addr=false, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
+LanceRead: uri=..., projection=[s, vec], num_fragments=2, range_before=None, range_after=None, \
+row_id=true, row_addr=false, full_filter=s IS NOT NULL, refine_filter=s IS NOT NULL"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1094,7 +1094,7 @@ async fn test_plans(
         "LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=false, range=None"
     } else {
         "LanceRead: uri=..., projection=[s], num_fragments=2, range_before=None, range_after=None, row_id=true, \
-            row_addr=false, full_filter=--, refine_filter=--"
+        row_addr=false, full_filter=--, refine_filter=--"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1110,19 +1110,19 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
   Take: columns=\"vec, _rowid, _distance, (i), (s)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: _distance@2 IS NOT NULL
-        SortExec: TopK(fetch=5), expr=...
-          KNNVectorDistance: metric=l2
-            LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None"
+CoalesceBatchesExec: target_batch_size=8192
+  FilterExec: _distance@2 IS NOT NULL
+    SortExec: TopK(fetch=5), expr=...
+      KNNVectorDistance: metric=l2
+        LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None"
     } else {
         "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
   LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
-    FilterExec: _distance@2 IS NOT NULL
-      SortExec: TopK(fetch=5), expr=...
-        KNNVectorDistance: metric=l2
-          LanceRead: uri=..., projection=[vec], num_fragments=2, range_before=None, range_after=None, \
-          row_id=true, row_addr=false, full_filter=--, refine_filter=--"
+FilterExec: _distance@2 IS NOT NULL
+  SortExec: TopK(fetch=5), expr=...
+    KNNVectorDistance: metric=l2
+      LanceRead: uri=..., projection=[vec], num_fragments=2, range_before=None, range_after=None, \
+      row_id=true, row_addr=false, full_filter=--, refine_filter=--"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1138,21 +1138,21 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
   Take: columns=\"vec, _rowid, _distance, (i), (s)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      GlobalLimitExec: skip=0, fetch=1
-        FilterExec: _distance@2 IS NOT NULL
-          SortExec: TopK(fetch=5), expr=...
-            KNNVectorDistance: metric=l2
-              LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None"
+CoalesceBatchesExec: target_batch_size=8192
+  GlobalLimitExec: skip=0, fetch=1
+    FilterExec: _distance@2 IS NOT NULL
+      SortExec: TopK(fetch=5), expr=...
+        KNNVectorDistance: metric=l2
+          LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None"
     } else {
         "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
   LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
-    GlobalLimitExec: skip=0, fetch=1
-      FilterExec: _distance@2 IS NOT NULL
-        SortExec: TopK(fetch=5), expr=...
-          KNNVectorDistance: metric=l2
-            LanceRead: uri=..., projection=[vec], num_fragments=2, range_before=None, range_after=None, \
-            row_id=true, row_addr=false, full_filter=--, refine_filter=--"
+GlobalLimitExec: skip=0, fetch=1
+  FilterExec: _distance@2 IS NOT NULL
+    SortExec: TopK(fetch=5), expr=...
+      KNNVectorDistance: metric=l2
+        LanceRead: uri=..., projection=[vec], num_fragments=2, range_before=None, range_after=None, \
+        row_id=true, row_addr=false, full_filter=--, refine_filter=--"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1168,16 +1168,16 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
   Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      SortExec: TopK(fetch=42), expr=...
-        ANNSubIndex: name=..., k=42, deltas=1, metric=L2
-          ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
+CoalesceBatchesExec: target_batch_size=8192
+  SortExec: TopK(fetch=42), expr=...
+    ANNSubIndex: name=..., k=42, deltas=1, metric=L2
+      ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
     } else {
         "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
   LanceRead: uri=..., projection=[i, s, vec], source=stream(_rowid)
-    SortExec: TopK(fetch=42), expr=...
-      ANNSubIndex: name=..., k=42, deltas=1, metric=L2
-        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
+SortExec: TopK(fetch=42), expr=...
+  ANNSubIndex: name=..., k=42, deltas=1, metric=L2
+    ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1190,25 +1190,25 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, (i), (s)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: _distance@... IS NOT NULL
-        SortExec: TopK(fetch=10), expr=...
-          KNNVectorDistance: metric=l2
-            Take: columns=\"_distance, _rowid, (vec)\"
-              CoalesceBatchesExec: target_batch_size=8192
-                SortExec: TopK(fetch=40), expr=...
-                  ANNSubIndex: name=..., k=40, deltas=1, metric=L2
-                    ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
-    } else {
-        "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
-    FilterExec: _distance@... IS NOT NULL
-      SortExec: TopK(fetch=10), expr=...
-        KNNVectorDistance: metric=l2
-          LanceRead: uri=..., projection=[vec], source=stream(_rowid)
+CoalesceBatchesExec: target_batch_size=8192
+  FilterExec: _distance@... IS NOT NULL
+    SortExec: TopK(fetch=10), expr=...
+      KNNVectorDistance: metric=l2
+        Take: columns=\"_distance, _rowid, (vec)\"
+          CoalesceBatchesExec: target_batch_size=8192
             SortExec: TopK(fetch=40), expr=...
               ANNSubIndex: name=..., k=40, deltas=1, metric=L2
                 ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
+    } else {
+        "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+  LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
+FilterExec: _distance@... IS NOT NULL
+  SortExec: TopK(fetch=10), expr=...
+    KNNVectorDistance: metric=l2
+      LanceRead: uri=..., projection=[vec], source=stream(_rowid)
+        SortExec: TopK(fetch=40), expr=...
+          ANNSubIndex: name=..., k=40, deltas=1, metric=L2
+            ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1222,19 +1222,19 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
   Take: columns=\"vec, _rowid, _distance, (i), (s)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: _distance@... IS NOT NULL
-        SortExec: TopK(fetch=13), expr=...
-          KNNVectorDistance: metric=l2
-            LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None"
+CoalesceBatchesExec: target_batch_size=8192
+  FilterExec: _distance@... IS NOT NULL
+    SortExec: TopK(fetch=13), expr=...
+      KNNVectorDistance: metric=l2
+        LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None"
     } else {
         "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
   LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
-    FilterExec: _distance@... IS NOT NULL
-      SortExec: TopK(fetch=13), expr=...
-        KNNVectorDistance: metric=l2
-          LanceRead: uri=..., projection=[vec], num_fragments=2, range_before=None, range_after=None, \
-          row_id=true, row_addr=false, full_filter=--, refine_filter=--"
+FilterExec: _distance@... IS NOT NULL
+  SortExec: TopK(fetch=13), expr=...
+    KNNVectorDistance: metric=l2
+      LanceRead: uri=..., projection=[vec], num_fragments=2, range_before=None, range_after=None, \
+      row_id=true, row_addr=false, full_filter=--, refine_filter=--"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1247,21 +1247,21 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[s@3 as s, vec@4 as vec, _distance@0 as _distance, _rowid@1 as _rowid]
   Take: columns=\"_distance, _rowid, i, (s), (vec)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: i@2 > 10
-        Take: columns=\"_distance, _rowid, (i)\"
-          CoalesceBatchesExec: target_batch_size=8192
-            SortExec: TopK(fetch=17), expr=...
-              ANNSubIndex: name=..., k=17, deltas=1, metric=L2
-                ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
-    } else {
-        "ProjectionExec: expr=[s@3 as s, vec@4 as vec, _distance@0 as _distance, _rowid@1 as _rowid]
-  LanceRead: uri=..., projection=[s, vec], source=stream(_rowid)
-    FilterExec: i@2 > 10
-      LanceRead: uri=..., projection=[i], source=stream(_rowid)
+CoalesceBatchesExec: target_batch_size=8192
+  FilterExec: i@2 > 10
+    Take: columns=\"_distance, _rowid, (i)\"
+      CoalesceBatchesExec: target_batch_size=8192
         SortExec: TopK(fetch=17), expr=...
           ANNSubIndex: name=..., k=17, deltas=1, metric=L2
             ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
+    } else {
+        "ProjectionExec: expr=[s@3 as s, vec@4 as vec, _distance@0 as _distance, _rowid@1 as _rowid]
+  LanceRead: uri=..., projection=[s, vec], source=stream(_rowid)
+FilterExec: i@2 > 10
+  LanceRead: uri=..., projection=[i], source=stream(_rowid)
+    SortExec: TopK(fetch=17), expr=...
+      ANNSubIndex: name=..., k=17, deltas=1, metric=L2
+        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1280,20 +1280,20 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
   Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      SortExec: TopK(fetch=17), expr=...
-        ANNSubIndex: name=..., k=17, deltas=1, metric=L2
-          ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-          FilterExec: i@0 > 10
-            LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"
+CoalesceBatchesExec: target_batch_size=8192
+  SortExec: TopK(fetch=17), expr=...
+    ANNSubIndex: name=..., k=17, deltas=1, metric=L2
+      ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
+      FilterExec: i@0 > 10
+        LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"
     } else {
         "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
   LanceRead: uri=..., projection=[i, s, vec], source=stream(_rowid)
-    SortExec: TopK(fetch=17), expr=...
-      ANNSubIndex: name=..., k=17, deltas=1, metric=L2
-        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-        LanceRead: uri=..., projection=[], num_fragments=2, range_before=None, range_after=None, \
-        row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)
+SortExec: TopK(fetch=17), expr=...
+  ANNSubIndex: name=..., k=17, deltas=1, metric=L2
+    ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
+    LanceRead: uri=..., projection=[], num_fragments=2, range_before=None, range_after=None, \
+    row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)
 "
     };
     assert_plan_equals(
@@ -1313,39 +1313,39 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, (i), (s)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: _distance@... IS NOT NULL
-        SortExec: TopK(fetch=6), expr=...
-          KNNVectorDistance: metric=l2
-            CoalescePartitionsExec
-              UnionExec
-                ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
-                  FilterExec: _distance@... IS NOT NULL
-                    SortExec: TopK(fetch=6), expr=...
-                      KNNVectorDistance: metric=l2
-                        LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
-                Take: columns=\"_distance, _rowid, (vec)\"
-                  CoalesceBatchesExec: target_batch_size=8192
-                    SortExec: TopK(fetch=6), expr=...
-                      ANNSubIndex: name=..., k=6, deltas=1, metric=L2
-                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
-    } else {
-        "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
-    FilterExec: _distance@... IS NOT NULL
-      SortExec: TopK(fetch=6), expr=...
-        KNNVectorDistance: metric=l2
-          CoalescePartitionsExec
-            UnionExec
-              ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
-                FilterExec: _distance@... IS NOT NULL
-                  SortExec: TopK(fetch=6), expr=...
-                    KNNVectorDistance: metric=l2
-                      LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
-              LanceRead: uri=..., projection=[vec], source=stream(_rowid)
+CoalesceBatchesExec: target_batch_size=8192
+  FilterExec: _distance@... IS NOT NULL
+    SortExec: TopK(fetch=6), expr=...
+      KNNVectorDistance: metric=l2
+        CoalescePartitionsExec
+          UnionExec
+            ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
+              FilterExec: _distance@... IS NOT NULL
+                SortExec: TopK(fetch=6), expr=...
+                  KNNVectorDistance: metric=l2
+                    LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
+            Take: columns=\"_distance, _rowid, (vec)\"
+              CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=6), expr=...
                   ANNSubIndex: name=..., k=6, deltas=1, metric=L2
                     ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
+    } else {
+        "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+  LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
+FilterExec: _distance@... IS NOT NULL
+  SortExec: TopK(fetch=6), expr=...
+    KNNVectorDistance: metric=l2
+      CoalescePartitionsExec
+        UnionExec
+          ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
+            FilterExec: _distance@... IS NOT NULL
+              SortExec: TopK(fetch=6), expr=...
+                KNNVectorDistance: metric=l2
+                  LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
+          LanceRead: uri=..., projection=[vec], source=stream(_rowid)
+            SortExec: TopK(fetch=6), expr=...
+              ANNSubIndex: name=..., k=6, deltas=1, metric=L2
+                ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1361,30 +1361,10 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, i, (s)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: i@3 > 10
-        Take: columns=\"_rowid, vec, _distance, (i)\"
-          CoalesceBatchesExec: target_batch_size=8192
-            FilterExec: _distance@... IS NOT NULL
-              SortExec: TopK(fetch=15), expr=...
-                KNNVectorDistance: metric=l2
-                  CoalescePartitionsExec
-                    UnionExec
-                      ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
-                        FilterExec: _distance@... IS NOT NULL
-                          SortExec: TopK(fetch=15), expr=...
-                            KNNVectorDistance: metric=l2
-                              LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
-                      Take: columns=\"_distance, _rowid, (vec)\"
-                        CoalesceBatchesExec: target_batch_size=8192
-                          SortExec: TopK(fetch=15), expr=...
-                            ANNSubIndex: name=..., k=15, deltas=1, metric=L2
-                              ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
-    } else {
-        "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  LanceRead: uri=..., projection=[s], source=stream(_rowid)
-    FilterExec: i@3 > 10
-      LanceRead: uri=..., projection=[i], source=stream(_rowid)
+CoalesceBatchesExec: target_batch_size=8192
+  FilterExec: i@3 > 10
+    Take: columns=\"_rowid, vec, _distance, (i)\"
+      CoalesceBatchesExec: target_batch_size=8192
         FilterExec: _distance@... IS NOT NULL
           SortExec: TopK(fetch=15), expr=...
             KNNVectorDistance: metric=l2
@@ -1395,10 +1375,30 @@ async fn test_plans(
                       SortExec: TopK(fetch=15), expr=...
                         KNNVectorDistance: metric=l2
                           LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
-                  LanceRead: uri=..., projection=[vec], source=stream(_rowid)
-                    SortExec: TopK(fetch=15), expr=...
-                      ANNSubIndex: name=..., k=15, deltas=1, metric=L2
-                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
+                  Take: columns=\"_distance, _rowid, (vec)\"
+                    CoalesceBatchesExec: target_batch_size=8192
+                      SortExec: TopK(fetch=15), expr=...
+                        ANNSubIndex: name=..., k=15, deltas=1, metric=L2
+                          ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
+    } else {
+        "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
+FilterExec: i@3 > 10
+  LanceRead: uri=..., projection=[i], source=stream(_rowid)
+    FilterExec: _distance@... IS NOT NULL
+      SortExec: TopK(fetch=15), expr=...
+        KNNVectorDistance: metric=l2
+          CoalescePartitionsExec
+            UnionExec
+              ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
+                FilterExec: _distance@... IS NOT NULL
+                  SortExec: TopK(fetch=15), expr=...
+                    KNNVectorDistance: metric=l2
+                      LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
+              LanceRead: uri=..., projection=[vec], source=stream(_rowid)
+                SortExec: TopK(fetch=15), expr=...
+                  ANNSubIndex: name=..., k=15, deltas=1, metric=L2
+                    ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1412,45 +1412,45 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, (i), (s)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: _distance@... IS NOT NULL
-        SortExec: TopK(fetch=5), expr=...
-          KNNVectorDistance: metric=l2
-            CoalescePartitionsExec
-              UnionExec
-                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
-                  FilterExec: _distance@... IS NOT NULL
-                    SortExec: TopK(fetch=5), expr=...
-                      KNNVectorDistance: metric=l2
-                        FilterExec: i@1 > 10
-                          LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
-                Take: columns=\"_distance, _rowid, (vec)\"
-                  CoalesceBatchesExec: target_batch_size=8192
-                    SortExec: TopK(fetch=5), expr=...
-                      ANNSubIndex: name=..., k=5, deltas=1, metric=L2
-                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-                        FilterExec: i@0 > 10
-                          LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"
-    } else {
-        "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
-    FilterExec: _distance@... IS NOT NULL
-      SortExec: TopK(fetch=5), expr=...
-        KNNVectorDistance: metric=l2
-          CoalescePartitionsExec
-            UnionExec
-              ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
-                FilterExec: _distance@... IS NOT NULL
-                  SortExec: TopK(fetch=5), expr=...
-                    KNNVectorDistance: metric=l2
-                      FilterExec: i@1 > 10
-                        LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
-              LanceRead: uri=..., projection=[vec], source=stream(_rowid)
+CoalesceBatchesExec: target_batch_size=8192
+  FilterExec: _distance@... IS NOT NULL
+    SortExec: TopK(fetch=5), expr=...
+      KNNVectorDistance: metric=l2
+        CoalescePartitionsExec
+          UnionExec
+            ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+              FilterExec: _distance@... IS NOT NULL
+                SortExec: TopK(fetch=5), expr=...
+                  KNNVectorDistance: metric=l2
+                    FilterExec: i@1 > 10
+                      LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
+            Take: columns=\"_distance, _rowid, (vec)\"
+              CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=5), expr=...
                   ANNSubIndex: name=..., k=5, deltas=1, metric=L2
                     ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-                    LanceRead: uri=..., projection=[], num_fragments=2, range_before=None, range_after=None, \
-                      row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)"
+                    FilterExec: i@0 > 10
+                      LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"
+    } else {
+        "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+  LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
+FilterExec: _distance@... IS NOT NULL
+  SortExec: TopK(fetch=5), expr=...
+    KNNVectorDistance: metric=l2
+      CoalescePartitionsExec
+        UnionExec
+          ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+            FilterExec: _distance@... IS NOT NULL
+              SortExec: TopK(fetch=5), expr=...
+                KNNVectorDistance: metric=l2
+                  FilterExec: i@1 > 10
+                    LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
+          LanceRead: uri=..., projection=[vec], source=stream(_rowid)
+            SortExec: TopK(fetch=5), expr=...
+              ANNSubIndex: name=..., k=5, deltas=1, metric=L2
+                ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
+                LanceRead: uri=..., projection=[], num_fragments=2, range_before=None, range_after=None, \
+                  row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1476,18 +1476,18 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
   Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      SortExec: TopK(fetch=5), expr=...
-        ANNSubIndex: name=..., k=5, deltas=1, metric=L2
-          ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-          ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
+CoalesceBatchesExec: target_batch_size=8192
+  SortExec: TopK(fetch=5), expr=...
+    ANNSubIndex: name=..., k=5, deltas=1, metric=L2
+      ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
+      ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
     } else {
         "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
   LanceRead: uri=..., projection=[i, s, vec], source=stream(_rowid)
-    SortExec: TopK(fetch=5), expr=...
-      ANNSubIndex: name=..., k=5, deltas=1, metric=L2
-        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-        ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
+SortExec: TopK(fetch=5), expr=...
+  ANNSubIndex: name=..., k=5, deltas=1, metric=L2
+    ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
+    ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1505,20 +1505,20 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
   Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      SortExec: TopK(fetch=5), expr=...
-        ANNSubIndex: name=..., k=5, deltas=1, metric=L2
-          ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-          FilterExec: i@0 > 10
-            LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"
+CoalesceBatchesExec: target_batch_size=8192
+  SortExec: TopK(fetch=5), expr=...
+    ANNSubIndex: name=..., k=5, deltas=1, metric=L2
+      ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
+      FilterExec: i@0 > 10
+        LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"
     } else {
         "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
   LanceRead: uri=..., projection=[i, s, vec], source=stream(_rowid)
-    SortExec: TopK(fetch=5), expr=...
-      ANNSubIndex: name=..., k=5, deltas=1, metric=L2
-        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-        LanceRead: uri=..., projection=[], num_fragments=3, range_before=None, \
-        range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)"
+SortExec: TopK(fetch=5), expr=...
+  ANNSubIndex: name=..., k=5, deltas=1, metric=L2
+    ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
+    LanceRead: uri=..., projection=[], num_fragments=3, range_before=None, \
+    range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1539,43 +1539,43 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, (i), (s)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: _distance@... IS NOT NULL
-        SortExec: TopK(fetch=8), expr=...
-          KNNVectorDistance: metric=l2
-            CoalescePartitionsExec
-              UnionExec
-                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
-                  FilterExec: _distance@... IS NOT NULL
-                    SortExec: TopK(fetch=8), expr=...
-                      KNNVectorDistance: metric=l2
-                        FilterExec: i@1 > 10
-                          LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
-                Take: columns=\"_distance, _rowid, (vec)\"
-                  CoalesceBatchesExec: target_batch_size=8192
-                    SortExec: TopK(fetch=8), expr=...
-                      ANNSubIndex: name=..., k=8, deltas=1, metric=L2
-                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-                        ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
-    } else {
-        "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
-    FilterExec: _distance@... IS NOT NULL
-      SortExec: TopK(fetch=8), expr=...
-        KNNVectorDistance: metric=l2
-          CoalescePartitionsExec
-            UnionExec
-              ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
-                FilterExec: _distance@... IS NOT NULL
-                  SortExec: TopK(fetch=8), expr=...
-                    KNNVectorDistance: metric=l2
-                      FilterExec: i@1 > 10
-                        LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
-              LanceRead: uri=..., projection=[vec], source=stream(_rowid)
+CoalesceBatchesExec: target_batch_size=8192
+  FilterExec: _distance@... IS NOT NULL
+    SortExec: TopK(fetch=8), expr=...
+      KNNVectorDistance: metric=l2
+        CoalescePartitionsExec
+          UnionExec
+            ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+              FilterExec: _distance@... IS NOT NULL
+                SortExec: TopK(fetch=8), expr=...
+                  KNNVectorDistance: metric=l2
+                    FilterExec: i@1 > 10
+                      LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
+            Take: columns=\"_distance, _rowid, (vec)\"
+              CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=8), expr=...
                   ANNSubIndex: name=..., k=8, deltas=1, metric=L2
                     ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
                     ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
+    } else {
+        "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+  LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
+FilterExec: _distance@... IS NOT NULL
+  SortExec: TopK(fetch=8), expr=...
+    KNNVectorDistance: metric=l2
+      CoalescePartitionsExec
+        UnionExec
+          ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+            FilterExec: _distance@... IS NOT NULL
+              SortExec: TopK(fetch=8), expr=...
+                KNNVectorDistance: metric=l2
+                  FilterExec: i@1 > 10
+                    LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
+          LanceRead: uri=..., projection=[vec], source=stream(_rowid)
+            SortExec: TopK(fetch=8), expr=...
+              ANNSubIndex: name=..., k=8, deltas=1, metric=L2
+                ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
+                ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1594,43 +1594,43 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, (i), (s)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: _distance@... IS NOT NULL
-        SortExec: TopK(fetch=11), expr=...
-          KNNVectorDistance: metric=l2
-            CoalescePartitionsExec
-              UnionExec
-                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
-                  FilterExec: _distance@... IS NOT NULL
-                    SortExec: TopK(fetch=11), expr=...
-                      KNNVectorDistance: metric=l2
-                        FilterExec: i@1 > 10
-                          LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
-                Take: columns=\"_distance, _rowid, (vec)\"
-                  CoalesceBatchesExec: target_batch_size=8192
-                    SortExec: TopK(fetch=11), expr=...
-                      ANNSubIndex: name=..., k=11, deltas=1, metric=L2
-                        ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
-                        ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
-    } else {
-        "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
-    FilterExec: _distance@... IS NOT NULL
-      SortExec: TopK(fetch=11), expr=...
-        KNNVectorDistance: metric=l2
-          CoalescePartitionsExec
-            UnionExec
-              ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
-                FilterExec: _distance@... IS NOT NULL
-                  SortExec: TopK(fetch=11), expr=...
-                    KNNVectorDistance: metric=l2
-                      FilterExec: i@1 > 10
-                        LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
-              LanceRead: uri=..., projection=[vec], source=stream(_rowid)
+CoalesceBatchesExec: target_batch_size=8192
+  FilterExec: _distance@... IS NOT NULL
+    SortExec: TopK(fetch=11), expr=...
+      KNNVectorDistance: metric=l2
+        CoalescePartitionsExec
+          UnionExec
+            ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+              FilterExec: _distance@... IS NOT NULL
+                SortExec: TopK(fetch=11), expr=...
+                  KNNVectorDistance: metric=l2
+                    FilterExec: i@1 > 10
+                      LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
+            Take: columns=\"_distance, _rowid, (vec)\"
+              CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=11), expr=...
                   ANNSubIndex: name=..., k=11, deltas=1, metric=L2
                     ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
                     ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
+    } else {
+        "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
+  LanceRead: uri=..., projection=[i, s], source=stream(_rowid)
+FilterExec: _distance@... IS NOT NULL
+  SortExec: TopK(fetch=11), expr=...
+    KNNVectorDistance: metric=l2
+      CoalescePartitionsExec
+        UnionExec
+          ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+            FilterExec: _distance@... IS NOT NULL
+              SortExec: TopK(fetch=11), expr=...
+                KNNVectorDistance: metric=l2
+                  FilterExec: i@1 > 10
+                    LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false, range=None
+          LanceRead: uri=..., projection=[vec], source=stream(_rowid)
+            SortExec: TopK(fetch=11), expr=...
+              ANNSubIndex: name=..., k=11, deltas=1, metric=L2
+                ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1
+                ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
     };
     dataset.make_scalar_index().await?;
     assert_plan_equals(
@@ -1651,12 +1651,12 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[s@1 as s]
   Take: columns=\"_rowid, (s)\"
-    CoalesceBatchesExec: target_batch_size=8192
-      MaterializeIndex: query=[i > 10]@i_idx(BTree)"
+CoalesceBatchesExec: target_batch_size=8192
+  MaterializeIndex: query=[i > 10]@i_idx(BTree)"
     } else {
         "LanceRead: uri=..., projection=[s], num_fragments=4, range_before=None, \
-            range_after=None, row_id=false, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-              ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
+        range_after=None, row_id=false, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+          ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1676,8 +1676,8 @@ async fn test_plans(
             },
             "ProjectionExec: expr=[s@2 as s]
   LanceRead: uri=..., projection=[s], source=stream(_rowid)
-    LanceRead: uri=..., projection=[i], num_fragments=4, range_before=None, \
-    range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)",
+LanceRead: uri=..., projection=[i], num_fragments=4, range_before=None, \
+range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)",
         )
         .await?;
     }
@@ -1686,11 +1686,11 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[_rowaddr@0 as _rowaddr]
   AddRowAddrExec
-    MaterializeIndex: query=[i > 10]@i_idx(BTree)"
+MaterializeIndex: query=[i > 10]@i_idx(BTree)"
     } else {
         "LanceRead: uri=..., projection=[], num_fragments=4, range_before=None, \
-            range_after=None, row_id=false, row_addr=true, full_filter=i > Int32(10), refine_filter=--
-              ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
+        range_after=None, row_id=false, row_addr=true, full_filter=i > Int32(10), refine_filter=--
+          ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1709,16 +1709,16 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[s@1 as s]
   UnionExec
-    Take: columns=\"_rowid, (s)\"
-      CoalesceBatchesExec: target_batch_size=8192
-        MaterializeIndex: query=[i > 10]@i_idx(BTree)
-    ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
-      FilterExec: i@0 > 10
-        LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false, range=None"
+Take: columns=\"_rowid, (s)\"
+  CoalesceBatchesExec: target_batch_size=8192
+    MaterializeIndex: query=[i > 10]@i_idx(BTree)
+ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
+  FilterExec: i@0 > 10
+    LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false, range=None"
     } else {
         "LanceRead: uri=..., projection=[s], num_fragments=5, range_before=None, \
-            range_after=None, row_id=false, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-              ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
+        range_after=None, row_id=false, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+          ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1731,15 +1731,15 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[_rowaddr@0 as _rowaddr]
   UnionExec
-    AddRowAddrExec
-      MaterializeIndex: query=[i > 10]@i_idx(BTree)
-    ProjectionExec: expr=[_rowaddr@2 as _rowaddr, _rowid@1 as _rowid]
-      FilterExec: i@0 > 10
-        LanceScan: uri=..., projection=[i], row_id=true, row_addr=true, ordered=false, range=None"
+AddRowAddrExec
+  MaterializeIndex: query=[i > 10]@i_idx(BTree)
+ProjectionExec: expr=[_rowaddr@2 as _rowaddr, _rowid@1 as _rowid]
+  FilterExec: i@0 > 10
+    LanceScan: uri=..., projection=[i], row_id=true, row_addr=true, ordered=false, range=None"
     } else {
         "LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, \
-            range_after=None, row_id=false, row_addr=true, full_filter=i > Int32(10), refine_filter=--
-              ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
+        range_after=None, row_id=false, row_addr=true, full_filter=i > Int32(10), refine_filter=--
+          ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1759,17 +1759,17 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         "ProjectionExec: expr=[regexp_match(s@1, .*) as matches]
   UnionExec
-    Take: columns=\"_rowid, (s)\"
-      CoalesceBatchesExec: target_batch_size=8192
-        MaterializeIndex: query=[i > 10]@i_idx(BTree)
-    ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
-      FilterExec: i@0 > 10
-        LanceScan: uri=..., row_id=true, row_addr=false, ordered=false, range=None"
+Take: columns=\"_rowid, (s)\"
+  CoalesceBatchesExec: target_batch_size=8192
+    MaterializeIndex: query=[i > 10]@i_idx(BTree)
+ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
+  FilterExec: i@0 > 10
+    LanceScan: uri=..., row_id=true, row_addr=false, ordered=false, range=None"
     } else {
         "ProjectionExec: expr=[regexp_match(s@0, .*) as matches]
   LanceRead: uri=..., projection=[s], num_fragments=5, range_before=None, \
   range_after=None, row_id=false, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-    ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
+ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1789,12 +1789,12 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
-    CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: column=s, query=[hello]"#
+CoalesceBatchesExec: target_batch_size=8192
+  MatchQuery: column=s, query=[hello]"#
     } else {
         r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   LanceRead: uri=..., projection=[s], source=stream(_rowid)
-    MatchQuery: column=s, query=[hello]"#
+MatchQuery: column=s, query=[hello]"#
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1811,12 +1811,12 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
-    CoalesceBatchesExec: target_batch_size=8192
-      PhraseQuery: column=s, query=hello world"#
+CoalesceBatchesExec: target_batch_size=8192
+  PhraseQuery: column=s, query=hello world"#
     } else {
         r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   LanceRead: uri=..., projection=[s], source=stream(_rowid)
-    PhraseQuery: column=s, query=hello world"#
+PhraseQuery: column=s, query=hello world"#
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1834,12 +1834,12 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
-    CoalesceBatchesExec: target_batch_size=8192
-      CompoundFtsScorer: query=Boosting(positive=Match(MatchQuery { column: Some("s"), terms: "hello", ... }), negative=Match(MatchQuery { column: Some("s"), terms: "world", ... }), negative_boost=1)"#
+CoalesceBatchesExec: target_batch_size=8192
+  CompoundFtsScorer: query=Boosting(positive=Match(MatchQuery { column: Some("s"), terms: "hello", ... }), negative=Match(MatchQuery { column: Some("s"), terms: "world", ... }), negative_boost=1)"#
     } else {
         r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   LanceRead: uri=..., projection=[s], source=stream(_rowid)
-    CompoundFtsScorer: query=Boosting(positive=Match(MatchQuery { column: Some("s"), terms: "hello", ... }), negative=Match(MatchQuery { column: Some("s"), terms: "world", ... }), negative_boost=1)"#
+CompoundFtsScorer: query=Boosting(positive=Match(MatchQuery { column: Some("s"), terms: "hello", ... }), negative=Match(MatchQuery { column: Some("s"), terms: "world", ... }), negative_boost=1)"#
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1859,20 +1859,20 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
-    CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: column=s, query=[hello]
-        CoalescePartitionsExec
-          UnionExec
-            MaterializeIndex: query=[i > 10]@i_idx(BTree)
-            ProjectionExec: expr=[_rowid@1 as _rowid]
-              FilterExec: i@0 > 10
-                LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"#
+CoalesceBatchesExec: target_batch_size=8192
+  MatchQuery: column=s, query=[hello]
+    CoalescePartitionsExec
+      UnionExec
+        MaterializeIndex: query=[i > 10]@i_idx(BTree)
+        ProjectionExec: expr=[_rowid@1 as _rowid]
+          FilterExec: i@0 > 10
+            LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"#
     } else {
         r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   LanceRead: uri=..., projection=[s], source=stream(_rowid)
-    MatchQuery: column=s, query=[hello]
-      LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-        ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"#
+MatchQuery: column=s, query=[hello]
+  LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+    ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"#
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1888,29 +1888,30 @@ async fn test_plans(
     .await?;
 
     log::info!("Test case: Full text search with unindexed rows");
-    // The flat-FTS path now reads through `FilteredReadExec`, matching the
-    // brute-force KNN path. With no prefilter the scan still produces no
-    // pushdown, but the operator differs by storage version: legacy emits
-    // a `LanceScan`, v2 emits a `LanceRead` with empty filters.
+    // MatchCorpus initializes shared BM25 statistics before either child scores
+    // candidates. The flat input reads through FilteredReadExec: legacy emits
+    // a LanceScan, v2 emits a LanceRead with empty filters.
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
-    CoalesceBatchesExec: target_batch_size=8192
-      SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        CoalescePartitionsExec
-          UnionExec
-            MatchQuery: column=s, query=[hello]
-            FlatMatchQuery: column=s, query=hello
-              LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None"#
-    } else {
-        r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], source=stream(_rowid)
+CoalesceBatchesExec: target_batch_size=8192
+  MatchCorpus
     SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
       CoalescePartitionsExec
         UnionExec
           MatchQuery: column=s, query=[hello]
           FlatMatchQuery: column=s, query=hello
-            LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--"#
+            LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None"#
+    } else {
+        r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
+MatchCorpus
+  SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+    CoalescePartitionsExec
+      UnionExec
+        MatchQuery: column=s, query=[hello]
+        FlatMatchQuery: column=s, query=hello
+          LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--"#
     };
     dataset.append_new_data().await?;
     assert_plan_equals(
@@ -1928,12 +1929,12 @@ async fn test_plans(
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
-    CoalesceBatchesExec: target_batch_size=8192
-      MatchQuery: column=s, query=[hello]"#
+CoalesceBatchesExec: target_batch_size=8192
+  MatchQuery: column=s, query=[hello]"#
     } else {
         r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   LanceRead: uri=..., projection=[s], source=stream(_rowid)
-    MatchQuery: column=s, query=[hello]"#
+MatchQuery: column=s, query=[hello]"#
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -1950,45 +1951,46 @@ async fn test_plans(
     .await?;
 
     log::info!("Test case: Full text search with unindexed rows and prefilter");
-    // After routing flat FTS through `FilteredReadExec`, the BTree on `i`
-    // pushes into the unindexed-fragment scan too — no more `FilterExec` on
-    // top of an unfiltered `LanceScan`. Legacy uses the `MaterializeIndex`
-    // shape, v2 uses `LanceRead` with `full_filter` set.
+    // The shared scorer reads the full unindexed text corpus for BM25 statistics.
+    // Keep the BTree prefilter in separate candidate inputs so it restricts
+    // emitted matches without changing corpus statistics.
     let expected = if data_storage_version == LanceFileVersion::Legacy {
         r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   Take: columns="_rowid, _score, (s)"
-    CoalesceBatchesExec: target_batch_size=8192
-      SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        CoalescePartitionsExec
-          UnionExec
-            MatchQuery: column=s, query=[hello]
-              CoalescePartitionsExec
-                UnionExec
-                  MaterializeIndex: query=[i > 10]@i_idx(BTree)
-                  ProjectionExec: expr=[_rowid@1 as _rowid]
-                    FilterExec: i@0 > 10
-                      LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None
-            FlatMatchQuery: column=s, query=hello
-              CoalescePartitionsExec
-                UnionExec
-                  Take: columns="_rowid, (s)"
-                    CoalesceBatchesExec: target_batch_size=8192
-                      MaterializeIndex: query=[i > 10]@i_idx(BTree)
-                  ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
-                    FilterExec: i@0 > 10
-                      LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false, range=None"#
-    } else {
-        r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], source=stream(_rowid)
+CoalesceBatchesExec: target_batch_size=8192
+  MatchCorpus
     SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
       CoalescePartitionsExec
         UnionExec
           MatchQuery: column=s, query=[hello]
-            LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-              ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
+            CoalescePartitionsExec
+              UnionExec
+                MaterializeIndex: query=[i > 10]@i_idx(BTree)
+                ProjectionExec: expr=[_rowid@1 as _rowid]
+                  FilterExec: i@0 > 10
+                    LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None
           FlatMatchQuery: column=s, query=hello
-            LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
-              ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"#
+            LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None
+            CoalescePartitionsExec
+              UnionExec
+                MaterializeIndex: query=[i > 10]@i_idx(BTree)
+                ProjectionExec: expr=[_rowid@1 as _rowid]
+                  FilterExec: i@0 > 10
+                    LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"#
+    } else {
+        r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+  LanceRead: uri=..., projection=[s], source=stream(_rowid)
+MatchCorpus
+  SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+    CoalescePartitionsExec
+      UnionExec
+        MatchQuery: column=s, query=[hello]
+          LanceRead: uri=..., projection=[], num_fragments=5, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+            ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
+        FlatMatchQuery: column=s, query=hello
+          LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--
+          LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=--
+            ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"#
     };
     assert_plan_equals(
         &dataset.dataset,
@@ -2025,8 +2027,8 @@ async fn test_fast_search_plan() {
                 .project(&["_distance", "_rowid"])
         },
         "SortExec: TopK(fetch=32), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
-    ANNSubIndex: name=idx, k=32, deltas=1, metric=L2
-      ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1",
+ANNSubIndex: name=idx, k=32, deltas=1, metric=L2
+  ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1",
     )
     .await
     .unwrap();
@@ -2040,8 +2042,8 @@ async fn test_fast_search_plan() {
                 .project(&["_distance", "_rowid"])
         },
         "SortExec: TopK(fetch=33), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
-    ANNSubIndex: name=idx, k=33, deltas=1, metric=L2
-      ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1",
+ANNSubIndex: name=idx, k=33, deltas=1, metric=L2
+  ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1",
     )
     .await
     .unwrap();
@@ -2056,19 +2058,19 @@ async fn test_fast_search_plan() {
         },
         "ProjectionExec: expr=[_distance@2 as _distance, _rowid@0 as _rowid]
   FilterExec: _distance@2 IS NOT NULL
-    SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST, _rowid@0 ASC NULLS LAST]...
-      KNNVectorDistance: metric=l2
-        CoalescePartitionsExec
-          UnionExec
-            ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
-              FilterExec: _distance@2 IS NOT NULL
-                SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
-                  KNNVectorDistance: metric=l2
-                    LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
-            LanceRead: uri=..., projection=[vec], source=stream(_rowid)
-              SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
-                ANNSubIndex: name=idx, k=34, deltas=1, metric=L2
-                  ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1",
+SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST, _rowid@0 ASC NULLS LAST]...
+  KNNVectorDistance: metric=l2
+    CoalescePartitionsExec
+      UnionExec
+        ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
+          FilterExec: _distance@2 IS NOT NULL
+            SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
+              KNNVectorDistance: metric=l2
+                LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false, range=None
+        LanceRead: uri=..., projection=[vec], source=stream(_rowid)
+          SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST, _rowid@1 ASC NULLS LAST]...
+            ANNSubIndex: name=idx, k=34, deltas=1, metric=L2
+              ANNIvfPartition: uuid=..., minimum_nprobes=1, maximum_nprobes=None, deltas=1",
     )
     .await
     .unwrap();
@@ -2704,4 +2706,474 @@ pub async fn test_row_meta_columns(
     } else {
         assert!(stream.schema().field_with_name(ROW_ADDR).is_ok());
     }
+}
+
+#[rstest]
+#[case::flat(false, false)]
+#[case::indexed(true, false)]
+#[case::mixed(true, true)]
+#[tokio::test]
+async fn test_fts_ordered_limit_offset(
+    #[case] has_index: bool,
+    #[case] has_append: bool,
+    #[values(None, Some(4))] candidate_limit: Option<i64>,
+) {
+    // Longer documents rank lower, opposite to the requested id ordering.
+    let texts: Vec<String> = (0..6)
+        .map(|i| format!("needle {}", "filler ".repeat(20 * i)))
+        .collect();
+    let batch = arrow_array::record_batch!(
+        ("id", Int32, (0..6).collect::<Vec<i32>>()),
+        ("text", Utf8, texts)
+    )
+    .unwrap();
+    let initial_rows = if has_append { 4 } else { 6 };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.slice(0, initial_rows))], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    if has_index {
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &InvertedIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+    }
+    if has_append {
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch.slice(4, 2))], batch.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(dataset.get_fragments().len(), 3);
+
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["id", SCORE_COL])
+        .unwrap()
+        .full_text_search(
+            FullTextSearchQuery::new("needle".into())
+                .with_column("text".into())
+                .unwrap()
+                .limit(candidate_limit),
+        )
+        .unwrap()
+        .order_by(Some(vec![ColumnOrdering::desc_nulls_last("id".into())]))
+        .unwrap();
+    let full = scanner.try_into_batch().await.unwrap();
+    let candidate_count = candidate_limit.unwrap_or(6) as i32;
+    assert_eq!(
+        full["id"].as_primitive::<Int32Type>().values().as_ref(),
+        (0..candidate_count).rev().collect::<Vec<_>>()
+    );
+    assert!(
+        full[SCORE_COL]
+            .as_primitive::<Float32Type>()
+            .values()
+            .windows(2)
+            .all(|scores| scores[0] < scores[1])
+    );
+    limit_offset_equivalency_test(&scanner).await;
+}
+
+#[tokio::test]
+async fn test_fts_global_statistics_preserve_prepared_query() {
+    let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+        .await
+        .unwrap();
+    let error = test_ds
+        .dataset
+        .scan()
+        .fts_global_statistics()
+        .await
+        .unwrap_err();
+    assert!(matches!(&error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("requires a full-text query"));
+    let mut unindexed_scanner = test_ds.dataset.scan();
+    unindexed_scanner
+        .full_text_search(
+            FullTextSearchQuery::new("s-5".into())
+                .with_column("s".into())
+                .unwrap(),
+        )
+        .unwrap();
+    let error = unindexed_scanner.fts_global_statistics().await.unwrap_err();
+    assert!(matches!(&error, Error::InvalidInput { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("No Inverted index found for column s")
+    );
+    test_ds.make_segmented_fts_index().await.unwrap();
+    let mut combined_scanner = test_ds.dataset.scan();
+    combined_scanner
+        .full_text_search(FullTextSearchQuery::new_query(
+            CombinedFieldsQuery::try_new("s".into(), vec!["s".into()])
+                .unwrap()
+                .into(),
+        ))
+        .unwrap();
+    let error = combined_scanner.fts_global_statistics().await.unwrap_err();
+    assert!(matches!(&error, Error::NotSupported { .. }));
+    assert!(error.to_string().contains("combined_fields"));
+    test_ds.append_new_data().await.unwrap();
+
+    let mut scanner = test_ds.dataset.scan();
+    scanner
+        .full_text_search(
+            FullTextSearchQuery::new("s-5".into())
+                .with_column("S".into())
+                .unwrap(),
+        )
+        .unwrap();
+    let encoded = scanner.fts_global_statistics().await.unwrap();
+    let statistics = crate::pb::FtsGlobalStatisticsProto::decode(encoded.as_slice()).unwrap();
+
+    assert_eq!(
+        statistics.schema_version,
+        crate::pb::FtsGlobalStatisticsSchemaVersion::V1 as i32
+    );
+    assert_eq!(statistics.dataset_version, test_ds.dataset.version_id());
+    assert_eq!(statistics.corpora.len(), 1);
+    let corpus = &statistics.corpora[0];
+    assert_eq!(corpus.index_name, "s_idx");
+    assert_eq!(corpus.column, "s");
+    assert_eq!(
+        corpus.document_granularity,
+        crate::pb::FtsDocumentGranularity::Row as i32
+    );
+    assert_eq!(
+        corpus.count_unit,
+        crate::pb::FtsCorpusCountUnit::Document as i32
+    );
+    assert_eq!(corpus.segment_uuids.len(), 2);
+    assert!(corpus.segment_uuids.iter().all(|uuid| uuid.len() == 16));
+    assert!(
+        corpus
+            .segment_uuids
+            .windows(2)
+            .all(|uuids| uuids[0] < uuids[1])
+    );
+    assert_eq!(corpus.num_docs, Some(400));
+    assert!(corpus.total_tokens.unwrap() > 0);
+    let term_document_frequencies = corpus
+        .terms
+        .iter()
+        .map(|term| {
+            (
+                statistics.terms[term.term_index.unwrap() as usize].as_str(),
+                term.document_frequency,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(term_document_frequencies.get("s"), Some(&Some(400)));
+    assert_eq!(term_document_frequencies.get("5"), Some(&Some(1)));
+    assert!(statistics.terms.windows(2).all(|terms| terms[0] < terms[1]));
+    assert_eq!(corpus.terms.len(), statistics.terms.len());
+    assert!(
+        corpus
+            .terms
+            .windows(2)
+            .all(|terms| terms[0].term_index < terms[1].term_index)
+    );
+    assert_eq!(statistics.query_leaves.len(), 1);
+    let leaf = &statistics.query_leaves[0];
+    assert_eq!(leaf.leaf_ordinal, Some(0));
+    assert_eq!(leaf.kind, crate::pb::FtsQueryLeafKind::Match as i32);
+    assert_eq!(leaf.corpus_indices, [0]);
+    assert_eq!(leaf.has_all_query_positions, Some(true));
+    let leaf_tokens = leaf
+        .tokens
+        .iter()
+        .map(|token| {
+            (
+                statistics.terms[token.term_index.unwrap() as usize].as_str(),
+                token.query_position.unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(leaf_tokens, [("s", 0), ("5", 1)]);
+    assert_eq!(
+        scanner.fts_global_statistics().await.unwrap(),
+        encoded,
+        "opaque statistics serialization must be deterministic"
+    );
+    scanner.with_fragments(vec![test_ds.dataset.fragments()[0].clone()]);
+    scanner.filter("i < 1").unwrap();
+    scanner.limit(Some(1), Some(1)).unwrap();
+    assert_eq!(scanner.fts_global_statistics().await.unwrap(), encoded);
+}
+
+#[rstest]
+#[case::complete(50, true)]
+#[case::capped(1, false)]
+#[tokio::test]
+async fn test_fts_global_statistics_compound_leaves(
+    #[case] max_expansions: usize,
+    #[case] has_all_query_positions: bool,
+) {
+    let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+        .await
+        .unwrap();
+    test_ds.make_segmented_fts_index().await.unwrap();
+
+    let query: FtsQuery = BooleanQuery::new([
+        (
+            Occur::Should,
+            MatchQuery::new("s-5".to_string())
+                .with_column(Some("s".to_string()))
+                .into(),
+        ),
+        (
+            Occur::Should,
+            PhraseQuery::new("s-5".to_string())
+                .with_column(Some("S".to_string()))
+                .into(),
+        ),
+        (
+            Occur::Must,
+            MatchQuery::new("s-205".to_string())
+                .with_column(Some("s".to_string()))
+                .with_fuzziness(Some(1))
+                .with_max_expansions(max_expansions)
+                .into(),
+        ),
+    ])
+    .into();
+    let mut compound_scanner = test_ds.dataset.scan();
+    compound_scanner
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap();
+    let compound_statistics = crate::pb::FtsGlobalStatisticsProto::decode(
+        compound_scanner
+            .fts_global_statistics()
+            .await
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(compound_statistics.corpora.len(), 1);
+    assert_eq!(compound_statistics.corpora[0].column, "s");
+    assert_eq!(compound_statistics.query_leaves.len(), 3);
+    assert_eq!(
+        compound_statistics
+            .query_leaves
+            .iter()
+            .map(|leaf| leaf.leaf_ordinal)
+            .collect::<Vec<_>>(),
+        [Some(0), Some(1), Some(2)]
+    );
+    assert_eq!(
+        compound_statistics
+            .query_leaves
+            .iter()
+            .map(|leaf| leaf.kind)
+            .collect::<Vec<_>>(),
+        [
+            crate::pb::FtsQueryLeafKind::Match as i32,
+            crate::pb::FtsQueryLeafKind::Phrase as i32,
+            crate::pb::FtsQueryLeafKind::Match as i32
+        ]
+    );
+    assert!(
+        compound_statistics
+            .query_leaves
+            .iter()
+            .all(|leaf| leaf.corpus_indices == [0])
+    );
+    let match_leaf = &compound_statistics.query_leaves[0];
+    let phrase_leaf = &compound_statistics.query_leaves[1];
+    assert_eq!(phrase_leaf.tokens, match_leaf.tokens);
+    assert_eq!(phrase_leaf.has_all_query_positions, Some(true));
+    assert_eq!(
+        compound_statistics.query_leaves[0]
+            .tokens
+            .iter()
+            .map(|token| token.query_position.unwrap())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([0, 1])
+    );
+    let fuzzy_leaf = &compound_statistics.query_leaves[2];
+    assert_eq!(
+        fuzzy_leaf.has_all_query_positions,
+        Some(has_all_query_positions)
+    );
+    if !has_all_query_positions {
+        assert_eq!(fuzzy_leaf.tokens.len(), 1);
+        assert_eq!(fuzzy_leaf.tokens[0].query_position, Some(0));
+        return;
+    }
+    assert!(fuzzy_leaf.tokens.len() > 2);
+    assert_eq!(
+        fuzzy_leaf
+            .tokens
+            .iter()
+            .map(|token| token.query_position.unwrap())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([0, 1])
+    );
+}
+
+#[tokio::test]
+async fn test_fts_global_statistics_preserves_ngram_fuzzy_and_phrase_positions() {
+    let batch =
+        arrow_array::record_batch!(("text", Utf8, ["abcd", "xbcd", "axcd", "abxd"])).unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new([Ok(batch)], schema);
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+    let params = InvertedIndexParams::default()
+        .base_tokenizer("ngram".into())
+        .ngram_min_length(2)
+        .ngram_max_length(2)
+        .with_position(true);
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    let match_query: FtsQuery = BooleanQuery::new([
+        (
+            Occur::Must,
+            MatchQuery::new("abcd".into())
+                .with_column(Some("text".into()))
+                .into(),
+        ),
+        (
+            Occur::Must,
+            MatchQuery::new("ab bc".into())
+                .with_column(Some("text".into()))
+                .with_fuzziness(Some(1))
+                .with_max_expansions(50)
+                .into(),
+        ),
+    ])
+    .into();
+    let mut match_scanner = dataset.scan();
+    match_scanner
+        .full_text_search(FullTextSearchQuery::new_query(match_query))
+        .unwrap();
+    let match_statistics = crate::pb::FtsGlobalStatisticsProto::decode(
+        match_scanner
+            .fts_global_statistics()
+            .await
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    assert_eq!(match_statistics.query_leaves.len(), 2);
+    let match_leaf = &match_statistics.query_leaves[0];
+    assert_eq!(match_leaf.kind, crate::pb::FtsQueryLeafKind::Match as i32);
+
+    let mut tokens_by_term = BTreeMap::new();
+    let mut terms_by_group = BTreeMap::<u32, BTreeSet<&str>>::new();
+    for token in &match_leaf.tokens {
+        let term = match_statistics.terms[token.term_index.unwrap() as usize].as_str();
+        let position = token.query_position.unwrap();
+        tokens_by_term.insert(term, position);
+        terms_by_group.entry(position).or_default().insert(term);
+    }
+    assert_eq!(tokens_by_term.get("ab"), Some(&0));
+    assert_eq!(tokens_by_term.get("bc"), Some(&1));
+    assert_eq!(tokens_by_term.get("cd"), Some(&2));
+    assert_eq!(
+        terms_by_group.keys().copied().collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    let fuzzy_leaf = &match_statistics.query_leaves[1];
+    let mut fuzzy_terms_by_group = BTreeMap::<u32, BTreeSet<&str>>::new();
+    for token in &fuzzy_leaf.tokens {
+        let term = match_statistics.terms[token.term_index.unwrap() as usize].as_str();
+        fuzzy_terms_by_group
+            .entry(token.query_position.unwrap())
+            .or_default()
+            .insert(term);
+    }
+    assert_eq!(
+        fuzzy_terms_by_group.keys().copied().collect::<Vec<_>>(),
+        [0, 1],
+        "fuzzy Match tokens must retain their source term groups: {fuzzy_terms_by_group:?}"
+    );
+    assert!(
+        fuzzy_terms_by_group.values().any(|terms| terms.len() > 1),
+        "fuzzy alternatives must retain their source term group: {fuzzy_terms_by_group:?}"
+    );
+
+    let phrase_query = PhraseQuery::new("abcd".into()).with_column(Some("text".into()));
+    let mut phrase_scanner = dataset.scan();
+    phrase_scanner
+        .full_text_search(FullTextSearchQuery::new_query(phrase_query.into()))
+        .unwrap();
+    let phrase_statistics = crate::pb::FtsGlobalStatisticsProto::decode(
+        phrase_scanner
+            .fts_global_statistics()
+            .await
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    let phrase_leaf = &phrase_statistics.query_leaves[0];
+    assert_eq!(phrase_leaf.kind, crate::pb::FtsQueryLeafKind::Phrase as i32);
+    assert_eq!(
+        phrase_leaf
+            .tokens
+            .iter()
+            .map(|token| token.query_position.unwrap())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([0]),
+        "Phrase must use the ngram tokenizer's raw zero offsets, not Match term groups"
+    );
+}
+
+#[rstest]
+#[case::all_null(vec![None, None])]
+#[case::empty_strings(vec![Some(""), Some("")])]
+#[tokio::test]
+async fn test_fts_global_statistics_empty_corpus(#[case] texts: Vec<Option<&str>>) {
+    let batch = arrow_array::record_batch!(("text", Utf8, texts)).unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new([Ok(batch)], schema);
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let mut scanner = dataset.scan();
+    scanner
+        .full_text_search(
+            FullTextSearchQuery::new("missing".into())
+                .with_column("text".into())
+                .unwrap(),
+        )
+        .unwrap();
+    let encoded = scanner.fts_global_statistics().await.unwrap();
+    let statistics = crate::pb::FtsGlobalStatisticsProto::decode(encoded.as_slice()).unwrap();
+    // The default English tokenizer stems "missing" to "miss".
+    assert_eq!(statistics.terms, ["miss"]);
+    assert_eq!(statistics.corpora.len(), 1);
+    let corpus = &statistics.corpora[0];
+    assert_eq!(corpus.num_docs, Some(0));
+    assert_eq!(corpus.total_tokens, Some(0));
+    assert_eq!(corpus.terms.len(), 1);
+    assert_eq!(corpus.terms[0].term_index, Some(0));
+    assert_eq!(corpus.terms[0].document_frequency, Some(0));
 }

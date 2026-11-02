@@ -342,7 +342,7 @@ pub fn project_to_canonical(
             // its rows are all live. The column is non-nullable, so a null here
             // fails the scan outright.
             None if name == TOMBSTONE => Arc::new(Literal::new(ScalarValue::Boolean(Some(false)))),
-            // A source sealed before this column existed. Typed nulls are what
+            // A source frozen before this column existed. Typed nulls are what
             // it holds for those rows.
             None => Arc::new(Literal::new(
                 ScalarValue::try_from(field.data_type()).map_err(|e| {

@@ -17,6 +17,7 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, expressions};
 use datafusion::scalar::ScalarValue;
 use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_physical_expr::expressions::{Column, Literal};
 use datafusion_physical_expr::{Partitioning, PhysicalExpr, create_physical_expr};
 use datafusion_physical_plan::empty::EmptyExec;
@@ -51,6 +52,23 @@ use crate::{Error, Result};
 
 use super::{DEFAULT_XTR_OVERFETCH, FilterPlan, PlannedFilteredScan, Scanner};
 
+/// The multiple of the exact distance a vector index ranks by. Lance indexes
+/// cosine on SQ, PQ, and RQ as L2 over normalized vectors, twice `1 - cos`;
+/// FLAT ranks it, and every other metric, on its own scale.
+fn index_distance_scale(metric: MetricType, segments: &[IndexMetadata]) -> f32 {
+    let quantized_as_l2 = segments.iter().any(|segment| {
+        segment.index_details.as_ref().is_some_and(|details| {
+            let index_type = crate::index::vector::details::derive_vector_index_type(details);
+            index_type.ends_with("PQ") || index_type.ends_with("SQ") || index_type.ends_with("RQ")
+        })
+    });
+    if metric == MetricType::Cosine && quantized_as_l2 {
+        2.0
+    } else {
+        1.0
+    }
+}
+
 impl Scanner {
     pub(super) async fn vector_search_source(
         &self,
@@ -80,7 +98,7 @@ impl Scanner {
                         .union_column(&query.column, OnMissing::Error)?;
                     let plan = self.take(fts_plan, projection)?;
 
-                    self.flat_knn(plan, query)?
+                    self.flat_knn(plan, query).await?
                 }
                 None => {
                     self.vector_search(&filter_plan.expr_filter_plan, query)
@@ -108,6 +126,12 @@ impl Scanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut q = q.clone();
 
+        if matches!(self.quantized_refine_factor, Some(0)) {
+            return Err(Error::invalid_input(
+                "Quantized refine factor cannot be zero".to_string(),
+            ));
+        }
+
         // Sanity check
         let (vector_type, element_type) = get_vector_type(self.dataset.schema(), &q.column)?;
 
@@ -118,6 +142,11 @@ impl Scanner {
         } else {
             Arc::new(vec![])
         };
+        // The metric of the index chosen for this query. When that index ends up unused
+        // because no searched fragment is in its coverage, or the fragment-reuse check drops
+        // it, the flat branch below still ranks by it if the query names no metric, so
+        // `_distance` keeps one scale whichever fragments are searched.
+        let mut chosen_index_metric = None;
         let mut index_and_segments = if use_index {
             if let Some(requested_segments) = self.index_segments.as_ref() {
                 let requested_segment_set =
@@ -163,6 +192,11 @@ impl Scanner {
                     ));
                 }
 
+                // From the details alone: opening a segment the scope may exclude would add
+                // I/O and a failure mode to what can end as a flat search.
+                chosen_index_metric = requested_index_segments
+                    .iter()
+                    .find_map(crate::index::vector::details::metric_type_from_index_metadata);
                 let selected_index_segments =
                     self.retain_relevant_index_segments(requested_index_segments);
                 if selected_index_segments.is_empty() {
@@ -196,61 +230,83 @@ impl Scanner {
                         None
                     }
                 }
-            }
-            // An index can only answer a query on the column it is keyed on, which is
-            // always `fields[0]`. Not `contains`: `fields` also lists columns the index
-            // merely carries values for, which it cannot search. Not a boundary derived
-            // from `covering_fields` either -- that is computed from a field older
-            // writers drop, so it would widen to the carried columns exactly when the
-            // declaration is lost.
-            else if let Some(index) = indices.iter().find(|i| {
-                i.fields.first() == Some(&column_id) && crate::index::index_type_is_known(i)
-            }) {
-                // Try to get metric type from index metadata first (fast path for newer indices)
-                let index_metric = if let Some(metric) =
-                    crate::index::vector::details::metric_type_from_index_metadata(index)
-                {
-                    metric
-                } else {
-                    // Fall back to opening the index for legacy indices without details
-                    let idx = self
-                        .dataset
-                        .open_vector_index(q.column.as_str(), &index.uuid, &NoOpMetricsCollector)
-                        .await?;
-                    idx.metric_type()
-                };
+            } else {
+                // An index can only answer a query on the column it is keyed on, which
+                // is always `fields[0]`. Not `contains`: `fields` also lists columns the
+                // index merely carries values for, which it cannot search. Not a boundary
+                // derived from `covering_fields` either -- that is computed from a field
+                // older writers drop, so it would widen to the carried columns exactly
+                // when the declaration is lost.
+                let candidates = indices.iter().filter(|i| {
+                    i.fields.first() == Some(&column_id) && crate::index::index_type_is_known(i)
+                });
 
-                let use_this_index = match q.metric_type {
-                    Some(user_metric) => {
-                        if user_metric == index_metric {
-                            true
+                // A column may carry several vector indices with different metrics. The
+                // query's metric has to take part in *selecting* one, not merely veto the
+                // first candidate: picking the first keyed index and then rejecting it on
+                // a metric mismatch brute-forced the whole column even when another index
+                // on it had exactly the requested metric (issue #9873).
+                let mut selected: Option<(&IndexMetadata, MetricType)> = None;
+                let mut saw_candidate = false;
+                for index in candidates {
+                    saw_candidate = true;
+                    // Resolve the metric from index metadata first (fast path for newer
+                    // indices); open the index only for legacy candidates without details.
+                    let index_metric = if let Some(metric) =
+                        crate::index::vector::details::metric_type_from_index_metadata(index)
+                    {
+                        metric
+                    } else {
+                        self.dataset
+                            .open_vector_index(
+                                q.column.as_str(),
+                                &index.uuid,
+                                &NoOpMetricsCollector,
+                            )
+                            .await?
+                            .metric_type()
+                    };
+                    match q.metric_type {
+                        // No metric requested: the first keyed index answers, as before.
+                        None => {
+                            selected = Some((index, index_metric));
+                            break;
+                        }
+                        Some(user_metric) if user_metric == index_metric => {
+                            selected = Some((index, index_metric));
+                            break;
+                        }
+                        // Metric mismatch: keep looking at the column's other indices.
+                        Some(_) => continue,
+                    }
+                }
+
+                match selected {
+                    Some((index, index_metric)) => {
+                        chosen_index_metric = Some(index_metric);
+                        let index_segments = self.retain_relevant_index_segments(
+                            self.dataset.load_indices_by_name(&index.name).await?,
+                        );
+                        let index_frags = self.get_indexed_frags(&index_segments);
+                        if !index_segments.is_empty() && !index_frags.is_empty() {
+                            Some((index.name.clone(), index_segments, index_metric))
                         } else {
-                            log::warn!(
-                                "Requested metric {:?} is incompatible with index metric {:?}, falling back to brute-force search",
-                                user_metric,
-                                index_metric
-                            );
-                            false
+                            None
                         }
                     }
-                    None => true,
-                };
-
-                if use_this_index {
-                    let index_segments = self.retain_relevant_index_segments(
-                        self.dataset.load_indices_by_name(&index.name).await?,
-                    );
-                    let index_frags = self.get_indexed_frags(&index_segments);
-                    if !index_segments.is_empty() && !index_frags.is_empty() {
-                        Some((index.name.clone(), index_segments, index_metric))
-                    } else {
+                    None => {
+                        if saw_candidate {
+                            // Every index on this column uses a different metric than the
+                            // query asked for, so none can accelerate it.
+                            log::warn!(
+                                "Requested metric {:?} does not match any index on column '{}', falling back to brute-force search",
+                                q.metric_type,
+                                q.column
+                            );
+                        }
                         None
                     }
-                } else {
-                    None
                 }
-            } else {
-                None
             }
         } else {
             None
@@ -314,12 +370,52 @@ impl Scanner {
             // Build a prefilter block mask for stale rows (empty = no-op fast path).
             let overlay_block = self.stale_rows_block_mask(&stale_rows).await?;
 
+            let ann_query = if self.quantized_refine_factor.is_some() {
+                let exact_factor = q.refine_factor.unwrap_or(1) as usize;
+                let mut ann_query = q.clone();
+                ann_query.k = q.k.checked_mul(exact_factor).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "quantized refinement result count overflows: k={} exact_refine_factor={exact_factor}",
+                        q.k
+                    ))
+                })?;
+                ann_query.refine_factor = None;
+                ann_query
+            } else {
+                q.clone()
+            };
+
             let ann_node = match vector_type {
                 DataType::FixedSizeList(_, _) => {
-                    self.ann(&q, &index_segments, filter_plan, overlay_block.clone())
-                        .await?
+                    // Refine applies the distance range to exact distances, but
+                    // the search still has to, or a lower bound leaves it only
+                    // candidates refine then drops. It ranks on the index's own
+                    // scale, so it gets the range on that scale.
+                    let ann_query = match q.refine_factor {
+                        Some(_) => {
+                            let scale = index_distance_scale(index_metric, &index_segments);
+                            Query {
+                                lower_bound: q.lower_bound.map(|lower| lower * scale),
+                                upper_bound: q.upper_bound.map(|upper| upper * scale),
+                                ..ann_query
+                            }
+                        }
+                        None => ann_query,
+                    };
+                    self.ann(
+                        &ann_query,
+                        &index_segments,
+                        filter_plan,
+                        overlay_block.clone(),
+                    )
+                    .await?
                 }
                 DataType::List(_) => {
+                    if self.quantized_refine_factor.is_some() {
+                        return Err(Error::not_supported(
+                            "quantized refinement is not supported for multivector columns",
+                        ));
+                    }
                     self.multivec_ann(&q, &index_segments, filter_plan, overlay_block.clone())
                         .await?
                 }
@@ -333,7 +429,7 @@ impl Scanner {
                     .union_column(&q.column, OnMissing::Error)
                     .unwrap();
                 let knn_node_with_vector = self.take(ann_node, vector_projection)?;
-                self.flat_knn(knn_node_with_vector, &q)?
+                self.flat_knn(knn_node_with_vector, &q).await?
             } else {
                 ann_node
             }; // vector, _distance, _rowid
@@ -353,14 +449,23 @@ impl Scanner {
 
             Ok(knn_node)
         } else {
+            if self.quantized_refine_factor.is_some() {
+                return Err(Error::not_supported(
+                    "quantized refinement requires an IVF_RQ vector index",
+                ));
+            }
             if self.fast_search {
                 return Ok(Arc::new(EmptyExec::new(knn_empty_result_schema(
                     self.is_batch_nearest,
                 ))));
             }
-            // Resolve metric type for flat search (use default if not specified)
+            // Resolve metric type for flat search: the query's, else the chosen index's,
+            // else the column type's default. An untrained index can record a metric its
+            // column cannot use, so such a metric is skipped.
             let metric = q
                 .metric_type
+                .or(chosen_index_metric
+                    .filter(|metric| validate_distance_type_for(*metric, &element_type).is_ok()))
                 .unwrap_or_else(|| default_distance_type_for(&element_type));
             q.metric_type = Some(metric);
             validate_distance_type_for(metric, &element_type)?;
@@ -398,7 +503,7 @@ impl Scanner {
             if let Some(mask) = self.external_row_mask.clone() {
                 plan = Arc::new(RowAddrMaskFilterExec::new(plan, mask));
             }
-            Ok(self.flat_knn(plan, &q)?)
+            self.flat_knn(plan, &q).await
         }
     }
 
@@ -407,7 +512,7 @@ impl Scanner {
     /// search per query vector.
     ///
     /// Requires all of:
-    /// - no refine step (the batch path does not yet rerank);
+    /// - no exact or quantized refine step (the batch path does not yet rerank);
     /// - fixed nprobes (`minimum_nprobes == maximum_nprobes`) — see below;
     /// - every segment an IVF index with a flat-style sub-index (i.e. not HNSW);
     /// - every target fragment covered by the *selected* `index_segments` (or
@@ -432,12 +537,13 @@ impl Scanner {
         index_segments: &[IndexMetadata],
         q: &Query,
     ) -> Result<bool> {
-        // Any refine factor sends the query onto a reranking path that the
-        // shared batch scan does not implement: the single-query path reranks
-        // with the original vectors even when the factor is 1, and rejects a
-        // factor of 0 outright (`Refine factor cannot be zero`). The batch path
-        // does neither, so fall back to the per-query loop for every `Some(_)`.
-        if q.refine_factor.is_some() {
+        // Any exact or quantized refine factor sends the query onto a reranking
+        // path that the shared batch scan does not implement. Exact refinement
+        // reranks with the original vectors even when the factor is 1, while
+        // quantized refinement overfetches and reranks with Accurate RQ scores.
+        // The batch path does neither, so fall back to the per-query loop for
+        // every configured refinement.
+        if q.refine_factor.is_some() || self.quantized_refine_factor.is_some() {
             return Ok(false);
         }
         // Only fixed nprobes is provably equivalent to single-query search; see
@@ -670,9 +776,26 @@ impl Scanner {
 
         let q = q.clone();
         debug_assert!(q.metric_type.is_some());
+        let keep_quantized_distances =
+            self.quantized_refine_factor.is_some() && q.refine_factor.is_none();
+
+        // Retained RQ scores use the index's native distance scale. Convert the
+        // flat arms' bounds before filtering, then their scores before merging;
+        // fetching indexed vectors just to recompute distances defeats quantized refinement.
+        let flat_distance_scale = if keep_quantized_distances {
+            q.metric_type
+                .map_or(1.0, |metric| index_distance_scale(metric, indexed_segments))
+        } else {
+            1.0
+        };
+        let flat_query = Query {
+            lower_bound: q.lower_bound.map(|bound| bound / flat_distance_scale),
+            upper_bound: q.upper_bound.map(|bound| bound / flat_distance_scale),
+            ..q.clone()
+        };
 
         // Ensure the vector column is present for distance computation.
-        if knn_node.schema().column_with_name(&q.column).is_none() {
+        if !keep_quantized_distances && knn_node.schema().column_with_name(&q.column).is_none() {
             let vector_projection = self
                 .dataset
                 .empty_projection()
@@ -718,7 +841,7 @@ impl Scanner {
                 Some(mask) => Arc::new(RowAddrMaskFilterExec::new(scan_node, mask)) as _,
                 None => scan_node,
             };
-            let topk_fallback = self.flat_knn(scan_node, &q)?;
+            let topk_fallback = self.flat_knn(scan_node, &flat_query).await?;
             let topk_fallback: Arc<dyn ExecutionPlan> =
                 Arc::new(project(topk_fallback, knn_node.schema().as_ref())?);
             flat_inputs.push(topk_fallback);
@@ -743,20 +866,73 @@ impl Scanner {
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 stale_node = Arc::new(LanceFilterExec::try_new(expr.clone(), stale_node)?);
             }
-            let topk_stale = self.flat_knn(stale_node, &q)?;
+            let topk_stale = self.flat_knn(stale_node, &flat_query).await?;
             let topk_stale: Arc<dyn ExecutionPlan> =
                 Arc::new(project(topk_stale, knn_node.schema().as_ref())?);
             flat_inputs.push(topk_stale);
         }
 
+        if flat_distance_scale != 1.0 {
+            for input in &mut flat_inputs {
+                let exprs: Vec<_> = input
+                    .schema()
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, field)| {
+                        let column =
+                            Arc::new(Column::new(field.name(), index)) as Arc<dyn PhysicalExpr>;
+                        let expr = if field.name() == DIST_COL {
+                            Arc::new(expressions::BinaryExpr::new(
+                                column,
+                                datafusion::logical_expr::Operator::Multiply,
+                                Arc::new(Literal::new(ScalarValue::Float32(Some(
+                                    flat_distance_scale,
+                                )))),
+                            )) as Arc<dyn PhysicalExpr>
+                        } else {
+                            column
+                        };
+                        (expr, field.name().clone())
+                    })
+                    .collect();
+                *input = Arc::new(ProjectionExec::try_new(exprs, input.clone())?);
+            }
+        }
+
         // Union: flat paths first (matching original order), then ANN results.
         flat_inputs.push(knn_node);
         let unioned = UnionExec::try_new(flat_inputs)?;
-        let unioned = RepartitionExec::try_new(
+        let unioned: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
             unioned,
             datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
-        )?;
-        self.flat_knn(Arc::new(unioned), &q)
+        )?);
+        if keep_quantized_distances {
+            let sort = SortExec::new(
+                [
+                    PhysicalSortExpr {
+                        expr: expressions::col(DIST_COL, unioned.schema().as_ref())?,
+                        options: SortOptions {
+                            descending: false,
+                            nulls_first: false,
+                        },
+                    },
+                    PhysicalSortExpr {
+                        expr: expressions::col(ROW_ID, unioned.schema().as_ref())?,
+                        options: SortOptions {
+                            descending: false,
+                            nulls_first: false,
+                        },
+                    },
+                ]
+                .into(),
+                unioned,
+            )
+            .with_fetch(Some(q.k));
+            Self::flat_knn_not_null_filter(Arc::new(sort))
+        } else {
+            self.flat_knn(unioned, &q).await
+        }
     }
 
     #[async_recursion]
@@ -822,19 +998,40 @@ impl Scanner {
     }
 
     /// Add a knn search node to the input plan
-    pub(super) fn flat_knn(
+    pub(super) async fn flat_knn(
         &self,
         input: Arc<dyn ExecutionPlan>,
         q: &Query,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Resolve metric_type if not set (use default for the column's element type)
-        let metric_type = match q.metric_type {
-            Some(m) => m,
-            None => {
-                let (_, element_type) = get_vector_type(self.dataset.schema(), &q.column)?;
-                default_distance_type_for(&element_type)
+        let (_, element_type) = get_vector_type(self.dataset.schema(), &q.column)?;
+        let mut metric_type = q.metric_type;
+        // Ranking FTS hits still needs the index's metric, even though the rows
+        // are scored directly instead of being retrieved through ANN.
+        if metric_type.is_none() && q.use_index {
+            let column_id = self.dataset.schema().field_id(&q.column)?;
+            let indices = self.dataset.load_indices().await?;
+            if let Some(index) = indices.iter().find(|index| {
+                index.fields.first() == Some(&column_id) && crate::index::index_type_is_known(index)
+            }) {
+                let index_metric = if let Some(metric) =
+                    crate::index::vector::details::metric_type_from_index_metadata(index)
+                {
+                    metric
+                } else {
+                    self.dataset
+                        .open_vector_index(&q.column, &index.uuid, &NoOpMetricsCollector)
+                        .await?
+                        .metric_type()
+                };
+                // Match the flat fallback in vector_search for untrained indices
+                // whose recorded metric is incompatible with the column type.
+                if validate_distance_type_for(index_metric, &element_type).is_ok() {
+                    metric_type = Some(index_metric);
+                }
             }
-        };
+        }
+        let metric_type = metric_type.unwrap_or_else(|| default_distance_type_for(&element_type));
+        validate_distance_type_for(metric_type, &element_type)?;
         let input = if self.is_batch_nearest {
             Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
         } else {
@@ -873,7 +1070,12 @@ impl Scanner {
                 let logical = col(DIST_COL).gt_eq(lit(v));
                 let schema = flat_dist.schema();
                 let df_schema = DFSchema::try_from(schema)?;
-                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())?;
+                let physical = create_physical_expr(
+                    &logical,
+                    &df_schema,
+                    &ExecutionProps::new(),
+                    &PhysicalPlanningContext::default(),
+                )?;
                 Ok::<(Expr, Arc<dyn PhysicalExpr>), _>((logical, physical))
             })
             .transpose()?;
@@ -884,7 +1086,12 @@ impl Scanner {
                 let logical = col(DIST_COL).lt(lit(v));
                 let schema = flat_dist.schema();
                 let df_schema = DFSchema::try_from(schema)?;
-                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())?;
+                let physical = create_physical_expr(
+                    &logical,
+                    &df_schema,
+                    &ExecutionProps::new(),
+                    &PhysicalPlanningContext::default(),
+                )?;
                 Ok::<(Expr, Arc<dyn PhysicalExpr>), _>((logical, physical))
             })
             .transpose()?;
@@ -894,7 +1101,12 @@ impl Scanner {
                 let logical = llog.and(ulog);
                 let schema = flat_dist.schema();
                 let df_schema = DFSchema::try_from(schema)?;
-                let physical = create_physical_expr(&logical, &df_schema, &ExecutionProps::new())?;
+                let physical = create_physical_expr(
+                    &logical,
+                    &df_schema,
+                    &ExecutionProps::new(),
+                    &PhysicalPlanningContext::default(),
+                )?;
                 Some((logical, physical))
             }
             (Some((llog, lphys)), None) => Some((llog, lphys)),
@@ -1049,6 +1261,7 @@ impl Scanner {
             prefilter_source,
             overlay_block,
             self.external_row_mask.clone(),
+            self.quantized_refine_factor,
         )?;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
@@ -1109,6 +1322,7 @@ impl Scanner {
                 prefilter_source.clone(),
                 overlay_block.clone(),
                 self.external_row_mask.clone(),
+                None,
             )?;
             let sort_expr = PhysicalSortExpr {
                 expr: expressions::col(DIST_COL, ann_node.schema().as_ref())?,

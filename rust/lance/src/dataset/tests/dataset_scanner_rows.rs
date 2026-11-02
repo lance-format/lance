@@ -659,6 +659,16 @@ async fn row_addr_mask_cross_column_fts_respects_mask() {
         .limit(Some(10))
     };
 
+    let mut statistics_scan = dataset.scan();
+    statistics_scan.full_text_search(cross_column()).unwrap();
+    let error = statistics_scan.fts_global_statistics().await.unwrap_err();
+    assert!(matches!(&error, Error::NotSupported { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("requires exactly one indexed column")
+    );
+
     let mut scan = dataset.scan();
     scan.full_text_search(cross_column()).unwrap();
     scan.with_row_id();
@@ -896,6 +906,27 @@ async fn test_scan_with_wildcard() {
 
     // Make sure we can reference * fields in exprs and add new columns
     check_exprs(&["_rowid", "*", "x * 2"], &["_rowid", "x", "y", "x * 2"]).await;
+
+    // A system column inside a larger expression is requested just like a
+    // bare reference.
+    for expr in [
+        "_rowid + 1",
+        "_rowaddr + 1",
+        "_rowoffset + 1",
+        "_row_last_updated_at_version + 1",
+        "_row_created_at_version + 1",
+    ] {
+        check_exprs(&[expr], &[expr]).await;
+    }
+    let mut scan = data.scan();
+    scan.project_with_transform(&[("o", "_rowoffset + 1")])
+        .unwrap();
+    let batch = scan.try_into_batch().await.unwrap();
+    let offsets = arrow::compute::cast(&batch["o"], &DataType::Int64).unwrap();
+    assert_eq!(
+        offsets.as_primitive::<Int64Type>().values(),
+        &(1..=100).collect::<Vec<i64>>()[..]
+    );
 
     let check_fails = |projection: &[&str]| {
         let mut scan = data.scan();
@@ -1675,8 +1706,9 @@ async fn test_filter_not_in_is_not_inverted() {
     check("_rowaddr NOT IN (2, 4, 6, 8)", complement).await;
 }
 
+#[rstest]
 #[tokio::test]
-async fn test_nested_field_ordering() {
+async fn test_nested_field_ordering(#[values(false, true)] is_sort_column_projected: bool) {
     use arrow_array::StructArray;
 
     // Create test data with nested structs
@@ -1710,6 +1742,9 @@ async fn test_nested_field_ordering() {
 
     // Test ordering by nested field
     let mut scanner = dataset.scan();
+    if !is_sort_column_projected {
+        scanner.project(&["id"]).unwrap();
+    }
     scanner
         .order_by(Some(vec![ColumnOrdering {
             column_name: "nested.value".to_string(),
@@ -1718,11 +1753,14 @@ async fn test_nested_field_ordering() {
         }]))
         .unwrap(); // ascending order
 
-    let stream = scanner.try_into_stream().await.unwrap();
-    let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_eq!(
+        batch.num_columns(),
+        if is_sort_column_projected { 2 } else { 1 }
+    );
 
     // Check that results are sorted by nested.value
-    let sorted_ids = batches[0].column(0).as_primitive::<Int32Type>().values();
+    let sorted_ids = batch["id"].as_primitive::<Int32Type>().values();
     assert_eq!(sorted_ids[0], 1); // id=1 has nested.value=10
     assert_eq!(sorted_ids[1], 2); // id=2 has nested.value=20
     assert_eq!(sorted_ids[2], 3); // id=3 has nested.value=30
@@ -1914,4 +1952,92 @@ async fn test_scan_with_version_columns() {
             "All rows created at version 1"
         );
     }
+}
+
+#[rstest]
+#[case::equals("category = 'x'")]
+#[case::not_equals("category != 'y'")]
+#[tokio::test]
+async fn test_scalar_indexed_filter_with_unprojected_sort(
+    #[case] filter: &str,
+    #[values(BuiltinIndexType::Bitmap, BuiltinIndexType::BTree)] index_type: BuiltinIndexType,
+    #[values(false, true)] has_full_index_coverage: bool,
+    #[values(false, true)] has_stable_row_ids: bool,
+) {
+    let data = arrow_array::record_batch!(
+        ("id", Utf8, ["a", "b", "c", "d", "e", "f"]),
+        (
+            "category",
+            Utf8,
+            [Some("x"), Some("x"), Some("y"), Some("x"), Some("x"), None]
+        ),
+        (
+            "t",
+            Int32,
+            [Some(3), Some(1), Some(2), Some(0), None, Some(4)]
+        )
+    )
+    .unwrap();
+    let indexed_rows = if has_full_index_coverage { 6 } else { 3 };
+    let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, indexed_rows))], data.schema());
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 3,
+            enable_stable_row_ids: has_stable_row_ids,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["category"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::for_builtin(index_type),
+            false,
+        )
+        .await
+        .unwrap();
+    if !has_full_index_coverage {
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(data.slice(3, 3))], data.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["id"])
+        .unwrap()
+        .filter(filter)
+        .unwrap()
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_first("t".to_string())]))
+        .unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_columns(), 1);
+    assert_eq!(
+        batch["id"].as_string::<i32>(),
+        &StringArray::from(vec!["e", "d", "b", "a"])
+    );
+
+    let mut unindexed_scanner = scanner.clone();
+    unindexed_scanner.use_scalar_index(false);
+    assert_eq!(unindexed_scanner.try_into_batch().await.unwrap(), batch);
+
+    scanner.limit(Some(2), Some(1)).unwrap();
+    let limited = scanner.try_into_batch().await.unwrap();
+    assert_eq!(limited.num_columns(), 1);
+    assert_eq!(
+        limited["id"].as_string::<i32>(),
+        &StringArray::from(vec!["d", "b"])
+    );
 }

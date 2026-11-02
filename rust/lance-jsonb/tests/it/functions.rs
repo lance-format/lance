@@ -260,6 +260,21 @@ fn test_get_by_index() {
 }
 
 #[test]
+fn test_array_elements_stops_after_a_decode_error() {
+    // An array header claiming two elements with no entries behind it: the
+    // first element fails to decode and the iterator ends there, rather than
+    // returning the same error on every call.
+    let owned_jsonb = OwnedJsonb::from(vec![0x80, 0, 0, 2]);
+    let raw_jsonb = owned_jsonb.as_raw();
+    assert_eq!(raw_jsonb.array_len().unwrap(), Some(2));
+
+    let mut elements = raw_jsonb.array_elements().unwrap().unwrap();
+    assert!(elements.next().unwrap().is_err());
+    assert!(elements.next().is_none());
+    assert_eq!(elements.size_hint(), (0, Some(0)));
+}
+
+#[test]
 fn test_get_by_name() {
     let sources = vec![
         (r#"true"#, "a".to_string(), None),

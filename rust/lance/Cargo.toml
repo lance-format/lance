@@ -64,11 +64,13 @@ rustc-hash = "2.1"
 fst.workspace = true
 itertools.workspace = true
 moka.workspace = true
+num-traits.workspace = true
 object_store = { workspace = true }
 pin-project.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 roaring.workspace = true
+hex.workspace = true
 tokio.workspace = true
 url.workspace = true
 rand.workspace = true
@@ -139,7 +141,7 @@ geoarrow-schema = { workspace = true }
 geo-types = { workspace = true }
 datafusion-substrait = { workspace = true }
 parquet = { workspace = true }
-reqwest = { workspace = true, features = ["rustls-tls"] }
+reqwest = { workspace = true, features = ["rustls"] }
 
 # Pins the ordering contract Lance inherits from Arrow, DataFusion and `half`.
 # Not part of the default test run: CI runs it from the `arrow-ordering-compat`
@@ -179,6 +181,8 @@ metrics = ["lance-io/metrics"]
 geo = ["lance-datafusion/geo", "lance-index/geo"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []
+# Expose internal update-join controls to the dedicated benchmark target.
+update-join-bench = []
 # Compile the RocksDB comparison arm of the (disabled) mem_wal_kv_point_lookup
 # bench. Commented out so it stays out of CI's all-features build.
 # bench-rocksdb = ["dep:rocksdb"]
@@ -206,6 +210,11 @@ harness = false
 [[bench]]
 name = "merge_insert"
 harness = false
+
+[[bench]]
+name = "update_join"
+harness = false
+required-features = ["update-join-bench"]
 
 [[bench]]
 name = "scan"

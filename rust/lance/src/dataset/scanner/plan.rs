@@ -18,6 +18,7 @@ use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, expressions};
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{Distribution, LexOrdering, PhysicalExpr};
 use futures::future::BoxFuture;
@@ -31,6 +32,7 @@ use lance_datafusion::exec::{
     LanceExecutionOptions, StrictBatchSizeExec, analyze_plan, execute_plan,
 };
 use lance_index::scalar::expression::PlannerIndexExt;
+use lance_index::scalar::expression::create_filter_plan;
 use lance_index::scalar::inverted::{
     DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity, SCORE_COL,
 };
@@ -312,8 +314,6 @@ impl Scanner {
     ///
     /// Note: calling [`Dataset::count_rows`] can be more efficient than calling this method
     /// especially if there is no filter.
-    ///
-    /// [`Dataset::count_rows`]: crate::dataset::Dataset::count_rows
     #[instrument(skip_all)]
     pub fn count_rows(&self) -> BoxFuture<'_, Result<u64>> {
         // Future intentionally boxed here to avoid large futures on the stack
@@ -541,17 +541,25 @@ impl Scanner {
 
         // Check expr filter
         let filter_plan = if let Some(filter) = self.filter.expr_filter.as_ref() {
-            let expr = filter.to_datafusion(self.dataset.schema(), filter_schema.as_ref())?;
+            let expr = planner.optimize_expr(
+                filter.to_datafusion(self.dataset.schema(), filter_schema.as_ref())?,
+            )?;
             let index_info = match self.scalar_index_selection.as_ref() {
                 Some(selection) => {
                     self.dataset
-                        .scalar_index_info_for_segments(selection.segments.as_ref())
+                        .scalar_index_info_for_segments_ignoring(
+                            selection.segments.as_ref(),
+                            &self.ignored_scalar_index_names,
+                        )
                         .await?
                 }
-                None => self.dataset.scalar_index_info().await?,
+                None => {
+                    self.dataset
+                        .scalar_index_info_ignoring(&self.ignored_scalar_index_names)
+                        .await?
+                }
             };
-            let filter_plan =
-                planner.create_filter_plan(expr.clone(), &index_info, use_scalar_index)?;
+            let filter_plan = create_filter_plan(expr.clone(), &index_info, use_scalar_index)?;
 
             // This tests if any of the fragments are missing the physical_rows property (old style)
             // If they are then we cannot use scalar indices
@@ -571,8 +579,7 @@ impl Scanner {
                 if has_missing_row_count {
                     // We need row counts to use scalar indices.  If we don't have them then
                     // fallback to a non-indexed filter
-                    let filter_plan =
-                        planner.create_filter_plan(expr.clone(), &index_info, false)?;
+                    let filter_plan = create_filter_plan(expr.clone(), &index_info, false)?;
                     FilterPlan::new(query_filter.clone(), filter_plan)
                 } else {
                     FilterPlan::new(query_filter.clone(), filter_plan)
@@ -796,7 +803,7 @@ impl Scanner {
         log::trace!("creating scanner plan");
         self.validate_options()?;
         if let Some(rows) = &self.physical_row_addr_prefilter {
-            crate::dataset::fragment_slice::validate_physical_rows(&self.dataset, rows).await?;
+            super::fragment_slice::validate_physical_rows(&self.dataset, rows).await?;
         }
 
         let full_text_query = match &self.full_text_query {

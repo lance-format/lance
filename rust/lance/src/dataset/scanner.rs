@@ -354,7 +354,7 @@ impl FilterPlan {
                     plan = scanner.flat_fts_filter(plan, fts_query).await?;
                 }
                 Some(QueryFilter::Vector(vector_query)) => {
-                    plan = scanner.flat_knn(plan, vector_query)?;
+                    plan = scanner.flat_knn(plan, vector_query).await?;
                 }
                 None => {}
             }
@@ -558,6 +558,8 @@ pub struct Scanner {
 
     nearest: Option<Query>,
     probe_params: ProbeParams,
+    /// Candidate overfetch factor for RQ Fast-to-Accurate refinement.
+    quantized_refine_factor: Option<u32>,
     nearest_query_count: usize,
     /// True when the query shape represents a batch of single-vector queries
     /// (list-like query on a fixed-size vector column, or multiple concatenated vectors).
@@ -569,6 +571,9 @@ pub struct Scanner {
     /// scalar indices do not work well (though we should also improve our planning
     /// to handle this better in the future as well)
     use_scalar_index: bool,
+
+    /// Scalar indices that must not participate in expression-filter planning.
+    ignored_scalar_index_names: HashSet<String>,
 
     /// Whether to use statistics to optimize the scan (default: true)
     ///

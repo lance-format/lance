@@ -12,6 +12,7 @@ use datafusion::common::DFSchema;
 use datafusion::logical_expr::{Expr, ScalarUDF, lit};
 use datafusion::physical_plan::{ExecutionPlan, expressions};
 use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
@@ -69,6 +70,7 @@ impl Scanner {
             ordering: None,
             nearest: None,
             probe_params: ProbeParams::default(),
+            quantized_refine_factor: None,
             nearest_query_count: 1,
             is_batch_nearest: false,
             use_stats: true,
@@ -78,6 +80,7 @@ impl Scanner {
             index_segments: None,
             fast_search: false,
             use_scalar_index: true,
+            ignored_scalar_index_names: HashSet::new(),
             include_deleted_rows: false,
             scan_stats_callback: None,
             strict_batch_size: false,
@@ -116,9 +119,20 @@ impl Scanner {
         }
     }
 
-    /// Set which fragments should be scanned.
+    /// Set the fragments that define the scan's search scope.
     ///
-    /// If scan_in_order is set to true, the fragments will be scanned in the order of the vector.
+    /// An empty list produces no rows. For vector search, this scope is enforced before
+    /// candidate selection even when [`Self::prefilter`] is false. An index segment
+    /// covering other fragments cannot return rows from those fragments.
+    ///
+    /// Fragments not covered by the selected vector index segments are searched with
+    /// flat KNN unless [`Self::fast_search`] is enabled. This includes fragments covered
+    /// only by an unselected segment. Without a usable index, the scope is searched
+    /// entirely with flat KNN (or returns no rows with fast search).
+    ///
+    /// This can be called before or after [`Self::nearest`] and
+    /// [`Self::with_index_segments`]. For ordinary scans, [`Self::scan_in_order`] preserves
+    /// the fragment list's order; vector search ranks results by distance instead.
     pub fn with_fragments(&mut self, fragments: Vec<Fragment>) -> &mut Self {
         self.fragments = Some(fragments);
         self
@@ -140,11 +154,51 @@ impl Scanner {
 
     /// Restrict vector index search to the specified index segments.
     ///
-    /// This setting is only supported for vector search.
+    /// This setting is only supported for vector search. When unset, Lance selects
+    /// a suitable logical index and its relevant segments automatically.
     ///
-    /// If [`Self::with_fragments`] is also set then rows from those fragments that are not covered
-    /// by the selected index segments will still be searched with flat KNN. Otherwise, unindexed
-    /// fragments outside the selected index segments are not searched.
+    /// With [`Self::with_fragments`], ANN searches the intersection of the fragment scope
+    /// and selected segment coverage. The remaining fragments are searched with flat
+    /// KNN unless [`Self::fast_search`] is enabled, including fragments covered only by
+    /// an unselected segment. With no fragment scope, indexed search searches only the
+    /// selected segments; appended unindexed fragments are not added.
+    ///
+    /// Segment selection controls index use, not a flat scan when [`Self::use_index`]
+    /// is false. It is independent of SQL [`Self::prefilter`] and can be set before or
+    /// after [`Self::nearest`] and [`Self::with_fragments`].
+    ///
+    /// # Errors
+    ///
+    /// An empty list is rejected immediately. Segment selection without a vector query
+    /// is rejected during planning. When index use is enabled, planning also rejects
+    /// unknown UUIDs and segments from different logical indices or the wrong vector
+    /// column. Query metric compatibility is checked when selected segments overlap the
+    /// fragment scope. With no overlap, ordinary search uses flat KNN with the query
+    /// metric, or the selected index's metric when unset, while fast search returns
+    /// no rows. See [`Self::distance_metric`] for metric defaults.
+    ///
+    /// # Example
+    ///
+    /// Suppose the selected segment covers the first two fragments and a third fragment
+    /// was appended later. Searching all but the first fragment combines ANN on the
+    /// second fragment with flat KNN on the third. `query` must match the `vector` column.
+    ///
+    /// ```
+    /// # use arrow_array::Array;
+    /// # use lance::{Dataset, Result};
+    /// # use uuid::Uuid;
+    /// # async fn example(dataset: &Dataset, segment_uuid: Uuid, query: &dyn Array) -> Result<()> {
+    /// let mut scanner = dataset.scan();
+    /// scanner
+    ///     .with_fragments(dataset.fragments()[1..].to_vec())
+    ///     .with_index_segments(vec![segment_uuid])?
+    ///     .nearest("vector", query, 6)?
+    ///     .prefilter(false);
+    /// let batch = scanner.try_into_batch().await?;
+    /// # let _ = batch;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_index_segments(&mut self, segments: Vec<Uuid>) -> Result<&mut Self> {
         if segments.is_empty() {
             return Err(Error::invalid_input(
@@ -169,20 +223,6 @@ impl Scanner {
                 )
             })
         })
-    }
-
-    fn ensure_not_fragment_scan(&self) -> Result<()> {
-        if self.is_fragment_scan() {
-            Err(Error::not_supported(
-                "This operation is not supported for fragment scan".to_string(),
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn is_fragment_scan(&self) -> bool {
-        self.fragments.is_some()
     }
 
     /// Empty Projection (useful for count queries)
@@ -265,14 +305,18 @@ impl Scanner {
         Ok(self)
     }
 
-    /// Should the filter run before the vector index is applied
+    /// Set whether the SQL filter runs before vector top-k selection (default: false).
     ///
-    /// If true then the filter will be applied before the vector index.  This
-    /// means the results will be accurate but the overall query may be more expensive.
+    /// If true, top-k is selected from rows matching the filter. This may be more
+    /// expensive and does not guarantee exact results from an approximate index.
     ///
-    /// If false then the filter will be applied to the nearest results.  This means
-    /// you may get back fewer results than you ask for (or none at all) if the closest
-    /// results do not match the filter.
+    /// If false, the filter is applied after the combined ANN and flat top-k result.
+    /// Rows rejected by the filter are not replaced, so fewer than k rows (or none)
+    /// may be returned. This also applies to searches without a vector index.
+    ///
+    /// The fragment scope, deletions, and [`Self::with_row_id_prefilter`] restrict
+    /// candidates regardless of this setting. See [`Self::with_index_segments`] for
+    /// a mixed-search example.
     pub fn prefilter(&mut self, should_prefilter: bool) -> &mut Self {
         self.prefilter = should_prefilter;
         self
@@ -350,8 +394,7 @@ impl Scanner {
     /// # }
     /// ```
     pub async fn with_fragment_slices(&mut self, slices: &[FragmentSlice]) -> Result<&mut Self> {
-        let rows = crate::dataset::fragment_slice::physical_rows_from_slices(&self.dataset, slices)
-            .await?;
+        let rows = super::fragment_slice::physical_rows_from_slices(&self.dataset, slices).await?;
         Ok(self.with_physical_row_addr_prefilter(rows))
     }
 
@@ -652,6 +695,45 @@ impl Scanner {
         self
     }
 
+    /// Ignore named scalar indices from expression-filter planning.
+    ///
+    /// Other scalar indices remain eligible, and the original filter is still
+    /// evaluated for rows selected by the remaining scan plan. Names that do
+    /// not identify an available scalar index have no effect. This option is
+    /// ignored when scalar indices are disabled with [`Self::use_scalar_index`].
+    ///
+    /// Inverted index names are also honored for expression filters such as
+    /// `contains_tokens`, which fall back to evaluating the function without that
+    /// index. This does not control vector index segments or the index selected
+    /// by an explicit full-text search query.
+    ///
+    /// With [`Self::fast_search`], only a filter plan that still uses an index
+    /// skips unindexed fragments. If ignoring indices removes every index query,
+    /// the scan falls back to evaluating the filter over all selected fragments,
+    /// potentially returning more matching rows. Explicit fragment and row
+    /// selections still apply; use them to preserve a caller-defined scan scope.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn scan_without_one_index(dataset: &Dataset) -> Result<()> {
+    /// let mut scanner = dataset.scan();
+    /// scanner
+    ///     .filter("id = 42")?
+    ///     .with_ignored_scalar_indices(["id_zonemap"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_ignored_scalar_indices<I, S>(&mut self, index_names: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.ignored_scalar_index_names = index_names.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Set whether to use strict batch size.
     ///
     /// If this is true then output batches (except the last batch) will have exactly `batch_size` rows.
@@ -704,16 +786,18 @@ impl Scanner {
             )
     }
 
-    /// Find k-nearest neighbor within the vector column.
-    /// the query can be a Float16Array, Float32Array, Float64Array, UInt8Array,
-    /// or a ListArray/FixedSizeListArray of the above types.
+    /// Find up to k nearest neighbors within the vector column.
+    ///
+    /// The query can be a Float16Array, Float32Array, Float64Array, UInt8Array,
+    /// or a ListArray/FixedSizeListArray of the above types. A suitable vector index
+    /// is used when available; otherwise the search uses flat KNN.
+    ///
+    /// [`Self::with_fragments`] defines the search scope with either SQL filtering
+    /// strategy. It and [`Self::with_index_segments`] can be configured before or after
+    /// this method. See [`Self::with_index_segments`] for a mixed ANN and flat example,
+    /// [`Self::prefilter`] for SQL filter placement, and [`Self::fast_search`] for
+    /// searches limited to indexed data.
     pub fn nearest(&mut self, column: &str, q: &dyn Array, k: usize) -> Result<&mut Self> {
-        if !self.prefilter {
-            // We can allow fragment scan if the input to nearest is a prefilter.
-            // The fragment scan will be performed by the prefilter.
-            self.ensure_not_fragment_scan()?;
-        }
-
         if k == 0 {
             return Err(Error::invalid_input("k must be positive".to_string()));
         }
@@ -749,7 +833,10 @@ impl Scanner {
                     } else {
                         list_array.len()
                     };
-                    (list_array.values().clone(), query_count)
+                    let offsets = list_array.value_offsets();
+                    let start = offsets[0] as usize;
+                    let end = offsets[list_array.len()] as usize;
+                    (list_array.values().slice(start, end - start), query_count)
                 } else {
                     let fsl = q.as_fixed_size_list();
                     if fsl.value_length() as usize != dim {
@@ -793,8 +880,8 @@ impl Scanner {
 
         let key = match &element_type {
             dt if dt == q.data_type() => q,
-            dt if dt.is_floating() => coerce_float_vector(
-                q.as_any().downcast_ref::<Float32Array>().unwrap(),
+            dt if dt.is_floating() && q.data_type() == &DataType::Float32 => coerce_float_vector(
+                q.as_primitive::<arrow_array::types::Float32Type>(),
                 FloatType::try_from(dt)?,
             )?,
             _ => {
@@ -825,6 +912,7 @@ impl Scanner {
             dist_q_c: 0.0,
             approx_mode: Default::default(),
         });
+        self.quantized_refine_factor = None;
         self.nearest_query_count = query_count;
         self.is_batch_nearest = is_batch_nearest;
         Ok(self)
@@ -948,18 +1036,36 @@ impl Scanner {
         self
     }
 
+    /// Set the beam width used when searching an HNSW graph.
+    ///
+    /// Defaults to `1.5 * k * refine_factor`, floored at
+    /// [`lance_index::vector::hnsw::builder::DEFAULT_MIN_EF`].
     pub fn ef(&mut self, ef: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.ef = Some(ef);
+        } else {
+            log::warn!("ef is not set because nearest has not been called yet");
         }
         self
     }
 
-    /// Only search the data being indexed.
+    /// Only search indexed data, skipping flat fallback (default: false).
     ///
-    /// Default value is false.
+    /// For vector search, only the selected index segments' coverage within the
+    /// [`Self::with_fragments`] scope is searched. Fragments outside that coverage and
+    /// stale vector entries requiring overlay replay are skipped. With no usable
+    /// vector index coverage, the result is empty.
+    ///
+    /// This is a weak consistency search: newly appended or updated rows may be absent.
+    /// SQL [`Self::prefilter`] placement is unchanged. See [`Self::with_index_segments`]
+    /// for the default mixed-search behavior.
     ///
     /// This is essentially a weak consistency search, only on the indexed data.
+    /// For scalar expression filters, this applies only when the filter plan
+    /// uses an index. If no index query remains, including after
+    /// [`Self::with_ignored_scalar_indices`], the scan falls back to all selected
+    /// fragments while retaining the original filter and explicit row selections.
+    ///
     /// Row IDs are used internally but are only returned when explicitly requested.
     pub fn fast_search(&mut self) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
@@ -985,7 +1091,41 @@ impl Scanner {
         self
     }
 
+    /// Re-rank an over-fetched IVF_RQ candidate set with its multi-bit index data.
+    ///
+    /// Unlike [`Self::refine`], indexed candidates are re-ranked without reading
+    /// their original vectors. It first discovers `factor * k` candidates with
+    /// one-bit RQ scores and then re-ranks them with the index's most accurate
+    /// stored RQ representation. Unindexed fragments and stale overlay rows still
+    /// use flat fallback and may read original vectors. If exact refinement is also
+    /// configured, the quantized stage emits enough candidates for that exact stage.
+    /// When a distance range is set, the selected partitions use Accurate RQ search
+    /// directly so the range applies before top-k truncation.
+    ///
+    /// ```
+    /// # use arrow_array::Float32Array;
+    /// # use lance::{Dataset, Result};
+    /// # async fn search(dataset: &Dataset) -> Result<()> {
+    /// let query = Float32Array::from(vec![0.0_f32; 128]);
+    /// let mut scanner = dataset.scan();
+    /// scanner.nearest("vector", &query, 10)?;
+    /// scanner.quantized_refine(4);
+    /// let results = scanner.try_into_batch().await?;
+    /// # let _ = results;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn quantized_refine(&mut self, factor: u32) -> &mut Self {
+        self.quantized_refine_factor = Some(factor);
+        self
+    }
+
     /// Change the distance [MetricType], i.e, L2 or Cosine distance.
+    ///
+    /// When unset, the search ranks by the metric of the vector index it chooses for the
+    /// column, including when it falls back to flat KNN for filtered rows or fragments
+    /// that index does not cover. A search with [`Self::use_index`] false uses the column
+    /// type's default: Hamming for uint8 vectors and L2 otherwise.
     pub fn distance_metric(&mut self, metric_type: MetricType) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.metric_type = Some(metric_type)
@@ -1158,7 +1298,13 @@ impl Scanner {
             // Convert logical to physical expression
             let df_schema = Arc::new(DFSchema::try_from(arrow_schema.clone())?);
             let execution_props = ExecutionProps::new().with_query_execution_start_time(Utc::now());
-            create_physical_expr(&expr, &df_schema, &execution_props).map_err(|e| {
+            create_physical_expr(
+                &expr,
+                &df_schema,
+                &execution_props,
+                &PhysicalPlanningContext::default(),
+            )
+            .map_err(|e| {
                 Error::internal(format!(
                     "Failed to create physical expression for nested field '{}': {}",
                     column_name, e
@@ -1397,9 +1543,29 @@ mod tests {
         assert_eq!(query.search_effort, effort);
     }
 
+    #[rstest]
+    #[case::no_index(false)]
+    #[case::untrained_l2_index(true)]
     #[tokio::test]
-    async fn test_binary_vectors_default_to_hamming() {
-        let (_tmp_dir, dataset) = make_binary_vector_dataset().await.unwrap();
+    async fn test_binary_vectors_default_to_hamming(#[case] has_untrained_index: bool) {
+        let (_tmp_dir, mut dataset) = make_binary_vector_dataset().await.unwrap();
+        if has_untrained_index {
+            // An untrained index records its metric unchecked, and L2 cannot rank uint8.
+            dataset
+                .create_index_builder(
+                    &["bin"],
+                    IndexType::Vector,
+                    &VectorIndexParams::ivf_flat(1, DistanceType::L2),
+                )
+                .train(false)
+                .await
+                .unwrap();
+            let indices = dataset.load_indices().await.unwrap();
+            assert_eq!(
+                crate::index::vector::details::metric_type_from_index_metadata(&indices[0]),
+                Some(DistanceType::L2)
+            );
+        }
         let query = UInt8Array::from(vec![0b0000_1111u8, 0, 0, 0]);
 
         let mut scan = dataset.scan();
@@ -1535,6 +1701,18 @@ mod tests {
             scanner.nearest_mut().unwrap().approx_mode,
             ApproxMode::Accurate
         );
+
+        assert_eq!(scanner.quantized_refine_factor, None);
+        scanner.quantized_refine(4);
+        assert_eq!(scanner.quantized_refine_factor, Some(4));
+
+        scanner.nearest("vec", &query_vector, 5).unwrap();
+        assert_eq!(scanner.quantized_refine_factor, None);
+
+        scanner.quantized_refine(0);
+        let error = scanner.explain_plan(false).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("cannot be zero"));
     }
 
     #[tokio::test]

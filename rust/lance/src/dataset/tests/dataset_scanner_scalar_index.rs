@@ -592,9 +592,9 @@ async fn test_inexact_scalar_index_plans() {
         &dataset,
         |scanner| scanner.filter("contains(ngram, 'test string')"),
         "LanceRead: uri=..., projection=[ngram, exact, no_index], num_fragments=1, \
-             range_before=None, range_after=None, row_id=false, row_addr=false, \
-             full_filter=contains(ngram, Utf8(\"test string\")), refine_filter=--
-               ScalarIndexQuery: query=[contains(ngram, Utf8(\"test string\"))]@ngram_idx(NGram)",
+         range_before=None, range_after=None, row_id=false, row_addr=false, \
+         full_filter=contains(ngram, Utf8(\"test string\")), refine_filter=--
+           ScalarIndexQuery: query=[contains(ngram, Utf8(\"test string\"))]@ngram_idx(NGram)",
     )
     .await
     .unwrap();
@@ -604,10 +604,10 @@ async fn test_inexact_scalar_index_plans() {
         &dataset,
         |scanner| scanner.filter("contains(ngram, 'test string') and exact < 50"),
         "LanceRead: uri=..., projection=[ngram, exact, no_index], num_fragments=1, \
-            range_before=None, range_after=None, row_id=false, row_addr=false, \
-            full_filter=contains(ngram, Utf8(\"test string\")) AND exact < UInt32(50), \
-            refine_filter=--
-              ScalarIndexQuery: query=AND([contains(ngram, Utf8(\"test string\"))]@ngram_idx(NGram),[exact < 50]@exact_idx(BTree))",
+        range_before=None, range_after=None, row_id=false, row_addr=false, \
+        full_filter=contains(ngram, Utf8(\"test string\")) AND exact < UInt32(50), \
+        refine_filter=--
+          ScalarIndexQuery: query=AND([contains(ngram, Utf8(\"test string\"))]@ngram_idx(NGram),[exact < 50]@exact_idx(BTree))",
     )
     .await
     .unwrap();
@@ -622,7 +622,7 @@ async fn test_inexact_scalar_index_plans() {
   LanceRead: uri=..., projection=[ngram, exact, no_index], num_fragments=1, range_before=None, \
   range_after=None, row_id=true, row_addr=false, full_filter=contains(ngram, Utf8(\"test string\")) AND exact < UInt32(50) AND no_index > UInt32(100), \
   refine_filter=no_index > UInt32(100)
-    ScalarIndexQuery: query=AND([contains(ngram, Utf8(\"test string\"))]@ngram_idx(NGram),[exact < 50]@exact_idx(BTree))",
+ScalarIndexQuery: query=AND([contains(ngram, Utf8(\"test string\"))]@ngram_idx(NGram),[exact < 50]@exact_idx(BTree))",
     )
     .await
     .unwrap();
@@ -1044,32 +1044,53 @@ async fn test_ngram_regex_non_accelerable_recheck() {
     assert_eq!(count(&dataset, "regexp_like(text, 'a.b')").await, 20);
 }
 
+#[rstest]
+#[case::short_unicode("éé", vec![0, 1], false)]
+#[case::tokenizable_unicode("ééb", vec![0], true)]
+#[case::punctuation("_k7", vec![5, 6, 7, 8], true)]
+#[case::all_windows_filtered("_k7_", vec![8], true)]
+#[case::partly_tokenizable("_k77", vec![6], true)]
+#[case::only_punctuation("!!!", vec![9], true)]
+#[case::no_matches("_x7", vec![], true)]
 #[tokio::test]
-async fn test_ngram_contains_untokenizable_needle() {
-    // A needle the tokenizer cannot turn into a trigram must fall back to a
-    // full recheck rather than silently matching nothing.  Byte length is
-    // not a usable proxy for this: "éé" is two characters but four bytes.
-    let unit = ["ééb", "aéé", "abc", "dog", "éab"];
-    let values: Vec<&str> = unit.iter().copied().cycle().take(60).collect();
-    let array = StringArray::from_iter_values(values);
-    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-        "text",
-        DataType::Utf8,
-        false,
-    )]));
-    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array)]).unwrap();
-    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+async fn test_ngram_contains_untokenizable_needle(
+    #[case] needle: &str,
+    #[case] expected_ids: Vec<u32>,
+    #[case] is_index_used: bool,
+    #[values(false, true)] has_stable_row_ids: bool,
+) {
+    let batch = arrow_array::record_batch!(
+        ("id", UInt32, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+        (
+            "text",
+            Utf8,
+            vec![
+                Some("ééb"),
+                Some("aéé"),
+                Some("abc"),
+                Some("dog"),
+                Some("éab"),
+                Some("user_k7"),
+                Some("user_k77"),
+                Some("_k7"),
+                Some("_k7_"),
+                Some("!!!"),
+                Some(""),
+                None,
+            ]
+        )
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
     let write_params = WriteParams {
-        max_rows_per_file: 20, // 60 rows -> 3 fragments
+        max_rows_per_file: 4,
+        enable_stable_row_ids: has_stable_row_ids,
         ..Default::default()
     };
-    let mut dataset = Dataset::write(
-        reader,
-        "memory://test_ngram_contains_utf8",
-        Some(write_params),
-    )
-    .await
-    .unwrap();
+    let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
     dataset
         .create_index(
             &["text"],
@@ -1081,46 +1102,29 @@ async fn test_ngram_contains_untokenizable_needle() {
         .await
         .unwrap();
 
-    async fn count(dataset: &Dataset, filter: &str) -> usize {
-        let mut scan = dataset.scan();
-        scan.filter(filter).unwrap();
-        let batches = scan
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        batches.iter().map(|b| b.num_rows()).sum()
+    let filter = format!("contains(text, '{needle}')");
+    let mut indexed_scan = dataset.scan();
+    indexed_scan.filter(&filter).unwrap();
+    let plan = indexed_scan.explain_plan(false).await.unwrap();
+    assert_eq!(plan.contains("ScalarIndexQuery"), is_index_used, "{plan}");
+    if is_index_used {
+        assert!(plan.contains("NGram"), "{plan}");
     }
 
-    async fn plan_of(dataset: &Dataset, filter: &str) -> String {
-        let mut scan = dataset.scan();
-        scan.filter(filter).unwrap();
-        let plan = scan.create_plan().await.unwrap();
-        format!(
-            "{}",
-            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
-        )
-    }
-
-    // Each unit value appears 12 times in the 60 rows.
-    // Two characters (four bytes): shorter than a trigram, so the index is
-    // bypassed and "ééb" / "aéé" are still found.
-    assert_eq!(count(&dataset, "contains(text, 'éé')").await, 24);
-    let plan_str = plan_of(&dataset, "contains(text, 'éé')").await;
-    assert!(
-        !plan_str.contains("ScalarIndexQuery"),
-        "expected NO ngram index usage for a two character needle, got plan:\n{plan_str}"
+    let indexed = indexed_scan.try_into_batch().await.unwrap();
+    let unindexed = dataset
+        .scan()
+        .use_scalar_index(false)
+        .filter(&filter)
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(
+        unindexed["id"].as_primitive::<UInt32Type>().values(),
+        &expected_ids,
     );
-
-    // Three characters: long enough to tokenize, so the index is used.
-    assert_eq!(count(&dataset, "contains(text, 'ééb')").await, 12);
-    let plan_str = plan_of(&dataset, "contains(text, 'ééb')").await;
-    assert!(
-        plan_str.contains("ScalarIndexQuery") && plan_str.contains("NGram"),
-        "expected ngram index usage for a three character needle, got plan:\n{plan_str}"
-    );
+    assert_eq!(indexed, unindexed);
 }
 
 #[tokio::test]
@@ -1167,9 +1171,9 @@ async fn test_like_prefix_with_btree_index() {
         &dataset,
         |scanner| scanner.filter("name LIKE 'app%'"),
         "LanceRead: uri=..., projection=[name, id], num_fragments=1, \
-             range_before=None, range_after=None, row_id=false, row_addr=false, \
-             full_filter=name LIKE Utf8(\"app%\"), refine_filter=--
-               ScalarIndexQuery: query=[name LIKE 'app%']@name_idx(BTree)",
+         range_before=None, range_after=None, row_id=false, row_addr=false, \
+         full_filter=name LIKE Utf8(\"app%\"), refine_filter=--
+           ScalarIndexQuery: query=[name LIKE 'app%']@name_idx(BTree)",
     )
     .await
     .unwrap();
@@ -1201,9 +1205,9 @@ async fn test_like_prefix_with_btree_index() {
         &dataset,
         |scanner| scanner.filter("starts_with(name, 'ban')"),
         "LanceRead: uri=..., projection=[name, id], num_fragments=1, \
-             range_before=None, range_after=None, row_id=false, row_addr=false, \
-             full_filter=name LIKE Utf8(\"ban%\"), refine_filter=--
-               ScalarIndexQuery: query=[name LIKE 'ban%']@name_idx(BTree)",
+         range_before=None, range_after=None, row_id=false, row_addr=false, \
+         full_filter=name LIKE Utf8(\"ban%\"), refine_filter=--
+           ScalarIndexQuery: query=[name LIKE 'ban%']@name_idx(BTree)",
     )
     .await
     .unwrap();
@@ -1237,7 +1241,7 @@ async fn test_like_prefix_with_btree_index() {
   LanceRead: uri=..., projection=[name, id], num_fragments=1, \
 range_before=None, range_after=None, row_id=true, row_addr=false, \
 full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
-    ScalarIndexQuery: query=[name LIKE 'test%']@name_idx(BTree)",
+ScalarIndexQuery: query=[name LIKE 'test%']@name_idx(BTree)",
     )
     .await
     .unwrap();
@@ -2171,4 +2175,341 @@ async fn test_like_prefix_correctness_with_zone_map() {
         starts_with_names,
         BTreeSet::from(["epsilon".to_string(), "eta".to_string()])
     );
+}
+
+/// Zone map pruning over NaN-bearing float zones returns exactly what the
+/// unindexed scan returns, for every filter shape, while really going
+/// through the index.
+#[tokio::test]
+async fn test_zonemap_nan_scan_matches_unindexed_scan() {
+    use arrow_array::Float32Array;
+
+    let pos_nan = f32::from_bits(0x7FC0_0000);
+    let pos_nan_payload = f32::from_bits(0x7FFF_FFFF);
+    let neg_nan = f32::from_bits(0xFFC0_0000);
+    let neg_nan_payload = f32::from_bits(0xFFFF_FFFF);
+
+    // One fragment (= one zone) per value class: all positive NaNs, all
+    // negative NaNs, NaN plus null, finite plus NaN, finite only.
+    let values: Vec<Option<f32>> = vec![
+        Some(pos_nan),
+        Some(pos_nan_payload),
+        Some(neg_nan),
+        Some(neg_nan_payload),
+        Some(neg_nan),
+        None,
+        Some(1.0),
+        Some(pos_nan),
+        Some(-5.0),
+        Some(7.0),
+    ];
+    let ids: Vec<i32> = (0..values.len() as i32).collect();
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("val", DataType::Float32, true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(Float32Array::from(values)),
+        ],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 5);
+    dataset
+        .create_index(
+            &["val"],
+            IndexType::ZoneMap,
+            None,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+            false,
+        )
+        .await
+        .unwrap();
+
+    for filter in [
+        "val < 0.0",
+        "val > 0.0",
+        "val >= 0.0 AND val <= 5.0",
+        "val <= -1.0",
+        "val > 100.0",
+        "val = 7.0",
+        "val IS NULL",
+    ] {
+        let mut full_scan = dataset.scan();
+        full_scan
+            .use_scalar_index(false)
+            .filter(filter)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let full = full_scan.try_into_batch().await.unwrap();
+        let full_ids: Vec<i32> = full["id"].as_primitive::<Int32Type>().values().to_vec();
+
+        let mut indexed_scan = dataset.scan();
+        indexed_scan
+            .filter(filter)
+            .unwrap()
+            .project(&["id"])
+            .unwrap();
+        let plan = indexed_scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ScalarIndexQuery") && plan.contains("ZoneMap"),
+            "filter {filter} must go through the zone map index: {plan}"
+        );
+        let indexed = indexed_scan.try_into_batch().await.unwrap();
+        let indexed_ids: Vec<i32> = indexed["id"].as_primitive::<Int32Type>().values().to_vec();
+        assert_eq!(
+            indexed_ids, full_ids,
+            "indexed and unindexed scans disagree for filter {filter}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_fm_index_contains_empty_needle() {
+    // Every non-null string contains the empty string, so no text index can
+    // narrow `contains(text, '')` down; it must be left to a full scan.
+    let batch = arrow_array::record_batch!(
+        ("text", Utf8, [Some("alpha"), Some(""), None, Some("beta")]),
+        ("id", Int32, [0, 1, 2, 3])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+    let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Fm);
+    dataset
+        .create_index(&["text"], IndexType::Fm, None, &params, true)
+        .await
+        .unwrap();
+
+    for (filter, uses_index, expected_ids) in [
+        ("contains(text, '')", false, vec![0, 1, 3]),
+        ("NOT contains(text, '')", false, vec![]),
+        // A one-character needle is still answered by the index.
+        ("contains(text, 'a')", true, vec![0, 3]),
+    ] {
+        let mut scan = dataset.scan();
+        scan.filter(filter).unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+        assert_eq!(ids, expected_ids, "wrong rows for {filter}");
+        assert_eq!(
+            plan.contains("ScalarIndexQuery"),
+            uses_index,
+            "unexpected plan for {filter}:\n{plan}"
+        );
+    }
+}
+
+#[rstest]
+#[case::known_names(false)]
+#[case::unknown_name(true)]
+#[tokio::test]
+async fn test_ignored_scalar_indices(#[case] include_unknown_name: bool) {
+    use lance_index::scalar::BuiltinIndexType;
+
+    let data = gen_batch()
+        .col("a", array::step::<Int32Type>())
+        .col("b", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+    dataset
+        .create_index(
+            &["a"],
+            IndexType::Scalar,
+            Some("a_zonemap".to_string()),
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["b"],
+            IndexType::BTree,
+            Some("b_btree".to_string()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let mut default_scan = dataset.scan();
+    default_scan.filter("a < 50 AND b < 50").unwrap();
+    let default_plan = default_scan.explain_plan(true).await.unwrap();
+    assert!(
+        default_plan.contains("@a_zonemap(ZoneMap)"),
+        "{default_plan}"
+    );
+    assert!(default_plan.contains("@b_btree(BTree)"), "{default_plan}");
+
+    let mut ignore_a = dataset.scan();
+    ignore_a
+        .filter("a < 50 AND b < 50")
+        .unwrap()
+        .with_ignored_scalar_indices(if include_unknown_name {
+            vec!["a_zonemap", "missing_index"]
+        } else {
+            vec!["a_zonemap"]
+        });
+    let ignore_a_plan = ignore_a.explain_plan(true).await.unwrap();
+    assert!(
+        !ignore_a_plan.contains("@a_zonemap(ZoneMap)"),
+        "{ignore_a_plan}"
+    );
+    assert!(ignore_a_plan.contains("@b_btree(BTree)"), "{ignore_a_plan}");
+
+    let result = ignore_a.try_into_batch().await.unwrap();
+    assert_eq!(result.num_rows(), 50);
+
+    let mut ignore_both = dataset.scan();
+    ignore_both
+        .filter("a < 50 AND b < 50")
+        .unwrap()
+        .with_ignored_scalar_indices(["a_zonemap", "b_btree"]);
+    let ignore_both_plan = ignore_both.explain_plan(true).await.unwrap();
+    assert!(
+        !ignore_both_plan.contains("ScalarIndexQuery"),
+        "{ignore_both_plan}"
+    );
+    let result = ignore_both.try_into_batch().await.unwrap();
+    assert_eq!(result.num_rows(), 50);
+}
+
+/// A LIKE whose escape consumes an ordinary character (`a\b%` means "starts
+/// with ab") or that runs escapes together (`\\\%` is the literal `\%`) must
+/// return the same rows through an index as without one. The BTree answer
+/// has no recheck, and a multi-fragment zone map prunes before its recheck.
+#[rstest]
+#[case::btree(IndexType::BTree, ScalarIndexParams::default())]
+#[case::zonemap(
+    IndexType::Scalar,
+    ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap)
+)]
+#[tokio::test]
+async fn test_like_prefix_escapes_match_unindexed_scan(
+    #[case] index_type: IndexType,
+    #[case] params: ScalarIndexParams,
+) {
+    // Two rows per fragment: the first holds only the "ab" rows, so a zone map
+    // pruning on the wrong prefix skips it before its recheck can see them.
+    let names = ["ab1", "ab2", r"a\b1", r"\%", r"\%x", "zz"];
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "name",
+        DataType::Utf8,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(names.to_vec()))],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://test_like_prefix_escapes",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+    dataset
+        .create_index(&["name"], index_type, None, &params, true)
+        .await
+        .unwrap();
+
+    let matched = async |filter: &str, use_index: bool| -> BTreeSet<String> {
+        let batch = dataset
+            .scan()
+            .use_scalar_index(use_index)
+            .filter(filter)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        batch["name"]
+            .as_string::<i32>()
+            .iter()
+            .map(|name| name.unwrap().to_string())
+            .collect()
+    };
+    for (filter, expected) in [
+        (r"name LIKE 'a\b%'", vec!["ab1", "ab2"]),
+        (r"name LIKE '\\\%'", vec![r"\%"]),
+    ] {
+        let expected: BTreeSet<String> = expected.into_iter().map(String::from).collect();
+        assert_eq!(
+            matched(filter, false).await,
+            expected,
+            "{filter} without index"
+        );
+        assert_eq!(matched(filter, true).await, expected, "{filter} with index");
+    }
+}
+
+#[rstest]
+#[case::no_ignored_indices(vec![], false, 5)]
+#[case::remaining_index(vec!["a_btree"], false, 5)]
+#[case::all_ignored(vec!["a_btree", "b_btree"], false, 15)]
+#[case::explicit_rows(vec!["a_btree", "b_btree"], true, 2)]
+#[case::unknown_name(vec!["missing_index"], false, 5)]
+#[tokio::test]
+async fn test_fast_search_ignored_scalar_indices(
+    #[case] ignored_names: Vec<&str>,
+    #[case] restrict_rows: bool,
+    #[case] expected_rows: usize,
+) {
+    let (_tmp_dir, schema, mut dataset) =
+        make_scalar_filter_test_dataset(LanceFileVersion::Stable).await;
+    for column in ["a", "b"] {
+        dataset
+            .create_index(
+                &[column],
+                IndexType::BTree,
+                Some(format!("{column}_btree")),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    append_scalar_filter_test_data(&mut dataset, schema, 100, 110).await;
+
+    let mut scanner = dataset.scan();
+    scanner
+        .filter("a >= 95 AND b >= 95")
+        .unwrap()
+        .with_ignored_scalar_indices(ignored_names)
+        .fast_search();
+    if restrict_rows {
+        // The caller's selection must survive fallback, and its rows must
+        // still be refined by the original expression (which excludes 90).
+        scanner.with_row_id_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+            90u64, 97, 99,
+        ])));
+    }
+    let batch = scanner.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), expected_rows);
+    if restrict_rows {
+        let values = batch["a"].as_primitive::<Int32Type>();
+        assert_eq!(values.values().as_ref(), &[97, 99]);
+    }
 }

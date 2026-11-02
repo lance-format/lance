@@ -688,8 +688,8 @@ async fn test_scan_regexp_match_and_non_empty_captions() {
     let mut scan = dataset.scan();
     scan.filter(
         "regexp_match(keywords, 'Liberty|revolution') AND \
-             (natural_caption IS NOT NULL AND natural_caption <> '' AND \
-              poetic_caption IS NOT NULL AND poetic_caption <> '')",
+         (natural_caption IS NOT NULL AND natural_caption <> '' AND \
+          poetic_caption IS NOT NULL AND poetic_caption <> '')",
     )
     .unwrap();
 
@@ -1589,7 +1589,9 @@ async fn test_ann_with_deletion(
 
         assert_eq!(
             dataset.index_cache_entry_count().await,
-            5 + dataset.versions().await.unwrap().len()
+            // the index, its partitions and the segment ownership mask, plus
+            // the index metadata of every version
+            6 + dataset.versions().await.unwrap().len()
         );
         assert_eq!(results.len(), 1);
         let batch = &results[0];

@@ -294,12 +294,24 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
         let key = Arc::new(Float32Array::from(key_array));
 
         let k = env.get_int_as_usize_from_method(&java_obj, "getK")?;
+        let lower_bound =
+            env.get_optional_from_method(&java_obj, "getLowerBound", |env, value| {
+                env.get_f32_from_method(&value, "floatValue")
+            })?;
+        let upper_bound =
+            env.get_optional_from_method(&java_obj, "getUpperBound", |env, value| {
+                env.get_f32_from_method(&value, "floatValue")
+            })?;
         let minimum_nprobes = env.get_int_as_usize_from_method(&java_obj, "getMinimumNprobes")?;
         let maximum_nprobes = env.get_optional_usize_from_method(&java_obj, "getMaximumNprobes")?;
 
         let ef = env.get_optional_usize_from_method(&java_obj, "getEf")?;
 
         let refine_factor = env.get_optional_u32_from_method(&java_obj, "getRefineFactor")?;
+        // Query filters cannot represent scanner execution stages, but read the
+        // property here so JNI contract tests cover the Java method signature.
+        let _quantized_refine_factor =
+            env.get_optional_u32_from_method(&java_obj, "getQuantizedRefineFactor")?;
 
         let distance_type = if let Some(distance_type_str) =
             env.get_optional_string_from_method(&java_obj, "getDistanceTypeString")?
@@ -323,8 +335,8 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             column,
             key,
             k,
-            lower_bound: None,
-            upper_bound: None,
+            lower_bound,
+            upper_bound,
             minimum_nprobes,
             maximum_nprobes,
             search_effort,

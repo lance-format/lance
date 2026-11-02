@@ -542,20 +542,28 @@ async fn test_batch_knn_flat_projects_row_id_and_row_addr_without_vector() {
     );
 }
 
+#[rstest]
+#[case::whole_dataset(false)]
+#[case::fragments_first(true)]
 #[tokio::test]
-async fn test_primitive_query_length_multiple_of_dim_is_rejected() {
+async fn test_primitive_query_length_multiple_of_dim_is_rejected(#[case] has_fragments: bool) {
     let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
         .await
         .unwrap();
     let dataset = &test_ds.dataset;
     let q: Float32Array = (32..96).map(|v| v as f32).collect();
 
-    let err = match dataset.scan().nearest("vec", &q, 2) {
-        Err(err) => err.to_string(),
-        Ok(_) => panic!("expected primitive query length mismatch error"),
+    let mut scanner = dataset.scan();
+    if has_fragments {
+        scanner.with_fragments(vec![dataset.fragments()[0].clone()]);
+    }
+    let Err(err) = scanner.nearest("vec", &q, 2) else {
+        panic!("expected primitive query length mismatch error");
     };
+    assert!(matches!(err, Error::InvalidInput { .. }));
     assert!(
-        err.contains("query dim(64) doesn't match the column vec vector dim(32)"),
+        err.to_string()
+            .contains("query dim(64) doesn't match the column vec vector dim(32)"),
         "unexpected error: {err}"
     );
 }
@@ -881,7 +889,7 @@ async fn test_batch_knn_indexed_refine_falls_back() {
         assert!(
             plan.contains("ANNSubIndex"),
             "refine({refine_factor}) batch search should fall back to the per-query \
-                 indexed loop, got:\n{plan}"
+             indexed loop, got:\n{plan}"
         );
 
         let batch = scan.try_into_batch().await.unwrap();
@@ -971,7 +979,7 @@ async fn test_batch_knn_indexed_zero_nprobes_falls_back() {
     assert!(
         !plan.contains("ANNIvfBatch"),
         "nprobes(0) must not use the shared-scan batch node (which would clamp \
-             to one partition), got:\n{plan}"
+         to one partition), got:\n{plan}"
     );
     assert!(
         plan.contains("ANNSubIndex"),
@@ -1055,7 +1063,7 @@ async fn test_batch_knn_indexed_external_mask_falls_back() {
     assert!(
         !plan.contains("ANNIvfBatch"),
         "an external row mask must not use the shared-scan batch node, which \
-             does not carry the mask, got:\n{plan}"
+         does not carry the mask, got:\n{plan}"
     );
     assert!(
         plan.contains("ANNSubIndex"),
@@ -1115,7 +1123,7 @@ async fn test_batch_knn_indexed_partial_segment_selection_falls_back() {
     assert!(
         !plan.contains("ANNIvfBatch"),
         "a requested fragment outside the selected segments must force a fallback, \
-             not a shared scan that drops it, got:\n{plan}"
+         not a shared scan that drops it, got:\n{plan}"
     );
 
     let batch = scan.try_into_batch().await.unwrap();
@@ -1189,7 +1197,7 @@ async fn test_batch_knn_indexed_streams_multiple_chunks() {
     assert!(
         num_partitions > chunk_size,
         "test needs more partitions ({num_partitions}) than the streaming chunk size \
-             ({chunk_size}) to span multiple chunks",
+         ({chunk_size}) to span multiple chunks",
     );
 
     let (queries, query_values) = batch_knn_two_queries();
@@ -2057,4 +2065,1142 @@ async fn test_knn_no_metric_uses_index_metric() {
         "Expected ANN index with L2 metric in plan:\n{}",
         plan
     );
+}
+
+#[tokio::test]
+async fn test_sliced_list_batch_nearest() {
+    let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+        .await
+        .unwrap();
+    test_ds.make_vector_index().await.unwrap();
+    let dataset = &test_ds.dataset;
+    let query_values = (0..4)
+        .map(|query| {
+            (query * 32..(query + 1) * 32)
+                .map(|value| Some(value as f32))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let queries =
+        ListArray::from_iter_primitive::<Float32Type, _, _>(query_values.iter().cloned().map(Some));
+
+    for (start, length) in [(0, 4), (0, 2), (1, 2), (2, 2)] {
+        let sliced = queries.slice(start, length);
+        let equivalent = ListArray::from_iter_primitive::<Float32Type, _, _>(
+            query_values[start..start + length]
+                .iter()
+                .cloned()
+                .map(Some),
+        );
+        let mut scanner = dataset.scan();
+        scanner.nearest("vec", &sliced, 5).unwrap();
+        assert_eq!(scanner.nearest_query_count, length);
+        assert_eq!(scanner.nearest.as_ref().unwrap().key.len(), length * 32);
+        assert_eq!(
+            scanner.nearest.as_ref().unwrap().key.as_ref(),
+            equivalent.values().as_ref()
+        );
+
+        for use_index in [false, true] {
+            let search = |query: &ListArray| {
+                let mut scanner = dataset.scan();
+                scanner.nearest("vec", query, 5).unwrap();
+                scanner.use_index(use_index).nprobes(2);
+                scanner.project(&["i"]).unwrap();
+                scanner
+            };
+            let actual = search(&sliced).try_into_batch().await.unwrap();
+            let expected = search(&equivalent).try_into_batch().await.unwrap();
+            assert_eq!(
+                actual[QUERY_INDEX_COL].as_ref(),
+                expected[QUERY_INDEX_COL].as_ref()
+            );
+            assert_eq!(actual["i"].as_ref(), expected["i"].as_ref());
+            assert_eq!(actual[DIST_COL].as_ref(), expected[DIST_COL].as_ref());
+            assert_eq!(actual.num_rows(), length * 5);
+            let row_numbers = actual["i"].as_primitive::<Int32Type>();
+            assert!(row_numbers.iter().flatten().any(|value| value < 200));
+            assert!(row_numbers.iter().flatten().any(|value| value >= 200));
+        }
+    }
+
+    let fixed_size_queries = FixedSizeListArray::try_new_from_values(
+        Float32Array::from((0..128).map(|value| value as f32).collect::<Vec<_>>()),
+        32,
+    )
+    .unwrap();
+    let mut scanner = dataset.scan();
+    scanner
+        .nearest("vec", &fixed_size_queries.slice(1, 2), 5)
+        .unwrap();
+    assert_eq!(scanner.nearest_query_count, 2);
+    assert_eq!(scanner.nearest.as_ref().unwrap().key.len(), 64);
+}
+
+#[tokio::test]
+async fn test_sliced_list_multivector_nearest_key() {
+    let mut vectors = ListBuilder::new(FixedSizeListBuilder::new(Float32Builder::new(), 2));
+    for value in [0.0, 1.0] {
+        vectors.values().values().append_value(value);
+        vectors.values().values().append_value(value);
+        vectors.values().append(true);
+        vectors.append(true);
+    }
+    let vectors = vectors.finish();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "vec",
+        vectors.data_type().clone(),
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+    let queries = ListArray::from_iter_primitive::<Float32Type, _, _>(vec![
+        Some(vec![Some(0.0), Some(0.0)]),
+        Some(vec![Some(1.0), Some(1.0)]),
+        Some(vec![Some(2.0), Some(2.0)]),
+        Some(vec![Some(3.0), Some(3.0)]),
+    ]);
+    let sliced = queries.slice(1, 2);
+    let mut scanner = dataset.scan();
+    scanner.nearest("vec", &sliced, 1).unwrap();
+    assert!(!scanner.is_batch_nearest);
+    assert_eq!(scanner.nearest_query_count, 1);
+    assert_eq!(
+        scanner.nearest.as_ref().unwrap().key.as_ref(),
+        &Float32Array::from(vec![1.0, 1.0, 2.0, 2.0])
+    );
+}
+
+#[tokio::test]
+async fn test_nearest_query_element_type_conversion() {
+    let float16 = FixedSizeListArray::try_new_from_values(
+        Float16Array::from(vec![f16::from_f32(1.0), f16::from_f32(2.0)]),
+        2,
+    )
+    .unwrap();
+    let float32 =
+        FixedSizeListArray::try_new_from_values(Float32Array::from(vec![1.0, 2.0]), 2).unwrap();
+    let float64 =
+        FixedSizeListArray::try_new_from_values(Float64Array::from(vec![1.0, 2.0]), 2).unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("float16", float16.data_type().clone(), false),
+        ArrowField::new("float32", float32.data_type().clone(), false),
+        ArrowField::new("float64", float64.data_type().clone(), false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(float16), Arc::new(float32), Arc::new(float64)],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+    let float16_query: ArrayRef = Arc::new(Float16Array::from(vec![
+        f16::from_f32(1.0),
+        f16::from_f32(2.0),
+    ]));
+    let float32_query: ArrayRef = Arc::new(Float32Array::from(vec![1.0, 2.0]));
+    let float64_query: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0]));
+    let integer_query: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+    let list_query: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Float32Type, _, _>(vec![
+        Some(vec![Some(1.0), Some(2.0)]),
+    ]));
+
+    for (column, query) in [
+        ("float32", &float64_query),
+        ("float32", &float16_query),
+        ("float32", &integer_query),
+    ] {
+        let Err(error) = dataset.scan().nearest(column, query.as_ref(), 1) else {
+            panic!("expected {column} to reject {}", query.data_type());
+        };
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(
+            message.contains("Float32") && message.contains(&query.data_type().to_string()),
+            "unexpected error: {message}"
+        );
+    }
+
+    for (column, query, expected_type) in [
+        ("float16", &float32_query, DataType::Float16),
+        ("float64", &float32_query, DataType::Float64),
+        ("float32", &float32_query, DataType::Float32),
+        ("float64", &float64_query, DataType::Float64),
+        ("float16", &float16_query, DataType::Float16),
+        ("float64", &list_query, DataType::Float64),
+    ] {
+        let mut scan = dataset.scan();
+        scan.nearest(column, query.as_ref(), 1).unwrap();
+        assert_eq!(
+            scan.nearest.as_ref().unwrap().key.data_type(),
+            &expected_type
+        );
+    }
+}
+
+/// A cosine SQ index ranks as twice `1 - cos`, so a refined search that also
+/// applied the range inside the index would drop rows whose exact distance
+/// is in range.
+#[tokio::test]
+async fn test_refined_knn_applies_distance_range_to_exact_distances() {
+    use lance_linalg::distance::cosine_distance;
+
+    const DIM: usize = 16;
+    const ROWS: usize = 2000;
+    let mut seed: u64 = 42;
+    let values: Vec<f32> = (0..ROWS * DIM)
+        .map(|_| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+        })
+        .collect();
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "vec",
+        DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+            DIM as i32,
+        ),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values.clone()), DIM as i32)
+                .unwrap(),
+        )],
+    )
+    .unwrap();
+    let tmp = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        &tmp,
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::with_ivf_hnsw_sq_params(
+                DistanceType::Cosine,
+                IvfBuildParams::new(1),
+                HnswBuildParams::default(),
+                SQBuildParams::default(),
+            ),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let query = values[..DIM].to_vec();
+    let mut exact: Vec<f32> = values
+        .as_chunks::<DIM>()
+        .0
+        .iter()
+        .map(|row| cosine_distance(&query, row))
+        .collect();
+    exact.sort_by(f32::total_cmp);
+    // Rows from the 20th nearest out, capped so that `upper <= 2 * lower`:
+    // no row is in range on both the exact and the doubled scale.
+    let lower = exact[20];
+    let upper = exact[60].min(2.0 * lower);
+    assert!(upper > lower);
+
+    let batch = dataset
+        .scan()
+        .nearest("vec", &Float32Array::from(query), 5)
+        .unwrap()
+        .distance_metric(DistanceType::Cosine)
+        .refine(1)
+        .distance_range(Some(lower), Some(upper))
+        .try_into_batch()
+        .await
+        .unwrap();
+    let distances = batch[DIST_COL].as_primitive::<Float32Type>().values();
+    assert!(!distances.is_empty(), "no rows within the exact range");
+    for distance in distances {
+        assert!(
+            (lower..upper).contains(distance),
+            "{distance} is outside [{lower}, {upper})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_batch_knn_quantized_refinement_uses_rerank_path() {
+    let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+        .await
+        .unwrap();
+    test_ds.make_rq_vector_index(4).await.unwrap();
+    let (queries, _) = batch_knn_two_queries();
+
+    let mut scan = test_ds.dataset.scan();
+    scan.nearest("vec", &queries, 10).unwrap();
+    scan.nprobes(2);
+    scan.quantized_refine(40);
+
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(
+        !plan.contains("ANNIvfBatch"),
+        "quantized refinement must not use the shared-scan batch node, got:\n{plan}"
+    );
+    assert!(plan.contains("quantized_refine_factor=40"), "{plan}");
+}
+
+/// An in-place vector update (`update_columns` + `Operation::Update`) prunes the
+/// fragment from the old segment's bitmap while that segment still physically
+/// holds the pre-update vector, and `optimize_indices(append)` indexes the fresh
+/// vector in a new delta. Like the single-query path, the batch node must apply
+/// each segment's ownership so the stale copy is neither returned nor counted.
+#[rstest]
+#[case::fixed_nprobes(Some(2))]
+#[tokio::test]
+async fn test_batch_knn_skips_rows_owned_by_newer_delta(
+    #[case] nprobes: Option<usize>,
+    #[values(false, true)] enable_stable_row_ids: bool,
+) {
+    use crate::dataset::transaction::{Operation, UpdateMode, UpdatedFragmentOffsets};
+    use arrow_array::{RecordBatchReader, UInt64Array};
+
+    const DIM: usize = 8;
+    const BULK_ROWS: usize = 1000;
+    const UPDATED_ID: u32 = 10_000;
+    const STALE_VALUE: f32 = 10.0;
+    const FRESH_VALUE: f32 = -10.0;
+    let k = 5;
+
+    let test_dir = TempStrDir::default();
+    let test_uri = test_dir.as_str();
+    let vector_type = DataType::FixedSizeList(
+        Arc::new(ArrowField::new("item", DataType::Float32, true)),
+        DIM as i32,
+    );
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::UInt32, false),
+        ArrowField::new("vec", vector_type.clone(), true),
+    ]));
+    let constant_vector = |value: f32| {
+        FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values(std::iter::repeat_n(value, DIM)),
+            DIM as i32,
+        )
+        .unwrap()
+    };
+
+    let bulk = lance_testing::datagen::generate_random_array_with_seed::<Float32Type>(
+        BULK_ROWS * DIM,
+        [7; 32],
+    );
+    let bulk_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from_iter_values(0..BULK_ROWS as u32)),
+            Arc::new(FixedSizeListArray::try_new_from_values(bulk, DIM as i32).unwrap()),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(bulk_batch)], schema.clone()),
+        test_uri,
+        Some(WriteParams {
+            enable_stable_row_ids,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let stale_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from_iter_values([UPDATED_ID])),
+            Arc::new(constant_vector(STALE_VALUE)),
+        ],
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(stale_batch)], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            Some("idx".into()),
+            &VectorIndexParams::ivf_flat(4, MetricType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let mut fragment = dataset.get_fragment(1).unwrap();
+    let mut fragment_scan = fragment.scan();
+    fragment_scan.with_row_id();
+    let updated_row_id = fragment_scan.try_into_batch().await.unwrap()[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .value(0);
+    let update_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new(ROW_ID, DataType::UInt64, false),
+        ArrowField::new("vec", vector_type, true),
+    ]));
+    let update_batch = RecordBatch::try_new(
+        update_schema.clone(),
+        vec![
+            Arc::new(UInt64Array::from_iter_values([updated_row_id])),
+            Arc::new(constant_vector(FRESH_VALUE)),
+        ],
+    )
+    .unwrap();
+    let right_stream: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+        vec![Ok(update_batch)],
+        update_schema,
+    ));
+    let updated = fragment
+        .update_columns_with_offsets(right_stream, ROW_ID, ROW_ID)
+        .await
+        .unwrap();
+    let updated_fragment_id = updated.fragment.id;
+    let mut dataset = Dataset::commit(
+        test_uri,
+        Operation::Update {
+            removed_fragment_ids: vec![],
+            updated_fragments: vec![updated.fragment],
+            new_fragments: vec![],
+            fields_modified: updated.fields_modified,
+            mem_wal_dir_id: None,
+            compacted_sstables: Vec::new(),
+            fields_for_preserving_frag_bitmap: vec![],
+            update_mode: Some(UpdateMode::RewriteColumns),
+            inserted_rows_filter: None,
+            updated_fragment_offsets: Some(UpdatedFragmentOffsets(HashMap::from([(
+                updated_fragment_id,
+                updated.matched_offsets,
+            )]))),
+        },
+        Some(dataset.version().version),
+        None,
+        None,
+        Default::default(),
+        true,
+    )
+    .await
+    .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    assert_eq!(dataset.load_indices_by_name("idx").await.unwrap().len(), 2);
+
+    // Query 0 sits on the stale value, query 1 on the fresh one.
+    let query_values: Vec<f32> = [STALE_VALUE, FRESH_VALUE]
+        .iter()
+        .flat_map(|&value| std::iter::repeat_n(value, DIM))
+        .collect();
+    let queries = FixedSizeListArray::try_new_from_values(
+        Float32Array::from(query_values.clone()),
+        DIM as i32,
+    )
+    .unwrap();
+    let configure = |scan: &mut Scanner, query: &dyn Array| {
+        scan.nearest("vec", query, k).unwrap();
+        match nprobes {
+            Some(nprobes) => {
+                scan.nprobes(nprobes);
+            }
+            None => {
+                scan.minimum_nprobes(1);
+            }
+        }
+        scan.project(&["id"]).unwrap();
+    };
+
+    let mut scan = dataset.scan();
+    configure(&mut scan, &queries);
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(plan.contains("ANNIvfBatch"), "got:\n{plan}");
+    let batch = scan.try_into_batch().await.unwrap();
+    for query_index in 0..2 {
+        let query =
+            Float32Array::from(query_values[query_index * DIM..(query_index + 1) * DIM].to_vec());
+        let mut single_scan = dataset.scan();
+        configure(&mut single_scan, &query);
+        let single = single_scan.try_into_batch().await.unwrap();
+        let mask = BooleanArray::from_iter(
+            batch[QUERY_INDEX_COL]
+                .as_primitive::<Int32Type>()
+                .iter()
+                .map(|value| value.map(|value| value == query_index as i32)),
+        );
+        let batch_rows = arrow::compute::filter_record_batch(&batch, &mask).unwrap();
+        let ids = batch_rows["id"].as_primitive::<UInt32Type>().values();
+        assert_eq!(
+            ids.iter().filter(|&&id| id == UPDATED_ID).count(),
+            usize::from(query_index == 1),
+            "query {query_index}: the updated row must appear once, with its fresh vector only; ids {ids:?}"
+        );
+        assert_eq!(batch_rows.num_rows(), k);
+        assert_eq!(
+            batch_rows[DIST_COL].as_primitive::<Float32Type>().values(),
+            single[DIST_COL].as_primitive::<Float32Type>().values(),
+            "query {query_index}: batch distances must match single-query"
+        );
+    }
+}
+
+/// A column can carry more than one vector index. The query's metric has to
+/// take part in selecting which index answers, not merely veto the first one
+/// keyed on the column: a cosine query on a column holding both an L2 and a
+/// cosine index must reach the cosine index instead of brute-forcing.
+/// Regression test for https://github.com/lance-format/lance/issues/9873
+#[tokio::test]
+async fn test_knn_selects_index_matching_requested_metric() {
+    let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+        .await
+        .unwrap();
+    // Two indices on the same `vec` column: L2 created first, cosine second.
+    test_ds
+        .make_named_vector_index_with_metric("idx_l2", MetricType::L2)
+        .await
+        .unwrap();
+    test_ds
+        .make_named_vector_index_with_metric("idx_cos", MetricType::Cosine)
+        .await
+        .unwrap();
+
+    let dataset = &test_ds.dataset;
+    let key: Float32Array = (32..64).map(|v| v as f32).collect();
+
+    // The cosine query must use the cosine index. Before the fix the first
+    // keyed index (idx_l2) was selected, vetoed on the metric mismatch, and
+    // the whole column brute-forced even though idx_cos matched.
+    let mut scan = dataset.scan();
+    scan.nearest("vec", &key, 5).unwrap();
+    scan.distance_metric(MetricType::Cosine);
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("ANNSubIndex") && plan.to_lowercase().contains("cosine"),
+        "Expected the cosine index to answer a cosine query, got plan:\n{}",
+        plan
+    );
+
+    // An L2 query still selects the L2 index.
+    let mut scan = dataset.scan();
+    scan.nearest("vec", &key, 5).unwrap();
+    scan.distance_metric(MetricType::L2);
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("ANNSubIndex") && plan.to_lowercase().contains("l2"),
+        "Expected the L2 index to answer an L2 query, got plan:\n{}",
+        plan
+    );
+}
+
+/// A query that names no metric ranks by the chosen index's metric even when its
+/// fragment scope misses every segment of that index and the search runs flat KNN, so
+/// `_distance` keeps one scale whichever fragments the scope selects.
+#[rstest]
+#[case::automatic_selection(false)]
+#[case::explicit_segments(true)]
+#[tokio::test]
+async fn test_knn_no_metric_uses_index_metric_outside_index_coverage(
+    #[case] has_explicit_segments: bool,
+) {
+    // F0 (ids 0..3) is indexed and F1 (ids 3..6) is appended afterwards. On F1 cosine
+    // and L2 rank in reverse order: id 3 is nearest by angle and farthest by L2.
+    let vectors: [[f32; 4]; 6] = [
+        [3.0, 1.0, 0.0, 0.0],
+        [1.0, 2.0, 0.0, 0.0],
+        [4.0, 3.0, 0.0, 0.0],
+        [10.0, 1.0, 0.0, 0.0],
+        [0.6, 0.6, 0.0, 0.0],
+        [2.0, 1.0, 0.0, 0.0],
+    ];
+    let rows_for = |ids: std::ops::Range<usize>| {
+        gen_batch()
+            .col("id", array::step_custom::<Int32Type>(ids.start as i32, 1))
+            .col(
+                "vec",
+                array::cycle_vec(
+                    array::cycle::<Float32Type>(vectors[ids].concat()),
+                    Dimension::from(4),
+                ),
+            )
+    };
+    let mut dataset = rows_for(0..3)
+        .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(3))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::ivf_flat(1, DistanceType::Cosine),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .append(
+            rows_for(3..6).into_reader_rows(RowCount::from(3), BatchCount::from(1)),
+            None,
+        )
+        .await
+        .unwrap();
+    let indices = dataset.load_indices().await.unwrap();
+    assert_eq!(indices.len(), 1);
+    assert_eq!(
+        indices[0].fragment_bitmap.as_ref(),
+        Some(&RoaringBitmap::from_iter([0]))
+    );
+    assert_eq!(dataset.fragments().len(), 2);
+
+    let query = [1.0_f32, 0.0, 0.0, 0.0];
+    let norm = |vector: &[f32]| {
+        vector
+            .iter()
+            .map(|value| f64::from(*value).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    };
+    let cosine_distance = |vector: &[f32; 4]| {
+        let dot: f64 = vector
+            .iter()
+            .zip(query)
+            .map(|(value, query_value)| f64::from(*value) * f64::from(query_value))
+            .sum();
+        1.0 - dot / (norm(vector) * norm(&query))
+    };
+    let mut scan = dataset.scan();
+    scan.nearest("vec", &Float32Array::from(query.to_vec()), 3)
+        .unwrap();
+    scan.with_fragments(vec![dataset.fragments()[1].clone()]);
+    if has_explicit_segments {
+        scan.with_index_segments(vec![indices[0].uuid]).unwrap();
+    }
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(
+        !plan.contains("ANNSubIndex") && plan.contains("KNNVectorDistance: metric=cosine"),
+        "{plan}"
+    );
+    let batch = scan.try_into_batch().await.unwrap();
+    let ids = batch["id"].as_primitive::<Int32Type>().values();
+    assert_eq!(ids, &[3, 5, 4], "{plan}");
+    let distances = batch[DIST_COL].as_primitive::<Float32Type>().values();
+    for (id, distance) in ids.iter().zip(distances.iter()) {
+        let expected = cosine_distance(&vectors[*id as usize]);
+        assert!(
+            (f64::from(*distance) - expected).abs() <= 1e-6,
+            "id={id}: distance={distance}, expected={expected}"
+        );
+    }
+}
+
+#[rstest]
+#[case::zero_k(Arc::new(Float32Array::from(vec![0.0; 4])), 0, "k must be positive")]
+#[case::empty_query(
+    Arc::new(Float32Array::from(Vec::<f32>::new())),
+    1,
+    "Query vector must have non-zero length"
+)]
+#[case::primitive_dimension(
+    Arc::new(Float32Array::from(vec![0.0; 3])),
+    1,
+    "query dim(3) doesn't match the column vec vector dim(4)"
+)]
+#[case::list_dimension(
+    Arc::new(ListArray::from_iter_primitive::<Float32Type, _, _>([Some(vec![Some(0.0); 3])])),
+    1,
+    "query dim(3) doesn't match the column vec vector dim(4)"
+)]
+#[case::fixed_size_list_dimension(
+    Arc::new(FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; 3]), 3).unwrap()),
+    1,
+    "query dim(3) doesn't match the column vec vector dim(4)"
+)]
+#[tokio::test]
+async fn test_nearest_rejects_invalid_query(
+    #[case] query: ArrayRef,
+    #[case] k: usize,
+    #[case] message: &str,
+    #[values(false, true)] has_fragments: bool,
+) {
+    let fixture = FragmentVectorFixture::new(false, false).await;
+    let mut scanner = fixture.dataset.scan();
+    if has_fragments {
+        scanner.with_fragments(fixture.dataset.fragments()[1..].to_vec());
+    }
+    let Err(err) = scanner.nearest("vec", query.as_ref(), k) else {
+        panic!("expected invalid query to be rejected");
+    };
+    assert!(matches!(err, Error::InvalidInput { .. }));
+    assert!(err.to_string().contains(message), "unexpected error: {err}");
+}
+
+#[rstest]
+#[case::whole_dataset(false)]
+#[case::fragments_first(true)]
+#[tokio::test]
+async fn test_nearest_rejects_query_type_mismatch(#[case] has_fragments: bool) {
+    let (_tmp_dir, dataset) = make_binary_vector_dataset().await.unwrap();
+    let mut scanner = dataset.scan();
+    if has_fragments {
+        scanner.with_fragments(dataset.fragments().to_vec());
+    }
+    let query = Float32Array::from(vec![0.0; 4]);
+    let Err(err) = scanner.nearest("bin", &query, 1) else {
+        panic!("expected incompatible query type to be rejected");
+    };
+    assert!(matches!(err, Error::InvalidInput { .. }));
+    assert!(
+        err.to_string()
+            .contains("Column bin has element type UInt8 and the query vector is Float32"),
+        "unexpected error: {err}"
+    );
+}
+
+#[rstest]
+#[case::rq4(4)]
+#[case::rq8(8)]
+#[tokio::test]
+async fn test_ivf_rq_quantized_refinement(#[case] num_bits: u8) {
+    let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+        .await
+        .unwrap();
+    test_ds.make_rq_vector_index(num_bits).await.unwrap();
+    let query_vector = Float32Array::from_iter_values((0..32).map(|value| value as f32));
+
+    let mut accurate = test_ds.dataset.scan();
+    accurate
+        .nearest("vec", &query_vector, 10)
+        .unwrap()
+        .nprobes(2)
+        .approx_mode(ApproxMode::Accurate)
+        .with_row_id()
+        .project(&["i"])
+        .unwrap();
+    let accurate_results = accurate.try_into_batch().await.unwrap();
+
+    // The fixture has 400 rows across multiple fragments. This factor makes
+    // the Fast candidate pass exhaustive, so selected-candidate scoring
+    // must produce the same top-k set as native Accurate RQ search. Ties in
+    // approximate scores may appear in a different order.
+    let mut quantized = test_ds.dataset.scan();
+    quantized
+        .nearest("vec", &query_vector, 10)
+        .unwrap()
+        .nprobes(2)
+        .quantized_refine(40)
+        .with_row_id()
+        .project(&["i"])
+        .unwrap();
+    let plan = quantized.explain_plan(false).await.unwrap();
+    assert!(plan.contains("quantized_refine_factor=40"), "{plan}");
+    assert!(!plan.contains("KNNVectorDistance"), "{plan}");
+    let quantized_results = quantized.try_into_batch().await.unwrap();
+    let quantized_ids = BTreeSet::from_iter(batch_row_ids(&quantized_results));
+    let accurate_ids = BTreeSet::from_iter(batch_row_ids(&accurate_results));
+    assert_eq!(quantized_ids, accurate_ids);
+    assert!(
+        quantized_results[DIST_COL]
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .all(|distance| distance.is_finite())
+    );
+
+    // Exact refinement remains a separate final stage and still reads the
+    // original vectors only when the caller explicitly asks for it.
+    let mut exact = test_ds.dataset.scan();
+    exact
+        .nearest("vec", &query_vector, 10)
+        .unwrap()
+        .use_index(false)
+        .with_row_id()
+        .project(&["i"])
+        .unwrap();
+    let exact_results = exact.try_into_batch().await.unwrap();
+
+    let mut quantized_then_exact = test_ds.dataset.scan();
+    quantized_then_exact
+        .nearest("vec", &query_vector, 10)
+        .unwrap()
+        .nprobes(2)
+        .quantized_refine(40)
+        .refine(2)
+        .with_row_id()
+        .project(&["i"])
+        .unwrap();
+    let plan = quantized_then_exact.explain_plan(false).await.unwrap();
+    assert!(plan.contains("quantized_refine_factor=40"), "{plan}");
+    assert!(plan.contains("KNNVectorDistance"), "{plan}");
+    let quantized_then_exact_results = quantized_then_exact.try_into_batch().await.unwrap();
+    assert_eq!(quantized_then_exact_results, exact_results);
+}
+
+#[rstest]
+#[case::rq4(4)]
+#[case::rq8(8)]
+#[tokio::test]
+async fn test_quantized_refinement_merges_unindexed_distance_scales(
+    #[case] num_bits: u8,
+    #[values(DistanceType::Cosine, DistanceType::L2, DistanceType::Dot)] metric: DistanceType,
+    #[values(false, true)] exact_refine: bool,
+    #[values(None, Some((0.15, 0.25)), Some((0.28, 0.32)))] range: Option<(f32, f32)>,
+) {
+    const DIM: usize = 32;
+    let make_batch = |rows: usize, first: f32, nearest_boost: f32| {
+        let mut values = Vec::with_capacity(rows * DIM);
+        for row in 0..rows {
+            // Separate the nearest ten so recall measures the merge rather
+            // than approximation noise among nearly tied RQ4 scores.
+            let boost = if row < 10 { nearest_boost } else { 0.0 };
+            let x = first + boost + row as f32 * 0.0001;
+            let tail: Vec<f32> = (1..DIM)
+                .map(|dim| ((row * 37 + dim * 19) as f32).sin())
+                .collect();
+            let norm = tail.iter().map(|value| value * value).sum::<f32>().sqrt();
+            values.push(x);
+            values.extend(tail.iter().map(|value| value / norm * (1.0 - x * x).sqrt()));
+        }
+        RecordBatch::try_from_iter([(
+            "vec",
+            Arc::new(
+                FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM as i32)
+                    .unwrap(),
+            ) as ArrayRef,
+        )])
+        .unwrap()
+    };
+    let indexed = make_batch(128, 0.8, 0.04);
+    let centroids = indexed["vec"].as_fixed_size_list().slice(0, 4);
+    let tmp = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(indexed.clone())], indexed.schema()),
+        &tmp,
+        Some(WriteParams {
+            max_rows_per_file: 32,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let mut rq_params = RQBuildParams::with_rotation_type(num_bits, RQRotationType::Fast);
+    let mut rotation = RabitQuantizer::new::<Float32Type>(num_bits, DIM as i32)
+        .metadata_ref()
+        .clone();
+    // Reuse a fixed rotation so recall assertions are deterministic.
+    for (index, signs) in rotation
+        .fast_rotation_signs
+        .as_mut()
+        .unwrap()
+        .iter_mut()
+        .enumerate()
+    {
+        *signs = (index * 37 + 19) as u8;
+    }
+    rq_params.rotation = Some(rotation);
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::with_ivf_rq_params(
+                metric,
+                IvfBuildParams::try_with_centroids(4, Arc::new(centroids)).unwrap(),
+                rq_params,
+            ),
+            true,
+        )
+        .await
+        .unwrap();
+    let appended = make_batch(16, 0.7, 0.0);
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 5);
+
+    let mut query = vec![0.0; DIM];
+    query[0] = 1.0;
+    let query = Float32Array::from(query);
+    let scale = if metric == DistanceType::Cosine && !exact_refine {
+        2.0
+    } else {
+        1.0
+    };
+    // Fixture ranges are expressed as 1 - cos. L2 on unit vectors is twice
+    // that, as are native RQ cosine scores without exact refinement.
+    let metric_scale = if metric == DistanceType::L2 { 2.0 } else { 1.0 };
+    let mut exact = dataset.scan();
+    exact
+        .nearest("vec", &query, 10)
+        .unwrap()
+        .distance_metric(metric)
+        .use_index(false)
+        .with_row_id()
+        .project::<&str>(&[])
+        .unwrap();
+    if let Some((lower, upper)) = range {
+        exact.distance_range(Some(lower * metric_scale), Some(upper * metric_scale));
+    }
+    let expected = exact.try_into_batch().await.unwrap();
+    let expected_ids = BTreeSet::from_iter(batch_row_ids(&expected));
+
+    let mut scanner = dataset.scan();
+    scanner
+        .nearest("vec", &query, 10)
+        .unwrap()
+        .distance_metric(metric)
+        .nprobes(4)
+        .quantized_refine(64)
+        .with_row_id()
+        .project::<&str>(&[])
+        .unwrap();
+    if exact_refine {
+        scanner.refine(2);
+    }
+    if let Some((lower, upper)) = range {
+        scanner.distance_range(
+            Some(lower * metric_scale * scale),
+            Some(upper * metric_scale * scale),
+        );
+    }
+    let plan = scanner.explain_plan(false).await.unwrap();
+    if !exact_refine {
+        // Only the unindexed scan computes vector distances. Indexed rows
+        // retain their RQ scores without taking their original vectors.
+        assert_eq!(plan.matches("KNNVectorDistance").count(), 1, "{plan}");
+        assert!(!plan.contains("Take:"), "{plan}");
+    }
+    let results = scanner.try_into_batch().await.unwrap();
+    assert_eq!(results.num_rows(), 10);
+    let ids = batch_row_ids(&results);
+    let recall = ids.iter().filter(|id| expected_ids.contains(id)).count();
+    assert!(
+        recall >= 5,
+        "recall={recall}/10, metric={metric:?}, ids={ids:?}"
+    );
+    for (row, distance) in results[DIST_COL]
+        .as_primitive::<Float32Type>()
+        .values()
+        .iter()
+        .enumerate()
+    {
+        if let Some((lower, upper)) = range {
+            assert!(
+                (lower * metric_scale * scale..upper * metric_scale * scale).contains(distance)
+            );
+        }
+        if RowAddress::from(ids[row]).fragment_id() == 4 {
+            let offset = RowAddress::from(ids[row]).row_offset();
+            let expected_distance = (1.0 - (0.7 + offset as f32 * 0.0001)) * metric_scale * scale;
+            assert!((distance - expected_distance).abs() < 1e-5);
+        } else {
+            assert!(
+                range != Some((0.28, 0.32)),
+                "indexed row passed appended-only bounds"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_quantized_refinement_scores_selective_prefilter_shortcut_rows() {
+    let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+        .await
+        .unwrap();
+    test_ds.make_rq_vector_index(4).await.unwrap();
+    let query_vector = Float32Array::from_iter_values((0..32).map(|value| value as f32));
+
+    let mut scanner = test_ds.dataset.scan();
+    scanner
+        .nearest("vec", &query_vector, 10)
+        .unwrap()
+        .minimum_nprobes(1)
+        .maximum_nprobes(2)
+        .prefilter(true)
+        .filter("i = 0 OR i = 399")
+        .unwrap()
+        .quantized_refine(2)
+        .distance_range(None, Some(f32::MAX));
+    let results = scanner.try_into_batch().await.unwrap();
+
+    assert_eq!(results.num_rows(), 2);
+    assert!(
+        results[DIST_COL]
+            .as_primitive::<Float32Type>()
+            .values()
+            .iter()
+            .all(|distance| distance.is_finite())
+    );
+}
+
+#[tokio::test]
+async fn test_quantized_refinement_rejects_non_rq_index() {
+    let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+        .await
+        .unwrap();
+    test_ds.make_vector_index().await.unwrap();
+    let query_vector = Float32Array::from(vec![0.0; 32]);
+    let mut scanner = test_ds.dataset.scan();
+    scanner
+        .nearest("vec", &query_vector, 5)
+        .unwrap()
+        .quantized_refine(2);
+    let error = scanner.try_into_batch().await.unwrap_err();
+    assert!(error.to_string().contains("requires an IVF_RQ flat index"));
+}
+
+#[tokio::test]
+async fn test_quantized_refinement_applies_range_before_candidate_truncation() {
+    const DIM: usize = 32;
+    const ROWS: usize = 64;
+    let mut state = 0x1234_5678_u32;
+    let mut next = || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        ((state >> 8) as f32 / (u32::MAX >> 8) as f32) * 2.0 - 1.0
+    };
+    let mut values = Vec::with_capacity(ROWS * DIM);
+    for _ in 0..ROWS {
+        let start = values.len();
+        values.extend((0..DIM).map(|_| next()));
+        let norm = values[start..]
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        values[start..].iter_mut().for_each(|value| *value /= norm);
+    }
+    let vectors =
+        FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM as i32).unwrap();
+    let batch = RecordBatch::try_from_iter([("vec", Arc::new(vectors) as ArrayRef)]).unwrap();
+    let tmp = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        &tmp,
+        None,
+    )
+    .await
+    .unwrap();
+    let mut rq_params = RQBuildParams::with_rotation_type(4, RQRotationType::Fast);
+    let mut rotation = RabitQuantizer::new::<Float32Type>(4, DIM as i32)
+        .metadata_ref()
+        .clone();
+    for (index, signs) in rotation
+        .fast_rotation_signs
+        .as_mut()
+        .unwrap()
+        .iter_mut()
+        .enumerate()
+    {
+        *signs = (index * 37 + 19) as u8;
+    }
+    rq_params.rotation = Some(rotation);
+    dataset
+        .create_index(
+            &["vec"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::with_ivf_rq_params(
+                DistanceType::L2,
+                IvfBuildParams::new(1),
+                rq_params,
+            ),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let mut query_state = 0x9e37_79b9_u32;
+    let mut query = Vec::with_capacity(DIM);
+    for _ in 0..DIM {
+        query_state = query_state
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
+        query.push(((query_state >> 8) as f32 / (u32::MAX >> 8) as f32) * 2.0 - 1.0);
+    }
+    let norm = query.iter().map(|value| value * value).sum::<f32>().sqrt();
+    query.iter_mut().for_each(|value| *value /= norm);
+    let query = Float32Array::from(query);
+
+    let mut fast = dataset.scan();
+    fast.nearest("vec", &query, 2)
+        .unwrap()
+        .nprobes(1)
+        .approx_mode(ApproxMode::Fast)
+        .fast_search()
+        .with_row_id()
+        .project::<&str>(&[])
+        .unwrap();
+    let fast = fast.try_into_batch().await.unwrap();
+    let fast_ids = batch_row_ids(&fast);
+
+    let mut accurate = dataset.scan();
+    accurate
+        .nearest("vec", &query, 2)
+        .unwrap()
+        .nprobes(1)
+        .approx_mode(ApproxMode::Accurate)
+        .fast_search()
+        .with_row_id()
+        .project::<&str>(&[])
+        .unwrap();
+    let accurate = accurate.try_into_batch().await.unwrap();
+    let accurate_ids = batch_row_ids(&accurate);
+    let accurate_distances = accurate[DIST_COL]
+        .as_primitive::<Float32Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+
+    assert_eq!(fast_ids, vec![accurate_ids[1], accurate_ids[0]]);
+    assert!(accurate_distances[0] < accurate_distances[1]);
+
+    // The Fast winner is the farther Accurate candidate. With factor=1, a
+    // post-truncation upper bound would discard it without ever scoring the
+    // in-range candidate that the Fast pass ranked second.
+    let upper_bound = (accurate_distances[0] + accurate_distances[1]) / 2.0;
+    let mut accurate_range = dataset.scan();
+    accurate_range
+        .nearest("vec", &query, 1)
+        .unwrap()
+        .nprobes(1)
+        .approx_mode(ApproxMode::Accurate)
+        .distance_range(None, Some(upper_bound))
+        .fast_search()
+        .with_row_id()
+        .project::<&str>(&[])
+        .unwrap();
+    let accurate_range = accurate_range.try_into_batch().await.unwrap();
+
+    let mut quantized = dataset.scan();
+    quantized
+        .nearest("vec", &query, 1)
+        .unwrap()
+        .nprobes(1)
+        .quantized_refine(1)
+        .distance_range(None, Some(upper_bound))
+        .fast_search()
+        .with_row_id()
+        .project::<&str>(&[])
+        .unwrap();
+    let quantized = quantized.try_into_batch().await.unwrap();
+
+    assert_eq!(batch_row_ids(&quantized), batch_row_ids(&accurate_range));
+    assert_eq!(quantized.num_rows(), 1);
+    assert!(quantized[DIST_COL].as_primitive::<Float32Type>().value(0) < upper_bound);
 }

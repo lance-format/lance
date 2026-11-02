@@ -5,6 +5,7 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use super::bitmap::{Bitmap, count_ones};
+use super::encoded_array::EncodedU64Array;
 use super::{RowIdSequence, U64Segment};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
@@ -20,6 +21,9 @@ const MAX_PROBE_DEPTH: u64 = 64;
 /// Row ids the merged build may read before probing is worth its per-lookup
 /// cost instead.
 const MERGE_ROWS_BUDGET: u64 = 1 << 20;
+/// Consecutive ids of one segment at least this far apart get separate probe
+/// entries, so a segment does not cover the gap between the pieces it holds.
+const PROBE_GAP: u64 = 1 << 16;
 
 /// Bitmap bytes summarized by one entry of a bitmap rank directory. A lookup
 /// counts at most this many bytes; the directory costs one `u32` per block,
@@ -39,16 +43,35 @@ const RANK_BLOCK_BYTES: usize = 256;
 // map keys disjoint ranges of row ids to a pair of segments, the row ids and
 // the addresses, and reads every row id to build. A probe instead reads each
 // segment's bounds and asks the covering segment for the position of the id;
-// `new` takes that when few fragments cover one id and the merged build would
+// `new` takes that when few segments cover one id and the merged build would
 // read a lot of them.
 #[derive(Debug)]
 pub struct RowIdIndex {
-    /// Fragments that hold at least one row id, sorted by their lowest row id.
+    /// Fragments that hold at least one row id.
     fragments: Vec<FragmentEntry>,
-    /// Max-`end` heap over `fragments`: `end_tree[1]` is the root and leaf `i`
+    /// Every piece of every segment of `fragments`, sorted by its lowest row
+    /// id (see [`probe_spans`]).
+    probes: Vec<ProbeEntry>,
+    /// Max-`end` heap over `probes`: `end_tree[1]` is the root and leaf `i`
     /// sits at `end_tree[len() / 2 + i]`.
     end_tree: Vec<u64>,
     merged: Option<MergedIndex>,
+}
+
+/// One piece of one segment of one fragment, as the probe tree sees it. The
+/// tree is over pieces rather than fragments: a compacted fragment's rows come
+/// from far-apart places, so its span covers most of the table while each
+/// piece covers only the ids it holds. A segment that holds several pieces
+/// has one entry per piece, split at gaps of [`PROBE_GAP`].
+#[derive(Debug, Clone, Copy)]
+struct ProbeEntry {
+    /// Index into `RowIdIndex::fragments`.
+    fragment: u32,
+    /// Index into that fragment's `segments`.
+    segment: u32,
+    /// Lowest and highest id of the piece, inclusive.
+    start: u64,
+    end: u64,
 }
 
 type MergedIndex = RangeInclusiveMap<u64, (U64Segment, U64Segment)>;
@@ -62,18 +85,19 @@ pub struct FragmentRowIdIndex {
 impl RowIdIndex {
     /// Create a new index from a list of fragment ids and their corresponding row id sequences.
     pub fn new(fragment_indices: &[FragmentRowIdIndex]) -> Result<Self> {
-        let mut fragments: Vec<FragmentEntry> = fragment_indices
+        let fragments: Vec<FragmentEntry> = fragment_indices
             .iter()
             .filter_map(FragmentEntry::new)
             .collect();
-        fragments.sort_unstable_by_key(|entry| entry.start);
+        let probes = probe_entries(&fragments);
 
         let mut index = Self {
-            end_tree: build_end_tree(&fragments),
+            end_tree: build_end_tree(&probes),
+            probes,
             fragments,
             merged: None,
         };
-        if !probing_beats_merging(&index.fragments) {
+        if !probing_beats_merging(&index.fragments, &index.probes) {
             index.merged = Some(index.build_merged()?);
         }
         Ok(index)
@@ -182,20 +206,18 @@ impl RowIdIndex {
         Ok(out)
     }
 
-    /// Address of `row_id`, from the fragment that holds it live. Descends the
-    /// max-`end` tree, so a fragment out of reach of the id costs nothing.
+    /// Address of `row_id`, from the segment that holds it live. Descends the
+    /// max-`end` tree, so a segment out of reach of the id costs nothing.
     ///
     /// Visits every candidate rather than stopping at the first hit, and
     /// errors when a second fragment holds the id live.
     fn probe(&self, row_id: u64) -> Result<Option<RowAddress>> {
-        let fragments = self.fragments.len();
-        if fragments == 0 {
+        let probes = self.probes.len();
+        if probes == 0 {
             return Ok(None);
         }
-        // Only a fragment that starts at or below the id can hold it.
-        let upper = self
-            .fragments
-            .partition_point(|entry| entry.start <= row_id);
+        // Only a segment that starts at or below the id can hold it.
+        let upper = self.probes.partition_point(|probe| probe.start <= row_id);
         if upper == 0 {
             return Ok(None);
         }
@@ -216,8 +238,9 @@ impl RowIdIndex {
                     width /= 2;
                     continue;
                 }
-                if lo < fragments
-                    && let Some(candidate) = self.fragments[lo].resolve(row_id)
+                if let Some(probe) = self.probes.get(lo)
+                    && let Some(candidate) = self.fragments[probe.fragment as usize]
+                        .resolve_segment(probe.segment as usize, row_id)
                 {
                     if found.is_some() {
                         return Err(Error::internal(format!(
@@ -343,8 +366,6 @@ struct FragmentEntry {
     sequence: Arc<RowIdSequence>,
     deletion_vector: Arc<DeletionVector>,
     segments: Vec<SegmentEntry>,
-    start: u64,
-    end: u64,
     /// Row ids the merged build reads one by one.
     merge_rows: u64,
 }
@@ -375,58 +396,147 @@ impl FragmentEntry {
             }
             start_offset += len as u32;
         }
-        let start = segments.iter().map(|entry| *entry.range.start()).min()?;
-        let end = segments.iter().map(|entry| *entry.range.end()).max()?;
+        if segments.is_empty() {
+            return None;
+        }
         Some(Self {
             fragment_id: source.fragment_id,
             sequence: source.row_id_sequence.clone(),
             deletion_vector: source.deletion_vector.clone(),
             segments,
-            start,
-            end,
             merge_rows,
         })
     }
 
-    /// Address of `row_id` here, or `None` when the fragment lacks it or holds
-    /// it deleted.
-    fn resolve(&self, row_id: u64) -> Option<RowAddress> {
-        for entry in &self.segments {
-            if !entry.range.contains(&row_id) {
-                continue;
-            }
-            let Some(position) = entry.position(&self.sequence, row_id) else {
-                continue;
-            };
-            let row_offset = entry.start_offset + position as u32;
-            if self.deletion_vector.contains(row_offset) {
-                continue;
-            }
-            return Some(RowAddress::new_from_parts(self.fragment_id, row_offset));
+    /// Address of `row_id` in segment `segment` of this fragment, or `None`
+    /// when the segment lacks it or the fragment holds it deleted.
+    fn resolve_segment(&self, segment: usize, row_id: u64) -> Option<RowAddress> {
+        let entry = &self.segments[segment];
+        if !entry.range.contains(&row_id) {
+            return None;
         }
-        None
+        let position = entry.position(&self.sequence, row_id)?;
+        let row_offset = entry.start_offset + position as u32;
+        if self.deletion_vector.contains(row_offset) {
+            return None;
+        }
+        Some(RowAddress::new_from_parts(self.fragment_id, row_offset))
     }
 }
 
-/// Whether to answer lookups by probing the fragments rather than by merging
-/// every row id.
-///
-/// Probing costs the fragments that cover one id, per lookup; merging costs the
-/// row ids it reads, once. So probe only when both stay on the right side of
-/// [`MAX_PROBE_DEPTH`] and [`MERGE_ROWS_BUDGET`].
-fn probing_beats_merging(fragments: &[FragmentEntry]) -> bool {
-    let merge_rows: u64 = fragments.iter().map(|entry| entry.merge_rows).sum();
-    merge_rows > MERGE_ROWS_BUDGET && max_overlap_depth(fragments) <= MAX_PROBE_DEPTH
+/// Every piece of every segment of `fragments`, sorted by its lowest row id.
+fn probe_entries(fragments: &[FragmentEntry]) -> Vec<ProbeEntry> {
+    let mut probes: Vec<ProbeEntry> = fragments
+        .iter()
+        .enumerate()
+        .flat_map(|(fragment, entry)| {
+            entry
+                .segments
+                .iter()
+                .enumerate()
+                .flat_map(move |(segment, seg)| {
+                    probe_spans(&entry.sequence.0[seg.seq_idx], &seg.range)
+                        .into_iter()
+                        .map(move |(start, end)| ProbeEntry {
+                            fragment: fragment as u32,
+                            segment: segment as u32,
+                            start,
+                            end,
+                        })
+                })
+        })
+        .collect();
+    probes.sort_unstable_by_key(|probe| probe.start);
+    probes
 }
 
-/// Most fragments that cover any one row id.
-fn max_overlap_depth(fragments: &[FragmentEntry]) -> u64 {
-    let mut ends: Vec<u64> = fragments.iter().map(|entry| entry.end).collect();
+/// The inclusive spans of ids `segment` holds, split where consecutive ids are
+/// more than [`PROBE_GAP`] apart.
+///
+/// Compaction leaves a sorted array holding the ids of far-apart source
+/// fragments, and decoding folds consecutive `Range` segments into one
+/// `Ranges` across any gap below 4 billion ids. One entry per such segment
+/// would cover every piece that lives in its gaps and push the overlap depth
+/// past [`MAX_PROBE_DEPTH`]; one entry per piece keeps the depth at what the
+/// pieces themselves overlap. Costs the runs of a `Ranges` or the length of a
+/// sorted array; the other kinds are one span by construction.
+fn probe_spans(segment: &U64Segment, range: &RangeInclusive<u64>) -> Vec<(u64, u64)> {
+    let mut spans: Vec<(u64, u64)> = Vec::new();
+    let mut push = |start: u64, end: u64| match spans.last_mut() {
+        Some((_, last_end)) if start - *last_end <= PROBE_GAP => *last_end = end,
+        _ => spans.push((start, end)),
+    };
+    match segment {
+        U64Segment::Ranges { range, runs } => {
+            for run in runs.present_ranges() {
+                push(
+                    range.start + run.start as u64,
+                    range.start + run.end as u64 - 1,
+                );
+            }
+        }
+        // Offsets fit u16, so no gap inside the array can reach PROBE_GAP.
+        U64Segment::SortedArray(EncodedU64Array::U32 { base, offsets }) => {
+            sorted_gap_spans(*base, offsets, &mut spans)
+        }
+        U64Segment::SortedArray(EncodedU64Array::U64(values)) => {
+            sorted_gap_spans(0, values, &mut spans)
+        }
+        _ => return vec![(*range.start(), *range.end())],
+    }
+    spans
+}
+
+/// Spans of a sorted packed array split at gaps above [`PROBE_GAP`], read
+/// straight from the slice. Gaps that wide are rare (a compacted fragment
+/// holds a handful of pieces), so each block of values is first checked for
+/// one with a branch-free reduction that vectorizes, and only a block that
+/// has one is walked value by value.
+fn sorted_gap_spans<T: Copy + Into<u64>>(base: u64, offsets: &[T], spans: &mut Vec<(u64, u64)>) {
+    const BLOCK: usize = 256;
+    let Some(&first) = offsets.first() else {
+        return;
+    };
+    let mut start = base + first.into();
+    let mut at = 0;
+    while at + 1 < offsets.len() {
+        let end = (at + BLOCK).min(offsets.len() - 1);
+        let (block, next) = (&offsets[at..end], &offsets[at + 1..=end]);
+        let has_gap = block.iter().zip(next).fold(false, |found, (&a, &b)| {
+            found | (b.into() - a.into() > PROBE_GAP)
+        });
+        if has_gap {
+            for (&a, &b) in block.iter().zip(next) {
+                if b.into() - a.into() > PROBE_GAP {
+                    spans.push((start, base + a.into()));
+                    start = base + b.into();
+                }
+            }
+        }
+        at = end;
+    }
+    spans.push((start, base + offsets[offsets.len() - 1].into()));
+}
+
+/// Whether to answer lookups by probing the segments rather than by merging
+/// every row id.
+///
+/// Probing costs the segments that cover one id, per lookup; merging costs the
+/// row ids it reads, once. So probe only when both stay on the right side of
+/// [`MAX_PROBE_DEPTH`] and [`MERGE_ROWS_BUDGET`].
+fn probing_beats_merging(fragments: &[FragmentEntry], probes: &[ProbeEntry]) -> bool {
+    let merge_rows: u64 = fragments.iter().map(|entry| entry.merge_rows).sum();
+    merge_rows > MERGE_ROWS_BUDGET && max_overlap_depth(probes) <= MAX_PROBE_DEPTH
+}
+
+/// Most segments that cover any one row id. `probes` is sorted by `start`.
+fn max_overlap_depth(probes: &[ProbeEntry]) -> u64 {
+    let mut ends: Vec<u64> = probes.iter().map(|probe| probe.end).collect();
     ends.sort_unstable();
     let mut closed = 0;
     let mut depth: u64 = 0;
-    for (opened, entry) in fragments.iter().enumerate() {
-        while closed < ends.len() && ends[closed] < entry.start {
+    for (opened, probe) in probes.iter().enumerate() {
+        while closed < ends.len() && ends[closed] < probe.start {
             closed += 1;
         }
         depth = depth.max((opened + 1 - closed) as u64);
@@ -434,16 +544,16 @@ fn max_overlap_depth(fragments: &[FragmentEntry]) -> u64 {
     depth
 }
 
-/// Implicit max-`end` heap over `fragments`, padded to a power of two. Padding
+/// Implicit max-`end` heap over `probes`, padded to a power of two. Padding
 /// leaves hold 0, which prunes for every id above 0 and is filtered by slot.
-fn build_end_tree(fragments: &[FragmentEntry]) -> Vec<u64> {
-    if fragments.is_empty() {
+fn build_end_tree(probes: &[ProbeEntry]) -> Vec<u64> {
+    if probes.is_empty() {
         return Vec::new();
     }
-    let leaves = fragments.len().next_power_of_two();
+    let leaves = probes.len().next_power_of_two();
     let mut tree = vec![0_u64; 2 * leaves];
-    for (slot, entry) in fragments.iter().enumerate() {
-        tree[leaves + slot] = entry.end;
+    for (slot, probe) in probes.iter().enumerate() {
+        tree[leaves + slot] = probe.end;
     }
     for node in (1..leaves).rev() {
         tree[node] = tree[2 * node].max(tree[2 * node + 1]);
@@ -495,6 +605,7 @@ impl DeepSizeOf for RowIdIndex {
         fragment_bytes
             + merged_bytes
             + self.fragments.capacity() * std::mem::size_of::<FragmentEntry>()
+            + self.probes.capacity() * std::mem::size_of::<ProbeEntry>()
             + self.end_tree.capacity() * std::mem::size_of::<u64>()
     }
 }
@@ -755,13 +866,14 @@ fn merge_overlapping_chunks(overlapping_chunks: Vec<IndexChunk>) -> Result<Index
 impl RowIdIndex {
     /// Index that answers from the probe path, whatever the gate decided.
     fn probing(fragment_indices: &[FragmentRowIdIndex]) -> Result<Self> {
-        let mut fragments: Vec<FragmentEntry> = fragment_indices
+        let fragments: Vec<FragmentEntry> = fragment_indices
             .iter()
             .filter_map(FragmentEntry::new)
             .collect();
-        fragments.sort_unstable_by_key(|entry| entry.start);
+        let probes = probe_entries(&fragments);
         Ok(Self {
-            end_tree: build_end_tree(&fragments),
+            end_tree: build_end_tree(&probes),
+            probes,
             fragments,
             merged: None,
         })
@@ -902,6 +1014,100 @@ mod tests {
                 "row id {row_id}"
             );
         }
+    }
+
+    /// How one fragment of [`interleaved_table`] holds its two far-apart pieces.
+    #[derive(Clone, Copy)]
+    enum PieceLayout {
+        /// One hole array per piece.
+        TwoSegments,
+        /// One sorted array holding both, as compaction writes it; the far
+        /// piece past 2^32 packs it as u64.
+        OneSortedArray,
+        /// The same, with the far piece below 2^32 so it packs as u32.
+        OneSortedArrayU32,
+        /// One `Ranges` folded across the gap, as decoding `Range` runs does.
+        OneRanges,
+    }
+
+    /// `MAX_PROBE_DEPTH + 1` fragments of two far-apart pieces of `piece` ids,
+    /// each piece missing its second id, so every fragment span covers every
+    /// other while no two pieces overlap. Returns the fragments, `piece` and
+    /// `far`, the offset of the high pieces.
+    fn interleaved_table(layout: PieceLayout) -> (Vec<FragmentRowIdIndex>, u64, u64) {
+        let fragments = MAX_PROBE_DEPTH + 1;
+        let piece = MERGE_ROWS_BUDGET / fragments + 1;
+        // `Ranges` offsets are u32, so that layout keeps the gap below 4 billion.
+        let far = match layout {
+            PieceLayout::OneRanges | PieceLayout::OneSortedArrayU32 => 1u64 << 30,
+            _ => 1u64 << 40,
+        };
+        let table = (0..fragments)
+            .map(|i| {
+                let low = i * piece..(i + 1) * piece;
+                let high = far + low.start..far + low.end;
+                let segments = match layout {
+                    PieceLayout::TwoSegments => [&low, &high]
+                        .map(|range| U64Segment::RangeWithHoles {
+                            range: range.clone(),
+                            holes: vec![range.start + 1].into(),
+                        })
+                        .to_vec(),
+                    PieceLayout::OneSortedArray | PieceLayout::OneSortedArrayU32 => {
+                        vec![U64Segment::SortedArray(
+                            low.clone()
+                                .chain(high.clone())
+                                .filter(|id| *id != low.start + 1 && *id != high.start + 1)
+                                .collect::<Vec<_>>()
+                                .into(),
+                        )]
+                    }
+                    PieceLayout::OneRanges => vec![
+                        U64Segment::from_sorted_ranges(&[
+                            low.start..low.start + 1,
+                            low.start + 2..low.end,
+                            high.start..high.start + 1,
+                            high.start + 2..high.end,
+                        ])
+                        .unwrap(),
+                    ],
+                };
+                fragment(i as u32, RowIdSequence(segments))
+            })
+            .collect();
+        (table, piece, far)
+    }
+
+    #[rstest::rstest]
+    #[case::two_segments(PieceLayout::TwoSegments)]
+    #[case::one_sorted_array(PieceLayout::OneSortedArray)]
+    #[case::one_sorted_array_u32(PieceLayout::OneSortedArrayU32)]
+    #[case::one_ranges(PieceLayout::OneRanges)]
+    fn test_probes_pieces_not_fragment_spans(#[case] layout: PieceLayout) {
+        let (deep, piece, far) = interleaved_table(layout);
+        let index = RowIdIndex::new(&deep).unwrap();
+        assert!(
+            index.merged.is_none(),
+            "pieces do not overlap, so probing wins"
+        );
+
+        // Offsets skip the hole: id `start + k` sits at offset `k - 1`, and the
+        // high piece starts after the low piece's `piece - 1` live rows.
+        let addr = |fragment: u64, offset: u64| {
+            Some(RowAddress::new_from_parts(fragment as u32, offset as u32))
+        };
+        assert_eq!(index.get(0).unwrap(), addr(0, 0));
+        assert_eq!(index.get(3 * piece + 1).unwrap(), None, "the hole");
+        assert_eq!(
+            index.get(far + 3 * piece + 10).unwrap(),
+            addr(3, piece - 1 + 9)
+        );
+        assert_eq!(
+            index
+                .get_many(&[far + 7 * piece + 2, 5 * piece + 1, 5 * piece + 2])
+                .unwrap(),
+            vec![addr(7, piece - 1 + 1), None, addr(5, 1)]
+        );
     }
 
     #[test]
@@ -1718,8 +1924,11 @@ mod tests {
         let live: Vec<u64> = (1000..3000u64)
             .filter(|v| !(1200..1900).contains(v))
             .collect();
-        let mut runs_sequence = RowIdSequence::from(live.as_slice());
-        assert!(runs_sequence.use_range_segments());
+        let runs_sequence = RowIdSequence::from(live.as_slice()).reencode();
+        assert!(matches!(
+            runs_sequence.segments(),
+            [crate::rowids::segment::U64Segment::Ranges { .. }]
+        ));
         let index = RowIdIndex::new(&[fragment(7, runs_sequence)]).unwrap();
         for (position, &row_id) in live.iter().enumerate() {
             assert_eq!(

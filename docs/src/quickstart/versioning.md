@@ -27,6 +27,17 @@ import pandas as pd
 import pyarrow as pa
 ```
 
+## Create a Dataset
+
+Start with a fresh dataset, which becomes version 1:
+
+```python
+shutil.rmtree("/tmp/test.lance", ignore_errors=True)
+
+df = pd.DataFrame({"a": [5]})
+dataset = lance.write_dataset(df, "/tmp/test.lance")
+```
+
 ## Append New Data to Your Dataset
 
 You can add new rows to your existing dataset, creating a new version while preserving the original data. Here is how to append rows:
@@ -109,14 +120,14 @@ Branches manage parallel lines of dataset evolution. You can create branches fro
 
 ```python
 # Create branch from current latest version
-experiment_branch = ds.create_branch("experiment")
+experiment_branch = dataset.create_branch("experiment")
 
 # Write to the branch (affects only that branch's history)
 tbl = pa.Table.from_pandas(pd.DataFrame({"a": [42]}))
 lance.write_dataset(tbl, experiment_branch, mode="append")
 ```
 
-For more details, see [Tags and Branches](../guide/tags_and_branches.md).
+For more details, see [Tags and Branches](../guide/tags_and_branches.md). To preserve logical row identity across updates and compaction, see [Stable Row IDs and Lineage](../guide/row_ids.md).
 
 ## Next Steps
 

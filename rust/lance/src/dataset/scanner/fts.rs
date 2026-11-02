@@ -31,7 +31,8 @@ use lance_index::scalar::inverted::query::{
 };
 use lance_index::scalar::inverted::{
     CombinedFieldsBM25Scorer, DocumentGranularity, INVERTED_INDEX_VERSION_V2,
-    INVERTED_INDEX_VERSION_V3, SCORE_COL, SCORE_FIELD, fts_schema,
+    INVERTED_INDEX_VERSION_V3, PreparedFtsQueryLeaf, SCORE_COL, SCORE_FIELD, fts_schema,
+    prepare_fts_global_statistics,
 };
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_select::RowAddrTreeMap;
@@ -51,7 +52,8 @@ use crate::io::exec::fts::{
     BoolSlot, BooleanQueryExec, BoostQueryExec, CombinedFieldsQueryExec, CompoundQueryExec,
     CrossColumnCompoundQueryExec, FlatCombinedFieldsExec, FlatMatchFilterExec, FlatMatchQueryExec,
     FlatStatsCoverage, FlatStatsScope, FtsDocumentExec, HybridCompoundQueryExec, MatchQueryExec,
-    PhraseQueryExec, SharedFtsScorer, build_boolean_query_children_with_schema,
+    PhraseQueryExec, SharedFtsScorer, SharedFtsScorerExec,
+    build_boolean_query_children_with_schema, open_fts_segments_without_coverage,
 };
 use crate::io::exec::{FilterPlan as ExprFilterPlan, PreFilterSource, RowAddrMaskFilterExec};
 use crate::{Error, Result};
@@ -357,7 +359,7 @@ fn normalize_fts_zero_boosts(query: &mut FtsQuery) {
 /// unindexed rows. AUTO activation is deferred until OSS-2105 lands that
 /// current-row preparation atomically. Until then, recursively rewrite AUTO to
 /// exact while preserving explicit positive fuzziness.
-pub fn apply_dataset_planner_auto_fuzziness_compatibility_gate(query: &mut FtsQuery) {
+pub(crate) fn apply_dataset_planner_auto_fuzziness_compatibility_gate(query: &mut FtsQuery) {
     match query {
         FtsQuery::Match(query) => {
             query.fuzziness.get_or_insert(0);
@@ -386,7 +388,220 @@ pub fn apply_dataset_planner_auto_fuzziness_compatibility_gate(query: &mut FtsQu
     }
 }
 
+/// A restricted corpus scan must count every document before selecting output rows.
+enum FlatMatchFilter<'a> {
+    BeforeScoring(&'a ExprFilterPlan),
+    AtEmission(PreFilterSource),
+}
+
 impl Scanner {
+    /// Return opaque protobuf-encoded global BM25 statistics for this scanner's
+    /// full-text query.
+    ///
+    /// Statistics are aggregated across every committed physical segment of
+    /// the selected logical FTS index. The payload is bound to the current
+    /// dataset version, exact segment UUIDs, indexed column, document
+    /// granularity, and the prepared Match term groups or Phrase token
+    /// positions, including fuzzy expansions. It does not include documents in
+    /// unindexed fragments. Scanner filters, fragment or segment selection,
+    /// limits, and offsets do not restrict the corpus.
+    ///
+    /// The query must resolve to exactly one indexed column. The returned bytes
+    /// are an opaque transport handle intended for Lance bindings and
+    /// distributed query planning. The caller must attach them only to the same
+    /// query used to produce them; V1 consumers cannot independently verify the
+    /// source query identity.
+    ///
+    /// ```no_run
+    /// # use lance::{Dataset, Result};
+    /// # use lance_index::scalar::FullTextSearchQuery;
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let mut scanner = dataset.scan();
+    /// scanner.full_text_search(
+    ///     FullTextSearchQuery::new("hello".to_string()).with_column("text".to_string())?,
+    /// )?;
+    /// let statistics = scanner.fts_global_statistics().await?;
+    /// assert!(!statistics.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn fts_global_statistics(&self) -> Result<Vec<u8>> {
+        let query = self.full_text_query.as_ref().ok_or_else(|| {
+            Error::invalid_input("fts_global_statistics requires a full-text query")
+        })?;
+        let query = self.resolve_full_text_search_query(query).await?;
+        validate_fts_query_contract(&query.query)?;
+
+        let document_granularity = self.fts_document_granularity(&query.query)?;
+        let columns = query
+            .columns()
+            .into_iter()
+            .map(|column| {
+                resolve_fts_field(self.dataset.schema(), &column, document_granularity)
+                    .map(|field| field.canonical_path)
+            })
+            .collect::<Result<HashSet<_>>>()?;
+        if columns.len() != 1 {
+            return Err(Error::not_supported(format!(
+                "fts_global_statistics requires exactly one indexed column, got {}",
+                columns.len()
+            )));
+        }
+        let column = columns.into_iter().next().ok_or_else(|| {
+            Error::invalid_input("fts_global_statistics query does not reference a column")
+        })?;
+        let segments = load_segments(&self.dataset, &column, document_granularity)
+            .await?
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "No Inverted index found for column {column} and document granularity {document_granularity:?}"
+                ))
+            })?;
+        load_segment_details(&self.dataset, &column, &segments).await?;
+        let indices = open_fts_segments_without_coverage(
+            &self.dataset,
+            &column,
+            &segments,
+            &NoOpMetricsCollector,
+        )
+        .await?;
+        let params = query.params();
+        let prepared = prepare_fts_global_statistics(&indices, &query.query, &params, None).await?;
+        let scorer = prepared.scorer();
+
+        let num_docs = u64::try_from(scorer.num_docs).map_err(|_| {
+            Error::internal(format!(
+                "FTS document count {} exceeds u64::MAX",
+                scorer.num_docs
+            ))
+        })?;
+        let total_tokens = scorer.total_tokens;
+        let mut term_statistics = scorer
+            .token_docs
+            .iter()
+            .map(|(term, document_frequency)| (term.clone(), *document_frequency))
+            .collect::<Vec<_>>();
+        term_statistics.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut term_indices = HashMap::with_capacity(term_statistics.len());
+        let mut terms = Vec::with_capacity(term_statistics.len());
+        let mut corpus_terms = Vec::with_capacity(term_statistics.len());
+        for (term_index, (term, document_frequency)) in term_statistics.iter().enumerate() {
+            let term_index = u32::try_from(term_index).map_err(|_| {
+                Error::internal(format!(
+                    "FTS global term count {} exceeds u32::MAX",
+                    term_statistics.len()
+                ))
+            })?;
+            term_indices.insert(term.as_str(), term_index);
+            terms.push(term.clone());
+            corpus_terms.push(crate::pb::FtsCorpusTermStatisticsProto {
+                term_index: Some(term_index),
+                document_frequency: Some(u64::try_from(*document_frequency).map_err(|_| {
+                    Error::internal(format!(
+                        "FTS document frequency for term '{term}' exceeds u64::MAX"
+                    ))
+                })?),
+            });
+        }
+        let query_leaves = prepared
+            .query_leaves()
+            .iter()
+            .enumerate()
+            .map(|(leaf_ordinal, prepared_leaf)| {
+                let is_phrase_query = matches!(prepared_leaf, PreparedFtsQueryLeaf::Phrase(_));
+                let (kind, prepared_leaf) = match prepared_leaf {
+                    PreparedFtsQueryLeaf::Match(query) => (crate::pb::FtsQueryLeafKind::Match, query),
+                    PreparedFtsQueryLeaf::Phrase(query) => (crate::pb::FtsQueryLeafKind::Phrase, query),
+                };
+                let leaf_ordinal = u32::try_from(leaf_ordinal).map_err(|_| {
+                    Error::internal(format!(
+                        "FTS prepared query leaf count {} exceeds u32::MAX",
+                        prepared.query_leaves().len()
+                    ))
+                })?;
+                let prepared_tokens = prepared_leaf.tokens();
+                let mut tokens = Vec::with_capacity(prepared_tokens.len());
+                for token_index in 0..prepared_tokens.len() {
+                    let term = prepared_tokens.get_token(token_index);
+                    let term_index = term_indices.get(term).copied().ok_or_else(|| {
+                        Error::internal(format!(
+                            "FTS prepared leaf {leaf_ordinal} references missing global term '{term}'"
+                        ))
+                    })?;
+                    let query_position = if is_phrase_query {
+                        prepared_tokens.position(token_index)
+                    } else {
+                        prepared_tokens.term_group(token_index)
+                    };
+                    tokens.push((query_position, term_index));
+                }
+                tokens.sort_unstable();
+                tokens.dedup();
+                let tokens = tokens
+                    .into_iter()
+                    .map(
+                        |(query_position, term_index)| crate::pb::FtsPreparedTokenProto {
+                            term_index: Some(term_index),
+                            query_position: Some(query_position),
+                        },
+                    )
+                    .collect();
+                Ok(crate::pb::FtsPreparedQueryLeafProto {
+                    leaf_ordinal: Some(leaf_ordinal),
+                    kind: kind as i32,
+                    corpus_indices: vec![0],
+                    tokens,
+                    has_all_query_positions: Some(prepared_leaf.has_all_query_positions()),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let index_name = segments
+            .first()
+            .ok_or_else(|| Error::internal("FTS index has no committed segments"))?
+            .name
+            .clone();
+        if let Some(segment) = segments.iter().find(|segment| segment.name != index_name) {
+            return Err(Error::internal(format!(
+                "FTS segment {} belongs to logical index '{}', expected '{}'",
+                segment.uuid, segment.name, index_name
+            )));
+        }
+        let document_granularity = match document_granularity {
+            DocumentGranularity::Row => crate::pb::FtsDocumentGranularity::Row,
+            DocumentGranularity::ListElement => crate::pb::FtsDocumentGranularity::ListElement,
+        };
+        let mut segment_uuids = segments
+            .iter()
+            .map(|segment| segment.uuid.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        segment_uuids.sort_unstable();
+        if let Some(duplicate) = segment_uuids.windows(2).find(|uuids| uuids[0] == uuids[1]) {
+            return Err(Error::internal(format!(
+                "FTS logical index '{index_name}' contains duplicate segment UUID {}",
+                Uuid::from_slice(&duplicate[0]).map_err(|error| Error::internal(format!(
+                    "FTS segment UUID must contain 16 bytes: {error}"
+                )))?
+            )));
+        }
+        Ok(crate::pb::FtsGlobalStatisticsProto {
+            schema_version: crate::pb::FtsGlobalStatisticsSchemaVersion::V1 as i32,
+            dataset_version: self.dataset.version_id(),
+            terms,
+            corpora: vec![crate::pb::FtsCorpusStatisticsProto {
+                index_name,
+                column,
+                document_granularity: document_granularity as i32,
+                count_unit: crate::pb::FtsCorpusCountUnit::Document as i32,
+                segment_uuids,
+                num_docs: Some(num_docs),
+                total_tokens: Some(total_tokens),
+                terms: corpus_terms,
+            }],
+            query_leaves,
+        }
+        .encode_to_vec())
+    }
+
     pub(super) async fn fts_search_source(
         &self,
         filter_plan: &mut FilterPlan,
@@ -883,7 +1098,8 @@ impl Scanner {
         query: &FullTextSearchQuery,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut params = query.params();
-        if params.limit.is_none() {
+        // A column sort must select the page before relevance can truncate its candidates.
+        if params.limit.is_none() && self.ordering.is_none() {
             let search_limit = match (self.limit, self.offset) {
                 (Some(limit), Some(offset)) => Some((limit + offset) as usize),
                 (Some(limit), None) => Some(limit as usize),
@@ -904,6 +1120,15 @@ impl Scanner {
                 self.fragments_covered_by_fts_query(query).await?,
             )
             .await?;
+        // Choose corpus-aware scoring only for the resolved root Match. Recursive leaves
+        // retain their existing scoring and approximation contracts.
+        if let FtsQuery::Match(match_query) = query
+            && let Some(plan) = self
+                .plan_corpus_match_query(match_query, &params, filter_plan, &prefilter_source)
+                .await?
+        {
+            return Ok(plan);
+        }
         // Data overlay masking blocks stale rows from indexed leaves and re-evaluates only those
         // rows from their current values on the flat-text path.
         let fts_exec = self
@@ -1444,7 +1669,7 @@ impl Scanner {
                             HashMap::new(),
                             &flat_query,
                             &flat_params,
-                            filter_plan,
+                            FlatMatchFilter::BeforeScoring(filter_plan),
                             None,
                         )
                         .await?;
@@ -1470,7 +1695,7 @@ impl Scanner {
                                 HashMap::new(),
                                 &flat_query,
                                 &flat_params,
-                                filter_plan,
+                                FlatMatchFilter::BeforeScoring(filter_plan),
                                 None,
                             )
                             .await?;
@@ -1521,7 +1746,7 @@ impl Scanner {
                             stale_rows,
                             &flat_query,
                             &flat_params,
-                            filter_plan,
+                            FlatMatchFilter::BeforeScoring(filter_plan),
                             shared_scorer,
                         )
                         .await?,
@@ -1544,7 +1769,7 @@ impl Scanner {
                         HashMap::new(),
                         &flat_query,
                         &flat_params,
-                        filter_plan,
+                        FlatMatchFilter::BeforeScoring(filter_plan),
                         None,
                     )
                     .await?;
@@ -1553,6 +1778,153 @@ impl Scanner {
         };
 
         Self::combine_fts_leaf_plans(phrase_plan, flat_phrase_plan, params)
+    }
+
+    /// Use global append-only corpus statistics independently of the selected candidates.
+    /// Exact root scalar-text matches share this corpus with and without candidate
+    /// restrictions. Other query shapes retain their existing planner.
+    async fn plan_corpus_match_query(
+        &self,
+        query: &MatchQuery,
+        params: &FtsSearchParams,
+        filter_plan: &ExprFilterPlan,
+        prefilter_source: &PreFilterSource,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let is_primary_fts = self.full_text_query.is_some()
+            && self.nearest.is_none()
+            && self.filter.query_filter.is_none();
+        if !is_primary_fts
+            || self.fast_search
+            || params.wand_factor != 1.0
+            || params.phrase_slop.is_some()
+            || query.fuzziness != Some(0)
+            || query.document_granularity != Some(DocumentGranularity::Row)
+            || self
+                .dataset
+                .fragments()
+                .iter()
+                .any(|f| f.deletion_file.is_some())
+        {
+            return Ok(None);
+        }
+        let Some(column) = query.column.as_ref() else {
+            return Ok(None);
+        };
+        let resolved = resolve_fts_field(self.dataset.schema(), column, DocumentGranularity::Row)?;
+        if resolved.has_lists()
+            || !self
+                .dataset
+                .schema()
+                .field_by_id(resolved.final_field_id)
+                .is_some_and(|field| {
+                    matches!(
+                        field.data_type(),
+                        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                    )
+                })
+        {
+            return Ok(None);
+        }
+        if params.limit == Some(0)
+            || self.dataset.fragments().is_empty()
+            || self.fragments.as_ref().is_some_and(Vec::is_empty)
+        {
+            return Ok(Some(Arc::new(EmptyExec::new(fts_schema(
+                DocumentGranularity::Row,
+            )))));
+        }
+
+        let index = self
+            .dataset
+            .load_scalar_index(
+                IndexCriteria::default()
+                    .for_column(column)
+                    .supports_fts()
+                    .with_fts_document_granularity(DocumentGranularity::Row),
+            )
+            .await?;
+        let (corpus_fragments, segments) = if let Some(index) = index {
+            // Keep the full residual corpus, including fragments outside candidate selection.
+            let corpus_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+            if corpus_fragments.is_empty() {
+                return Ok(None);
+            }
+            let FtsOverlayPlan::Unchanged(segments) = self
+                .fts_overlay_plan(column, DocumentGranularity::Row, self.dataset.fragments())
+                .await?
+            else {
+                return Ok(None);
+            };
+            let segments = match segments {
+                Some(segments) => segments,
+                None => load_segments(&self.dataset, column, DocumentGranularity::Row)
+                    .await?
+                    .ok_or_else(|| Error::internal("FTS index has no physical segments"))?,
+            };
+            let details = futures::future::try_join_all(
+                segments
+                    .iter()
+                    .map(|segment| load_physical_fts_details(&self.dataset, column, segment)),
+            )
+            .await?;
+            if details.iter().any(|details| {
+                !matches!(
+                    details.posting_format_version,
+                    Some(INVERTED_INDEX_VERSION_V2 | INVERTED_INDEX_VERSION_V3)
+                )
+            }) {
+                return Ok(None);
+            }
+            (corpus_fragments, Some(segments))
+        } else {
+            (self.dataset.fragments().to_vec(), None)
+        };
+        let candidate_filter = self
+            .prefilter_source(
+                filter_plan,
+                corpus_fragments
+                    .iter()
+                    .map(|fragment| fragment.id as u32)
+                    .collect(),
+            )
+            .await?;
+        let (indexed_plan, shared_scorer) = match segments {
+            Some(segments) => {
+                let shared_scorer = Arc::new(SharedFtsScorer::new());
+                let indexed_plan = MatchQueryExec::new_with_segments_and_document_granularity(
+                    self.dataset.clone(),
+                    query.clone(),
+                    params.clone(),
+                    prefilter_source.clone(),
+                    segments,
+                    DocumentGranularity::Row,
+                )
+                .with_shared_scorer(shared_scorer.clone())
+                .with_external_mask(self.external_row_mask.clone());
+                (
+                    Some(Arc::new(indexed_plan) as Arc<dyn ExecutionPlan>),
+                    Some(shared_scorer),
+                )
+            }
+            None => (None, None),
+        };
+        // Retain this producer even when the selected residual domain is empty. Its
+        // scorer must be published before indexed candidates can be pruned to top-k.
+        let flat_plan = self
+            .plan_flat_match_query(
+                corpus_fragments,
+                HashMap::new(),
+                query,
+                params,
+                FlatMatchFilter::AtEmission(candidate_filter),
+                shared_scorer.clone(),
+            )
+            .await?;
+        let plan = Self::combine_fts_leaf_plans(indexed_plan, Some(flat_plan), params)?;
+        Ok(Some(match shared_scorer {
+            Some(shared_scorer) => Arc::new(SharedFtsScorerExec::new(plan, shared_scorer)),
+            None => plan,
+        }))
     }
 
     async fn plan_match_query(
@@ -1610,7 +1982,7 @@ impl Scanner {
                             HashMap::new(),
                             query,
                             params,
-                            filter_plan,
+                            FlatMatchFilter::BeforeScoring(filter_plan),
                             None,
                         )
                         .await?;
@@ -1636,7 +2008,7 @@ impl Scanner {
                                 HashMap::new(),
                                 query,
                                 params,
-                                filter_plan,
+                                FlatMatchFilter::BeforeScoring(filter_plan),
                                 None,
                             )
                             .await?;
@@ -1680,7 +2052,7 @@ impl Scanner {
                             stale_rows,
                             query,
                             params,
-                            filter_plan,
+                            FlatMatchFilter::BeforeScoring(filter_plan),
                             shared_scorer,
                         )
                         .await?,
@@ -1704,7 +2076,7 @@ impl Scanner {
                         HashMap::new(),
                         query,
                         params,
-                        filter_plan,
+                        FlatMatchFilter::BeforeScoring(filter_plan),
                         None,
                     )
                     .await?;
@@ -1756,9 +2128,14 @@ impl Scanner {
         stale_rows: HashMap<u32, RoaringBitmap>,
         query: &MatchQuery,
         params: &FtsSearchParams,
-        filter_plan: &ExprFilterPlan,
+        filter: FlatMatchFilter<'_>,
         shared_scorer: Option<Arc<SharedFtsScorer>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let unfiltered = ExprFilterPlan::default();
+        let (filter_plan, candidate_filter) = match filter {
+            FlatMatchFilter::BeforeScoring(filter_plan) => (filter_plan, None),
+            FlatMatchFilter::AtEmission(candidate_filter) => (&unfiltered, Some(candidate_filter)),
+        };
         let column = query
             .column
             .as_ref()
@@ -1798,6 +2175,9 @@ impl Scanner {
         );
         if let Some(shared_scorer) = shared_scorer {
             flat_match_plan = flat_match_plan.with_shared_scorer(shared_scorer);
+        }
+        if let Some(candidate_filter) = candidate_filter {
+            flat_match_plan = flat_match_plan.with_candidate_filter(candidate_filter);
         }
         let flat_match_plan: Arc<dyn ExecutionPlan> = Arc::new(flat_match_plan);
         // Unindexed fragments and stale rows never reach the index-side prefilter,
@@ -1880,6 +2260,14 @@ impl Scanner {
             ))));
         }
 
+        // Candidate fragments do not define the corpus: even an index-only
+        // selection needs statistics from unindexed rows outside that selection.
+        let corpus_fragments = if self.fast_search {
+            target_fragments
+        } else {
+            self.dataset.fragments()
+        };
+
         // Kept per column; see `FlatStatsCoverage`.
         let mut per_column_coverage = Vec::with_capacity(query.column_names().len());
         let mut uncovered = RoaringBitmap::new();
@@ -1908,7 +2296,7 @@ impl Scanner {
                         .collect()
                 }
                 // No index on this column at all, so no fragment is covered for it.
-                None => target_fragments
+                None => corpus_fragments
                     .iter()
                     .map(|fragment| fragment.id as u32)
                     .collect(),
@@ -1922,7 +2310,7 @@ impl Scanner {
             // reaches `docFreq_f`.
             let mut column_stale_rows = RowAddrTreeMap::new();
             match self
-                .fts_overlay_plan(column, DocumentGranularity::Row, target_fragments)
+                .fts_overlay_plan(column, DocumentGranularity::Row, corpus_fragments)
                 .await?
             {
                 FtsOverlayPlan::Unchanged(_) => {}
@@ -1935,7 +2323,7 @@ impl Scanner {
                 // A legacy segment reports no fragment coverage, so no target fragment
                 // can be proven free of stale entries and no row can be named as one.
                 FtsOverlayPlan::FullScan => {
-                    uncovered.extend(target_fragments.iter().map(|fragment| fragment.id as u32));
+                    uncovered.extend(corpus_fragments.iter().map(|fragment| fragment.id as u32));
                     needs_whole_corpus = true;
                 }
             }
@@ -1962,7 +2350,7 @@ impl Scanner {
         stale_addresses.retain(|fragment_id, _| !uncovered.contains(*fragment_id));
         let overlay_block = self.stale_rows_block_mask(&stale_addresses).await?;
 
-        let uncovered_fragments: Vec<Fragment> = target_fragments
+        let uncovered_fragments: Vec<Fragment> = corpus_fragments
             .iter()
             .filter(|fragment| uncovered.contains(fragment.id as u32))
             .cloned()
@@ -2034,7 +2422,7 @@ impl Scanner {
         // index and the corpus has to be re-measured from every target fragment. That
         // is a full scan, so it stays confined to that case.
         let (flat_fragments, stats_scope) = if needs_whole_corpus {
-            (target_fragments.to_vec(), FlatStatsScope::WholeCorpus)
+            (corpus_fragments.to_vec(), FlatStatsScope::WholeCorpus)
         } else {
             (
                 uncovered_fragments,
@@ -2062,7 +2450,7 @@ impl Scanner {
             .await?;
         // Only a plan with both children needs the two to agree on a corpus, and a
         // whole-corpus scan leaves no fragment for an indexed child.
-        let is_mixed = !needs_whole_corpus && flat_fragments.len() != target_fragments.len();
+        let is_mixed = !needs_whole_corpus && !covered.is_empty();
         let shared_scorer = is_mixed.then(|| Arc::new(SharedFtsScorer::new()));
         let flat_plan = self
             .plan_flat_combined_fields_query(
@@ -2081,20 +2469,26 @@ impl Scanner {
         let scored_plan = if !is_mixed {
             flat_plan
         } else {
-            let union =
-                UnionExec::try_new(vec![index_exec(Some(covered), shared_scorer), flat_plan])?;
+            let union = UnionExec::try_new(vec![
+                index_exec(Some(covered), shared_scorer.clone()),
+                flat_plan,
+            ])?;
             Arc::new(RepartitionExec::try_new(
                 union,
                 Partitioning::RoundRobinBatch(1),
             )?)
         };
-        Ok(Arc::new(
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
             SortExec::new(
                 Self::fts_score_sort_exprs(scored_plan.schema().as_ref())?.into(),
                 scored_plan,
             )
             .with_fetch(params.limit),
-        ))
+        );
+        Ok(match shared_scorer {
+            Some(shared_scorer) => Arc::new(SharedFtsScorerExec::new_combined(plan, shared_scorer)),
+            None => plan,
+        })
     }
 
     /// Plan the flat (unindexed) side of a `combined_fields` query: one scan over

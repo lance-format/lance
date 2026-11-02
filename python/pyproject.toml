@@ -56,10 +56,10 @@ tests = [
     "pandas",
     "polars[pyarrow,pandas]",
     "psutil",
-    "pytest",
-    "pytest-xdist",
+    "pytest==8.4.2",
+    "pytest-xdist==3.8.0",
     "tqdm",
-    "datafusion>=54,<55",
+    "datafusion>=55,<56",
 ]
 dev = ["ruff==0.11.2", "pyright"]
 benchmarks = ["pytest-benchmark"]
@@ -83,7 +83,7 @@ tests = [
     "pytest==8.4.2",
     "pytest-xdist==3.8.0",
     "tqdm==4.67.1",
-    "datafusion==54.0.0",
+    "datafusion==55.0.0",
     "opentelemetry-sdk==1.30.0",
 ]
 dev = [
@@ -117,8 +117,11 @@ include = [
     "python/lance/file.py",
     "python/lance/util.py",
     "python/lance/arrow.py",
+    "python/lance/mem_wal.py",
     "python/tests/test_arrow.py",
     "python/tests/test_fragment_typing.py",
+    "python/tests/test_optimize_typing.py",
+    "python/tests/test_optional_types_typing.py",
     "python/tests/test_udf.py",
 ]
 # Dependencies like pyarrow make this difficult to enforce strictly.

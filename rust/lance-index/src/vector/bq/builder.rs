@@ -1198,7 +1198,7 @@ impl From<RabitQuantizer> for Quantizer {
 
 fn random_normal_matrix(n: usize) -> ndarray::Array2<f64> {
     let mut rng = rand::rng();
-    let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
+    let normal = rand_distr::Normal::new(0.0, 1.0).expect("standard normal distribution");
     ndarray::Array2::from_shape_simple_fn((n, n), || normal.sample(&mut rng))
 }
 

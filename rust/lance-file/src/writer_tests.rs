@@ -4,7 +4,9 @@
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::ptr::NonNull;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::reader::{FileReader, FileReaderOptions, ReaderProjection, describe_encoding};
     use crate::testing::FsFixture;
@@ -13,13 +15,13 @@ mod tests {
     use crate::writer::{
         ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FieldTypeMismatch, FileWriter, FileWriterOptions,
     };
-    use arrow_array::builder::{Float32Builder, Int32Builder};
-    use arrow_array::types::Float64Type;
+    use arrow_array::builder::{Float32Builder, Int32Builder, StringDictionaryBuilder};
+    use arrow_array::types::{Float64Type, Int32Type};
     use arrow_array::{
-        Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, ListArray, RecordBatch,
-        RecordBatchReader, StringArray, StructArray, UInt64Array,
+        Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, LargeBinaryArray, ListArray,
+        RecordBatch, RecordBatchReader, StringArray, StructArray, UInt64Array,
     };
-    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+    use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{
         DataType, Field, Field as ArrowField, Fields as ArrowFields, Schema, Schema as ArrowSchema,
     };
@@ -30,7 +32,9 @@ mod tests {
     use lance_core::utils::tempfile::TempObjFile;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_encoding::compression_config::{CompressionFieldParams, CompressionParams};
-    use lance_encoding::constants::PACKED_STRUCT_META_KEY;
+    use lance_encoding::constants::{
+        PACKED_STRUCT_META_KEY, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_SPARSE,
+    };
     use lance_encoding::decoder::DecoderPlugins;
     use lance_encoding::encoder::{
         BatchEncoder, ColumnIndexSequence, EncodingOptions, FieldEncodingContext, OutOfLineBuffers,
@@ -59,6 +63,101 @@ mod tests {
     ) -> lance_core::Result<FileWriter> {
         versions::v2_1::create_writer_with_compression(object_writer, schema, options, compression)
             .map(Into::into)
+    }
+
+    fn create_v2_3_writer_with_compression(
+        object_writer: Box<dyn Writer>,
+        schema: LanceSchema,
+        options: FileWriterOptions,
+        compression: CompressionParams,
+    ) -> lance_core::Result<FileWriter> {
+        versions::v2_3::create_writer_with_compression(object_writer, schema, options, compression)
+            .map(Into::into)
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_alp_rd_single_dictionary_default_compression() {
+        // A slow linear drift whose pages collapse to a one-entry ALP-RD
+        // dictionary writes an empty index stream (index_bits == 0). The files
+        // must still read back end-to-end through the default Compress-All path;
+        // this is the integration-level companion to the ALP-RD unit test.
+        use futures::TryStreamExt;
+        use lance_encoding::decoder::FilterExpression;
+        use lance_io::ReadBatchParams;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "data",
+            DataType::Float64,
+            false,
+        )]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+        let n = 65536usize;
+        use rand::rngs::SmallRng;
+        use rand::{Rng, SeedableRng};
+        let mut rng = SmallRng::seed_from_u64(0x05ee_da1b_2026_1023);
+        let mut gauss = || {
+            let u1: f64 = rng.random_range(1e-12..1.0);
+            let u2: f64 = rng.random();
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        };
+        let vals: Vec<f64> = (0..n)
+            .map(|i| 1_000_000.0 + i as f64 * 0.1 + gauss() * 0.01)
+            .collect();
+        let expected_sum: f64 = vals.iter().sum();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = create_v2_3_writer_with_compression(
+            object_store.create(&path).await.unwrap(),
+            lance_schema,
+            FileWriterOptions::default(),
+            CompressionParams::new(),
+        )
+        .unwrap();
+        let arr = Arc::new(arrow_array::Float64Array::from(vals));
+        let batch = RecordBatch::try_new(arrow_schema, vec![arr]).unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let stream = file_reader
+            .read_stream(
+                ReadBatchParams::RangeFull,
+                1024,
+                16,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        assert_eq!(total, n as u64);
+        let read_sum: f64 = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+            })
+            .sum();
+        assert_eq!(read_sum, expected_sum);
     }
 
     fn reader_projection_from_column_names(
@@ -97,6 +196,160 @@ mod tests {
         file_writer.add_schema_metadata("foo", "bar");
         file_writer.finish().await.unwrap();
         // Tests asserting the contents of the written file are in reader.rs
+    }
+
+    #[tokio::test]
+    async fn test_sliced_batches_preserve_page_accumulation() {
+        let expected =
+            arrow_array::record_batch!(("id", UInt64, (0..1024).collect::<Vec<u64>>())).unwrap();
+        let mut page_counts = Vec::with_capacity(2);
+        for sliced in [false, true] {
+            let batches = (0..1024).step_by(32).map(|offset| {
+                if sliced {
+                    Ok(expected.slice(offset, 32))
+                } else {
+                    arrow_array::record_batch!((
+                        "id",
+                        UInt64,
+                        (offset as u64..offset as u64 + 32).collect::<Vec<_>>()
+                    ))
+                }
+            });
+            let input = arrow_array::RecordBatchIterator::new(batches, expected.schema());
+            let fs = FsFixture::default();
+            crate::testing::write_lance_file(
+                input,
+                &fs,
+                ConcreteFileVersion::V2_1,
+                FileWriterOptions {
+                    data_cache_bytes: Some(4096),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let scheduler = fs
+                .scheduler
+                .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+                .await
+                .unwrap();
+            let reader = FileReader::try_open(
+                scheduler,
+                None,
+                Arc::<DecoderPlugins>::default(),
+                &LanceCache::no_cache(),
+                FileReaderOptions::default(),
+            )
+            .await
+            .unwrap();
+            page_counts.push(reader.metadata().column_metadatas[0].pages.len());
+            let output = crate::testing::read_lance_file(
+                &fs,
+                Arc::<DecoderPlugins>::default(),
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .await;
+            let actual = arrow_select::concat::concat_batches(&expected.schema(), &output).unwrap();
+            assert_eq!(actual, expected);
+        }
+        assert!(page_counts[0] < 32);
+        assert_eq!(page_counts[0], page_counts[1]);
+    }
+
+    #[tokio::test]
+    async fn test_write_batch_snapshots_foreign_values() {
+        let owner = Arc::new((0..4096).map(AtomicU64::new).collect::<Vec<_>>());
+        // SAFETY: AtomicU64 has u64's layout and owner keeps the allocation alive.
+        let buffer = unsafe {
+            Buffer::from_custom_allocation(
+                NonNull::new(owner.as_ptr() as *mut u8).unwrap(),
+                4096 * 8,
+                owner.clone(),
+            )
+        };
+        let input = UInt64Array::new(ScalarBuffer::new(buffer, 0, 4096), None).slice(17, 32);
+        let batch = RecordBatch::try_from_iter([("id", Arc::new(input) as ArrayRef)]).unwrap();
+        let fs = FsFixture::default();
+        let sink = fs.object_store.create(&fs.tmp_path).await.unwrap();
+        let schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
+        let mut writer = versions::create_writer(
+            ConcreteFileVersion::V2_1,
+            sink,
+            schema,
+            FileWriterOptions {
+                data_cache_bytes: Some(4096),
+                keep_original_array: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        writer.write_batch(&batch).await.unwrap();
+        drop(batch);
+        owner[17].store(999, Ordering::Relaxed);
+        writer.add_schema_metadata("foo", "bar");
+        writer.finish().await.unwrap();
+
+        let output = crate::testing::read_lance_file(
+            &fs,
+            Arc::<DecoderPlugins>::default(),
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await;
+        let values = output[0]
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 17);
+    }
+
+    #[tokio::test]
+    async fn test_spare_batch_capacity_preserves_page_accumulation() {
+        async fn page_count(capacity: usize) -> usize {
+            let batches = (0..32)
+                .map(|batch_index| {
+                    let mut values = Vec::with_capacity(capacity);
+                    values.extend(batch_index * 32..batch_index * 32 + 32);
+                    RecordBatch::try_from_iter([(
+                        "id",
+                        Arc::new(UInt64Array::from(values)) as ArrayRef,
+                    )])
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let schema = batches[0].schema();
+            let fs = FsFixture::default();
+            crate::testing::write_lance_file(
+                arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema),
+                &fs,
+                ConcreteFileVersion::V2_1,
+                FileWriterOptions {
+                    data_cache_bytes: Some(4096),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let scheduler = fs
+                .scheduler
+                .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+                .await
+                .unwrap();
+            let reader = FileReader::try_open(
+                scheduler,
+                None,
+                Arc::<DecoderPlugins>::default(),
+                &LanceCache::no_cache(),
+                FileReaderOptions::default(),
+            )
+            .await
+            .unwrap();
+            reader.metadata().column_metadatas[0].pages.len()
+        }
+
+        let compact_capacity = page_count(32).await;
+        assert_eq!(compact_capacity, page_count(64).await);
+        assert!(compact_capacity < 32);
     }
 
     #[rstest]
@@ -551,6 +804,59 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::v2_2(ConcreteFileVersion::V2_2, false)]
+    #[case::v2_3_dense(ConcreteFileVersion::V2_3, false)]
+    #[case::v2_3_sparse(ConcreteFileVersion::V2_3, true)]
+    #[tokio::test]
+    async fn test_read_fixed_size_list_struct_with_scalar(
+        #[case] version: ConcreteFileVersion,
+        #[case] sparse: bool,
+    ) {
+        use lance_encoding::constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_SPARSE};
+
+        let metadata = if sparse {
+            HashMap::from([(
+                STRUCTURAL_ENCODING_META_KEY.to_string(),
+                STRUCTURAL_ENCODING_SPARSE.to_string(),
+            )])
+        } else {
+            HashMap::new()
+        };
+        let values = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("x", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
+        )]));
+        let points = FixedSizeListArray::new(
+            Arc::new(Field::new("item", values.data_type().clone(), true)),
+            2,
+            values,
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("points", points.data_type().clone(), true).with_metadata(metadata),
+            ])),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(points) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let data = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let fs = FsFixture::default();
+
+        crate::testing::write_lance_file(data, &fs, version, FileWriterOptions::default()).await;
+        let batches = crate::testing::read_lance_file(
+            &fs,
+            Arc::<DecoderPlugins>::default(),
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await;
+        assert_eq!(batches, vec![batch]);
+    }
+
     /// `write_column` rejects invalid inputs at the API boundary with
     /// descriptive errors: a writer without an explicit schema, an
     /// out-of-bounds field index, and a null written into a non-nullable field.
@@ -715,6 +1021,169 @@ mod tests {
         // A bare array carries no extension of its own.
         assert_eq!(mismatch.actual.data_type(), &DataType::Utf8);
         assert_eq!(mismatch.actual.extension_type_name(), None);
+    }
+
+    /// The value encoder stores each fixed-size list as one fixed-width value, so
+    /// writing a list of strings or binaries fails with an error, not a panic.
+    #[rstest]
+    #[case::utf8(DataType::Utf8, false)]
+    #[case::large_binary(DataType::LargeBinary, false)]
+    #[case::nested_utf8(DataType::Utf8, true)]
+    #[tokio::test]
+    async fn test_writer_rejects_fixed_size_list_of_variable_width_items(
+        #[case] item_type: DataType,
+        #[case] nested: bool,
+        #[values(false, true)] null_lists: bool,
+        // Lists of 200-byte items are too wide for mini-block pages and use full zip.
+        #[values(2, 200)] item_len: usize,
+        // 2.3 sparse pages choose their compressors without the dense page path.
+        #[values(
+            (ConcreteFileVersion::V2_0, None),
+            (ConcreteFileVersion::V2_1, None),
+            (ConcreteFileVersion::V2_2, None),
+            (ConcreteFileVersion::V2_3, None),
+            (ConcreteFileVersion::V2_3, Some(STRUCTURAL_ENCODING_SPARSE))
+        )]
+        target: (ConcreteFileVersion, Option<&str>),
+    ) {
+        let (version, structural_encoding) = target;
+        let items = (0..8).map(|i| format!("{i:0>item_len$}"));
+        let values: ArrayRef = match item_type {
+            DataType::Utf8 => Arc::new(StringArray::from_iter_values(items)),
+            DataType::LargeBinary => Arc::new(LargeBinaryArray::from_iter_values(items)),
+            _ => unreachable!(),
+        };
+        let item_field = Arc::new(ArrowField::new("item", item_type, true));
+        // A null list makes the encoder write definition levels.
+        let nulls = null_lists.then(|| NullBuffer::from(vec![true, false, true, true]));
+        let mut tags: ArrayRef = Arc::new(FixedSizeListArray::new(item_field, 2, values, nulls));
+        if nested {
+            let item_field = Arc::new(ArrowField::new("item", tags.data_type().clone(), true));
+            tags = Arc::new(FixedSizeListArray::new(item_field, 2, tags, None));
+        }
+        let metadata = structural_encoding.map(|encoding| {
+            (
+                STRUCTURAL_ENCODING_META_KEY.to_string(),
+                encoding.to_string(),
+            )
+        });
+        let tags_field = ArrowField::new("tags", tags.data_type().clone(), true)
+            .with_metadata(metadata.into_iter().collect());
+        let schema = Arc::new(ArrowSchema::new(vec![tags_field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![tags]).unwrap();
+        let fs = FsFixture::default();
+        let result = async {
+            let mut writer = create_writer(
+                fs.object_store.create(&fs.tmp_path).await?,
+                LanceSchema::try_from(schema.as_ref())?,
+                version,
+                FileWriterOptions::default(),
+            )?;
+            writer.write_batch(&batch).await?;
+            writer.finish().await
+        }
+        .await;
+        let error = result.expect_err("a fixed-size list of variable-width items was written");
+        assert!(
+            matches!(error, lance_core::Error::NotSupported { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("FixedSizeList"), "{error}");
+    }
+
+    /// A row with more rep/def levels than one mini-block chunk holds is checked
+    /// for full-zip support before any compressor is chosen.
+    #[rstest]
+    #[tokio::test]
+    async fn test_writer_rejects_large_row_of_fixed_size_lists_of_strings(
+        // 2.3 writes such a row as a sparse page, which has no such limit.
+        #[values(ConcreteFileVersion::V2_1, ConcreteFileVersion::V2_2)]
+        version: ConcreteFileVersion,
+    ) {
+        let item_field = Arc::new(ArrowField::new("item", DataType::Utf8, true));
+        let items = Arc::new(StringArray::from(vec!["a", "b"]));
+        let tags = FixedSizeListArray::new(item_field, 2, items, None);
+        // One row of 70,000 lists, all empty but the first, has a level for each
+        // list but a single value.
+        let num_lists = 70_000;
+        let offsets = std::iter::once(0).chain(std::iter::repeat_n(1, num_lists));
+        let list_field = Arc::new(ArrowField::new("item", tags.data_type().clone(), true));
+        let lists = ListArray::new(
+            list_field,
+            OffsetBuffer::new(ScalarBuffer::from_iter(offsets)),
+            Arc::new(tags),
+            None,
+        );
+        let row_field = Arc::new(ArrowField::new("item", lists.data_type().clone(), true));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, num_lists as i32]));
+        let row: ArrayRef = Arc::new(ListArray::new(row_field, offsets, Arc::new(lists), None));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "tags",
+            row.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![row]).unwrap();
+        let fs = FsFixture::default();
+        let result = async {
+            let mut writer = create_writer(
+                fs.object_store.create(&fs.tmp_path).await?,
+                LanceSchema::try_from(schema.as_ref())?,
+                version,
+                FileWriterOptions::default(),
+            )?;
+            writer.write_batch(&batch).await?;
+            writer.finish().await
+        }
+        .await;
+        let error = result.expect_err("a fixed-size list of variable-width items was written");
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "{error}"
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_writer_rejects_fixed_size_list_of_dictionary_strings(
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let mut builder = StringDictionaryBuilder::<Int32Type>::new();
+        for i in 0..8 {
+            builder.append_value(format!("item-{i}"));
+        }
+        let values: ArrayRef = Arc::new(builder.finish());
+        let item_field = Arc::new(ArrowField::new("item", values.data_type().clone(), true));
+        let tags = FixedSizeListArray::new(item_field, 2, values, None);
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "tags",
+            tags.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(tags)]).unwrap();
+        let fs = FsFixture::default();
+        let result = async {
+            let mut writer = create_writer(
+                fs.object_store.create(&fs.tmp_path).await?,
+                LanceSchema::try_from(schema.as_ref())?,
+                version,
+                FileWriterOptions::default(),
+            )?;
+            writer.write_batch(&batch).await?;
+            writer.finish().await
+        }
+        .await;
+        let error = result.expect_err("fixed-size list of dictionary strings was written");
+        assert!(
+            matches!(error, lance_core::Error::NotSupported { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("FixedSizeList"), "{error}");
     }
 
     fn struct_array(fields: ArrowFields, nulls: Option<NullBuffer>) -> StructArray {
@@ -1701,6 +2170,8 @@ mod tests {
                 compression: None,        // Will use default compression if any
                 compression_level: None,
                 bss: Some(lance_encoding::compression_config::BssMode::Off), // Explicitly disable BSS to ensure RLE is used
+                alp: None,
+                axis_delta: None,
                 minichunk_size: None,
             },
         );
@@ -1973,6 +2444,244 @@ mod tests {
             status_encoding.contains("RLE") || status_encoding.contains("Rle"),
             "status column should use RLE encoding due to metadata threshold, but got: {}",
             status_encoding
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_default_alp_auto_gate() {
+        // With no ALP metadata, the v2.3 writer defaults to AlpMode::Auto: finite
+        // decimal floats pass the entropy gate, high-entropy floats stay flat.
+        use futures::TryStreamExt;
+        use lance_encoding::decoder::FilterExpression;
+        use lance_io::ReadBatchParams;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("prices", DataType::Float64, false),
+            ArrowField::new("random", DataType::Float64, false),
+        ]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let n = 8192usize;
+        let prices = arrow_array::Float64Array::from_iter_values(
+            (0..n).map(|i| ((i * 73) % 10000) as f64 / 100.0),
+        );
+        // Reuse a fixed LCG so the test is deterministic across platforms. The
+        // [-1e12, 1e12) range matches the high-entropy fixture used by the
+        // `should_use_alp` unit test: near-uniform bytes in every position.
+        let mut state = 0x05ee_da1b_2026_1023_u64;
+        let random = arrow_array::Float64Array::from_iter_values((0..n).map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 11) as f64 * (2e12 / (1u64 << 53) as f64)) - 1e12
+        }));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(prices), Arc::new(random)],
+        )
+        .unwrap();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = create_v2_3_writer_with_compression(
+            object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            FileWriterOptions::default(),
+            CompressionParams::new(),
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let column_metadatas = &file_reader.metadata().column_metadatas;
+        let prices_encoding = describe_encoding(&column_metadatas[0].pages[0]);
+        let random_encoding = describe_encoding(&column_metadatas[1].pages[0]);
+        assert!(
+            prices_encoding.contains("Alp"),
+            "prices column should use ALP via the Auto gate, got: {prices_encoding}"
+        );
+        assert!(
+            !random_encoding.contains("Alp"),
+            "random column should stay flat under the Auto gate, got: {random_encoding}"
+        );
+
+        // Both columns must round-trip bitwise; this also exercises the reader.
+        let projection = reader_projection_from_column_names(
+            ConcreteFileVersion::V2_3,
+            &lance_schema,
+            &["prices", "random"],
+        )
+        .unwrap();
+        let batches: Vec<RecordBatch> = file_reader
+            .read_stream_projected(
+                ReadBatchParams::RangeFull,
+                1024,
+                16,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let got_prices: Vec<u64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .map(|v| v.to_bits())
+            })
+            .collect();
+        assert_eq!(
+            got_prices,
+            (0..n)
+                .map(|i| (((i * 73) % 10000) as f64 / 100.0).to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_field_metadata_alp_round_trip() {
+        use futures::TryStreamExt;
+        use lance_encoding::constants::ALP_META_KEY;
+        use lance_encoding::decoder::FilterExpression;
+        use lance_io::ReadBatchParams;
+
+        let mut metadata = HashMap::new();
+        metadata.insert(ALP_META_KEY.to_string(), "on".to_string());
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("price", DataType::Float32, false).with_metadata(metadata.clone()),
+            ArrowField::new("sensor", DataType::Float64, false).with_metadata(metadata),
+        ]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let n = 8192usize;
+        let prices =
+            Float32Array::from_iter_values((0..n).map(|i| ((i * 73) % 10000) as f32 / 100.0));
+        let sensors = arrow_array::Float64Array::from_iter_values(
+            (0..n).map(|i| ((i * 73) % 10000) as f64 / 100.0),
+        );
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(prices), Arc::new(sensors)],
+        )
+        .unwrap();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = create_v2_3_writer_with_compression(
+            object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            FileWriterOptions::default(),
+            CompressionParams::new(),
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // Both float columns should have been written with the ALP codec.
+        let column_metadatas = &file_reader.metadata().column_metadatas;
+        for (i, column) in ["price", "sensor"].iter().enumerate() {
+            let encoding = describe_encoding(&column_metadatas[i].pages[0]);
+            assert!(
+                encoding.contains("Alp"),
+                "column {column} should use ALP encoding, got: {encoding}"
+            );
+        }
+
+        // Full pipeline round-trip must be bitwise identical.
+        let projection = reader_projection_from_column_names(
+            ConcreteFileVersion::V2_3,
+            &lance_schema,
+            &["price", "sensor"],
+        )
+        .unwrap();
+        let batches: Vec<RecordBatch> = file_reader
+            .read_stream_projected(
+                ReadBatchParams::RangeFull,
+                1024,
+                16,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let got_prices: Vec<u32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .map(|v| v.to_bits())
+            })
+            .collect();
+        let got_sensors: Vec<u64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(1)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .map(|v| v.to_bits())
+            })
+            .collect();
+        assert_eq!(
+            got_prices,
+            (0..n)
+                .map(|i| (((i * 73) % 10000) as f32 / 100.0).to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            got_sensors,
+            (0..n)
+                .map(|i| (((i * 73) % 10000) as f64 / 100.0).to_bits())
+                .collect::<Vec<_>>()
         );
     }
 

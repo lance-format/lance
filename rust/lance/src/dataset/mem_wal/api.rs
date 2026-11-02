@@ -15,7 +15,7 @@
 //! A writer that is already open keeps the set it opened with until something
 //! calls [`DatasetMemWalExt::refresh_mem_wal_index_configs`].
 //!
-//! A rename reaches every MemTable, sealed generation and replayed entry: each
+//! A rename reaches every MemTable, flushed generation and replayed entry: each
 //! is read by field id.
 //!
 //! # Upgrading
@@ -36,9 +36,9 @@
 //! generations with no value for it.
 //!
 //! A generation frozen before an index joined the maintained set is flushed
-//! without a vector or full-text index for it, and search over both is
-//! index-only, so its rows answer neither until compaction folds them into the
-//! base table.
+//! without a vector or full-text index for it. Vector search scans such a
+//! generation flat; full-text search over it is index-only, so its rows do not
+//! answer one until compaction folds them into the base table.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -67,9 +67,9 @@ use super::scanner::exec::validate_pk_types;
 use super::scanner::sstable_cache::open_sstable;
 use super::scanner::{DatasetCache, ShardSnapshot};
 use super::schema_with_tombstone;
-use super::util::derived_store_params;
+use super::util::{derived_store_params, generate_mem_wal_dir_id, mem_wal_path, sstable_uri};
 use super::write::ShardWriter;
-use super::{SealFence, ShardWriterConfig};
+use super::{FreezeFence, ShardWriterConfig};
 
 /// Spec id of the sole sharding spec installed by [`InitializeMemWalBuilder`].
 const SHARDING_SPEC_ID: u32 = 1;
@@ -315,6 +315,7 @@ impl<'a> InitializeMemWalBuilder<'a> {
             maintained_indexes,
             maintain_all_indexes,
             writer_config_defaults,
+            dir_id: mint_mem_wal_dir_id(dataset).await?,
             ..Default::default()
         };
 
@@ -334,6 +335,29 @@ impl<'a> InitializeMemWalBuilder<'a> {
         *dataset = new_dataset;
 
         Ok(())
+    }
+}
+
+/// Mint a `dir_id` whose directory holds nothing yet. The id is only 32 bits,
+/// and an earlier MemWAL's leftovers must never be shared with a new one.
+async fn mint_mem_wal_dir_id(dataset: &Dataset) -> Result<String> {
+    use futures::StreamExt;
+
+    let store = dataset.object_store(None).await?;
+    let base_path = dataset.branch_location().path;
+    loop {
+        let dir_id = generate_mem_wal_dir_id(dataset.uri());
+        let prefix = mem_wal_path(&base_path, &dir_id);
+        let first = store
+            .inner
+            .list(Some(&prefix))
+            .next()
+            .await
+            .transpose()
+            .map_err(|e| Error::io(format!("failed to list MemWAL directory {prefix}: {e}")))?;
+        if first.is_none() {
+            return Ok(dir_id);
+        }
     }
 }
 
@@ -653,7 +677,7 @@ pub trait DatasetMemWalExt {
     ) -> Result<ShardWriter>;
 
     /// Re-resolve the maintained set from this dataset and install it on
-    /// `writer`, sealing so the next MemTable carries it.
+    /// `writer`, freezing so the next MemTable carries it.
     ///
     /// This is how a change reaches a writer that is already open: a replaced
     /// `maintained_indexes`, or, for a table that maintains all of them, an
@@ -665,7 +689,7 @@ pub trait DatasetMemWalExt {
     async fn refresh_mem_wal_index_configs(
         &self,
         writer: &ShardWriter,
-    ) -> Result<Option<SealFence>>;
+    ) -> Result<Option<FreezeFence>>;
 }
 
 /// Prewarm every index of `dataset` into its session caches. A no-op when the
@@ -749,7 +773,12 @@ impl DatasetMemWalExt for Dataset {
     }
 
     async fn list_mem_wal_latest_shard_ids(&self) -> Result<Vec<Uuid>> {
-        let prefix = super::util::mem_wal_path(&self.branch_location().path);
+        // Only the directory the index names: another MemWAL's leftovers may
+        // sit beside it until GC removes them.
+        let Some(details) = self.mem_wal_index_details().await? else {
+            return Ok(Vec::new());
+        };
+        let prefix = mem_wal_path(&self.branch_location().path, &details.dir_id);
         let object_store = self.object_store(None).await?;
         let list_result = object_store
             .inner
@@ -783,16 +812,22 @@ impl DatasetMemWalExt for Dataset {
         let store_params = self.store_params().map(derived_store_params);
         // Resolve SSTable paths exactly as the LSM collector does, so the
         // session/cache entries we warm key-match the paths later lookups open.
+        let dir_id = self
+            .mem_wal_index_details()
+            .await?
+            .map(|details| details.dir_id)
+            .unwrap_or_default();
         let base_path = self.uri().trim_end_matches('/').to_string();
         let opens = snapshots
             .iter()
             .flat_map(|snapshot| {
                 let shard_id = snapshot.shard_id;
                 let base_path = &base_path;
+                let dir_id = &dir_id;
                 let session = &session;
                 let store_params = &store_params;
                 snapshot.sstables.iter().map(move |sstable| {
-                    let path = format!("{}/_mem_wal/{}/{}", base_path, shard_id, sstable.path);
+                    let path = sstable_uri(base_path, dir_id, &shard_id, &sstable.path);
                     async move {
                         let dataset =
                             open_sstable(&path, Some(session), store_params.as_ref(), cache, None)
@@ -817,6 +852,7 @@ impl DatasetMemWalExt for Dataset {
 
         // Set shard_id in config
         config.shard_id = shard_id;
+        config.dir_id = details.dir_id.clone();
 
         // Inject the dataset's store params + session so the flusher opens the
         // base + generations with the same store the base was resolved with.
@@ -845,7 +881,7 @@ impl DatasetMemWalExt for Dataset {
     async fn refresh_mem_wal_index_configs(
         &self,
         writer: &ShardWriter,
-    ) -> Result<Option<SealFence>> {
+    ) -> Result<Option<FreezeFence>> {
         let details = require_mem_wal_details(self).await?;
         let index_specs = maintained_index_specs(self, &details, writer.config()).await?;
         writer.replace_index_configs(index_specs).await
@@ -878,7 +914,7 @@ impl ShardWriter {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn evolve_to(&self, dataset: &Dataset) -> Result<Option<SealFence>> {
+    pub async fn evolve_to(&self, dataset: &Dataset) -> Result<Option<FreezeFence>> {
         let details = require_mem_wal_details(dataset).await?;
         let index_specs = maintained_index_specs(dataset, &details, self.config()).await?;
         self.evolve_schema(
@@ -1560,6 +1596,107 @@ mod tests {
         );
     }
 
+    /// Remove the MemWAL index the way a disable does.
+    async fn remove_mem_wal_index(dataset: &mut Dataset) {
+        let mem_wal = dataset
+            .load_index_by_name(MEM_WAL_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("MemWAL index present");
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![],
+                removed_indices: vec![mem_wal],
+            },
+            None,
+        );
+        *dataset = CommitBuilder::new(Arc::new(dataset.clone()))
+            .execute(transaction)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_initialize_mem_wal_mints_a_fresh_dir_id_each_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let mut dataset = id_v_dataset(&uri, &[1]).await;
+
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .unwrap();
+        let first = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .unwrap()
+            .dir_id;
+        assert_eq!(first.len(), 8, "dir_id is 8 hex characters: {first}");
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()), "{first}");
+
+        remove_mem_wal_index(&mut dataset).await;
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .unwrap();
+        let second = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .unwrap()
+            .dir_id;
+        assert_ne!(
+            first, second,
+            "a re-initialized MemWAL reused its predecessor's directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shard_listing_ignores_unreferenced_mem_wal_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let mut dataset = id_v_dataset(&uri, &[1]).await;
+        dataset
+            .initialize_mem_wal()
+            .unsharded()
+            .execute()
+            .await
+            .unwrap();
+        let dir_id = dataset
+            .mem_wal_index_details()
+            .await
+            .unwrap()
+            .unwrap()
+            .dir_id;
+
+        let store = dataset.object_store(None).await.unwrap();
+        let base_path = dataset.branch_location().path;
+        let ours = Uuid::new_v4();
+        for (dir, shard) in [
+            (dir_id.as_str(), ours),
+            ("ffffffff", Uuid::new_v4()),
+            ("", Uuid::new_v4()),
+        ] {
+            let path = super::super::util::shard_manifest_path(&base_path, dir, &shard)
+                .join("version_hint.json");
+            object_store::ObjectStoreExt::put(store.inner.as_ref(), &path, b"{}".to_vec().into())
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            dataset.list_mem_wal_latest_shard_ids().await.unwrap(),
+            vec![ours],
+            "only the referenced MemWAL directory is listed"
+        );
+    }
+
     #[tokio::test]
     async fn test_initialize_mem_wal_rejects_unmaintainable_index() {
         // Initialization persists the set, so it must apply the writer's rules
@@ -2034,7 +2171,7 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none(),
-            "a second pass over an unchanged table seals nothing"
+            "a second pass over an unchanged table freezes nothing"
         );
         writer.close().await.unwrap();
     }
@@ -2043,7 +2180,7 @@ mod tests {
     /// from is the same maintained index, so the writer keeps its memtable;
     /// one rebuilt with another distance type is not.
     #[tokio::test]
-    async fn refresh_seals_only_when_a_maintained_index_changes_its_settings() {
+    async fn refresh_freezes_only_when_a_maintained_index_changes_its_settings() {
         use crate::dataset::optimize::remapping::remap_column_index;
         use crate::dataset::optimize::{CompactionOptions, compact_files};
         use crate::index::vector::VectorIndexParams;
