@@ -364,10 +364,15 @@ async fn multi_segment_fmindex_after_cleanup_returns_empty_definition_and_scans(
             .is_some_and(RoaringBitmap::is_empty),
         "all retired coverage must be withdrawn"
     );
-    assert!(
-        stale.load_indices_by_name("idx").await.unwrap().is_empty(),
-        "the empty definition is not query-visible"
-    );
+    // Listed with empty coverage, so every fragment is scanned (#10623).
+    let listed = stale.load_indices_by_name("idx").await.unwrap();
+    assert!(!listed.is_empty());
+    assert!(listed.iter().all(|index| {
+        index
+            .fragment_bitmap
+            .as_ref()
+            .is_some_and(RoaringBitmap::is_empty)
+    }));
     let stored = crate::index::loading::load_all_indices(&stale)
         .await
         .unwrap();

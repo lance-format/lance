@@ -895,8 +895,8 @@ impl<'a> CreateIndexBuilder<'a> {
             if let Some(index) = indices.into_iter().next() {
                 return Ok(index);
             }
-            // A rebase can withdraw all query coverage and leave empty
-            // definitions, which tagged query listings omit.
+            // Tagged query listings omit segments whose type cannot translate
+            // the history's row addresses; their rows are scanned instead.
             let indices = load_all_indices_by_name(self.dataset, &index_name).await?;
             return indices.into_iter().next().ok_or_else(|| {
                 Error::internal(format!(
@@ -980,8 +980,8 @@ impl<'a> CreateIndexBuilder<'a> {
         if let Some(index) = indices.into_iter().next() {
             return Ok(index);
         }
-        // A rebase can withdraw all query coverage and leave empty
-        // definitions, which tagged query listings omit.
+        // Tagged query listings omit segments whose type cannot translate
+        // the history's row addresses; their rows are scanned instead.
         let indices = load_all_indices_by_name(self.dataset, &index_name).await?;
         indices.into_iter().next().ok_or_else(|| {
             Error::internal(format!(
