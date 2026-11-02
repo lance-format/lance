@@ -16,10 +16,11 @@ mod tests {
         ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FieldTypeMismatch, FileWriter, FileWriterOptions,
     };
     use arrow_array::builder::{Float32Builder, Int32Builder, StringDictionaryBuilder};
-    use arrow_array::types::{Float64Type, Int32Type};
+    use arrow_array::types::{Float16Type, Float64Type, Int32Type};
     use arrow_array::{
-        Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, LargeBinaryArray, ListArray,
-        RecordBatch, RecordBatchReader, StringArray, StructArray, UInt64Array,
+        Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float16Array, Float32Array,
+        Int32Array, LargeBinaryArray, ListArray, RecordBatch, RecordBatchReader, StringArray,
+        StructArray, UInt64Array,
     };
     use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{
@@ -2888,6 +2889,7 @@ mod tests {
     }
 
     #[rstest]
+    #[case::narrow_f16(DataType::Float16, vec![6], None, 5000)]
     #[case::narrow_f32(DataType::Float32, vec![3], None, 5000)]
     #[case::nested_f64(DataType::Float64, vec![4, 4], None, 5000)]
     #[case::wide_f64(DataType::Float64, vec![64], None, 5000)]
@@ -2912,6 +2914,11 @@ mod tests {
         let dimension = dims.iter().product::<i32>() as usize;
         let values = pcodec_trajectory(num_rows, dimension, num_levels);
         let mut array: ArrayRef = match item_type {
+            DataType::Float16 => {
+                Arc::new(Float16Array::from_iter_values(values.iter().map(|v| {
+                    <Float16Type as ArrowPrimitiveType>::Native::from_f64(*v)
+                })))
+            }
             DataType::Float32 => Arc::new(Float32Array::from_iter_values(
                 values.iter().map(|v| *v as f32),
             )),
