@@ -737,7 +737,10 @@ impl<'a> CreateIndexBuilder<'a> {
 
         // Fetch the committed index metadata from the dataset.
         // This ensures we return the version that may have been modified by the commit.
-        let indices = self.dataset.load_indices().await?;
+        // The stored listing, not the query listing: a segment the query
+        // listing leaves out (one a fragment reuse history would have to
+        // translate but its type cannot) was still committed.
+        let indices = super::load_all_indices(self.dataset).await?;
         indices
             .iter()
             .find(|idx| idx.uuid == index_uuid)

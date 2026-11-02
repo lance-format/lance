@@ -94,6 +94,7 @@ async fn test_eager_compaction_over_a_pending_history_matches_the_table(
         IndexKind::BloomFilter,
         IndexKind::LabelList,
         IndexKind::NGram,
+        IndexKind::Fm,
         IndexKind::Inverted,
         IndexKind::IvfFlat
     )]
@@ -112,6 +113,7 @@ async fn test_indexed_queries_match_the_table_through_fragment_reuse(
         IndexKind::BloomFilter,
         IndexKind::LabelList,
         IndexKind::NGram,
+        IndexKind::Fm,
         IndexKind::Inverted,
         IndexKind::IvfFlat
     )]
