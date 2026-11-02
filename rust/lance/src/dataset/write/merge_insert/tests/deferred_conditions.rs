@@ -693,3 +693,61 @@ async fn source_only_condition_is_not_deferred() {
         "{plan}"
     );
 }
+
+/// Without an update no row written needs a stored value, so the
+/// columns the source omits are filled with NULL rather than scanned:
+/// a delete by key reads only the key.
+#[tokio::test]
+async fn delete_by_key_scans_only_the_key() {
+    let Fixture { ds, io, .. } = fixture().await;
+    let source = record_batch!(("key", Int32, [325, 30, 130])).unwrap();
+    let job = builder(&ds)
+        .when_matched(WhenMatched::Delete)
+        .try_build()
+        .unwrap();
+
+    let plan = explain(&job, &source).await;
+    assert!(scan_line(&plan).contains("projection=[key]"), "{plan}");
+
+    io.incremental_stats();
+    let (updated, stats) = run(job, &source).await;
+    assert_eq!(stats.num_deleted_rows, 3);
+    let read_bytes = io.incremental_stats().read_bytes;
+    assert!(
+        read_bytes < COLUMN_BYTES / 2,
+        "read {read_bytes} bytes against a {COLUMN_BYTES}-byte column"
+    );
+    assert_eq!(payloads(&updated, "key IN (325, 30, 130)").await, vec![]);
+    assert_eq!(updated.count_rows(None).await.unwrap(), NUM_ROWS - 3);
+}
+
+/// A `DeleteIf` over a column the source omits reads the filled copy,
+/// so that column is still filled from the target when nothing is
+/// updated; filled with NULL, no row would pass the condition.
+#[tokio::test]
+async fn delete_if_over_column_the_source_omits() {
+    let Fixture { ds, batch, .. } = fixture().await;
+    let source = record_batch!(("key", Int32, [25, 30, 1000])).unwrap();
+    let job = builder(&ds)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .when_not_matched_by_source(WhenNotMatchedBySource::delete_if(&ds, "other < 3").unwrap())
+        .try_build()
+        .unwrap();
+
+    let plan = explain(&job, &source).await;
+    assert!(
+        scan_line(&plan).contains("other")
+            && !scan_line(&plan).contains("payload")
+            && plan.contains("take=[]"),
+        "{plan}"
+    );
+
+    let (updated, stats) = run(job, &source).await;
+    assert_eq!((stats.num_inserted_rows, stats.num_deleted_rows), (1, 3));
+    assert_eq!(payloads(&updated, "key < 3").await, vec![]);
+    assert_eq!(
+        payloads(&updated, "key IN (25, 30, 1000)").await,
+        vec![(25, None), (30, stored(&batch, 30)), (1000, None)]
+    );
+    assert_eq!(updated.count_rows(None).await.unwrap(), NUM_ROWS - 3 + 1);
+}

@@ -7,19 +7,13 @@ mod concurrency;
 /// `MergeConditionExec` on the rows they gate, never through the target scan.
 mod deferred_conditions;
 mod indexed;
-mod plans;
 mod semantics;
-mod spilled_lineage;
 mod subcols;
 mod subcols_indexed;
 mod types;
 mod units;
 
 use super::*;
-use crate::dataset::optimize::{CompactionOptions, compact_files};
-use crate::dataset::rowids::{
-    INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, SPILL_ROW_LINEAGE_CONFIG_KEY,
-};
 use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::transaction::Operation;
 use crate::dataset::transaction::UpdateMode::RewriteColumns;
@@ -28,20 +22,19 @@ use crate::dataset::write::merge_insert::inserted_rows::{
     KeyExistenceFilter, KeyExistenceFilterBuilder, extract_key_value_from_batch,
 };
 use crate::dataset::write::merge_insert::job::{
-    fragment_update_session_context, max_fragment_update_partitions, merge_insert_execution_options,
+    fragment_update_session_context, merge_insert_execution_options,
 };
 use crate::index::DatasetIndexExt;
 use crate::index::vector::VectorIndexParams;
 use crate::io::commit::read_transaction_file;
 use crate::{
     dataset::{
-        ExternalBlobMode, InsertBuilder, ProjectionRequest, ReadParams, UpdateBuilder,
-        WriteDestination, WriteMode, WriteParams, builder::DatasetBuilder,
+        ExternalBlobMode, InsertBuilder, ReadParams, WriteDestination, WriteMode, WriteParams,
+        builder::DatasetBuilder,
     },
     session::Session,
     utils::test::{
-        DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper,
-        assert_plan_node_equals, assert_string_matches,
+        DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper, assert_string_matches,
     },
 };
 use arrow_array::ArrayRef;
@@ -63,21 +56,16 @@ use datafusion::common::Column;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{JoinType, LogicalPlan};
-use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
-use datafusion::physical_plan::{
-    ChildrenPropertiesMode, ReplaceChildrenOptions, StatisticsArgs, StatisticsContext,
-};
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{FutureExt, StreamExt, TryStreamExt, future::try_join_all};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::ROW_ID;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
 use lance_datafusion::{
-    datagen::DatafusionDatagenExt,
-    exec::{LanceExecutionOptions, new_session_context},
-    utils::reader_to_stream,
+    datagen::DatafusionDatagenExt, exec::LanceExecutionOptions, utils::reader_to_stream,
 };
 use lance_datagen::{BatchCount, Dimension, RowCount, Seed, array};
 use lance_file::version::LanceFileVersion;
@@ -87,13 +75,10 @@ use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, ScalarIndexP
 use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
-use lance_table::format::RowIdMeta;
-use lance_table::rowids::version::RowDatasetVersionMeta;
 use mock_instant::thread_local::MockClock;
 use object_store::throttle::ThrottleConfig;
 use roaring::RoaringBitmap;
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::sync::atomic::AtomicUsize;
 use tokio::sync::{Barrier, Notify};
 use url::Url;
@@ -166,7 +151,7 @@ async fn check_then_refresh_dataset(
     merged_dataset
 }
 
-fn create_test_schema() -> Arc<Schema> {
+pub(super) fn create_test_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("key", DataType::UInt32, true),
         Field::new("value", DataType::UInt32, true),
@@ -174,7 +159,7 @@ fn create_test_schema() -> Arc<Schema> {
     ]))
 }
 
-fn create_new_batch(schema: Arc<Schema>) -> RecordBatch {
+pub(super) fn create_new_batch(schema: Arc<Schema>) -> RecordBatch {
     RecordBatch::try_new(
         schema,
         vec![
@@ -186,7 +171,7 @@ fn create_new_batch(schema: Arc<Schema>) -> RecordBatch {
     .unwrap()
 }
 
-async fn create_test_dataset(
+pub(super) async fn create_test_dataset(
     test_uri: &str,
     version: LanceFileVersion,
     enable_stable_row_ids: bool,

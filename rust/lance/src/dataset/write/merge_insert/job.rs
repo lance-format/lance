@@ -101,7 +101,7 @@ fn subtree_has_blob(field: &lance_core::datatypes::Field) -> bool {
 impl MergeInsertJob {
     /// Clone one execution attempt while preserving the spill manager owned by
     /// the surrounding retry loop.
-    pub(super) fn clone_for_retry(&self) -> Self {
+    fn clone_for_retry(&self) -> Self {
         Self {
             dataset: self.dataset.clone(),
             params: self.params.clone(),
@@ -155,7 +155,7 @@ impl MergeInsertJob {
     ///
     /// Returns an empty vec when no join column has a usable scalar index;
     /// callers should then fall through to the full-scan path.
-    pub(super) async fn indexed_join_keys(&self) -> Result<Vec<(String, IndexMetadata)>> {
+    async fn indexed_join_keys(&self) -> Result<Vec<(String, IndexMetadata)>> {
         let mut indexed = Vec::with_capacity(self.params.on.len());
         for col in &self.params.on {
             if let Some(idx) = self
@@ -193,7 +193,7 @@ impl MergeInsertJob {
     }
 
     /// Physical rows whose join-key index entries may be stale due to newer overlays.
-    pub(super) async fn overlay_stale_rows_for_keys(
+    async fn overlay_stale_rows_for_keys(
         &self,
         indexed_keys: &[(String, IndexMetadata)],
     ) -> Result<RowAddrTreeMap> {
@@ -950,10 +950,7 @@ impl MergeInsertJob {
         }
     }
 
-    pub(super) async fn create_plan(
-        self,
-        provider: Arc<dyn TableProvider>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+    async fn create_plan(self, provider: Arc<dyn TableProvider>) -> Result<Arc<dyn ExecutionPlan>> {
         // Goal: we shouldn't manually have to specify which columns to scan.
         //       DataFusion's optimizer should be able to automatically perform
         //       projection pushdown for us.
@@ -1224,7 +1221,7 @@ impl MergeInsertJob {
     /// target column must be nullable — otherwise this method returns an
     /// `InvalidInput` error, because inserted rows would otherwise attempt to
     /// write a non-nullable NULL downstream.
-    pub(super) async fn can_use_create_plan(&self, source_schema: &Schema) -> Result<bool> {
+    async fn can_use_create_plan(&self, source_schema: &Schema) -> Result<bool> {
         // Convert to lance schema for comparison
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema)?;
         let full_schema = self.dataset.schema();
@@ -2083,7 +2080,7 @@ pub(super) fn merge_insert_execution_options() -> LanceExecutionOptions {
     }
 }
 
-pub(super) fn max_fragment_update_partitions(memory_pool_size: u64) -> usize {
+fn max_fragment_update_partitions(memory_pool_size: u64) -> usize {
     // The joined update stream is staged before this sort, so no upstream sort
     // reservation remains live. Budget each downstream partition for its merge
     // reservation plus one capped input and output/fragment-grouping batch.
@@ -2254,3 +2251,6 @@ impl Clone for MergeInsertJobWithProvider {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

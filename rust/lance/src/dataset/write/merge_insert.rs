@@ -15,6 +15,12 @@
 //! This match condition is currently limited to a key-match.  This means we consider a row to be a match if the
 //! key columns are identical in both the source and the target.  This means that you will need some kind of
 //! meaningful key column to be able to perform a merge insert.
+//!
+//! On stable-row-id V2 tables that opt into `lance.row_lineage.spill`, the V2
+//! row-rewrite plan spills carried row ids and creation versions above the
+//! table's inline budget. Updated and inserted rows are written to separate
+//! fragments so inserts retain commit-assigned lineage through conflict retries.
+//! Spilling is disabled by default and does not rewrite existing fragments.
 
 // Internal column name for the merge action. Using "__action" to avoid collisions with user columns.
 const MERGE_ACTION_COLUMN: &str = "__action";
