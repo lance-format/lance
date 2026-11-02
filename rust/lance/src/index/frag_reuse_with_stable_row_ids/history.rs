@@ -13,9 +13,8 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
-use lance_table::format::{Fragment, IndexMetadata, Manifest, is_detached_version};
+use lance_table::format::{IndexMetadata, Manifest, is_detached_version};
 use lance_table::system_index::frag_reuse::{
     FragDigest, FragReuseGroup, FragReuseIndexDetails, FragReuseVersion, is_frag_reuse_index_entry,
 };
@@ -24,10 +23,11 @@ use roaring::{RoaringBitmap, RoaringTreemap};
 
 use crate::Dataset;
 use crate::dataset::index::frag_reuse::{is_index_remap_caught_up, reuse_chain_frag_bitmap};
-use crate::dataset::optimize::{live_source_row_addrs, normalize_source_fragments};
+use crate::dataset::optimize::commit::normalize_source_fragments;
+use crate::dataset::optimize::execution::live_source_row_addrs;
 use crate::dataset::transaction::{Operation, RewriteGroup};
 use crate::index::frag_reuse::load_frag_reuse_index_details;
-use crate::index::load_all_indices;
+use crate::index::loading::load_all_indices;
 
 /// The snapshot a writer read, fixed before any rebase, so a refusal can tell
 /// history the writer saw from history published after it read.
@@ -512,53 +512,6 @@ fn decode_row_addrs(group: &FragReuseGroup) -> Result<RoaringTreemap> {
     })
 }
 
-fn all_source_row_addrs(fragments: &[Fragment]) -> Result<RoaringTreemap> {
-    let mut row_addrs = RoaringTreemap::new();
-    for fragment in fragments {
-        let fragment_id = u32::try_from(fragment.id).map_err(|_| {
-            Error::internal(format!(
-                "fragment {} is outside the row-address range",
-                fragment.id
-            ))
-        })?;
-        let physical_rows = fragment.physical_rows.ok_or_else(|| {
-            Error::internal(format!(
-                "fragment {} is missing physical_rows during fragment reuse validation",
-                fragment.id
-            ))
-        })?;
-        let physical_rows = u64::try_from(physical_rows).map_err(|_| {
-            Error::internal(format!(
-                "fragment {} physical_rows does not fit in a row address",
-                fragment.id
-            ))
-        })?;
-        let start = u64::from(RowAddress::first_row(fragment_id));
-        let end = start.checked_add(physical_rows).ok_or_else(|| {
-            Error::internal(format!(
-                "fragment {} row-address range overflows",
-                fragment.id
-            ))
-        })?;
-        row_addrs.insert_range(start..end);
-    }
-    Ok(row_addrs)
-}
-
-/// A partial compaction relabels an untouched fragment without rewriting its
-/// rows. Its deletion file moves to the new fragment, so every physical address
-/// moved, including addresses masked by that deletion file.
-fn is_metadata_only_relabel(source: &Fragment, destination: &Fragment) -> bool {
-    let mut source = source.clone();
-    source.id = destination.id;
-    if let (Some(source_deletion), Some(destination_deletion)) =
-        (&mut source.deletion_file, &destination.deletion_file)
-    {
-        source_deletion.base_id = destination_deletion.base_id;
-    }
-    source == *destination
-}
-
 /// Whether two versions record the same moves under the same stamp. Groups
 /// cover disjoint fragments, so their order carries no meaning; fragment order
 /// within a group decides where rows land and must match.
@@ -688,14 +641,7 @@ async fn validate_appended_version(
                 ),
             ));
         }
-        let moved_rows = if let ([source], [destination]) =
-            (sources.as_slice(), destinations.as_slice())
-            && is_metadata_only_relabel(source, destination)
-        {
-            all_source_row_addrs(&sources)?
-        } else {
-            live_source_row_addrs(base, &sources).await?
-        };
+        let moved_rows = live_source_row_addrs(base, &sources).await?;
         if decode_row_addrs(recorded)? != moved_rows {
             return Err(mismatch(
                 position,
@@ -771,7 +717,7 @@ fn validate_appended_stamp(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::collections::HashMap;
 
     use arrow_array::cast::AsArray;
@@ -809,7 +755,7 @@ mod tests {
     use crate::session::Session;
     use crate::session::caches::TransactionKey;
     use crate::utils::test::{
-        DatagenExt, FragmentCount, FragmentRowCount, compact_into_two, inline_padding_capacity,
+        DatagenExt, FragmentCount, FragmentRowCount, inline_padding_capacity,
         padding_reuse_versions,
     };
 
@@ -891,7 +837,7 @@ mod tests {
             .clone()
     }
 
-    async fn history(dataset: &Dataset) -> Vec<FragReuseVersion> {
+    pub async fn history(dataset: &Dataset) -> Vec<FragReuseVersion> {
         load_frag_reuse_index_details(dataset, &frag_reuse_entry(dataset).await)
             .await
             .unwrap()
@@ -2266,7 +2212,7 @@ mod tests {
     }
 
     /// Queries through `index_name` answer `filter` as a full scan does.
-    async fn assert_answers_through(dataset: &Dataset, index_name: &str, filter: &str) {
+    pub async fn assert_answers_through(dataset: &Dataset, index_name: &str, filter: &str) {
         let mut answers = Vec::new();
         for use_scalar_index in [false, true] {
             let mut scanner = dataset.scan();
@@ -2711,7 +2657,7 @@ mod tests {
 
     /// Catches `i_idx` up past every recorded compaction by merging its
     /// segments, which moves their coverage onto the current fragments.
-    async fn catch_up_i_idx(dataset: &mut Dataset) {
+    pub async fn catch_up_i_idx(dataset: &mut Dataset) {
         let segments = dataset.load_indices_by_name("i_idx").await.unwrap();
         let merged = dataset
             .merge_existing_index_segments(segments)
@@ -2723,7 +2669,7 @@ mod tests {
             .unwrap();
     }
 
-    async fn create_zone_map(dataset: &mut Dataset) {
+    pub async fn create_zone_map(dataset: &mut Dataset) {
         dataset
             .create_index_builder(
                 &["i"],
@@ -3282,7 +3228,7 @@ mod tests {
             .unwrap()
     }
 
-    fn coverage_of(indices: &[IndexMetadata], name: &str) -> RoaringBitmap {
+    pub fn coverage_of(indices: &[IndexMetadata], name: &str) -> RoaringBitmap {
         indices
             .iter()
             .filter(|index| index.name == name)
@@ -3421,78 +3367,6 @@ mod tests {
             RoaringBitmap::from_iter([compacted])
         );
         assert_answers_through(&latest, "late", "i < 150").await;
-    }
-
-    /// Twelve recorded compactions each rewrite both fragments into two, so
-    /// both outputs come from both inputs. Traced back to the zone map's
-    /// build, each fragment is followed once and the build's two fragments
-    /// come back once each; caught up past every compaction, the zone map
-    /// covers both current fragments and answers through them.
-    #[tokio::test]
-    async fn test_tracing_a_zone_map_follows_each_shared_ancestor_once() {
-        let dir = TempStrDir::default();
-        let mut dataset = gen_batch()
-            .col("i", array::step::<Int32Type>())
-            .into_dataset_with_params(
-                dir.as_str(),
-                FragmentCount::from(2),
-                FragmentRowCount::from(50),
-                Some(WriteParams {
-                    enable_stable_row_ids: true,
-                    max_rows_per_file: 50,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap();
-        create_zone_map(&mut dataset).await;
-        let version = dataset.manifest.version;
-        let built = RoaringBitmap::from_iter([0, 1]);
-        for _ in 0..12 {
-            let current = dataset
-                .manifest
-                .fragments
-                .iter()
-                .map(|fragment| fragment.id)
-                .collect::<Vec<_>>();
-            compact_into_two(&mut dataset, &current).await;
-        }
-        let versions = history(&dataset).await;
-        let named = versions
-            .iter()
-            .flat_map(|reuse| reuse.old_frag_ids().into_iter().chain(reuse.new_frag_ids()))
-            .map(|id| id as u32)
-            .collect::<RoaringBitmap>();
-        assert_eq!((versions.len(), named.len()), (12, 26));
-
-        let current = dataset
-            .manifest
-            .fragments
-            .iter()
-            .map(|fragment| fragment.id as u32)
-            .collect::<RoaringBitmap>();
-        for fragment in current.iter() {
-            let visits = std::cell::Cell::new(0);
-            let mut sources = crate::index::sources_at_build(&versions, version, fragment, |id| {
-                visits.set(visits.get() + 1);
-                built.contains(id)
-            })
-            .unwrap();
-            assert!(
-                visits.get() <= named.len(),
-                "tracing fragment {fragment} took {} visits and returned {} sources",
-                visits.get(),
-                sources.len()
-            );
-            sources.sort_unstable();
-            assert_eq!(sources, [0, 1]);
-        }
-        catch_up_i_idx(&mut dataset).await;
-        assert_eq!(
-            coverage_of(&load_all_indices(&dataset).await.unwrap(), "i_idx"),
-            current
-        );
-        assert_answers_through(&dataset, "i_idx", "i < 50").await;
     }
 
     #[derive(Clone, Copy, Debug)]

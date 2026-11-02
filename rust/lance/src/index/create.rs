@@ -8,18 +8,18 @@ use crate::{
         transaction::{Operation, TransactionBuilder},
     },
     index::{
-        DatasetIndexExt, DatasetIndexInternalExt, IntoIndexSegment,
-        build_index_metadata_from_segments,
+        DatasetIndexExt, IntoIndexSegment,
         frag_reuse_with_stable_row_ids::{
             ensure_index_allowed_with_frag_reuse, ensure_index_kind_allowed_with_frag_reuse,
         },
-        load_all_indices,
+        lifecycle::build_index_metadata_from_segments,
+        loading::{DatasetIndexInternalExt, load_all_indices},
         scalar::{build_bitmap_index_segment, build_scalar_index},
+        vector::details::{vector_index_details, vector_index_details_default},
         vector::{
             LANCE_VECTOR_INDEX, StageParams, VectorIndexParams, build_distributed_vector_index,
             build_empty_vector_index, build_filtered_vector_index, build_vector_index,
         },
-        vector_index_details, vector_index_details_default,
     },
 };
 use futures::{FutureExt, future::BoxFuture};
@@ -1135,7 +1135,7 @@ mod tests {
     mod staged_tagged;
 
     use super::*;
-    use crate::dataset::{WriteMode, WriteParams};
+    use crate::dataset::{ColumnAlteration, WriteMode, WriteParams};
     use crate::index::{DatasetIndexExt, IndexSegment};
     use crate::utils::test::covering;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
@@ -1564,6 +1564,118 @@ mod tests {
 
         let latest_indices = reader1.load_indices_by_name("a_idx").await.unwrap();
         assert_eq!(latest_indices.len(), 1);
+    }
+
+    #[rstest]
+    #[case::drop_indexed("drop", "value", true)]
+    #[case::drop_unrelated("drop", "other", false)]
+    #[case::cast_indexed("cast", "value", true)]
+    #[case::cast_unrelated("cast", "other", false)]
+    #[case::rename_indexed("rename", "value", false)]
+    #[tokio::test]
+    async fn test_create_index_after_concurrent_schema_change(
+        #[case] change: &str,
+        #[case] column: &str,
+        #[case] expect_conflict: bool,
+    ) {
+        let batch = arrow_array::record_batch!(
+            ("id", Int32, [1, 2, 3]),
+            ("value", Int32, [Some(10), None, Some(20)]),
+            ("other", Int32, [Some(100), None, Some(200)])
+        )
+        .unwrap();
+        let reader =
+            RecordBatchIterator::new([Ok(batch.clone()), Ok(batch.clone())], batch.schema());
+        let mut writer = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(writer.get_fragments().len(), 2);
+        let mut concurrent = writer.clone();
+        if change == "drop" {
+            concurrent.drop_columns(&[column]).await.unwrap();
+        } else {
+            let alteration = ColumnAlteration::new(column.to_string());
+            let alteration = match change {
+                "cast" => alteration.cast_to(DataType::Int64),
+                "rename" => alteration.rename("renamed".to_string()),
+                _ => panic!("unknown schema change: {change}"),
+            };
+            concurrent.alter_columns(&[alteration]).await.unwrap();
+        }
+        let schema_version = concurrent.manifest.version;
+        let expected = concurrent
+            .scan()
+            .filter("id = 1")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Bitmap);
+        let result = CreateIndexBuilder::new(&mut writer, &["value"], IndexType::Bitmap, &params)
+            .name("value_idx".to_string())
+            .execute()
+            .await;
+        if expect_conflict {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "{error}"
+            );
+            let operation = if change == "drop" { "Project" } else { "Merge" };
+            assert!(
+                error.to_string().contains(&format!(
+                    "CreateIndex transaction was preempted by concurrent transaction {operation}"
+                )),
+                "{error}"
+            );
+        } else {
+            result.unwrap();
+        }
+
+        concurrent.checkout_latest().await.unwrap();
+        assert_eq!(
+            concurrent.manifest.version,
+            schema_version + u64::from(!expect_conflict)
+        );
+        let indices = concurrent.load_indices_by_name("value_idx").await.unwrap();
+        assert_eq!(indices.len(), usize::from(!expect_conflict));
+        let actual = concurrent
+            .scan()
+            .filter("id = 1")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.num_rows(), 2);
+        if !expect_conflict {
+            let indexed_column = if change == "rename" {
+                "renamed"
+            } else {
+                "value"
+            };
+            let filter = format!("{indexed_column} = 10 OR {indexed_column} IS NULL");
+            let indexed = concurrent
+                .scan()
+                .filter(&filter)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let mut scanner = concurrent.scan();
+            scanner.use_scalar_index(false);
+            scanner.filter(&filter).unwrap();
+            assert_eq!(indexed, scanner.try_into_batch().await.unwrap());
+            assert_eq!(indexed.num_rows(), 4);
+        }
     }
 
     #[tokio::test]
@@ -2749,7 +2861,7 @@ mod tests {
                 .indices_dir()
                 .clone()
                 .join(segment.uuid.to_string())
-                .join(crate::index::INDEX_FILE_NAME);
+                .join(lance_index::INDEX_FILE_NAME);
             assert!(
                 dataset
                     .object_store
@@ -3544,14 +3656,13 @@ mod tests {
     /// surviving half made the coverage look healthy.
     #[tokio::test]
     async fn test_merge_uncommitted_segments_partly_retired_by_compaction() {
-        // One fragment at the compaction target followed by two undersized
-        // fragments. Rewriting the trailing pair leaves the first fragment's
-        // staged coverage live without relabeling it.
+        // Two undersized fragments and one already at the compaction target, so
+        // compaction rewrites the pair and leaves the third alone.
         let reader = gen_batch()
             .col("id", lance_datagen::array::step::<Int32Type>())
             .into_reader_rows(
-                lance_datagen::RowCount::from(4),
-                lance_datagen::BatchCount::from(1),
+                lance_datagen::RowCount::from(2),
+                lance_datagen::BatchCount::from(2),
             );
         let test_dir = tempfile::tempdir().unwrap();
         let dataset_uri = test_dir.path().to_str().unwrap();
@@ -3559,7 +3670,7 @@ mod tests {
             reader,
             dataset_uri,
             Some(WriteParams {
-                max_rows_per_file: 4,
+                max_rows_per_file: 2,
                 enable_stable_row_ids: false,
                 ..Default::default()
             }),
@@ -3569,15 +3680,15 @@ mod tests {
         let reader = gen_batch()
             .col("id", lance_datagen::array::step::<Int32Type>())
             .into_reader_rows(
-                lance_datagen::RowCount::from(2),
-                lance_datagen::BatchCount::from(2),
+                lance_datagen::RowCount::from(4),
+                lance_datagen::BatchCount::from(1),
             );
         let mut dataset = Dataset::write(
             reader,
             dataset_uri,
             Some(WriteParams {
                 mode: WriteMode::Append,
-                max_rows_per_file: 2,
+                max_rows_per_file: 4,
                 enable_stable_row_ids: false,
                 ..Default::default()
             }),
@@ -3609,8 +3720,8 @@ mod tests {
             )
             .await
             .unwrap();
-        // Two trailing two-row fragments compact while the leading four-row
-        // fragment keeps its identity.
+        // Two rows per fragment against a four-row target pairs some fragments
+        // and leaves at least one alone.
         crate::dataset::optimize::compact_files(
             &mut dataset,
             crate::dataset::optimize::CompactionOptions {
@@ -4293,10 +4404,10 @@ mod tests {
         );
         assert_eq!(count_in_range(&dataset, &merged, 50, 100).await, 50);
 
-        // Phase 2 — delete >10% of fragment 0's rows so compaction rewrites its
-        // data. Preserving row order in the ID-sorted manifest also relabels the
-        // untouched trailing fragment, so both committed segments must follow
-        // their stable row-id coverage to fresh fragment IDs.
+        // Phase 2 — retire fragment 0: delete >10% of its rows so compaction
+        // rewrites only frag 0 (frag 1 has no deletions and is at target size).
+        // The committed per-fragment segment now claims a fragment the dataset
+        // no longer has.
         dataset.delete("id < 16").await.unwrap();
         crate::dataset::optimize::compact_files(
             &mut dataset,
@@ -4315,15 +4426,16 @@ mod tests {
             .collect();
         assert!(!live_frags.contains(0), "compaction should retire frag 0");
 
-        // Filtered merge: coverage follows the current fragments, and the
-        // merged page data does not leak the retired row ids (ids < 16 lived
-        // only in frag 0, so the range now returns nothing).
+        // Filtered merge: coverage drops the retired fragment but keeps the
+        // live one, and the merged page data does not leak the retired row ids
+        // (ids < 16 lived only in frag 0, so the range now returns nothing).
         let merged = dataset
             .merge_existing_index_segments(dataset.load_indices_by_name("id_btree").await.unwrap())
             .await
             .unwrap();
         let coverage = merged.fragment_bitmap.as_ref().unwrap();
-        assert_eq!(coverage, &live_frags);
+        assert!(!coverage.contains(0), "must drop retired frag 0");
+        assert!(coverage.contains(1), "must keep live frag 1");
         assert_eq!(
             count_in_range(&dataset, &merged, 0, 16).await,
             0,

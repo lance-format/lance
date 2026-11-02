@@ -1101,6 +1101,257 @@ async fn a_stale_first_submission_activates_at_the_landing_mark() {
     }
 }
 
+/// A key that was already absent when the writer read the table is history,
+/// not a changed dependency: a list that retains such a definition, allocates
+/// another and removes an unreferenced one still lands.
+#[tokio::test]
+async fn a_historical_absence_is_not_a_changed_dependency() {
+    let dir = TempStrDir::default();
+    let read = with_region_column(write_named_column(&dir, "a", WriteMode::Create).await).await;
+    let key_id = read.schema().field("region").unwrap().id;
+    let a_id = read.schema().field("a").unwrap().id;
+    let on_region = ClusteringDefinition {
+        columns: vec![key_id],
+        ..definition(1)
+    };
+    let stale = ClusteringDefinition {
+        columns: vec![key_id],
+        ..definition(2)
+    };
+    let read = commit(
+        &read,
+        submission(
+            read.manifest().version,
+            vec![on_region.clone(), stale.clone()],
+            vec![],
+        ),
+    )
+    .await
+    .unwrap();
+    let mut read = read;
+    read.drop_columns(&["region"]).await.unwrap();
+    assert!(read.schema().field_by_id(key_id).is_none());
+
+    let on_a = ClusteringDefinition {
+        columns: vec![a_id],
+        ..definition(3)
+    };
+    let landed = commit(
+        &read,
+        submission(
+            read.manifest().version,
+            vec![on_region.clone(), on_a.clone()],
+            vec![],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(landed.manifest().clustering, vec![on_region, on_a]);
+    assert_eq!(landed.manifest().max_clustering_id, 3);
+}
+
+/// The first-allocation fence judges the concurrent transaction, not the final
+/// shape: a Merge that only adds fields (a new column, a new struct column
+/// with its children) is compatible and the allocation rebases over it, while a Merge
+/// that renames a field the writer read is refused, since on a table with
+/// reusable field ids it may have moved a key's id.
+#[tokio::test]
+async fn a_first_allocation_rebases_over_an_additive_merge_but_not_a_rename() {
+    // Additive: a new top-level column and a new struct column with children.
+    let dir = TempStrDir::default();
+    let read = with_region_column(write_named_column(&dir, "a", WriteMode::Create).await).await;
+    let mut b = read.clone();
+    b.add_columns(
+        NewColumnTransform::SqlExpressions(vec![
+            ("price".to_string(), "a * 2".to_string()),
+            (
+                "info".to_string(),
+                "named_struct('zip', a, 'note', a)".to_string(),
+            ),
+        ]),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let key_id = read.schema().field("region").unwrap().id;
+    let landed = commit(
+        &read,
+        submission(
+            read.manifest().version,
+            vec![ClusteringDefinition {
+                columns: vec![key_id],
+                ..definition(1)
+            }],
+            vec![],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&landed), vec![1]);
+    assert!(landed.schema().field("price").is_some());
+    assert!(landed.schema().field("info").is_some());
+
+    // A rename through a Merge in the window is refused: the renamed field is
+    // one the writer read, and on this table its id could have moved.
+    let dir = TempStrDir::default();
+    let read = with_region_column(write_named_column(&dir, "a", WriteMode::Create).await).await;
+    let mut b = Dataset::open(&dir).await.unwrap();
+    b.alter_columns(&[crate::dataset::ColumnAlteration::new("a".into()).rename("b".into())])
+        .await
+        .unwrap();
+    let key_id = read.schema().field("region").unwrap().id;
+    let error = commit(
+        &read,
+        submission(
+            read.manifest().version,
+            vec![ClusteringDefinition {
+                columns: vec![key_id],
+                ..definition(1)
+            }],
+            vec![],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("may have given one of those ids to another column"),
+        "{error}"
+    );
+}
+
+/// A submission depends on the key fields of the definitions it allocates,
+/// not on every retained definition's. An unchanged list with unrelated
+/// metadata lands over another writer's rename, retype or drop of a retained
+/// key. A submission allocating two more definitions, the lower one keyed on
+/// that field, lands over the rename and is refused as a whole over the
+/// retype or drop; planned again from the landing snapshot, it lands.
+#[rstest]
+#[case::rename("rename")]
+#[case::cast("cast")]
+#[case::drop("drop")]
+#[tokio::test]
+async fn a_retained_keys_change_blocks_only_a_new_allocation_on_it(#[case] change: &'static str) {
+    let dir = TempStrDir::default();
+    let read = with_region_column(write_named_column(&dir, "a", WriteMode::Create).await).await;
+    let key_id = read.schema().field("region").unwrap().id;
+    let a_id = read.schema().field("a").unwrap().id;
+    let configured = ClusteringDefinition {
+        columns: vec![key_id],
+        ..definition(1)
+    };
+    let read = commit(
+        &read,
+        submission(read.manifest().version, vec![configured.clone()], vec![]),
+    )
+    .await
+    .unwrap();
+    let planned_at = read.manifest().version;
+    let mut b = Dataset::open(&dir).await.unwrap();
+    match change {
+        "drop" => b.drop_columns(&["region"]).await.unwrap(),
+        "rename" => b
+            .alter_columns(&[
+                crate::dataset::ColumnAlteration::new("region".into()).rename("zone".into())
+            ])
+            .await
+            .unwrap(),
+        _ => b
+            .alter_columns(&[crate::dataset::ColumnAlteration::new("region".into())
+                .cast_to(arrow_schema::DataType::Int64)])
+            .await
+            .unwrap(),
+    }
+    // Unrelated to the retained definition: lands over any of the changes.
+    let note = ("org.example.note".to_string(), Some("x".to_string()));
+    let landed = commit(
+        &read,
+        submission(planned_at, vec![configured.clone()], vec![note.clone()]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(landed.manifest().clustering, vec![configured.clone()]);
+    assert_eq!(
+        landed.manifest().table_metadata["org.example.note"],
+        "x",
+        "{change}: the unrelated submission landed"
+    );
+
+    // Allocating on the changed key (definition 2) and on an untouched one
+    // (definition 3) at once: a rename keeps the key, a retype or a drop
+    // refuses the submission for definition 2 and nothing of it lands.
+    let on_region = ClusteringDefinition {
+        columns: vec![key_id],
+        ..definition(2)
+    };
+    let on_a = ClusteringDefinition {
+        columns: vec![a_id],
+        ..definition(3)
+    };
+    let spec = ("org.example.spec.2".to_string(), Some("{}".to_string()));
+    let result = commit(
+        &read,
+        submission(
+            planned_at,
+            vec![configured.clone(), on_region.clone(), on_a.clone()],
+            vec![spec.clone()],
+        ),
+    )
+    .await;
+    let reopened = Dataset::open(&dir).await.unwrap();
+    if change == "rename" {
+        let landed = result.unwrap();
+        assert_eq!(ids(&landed), vec![1, 2, 3]);
+        assert_eq!(
+            reopened.manifest().table_metadata["org.example.spec.2"],
+            "{}"
+        );
+    } else {
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, crate::Error::CommitConflict { .. }),
+            "{change}: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("definition 2 is keyed on field id {key_id}")),
+            "{change}: {error}"
+        );
+        assert_eq!(ids(&reopened), vec![1], "{change}: no allocation landed");
+        assert!(
+            !reopened
+                .manifest()
+                .table_metadata
+                .contains_key("org.example.spec.2"),
+            "{change}: the refused submission landed nothing"
+        );
+        // Planned again from the landing snapshot, with the key as it is
+        // now (or without it, once dropped), it lands; ids continue the mark.
+        let mut replanned = vec![configured.clone()];
+        if let Some(region) = reopened.schema().field("region") {
+            replanned.push(ClusteringDefinition {
+                columns: vec![region.id],
+                ..definition(2)
+            });
+        }
+        replanned.push(ClusteringDefinition {
+            columns: vec![a_id],
+            ..definition(replanned.len() as u32 + 1)
+        });
+        let landed = commit(
+            &reopened,
+            submission(reopened.manifest().version, replanned.clone(), vec![spec]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(landed.manifest().clustering, replanned);
+        assert_eq!(landed.manifest().table_metadata["org.example.spec.2"], "{}");
+    }
+}
+
 /// Writer A resolves its key field in a reusable-id snapshot; before A lands,
 /// writer B replaces the schema in a way that can hand A's key id to another
 /// column: an overwrite, a drop followed by an add, the same with the original
@@ -1196,7 +1447,8 @@ async fn a_stale_allocation_cannot_cross_a_field_identity_change(#[case] race: &
     );
 
     // Under the contract from the start, the same race leaves A's key without
-    // a field; nothing in the window can give its id to another column.
+    // a field; nothing in the window can give its id to another column, and
+    // the vanished key is still a changed dependency, not bad input.
     if matches!(race, "overwrite" | "drop_add") {
         let dir = TempStrDir::default();
         let mut read =
@@ -1213,8 +1465,9 @@ async fn a_stale_allocation_cannot_cross_a_field_identity_change(#[case] race: &
             .await
             .unwrap_err();
         assert!(
-            error.to_string().contains("not in the schema"),
-            "{race}: {error}"
+            matches!(error, crate::Error::CommitConflict { .. })
+                && error.to_string().contains("no longer exists"),
+            "{race}: {error:?}"
         );
     }
 }

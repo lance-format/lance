@@ -2,6 +2,8 @@ site_name: Lance
 site_description: "Documentation for Lance, an open lakehouse format for Multimodal AI"
 site_url: https://lance.org/
 docs_dir: src
+exclude_docs: |
+  AGENTS.md
 
 repo_name: lance-format/lance
 repo_url: https://github.com/lance-format/lance

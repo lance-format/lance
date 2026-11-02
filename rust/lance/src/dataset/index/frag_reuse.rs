@@ -6,13 +6,13 @@ use std::sync::Arc;
 
 use crate::Dataset;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
-use crate::index::DatasetIndexInternalExt;
 use crate::index::frag_reuse::{
     build_frag_reuse_index_metadata, build_tagged_frag_reuse_entry,
     decode_frag_reuse_ledger_from_content, load_frag_reuse_index_details,
     load_raw_frag_reuse_content,
 };
 use crate::index::frag_reuse_with_stable_row_ids::history::trimmable_versions;
+use crate::index::loading::DatasetIndexInternalExt;
 use lance_core::{Error, Result};
 use lance_index::frag_reuse::{
     CompactFragReuseIndex, FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails, FragReuseVersion,
@@ -473,7 +473,7 @@ pub(crate) async fn derive_superseded_segments(
             // version) is opaque: its translated coverage is invisible, so it
             // is never pruned, and it must not mask anyone -- the reader will
             // not answer queries from it, so its bitmap covers nothing.
-            if !crate::index::index_is_usable(segment) {
+            if !crate::index::segment::index_is_usable(segment) {
                 kept_any = true;
                 continue;
             }
@@ -755,7 +755,7 @@ fn compute_tagged_retention(elements: &[TrimElement], indices: &[IndexMetadata])
         match &index.fragment_bitmap {
             Some(bitmap) => {
                 group.provenance |= bitmap;
-                if crate::index::index_is_usable(index) {
+                if crate::index::segment::index_is_usable(index) {
                     group.direct |= bitmap;
                 }
             }
@@ -1577,7 +1577,7 @@ mod tests {
         }
 
         async fn fri_entry(dataset: &Dataset) -> Option<IndexMetadata> {
-            crate::index::load_all_indices(dataset)
+            crate::index::loading::load_all_indices(dataset)
                 .await
                 .unwrap()
                 .iter()
@@ -2562,7 +2562,7 @@ mod tests {
             assert_eq!(records.legacy_versions.len(), 1);
             assert!(records.transitions.is_empty());
             let legacy_version = records.legacy_versions[0].dataset_version;
-            let listed = crate::index::load_all_indices(&dataset)
+            let listed = crate::index::loading::load_all_indices(&dataset)
                 .await
                 .unwrap()
                 .iter()
@@ -2719,7 +2719,7 @@ mod tests {
             RowAddress::from(before[&1250]).fragment_id(),
             RowAddress::from(before[&2250]).fragment_id(),
         ];
-        let trailing_addr = before[&5000];
+        let untouched_addr = before[&5000];
         // Offset 0 of the first rewritten fragment is i=1000, deleted above.
         let deleted_addr = u64::from(RowAddress::new_from_parts(rewritten_frags[0], 0));
 
@@ -2771,13 +2771,11 @@ mod tests {
         }
         assert_eq!(remap.get(deleted_addr), Some(None));
         assert_eq!(frag_reuse_index.remap_row_id(deleted_addr), None);
-        // The trailing fragment keeps its data but receives a new ID so the
-        // ID-sorted manifest preserves row order after the earlier rewrites.
-        assert_ne!(after[&5000], trailing_addr);
-        assert_eq!(remap.get(trailing_addr), Some(Some(after[&5000])));
+        assert_eq!(remap.get(untouched_addr), None);
+        assert_eq!(after[&5000], untouched_addr);
         assert_eq!(
-            frag_reuse_index.remap_row_id(trailing_addr),
-            Some(after[&5000])
+            frag_reuse_index.remap_row_id(untouched_addr),
+            Some(untouched_addr)
         );
 
         let pre_compaction = dataset

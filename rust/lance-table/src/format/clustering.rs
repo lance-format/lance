@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use lance_core::datatypes::Schema;
+use lance_core::datatypes::{Field, Schema};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 
@@ -333,44 +333,146 @@ pub fn apply_complete_clustering_definitions(
     Ok(())
 }
 
-/// Refuse to allocate a definition whose key fields are not the fields the
-/// writer planned against.
+/// Whether field `id` is the same field in `read` and `landing`: present in
+/// both, with the same id, name and logical type at every level from the
+/// root down to the field, and the same shape below it (every descendant's
+/// id, name and logical type, in order). A renamed ancestor changes the
+/// column a key names; a composite key's retyped, renamed, added or removed
+/// child changes the value it holds; metadata and nullability edits anywhere
+/// change neither.
+pub fn same_field_identity(read: &Schema, landing: &Schema, id: i32) -> bool {
+    match (
+        read.field_ancestry_by_id(id),
+        landing.field_ancestry_by_id(id),
+    ) {
+        (Some(planned), Some(landed)) => {
+            planned.len() == landed.len()
+                && planned
+                    .iter()
+                    .zip(&landed)
+                    .all(|(p, l)| same_field_shallow(p, l))
+                && same_subtree(planned[planned.len() - 1], landed[landed.len() - 1])
+        }
+        _ => false,
+    }
+}
+
+fn same_field_shallow(planned: &Field, landed: &Field) -> bool {
+    planned.id == landed.id
+        && planned.name == landed.name
+        && planned.logical_type == landed.logical_type
+}
+
+fn same_subtree(planned: &Field, landed: &Field) -> bool {
+    planned.children.len() == landed.children.len()
+        && planned
+            .children
+            .iter()
+            .zip(&landed.children)
+            .all(|(p, l)| same_field_shallow(p, l) && same_subtree(p, l))
+}
+
+/// Whether field `id` still holds the same values in `landing` as in `read`:
+/// present in both with the same id and logical type at every level from the
+/// root down to the field, and the same shape below it (every descendant's id
+/// and logical type, in order). Names are not part of this: a column keeps
+/// its field id across a rename, so a renamed key, or a renamed ancestor or
+/// child, is the same key. A logical type carries a timestamp's unit and
+/// timezone, so those changes are type changes. Metadata and nullability
+/// edits change nothing.
+pub fn same_field_type_identity(read: &Schema, landing: &Schema, id: i32) -> bool {
+    match (
+        read.field_ancestry_by_id(id),
+        landing.field_ancestry_by_id(id),
+    ) {
+        (Some(planned), Some(landed)) => {
+            planned.len() == landed.len()
+                && planned
+                    .iter()
+                    .zip(&landed)
+                    .all(|(p, l)| same_field_type(p, l))
+                && same_typed_subtree(planned[planned.len() - 1], landed[landed.len() - 1])
+        }
+        _ => false,
+    }
+}
+
+fn same_field_type(planned: &Field, landed: &Field) -> bool {
+    planned.id == landed.id && planned.logical_type == landed.logical_type
+}
+
+fn same_typed_subtree(planned: &Field, landed: &Field) -> bool {
+    planned.children.len() == landed.children.len()
+        && planned
+            .children
+            .iter()
+            .zip(&landed.children)
+            .all(|(p, l)| same_field_type(p, l) && same_typed_subtree(p, l))
+}
+
+/// Refuse a submission whose key fields are no longer the fields it was
+/// planned against.
 ///
 /// A definition keys on field ids. The writer resolved its key columns in the
-/// snapshot it read; a rebased attempt lands on a later schema, and on a table
-/// with reusable field ids an id may by then name another column (a dropped
-/// key replaced by a new column, or an overwrite that numbered a new schema
-/// from zero). Allocating would freeze that binding, so each key field of a
-/// new definition must be the same field in both schemas: same name, same
-/// parent, same type. A field the landing schema lacks is left to the
-/// allocation's own schema check. Only definitions new to `manifest` are
-/// checked, so a retained list costs nothing here.
+/// snapshot it read; a rebased attempt lands on a later schema, where a key
+/// may have been dropped, cast under a new id, or retyped under the same id.
+/// Whatever the submission publishes about a definition (its allocation, or
+/// a spec derived from its key values) was planned against the keys as read,
+/// so for every definition the submission depends on, each key must still be
+/// the same typed field in the landing schema, by id. A rename keeps the key:
+/// names are not part of a field's identity here. A key the writer's own
+/// snapshot already lacked is history, not a change.
+///
+/// The submission depends on the definitions it allocates: every definition
+/// in `desired` whose id lies above `read_max_clustering_id`, the allocation
+/// mark of the manifest the writer read, is checked, whether or not it is the
+/// highest. The mark, not the largest definition still present, decides: ids
+/// are never reused, so a removed definition's id stays below it. A retained
+/// definition is not a prerequisite, so an unrelated schema edit to one of
+/// its keys does not stop a submission that keeps it. Allocation, removal and
+/// identity races on the list itself, including an id at or below the mark
+/// that the read list did not hold, are checked separately when the list is
+/// applied.
 pub fn refuse_key_fields_that_changed_identity(
     read_schema: &Schema,
     landing: &Manifest,
     desired: &[ClusteringDefinition],
+    read_max_clustering_id: u32,
     commit_version: u64,
 ) -> Result<()> {
-    let current_ids: HashSet<u32> = landing.clustering.iter().map(|c| c.id).collect();
-    for definition in desired.iter().filter(|d| !current_ids.contains(&d.id)) {
+    let path = |schema: &Schema, id: i32| {
+        schema
+            .field_path(id)
+            .unwrap_or_else(|_| format!("field id {id}"))
+    };
+    for definition in desired.iter().filter(|d| d.id > read_max_clustering_id) {
         for column in &definition.columns {
-            let (Some(planned), Some(landed)) = (
-                read_schema.field_by_id(*column),
-                landing.schema.field_by_id(*column),
-            ) else {
+            if read_schema.field_by_id(*column).is_none() {
                 continue;
-            };
-            if planned.name != landed.name
-                || planned.parent_id != landed.parent_id
-                || planned.data_type() != landed.data_type()
-            {
+            }
+            if landing.schema.field_by_id(*column).is_none() {
                 return Err(Error::commit_conflict_source(
                     commit_version,
                     format!(
                         "clustering definition {} is keyed on field id {column}, which named {:?} \
-                         when the writer read the table and names {:?} now; reload the manifest \
-                         and rebuild the list",
-                        definition.id, planned.name, landed.name
+                         when the writer read the table and no longer exists; reload the \
+                         manifest and rebuild the list",
+                        definition.id,
+                        path(read_schema, *column)
+                    )
+                    .into(),
+                ));
+            }
+            if !same_field_type_identity(read_schema, &landing.schema, *column) {
+                return Err(Error::commit_conflict_source(
+                    commit_version,
+                    format!(
+                        "clustering definition {} is keyed on field id {column}, which named {:?} \
+                         when the writer read the table and has changed type or shape since \
+                         (now {:?}); reload the manifest and rebuild the list",
+                        definition.id,
+                        path(read_schema, *column),
+                        path(&landing.schema, *column)
                     )
                     .into(),
                 ));
@@ -848,11 +950,13 @@ mod tests {
         );
     }
 
-    /// A rebased allocation is refused when its key field id names a
-    /// different column than the writer read; a same-identity field, a field
-    /// the landing schema lacks, and a retained definition are all left alone.
+    /// An allocated definition's key must still be the same typed field in
+    /// the landing schema: a retype or a drop refuses the submission, a
+    /// rename does not, and a key the writer's snapshot never had is history.
+    /// Every definition above the read allocation mark is checked, none of
+    /// the retained ones.
     #[test]
-    fn a_key_field_that_changed_identity_refuses_the_allocation() {
+    fn an_allocated_keys_type_change_refuses_the_submission_and_a_rename_does_not() {
         let schema_of = |name: &str, data_type: arrow_schema::DataType| {
             lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
                 arrow_schema::Field::new(name, data_type, false),
@@ -861,33 +965,109 @@ mod tests {
         };
         let read = schema_of("region", arrow_schema::DataType::Int32);
         let mut landing = manifest_with(vec![], 0);
+        let refuse = |landing: &Manifest, read_max_clustering_id: u32| {
+            refuse_key_fields_that_changed_identity(
+                &read,
+                landing,
+                &[definition(1)],
+                read_max_clustering_id,
+                3,
+            )
+        };
+
+        // A new allocation: renamed key accepted, retyped key refused.
         landing.schema = schema_of("user_id", arrow_schema::DataType::Int32);
-        let error = refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3)
-            .unwrap_err();
+        refuse(&landing, 0).unwrap();
+        landing.schema = schema_of("region", arrow_schema::DataType::Int64);
+        let error = refuse(&landing, 0).unwrap_err();
         assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
         assert!(
-            error.to_string().contains("named \"region\"")
-                && error.to_string().contains("names \"user_id\""),
+            error.to_string().contains("field id 0")
+                && error.to_string().contains("changed type or shape"),
             "{error}"
         );
-
-        landing.schema = schema_of("region", arrow_schema::DataType::Int64);
-        let error = refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3)
-            .unwrap_err();
-        assert!(error.to_string().contains("field id 0"), "{error}");
-
         landing.schema = schema_of("region", arrow_schema::DataType::Int32);
-        refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3).unwrap();
+        refuse(&landing, 0).unwrap();
 
-        // A retained definition is not re-checked, whatever the field became.
-        landing.schema = schema_of("user_id", arrow_schema::DataType::Int32);
+        // A timestamp's unit and timezone are part of its type.
+        let ts = |unit, tz: Option<&str>| {
+            schema_of(
+                "region",
+                arrow_schema::DataType::Timestamp(unit, tz.map(Into::into)),
+            )
+        };
+        let read_ts = ts(arrow_schema::TimeUnit::Microsecond, Some("UTC"));
+        for (what, changed) in [
+            ("unit", ts(arrow_schema::TimeUnit::Millisecond, Some("UTC"))),
+            (
+                "timezone",
+                ts(arrow_schema::TimeUnit::Microsecond, Some("+08:00")),
+            ),
+            ("no timezone", ts(arrow_schema::TimeUnit::Microsecond, None)),
+        ] {
+            landing.schema = changed;
+            let error =
+                refuse_key_fields_that_changed_identity(&read_ts, &landing, &[definition(1)], 0, 3)
+                    .unwrap_err();
+            assert!(
+                matches!(error, Error::CommitConflict { .. }),
+                "{what}: {error:?}"
+            );
+        }
+        landing.schema = ts(arrow_schema::TimeUnit::Microsecond, Some("UTC"));
+        refuse_key_fields_that_changed_identity(&read_ts, &landing, &[definition(1)], 0, 3)
+            .unwrap();
+
+        // A retained definition is not a prerequisite: its key may be renamed
+        // or retyped underneath a submission that keeps it.
         landing.clustering = vec![definition(1)];
         landing.max_clustering_id = 1;
-        refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3).unwrap();
+        landing.schema = schema_of("user_id", arrow_schema::DataType::Int32);
+        refuse(&landing, 1).unwrap();
+        landing.schema = schema_of("region", arrow_schema::DataType::Int64);
+        refuse(&landing, 1).unwrap();
 
-        // A key the landing schema lacks is the allocation check's business.
-        landing.clustering = vec![];
-        landing.max_clustering_id = 0;
+        // Every definition above the read mark is checked, not only the
+        // highest: with field 0 retyped, allocating 2 (on field 0) and 3 (on
+        // field 1) is refused for definition 2. Above a mark that already
+        // covers both, neither is this submission's dependency.
+        let two_fields = |region: arrow_schema::DataType| {
+            lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("region", region, false),
+                arrow_schema::Field::new("amount", arrow_schema::DataType::Int32, false),
+            ]))
+            .unwrap()
+        };
+        let read_two = two_fields(arrow_schema::DataType::Int32);
+        landing.schema = two_fields(arrow_schema::DataType::Int64);
+        let on_amount = ClusteringDefinition {
+            columns: vec![1],
+            ..definition(3)
+        };
+        let three = [definition(1), definition(2), on_amount];
+        let error =
+            refuse_key_fields_that_changed_identity(&read_two, &landing, &three, 1, 3).unwrap_err();
+        assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("definition 2 is keyed on field id 0"),
+            "{error}"
+        );
+        refuse_key_fields_that_changed_identity(&read_two, &landing, &three, 3, 3).unwrap();
+        // The mark decides, not the largest definition still present: with
+        // definitions 2..5 removed since, a reused id 4 is not an allocation
+        // here (the list application refuses it), while 6 is.
+        let reused = [definition(1), definition(4)];
+        refuse_key_fields_that_changed_identity(&read_two, &landing, &reused, 5, 3).unwrap();
+        let fresh = [definition(1), definition(6)];
+        let error =
+            refuse_key_fields_that_changed_identity(&read_two, &landing, &fresh, 5, 3).unwrap_err();
+        assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
+
+        // A key the landing schema no longer has (dropped, or cast under a
+        // new id) refuses an allocation on it, not a retained definition; a
+        // key the writer's own snapshot already lacked is history.
         landing.schema = lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
             arrow_schema::Field::new("x", arrow_schema::DataType::Int32, false),
         ]))
@@ -895,7 +1075,122 @@ mod tests {
         for field in landing.schema.fields.iter_mut() {
             field.id = 9;
         }
-        refuse_key_fields_that_changed_identity(&read, &landing, &[definition(1)], 3).unwrap();
+        refuse(&landing, 1).unwrap();
+        landing.clustering = vec![];
+        landing.max_clustering_id = 0;
+        let error = refuse(&landing, 0).unwrap_err();
+        assert!(error.to_string().contains("no longer exists"), "{error}");
+        let mut never_had_it = schema_of("other", arrow_schema::DataType::Int32);
+        for field in never_had_it.fields.iter_mut() {
+            field.id = 9;
+        }
+        refuse_key_fields_that_changed_identity(&never_had_it, &landing, &[definition(1)], 0, 3)
+            .unwrap();
+    }
+
+    /// A nested key is identified by its path of ids and types and, for a
+    /// composite key, its whole typed subtree: renaming its parent struct or
+    /// a child keeps the key, a retyped, added or removed child changes its
+    /// value, and metadata on a sibling child changes nothing.
+    #[test]
+    fn a_nested_keys_identity_is_its_typed_path_and_subtree() {
+        let nested = |parent: &str, sibling_metadata: Option<(&str, &str)>| {
+            let mut sibling = arrow_schema::Field::new("zip", arrow_schema::DataType::Int32, true);
+            if let Some((k, v)) = sibling_metadata {
+                sibling = sibling.with_metadata([(k.to_string(), v.to_string())].into());
+            }
+            lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new(
+                    parent,
+                    arrow_schema::DataType::Struct(
+                        vec![
+                            arrow_schema::Field::new("region", arrow_schema::DataType::Utf8, true),
+                            sibling,
+                        ]
+                        .into(),
+                    ),
+                    true,
+                ),
+            ]))
+            .unwrap()
+        };
+        let read = nested("info", None);
+        let key_id = read.field("info.region").unwrap().id;
+        let keyed = ClusteringDefinition {
+            columns: vec![key_id],
+            ..definition(1)
+        };
+        let mut landing = manifest_with(vec![], 0);
+        let check = |landing: &Manifest, definition: &ClusteringDefinition| {
+            refuse_key_fields_that_changed_identity(
+                &read,
+                landing,
+                std::slice::from_ref(definition),
+                0,
+                3,
+            )
+        };
+        // The parent renamed: same ids and types all the way down.
+        landing.schema = nested("meta", None);
+        check(&landing, &keyed).unwrap();
+        landing.schema = nested("info", Some(("note", "x")));
+        check(&landing, &keyed).unwrap();
+
+        let struct_id = read.field("info").unwrap().id;
+        let on_struct = ClusteringDefinition {
+            columns: vec![struct_id],
+            ..definition(1)
+        };
+        let with_children = |children: Vec<arrow_schema::Field>| {
+            lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new(
+                    "info",
+                    arrow_schema::DataType::Struct(children.into()),
+                    true,
+                ),
+            ]))
+            .unwrap()
+        };
+        let region = |dt: arrow_schema::DataType| arrow_schema::Field::new("region", dt, true);
+        let zip = arrow_schema::Field::new("zip", arrow_schema::DataType::Int32, true);
+        landing.schema = with_children(vec![region(arrow_schema::DataType::Utf8), zip.clone()]);
+        check(&landing, &on_struct).unwrap();
+        // A renamed child keeps the struct's value.
+        landing.schema = with_children(vec![
+            arrow_schema::Field::new("area", arrow_schema::DataType::Utf8, true),
+            zip.clone(),
+        ]);
+        check(&landing, &on_struct).unwrap();
+        check(&landing, &keyed).unwrap();
+        for (what, changed) in [
+            (
+                "retyped child",
+                with_children(vec![region(arrow_schema::DataType::Int64), zip.clone()]),
+            ),
+            (
+                "removed child",
+                with_children(vec![region(arrow_schema::DataType::Utf8)]),
+            ),
+            (
+                "added child",
+                with_children(vec![
+                    region(arrow_schema::DataType::Utf8),
+                    zip,
+                    arrow_schema::Field::new("extra", arrow_schema::DataType::Int32, true),
+                ]),
+            ),
+        ] {
+            landing.schema = changed;
+            let error = check(&landing, &on_struct).unwrap_err();
+            assert!(
+                matches!(error, Error::CommitConflict { .. }),
+                "{what}: {error:?}"
+            );
+            // The primitive key inside the struct is unaffected by its siblings.
+            if what != "retyped child" {
+                check(&landing, &keyed).unwrap();
+            }
+        }
     }
 
     fn ids(manifest: &Manifest) -> Vec<u32> {
