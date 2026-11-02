@@ -194,9 +194,12 @@ impl FlatCombinedFieldsExec {
                 ))
             })?;
             let is_valid = if resolved.has_lists() {
+                // This root is already resolved; do not parse literal quotes again.
                 dataset
                     .schema()
-                    .field(input_name)
+                    .fields
+                    .iter()
+                    .find(|source| source.name == input_name)
                     .is_some_and(|source| field.data_type() == &source.data_type())
             } else {
                 matches!(

@@ -234,7 +234,7 @@ impl CombinedFieldsQueryExec {
     }
 
     /// Additional candidate mask, or `None` for no external restriction.
-    /// This mask does not narrow the statistics corpus.
+    /// It uses the index's row-id domain and does not narrow the statistics corpus.
     pub fn external_mask(&self) -> Option<&Arc<RowAddrMask>> {
         self.external_mask.as_ref()
     }

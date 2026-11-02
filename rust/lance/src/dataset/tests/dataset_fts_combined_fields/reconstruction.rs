@@ -208,7 +208,7 @@ async fn bm25f_plan_roundtrip_partial_coverage(
         .project(&["id"])
         .unwrap()
         .prefilter(true)
-        .filter("id != 0")
+        .filter("id != 0 AND id != 4")
         .unwrap()
         .full_text_search(FullTextSearchQuery::new_query(combined_query_with_boosts(
             "aa bb",
@@ -258,6 +258,7 @@ async fn bm25f_plan_roundtrip_partial_coverage(
     assert_eq!(actual, expected);
     let mut oracle = brute_force_bm25f(&[(3.0, titles), (1.0, bodies)], "aa bb", false);
     oracle[0] = None;
+    oracle[4] = None;
     assert_matches_brute_force(
         &actual,
         &oracle,
