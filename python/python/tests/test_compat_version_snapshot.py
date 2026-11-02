@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from compat import compat_decorator
+
 TESTS_DIR = Path(__file__).resolve().parent
 
 # Returns an extra release on gw1 only, so a worker that resolves the list itself
@@ -29,7 +31,12 @@ def _fetch_stable_versions():
     return sorted(Version(v) for v in ["6.0.0", "7.0.0", *extra])
 
 
+def _source_version():
+    return Version("9.0.0")
+
+
 compat_decorator._fetch_stable_versions = _fetch_stable_versions
+compat_decorator._source_version = _source_version
 """
 
 # Not run with --run-compat: the generated cases stay collected but skipped, which
@@ -99,3 +106,13 @@ def test_workers_share_the_controller_version_snapshot(tmp_path):
     assert "Different tests were collected" not in output, output
     assert "8.0.0" not in output, output
     assert result.returncode == 0, output
+
+
+def test_compat_versions_skip_releases_newer_than_the_source():
+    newer = f"{compat_decorator._source_version().major + 1}.0.0"
+    previous = compat_decorator._SNAPSHOT
+    compat_decorator.use_version_snapshot({"stable": ["13.0.0", newer]})
+    try:
+        assert compat_decorator.compat_versions() == ["13.0.0"]
+    finally:
+        compat_decorator.use_version_snapshot(previous)
