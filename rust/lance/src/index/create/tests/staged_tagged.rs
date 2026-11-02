@@ -1222,7 +1222,7 @@ async fn legacy_versions(
     match fri_entry(dataset).await {
         None => Vec::new(),
         Some(entry) => {
-            crate::index::frag_reuse::load_frag_reuse_records(dataset, &entry)
+            crate::utils::test::frag_reuse_records(dataset, &entry)
                 .await
                 .unwrap()
                 .legacy_versions

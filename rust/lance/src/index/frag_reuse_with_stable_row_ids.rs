@@ -336,7 +336,6 @@ mod tests {
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::transaction::{Operation, TransactionBuilder};
     use crate::dataset::{CommitBuilder, WriteParams};
-    use crate::index::frag_reuse::build_frag_reuse_index_metadata;
     use crate::index::vector::VectorIndexParams;
     use crate::index::{
         DatasetIndexExt,
@@ -605,9 +604,8 @@ mod tests {
     }
 
     async fn empty_frag_reuse_index(dataset: &Dataset, bitmap: RoaringBitmap) -> IndexMetadata {
-        build_frag_reuse_index_metadata(
+        crate::utils::test::legacy_frag_reuse_entry(
             dataset,
-            None,
             FragReuseIndexDetails { versions: vec![] },
             bitmap,
         )
@@ -1121,7 +1119,7 @@ mod tests {
             }],
         };
         let new_bitmap = new_fragments.iter().map(|f| f.id as u32).collect();
-        let frag_reuse = build_frag_reuse_index_metadata(&dataset, None, details, new_bitmap)
+        let frag_reuse = crate::utils::test::legacy_frag_reuse_entry(&dataset, details, new_bitmap)
             .await
             .unwrap();
         let mut indices = load_all_indices(&dataset).await.unwrap().as_ref().clone();

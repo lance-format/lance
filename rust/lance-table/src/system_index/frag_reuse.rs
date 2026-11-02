@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 pub mod gate;
+pub mod history;
 pub mod ledger;
 pub mod lineage;
 pub mod metadata;

@@ -126,6 +126,62 @@ fn content_field(details: &prost_types::Any) -> Result<(u32, Bytes)> {
     content.ok_or_else(|| corrupt("missing FRI content"))
 }
 
+/// The serialized history an FRI `index_details` holds, resolving an external
+/// reference through `read_external`, which must return exactly the
+/// referenced byte range.
+pub(super) async fn load_content<F, Fut>(
+    details: &prost_types::Any,
+    read_external: F,
+) -> Result<Bytes>
+where
+    F: FnOnce(crate::format::pb::ExternalFile) -> Fut,
+    Fut: Future<Output = Result<Bytes>>,
+{
+    let (tag, content) = content_field(details)?;
+    if tag == 1 {
+        return Ok(content);
+    }
+    let file =
+        crate::format::pb::ExternalFile::decode(content).map_err(|e| corrupt(e.to_string()))?;
+    file.offset
+        .checked_add(file.size)
+        .and_then(|end| usize::try_from(end).ok())
+        .ok_or_else(|| corrupt("external FRI range overflow"))?;
+    let expected = file.size;
+    let bytes = read_external(file).await?;
+    if bytes.len() as u64 != expected {
+        return Err(corrupt(format!(
+            "external FRI size mismatch: expected {expected}, received {}",
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Whether a serialized transition holds only fields this implementation
+/// interprets. A field it does not know may be metadata or a new mapping, and
+/// neither is safe to interpret partially.
+pub(super) fn is_interpretable_transition(raw: &Bytes) -> Result<bool> {
+    let mut fields = raw.clone();
+    let mut has_mapping = false;
+    while fields.has_remaining() {
+        let (tag, payload) = next_field(&mut fields)?;
+        if matches!(tag, ORDERED_COMPACTION_FIELD | STABLE_PARTITION_FIELD) {
+            require_message(tag, payload)?;
+            if has_mapping {
+                return Err(corrupt("transition contains multiple mapping alternatives"));
+            }
+            has_mapping = true;
+        } else if !matches!(tag, 1 | 2) {
+            return Ok(false);
+        }
+    }
+    if !has_mapping {
+        return Err(corrupt("transition has no mapping"));
+    }
+    Ok(true)
+}
+
 impl FragReuseLedger {
     /// Decode FRI details, resolving external history through `read_external`.
     /// The callback reads the exact byte range described by the external reference;
@@ -141,26 +197,7 @@ impl FragReuseLedger {
         Fut: Future<Output = Result<Bytes>>,
     {
         validate_index_version(index_version)?;
-        let (tag, content) = content_field(details)?;
-        let content = if tag == 1 {
-            content
-        } else {
-            let file = crate::format::pb::ExternalFile::decode(content)
-                .map_err(|e| corrupt(e.to_string()))?;
-            file.offset
-                .checked_add(file.size)
-                .and_then(|end| usize::try_from(end).ok())
-                .ok_or_else(|| corrupt("external FRI range overflow"))?;
-            let expected = file.size;
-            let bytes = read_external(file).await?;
-            if bytes.len() as u64 != expected {
-                return Err(corrupt(format!(
-                    "external FRI size mismatch: expected {expected}, received {}",
-                    bytes.len()
-                )));
-            }
-            bytes
-        };
+        let content = load_content(details, read_external).await?;
         Self::decode_content(index_version, content)
     }
 
@@ -179,7 +216,7 @@ impl FragReuseLedger {
 
     // Each legacy group owns a compaction remap. Address resolution follows its
     // fragment lineage, rather than searching every group in a legacy version.
-    fn decode_content(index_version: i32, content: Bytes) -> Result<Self> {
+    pub(super) fn decode_content(index_version: i32, content: Bytes) -> Result<Self> {
         validate_index_version(index_version)?;
         let mut remaining = content;
         let mut transitions = Vec::new();
@@ -210,31 +247,9 @@ impl FragReuseLedger {
                         return Err(corrupt("tagged transitions require FRI index_version 1"));
                     }
                     let raw = require_message(tag, payload)?;
-                    let mut fields = raw.clone();
-                    let mut has_mapping = false;
-                    let mut has_unknown_fields = false;
-                    while fields.has_remaining() {
-                        let (tag, payload) = next_field(&mut fields)?;
-                        if matches!(tag, ORDERED_COMPACTION_FIELD | STABLE_PARTITION_FIELD) {
-                            require_message(tag, payload)?;
-                            if has_mapping {
-                                return Err(corrupt(
-                                    "transition contains multiple mapping alternatives",
-                                ));
-                            }
-                            has_mapping = true;
-                        } else if !matches!(tag, 1 | 2) {
-                            has_unknown_fields = true;
-                        }
-                    }
-                    if has_unknown_fields {
-                        // The field number does not tell us whether this is metadata
-                        // or a mapping. Neither is safe to partially interpret.
+                    if !is_interpretable_transition(&raw)? {
                         has_unsupported_transitions = true;
                         continue;
-                    }
-                    if !has_mapping {
-                        return Err(corrupt("transition has no mapping"));
                     }
                     let decoded =
                         pb::Transition::decode(raw).map_err(|e| corrupt(e.to_string()))?;
@@ -339,9 +354,9 @@ impl DeepSizeOf for FragReuseLedger {
 
 // Exact protobuf alternatives, not the start of a reserved field-number range.
 const ORDERED_COMPACTION_FIELD: u32 = 3;
-const STABLE_PARTITION_FIELD: u32 = 4;
+pub(super) const STABLE_PARTITION_FIELD: u32 = 4;
 
-fn validate_index_version(index_version: i32) -> Result<()> {
+pub(super) fn validate_index_version(index_version: i32) -> Result<()> {
     if !matches!(index_version, 0 | 1) {
         return Err(Error::not_supported(format!(
             "Unsupported FRI index_version {index_version}; supported versions are 0 and 1. Please upgrade to a newer version of Lance."
@@ -350,7 +365,7 @@ fn validate_index_version(index_version: i32) -> Result<()> {
     Ok(())
 }
 
-fn corrupt(message: impl Into<String>) -> Error {
+pub(super) fn corrupt(message: impl Into<String>) -> Error {
     Error::corrupt_file_named("FRI details", message)
 }
 
