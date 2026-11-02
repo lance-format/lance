@@ -703,6 +703,11 @@ impl DocSet {
 
     // remap the row ids to the new row ids
     // returns the removed doc ids
+    /// The row id of every document, in doc id order.
+    pub fn row_ids(&self) -> &[u64] {
+        &self.row_ids
+    }
+
     pub fn remap(&mut self, mapping: &RowAddrRemap) -> Vec<u32> {
         let mut removed = Vec::new();
         let len = self.len();

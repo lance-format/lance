@@ -13,13 +13,19 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt64Array};
+use arrow_schema::SortOptions;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
-use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
+use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::{
+    Distribution, EquivalenceProperties, LexOrdering, Partitioning, PhysicalSortExpr,
+};
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
 use lance_arrow::iter_str_array;
@@ -32,6 +38,7 @@ use lance_index::scalar::minhash_lsh::{
     MinHashHit, MinHashLshIndex, MinHashLshIndexParams, MinHashQuery, QuerySignature,
     SignatureGenerator, SignatureValue, TopHits, estimate_jaccard,
 };
+use lance_index::vector::DIST_COL;
 use lance_index::vector::graph::OrderedFloat;
 use lance_select::RowAddrMask;
 use lance_table::format::IndexMetadata;
@@ -100,7 +107,7 @@ impl MinHashSearchExec {
         external_mask: Option<Arc<RowAddrMask>>,
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
+            EquivalenceProperties::new_with_orderings(KNN_INDEX_SCHEMA.clone(), [rank_order()]),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Final,
             Boundedness::Bounded,
@@ -156,6 +163,13 @@ impl ExecutionPlan for MinHashSearchExec {
             .iter()
             .map(|_| Distribution::SinglePartition)
             .collect()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -295,6 +309,20 @@ impl ExecutionPlan for MinHashSearchExec {
     }
 }
 
+/// The order both searches emit their hits in, which is [`MinHashHit`]'s order:
+/// ascending `_distance`, then ascending `_rowid`.
+fn rank_order() -> LexOrdering {
+    let ascending = SortOptions {
+        descending: false,
+        nulls_first: false,
+    };
+    [
+        PhysicalSortExpr::new(Arc::new(Column::new(DIST_COL, 0)), ascending),
+        PhysicalSortExpr::new(Arc::new(Column::new(ROW_ID, 1)), ascending),
+    ]
+    .into()
+}
+
 fn hits_batch(hits: &[MinHashHit]) -> DataFusionResult<RecordBatch> {
     let distances = Float32Array::from_iter_values(hits.iter().map(|hit| hit.distance.0));
     let row_ids = UInt64Array::from_iter_values(hits.iter().map(|hit| hit.row_id));
@@ -374,7 +402,7 @@ impl FlatMinHashExec {
         limit: usize,
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
+            EquivalenceProperties::new_with_orderings(KNN_INDEX_SCHEMA.clone(), [rank_order()]),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Final,
             Boundedness::Bounded,
@@ -424,6 +452,13 @@ impl ExecutionPlan for FlatMinHashExec {
         // `execute` reads a single input partition; without this the input
         // could be split across partitions of which only one is consumed.
         vec![Distribution::SinglePartition]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -527,6 +562,7 @@ mod tests {
     use lance_index::scalar::minhash_lsh::MinHashQuery;
     use lance_index::scalar::{BuiltinIndexType, FullTextSearchQuery, ScalarIndexParams};
     use lance_select::{RowAddrMask, RowAddrTreeMap};
+    use rstest::rstest;
 
     use crate::dataset::scanner::Scanner;
     use crate::dataset::{WriteMode, WriteParams};
@@ -698,6 +734,17 @@ mod tests {
         })
         .await;
         assert_eq!(prefiltered, vec![3, 1]);
+        let mut metric_scan = scan(&dataset, BASE, 2);
+        metric_scan.filter("id >= 1").unwrap().prefilter(true);
+        let analysis = metric_scan.analyze_plan().await.unwrap();
+        let minhash_line = analysis
+            .lines()
+            .find(|line| line.contains("MinHashSearch:"))
+            .unwrap();
+        assert!(
+            minhash_line.contains("prefilter_loads=1"),
+            "MinHash search is missing its prefilter metrics: {analysis}"
+        );
         // Postfiltering ranks first and filters the ranked rows afterwards
         let postfiltered = ids(&dataset, BASE, 2, |scan| {
             scan.filter("id >= 1").unwrap().prefilter(false);
@@ -789,13 +836,67 @@ mod tests {
             .unwrap();
         let allowed = batch[ROW_ID].as_primitive::<UInt64Type>().value(0);
         let found = hits(&dataset, BASE, 1, |scan| {
-            scan.with_row_addr_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+            scan.with_row_id_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
                 allowed,
             ])));
         })
         .await
         .unwrap();
         assert_eq!(found, vec![(13, 0.0)]);
+    }
+
+    #[rstest]
+    // The search declares its rank order, so its output may be split across
+    // partitions as long as they are merged back in that order
+    #[case::indexed(false, false, true)]
+    #[case::unindexed(true, false, true)]
+    // Without `_distance` the output declares no order, so nothing may split it
+    #[case::distance_dropped(false, true, false)]
+    #[tokio::test]
+    async fn test_minhash_search_unordered_scan_keeps_rank_order(
+        #[case] unindexed: bool,
+        #[case] drop_distance: bool,
+        #[case] parallel: bool,
+    ) {
+        let dataset = append(indexed_dataset().await, 12, &[BASE, NEAR]).await;
+        // Only indexed or only unindexed fragments, so the search has one branch
+        // and no `SortExec` above it
+        let fragments = if unindexed {
+            dataset.fragments()[3..].to_vec()
+        } else {
+            dataset.fragments()[..3].to_vec()
+        };
+        let expected = ids(&dataset, BASE, 4, |scan| {
+            scan.with_fragments(fragments.clone());
+        })
+        .await;
+
+        let mut scan = scan(&dataset, BASE, 4);
+        scan.with_fragments(fragments)
+            .scan_in_order(false)
+            .target_parallelism(8)
+            .project_with_transform(&[("id", "id"), ("foo", "id * 2")])
+            .unwrap();
+        if drop_distance {
+            scan.disable_scoring_autoprojection();
+        }
+        let explained = scan.explain_plan(false).await.unwrap();
+        assert!(!explained.contains("SortExec"), "{explained}");
+        assert_eq!(
+            explained.contains("RoundRobinBatch"),
+            parallel,
+            "{explained}"
+        );
+        assert_eq!(
+            explained.contains("SortPreservingMergeExec"),
+            parallel,
+            "{explained}"
+        );
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values(),
+            expected.as_slice()
+        );
     }
 
     #[tokio::test]

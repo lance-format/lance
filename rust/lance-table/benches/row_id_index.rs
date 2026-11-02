@@ -27,7 +27,7 @@ use lance_core::utils::deletion::DeletionVector;
 use lance_io::ReadBatchParams;
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::pb;
-use lance_table::rowids::FragmentRowIdIndex;
+use lance_table::rowids::{FragmentRowIdIndex, segment::U64Segment};
 use lance_table::{
     rowids::{RowIdIndex, RowIdSequence, read_row_ids, write_row_ids},
     utils::stream::{RowIdAndDeletesConfig, apply_row_id_and_deletes},
@@ -66,6 +66,36 @@ fn make_frag_sequences(
             );
             start += rows_per_frag;
             (i as u32, Arc::new(sequence))
+        })
+        .collect()
+}
+
+fn make_clustered_range_frag_sequences(num_rows: u64) -> Vec<FragmentRowIdIndex> {
+    let rows_per_fragment = num_rows / 100;
+    (0_u32..100)
+        .map(|fragment_id| {
+            let start = fragment_id as u64 * rows_per_fragment;
+            let end = start + rows_per_fragment;
+            let mut ranges = Vec::new();
+            let mut row_id = start;
+            while row_id < end {
+                let present_end = (row_id + 250).min(end);
+                ranges.push(row_id..present_end);
+                row_id = present_end.saturating_add(250);
+            }
+            let wire_sequence = pb::RowIdSequence {
+                segments: ranges
+                    .into_iter()
+                    .map(|range| pb::U64Segment::from(U64Segment::Range(range)))
+                    .collect(),
+            };
+            // Decode the wire ranges into the compact form used after PR #9311.
+            let sequence = read_row_ids(&wire_sequence.encode_to_vec()).unwrap();
+            FragmentRowIdIndex {
+                fragment_id,
+                row_id_sequence: Arc::new(sequence),
+                deletion_vector: Arc::new(DeletionVector::default()),
+            }
         })
         .collect()
 }
@@ -198,6 +228,11 @@ fn bench_creation(c: &mut Criterion) {
             },
         );
     }
+
+    let clustered_indices = make_clustered_range_frag_sequences(num_rows());
+    group.bench_function("BuildIndexClusteredRanges", |b| {
+        b.iter(|| std::hint::black_box(RowIdIndex::new(&clustered_indices).unwrap()));
+    });
 
     group.finish();
 }

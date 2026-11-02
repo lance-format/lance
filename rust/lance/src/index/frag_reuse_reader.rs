@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 mod cache;
-use cache::CachedMapping;
+pub(crate) use cache::{CachedMapping, open_mapping};
 
 #[cfg(test)]
 tokio::task_local! {
@@ -543,7 +543,7 @@ pub mod tests {
         }
         let batch = dataset
             .scan()
-            .with_row_id()
+            .with_row_address()
             .project_with_transform(&[("value", "i")])
             .unwrap()
             .try_into_batch()
@@ -592,6 +592,17 @@ pub mod tests {
         dataset: &Dataset,
         source_ids: &[u64],
         dest_base_id: u64,
+    ) -> (Transition, Vec<Fragment>) {
+        prepare_partition_with_block_rows(dataset, source_ids, dest_base_id, 3).await
+    }
+
+    /// [`prepare_partition`] with the row map's block size chosen by the
+    /// caller, for tests that need several blocks per cache chunk.
+    pub async fn prepare_partition_with_block_rows(
+        dataset: &Dataset,
+        source_ids: &[u64],
+        dest_base_id: u64,
+        block_rows: u32,
     ) -> (Transition, Vec<Fragment>) {
         let source_fragments: Vec<Fragment> = source_ids
             .iter()
@@ -677,7 +688,8 @@ pub mod tests {
             .new_index_file(MAPPING_FILE, RowMapWriter::schema())
             .await
             .unwrap();
-        let mut writer = RowMapWriter::try_new_with_block_rows(writer, source_rows, 2, 3).unwrap();
+        let mut writer =
+            RowMapWriter::try_new_with_block_rows(writer, source_rows, 2, block_rows).unwrap();
         writer.append_labels(&labels).await.unwrap();
         let (file, _) = writer.finish().await.unwrap();
         let transition = Transition {
@@ -752,6 +764,8 @@ pub mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         indices.push(fri.clone());
         let manifest = Arc::make_mut(&mut dataset.manifest);
@@ -1970,6 +1984,8 @@ pub mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         // Installed by writing the manifest directly: the commit chokepoint
         // (correctly) refuses a hand-built tagged entry, and no writer of this

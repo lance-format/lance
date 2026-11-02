@@ -23,8 +23,10 @@ use lance::dataset::mem_wal::scanner::{
 };
 use lance::dataset::mem_wal::write::{MemTableStats, ShardMemory, WriteStatsSnapshot};
 use lance::dataset::mem_wal::{
-    LsmScanner, ShardSnapshot, ShardWriter, arrow_schema_with_field_ids, evaluate_sharding_spec,
+    DatasetMemWalExt, LsmScanner, ShardSnapshot, ShardWriter, arrow_schema_with_field_ids,
+    evaluate_sharding_spec,
 };
+use lance::dataset::scanner::DatasetRecordBatchStream;
 use lance_index::mem_wal::{
     CompactedSsTable as LanceCompactedSsTable, ShardingField, ShardingSpec,
 };
@@ -36,6 +38,7 @@ use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 use crate::dataset::Dataset as PyDataset;
+use crate::reader::LanceReader;
 use crate::rt;
 use crate::schema::LanceSchema as PyLanceSchema;
 
@@ -333,7 +336,8 @@ impl PyShardWriter {
     /// Return a snapshot of current write statistics.
     ///
     /// Returns a dict with keys: put_count, put_time_ms, wal_flush_count,
-    /// wal_flush_bytes, memtable_flush_count, memtable_flush_rows.
+    /// wal_flush_bytes, memtable_flush_count, memtable_flush_rows,
+    /// memtable_flush_failures.
     pub fn stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
         let closed_state = self.closed_state.clone();
@@ -392,9 +396,11 @@ impl PyShardWriter {
         memtable_stats_to_pydict(py, &stats, bytes.as_ref())
     }
 
-    /// Create an LSM scanner that includes the active MemTable for strong consistency.
+    /// Create an LSM scanner that includes this writer's in-memory MemTables
+    /// for strong consistency.
     ///
-    /// The scanner covers: base table + given SSTables + current active MemTable.
+    /// The scanner covers: base table + given SSTables + the active MemTable
+    /// and every frozen MemTable still awaiting flush.
     #[pyo3(signature = (shard_snapshots=vec![]))]
     pub fn lsm_scanner(
         &self,
@@ -411,18 +417,25 @@ impl PyShardWriter {
         let dataset = self.dataset.clone();
         let shard_id = self.shard_id;
 
-        let (active_ref, writer_snapshot) = rt()
+        let (in_memory_memtables, writer_snapshot, dir_id) = rt()
             .block_on(Some(py), async move {
                 let guard = inner.lock().await;
                 match guard.as_ref() {
                     Some(w) => {
-                        let active_ref = w.active_memtable_ref().await?;
+                        // Capture the active memtable *and* any frozen-awaiting-flush
+                        // memtables so a concurrent flush rollover cannot hide
+                        // acknowledged writes from this read-your-writes scanner.
+                        let in_memory_memtables = w.in_memory_memtable_refs().await?;
                         let writer_snapshot = w
                             .manifest()
                             .await?
                             .map(shard_snapshot_from_manifest)
                             .unwrap_or_else(|| ShardSnapshot::new(shard_id));
-                        Ok((active_ref, writer_snapshot))
+                        Ok((
+                            in_memory_memtables,
+                            writer_snapshot,
+                            w.config().dir_id.clone(),
+                        ))
                     }
                     None => Err(lance_core::Error::invalid_input(
                         "ShardWriter is already closed",
@@ -434,7 +447,8 @@ impl PyShardWriter {
         snapshots.push(writer_snapshot);
 
         let scanner = LsmScanner::new(dataset, snapshots, pk_columns)
-            .with_active_memtable(shard_id, active_ref);
+            .with_mem_wal_dir_id(dir_id)
+            .with_in_memory_memtables(shard_id, in_memory_memtables);
 
         Ok(PyLsmScanner {
             inner: Some(scanner),
@@ -570,8 +584,9 @@ impl PyLsmScanner {
             .map(|s| s.borrow().inner.clone())
             .collect();
         let pk_columns = get_pk_columns(&ds)?;
+        let dir_id = mem_wal_dir_id(&ds)?;
         Ok(Self {
-            inner: Some(LsmScanner::new(ds, snapshots, pk_columns)),
+            inner: Some(LsmScanner::new(ds, snapshots, pk_columns).with_mem_wal_dir_id(dir_id)),
         })
     }
 
@@ -686,6 +701,25 @@ impl PyLsmScanner {
         PyList::new(py, py_batches)
     }
 
+    /// Execute the scan and return a PyArrow RecordBatchReader that yields
+    /// batches as the scan produces them, instead of collecting them first.
+    pub fn to_reader(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let scanner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Scanner has already been consumed"))?;
+        let stream = rt()
+            .block_on(Some(py), scanner.try_into_stream())
+            .map_err(|e| PyIOError::new_err(e.to_string()))?
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        Ok(PyArrowType(Box::new(LanceReader::from_stream(
+            DatasetRecordBatchStream::new(stream),
+        ))))
+    }
+
     /// Return the row count without loading all data.
     pub fn count_rows(&self, py: Python<'_>) -> PyResult<u64> {
         let scanner = self
@@ -728,10 +762,11 @@ impl PyLsmPointLookupPlanner {
             None => get_pk_columns(&ds)?,
         };
         let base_schema = Arc::new(ArrowSchema::from(ds.schema()));
-        // A sealed generation stores the names it was written with, so the
+        // A flushed generation stores the names it was written with, so the
         // planner resolves its columns by id; `base_schema` carries none.
         let identity_schema = Arc::new(arrow_schema_with_field_ids(ds.schema()));
-        let collector = LsmDataSourceCollector::new(ds.clone(), snapshots);
+        let collector = LsmDataSourceCollector::new(ds.clone(), snapshots)
+            .with_mem_wal_dir_id(mem_wal_dir_id(&ds)?);
         let planner = LsmPointLookupPlanner::new(collector, pk_cols.clone(), base_schema.clone())
             .map_err(|e| PyIOError::new_err(e.to_string()))?
             .with_identity_schema(identity_schema);
@@ -815,7 +850,8 @@ impl PyLsmVectorSearchPlanner {
             })
             .transpose()?;
 
-        let collector = LsmDataSourceCollector::new(ds.clone(), snapshots);
+        let collector = LsmDataSourceCollector::new(ds.clone(), snapshots)
+            .with_mem_wal_dir_id(mem_wal_dir_id(&ds)?);
         let mut planner = LsmVectorSearchPlanner::new(
             collector,
             pk_cols,
@@ -899,6 +935,15 @@ impl PyLsmVectorSearchPlanner {
     }
 }
 
+/// The dataset's MemWAL `dir_id`; empty when it has no MemWAL.
+fn mem_wal_dir_id(ds: &Arc<LanceDataset>) -> PyResult<String> {
+    let ds = ds.clone();
+    let details = rt()
+        .block_on(None, async move { ds.mem_wal_index_details().await })?
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+    Ok(details.map(|details| details.dir_id).unwrap_or_default())
+}
+
 /// Extract primary key column names from dataset schema.
 pub(crate) fn get_pk_columns(ds: &LanceDataset) -> PyResult<Vec<String>> {
     let pk_fields = ds.schema().unenforced_primary_key();
@@ -950,6 +995,7 @@ fn write_stats_to_pydict(py: Python<'_>, stats: &WriteStatsSnapshot) -> PyResult
     dict.set_item("wal_flush_time_ms", stats.wal_flush_time.as_millis() as u64)?;
     dict.set_item("memtable_flush_count", stats.memtable_flush_count)?;
     dict.set_item("memtable_flush_rows", stats.memtable_flush_rows)?;
+    dict.set_item("memtable_flush_failures", stats.memtable_flush_failures)?;
     dict.set_item(
         "memtable_flush_time_ms",
         stats.memtable_flush_time.as_millis() as u64,

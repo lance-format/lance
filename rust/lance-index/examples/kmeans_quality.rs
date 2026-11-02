@@ -37,7 +37,7 @@ use lance_index::vector::kmeans::{
     train_kmeans,
 };
 use lance_linalg::distance::DistanceType;
-use lance_linalg::distance::l2::l2_distance_batch;
+use lance_linalg::distance::l2::l2_distance_batch_into;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rayon::prelude::*;
@@ -274,15 +274,19 @@ fn ground_truth(args: &Args, base: &Base, rows: usize, d: usize, queries: &[f32]
         queries
             .par_chunks(d)
             .zip(best.par_iter_mut())
-            .for_each(|(query, best)| {
-                for (i, dist) in l2_distance_batch(query, values, d).enumerate() {
-                    if best.len() < TOP_K || dist < best[TOP_K - 1].0 {
-                        let pos = best.partition_point(|(other, _)| *other <= dist);
-                        best.insert(pos, (dist, (chunk_start + i) as u32));
-                        best.truncate(TOP_K);
+            .for_each_init(
+                || vec![0.0; values.len() / d],
+                |distances, (query, best)| {
+                    l2_distance_batch_into(query, values, d, distances);
+                    for (i, &dist) in distances.iter().enumerate() {
+                        if best.len() < TOP_K || dist < best[TOP_K - 1].0 {
+                            let pos = best.partition_point(|(other, _)| *other <= dist);
+                            best.insert(pos, (dist, (chunk_start + i) as u32));
+                            best.truncate(TOP_K);
+                        }
                     }
-                }
-            });
+                },
+            );
     });
     let gt: Vec<u32> = best
         .into_iter()

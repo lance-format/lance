@@ -554,33 +554,43 @@ pub struct MultiMatchQuery {
     pub match_queries: Vec<MatchQuery>,
 }
 
+/// Serializes every leaf under `match_queries`. The legacy `query`, `columns`
+/// and `boost` keys are also written when every leaf names a column, so a reader
+/// that predates `match_queries` degrades as before: it rebuilds default leaves
+/// from the first leaf's terms.
 impl Serialize for MultiMatchQuery {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        let mut map = serializer.serialize_map(Some(3))?;
-
-        let query = self.match_queries.first().ok_or(serde::ser::Error::custom(
+        let first = self.match_queries.first().ok_or(serde::ser::Error::custom(
             "MultiMatchQuery must have at least one MatchQuery".to_string(),
         ))?;
-        map.serialize_entry("query", &query.terms)?;
-        let columns = self
+        let legacy_columns = self
             .match_queries
             .iter()
-            .map(|q| q.column.as_ref().unwrap().clone())
-            .collect::<Vec<String>>();
-        map.serialize_entry("columns", &columns)?;
-        let boosts = self
-            .match_queries
-            .iter()
-            .map(|q| q.boost)
-            .collect::<Vec<f32>>();
-        map.serialize_entry("boost", &boosts)?;
+            .map(|q| q.column.as_deref())
+            .collect::<Option<Vec<&str>>>();
+
+        let mut map =
+            serializer.serialize_map(Some(if legacy_columns.is_some() { 4 } else { 1 }))?;
+        if let Some(columns) = legacy_columns {
+            map.serialize_entry("query", &first.terms)?;
+            map.serialize_entry("columns", &columns)?;
+            let boosts = self
+                .match_queries
+                .iter()
+                .map(|q| q.boost)
+                .collect::<Vec<f32>>();
+            map.serialize_entry("boost", &boosts)?;
+        }
+        map.serialize_entry("match_queries", &self.match_queries)?;
         map.end()
     }
 }
 
+/// Reads `match_queries` when present. Otherwise falls back to the legacy
+/// `{query, columns, boost}` shape, which carries no per-leaf settings.
 impl<'de> Deserialize<'de> for MultiMatchQuery {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -588,15 +598,30 @@ impl<'de> Deserialize<'de> for MultiMatchQuery {
     {
         #[derive(Deserialize)]
         struct MultiMatchQueryData {
-            query: String,
-            columns: Vec<String>,
+            match_queries: Option<Vec<MatchQuery>>,
+            query: Option<String>,
+            columns: Option<Vec<String>>,
             boost: Option<Vec<f32>>,
         }
 
         let data = MultiMatchQueryData::deserialize(deserializer)?;
-        let boosts = data.boost.unwrap_or(vec![1.0; data.columns.len()]);
+        if let Some(match_queries) = data.match_queries {
+            if match_queries.is_empty() {
+                return Err(serde::de::Error::custom(
+                    "Cannot create MultiMatchQuery with no match queries",
+                ));
+            }
+            return Ok(Self { match_queries });
+        }
 
-        Self::try_new(data.query, data.columns)
+        let query = data
+            .query
+            .ok_or_else(|| serde::de::Error::missing_field("query"))?;
+        let columns = data
+            .columns
+            .ok_or_else(|| serde::de::Error::missing_field("columns"))?;
+        let boosts = data.boost.unwrap_or(vec![1.0; columns.len()]);
+        Self::try_new(query, columns)
             .map_err(serde::de::Error::custom)?
             .try_with_boosts(boosts)
             .map_err(serde::de::Error::custom)
@@ -1020,6 +1045,9 @@ impl FtsQueryNode for BooleanQuery {
 pub struct Tokens {
     tokens: Vec<String>,
     positions: Vec<u32>,
+    // None means term groups follow phrase positions. Ngrams require independent
+    // Match groups even though their tokenizer emits all tokens at position zero.
+    term_groups: Option<Vec<u32>>,
     tokens_map: HashMap<String, usize>,
     token_type: DocType,
 }
@@ -1042,6 +1070,7 @@ impl Tokens {
         Self {
             tokens: tokens_vec,
             positions,
+            term_groups: None,
             tokens_map,
             token_type,
         }
@@ -1074,6 +1103,42 @@ impl Tokens {
     pub fn position(&self, index: usize) -> u32 {
         self.positions[index]
     }
+
+    /// The logical Match group for a token. Tokens in one group are alternatives;
+    /// an AND query requires a match in every group. Defaults to the token's
+    /// phrase position, but ngrams receive independent groups.
+    ///
+    /// ```
+    /// use lance_index::scalar::inverted::query::Tokens;
+    /// use lance_index::scalar::inverted::tokenizer::document_tokenizer::DocType;
+    /// let tokens = Tokens::with_positions(
+    ///     vec!["getusername".into(), "get".into(), "user".into()],
+    ///     vec![0, 0, 1],
+    ///     DocType::Text,
+    /// );
+    /// assert_eq!(tokens.term_group(0), tokens.term_group(1));
+    /// assert_ne!(tokens.term_group(1), tokens.term_group(2));
+    /// ```
+    pub fn term_group(&self, index: usize) -> u32 {
+        self.term_groups
+            .as_ref()
+            .map_or_else(|| self.position(index), |groups| groups[index])
+    }
+
+    pub(crate) fn with_term_groups(mut self, term_groups: Vec<u32>) -> Self {
+        debug_assert_eq!(self.len(), term_groups.len());
+        self.term_groups = Some(term_groups);
+        self
+    }
+
+    /// Posting unions use phrase offsets for phrases and logical groups for Match.
+    pub(crate) fn position_for_query(&self, index: usize, is_phrase_query: bool) -> u32 {
+        if is_phrase_query {
+            self.position(index)
+        } else {
+            self.term_group(index)
+        }
+    }
 }
 
 impl IntoIterator for Tokens {
@@ -1096,8 +1161,9 @@ impl<'a> IntoIterator for &'a Tokens {
 
 pub fn collect_query_tokens(text: &str, tokenizer: &mut Box<dyn LanceTokenizer>) -> Tokens {
     let token_type = tokenizer.doc_type();
+    let has_independent_query_tokens = tokenizer.query_tokens_are_independent();
     let stream = tokenizer.token_stream_for_search(text);
-    collect_tokens(stream, token_type)
+    collect_tokens(stream, token_type, has_independent_query_tokens)
 }
 
 /// Tokenize search text, returning tokenizer-specific query syntax errors.
@@ -1106,23 +1172,29 @@ pub fn try_collect_query_tokens(
     tokenizer: &mut Box<dyn LanceTokenizer>,
 ) -> Result<Tokens> {
     let token_type = tokenizer.doc_type();
+    let has_independent_query_tokens = tokenizer.query_tokens_are_independent();
     let stream = tokenizer.token_stream_for_search(text);
-    try_collect_tokens(stream, token_type)
+    try_collect_tokens(stream, token_type, has_independent_query_tokens)
 }
 
-fn collect_tokens(mut stream: lance_tokenizer::BoxTokenStream<'_>, token_type: DocType) -> Tokens {
+fn collect_tokens(
+    mut stream: lance_tokenizer::BoxTokenStream<'_>,
+    token_type: DocType,
+    has_independent_query_tokens: bool,
+) -> Tokens {
     let mut tokens = Vec::new();
     let mut positions = Vec::new();
     while let Some(token) = stream.next() {
         tokens.push(token.text.clone());
         positions.push(token.position as u32);
     }
-    finish_tokens(tokens, positions, token_type)
+    finish_tokens(tokens, positions, token_type, has_independent_query_tokens)
 }
 
 fn try_collect_tokens(
     mut stream: lance_tokenizer::BoxTokenStream<'_>,
     token_type: DocType,
+    has_independent_query_tokens: bool,
 ) -> Result<Tokens> {
     let mut tokens = Vec::new();
     let mut positions = Vec::new();
@@ -1133,10 +1205,20 @@ fn try_collect_tokens(
         tokens.push(token.text.clone());
         positions.push(token.position as u32);
     }
-    Ok(finish_tokens(tokens, positions, token_type))
+    Ok(finish_tokens(
+        tokens,
+        positions,
+        token_type,
+        has_independent_query_tokens,
+    ))
 }
 
-fn finish_tokens(tokens: Vec<String>, mut positions: Vec<u32>, token_type: DocType) -> Tokens {
+fn finish_tokens(
+    tokens: Vec<String>,
+    mut positions: Vec<u32>,
+    token_type: DocType,
+    has_independent_query_tokens: bool,
+) -> Tokens {
     if let Some(min_position) = positions.iter().copied().min() {
         // Token streams such as Jieba's search mode may emit overlapping terms out of position
         // order. Rebase from the minimum so every position remains valid while preserving gaps.
@@ -1144,7 +1226,13 @@ fn finish_tokens(tokens: Vec<String>, mut positions: Vec<u32>, token_type: DocTy
             *position -= min_position;
         }
     }
-    Tokens::with_positions(tokens, positions, token_type)
+    let tokens = Tokens::with_positions(tokens, positions, token_type);
+    if has_independent_query_tokens {
+        let term_groups = (0..tokens.len() as u32).collect();
+        tokens.with_term_groups(term_groups)
+    } else {
+        tokens
+    }
 }
 
 pub fn has_query_token(
@@ -1261,6 +1349,53 @@ pub fn fill_fts_query_column(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[rstest::rstest]
+    #[case::ngram(
+        crate::scalar::inverted::InvertedIndexParams::default()
+            .base_tokenizer("ngram".into()).ngram_min_length(2).ngram_max_length(2),
+        "abcd", vec!["ab", "bc", "cd"], vec![0, 1, 2], vec![0, 0, 0]
+    )]
+    #[case::code(
+        crate::scalar::inverted::InvertedIndexParams::code().split_identifiers(true),
+        "getUserName", vec!["getusername", "get", "user", "name"],
+        vec![0, 0, 1, 2], vec![0, 0, 1, 2]
+    )]
+    #[test]
+    fn test_collect_query_tokens_independent_terms_and_alternatives(
+        #[case] params: crate::scalar::inverted::InvertedIndexParams,
+        #[case] query: &str,
+        #[case] expected_tokens: Vec<&str>,
+        #[case] expected_term_groups: Vec<u32>,
+        #[case] expected_doc_positions: Vec<usize>,
+    ) {
+        let mut tokenizer = params.build().unwrap();
+        for tokens in [
+            collect_query_tokens(query, &mut tokenizer),
+            try_collect_query_tokens(query, &mut tokenizer).unwrap(),
+        ] {
+            assert_eq!(tokens.tokens, expected_tokens);
+            assert_eq!(
+                (0..tokens.len())
+                    .map(|index| tokens.term_group(index))
+                    .collect::<Vec<_>>(),
+                expected_term_groups
+            );
+            assert_eq!(
+                tokens.positions,
+                expected_doc_positions
+                    .iter()
+                    .map(|position| *position as u32)
+                    .collect::<Vec<_>>()
+            );
+        }
+        let mut stream = tokenizer.token_stream_for_doc(query);
+        let mut doc_positions = Vec::new();
+        while let Some(token) = stream.next() {
+            doc_positions.push(token.position);
+        }
+        assert_eq!(doc_positions, expected_doc_positions);
+    }
 
     #[cfg(feature = "tokenizer-jieba")]
     #[test]
@@ -1633,6 +1768,96 @@ mod tests {
         assert!(value.get("combined_fields").is_some());
         let round_trip: FtsQuery = serde_json::from_value(value).unwrap();
         assert_eq!(round_trip, wrapped);
+    }
+
+    fn per_leaf_multi_match() -> MultiMatchQuery {
+        MultiMatchQuery {
+            match_queries: vec![
+                MatchQuery::new("alpha beta".to_string())
+                    .with_column(Some("title".to_string()))
+                    .with_operator(Operator::And)
+                    .with_boost(2.0)
+                    .with_fuzziness(None)
+                    .with_document_granularity(DocumentGranularity::Row),
+                MatchQuery::new("gamma delta".to_string())
+                    .with_column(Some("body".to_string()))
+                    .with_operator(Operator::And)
+                    .with_fuzziness(Some(2))
+                    .with_max_expansions(7)
+                    .with_prefix_length(3),
+            ],
+        }
+    }
+
+    #[test]
+    fn test_multi_match_query_serde_round_trip() {
+        let query = FtsQuery::MultiMatch(per_leaf_multi_match());
+        let json = serde_json::to_string(&query).unwrap();
+        let round_trip: FtsQuery = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_trip, query);
+    }
+
+    #[test]
+    fn test_multi_match_query_serde_nested_round_trip() {
+        let query = FtsQuery::Boost(BoostQuery::new(
+            FtsQuery::Boolean(BooleanQuery::new([
+                (Occur::Must, FtsQuery::MultiMatch(per_leaf_multi_match())),
+                (
+                    Occur::MustNot,
+                    FtsQuery::Match(
+                        MatchQuery::new("epsilon".to_string())
+                            .with_column(Some("body".to_string())),
+                    ),
+                ),
+            ])),
+            FtsQuery::MultiMatch(per_leaf_multi_match()),
+            Some(0.3),
+        ));
+        let json = serde_json::to_string(&query).unwrap();
+        let round_trip: FtsQuery = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_trip, query);
+    }
+
+    #[test]
+    fn test_multi_match_query_legacy_serde() {
+        use serde_json::json;
+
+        // Writers predating `match_queries` send only these keys; every leaf is
+        // a default `MatchQuery` over the shared terms.
+        let legacy = json!({
+            "query": "alpha beta",
+            "columns": ["title", "body"],
+            "boost": [2.0, 1.0],
+        });
+        let query: MultiMatchQuery = serde_json::from_value(legacy).unwrap();
+        let expected = MultiMatchQuery::try_new(
+            "alpha beta".to_string(),
+            vec!["title".to_string(), "body".to_string()],
+        )
+        .unwrap()
+        .try_with_boosts(vec![2.0, 1.0])
+        .unwrap();
+        assert_eq!(query, expected);
+
+        let without_boost: MultiMatchQuery =
+            serde_json::from_value(json!({"query": "alpha", "columns": ["title"]})).unwrap();
+        assert_eq!(without_boost.match_queries[0].boost, 1.0);
+
+        let error = serde_json::from_value::<MultiMatchQuery>(json!({"columns": ["title"]}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing field `query`"), "{error}");
+        let error = serde_json::from_value::<MultiMatchQuery>(json!({"match_queries": []}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no match queries"), "{error}");
+
+        // A reader predating `match_queries` still finds the legacy keys and
+        // degrades as before: the first leaf's terms over every column.
+        let serialized = serde_json::to_value(per_leaf_multi_match()).unwrap();
+        assert_eq!(serialized["query"], "alpha beta");
+        assert_eq!(serialized["columns"], json!(["title", "body"]));
+        assert_eq!(serialized["boost"], json!([2.0, 1.0]));
     }
 
     #[test]
