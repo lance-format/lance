@@ -1367,14 +1367,18 @@ mod tests {
     use super::*;
 
     use arrow::datatypes::Int32Type;
-    use arrow_array::Float32Array;
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, UInt64Type};
-    use arrow_array::{RecordBatch, StringArray, UInt8Array};
+    use arrow_array::{
+        ArrayRef, FixedSizeListArray, Float16Array, Float32Array, Float64Array, Int32Array,
+        ListArray, RecordBatch, StringArray, UInt8Array,
+    };
     use arrow_schema::{Field as ArrowField, Fields};
     use arrow_select::concat::concat_batches;
     use datafusion::logical_expr::{col, lit};
     use futures::TryStreamExt;
+    use half::f16;
     use lance_arrow::SchemaExt;
     use lance_core::{ROW_ADDR, ROW_ID};
     use lance_file::version::LanceFileVersion;
@@ -1514,6 +1518,182 @@ mod tests {
         let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
         let taken = data.take_rows(&row_ids, projection).await.unwrap();
         assert_eq!(&batch["metadata"], &taken["metadata"]);
+    }
+
+    #[tokio::test]
+    async fn test_sliced_list_batch_nearest() {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        let dataset = &test_ds.dataset;
+        let query_values = (0..4)
+            .map(|query| {
+                (query * 32..(query + 1) * 32)
+                    .map(|value| Some(value as f32))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let queries = ListArray::from_iter_primitive::<Float32Type, _, _>(
+            query_values.iter().cloned().map(Some),
+        );
+
+        for (start, length) in [(0, 4), (0, 2), (1, 2), (2, 2)] {
+            let sliced = queries.slice(start, length);
+            let equivalent = ListArray::from_iter_primitive::<Float32Type, _, _>(
+                query_values[start..start + length]
+                    .iter()
+                    .cloned()
+                    .map(Some),
+            );
+            let mut scanner = dataset.scan();
+            scanner.nearest("vec", &sliced, 5).unwrap();
+            assert_eq!(scanner.nearest_query_count, length);
+            assert_eq!(scanner.nearest.as_ref().unwrap().key.len(), length * 32);
+            assert_eq!(
+                scanner.nearest.as_ref().unwrap().key.as_ref(),
+                equivalent.values().as_ref()
+            );
+
+            for use_index in [false, true] {
+                let search = |query: &ListArray| {
+                    let mut scanner = dataset.scan();
+                    scanner.nearest("vec", query, 5).unwrap();
+                    scanner.use_index(use_index).nprobes(2);
+                    scanner.project(&["i"]).unwrap();
+                    scanner
+                };
+                let actual = search(&sliced).try_into_batch().await.unwrap();
+                let expected = search(&equivalent).try_into_batch().await.unwrap();
+                assert_eq!(
+                    actual[QUERY_INDEX_COL].as_ref(),
+                    expected[QUERY_INDEX_COL].as_ref()
+                );
+                assert_eq!(actual["i"].as_ref(), expected["i"].as_ref());
+                assert_eq!(actual[DIST_COL].as_ref(), expected[DIST_COL].as_ref());
+                assert_eq!(actual.num_rows(), length * 5);
+                let row_numbers = actual["i"].as_primitive::<Int32Type>();
+                assert!(row_numbers.iter().flatten().any(|value| value < 200));
+                assert!(row_numbers.iter().flatten().any(|value| value >= 200));
+            }
+        }
+
+        let fixed_size_queries = FixedSizeListArray::try_new_from_values(
+            Float32Array::from((0..128).map(|value| value as f32).collect::<Vec<_>>()),
+            32,
+        )
+        .unwrap();
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("vec", &fixed_size_queries.slice(1, 2), 5)
+            .unwrap();
+        assert_eq!(scanner.nearest_query_count, 2);
+        assert_eq!(scanner.nearest.as_ref().unwrap().key.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn test_sliced_list_multivector_nearest_key() {
+        let mut vectors = ListBuilder::new(FixedSizeListBuilder::new(Float32Builder::new(), 2));
+        for value in [0.0, 1.0] {
+            vectors.values().values().append_value(value);
+            vectors.values().values().append_value(value);
+            vectors.values().append(true);
+            vectors.append(true);
+        }
+        let vectors = vectors.finish();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "vec",
+            vectors.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        let queries = ListArray::from_iter_primitive::<Float32Type, _, _>(vec![
+            Some(vec![Some(0.0), Some(0.0)]),
+            Some(vec![Some(1.0), Some(1.0)]),
+            Some(vec![Some(2.0), Some(2.0)]),
+            Some(vec![Some(3.0), Some(3.0)]),
+        ]);
+        let sliced = queries.slice(1, 2);
+        let mut scanner = dataset.scan();
+        scanner.nearest("vec", &sliced, 1).unwrap();
+        assert!(!scanner.is_batch_nearest);
+        assert_eq!(scanner.nearest_query_count, 1);
+        assert_eq!(
+            scanner.nearest.as_ref().unwrap().key.as_ref(),
+            &Float32Array::from(vec![1.0, 1.0, 2.0, 2.0])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nearest_query_element_type_conversion() {
+        let float16 = FixedSizeListArray::try_new_from_values(
+            Float16Array::from(vec![f16::from_f32(1.0), f16::from_f32(2.0)]),
+            2,
+        )
+        .unwrap();
+        let float32 =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![1.0, 2.0]), 2).unwrap();
+        let float64 =
+            FixedSizeListArray::try_new_from_values(Float64Array::from(vec![1.0, 2.0]), 2).unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("float16", float16.data_type().clone(), false),
+            ArrowField::new("float32", float32.data_type().clone(), false),
+            ArrowField::new("float64", float64.data_type().clone(), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(float16), Arc::new(float32), Arc::new(float64)],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+
+        let float16_query: ArrayRef = Arc::new(Float16Array::from(vec![
+            f16::from_f32(1.0),
+            f16::from_f32(2.0),
+        ]));
+        let float32_query: ArrayRef = Arc::new(Float32Array::from(vec![1.0, 2.0]));
+        let float64_query: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0]));
+        let integer_query: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+        let list_query: ArrayRef =
+            Arc::new(ListArray::from_iter_primitive::<Float32Type, _, _>(vec![
+                Some(vec![Some(1.0), Some(2.0)]),
+            ]));
+
+        for (column, query) in [
+            ("float32", &float64_query),
+            ("float32", &float16_query),
+            ("float32", &integer_query),
+        ] {
+            let Err(error) = dataset.scan().nearest(column, query.as_ref(), 1) else {
+                panic!("expected {column} to reject {}", query.data_type());
+            };
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            let message = error.to_string();
+            assert!(
+                message.contains("Float32") && message.contains(&query.data_type().to_string()),
+                "unexpected error: {message}"
+            );
+        }
+
+        for (column, query, expected_type) in [
+            ("float16", &float32_query, DataType::Float16),
+            ("float64", &float32_query, DataType::Float64),
+            ("float32", &float32_query, DataType::Float32),
+            ("float64", &float64_query, DataType::Float64),
+            ("float16", &float16_query, DataType::Float16),
+            ("float64", &list_query, DataType::Float64),
+        ] {
+            let mut scan = dataset.scan();
+            scan.nearest(column, query.as_ref(), 1).unwrap();
+            assert_eq!(
+                scan.nearest.as_ref().unwrap().key.data_type(),
+                &expected_type
+            );
+        }
     }
 
     #[rstest]

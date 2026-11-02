@@ -564,14 +564,14 @@ pub struct Scanner {
     /// will always be unordered since we are just going to reorder it anyways.
     ordering: Option<Vec<ColumnOrdering>>,
 
-    pub(super) nearest: Option<Query>,
+    nearest: Option<Query>,
     probe_params: ProbeParams,
     /// Candidate overfetch factor for RQ Fast-to-Accurate refinement.
     quantized_refine_factor: Option<u32>,
-    pub(super) nearest_query_count: usize,
+    nearest_query_count: usize,
     /// True when the query shape represents a batch of single-vector queries
     /// (list-like query on a fixed-size vector column, or multiple concatenated vectors).
-    pub(super) is_batch_nearest: bool,
+    is_batch_nearest: bool,
 
     /// If false, do not use any scalar indices for the scan
     ///
