@@ -1372,14 +1372,14 @@ mod tests {
     use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Float16Array, Float32Array, Float64Array, Int32Array,
-        ListArray, RecordBatch, StringArray, UInt8Array,
+        ListArray, RecordBatch, RecordBatchIterator, StringArray, UInt8Array,
     };
     use arrow_schema::{Field as ArrowField, Fields};
     use arrow_select::concat::concat_batches;
     use datafusion::logical_expr::{col, lit};
     use futures::TryStreamExt;
     use half::f16;
-    use lance_arrow::SchemaExt;
+    use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
     use lance_core::{ROW_ADDR, ROW_ID};
     use lance_file::version::LanceFileVersion;
     use lance_index::IndexType;
