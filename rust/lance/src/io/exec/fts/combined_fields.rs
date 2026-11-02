@@ -51,6 +51,33 @@ use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 /// scan so term statistics are shared across fields. Per-column boosts are baked
 /// into the blended term frequency, so there is no post-scan boost multiplier or
 /// `AggregateExec(max)`. Emits `(ROW_ID, SCORE)` in [`FTS_SCHEMA`].
+///
+/// Reconstruct the leaf with its complete candidate scope and scorer override.
+/// A shared scorer must be reconnected by the enclosing corpus owner; it is not
+/// an independently executable leaf after decoding.
+///
+/// ```
+/// # use lance::{io::exec::fts::CombinedFieldsQueryExec, Error, Result};
+/// # fn rebuild(exec: &CombinedFieldsQueryExec) -> Result<CombinedFieldsQueryExec> {
+/// if exec.has_shared_scorer() {
+///     return Err(Error::invalid_input("reconstruct the enclosing corpus owner"));
+/// }
+/// let mut rebuilt = CombinedFieldsQueryExec::new(
+///     exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+///     exec.prefilter_source().clone(),
+/// ).with_external_mask(exec.external_mask().cloned());
+/// if let Some(fragments) = exec.covered_fragments() {
+///     rebuilt = rebuilt.with_covered_fragments(fragments.clone());
+/// }
+/// if let Some(mask) = exec.overlay_block() {
+///     rebuilt = rebuilt.with_overlay_block(mask.clone());
+/// }
+/// if let Some(scorer) = exec.base_scorer() {
+///     rebuilt = rebuilt.with_base_scorer(scorer.clone());
+/// }
+/// # Ok(rebuilt)
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 
 pub struct CombinedFieldsQueryExec {
@@ -136,7 +163,9 @@ impl CombinedFieldsQueryExec {
 
     /// Exclude the rows whose indexed text a newer data overlay superseded in any
     /// target column. The flat sibling scores them from their current values.
-    pub(crate) fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
+    /// The mask uses the index's row-id domain, including stable row IDs when
+    /// enabled. See [`Self`] for an example preserving it during reconstruction.
+    pub fn with_overlay_block(mut self, overlay_block: RowAddrMask) -> Self {
         self.overlay_block = Some(overlay_block);
         self
     }
@@ -184,6 +213,42 @@ impl CombinedFieldsQueryExec {
 
     pub fn prefilter_source(&self) -> &PreFilterSource {
         &self.prefilter_source
+    }
+
+    /// The opened snapshot that supplies the schema and committed indices.
+    /// See [`Self`] for a reconstruction example.
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    /// Candidate fragments covered by every target column, or `None` for the
+    /// normal index-derived scope. `Some(empty)` selects no candidates.
+    pub fn covered_fragments(&self) -> Option<&roaring::RoaringBitmap> {
+        self.covered_fragments.as_ref()
+    }
+
+    /// Overlay-stale rows excluded from indexed results, in the index's row-id
+    /// domain. `None` means no additional overlay exclusion.
+    pub fn overlay_block(&self) -> Option<&RowAddrMask> {
+        self.overlay_block.as_ref()
+    }
+
+    /// Additional candidate mask, or `None` for no external restriction.
+    /// This mask does not narrow the statistics corpus.
+    pub fn external_mask(&self) -> Option<&Arc<RowAddrMask>> {
+        self.external_mask.as_ref()
+    }
+
+    /// Scorer override, or `None` to use shared or locally built statistics.
+    /// An override takes precedence over the enclosing owner's shared scorer.
+    pub fn base_scorer(&self) -> Option<&Arc<CombinedFieldsBM25Scorer>> {
+        self.base_scorer.as_ref()
+    }
+
+    /// Whether reconstruction must reconnect this leaf to its corpus owner.
+    /// The process-local coordination object is deliberately not exported.
+    pub fn has_shared_scorer(&self) -> bool {
+        self.shared_scorer.is_some()
     }
 
     fn clone_with_prefilter_source(&self, prefilter_source: PreFilterSource) -> Self {

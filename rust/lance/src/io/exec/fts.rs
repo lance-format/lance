@@ -1306,25 +1306,13 @@ mod tests {
             arrow_schema::Field::new("title", DataType::Utf8, true),
             arrow_schema::Field::new("body", DataType::Utf8, true),
         ]));
-        let resolved_fields = query
-            .column_names()
-            .map(|column| {
-                crate::index::scalar::inverted::resolve_fts_field(
-                    dataset.schema(),
-                    column,
-                    DocumentGranularity::Row,
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let num_columns = resolved_fields.len();
+        let num_columns = query.column_names().len();
         let flat = FlatCombinedFieldsExec::try_new(
             dataset.clone(),
             query.clone(),
             params.clone(),
             Arc::new(EmptyExec::new(flat_schema)),
             roaring::RoaringBitmap::new(),
-            resolved_fields,
             FlatStatsScope::PerColumn(vec![FlatStatsCoverage::default(); num_columns]),
             PreFilterSource::None,
         )

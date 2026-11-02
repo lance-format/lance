@@ -5,6 +5,7 @@
 
 use std::sync::{Arc, OnceLock};
 
+use arrow_schema::DataType;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
@@ -15,19 +16,21 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning, PhysicalExpr};
 use futures::stream::{self};
 use futures::{StreamExt, TryStreamExt};
-use lance_core::{Error, Result, utils::tracing::StreamTracingExt};
+use lance_core::{Error, ROW_ID, Result, utils::tracing::StreamTracingExt};
 use lance_select::RowAddrMask;
 
 use crate::Dataset;
 use crate::index::prefilter::DatasetPreFilter;
-use crate::index::scalar::inverted::{ResolvedFtsField, flatten_fts_document_column};
+use crate::index::scalar::inverted::{
+    ResolvedFtsField, flatten_fts_document_column, resolve_fts_field,
+};
 use crate::io::exec::PreFilterSource;
 use crate::io::exec::utils::{PreFilterMasks, build_prefilter_restricted_to_fragments};
 use lance_index::prefilter::PreFilter;
 use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::query::{CombinedFieldsQuery, FtsSearchParams};
 use lance_index::scalar::inverted::{
-    CombinedFieldsBM25Scorer, FTS_SCHEMA, flat_combined_fields_search_stream,
+    CombinedFieldsBM25Scorer, DocumentGranularity, FTS_SCHEMA, flat_combined_fields_search_stream,
 };
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use tracing::instrument;
@@ -78,6 +81,24 @@ pub enum FlatStatsScope {
 /// re-sorted by the planner, exactly as the single-column match path does.
 ///
 /// The input must carry `_rowid` plus every target column of the query.
+/// Field traversal is derived from the pinned dataset schema and query paths,
+/// always at row granularity. A codec preserves the corpus input separately from
+/// the emission prefilter and reconnects shared leaves through their owner.
+///
+/// ```
+/// # use lance::{io::exec::fts::FlatCombinedFieldsExec, Error, Result};
+/// # use datafusion::physical_plan::ExecutionPlan;
+/// # fn rebuild(exec: &FlatCombinedFieldsExec) -> Result<FlatCombinedFieldsExec> {
+/// if exec.has_shared_scorer() {
+///     return Err(Error::invalid_input("reconstruct the enclosing corpus owner"));
+/// }
+/// FlatCombinedFieldsExec::try_new(
+///     exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+///     exec.children()[0].clone(), exec.scanned_fragments().clone(),
+///     exec.stats_scope().clone(), exec.emit_prefilter().clone(),
+/// )
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct FlatCombinedFieldsExec {
     dataset: Arc<Dataset>,
@@ -116,16 +137,23 @@ impl DisplayAs for FlatCombinedFieldsExec {
 }
 
 impl FlatCombinedFieldsExec {
-    /// `resolved_fields` and a [`FlatStatsScope::PerColumn`] scope must hold one
-    /// entry per target column, in query order.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn try_new(
+    /// Reconstruct a flat BM25F scan with its native corpus and candidate scopes.
+    ///
+    /// `scanned_fragments` includes fragments read whole and those supplying
+    /// overlay-stale rows. A [`FlatStatsScope::PerColumn`] entry describes only
+    /// rows missing from that column's index statistics, in query column order;
+    /// its stale rows retain the dataset's row-id domain. Neither this scope nor
+    /// the corpus input may be narrowed to the emission prefilter.
+    ///
+    /// Paths crossing lists read the complete list root; other paths require a
+    /// string column aliased to the query path. The input also needs UInt64
+    /// `_rowid`. See [`Self`] for a reconstruction example.
+    pub fn try_new(
         dataset: Arc<Dataset>,
         query: CombinedFieldsQuery,
         params: FtsSearchParams,
         unindexed_input: Arc<dyn ExecutionPlan>,
         scanned_fragments: roaring::RoaringBitmap,
-        resolved_fields: Vec<ResolvedFtsField>,
         stats_scope: FlatStatsScope,
         emit_prefilter: PreFilterSource,
     ) -> Result<Self> {
@@ -134,14 +162,54 @@ impl FlatCombinedFieldsExec {
             FlatStatsScope::PerColumn(coverage) => coverage.len(),
             FlatStatsScope::WholeCorpus => num_columns,
         };
-        if resolved_fields.len() != num_columns || num_coverage != num_columns {
-            return Err(Error::internal(format!(
-                "combined_fields flat scan got {} resolved fields and {} statistics coverage \
-                 sets for {} target columns",
-                resolved_fields.len(),
-                num_coverage,
-                num_columns
+        if num_coverage != num_columns {
+            return Err(Error::invalid_input(format!(
+                "combined_fields flat scan got {} statistics coverage sets for {} target columns",
+                num_coverage, num_columns
             )));
+        }
+        let resolved_fields = query
+            .column_names()
+            .map(|column| resolve_fts_field(dataset.schema(), column, DocumentGranularity::Row))
+            .collect::<Result<Vec<_>>>()?;
+        let input_schema = unindexed_input.schema();
+        let row_id = input_schema
+            .field_with_name(ROW_ID)
+            .map_err(|_| Error::invalid_input("combined_fields flat input is missing _rowid"))?;
+        if row_id.data_type() != &DataType::UInt64 {
+            return Err(Error::invalid_input(format!(
+                "combined_fields flat input _rowid must be UInt64, got {}",
+                row_id.data_type()
+            )));
+        }
+        for (column, resolved) in query.column_names().zip(&resolved_fields) {
+            let input_name = if resolved.has_lists() {
+                resolved.root_column.as_str()
+            } else {
+                column
+            };
+            let field = input_schema.field_with_name(input_name).map_err(|_| {
+                Error::invalid_input(format!(
+                    "combined_fields flat input is missing column '{input_name}' for '{column}'"
+                ))
+            })?;
+            let is_valid = if resolved.has_lists() {
+                dataset
+                    .schema()
+                    .field(input_name)
+                    .is_some_and(|source| field.data_type() == &source.data_type())
+            } else {
+                matches!(
+                    field.data_type(),
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                )
+            };
+            if !is_valid {
+                return Err(Error::invalid_input(format!(
+                    "combined_fields flat input column '{input_name}' has incompatible type {} for '{column}'",
+                    field.data_type()
+                )));
+            }
         }
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(FTS_SCHEMA.clone()),
@@ -184,6 +252,43 @@ impl FlatCombinedFieldsExec {
         self.shared_scorer
             .as_ref()
             .is_some_and(|shared| Arc::ptr_eq(shared, scorer))
+    }
+
+    /// Snapshot whose schema resolves query paths and whose indices supply
+    /// tokenizer and corpus statistics. See [`Self`] for reconstruction.
+    pub fn dataset(&self) -> &Arc<Dataset> {
+        &self.dataset
+    }
+
+    /// Query paths and field weights in the order used by the statistics scope.
+    pub fn query(&self) -> &CombinedFieldsQuery {
+        &self.query
+    }
+
+    /// Native search parameters. Sorting and top-k remain in the parent plan.
+    pub fn params(&self) -> &FtsSearchParams {
+        &self.params
+    }
+
+    /// Every fragment read by the corpus input, including overlay row reads.
+    pub fn scanned_fragments(&self) -> &roaring::RoaringBitmap {
+        &self.scanned_fragments
+    }
+
+    /// Contributions to each column's statistics, independent of candidates.
+    pub fn stats_scope(&self) -> &FlatStatsScope {
+        &self.stats_scope
+    }
+
+    /// Candidate filter applied after measuring corpus statistics.
+    pub fn emit_prefilter(&self) -> &PreFilterSource {
+        &self.emit_prefilter
+    }
+
+    /// Whether reconstruction must reconnect this producer to its corpus owner.
+    /// The process-local coordination object is deliberately not exported.
+    pub fn has_shared_scorer(&self) -> bool {
+        self.shared_scorer.is_some()
     }
 }
 
