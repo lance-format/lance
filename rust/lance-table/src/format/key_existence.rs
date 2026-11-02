@@ -715,4 +715,22 @@ mod tests {
             "struct row with a null child should not produce a key",
         );
     }
+
+    /// The conflict check concurrent merge-inserts run: disjoint inserted keys
+    /// are not a conflict, and one shared key always is.
+    #[test]
+    fn test_intersects_only_on_a_shared_key() {
+        fn filter(keys: impl IntoIterator<Item = i64>) -> KeyExistenceFilter {
+            let mut builder = KeyExistenceFilterBuilder::new(vec![0]);
+            for key in keys {
+                builder.insert(KeyValue::Int64(key)).unwrap();
+            }
+            builder.build()
+        }
+        let a = filter(0..500);
+        let b = filter(1_000_000..1_000_500);
+        assert_eq!(a.intersects(&b).unwrap(), (false, false));
+        let shared = filter((1_000_000..1_000_500).chain([17]));
+        assert!(shared.intersects(&a).unwrap().0);
+    }
 }

@@ -7,6 +7,8 @@
 
 use super::*;
 use crate::scalar::RowAddrTranslatorRef;
+use lance_arrow::deepcopy::deep_copy_batch_sliced;
+use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 
 use std::collections::VecDeque;
@@ -16,29 +18,51 @@ use futures::future::try_join_all;
 /// One logical page of `bands.lance`, cached per page.
 #[derive(Debug, DeepSizeOf)]
 pub(super) struct BandPage {
-    keys: Vec<u64>,
-    doc_ids: Vec<u32>,
+    batch: RecordBatch,
 }
 
 impl BandPage {
     fn try_from_batch(batch: &RecordBatch) -> Result<Self> {
+        let page = Self {
+            // A page read with other pages must not pin their buffers in the cache.
+            batch: deep_copy_batch_sliced(batch)?,
+        };
+        page.columns()?;
+        Ok(page)
+    }
+
+    fn columns(&self) -> Result<(&[u64], &[u32])> {
         let corrupt = |message: String| Error::corrupt_file_named(BANDS_FILENAME, message);
-        let keys = batch
+        let keys = self
+            .batch
             .column_by_name(BAND_KEY_COL)
             .and_then(|column| column.as_primitive_opt::<UInt64Type>())
             .filter(|keys| keys.null_count() == 0)
             .ok_or_else(|| corrupt(format!("{BAND_KEY_COL} is not a non-null UInt64 column")))?;
-        let doc_ids = batch
+        let doc_ids = self
+            .batch
             .column_by_name(DOC_ID_COL)
             .and_then(|column| column.as_primitive_opt::<UInt32Type>())
             .filter(|doc_ids| doc_ids.null_count() == 0)
             .ok_or_else(|| corrupt(format!("{DOC_ID_COL} is not a non-null UInt32 column")))?;
-        // Copy out of the batch so a cached page neither pins nor is charged
-        // for the buffers of every other page read in the same request.
-        Ok(Self {
-            keys: keys.values().to_vec(),
-            doc_ids: doc_ids.values().to_vec(),
-        })
+        Ok((keys.values(), doc_ids.values()))
+    }
+}
+
+impl CacheCodecImpl for BandPage {
+    const TYPE_ID: &'static str = "lance.scalar.MinHashLshBandPage";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, writer: &mut CacheEntryWriter<'_>) -> Result<()> {
+        writer.write_ipc(&self.batch)
+    }
+
+    fn deserialize(reader: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let page = Self {
+            batch: reader.read_ipc()?,
+        };
+        page.columns()?;
+        Ok(page)
     }
 }
 
@@ -58,6 +82,10 @@ impl CacheKey for BandPageKey {
         "MinHashLshBandPage"
     }
 
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<BandPage>())
+    }
+
     fn schema() -> CacheKeySchema {
         CacheKeySchema::new("lance.scalar.minhashlsh.band-page-key", 1)
     }
@@ -71,9 +99,32 @@ impl CacheKey for BandPageKey {
 /// resident after a prewarm.
 #[derive(Debug, DeepSizeOf)]
 pub(super) struct SignatureChunk {
-    row_ids: Vec<u64>,
-    /// `row_ids.len() * num_hashes` values.
-    signatures: Vec<SignatureValue>,
+    batch: RecordBatch,
+}
+
+impl CacheCodecImpl for SignatureChunk {
+    const TYPE_ID: &'static str = "lance.scalar.MinHashLshSignatureChunk";
+    const CURRENT_VERSION: u32 = 1;
+
+    fn serialize(&self, writer: &mut CacheEntryWriter<'_>) -> Result<()> {
+        writer.write_ipc(&self.batch)
+    }
+
+    fn deserialize(reader: &mut CacheEntryReader<'_>) -> Result<Self> {
+        let batch = reader.read_ipc()?;
+        let num_hashes = batch
+            .column_by_name(SIGNATURE_COL)
+            .and_then(|column| column.as_fixed_size_list_opt())
+            .ok_or_else(|| {
+                Error::corrupt_file_named(
+                    SIGNATURES_FILENAME,
+                    format!("missing FixedSizeList column {SIGNATURE_COL}"),
+                )
+            })?
+            .value_length() as usize;
+        signature_columns(&batch, num_hashes)?;
+        Ok(Self { batch })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +141,10 @@ impl CacheKey for SignatureChunkKey {
 
     fn type_name() -> &'static str {
         "MinHashLshSignatureChunk"
+    }
+
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<SignatureChunk>())
     }
 
     fn schema() -> CacheKeySchema {
@@ -395,9 +450,11 @@ impl MinHashLshIndex {
         for (key, first_page, end_page) in located {
             let first = page(first_page)?;
             let page_start = first_page * self.page_rows;
-            let row = page_start + first.keys.partition_point(|&k| k < key);
+            let (keys, doc_ids) = first.columns()?;
+            let row = page_start + keys.partition_point(|&k| k < key);
             let end = if end_page < num_pages {
-                end_page * self.page_rows + page(end_page)?.keys.partition_point(|&k| k <= key)
+                end_page * self.page_rows
+                    + page(end_page)?.columns()?.0.partition_point(|&k| k <= key)
             } else {
                 // The bucket reaches the end of the file
                 self.bands.num_rows()
@@ -405,8 +462,8 @@ impl MinHashLshIndex {
             if row < end {
                 // The first window is the bucket's rows of the page in hand,
                 // all of them for the usual bucket within one page
-                let window = first.doc_ids
-                    [row - page_start..end.min(page_start + first.doc_ids.len()) - page_start]
+                let window = doc_ids
+                    [row - page_start..end.min(page_start + doc_ids.len()) - page_start]
                     .to_vec();
                 cursors.push(BucketCursor {
                     next: row,
@@ -468,7 +525,7 @@ impl MinHashLshIndex {
         let start = chunk * self.signature_chunk_docs;
         let end = (start + self.signature_chunk_docs).min(self.num_docs);
         let batch = self.signatures.read_range(start..end, None).await?;
-        let (row_ids, signatures) = signature_columns(&batch, num_hashes)?;
+        let (row_ids, _) = signature_columns(&batch, num_hashes)?;
         if row_ids.len() != end - start {
             return Err(Error::corrupt_file_named(
                 SIGNATURES_FILENAME,
@@ -479,8 +536,7 @@ impl MinHashLshIndex {
             ));
         }
         Ok(SignatureChunk {
-            row_ids: row_ids.values().to_vec(),
-            signatures: signatures.to_vec(),
+            batch: deep_copy_batch_sliced(&batch)?,
         })
     }
 
@@ -506,8 +562,9 @@ impl MinHashLshIndex {
             })?;
             let page_start = page as usize * self.page_rows;
             let from = row.max(page_start) - page_start;
-            let until = to.min(page_start + band_page.doc_ids.len()) - page_start;
-            window.extend_from_slice(&band_page.doc_ids[from..until]);
+            let (_, doc_ids) = band_page.columns()?;
+            let until = to.min(page_start + doc_ids.len()) - page_start;
+            window.extend_from_slice(&doc_ids[from..until]);
         }
         Ok(window)
     }
@@ -852,10 +909,11 @@ impl MinHashLshIndex {
                 continue;
             };
             metrics.record_index_cache_hit();
+            let (row_ids, signatures) = signature_columns(&resident.batch, num_hashes)?;
             let first_doc = chunk * chunk_docs;
             for &doc_id in group {
                 let offset = doc_id as usize - first_doc;
-                let Some(row_id) = resident.row_ids.get(offset) else {
+                let Some(row_id) = row_ids.values().get(offset) else {
                     return Err(Error::corrupt_file_named(
                         SIGNATURES_FILENAME,
                         format!("resident signature chunk {chunk} has no doc {doc_id}"),
@@ -863,7 +921,7 @@ impl MinHashLshIndex {
                 };
                 scorer.score(
                     *row_id,
-                    &resident.signatures[offset * num_hashes..(offset + 1) * num_hashes],
+                    &signatures[offset * num_hashes..(offset + 1) * num_hashes],
                 );
             }
         }
@@ -1096,14 +1154,25 @@ pub(super) fn signature_columns(
     num_hashes: usize,
 ) -> Result<(&UInt64Array, &[SignatureValue])> {
     let corrupt = |message: String| Error::corrupt_file_named(SIGNATURES_FILENAME, message);
+    if !(1..=MAX_NUM_HASHES as usize).contains(&num_hashes) {
+        return Err(corrupt(format!(
+            "num_hashes {num_hashes} is outside 1..={MAX_NUM_HASHES}"
+        )));
+    }
     let row_ids = batch
         .column_by_name(ROW_ID)
         .and_then(|column| column.as_primitive_opt::<UInt64Type>())
-        .ok_or_else(|| corrupt(format!("missing UInt64 column {ROW_ID}")))?;
+        .filter(|row_ids| row_ids.null_count() == 0)
+        .ok_or_else(|| corrupt(format!("{ROW_ID} is not a non-null UInt64 column")))?;
     let signatures = batch
         .column_by_name(SIGNATURE_COL)
         .and_then(|column| column.as_fixed_size_list_opt())
-        .ok_or_else(|| corrupt(format!("missing FixedSizeList column {SIGNATURE_COL}")))?;
+        .filter(|signatures| signatures.null_count() == 0)
+        .ok_or_else(|| {
+            corrupt(format!(
+                "{SIGNATURE_COL} is not a non-null FixedSizeList column"
+            ))
+        })?;
     if signatures.value_length() as usize != num_hashes {
         return Err(corrupt(format!(
             "signature width {} does not match num_hashes {num_hashes}",
@@ -1353,4 +1422,244 @@ pub async fn merge_minhash_indices(
         .rebuild_from(signature_sources, None, dest_store)
         .await?;
     first.created_index(files)
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use arrow_array::record_batch;
+    use lance_core::cache::{CacheDecode, CacheEntry};
+    use lance_core::utils::tempfile::TempDir;
+    use rstest::rstest;
+
+    fn signature_batch(row_ids: Vec<u64>, signatures: Vec<u16>, num_hashes: i32) -> RecordBatch {
+        RecordBatch::try_new(
+            signatures_schema(num_hashes),
+            vec![
+                Arc::new(UInt64Array::from(row_ids)),
+                Arc::new(FixedSizeListArray::new(
+                    Arc::new(Field::new("item", DataType::UInt16, false)),
+                    num_hashes,
+                    Arc::new(UInt16Array::from(signatures)),
+                    None,
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn disk_roundtrip(codec: CacheCodec, entry: CacheEntry) -> (CacheEntry, Bytes) {
+        let dir = TempDir::default();
+        let path = dir.std_path().join("minhash.cache");
+        codec
+            .serialize(&entry, &mut std::fs::File::create(&path).unwrap())
+            .unwrap();
+        drop(entry);
+        let payload = std::fs::read(path).unwrap();
+        // Model a backend reading into aligned storage. Misaligned IPC buffers
+        // may be copied by Arrow even though the codec itself does not copy.
+        let mut storage = vec![0; payload.len() + 64];
+        let offset = (storage.as_ptr() as usize).next_multiple_of(64) - storage.as_ptr() as usize;
+        storage[offset..offset + payload.len()].copy_from_slice(&payload);
+        let bytes = Bytes::from(storage).slice(offset..offset + payload.len());
+        let result = codec.deserialize(&bytes).hit().unwrap();
+        // IPC permits EOF after a complete batch instead of the 8-byte EOS marker.
+        let without_eos = bytes.len() - 8;
+        assert!(
+            codec
+                .deserialize(&bytes.slice(..without_eos))
+                .hit()
+                .is_some()
+        );
+        for len in 0..bytes.len() {
+            if len == without_eos {
+                continue;
+            }
+            assert!(
+                matches!(codec.deserialize(&bytes.slice(..len)), CacheDecode::Miss(_)),
+                "accepted truncated entry of {len} bytes"
+            );
+        }
+        (result, bytes)
+    }
+
+    fn assert_zero_copy(batch: &RecordBatch, bytes: &Bytes) {
+        let start = bytes.as_ptr() as usize;
+        let end = start + bytes.len();
+        let mut arrays: Vec<_> = batch
+            .columns()
+            .iter()
+            .map(|column| column.to_data())
+            .collect();
+        while let Some(array) = arrays.pop() {
+            for buffer in array.buffers().iter().filter(|buffer| !buffer.is_empty()) {
+                let ptr = buffer.as_ptr() as usize;
+                assert!(
+                    ptr >= start && ptr + buffer.len() <= end,
+                    "buffer was copied"
+                );
+            }
+            arrays.extend(array.child_data().iter().cloned());
+        }
+    }
+
+    #[rstest]
+    #[case::empty(vec![], vec![], 0..0)]
+    #[case::repeated_keys(vec![0, 0, u64::MAX], vec![0, u32::MAX, 42], 0..3)]
+    #[case::sliced(vec![0, 1, 1, u64::MAX], vec![0, u32::MAX, 42, 9], 1..3)]
+    fn band_page_cache_codec(
+        #[case] keys: Vec<u64>,
+        #[case] doc_ids: Vec<u32>,
+        #[case] rows: Range<usize>,
+    ) {
+        let batch = record_batch!(
+            (BAND_KEY_COL, UInt64, keys.clone()),
+            (DOC_ID_COL, UInt32, doc_ids.clone())
+        )
+        .unwrap()
+        .slice(rows.start, rows.len());
+        let (restored, bytes) = disk_roundtrip(
+            BandPageKey::codec().expect("band pages must support disk caching"),
+            Arc::new(BandPage { batch }),
+        );
+        let restored = restored.downcast_ref::<BandPage>().unwrap();
+        assert_zero_copy(&restored.batch, &bytes);
+        drop(bytes);
+        let (restored_keys, restored_doc_ids) = restored.columns().unwrap();
+        assert_eq!(restored_keys, &keys[rows.clone()]);
+        assert_eq!(restored_doc_ids, &doc_ids[rows]);
+    }
+
+    #[rstest]
+    #[case::empty(vec![], vec![], 128, 0..0)]
+    #[case::one_hash(vec![0, u64::MAX], vec![0, u16::MAX], 1, 0..2)]
+    #[case::two_hashes(vec![7, 1_u64 << 32], vec![0, 1, u16::MAX, 32768], 2, 0..2)]
+    #[case::sliced(vec![99, 7, 1_u64 << 32, 9], vec![9, 9, 0, 1, u16::MAX, 32768, 8, 8], 2, 1..3)]
+    #[case::max_width(vec![u64::MAX], vec![u16::MAX; MAX_NUM_HASHES as usize], MAX_NUM_HASHES as i32, 0..1)]
+    fn signature_chunk_cache_codec(
+        #[case] row_ids: Vec<u64>,
+        #[case] signatures: Vec<u16>,
+        #[case] num_hashes: i32,
+        #[case] rows: Range<usize>,
+    ) {
+        let batch = signature_batch(row_ids.clone(), signatures.clone(), num_hashes)
+            .slice(rows.start, rows.len());
+        let (restored, bytes) = disk_roundtrip(
+            SignatureChunkKey::codec().expect("signature chunks must support disk caching"),
+            Arc::new(SignatureChunk { batch }),
+        );
+        let restored = restored.downcast_ref::<SignatureChunk>().unwrap();
+        assert_zero_copy(&restored.batch, &bytes);
+        drop(bytes);
+        let (restored_row_ids, restored_signatures) =
+            signature_columns(&restored.batch, num_hashes as usize).unwrap();
+        assert_eq!(restored_row_ids.values().as_ref(), &row_ids[rows.clone()]);
+        assert_eq!(
+            restored_signatures,
+            &signatures[rows.start * num_hashes as usize..rows.end * num_hashes as usize]
+        );
+    }
+
+    #[test]
+    fn band_page_owns_only_its_slice() {
+        let batch = record_batch!(
+            (BAND_KEY_COL, UInt64, (0..10_000).collect::<Vec<u64>>()),
+            (DOC_ID_COL, UInt32, (0..10_000).collect::<Vec<u32>>())
+        )
+        .unwrap();
+        let page = BandPage::try_from_batch(&batch.slice(123, 2)).unwrap();
+        assert_eq!(page.columns().unwrap(), (&[123, 124][..], &[123, 124][..]));
+        assert!(page.deep_size_of() < 1024, "page retained the source batch");
+    }
+
+    fn assert_invalid_batch<T: CacheCodecImpl + std::fmt::Debug>(
+        batch: RecordBatch,
+        message: &str,
+    ) {
+        let mut body = Vec::new();
+        CacheEntryWriter::new(&mut body).write_ipc(&batch).unwrap();
+        let bytes = Bytes::from(body);
+        let error = T::deserialize(&mut CacheEntryReader::new(&bytes, 0, 1)).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+        assert!(error.to_string().contains(message), "{error}");
+    }
+
+    #[rstest]
+    #[case::missing_keys(record_batch!((DOC_ID_COL, UInt32, [1])).unwrap(), BAND_KEY_COL)]
+    #[case::wrong_key_type(record_batch!((BAND_KEY_COL, UInt32, [1]), (DOC_ID_COL, UInt32, [1])).unwrap(), BAND_KEY_COL)]
+    #[case::wrong_doc_type(record_batch!((BAND_KEY_COL, UInt64, [1]), (DOC_ID_COL, UInt64, [1])).unwrap(), DOC_ID_COL)]
+    #[case::null_keys(record_batch!((BAND_KEY_COL, UInt64, [None]), (DOC_ID_COL, UInt32, [1])).unwrap(), BAND_KEY_COL)]
+    #[case::null_docs(record_batch!((BAND_KEY_COL, UInt64, [1]), (DOC_ID_COL, UInt32, [None])).unwrap(), DOC_ID_COL)]
+    fn band_page_cache_rejects_invalid_columns(#[case] batch: RecordBatch, #[case] message: &str) {
+        assert_invalid_batch::<BandPage>(batch, message);
+    }
+
+    #[rstest]
+    #[case::zero_width(0)]
+    #[case::too_wide(MAX_NUM_HASHES as i32 + 1)]
+    fn signature_chunk_cache_rejects_invalid_width(#[case] num_hashes: i32) {
+        assert_invalid_batch::<SignatureChunk>(
+            RecordBatch::new_empty(signatures_schema(num_hashes)),
+            "num_hashes",
+        );
+    }
+
+    #[rstest]
+    #[case::null_row_ids(vec![None], vec![Some(vec![Some(1), Some(2)])], ROW_ID)]
+    #[case::null_signatures(vec![Some(1)], vec![None], SIGNATURE_COL)]
+    #[case::null_values(vec![Some(1)], vec![Some(vec![Some(1), None])], SIGNATURE_COL)]
+    fn signature_chunk_cache_rejects_nulls(
+        #[case] row_ids: Vec<Option<u64>>,
+        #[case] signatures: Vec<Option<Vec<Option<u16>>>>,
+        #[case] message: &str,
+    ) {
+        let batch = RecordBatch::try_from_iter(vec![
+            (ROW_ID, Arc::new(UInt64Array::from(row_ids)) as ArrayRef),
+            (
+                SIGNATURE_COL,
+                Arc::new(FixedSizeListArray::from_iter_primitive::<UInt16Type, _, _>(
+                    signatures, 2,
+                )) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        assert_invalid_batch::<SignatureChunk>(batch, message);
+    }
+
+    #[rstest]
+    #[case::missing_signature(record_batch!((ROW_ID, UInt64, [1])).unwrap(), SIGNATURE_COL)]
+    #[case::wrong_signature_type(record_batch!((ROW_ID, UInt64, [1]), (SIGNATURE_COL, UInt16, [1])).unwrap(), SIGNATURE_COL)]
+    fn signature_chunk_cache_rejects_invalid_columns(
+        #[case] batch: RecordBatch,
+        #[case] message: &str,
+    ) {
+        assert_invalid_batch::<SignatureChunk>(batch, message);
+    }
+
+    #[test]
+    fn signature_chunk_cache_batches_writes() {
+        #[derive(Default)]
+        struct CountWrites(usize);
+
+        impl std::io::Write for CountWrites {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 += 1;
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let chunk: CacheEntry = Arc::new(SignatureChunk {
+            batch: signature_batch((0..32).collect(), vec![12345; 32 * 128], 128),
+        });
+        let mut writer = CountWrites::default();
+        SignatureChunkKey::codec()
+            .unwrap()
+            .serialize(&chunk, &mut writer)
+            .unwrap();
+        assert!(writer.0 < 100, "issued {} small writes", writer.0);
+    }
 }

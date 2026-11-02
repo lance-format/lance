@@ -7,7 +7,12 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from lance.sampler import ShardedBatchSampler, ShardedFixedBatchSampler, maybe_sample
+from lance.sampler import (
+    ShardedBatchSampler,
+    ShardedFixedBatchSampler,
+    ShardedFragmentSampler,
+    maybe_sample,
+)
 
 TEST_CONFIG = {
     "total_rows": 1000,
@@ -203,6 +208,25 @@ def test_randomization_effect():
     assert epoch1 != epoch2, "Different epochs should produce different orders"
 
 
+@pytest.mark.parametrize("sampler_cls", [ShardedFragmentSampler, ShardedBatchSampler])
+def test_set_epoch_reshuffles(tmp_path: Path, sampler_cls):
+    ds = lance.write_dataset(
+        pa.table({"id": range(2000)}), tmp_path / "data.lance", max_rows_per_file=100
+    )
+    sampler = sampler_cls(rank=0, world_size=2, randomize=True, seed=42)
+
+    def first_ids():
+        batches = sampler(ds, columns=["id"], batch_size=100)
+        return [batch["id"][0].as_py() for batch in batches]
+
+    sampler.set_epoch(1)
+    epoch1 = first_ids()
+    sampler.set_epoch(2)
+    epoch2 = first_ids()
+
+    assert epoch1 != epoch2, "Different epochs should produce different orders"
+
+
 def test_edge_cases():
     """Validate handling of partial batches and data boundaries."""
 
@@ -276,3 +300,16 @@ def test_sample_dataset(tmp_path: Path, nrows: int):
     assert isinstance(large_scan[0], pa.RecordBatch)
     assert large_scan[0].schema == pa.schema([pa.field("vec", fsl.type)])
     assert large_scan[0].num_rows == min(nrows, 128)
+
+
+@pytest.mark.parametrize("n", [100, 3000, 4095])
+def test_sample_dataset_returns_n_rows(tmp_path: Path, n: int):
+    ds = lance.write_dataset(pa.table({"id": range(10000)}), tmp_path / "data.lance")
+
+    batches = list(maybe_sample(ds, n, ["id"], max_takes=32))
+
+    ids = pa.concat_arrays([batch["id"] for batch in batches]).to_pylist()
+    assert len(ids) == n
+    assert len(set(ids)) == n
+    # Samples are spread over the whole dataset, not just its head.
+    assert max(ids) >= 10000 - 10000 // 32

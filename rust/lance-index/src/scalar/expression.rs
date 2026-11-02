@@ -25,7 +25,7 @@ use super::{
 #[cfg(feature = "geo")]
 use super::{GeoQuery, RelationQuery};
 use lance_core::{Error, Result};
-use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
+use lance_datafusion_exec::expr::{column_names_in_expr, safe_coerce_scalar};
 use lance_select::{IndexExprResult, NullableIndexExprResult, NullableRowAddrMask};
 use roaring::RoaringBitmap;
 use tracing::instrument;
@@ -142,7 +142,7 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
     /// is "x = 7" and we have a scalar index on "x" then we apply the index to the "x" column reference.
     ///
     /// However, some indexes are designed to run on projections of the indexed column.  For example,
-    /// if a query is "json_get_string(json, '$.name') = 'books'" and we have a JSON index on the "json" column
+    /// if a query is "json_get_string(json, 'name') = 'books'" and we have a JSON index on the "json" column
     /// then we apply the index to the projection of the "json" column.
     ///
     /// This function is used to test if a potential column reference is a reference the index handles.
@@ -185,16 +185,111 @@ impl MultiQueryParser {
         self.parsers.push(other);
     }
 
-    /// Pick the first underlying parser whose `is_valid_reference` accepts `expr`.
+    /// Collect every underlying parser whose `is_valid_reference` accepts `expr`.
+    ///
+    /// Reference validation ("does this index handle this column / JSON path?")
+    /// and capability matching ("can this index serve this query shape?") are
+    /// two distinct decisions.  `is_valid_reference` only sees the column
+    /// reference, not the operator, so it cannot answer the second question.
+    /// Committing to the first accepting parser here would, for example, route
+    /// `x > 7` to a bloom filter (which only serves equality) even though a
+    /// btree on the same column could accelerate the range.
+    ///
+    /// We therefore keep *all* parsers that accept the reference and defer the
+    /// capability decision to the `visit_*` calls on the returned
+    /// [`MultiQueryParserView`], which try each candidate in registration order.
+    ///
+    /// All parsers that accept the same reference describe the same underlying
+    /// value, so they agree on its data type; we report the first one.
     pub fn select(
         &self,
         expr: &Expr,
         data_type: &DataType,
-    ) -> Option<(&dyn ScalarQueryParser, DataType)> {
-        self.parsers.iter().find_map(|p| {
-            p.is_valid_reference(expr, data_type)
-                .map(|dt| (p.as_ref(), dt))
-        })
+    ) -> Option<(MultiQueryParserView<'_>, DataType)> {
+        let mut parsers = Vec::new();
+        let mut reference_type = None;
+        for parser in &self.parsers {
+            if let Some(dt) = parser.is_valid_reference(expr, data_type) {
+                reference_type.get_or_insert(dt);
+                parsers.push(parser.as_ref());
+            }
+        }
+        reference_type.map(|dt| (MultiQueryParserView { parsers }, dt))
+    }
+}
+
+/// A borrowed view over the subset of a [`MultiQueryParser`]'s parsers whose
+/// `is_valid_reference` accepted a particular column reference.
+///
+/// It behaves exactly like the parent [`MultiQueryParser`] — every `visit_*`
+/// method fans out to its parsers with the same "first match wins" semantics —
+/// but operates on a borrowed subset rather than owning the parsers.  Selecting
+/// the reference-valid subset up front, then deferring the capability decision
+/// to the `visit_*` calls, lets a column carrying several indexes (e.g. a bloom
+/// filter that only serves equality alongside a btree that serves ranges) pick
+/// the right index per query instead of being locked to whichever parser was
+/// registered first.
+#[derive(Debug)]
+pub struct MultiQueryParserView<'a> {
+    parsers: Vec<&'a dyn ScalarQueryParser>,
+}
+
+impl ScalarQueryParser for MultiQueryParserView<'_> {
+    fn visit_between(
+        &self,
+        column: &str,
+        low: &Bound<ScalarValue>,
+        high: &Bound<ScalarValue>,
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_between(column, low, high))
+    }
+    fn visit_in_list(&self, column: &str, in_list: &[ScalarValue]) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_in_list(column, in_list))
+    }
+    fn visit_is_bool(&self, column: &str, value: bool) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_is_bool(column, value))
+    }
+    fn visit_is_null(&self, column: &str) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_is_null(column))
+    }
+    fn visit_comparison(
+        &self,
+        column: &str,
+        value: &ScalarValue,
+        op: &Operator,
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_comparison(column, value, op))
+    }
+    fn visit_scalar_function(
+        &self,
+        column: &str,
+        data_type: &DataType,
+        func: &ScalarUDF,
+        args: &[Expr],
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_scalar_function(column, data_type, func, args))
+    }
+    fn visit_like(
+        &self,
+        column: &str,
+        like: &Like,
+        pattern: &ScalarValue,
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_like(column, like, pattern))
     }
 }
 
@@ -522,7 +617,8 @@ impl ScalarQueryParser for SargableQueryParser {
 /// - `prefix` is the leading literal portion before any wildcards
 /// - `needs_refine` is true if the pattern has wildcards beyond a simple trailing `%`
 ///
-/// Returns `None` if the pattern starts with a wildcard (no leading literal).
+/// Returns `None` if the pattern starts with a wildcard (no leading literal), has
+/// no unescaped wildcard, or uses an escape character other than backslash.
 ///
 /// Examples:
 /// - "foo%" -> Some(("foo", false)) - pure prefix, no recheck needed
@@ -531,106 +627,54 @@ impl ScalarQueryParser for SargableQueryParser {
 /// - "foo\%bar%" with escape '\' -> Some(("foo%bar", false)) - escaped %, pure prefix
 /// - "%foo" -> None - starts with wildcard, cannot prune
 /// - "foo" -> None - no wildcard at all, use equality instead
+/// - "a\b%" -> Some(("ab", false)) - an escape consumes any character
 fn extract_like_leading_prefix(pattern: &str, escape_char: Option<char>) -> Option<(String, bool)> {
+    // DataFusion's starts_with simplification escapes special characters with backslash
+    // but doesn't set escape_char, so backslash is the default escape. It is also the
+    // only escape the executor defines: DataFusion's physical planner rejects any other
+    // ESCAPE character, so decline here rather than answer a query the executor
+    // refuses (an index query would replace the predicate and skip that rejection).
+    // Pattern: starts_with(col, 'test_ns$') -> col LIKE 'test\_ns$%' (escape_char: None)
+    let esc = match escape_char {
+        None | Some('\\') => '\\',
+        Some(_) => return None,
+    };
+
     let chars: Vec<char> = pattern.chars().collect();
     let len = chars.len();
 
-    if len == 0 {
-        return None;
-    }
-
-    // DataFusion's starts_with simplification escapes special characters with backslash
-    // but doesn't set escape_char. Use backslash as default escape character.
-    // Pattern: starts_with(col, 'test_ns$') -> col LIKE 'test\_ns$%' (escape_char: None)
-    // See: https://github.com/apache/datafusion/issues/XXXX
-    let effective_escape_char = escape_char.or(Some('\\'));
-
-    // Helper to check if a character at position i is escaped
-    let is_escaped = |i: usize| -> bool {
-        if let Some(esc) = effective_escape_char {
-            if i > 0 && chars[i - 1] == esc {
-                // Check if the escape char itself is escaped
-                if i >= 2 && chars[i - 2] == esc {
-                    false // Escape was escaped, so this char is NOT escaped
-                } else {
-                    true // This char is escaped
-                }
-            } else {
-                false
-            }
-        } else {
-            // No escape character defined - nothing can be escaped
-            false
-        }
-    };
-
-    // Pattern must contain at least one unescaped wildcard
-    let has_wildcard = chars.iter().enumerate().any(|(i, &c)| {
-        if c != '%' && c != '_' {
-            return false;
-        }
-        !is_escaped(i)
-    });
-
-    if !has_wildcard {
-        return None; // No wildcards, should use equality
-    }
-
-    // Check if pattern starts with an unescaped wildcard
-    if chars[0] == '%' || chars[0] == '_' {
-        return None; // Starts with wildcard, cannot prune
-    }
-
-    // Extract the leading literal prefix (everything before first unescaped wildcard)
+    // Single left-to-right pass. An escape consumes whatever follows it, matching
+    // arrow's LIKE kernel ("\x" matches a literal x for any x), so wildcard detection
+    // and prefix extraction must share this tokenization: judging a wildcard by its
+    // neighbours alone misreads runs of escapes such as "\\\%".
     let mut prefix = String::new();
     let mut i = 0;
-    let mut found_wildcard = false;
-
+    let mut first_wildcard = None;
     while i < len {
         let c = chars[i];
-
-        // Check for escape character (using effective escape char which may be inferred)
-        if let Some(esc) = effective_escape_char
-            && c == esc
-            && i + 1 < len
-        {
-            let next = chars[i + 1];
-            if next == '%' || next == '_' || next == esc {
-                // Escaped character - add the literal character
-                prefix.push(next);
-                i += 2;
-                continue;
-            }
+        if c == esc && i + 1 < len {
+            prefix.push(chars[i + 1]);
+            i += 2;
+            continue;
         }
-
-        // Check for unescaped wildcard
         if c == '%' || c == '_' {
-            found_wildcard = true;
+            first_wildcard = Some(i);
             break;
         }
-
         prefix.push(c);
         i += 1;
     }
 
+    // No unescaped wildcard: the pattern is an exact literal, use equality instead.
+    let wildcard_at = first_wildcard?;
+    // Starts with a wildcard: nothing to prune on.
     if prefix.is_empty() {
         return None;
     }
 
-    // Check if pattern is just a simple prefix (ends with single % and nothing after)
-    let needs_refine = if found_wildcard && i < len {
-        // Check if we're at a % wildcard
-        if chars[i] == '%' && i + 1 == len {
-            // Pattern is "prefix%" - pure prefix match, no refine needed
-            false
-        } else {
-            // Pattern has more after first wildcard, or has _ wildcard
-            true
-        }
-    } else {
-        // No wildcard found (shouldn't happen due to earlier check)
-        false
-    };
+    // "prefix%" is a pure prefix match; anything after the first wildcard, or a `_`
+    // wildcard, needs the original predicate re-applied.
+    let needs_refine = !(chars[wildcard_at] == '%' && wildcard_at + 1 == len);
 
     Some((prefix, needs_refine))
 }
@@ -933,11 +977,13 @@ impl ScalarQueryParser for TextQueryParser {
 
         let query = match func.name() {
             "contains" if args.len() == 2 => {
-                // A pattern shorter than the index's token width produces no
-                // tokens, so the index can only answer "recheck everything".
-                // Leave it to a full scan instead.  The count is in characters
-                // because tokenizers split on characters, not bytes.
-                if pattern.chars().count() < self.min_contains_chars {
+                // Every non-null string contains the empty pattern, so no index
+                // can narrow it down.  A pattern shorter than the index's token
+                // width produces no tokens, so the index can only answer
+                // "recheck everything".  Leave both to a full scan instead.  The
+                // count is in characters because tokenizers split on characters,
+                // not bytes.
+                if pattern.is_empty() || pattern.chars().count() < self.min_contains_chars {
                     return None;
                 }
                 TextQuery::StringContains(pattern)
@@ -1058,7 +1104,8 @@ fn like_to_regex(pattern: &str, escape: Option<char>) -> Option<String> {
 /// predicate to a full recheck rather than risk changing its semantics.
 fn apply_regex_flags(pattern: &str, flags_expr: &Expr) -> Option<String> {
     let (Expr::Literal(ScalarValue::Utf8(Some(flags)), _)
-    | Expr::Literal(ScalarValue::LargeUtf8(Some(flags)), _)) = flags_expr
+    | Expr::Literal(ScalarValue::LargeUtf8(Some(flags)), _)
+    | Expr::Literal(ScalarValue::Utf8View(Some(flags)), _)) = flags_expr
     else {
         return None;
     };
@@ -2086,6 +2133,19 @@ fn extract_nested_column_path(expr: &Expr) -> Option<String> {
     Some(lance_core::datatypes::format_field_path(&field_refs))
 }
 
+/// Whether `data_type` is one of Arrow's three plain string encodings.
+///
+/// The three carry the same values with the same ordering, so a cast between them
+/// preserves equality, ordering and nullness.  That is what makes it sound both to
+/// look through such a cast on a column reference and to renormalize a literal from
+/// one variant to another.
+fn is_plain_string(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
+}
+
 // Extract a column from the expression, if it is a column, and we have an index for that column, or None
 //
 // There's two ways to get a column.  First, the obvious way, is a
@@ -2095,7 +2155,7 @@ fn extract_nested_column_path(expr: &Expr) -> Option<String> {
 fn maybe_indexed_column<'b>(
     expr: &Expr,
     index_info: &'b dyn IndexInformationProvider,
-) -> Option<(String, DataType, &'b dyn ScalarQueryParser)> {
+) -> Option<(String, DataType, MultiQueryParserView<'b>)> {
     // First try to extract the full nested column path for get_field expressions
     if let Some(nested_path) = extract_nested_column_path(expr)
         && let Some((data_type, multi)) = index_info.get_index(&nested_path)
@@ -2120,6 +2180,18 @@ fn maybe_indexed_column<'b>(
             let (data_type, multi) = index_info.get_index(col)?;
             let (parser, data_type) = multi.select(expr, data_type)?;
             Some((col.to_string(), data_type, parser))
+        }
+        // DataFusion's LIKE coercion promotes both operands to a common string type
+        // and casts the column to it, and no later pass unwraps that cast the way
+        // `unwrap_cast_in_comparison` does for a comparison.  Looking through it is
+        // what keeps a LIKE whose pattern is a wider string variant on the index
+        // instead of a full scan; restricting it to casts that stay within the string
+        // types is what keeps the index answer equal to the original predicate, which
+        // matters because an exact answer skips the recheck.
+        Expr::Cast(cast) => {
+            let (column, data_type, parser) = maybe_indexed_column(&cast.expr, index_info)?;
+            (is_plain_string(&data_type) && is_plain_string(cast.field.data_type()))
+                .then_some((column, data_type, parser))
         }
         _ => None,
     }
@@ -2423,12 +2495,23 @@ fn visit_like_expr(
     like: &Like,
     index_info: &dyn IndexInformationProvider,
 ) -> Option<IndexedExpression> {
-    let (column, _, query_parser) = maybe_indexed_column(&like.expr, index_info)?;
+    let (column, col_type, query_parser) = maybe_indexed_column(&like.expr, index_info)?;
 
     // Extract the pattern as a ScalarValue
-    let pattern = match like.pattern.as_ref() {
-        Expr::Literal(scalar, _) => scalar.clone(),
-        _ => return None,
+    let Expr::Literal(pattern, _) = like.pattern.as_ref() else {
+        return None;
+    };
+
+    // Every other visitor coerces its operand to the indexed column's type through
+    // `maybe_scalar`; LIKE has to as well.  Once the column-side coercion cast is
+    // looked through, the pattern can be a wider string variant than the indexed
+    // data, and a parser that takes its bound's type from the pattern would emit a
+    // bound the index cannot compare against.  A non-string reference (a dictionary
+    // column, which the LIKE coercion leaves uncast) keeps its pattern verbatim.
+    let pattern = if is_plain_string(&col_type) {
+        safe_coerce_scalar(pattern, &col_type)?
+    } else {
+        pattern.clone()
     };
 
     query_parser.visit_like(&column, like, &pattern)
@@ -2565,14 +2648,14 @@ impl FilterPlan {
     pub fn all_columns(&self) -> Vec<String> {
         self.full_expr
             .as_ref()
-            .map(Planner::column_names_in_expr)
+            .map(column_names_in_expr)
             .unwrap_or_default()
     }
 
     pub fn refine_columns(&self) -> Vec<String> {
         self.refine_expr
             .as_ref()
-            .map(Planner::column_names_in_expr)
+            .map(column_names_in_expr)
             .unwrap_or_default()
     }
 
@@ -2601,49 +2684,39 @@ impl FilterPlan {
     }
 }
 
-pub trait PlannerIndexExt {
-    /// Determine how to apply a provided filter
-    ///
-    /// We parse the filter into a logical expression.  We then
-    /// split the logical expression into a portion that can be
-    /// satisfied by an index search (of one or more indices) and
-    /// a refine portion that must be applied after the index search
-    fn create_filter_plan(
-        &self,
-        filter: Expr,
-        index_info: &dyn IndexInformationProvider,
-        use_scalar_index: bool,
-    ) -> Result<FilterPlan>;
-}
-
-impl PlannerIndexExt for Planner {
-    fn create_filter_plan(
-        &self,
-        filter: Expr,
-        index_info: &dyn IndexInformationProvider,
-        use_scalar_index: bool,
-    ) -> Result<FilterPlan> {
-        let logical_expr = self.optimize_expr(filter)?;
-        if use_scalar_index {
-            let indexed_expr = apply_scalar_indices(logical_expr.clone(), index_info)?;
-            let mut skip_recheck = false;
-            if let Some(scalar_query) = indexed_expr.scalar_query.as_ref() {
-                skip_recheck = !scalar_query.needs_recheck();
-            }
-            Ok(FilterPlan {
-                index_query: indexed_expr.scalar_query,
-                refine_expr: indexed_expr.refine_expr,
-                full_expr: Some(logical_expr),
-                skip_recheck,
-            })
-        } else {
-            Ok(FilterPlan {
-                index_query: None,
-                skip_recheck: true,
-                refine_expr: Some(logical_expr.clone()),
-                full_expr: Some(logical_expr),
-            })
+/// Determine how to apply a provided filter
+///
+/// The filter is split into a portion that can be satisfied by an index
+/// search (of one or more indices) and a refine portion that must be applied
+/// after the index search.
+///
+/// `filter` should already be optimized (e.g. by `Planner::optimize_expr` in
+/// `lance-datafusion`), since index matching relies on the simplified and
+/// type-coerced form of the expression.
+pub fn create_filter_plan(
+    filter: Expr,
+    index_info: &dyn IndexInformationProvider,
+    use_scalar_index: bool,
+) -> Result<FilterPlan> {
+    if use_scalar_index {
+        let indexed_expr = apply_scalar_indices(filter.clone(), index_info)?;
+        let mut skip_recheck = false;
+        if let Some(scalar_query) = indexed_expr.scalar_query.as_ref() {
+            skip_recheck = !scalar_query.needs_recheck();
         }
+        Ok(FilterPlan {
+            index_query: indexed_expr.scalar_query,
+            refine_expr: indexed_expr.refine_expr,
+            full_expr: Some(filter),
+            skip_recheck,
+        })
+    } else {
+        Ok(FilterPlan {
+            index_query: None,
+            skip_recheck: true,
+            refine_expr: Some(filter.clone()),
+            full_expr: Some(filter),
+        })
     }
 }
 
@@ -2657,6 +2730,7 @@ mod tests {
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::simplify::SimplifyContext;
     use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
+    use lance_datafusion::planner::Planner;
     use lance_select::result::IndexExprResultWireFormat;
     use roaring::RoaringBitmap;
     use rstest::rstest;
@@ -2918,9 +2992,8 @@ mod tests {
         let filter = planner
             .parse_filter("user_profile.basic.age > 900")
             .unwrap();
-        let plan = planner
-            .create_filter_plan(filter, &index_info, true)
-            .unwrap();
+        let plan =
+            create_filter_plan(planner.optimize_expr(filter).unwrap(), &index_info, true).unwrap();
         let expected = IndexedExpression::index_query(
             column.to_string(),
             format!("{column}_idx"),
@@ -2953,7 +3026,19 @@ mod tests {
     #[case("temp = 1", SargableQuery::Equals(f16_scalar(1.0)))]
     #[case(
         "temp < 1.0",
-        SargableQuery::Range(Bound::Unbounded, Bound::Excluded(f16_scalar(1.0)))
+        SargableQuery::Range(
+            Bound::Included(f16_scalar(f32::NEG_INFINITY)),
+            Bound::Excluded(f16_scalar(1.0))
+        )
+    )]
+    // A two-sided bound needs neither negative-NaN range, so it stays one range.
+    #[case(
+        "temp BETWEEN 1.0 AND 2.5",
+        SargableQuery::Range(Bound::Included(f16_scalar(1.0)), Bound::Included(f16_scalar(2.5)))
+    )]
+    #[case(
+        "temp > 0.0 AND temp < 2.5",
+        SargableQuery::Range(Bound::Excluded(f16_scalar(0.0)), Bound::Excluded(f16_scalar(2.5)))
     )]
     #[case(
         // Four elements so DataFusion's `ShortenInListSimplifier` leaves the list
@@ -2983,9 +3068,8 @@ mod tests {
 
         let planner = Planner::new(Arc::new(schema));
         let filter = planner.parse_filter(expr).unwrap();
-        let plan = planner
-            .create_filter_plan(filter, &index_info, true)
-            .unwrap();
+        let plan =
+            create_filter_plan(planner.optimize_expr(filter).unwrap(), &index_info, true).unwrap();
         let wanted = IndexedExpression::index_query(
             "temp".to_string(),
             "temp_idx".to_string(),
@@ -3049,7 +3133,7 @@ mod tests {
                 ColInfo::new(
                     DataType::LargeBinary,
                     Box::new(JsonQueryParser::new(
-                        "$.name".to_string(),
+                        "name".to_string(),
                         Box::new(SargableQueryParser::new(
                             "json_idx".to_string(),
                             "BTree".to_string(),
@@ -3064,23 +3148,27 @@ mod tests {
         // the index was trained on, so they route.
         check_simple(
             &index_info,
-            "json_get_string(json, '$.name') = 'foo'",
+            "json_get_string(json, 'name') = 'foo'",
             "json",
             JsonQuery::new(
                 Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
                     "foo".to_string(),
                 )))),
-                "$.name".to_string(),
+                "name".to_string(),
             ),
         );
         // `json_extract` evaluates to serialized JSON text, which does not match the
         // decoded keys in the index, so it must not route.
         // https://github.com/lance-format/lance/issues/8806
-        check_no_index(&index_info, "json_extract(json, '$.name') = 'foo'");
-        check_no_index(&index_info, "json_extract(json, '$.name') = '\"foo\"'");
-        check_no_index(&index_info, "json_extract(json, '$.name') < 'foo'");
+        check_no_index(&index_info, "json_extract(json, 'name') = 'foo'");
+        check_no_index(&index_info, "json_extract(json, 'name') = '\"foo\"'");
+        check_no_index(&index_info, "json_extract(json, 'name') < 'foo'");
+        // Root-prefixed and nested JSONPath expressions do not have the same
+        // semantics as the typed accessors' literal key argument.
+        check_no_index(&index_info, "json_get_string(json, '$.name') = 'foo'");
+        check_no_index(&index_info, "json_get_string(json, 'name.first') = 'foo'");
         // A typed accessor on a path the index was not built for still declines.
-        check_no_index(&index_info, "json_get_string(json, '$.other') = 'foo'");
+        check_no_index(&index_info, "json_get_string(json, 'other') = 'foo'");
 
         check_no_index(&index_info, "size BETWEEN 5 AND 10");
         // Cast case.  We will cast 5 (an int64) to Int16 and then coerce to UInt32
@@ -3658,10 +3746,32 @@ mod tests {
         // With backslash as default escape (for DataFusion starts_with compatibility):
         // "foo\%" means escaped %, no wildcard -> None (should use equality)
         assert_eq!(extract_like_leading_prefix(r"foo\%", None), None);
-        // "foo\bar%" - \b is not a valid escape sequence, so \ and b are literals, % is wildcard
+        // "foo\bar%" - the escape consumes whatever follows it, so \b is a literal
+        // 'b' (arrow's LIKE kernel matches "\x" against "x" for any x), and the
+        // prefix must be "foobar" or the index would select rows starting with
+        // "foo\bar" and miss the correct ones.
         assert_eq!(
             extract_like_leading_prefix(r"foo\bar%", None),
-            Some(("foo\\bar".to_string(), false))
+            Some(("foobar".to_string(), false))
+        );
+        assert_eq!(
+            extract_like_leading_prefix(r"foo\bar%", Some('\\')),
+            Some(("foobar".to_string(), false))
+        );
+
+        // Only backslash escapes are defined by the executor (DataFusion rejects any
+        // other ESCAPE character at physical planning); declining keeps the index
+        // from answering a query the executor would refuse.
+        assert_eq!(extract_like_leading_prefix(r"a!b%", Some('!')), None);
+
+        // Wildcard detection must use the same escape-pair tokenization as prefix
+        // extraction: three backslashes then % is the exact literal "\%" (no
+        // wildcard), while a trailing % after it is a prefix on "\%".
+        assert_eq!(extract_like_leading_prefix(r"\\\%", Some('\\')), None);
+        assert_eq!(extract_like_leading_prefix(r"\\\%", None), None);
+        assert_eq!(
+            extract_like_leading_prefix(r"\\\%%", None),
+            Some(("\\%".to_string(), false))
         );
 
         // Empty pattern
@@ -3720,6 +3830,44 @@ mod tests {
         } else {
             panic!("Expected Query variant");
         }
+
+        // Escape followed by an ordinary character: LIKE 'a\b%' means "starts with
+        // ab" under arrow's LIKE semantics, so the index prefix must be "ab" (and
+        // needs no refine). A prefix of "a\b" would select disjoint rows with no
+        // recheck to catch it.
+        let expr = state
+            .create_logical_expr("color LIKE 'a\\b%'", &df_schema)
+            .unwrap();
+        let result = apply_scalar_indices(expr, &index_info).unwrap();
+        assert!(
+            result.refine_expr.is_none(),
+            "Escaped literal prefix should not need refine_expr"
+        );
+        if let Some(ScalarIndexExpr::Query(search)) = &result.scalar_query {
+            let query = search.query.as_any().downcast_ref::<SargableQuery>();
+            match query.unwrap() {
+                SargableQuery::LikePrefix(prefix) => {
+                    assert_eq!(prefix, &ScalarValue::Utf8(Some("ab".to_string())));
+                }
+                _ => panic!("Expected LikePrefix query"),
+            }
+        } else {
+            panic!("Expected Query variant");
+        }
+
+        // A non-backslash ESCAPE is accepted by the SQL layer but rejected by
+        // DataFusion's physical planner; the index must decline rather than answer
+        // a query the executor refuses (it would otherwise replace the predicate
+        // entirely and skip the planner's rejection).
+        let expr = state
+            .create_logical_expr("color LIKE 'a!b%' ESCAPE '!'", &df_schema)
+            .unwrap();
+        let result = apply_scalar_indices(expr, &index_info).unwrap();
+        assert!(
+            result.scalar_query.is_none(),
+            "non-backslash escape must not be accelerated, got {:?}",
+            result.scalar_query
+        );
 
         // Complex pattern: LIKE 'foo%bar%' -> LikePrefix("foo"), with refine_expr
         let expr = state
@@ -4011,6 +4159,204 @@ mod tests {
         assert_like_prefix(&indexed, &ScalarValue::Utf8(Some("foo".to_string())), false);
     }
 
+    /// Run a filter through the real planner so the assertion covers DataFusion's
+    /// type coercion instead of a hand-shaped expression.
+    fn plan_filter(
+        schema: Schema,
+        expr: Expr,
+        index_info: &dyn IndexInformationProvider,
+    ) -> FilterPlan {
+        let planner = Planner::new(Arc::new(schema));
+        create_filter_plan(planner.optimize_expr(expr).unwrap(), index_info, true).unwrap()
+    }
+
+    fn like_expr(pattern: ScalarValue) -> Expr {
+        Expr::Like(Like::new(
+            false,
+            Box::new(Expr::Column(Column::new_unqualified("color"))),
+            Box::new(Expr::Literal(pattern, None)),
+            None,
+            false,
+        ))
+    }
+
+    fn ngram_index_info() -> MockIndexInfoProvider {
+        MockIndexInfoProvider::new(vec![(
+            "color",
+            ColInfo::new(
+                DataType::Utf8,
+                Box::new(TextQueryParser::new(
+                    "color_idx".to_string(),
+                    "NGram".to_string(),
+                    true,
+                    true,
+                    3,
+                )),
+            ),
+        )])
+    }
+
+    fn expect_query<Q: AnyQuery>(plan: &FilterPlan) -> &Q {
+        let Some(ScalarIndexExpr::Query(search)) = plan.index_query.as_ref() else {
+            panic!("expected a scalar index query, got {:?}", plan.index_query);
+        };
+        assert_eq!(search.column, "color");
+        assert_eq!(search.index_name, "color_idx");
+        search
+            .query
+            .as_any()
+            .downcast_ref::<Q>()
+            .expect("unexpected query type")
+    }
+
+    // A `LIKE` whose pattern literal is a wider string variant than the indexed
+    // column makes DataFusion's `like_coercion` promote *both* operands, which wraps
+    // the column in a `Cast`.  Unlike a comparison, no later pass unwraps that cast,
+    // so index discovery has to look through it or the predicate silently falls back
+    // to a full scan.
+    #[rstest]
+    #[case::utf8_view(ScalarValue::Utf8View(Some("%foobar%".to_string())))]
+    #[case::large_utf8(ScalarValue::LargeUtf8(Some("%foobar%".to_string())))]
+    #[case::utf8(ScalarValue::Utf8(Some("%foobar%".to_string())))]
+    fn test_planner_ngram_like_string_variants(#[case] pattern: ScalarValue) {
+        let index_info = ngram_index_info();
+        let plan = plan_filter(
+            Schema::new(vec![Field::new("color", DataType::Utf8, true)]),
+            like_expr(pattern),
+            &index_info,
+        );
+
+        assert_eq!(
+            expect_query::<TextQuery>(&plan),
+            &TextQuery::Regex(".*foobar.*".to_string())
+        );
+        assert!(plan.refine_expr.is_some());
+        assert!(!plan.skip_recheck);
+    }
+
+    // The emitted bound must carry the *indexed* column's string variant, not the
+    // pattern's: a `LargeUtf8` bound against `Utf8` page statistics compares as
+    // `None` in the zone map (pruning every zone) and fails the BTree's physical
+    // `LIKE`, which asserts both sides share a type.
+    #[rstest]
+    #[case::utf8_col_utf8_pattern(DataType::Utf8, ScalarValue::Utf8(Some("foo%".to_string())), ScalarValue::Utf8(Some("foo".to_string())))]
+    #[case::utf8_col_view_pattern(DataType::Utf8, ScalarValue::Utf8View(Some("foo%".to_string())), ScalarValue::Utf8(Some("foo".to_string())))]
+    #[case::utf8_col_large_pattern(DataType::Utf8, ScalarValue::LargeUtf8(Some("foo%".to_string())), ScalarValue::Utf8(Some("foo".to_string())))]
+    #[case::large_col_large_pattern(DataType::LargeUtf8, ScalarValue::LargeUtf8(Some("foo%".to_string())), ScalarValue::LargeUtf8(Some("foo".to_string())))]
+    #[case::large_col_view_pattern(DataType::LargeUtf8, ScalarValue::Utf8View(Some("foo%".to_string())), ScalarValue::LargeUtf8(Some("foo".to_string())))]
+    #[case::large_col_utf8_pattern(DataType::LargeUtf8, ScalarValue::Utf8(Some("foo%".to_string())), ScalarValue::LargeUtf8(Some("foo".to_string())))]
+    fn test_planner_like_prefix_normalizes_to_index_type(
+        #[case] column_type: DataType,
+        #[case] pattern: ScalarValue,
+        #[case] expected_prefix: ScalarValue,
+    ) {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "color",
+            ColInfo::new(
+                column_type.clone(),
+                Box::new(SargableQueryParser::new(
+                    "color_idx".to_string(),
+                    "BTree".to_string(),
+                    false,
+                )),
+            ),
+        )]);
+        let plan = plan_filter(
+            Schema::new(vec![Field::new("color", column_type, true)]),
+            like_expr(pattern),
+            &index_info,
+        );
+
+        assert_eq!(
+            expect_query::<SargableQuery>(&plan),
+            &SargableQuery::LikePrefix(expected_prefix)
+        );
+        assert!(plan.refine_expr.is_none());
+        assert!(plan.skip_recheck);
+    }
+
+    // `regexp_like`'s per-argument coercible signature never unifies its arguments,
+    // so the flags literal reaches the parser with whatever string variant the
+    // caller built and the column is left uncast.  The flag is `s` rather than `i`
+    // because a case-insensitive pattern yields no usable trigram.
+    #[rstest]
+    #[case::utf8(ScalarValue::Utf8(Some("s".to_string())))]
+    #[case::large_utf8(ScalarValue::LargeUtf8(Some("s".to_string())))]
+    #[case::utf8_view(ScalarValue::Utf8View(Some("s".to_string())))]
+    fn test_planner_regexp_flags_string_variants(#[case] flags: ScalarValue) {
+        let schema = Schema::new(vec![Field::new("color", DataType::Utf8, true)]);
+        let df_schema: DFSchema = schema.clone().try_into().unwrap();
+        let ctx = get_session_context(&LanceExecutionOptions::default());
+        let Expr::ScalarFunction(mut regexp_like) = ctx
+            .state()
+            .create_logical_expr("regexp_like(color, 'foobar', 's')", &df_schema)
+            .unwrap()
+        else {
+            panic!("expected regexp_like to parse as a scalar function");
+        };
+        regexp_like.args[2] = Expr::Literal(flags, None);
+
+        let index_info = ngram_index_info();
+        let plan = plan_filter(schema, Expr::ScalarFunction(regexp_like), &index_info);
+
+        assert_eq!(
+            expect_query::<TextQuery>(&plan),
+            &TextQuery::Regex("(?s)foobar".to_string())
+        );
+    }
+
+    // Looking through a cast is only sound while it stays inside the string types,
+    // which share a value domain and an ordering.  A cast that crosses out of them
+    // changes what the predicate means, so the index must not answer it.
+    #[test]
+    fn test_planner_rejects_cast_out_of_string_types() {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "color",
+            ColInfo::new(
+                DataType::Utf8,
+                Box::new(SargableQueryParser::new(
+                    "color_idx".to_string(),
+                    "BTree".to_string(),
+                    false,
+                )),
+            ),
+        )]);
+        let schema = Schema::new(vec![Field::new("color", DataType::Utf8, true)]);
+        let planner = Planner::new(Arc::new(schema));
+        let expr = planner
+            .parse_filter("cast(color as bigint) is null")
+            .unwrap();
+        let plan =
+            create_filter_plan(planner.optimize_expr(expr).unwrap(), &index_info, true).unwrap();
+
+        assert!(plan.index_query.is_none());
+        assert_eq!(plan.refine_expr, plan.full_expr);
+    }
+
+    // The same guard from the other side: the cast target is a string type but the
+    // indexed values are not, so the index's ordering is not the string ordering.
+    #[test]
+    fn test_planner_rejects_cast_from_non_string_column() {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "color",
+            ColInfo::new(
+                DataType::LargeBinary,
+                Box::new(SargableQueryParser::new(
+                    "color_idx".to_string(),
+                    "BTree".to_string(),
+                    false,
+                )),
+            ),
+        )]);
+        let plan = plan_filter(
+            Schema::new(vec![Field::new("color", DataType::LargeBinary, true)]),
+            like_expr(ScalarValue::Utf8(Some("foo%".to_string()))),
+            &index_info,
+        );
+
+        assert!(plan.index_query.is_none());
+    }
+
     #[test]
     fn test_sargable_query_parser_without_like_prefix() {
         // Bitmap indexes configure the parser with `without_like_prefix`: a bitmap index
@@ -4235,9 +4581,9 @@ mod tests {
     #[test]
     fn test_multi_json_indices_route_by_path() {
         // Build a MultiQueryParser containing two JSON sub-parsers: one for
-        // path "$.a" and one for path "$.b".
+        // path "a" and one for path "b".
         let mut multi = MultiQueryParser::single(Box::new(JsonQueryParser::new(
-            "$.a".to_string(),
+            "a".to_string(),
             Box::new(SargableQueryParser::new(
                 "json_a_idx".to_string(),
                 "Json".to_string(),
@@ -4245,7 +4591,7 @@ mod tests {
             )),
         )));
         multi.add(Box::new(JsonQueryParser::new(
-            "$.b".to_string(),
+            "b".to_string(),
             Box::new(SargableQueryParser::new(
                 "json_b_idx".to_string(),
                 "Json".to_string(),
@@ -4267,12 +4613,12 @@ mod tests {
                 Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
                     "foo".to_string(),
                 )))),
-                "$.b".to_string(),
+                "b".to_string(),
             )),
         );
         check(
             &index_info,
-            "json_get_string(json, '$.b') = 'foo'",
+            "json_get_string(json, 'b') = 'foo'",
             Some(expected_b),
             false,
         );
@@ -4286,18 +4632,78 @@ mod tests {
                 Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
                     "foo".to_string(),
                 )))),
-                "$.a".to_string(),
+                "a".to_string(),
             )),
         );
         check(
             &index_info,
-            "json_get_string(json, '$.a') = 'foo'",
+            "json_get_string(json, 'a') = 'foo'",
             Some(expected_a),
             false,
         );
 
         // Query against an unindexed path must not bind to either index.
-        check_no_index(&index_info, "json_get_string(json, '$.c') = 'foo'");
+        check_no_index(&index_info, "json_get_string(json, 'c') = 'foo'");
+    }
+
+    /// Regression test for https://github.com/lance-format/lance/issues/7091.
+    ///
+    /// When a column carries both a bloom filter (equality only) and a btree
+    /// (ranges) index, parser selection must not commit to a single index based
+    /// on the column reference alone.  With the bloom filter registered first,
+    /// a range query like `size > 7` would otherwise be intercepted by the
+    /// bloom parser (which returns `None` for ranges) and fall back to a full
+    /// scan, even though the btree can serve it.
+    #[test]
+    fn test_multi_index_defers_to_operator_capability() {
+        // Register the bloom filter *first* so the pre-fix "first valid
+        // reference wins" behavior would route every query to it.
+        let mut multi = MultiQueryParser::single(Box::new(BloomFilterQueryParser::new(
+            "size_bloom_idx".to_string(),
+            "BloomFilter".to_string(),
+            false,
+        )));
+        multi.add(Box::new(SargableQueryParser::new(
+            "size_btree_idx".to_string(),
+            "BTree".to_string(),
+            false,
+        )));
+
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "size",
+            ColInfo::with_multi(DataType::Float32, Box::new(multi)),
+        )]);
+
+        // `size > 7`: bloom can't serve ranges, so the btree must pick it up.
+        check(
+            &index_info,
+            "size > 7",
+            Some(IndexedExpression::index_query(
+                "size".to_string(),
+                "size_btree_idx".to_string(),
+                "BTree".to_string(),
+                Arc::new(SargableQuery::Range(
+                    Bound::Excluded(ScalarValue::Float32(Some(7.0))),
+                    Bound::Unbounded,
+                )),
+            )),
+            false,
+        );
+
+        // `size = 7`: the bloom filter is registered first and serves equality,
+        // so it still wins for the query shape it supports.
+        check(
+            &index_info,
+            "size = 7",
+            Some(IndexedExpression::index_query_with_recheck(
+                "size".to_string(),
+                "size_bloom_idx".to_string(),
+                "BloomFilter".to_string(),
+                Arc::new(BloomFilterQuery::Equals(ScalarValue::Float32(Some(7.0)))),
+                false,
+            )),
+            false,
+        );
     }
 
     #[test]

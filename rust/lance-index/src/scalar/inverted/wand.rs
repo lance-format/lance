@@ -2444,6 +2444,9 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // `None` means the window has not been initialized yet and the next
     // candidate must refresh block-max state before making pruning decisions.
     up_to: Option<u64>,
+    // First unchecked disjunction doc. Head postings may jump beyond this
+    // while a clause stays parked in tail under a window-local bound.
+    or_next_target: u64,
     // For conjunctions, this is the maximum attainable score for the current
     // block-max window `[target, up_to]`.
     and_max_score: f32,
@@ -2580,6 +2583,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             tail: BinaryHeap::new(),
             tail_max_score: 0.0,
             up_to: None,
+            or_next_target: 0,
             and_max_score: f32::INFINITY,
             and_last_doc: None,
             and_candidate_score: None,
@@ -3890,7 +3894,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             };
 
             if self.up_to.is_none_or(|up_to| target > up_to) {
-                self.update_max_scores(target);
+                // The tail's bounds expire at the old window end. Refresh from
+                // the first unchecked doc, before the next head posting, and
+                // re-read the head since a competitive tail may now precede it.
+                let refresh_target = self.up_to.map_or(self.or_next_target, |up_to| {
+                    self.or_next_target.max(up_to + 1)
+                });
+                self.update_max_scores(refresh_target);
+                continue;
             }
             self.move_head_doc_to_lead(target);
             if self.lead.is_empty() {
@@ -5531,11 +5542,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // A low-scoring tail can be the only iterator left in the current
         // window. Move to the next window so a later high-scoring block is still
         // reachable instead of ending the disjunction early.
-        self.update_max_scores(up_to + 1);
+        self.update_max_scores(self.or_next_target.max(up_to + 1));
         true
     }
 
     fn push_back_leads(&mut self, target: u64) {
+        self.or_next_target = target;
         // After finishing a candidate doc, convert the aligned iterators back
         // into lagging iterators. Entries that do not stay in `tail` are
         // advanced to `target` and returned to `head`.
@@ -6298,6 +6310,7 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
             return;
         }
 
+        self.or_next_target = target;
         let mut postings = std::mem::take(&mut self.head)
             .into_vec()
             .into_iter()
@@ -9043,6 +9056,83 @@ mod tests {
         assert_eq!(wand.head_doc(), Some(BLOCK_SIZE as u64));
         let candidate = wand.next().unwrap().unwrap();
         assert_eq!(candidate.0.doc_id(), BLOCK_SIZE as u64);
+    }
+
+    #[rstest]
+    #[case::head_jump(false)]
+    #[case::window_skip(true)]
+    fn or_window_refresh_recovers_competitive_tail_documents(
+        #[case] is_window_skip: bool,
+        #[values(CompetitiveFloorMode::Exclusive, CompetitiveFloorMode::Inclusive)]
+        floor_mode: CompetitiveFloorMode,
+    ) {
+        let block_size = MAX_POSTING_BLOCK_SIZE as u32;
+        let hot_doc = block_size;
+        let next_head_doc = 4 * block_size;
+        let mut docs = DocSet::default();
+        for doc_id in 0..=next_head_doc {
+            docs.append(u64::from(doc_id), 1);
+        }
+
+        let parked_docs = (0..block_size).chain([hot_doc]).collect::<Vec<_>>();
+        let mut parked_freqs = vec![1; parked_docs.len()];
+        *parked_freqs.last_mut().unwrap() = 10;
+        let driving_docs = if is_window_skip {
+            (0..block_size).chain([next_head_doc]).collect::<Vec<_>>()
+        } else {
+            vec![0, next_head_doc]
+        };
+        let mut driving_freqs = vec![1; driving_docs.len()];
+        driving_freqs[0] = 6;
+        *driving_freqs.last_mut().unwrap() = 8;
+        let postings = [(parked_docs, parked_freqs), (driving_docs, driving_freqs)]
+            .into_iter()
+            .enumerate()
+            .map(|(term, (doc_ids, freqs))| {
+                let doc_lengths = vec![1; doc_ids.len()];
+                PostingIterator::with_query_weight(
+                    format!("term{term}"),
+                    term as u32,
+                    term as u32,
+                    1.0,
+                    generate_impact_posting_list_with_freqs_and_block_size(
+                        doc_ids,
+                        freqs,
+                        doc_lengths,
+                        MAX_POSTING_BLOCK_SIZE,
+                    ),
+                    docs.len(),
+                )
+            });
+        let mut wand =
+            Wand::new(Operator::Or, postings, &docs, UnitScorer).with_floor_mode(floor_mode);
+
+        let (first_doc, _) = wand.next().unwrap().unwrap();
+        assert_eq!(first_doc.doc_id(), 0);
+        wand.advance_all_tail(0, None, None);
+        assert_eq!(wand.score_in_query_order(1), 7.0);
+        wand.threshold = 6.5;
+        wand.push_back_leads(1);
+        assert_eq!(wand.tail.len(), 1);
+        assert_eq!(wand.up_to, Some(u64::from(hot_doc - 1)));
+
+        if is_window_skip {
+            // A shared collector may raise the floor between candidates. The
+            // old window is now dead, but the parked clause's next block wins.
+            wand.threshold = 7.5;
+            assert!(wand.or_block_window_max() < wand.threshold);
+        }
+
+        let mut competitive_docs = Vec::with_capacity(2);
+        while let Some((doc, _)) = wand.next().unwrap() {
+            wand.advance_all_tail(doc.doc_id(), None, None);
+            competitive_docs.push((doc.doc_id(), wand.score_in_query_order(1)));
+            wand.push_back_leads(doc.doc_id() + 1);
+        }
+        assert_eq!(
+            competitive_docs,
+            vec![(u64::from(hot_doc), 10.0), (u64::from(next_head_doc), 8.0)],
+        );
     }
 
     #[test]
