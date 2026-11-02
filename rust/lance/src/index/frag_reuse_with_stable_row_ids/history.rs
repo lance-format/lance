@@ -23,7 +23,8 @@ use roaring::{RoaringBitmap, RoaringTreemap};
 
 use crate::Dataset;
 use crate::dataset::index::frag_reuse::{is_index_remap_caught_up, reuse_chain_frag_bitmap};
-use crate::dataset::optimize::{live_source_row_addrs, normalize_source_fragments};
+use crate::dataset::optimize::commit::normalize_source_fragments;
+use crate::dataset::optimize::execution::live_source_row_addrs;
 use crate::dataset::transaction::{Operation, RewriteGroup};
 use crate::index::frag_reuse::load_frag_reuse_index_details;
 use crate::index::loading::load_all_indices;

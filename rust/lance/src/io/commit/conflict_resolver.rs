@@ -611,27 +611,56 @@ impl<'a> TransactionRebase<'a> {
         Ok(())
     }
 
-    /// Whether a version cleaned up from this attempt's window could hide a
-    /// change this CreateIndex must account for: it covers the source fragments
-    /// of a recorded deferred compaction, whose values must stay unchanged from
-    /// the build until that compaction read them, and its output's after.
-    /// Compactions before the build do not count: the index covers their
-    /// output under its own id.
-    pub(crate) fn needs_versions(&self, missing: &[u64]) -> bool {
+    /// Refuse gaps in the transaction history required to safely rebase.
+    pub(crate) fn check_missing_versions(
+        &self,
+        missing: &[u64],
+        latest_version: u64,
+    ) -> Result<()> {
+        if missing.is_empty() {
+            return Ok(());
+        }
+        // A missing transaction may have changed or removed any source fragment.
+        // Publishing a staged fragment without checking it can undo that write.
+        if !self.modified_fragment_ids.is_empty() {
+            return Err(Error::retryable_commit_conflict_source(
+                latest_version,
+                format!(
+                    "versions {missing:?} between transaction read version {} and latest \
+                     version {latest_version} were cleaned up, so {} cannot safely modify \
+                     existing fragments; retry the operation on the latest version",
+                    self.transaction.read_version, self.transaction.operation
+                )
+                .into(),
+            ));
+        }
+
+        // Gaps can hide changes to the source fragments an index covers, or to
+        // their outputs after a deferred compaction. Compactions before the build
+        // do not count: the index covers their output under its own id.
         let (Some(reuse), Operation::CreateIndex { new_indices, .. }) =
             (&self.untagged_reuse, &self.transaction.operation)
         else {
-            return false;
+            return Ok(());
         };
-        !missing.is_empty()
-            && reuse.groups.iter().any(|sources| {
-                new_indices.iter().any(|index| {
-                    index
-                        .fragment_bitmap
-                        .as_ref()
-                        .is_none_or(|bitmap| sources.iter().any(|id| bitmap.contains(*id as u32)))
-                })
+        if reuse.groups.iter().any(|sources| {
+            new_indices.iter().any(|index| {
+                index
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_none_or(|bitmap| sources.iter().any(|id| bitmap.contains(*id as u32)))
             })
+        }) {
+            return Err(Error::retryable_commit_conflict_source(
+                latest_version,
+                format!(
+                    "versions {missing:?} were cleaned up, so this index cannot be carried \
+                     through the deferred compaction it covers; rebuild it"
+                )
+                .into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {

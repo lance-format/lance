@@ -84,6 +84,9 @@ use super::utils::{
 };
 
 mod adaptive_probe;
+mod refine;
+
+pub use refine::BatchRefineExec;
 
 use adaptive_probe::AutoProbePolicy;
 
