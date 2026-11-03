@@ -3838,3 +3838,82 @@ async fn scan_blobs_as_logical_keeps_escaped_external_names() {
         expected
     );
 }
+
+/// Blob v2 nests only under Struct, List and LargeList, and from file version
+/// 2.2 every blob is stored as Blob v2: both the writer and the commit refuse a
+/// blob in a Map. A legacy blob in a 2.1 table stays allowed.
+#[tokio::test]
+async fn test_blob_in_map_is_rejected_from_v2_2() {
+    fn assert_not_supported<T>(result: Result<T>) {
+        assert!(
+            matches!(result, Err(Error::NotSupported { .. })),
+            "{:?}",
+            result.err()
+        );
+    }
+    let map_of = |blob: Field| {
+        let key = Field::new("key", DataType::Utf8, false);
+        let entries = Field::new("entries", DataType::Struct(vec![key, blob].into()), false);
+        let attrs = Field::new("attrs", DataType::Map(Arc::new(entries), false), true);
+        Arc::new(Schema::new(vec![attrs]))
+    };
+    let empty = |schema| RecordBatchIterator::new(std::iter::empty(), schema);
+    let params = |mode, version| WriteParams {
+        mode,
+        data_storage_version: Some(version),
+        ..Default::default()
+    };
+    let legacy_blob = Field::new("value", DataType::LargeBinary, true).with_metadata(
+        HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]),
+    );
+
+    let column = Arc::new(Int32Array::from(vec![1])) as ArrayRef;
+    let batch = RecordBatch::try_from_iter(["a", "b", "c", "d"].map(|name| (name, column.clone())))
+        .unwrap();
+    let test_dir = TempStrDir::default();
+    let v2_2 = params(WriteMode::Create, LanceFileVersion::V2_2);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        &test_dir,
+        Some(v2_2.clone()),
+    )
+    .await
+    .unwrap();
+
+    // The writer refuses legacy and prepared input alike.
+    let prepared_blob = BlobDescriptorArrayBuilder::new("value").field().clone();
+    for blob in [legacy_blob.clone(), prepared_blob] {
+        let result = crate::dataset::fragment::write::FragmentCreateBuilder::new(&test_dir)
+            .write_params(&v2_2)
+            .write(empty(map_of(blob)), None)
+            .await;
+        assert_not_supported(result);
+    }
+    // A schema-only add writes no data file, so only the commit can refuse it.
+    let result = dataset
+        .add_columns(
+            crate::dataset::NewColumnTransform::AllNulls(map_of(blob_field("value", true))),
+            None,
+            None,
+        )
+        .await;
+    assert_not_supported(result);
+    // An empty overwrite restarts the field ids, so the nested blob takes the
+    // id of column "d" and must not pass as a field the table already held.
+    let result = Dataset::write(
+        empty(map_of(blob_field("value", true))),
+        &test_dir,
+        Some(params(WriteMode::Overwrite, LanceFileVersion::V2_2)),
+    )
+    .await;
+    assert_not_supported(result);
+
+    let test_dir = TempStrDir::default();
+    Dataset::write(
+        empty(map_of(legacy_blob)),
+        &test_dir,
+        Some(params(WriteMode::Create, LanceFileVersion::V2_1)),
+    )
+    .await
+    .unwrap();
+}

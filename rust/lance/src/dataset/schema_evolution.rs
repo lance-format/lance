@@ -4253,60 +4253,6 @@ mod test {
         Ok(())
     }
 
-    fn legacy_blob_field() -> ArrowField {
-        ArrowField::new("value", DataType::LargeBinary, true).with_metadata(HashMap::from([(
-            lance_arrow::BLOB_META_KEY.to_string(),
-            "true".to_string(),
-        )]))
-    }
-
-    #[rstest]
-    #[case::blob_v2_rejected(crate::blob::blob_field("value", true), LanceFileVersion::V2_2, false)]
-    #[case::legacy_blob_stored_as_v2_rejected(legacy_blob_field(), LanceFileVersion::V2_2, false)]
-    #[case::legacy_blob_allowed_before_v2_2(legacy_blob_field(), LanceFileVersion::V2_1, true)]
-    #[tokio::test]
-    async fn test_add_all_null_blob_in_map(
-        #[case] blob: ArrowField,
-        #[case] version: LanceFileVersion,
-        #[case] allowed: bool,
-    ) {
-        let batch = record_batch!(("id", Int32, [1])).unwrap();
-        let test_dir = TempStrDir::default();
-        let mut dataset = Dataset::write(
-            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
-            &test_dir,
-            Some(WriteParams {
-                data_storage_version: Some(version),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        let key = ArrowField::new("key", DataType::Utf8, false);
-        let entries = ArrowField::new(
-            "entries",
-            DataType::Struct(ArrowFields::from(vec![key, blob])),
-            false,
-        );
-        let attrs = ArrowField::new("attrs", DataType::Map(Arc::new(entries), false), true);
-
-        let result = dataset
-            .add_columns(
-                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![attrs]))),
-                None,
-                None,
-            )
-            .await;
-        if allowed {
-            result.unwrap();
-        } else {
-            assert!(
-                matches!(&result, Err(Error::NotSupported { .. })),
-                "{result:?}"
-            );
-        }
-    }
-
     /// `AllNulls` accepts any nullable top-level column whatever its inner-field
     /// nullability (Map/List/Struct with non-null children); non-nullable ones are rejected.
     #[tokio::test]
