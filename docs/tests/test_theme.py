@@ -181,3 +181,74 @@ nav:
         ddl = spark_groups[1].find("./details[@class='ld-sidenav__sub']")
         self.assertEqual(ddl.attrib.get("open"), "open")
         self.assertEqual(ddl.find("./summary/span").text, "DDL")
+
+    def test_alternate_style_language_tabs_render_radio_inputs_and_labels(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            page = root / "src" / "index.md"
+            page.parent.mkdir(parents=True, exist_ok=True)
+            page.write_text(
+                "# Guide\n\n"
+                '=== "Python"\n\n'
+                "    ```python\n"
+                "    ds = lance.dataset('a.lance')\n"
+                "    ```\n\n"
+                '=== "Rust"\n\n'
+                "    ```rust\n"
+                '    let ds = Dataset::open("a.lance").await?;\n'
+                "    ```\n\n"
+                '=== "Java"\n\n'
+                "    ```java\n"
+                '    Dataset ds = Dataset.open("a.lance", allocator);\n'
+                "    ```\n",
+                encoding="utf-8",
+            )
+            config = load_config(
+                config_file=StringIO(
+                    "markdown_extensions:\n"
+                    "  - pymdownx.superfences\n"
+                    "  - pymdownx.tabbed:\n"
+                    "      alternate_style: true\n"
+                ),
+                site_name="Tab test",
+                docs_dir=str(root / "src"),
+                site_dir=str(root / "site"),
+                theme={"name": None, "custom_dir": str(DOCS_DIR / "theme")},
+                plugins=[],
+            )
+            build(config)
+            html = (root / "site" / "index.html").read_text(encoding="utf-8")
+            self.assertIn("tabbed-set tabbed-alternate", html)
+            self.assertIn(">Python</label>", html)
+            self.assertIn(">Rust</label>", html)
+            self.assertIn(">Java</label>", html)
+
+    def test_homepage_renders_three_layer_stack_links(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "src" / "index.md"
+            home.parent.mkdir(parents=True, exist_ok=True)
+            home.write_text("---\ntemplate: home.html\n---\n", encoding="utf-8")
+            config = load_config(
+                config_file=StringIO("nav:\n  - Home: index.md\n"),
+                site_name="Home test",
+                docs_dir=str(root / "src"),
+                site_dir=str(root / "site"),
+                theme={"name": None, "custom_dir": str(DOCS_DIR / "theme")},
+                plugins=[],
+            )
+            build(config)
+            html = (root / "site" / "index.html").read_text(encoding="utf-8")
+            self.assertIn("01 · Database", html)
+            self.assertIn("02 · Language SDKs", html)
+            self.assertIn("03 · Query &amp; Compute Engines", html)
+            for expected_href in (
+                'href="quickstart/lancedb/"',
+                'href="quickstart/pylance/"',
+                'href="quickstart/rust/"',
+                'href="quickstart/java/"',
+                'href="integrations/spark/"',
+                'href="format/"',
+                'href="format/namespace/"',
+            ):
+                self.assertIn(expected_href, html)

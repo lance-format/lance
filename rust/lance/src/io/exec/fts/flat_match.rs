@@ -27,7 +27,9 @@ use lance_core::{Error, Result, utils::tracing::StreamTracingExt};
 use lance_table::format::IndexMetadata;
 
 use crate::Dataset;
-use crate::index::scalar::inverted::{ResolvedFtsField, load_segment_details, load_segments};
+use crate::index::scalar::inverted::{
+    ResolvedFtsField, load_segment_details, load_segments, resolve_fts_field,
+};
 use crate::io::exec::PreFilterSource;
 use crate::io::exec::row_addr_mask::apply_mask;
 use crate::io::exec::utils::{FilteredRowIdsToPrefilter, IndexMetrics, SelectionVectorToPrefilter};
@@ -51,7 +53,45 @@ use super::query_tokens::{
 use super::segments::{open_fts_segment, open_fts_segments};
 use super::selection::FtsIndexMetrics;
 
+/// How a flat Match filter obtains each document from its input rows.
+///
+/// This contains configuration only. Source traversal is derived again from the
+/// pinned dataset schema by [`FlatMatchFilterExec::try_new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FtsFilterDocumentBinding {
+    /// A Utf8 or LargeUtf8 input column, possibly aliased from the logical query
+    /// field. Its name is literal and is not parsed as a source field path.
+    Column(String),
+    /// A source field path in the dataset schema. The input contains its complete
+    /// root column; each row is retained if any derived document matches.
+    ResolvedField {
+        /// Canonical source path, independent of input projection aliases.
+        path: String,
+        /// Physical document boundary; it takes precedence over the logical
+        /// query option, including when that option is absent.
+        document_granularity: DocumentGranularity,
+    },
+}
+
 /// Filters the input according to a match query's token operator.
+///
+/// Reconstruction preserves document binding separately from the logical query
+/// column and tokenizer segment selection. It does not copy cached tokens or
+/// metrics, and it retains the input schema without adding scores or coordinates.
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use datafusion::physical_plan::ExecutionPlan;
+/// # use lance::{io::exec::fts::FlatMatchFilterExec, Result};
+/// # fn rebuild(exec: &FlatMatchFilterExec, decoded_input: Arc<dyn ExecutionPlan>)
+/// #     -> Result<FlatMatchFilterExec> {
+/// FlatMatchFilterExec::try_new(
+///     decoded_input, exec.dataset().clone(), exec.query().clone(),
+///     exec.params().clone(), exec.document_binding(),
+///     exec.preset_segments().map(|segments| segments.to_vec()),
+/// )
+/// # }
+/// ```
 #[derive(Debug)]
 
 pub struct FlatMatchFilterExec {
@@ -138,6 +178,85 @@ impl DisplayAs for FlatMatchFilterExec {
 }
 
 impl FlatMatchFilterExec {
+    /// Reconstruct a filter from portable document binding and decoded input.
+    ///
+    /// Resolved fields use the pinned dataset schema and require a complete root
+    /// column of the same type. Column bindings require the named string column.
+    /// No row-ID column is required. The first explicit segment supplies the
+    /// tokenizer; `None` retains native index discovery/default tokenization and
+    /// `Some(empty)` retains its execution-time error. Fuzzy-query admission and
+    /// unresolved logical granularity errors remain in the native execution path.
+    /// See [`Self`] for a reconstruction example.
+    pub fn try_new(
+        input: Arc<dyn ExecutionPlan>,
+        dataset: Arc<Dataset>,
+        query: MatchQuery,
+        params: FtsSearchParams,
+        binding: FtsFilterDocumentBinding,
+        preset_segments: Option<Vec<IndexMetadata>>,
+    ) -> Result<Self> {
+        let input_schema = input.schema();
+        let mut result = match binding {
+            FtsFilterDocumentBinding::Column(column) => {
+                let field = input_schema.field_with_name(&column).map_err(|_| {
+                    Error::invalid_input(format!("FTS filter input is missing column '{column}'"))
+                })?;
+                if !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+                    return Err(Error::invalid_input(format!(
+                        "FTS filter column '{column}' must be Utf8 or LargeUtf8, got {}",
+                        field.data_type()
+                    )));
+                }
+                Self::new_with_document_column(input, dataset, query, params, column)
+            }
+            FtsFilterDocumentBinding::ResolvedField {
+                path,
+                document_granularity,
+            } => {
+                let resolved = resolve_fts_field(dataset.schema(), &path, document_granularity)?;
+                // The root name is already resolved; literal quotes are not path syntax.
+                let source = dataset
+                    .schema()
+                    .fields
+                    .iter()
+                    .find(|field| field.name == resolved.root_column)
+                    .ok_or_else(|| Error::internal("Resolved FTS filter root is missing"))?;
+                let field = input_schema
+                    .field_with_name(&resolved.root_column)
+                    .map_err(|_| {
+                        Error::invalid_input(format!(
+                            "FTS filter input is missing source root '{}'",
+                            resolved.root_column
+                        ))
+                    })?;
+                if field.data_type() != &source.data_type() {
+                    return Err(Error::invalid_input(format!(
+                        "FTS filter input root '{}' must have source type {}, got {}",
+                        resolved.root_column,
+                        source.data_type(),
+                        field.data_type()
+                    )));
+                }
+                Self::new_with_resolved_field(input, dataset, query, params, resolved)
+            }
+        };
+        result.preset_segments = preset_segments;
+        Ok(result)
+    }
+
+    /// The active input binding, including the actual flat-column alias or the
+    /// canonical source path and resolved document boundary. See [`Self`] for
+    /// reconstruction. Private traversal and token caches are not exported.
+    pub fn document_binding(&self) -> FtsFilterDocumentBinding {
+        match &self.resolved_field {
+            Some(resolved) => FtsFilterDocumentBinding::ResolvedField {
+                path: resolved.canonical_path.clone(),
+                document_granularity: resolved.document_granularity,
+            },
+            None => FtsFilterDocumentBinding::Column(self.document_column.clone()),
+        }
+    }
+
     async fn load_tokenizer(
         dataset: &Dataset,
         column: &str,
@@ -1060,6 +1179,7 @@ impl ExecutionPlan for FlatMatchQueryExec {
 
 #[cfg(test)]
 mod tests {
+    mod filter_binding;
     use super::*;
     use crate::dataset::transaction::{Operation, TransactionBuilder};
     use crate::index::DatasetIndexExt;

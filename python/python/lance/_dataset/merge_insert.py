@@ -7,17 +7,48 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 
+import pyarrow as pa
+
 from ..lance import _MergeInsertBuilder
-from ..types import _coerce_reader, _is_materialized
+from ..types import _coerce_source
 
 if TYPE_CHECKING:
     from datetime import timedelta
 
-    import pyarrow as pa
-
     from .. import mem_wal
     from ..types import ReaderLike
     from .transaction import Transaction
+
+
+def _type_contains_blob_v2(data_type: pa.DataType) -> bool:
+    if isinstance(data_type, pa.ExtensionType):
+        return data_type.extension_name == "lance.blob.v2"
+    if pa.types.is_struct(data_type):
+        return any(
+            _type_contains_blob_v2(data_type.field(index).type)
+            for index in range(data_type.num_fields)
+        )
+    if (
+        pa.types.is_list(data_type)
+        or pa.types.is_large_list(data_type)
+        or pa.types.is_fixed_size_list(data_type)
+    ):
+        return _type_contains_blob_v2(data_type.value_type)
+    if pa.types.is_map(data_type):
+        return _type_contains_blob_v2(data_type.item_type)
+    return False
+
+
+def _is_native_dataset_source(data_obj: ReaderLike) -> bool:
+    """Whether a merge can use the Lance dataset handle without a Python scanner."""
+    # Local import: ``lance.dataset`` imports this module.
+    from ..dataset import LanceDataset
+
+    return (
+        type(data_obj) is LanceDataset
+        and not data_obj._default_scan_options
+        and not any(_type_contains_blob_v2(field.type) for field in data_obj._ds.schema)
+    )
 
 
 class MergeInsertBuilder(_MergeInsertBuilder):
@@ -38,15 +69,23 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         schema: Optional[pa.Schema]
             The schema of the data.  This only needs to be supplied whenever the data
             source is some kind of generator.
+
+        Notes
+        -----
+        Repeatable sources provide fresh readers for conflict retries.
+        Keep external source files unchanged until the operation finishes.
+        Sources without a repeatability contract retain the replay buffer.
         """
-        reader = _coerce_reader(data_obj, schema)
-
-        # Materialized sources are wrapped in an in-memory table so retries never
-        # spill and the source's statistics can drive the join; everything else is
-        # treated as a one-shot stream.
-        if _is_materialized(data_obj):
+        if _is_native_dataset_source(data_obj):
+            return super(MergeInsertBuilder, self).execute_dataset(data_obj._ds)
+        source = _coerce_source(data_obj, schema)
+        if source.mode == "replayable":
+            return super(MergeInsertBuilder, self).execute_replayable(
+                source.schema, source.open_reader
+            )
+        reader = source.open_reader()
+        if source.mode == "materialized":
             return super(MergeInsertBuilder, self).execute_batches(reader)
-
         return super(MergeInsertBuilder, self).execute(reader)
 
     def execute_uncommitted(
@@ -69,9 +108,14 @@ class MergeInsertBuilder(_MergeInsertBuilder):
             The schema of the data.  This only needs to be supplied whenever the data
             source is some kind of generator.
         """
-        reader = _coerce_reader(data_obj, schema)
+        if _is_native_dataset_source(data_obj):
+            return super(MergeInsertBuilder, self).execute_uncommitted_dataset(
+                data_obj._ds
+            )
+        source = _coerce_source(data_obj, schema)
+        reader = source.open_reader()
 
-        if _is_materialized(data_obj):
+        if source.mode == "materialized":
             return super(MergeInsertBuilder, self).execute_uncommitted_batches(reader)
 
         return super(MergeInsertBuilder, self).execute_uncommitted(reader)
@@ -466,12 +510,15 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         - task_wait_time: time spent waiting for scheduled I/O
         - decode_time: time spent decoding, summed over concurrent decode tasks
         """  # noqa: E501
-        reader = _coerce_reader(data_obj, schema)
-
-        # Route exactly as execute() does, so the reported plan is the one that
-        # would run. A materialized source reports exact statistics where a stream
-        # reports none, which can change which side of the join is collected.
-        if _is_materialized(data_obj):
+        if _is_native_dataset_source(data_obj):
+            return super(MergeInsertBuilder, self).analyze_plan_dataset(data_obj._ds)
+        source = _coerce_source(data_obj, schema)
+        if source.mode == "replayable":
+            return super(MergeInsertBuilder, self).analyze_plan_replayable(
+                source.schema, source.open_reader
+            )
+        reader = source.open_reader()
+        if source.mode == "materialized":
             return super(MergeInsertBuilder, self).analyze_plan_batches(reader)
 
         return super(MergeInsertBuilder, self).analyze_plan(reader)

@@ -279,9 +279,10 @@ impl RabitScanContext {
         &self.index.storage
     }
 
-    /// This index's cache namespace; entries do not retain the strategy.
+    /// Cache namespace for immutable planes and code-only entries of this file.
+    /// It includes the storage location and is independent of FRI translation.
     pub fn cache(&self) -> &WeakLanceCache {
-        &self.index.index_cache
+        &self.index.raw_cache
     }
 
     /// Whether native full scoring can use raw-query sign bounds.
@@ -331,7 +332,7 @@ impl RabitScanContext {
         entry.cache_whole_partition = false;
         let entry = Arc::new(entry);
         let pre_filter = RabitIndex::prefilter_for_partition(
-            self.cache(),
+            &self.index.index_cache,
             partition_id,
             &entry,
             self.pre_filter.clone(),

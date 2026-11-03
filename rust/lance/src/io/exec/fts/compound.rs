@@ -71,6 +71,42 @@ use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 const WAND_TIE_COMPLETION_BUDGET: usize = 128;
 
 /// One DataFusion boundary around a posting-backed compound scorer tree.
+///
+/// Reconstruction preserves the explicit selection kind, candidate scope and
+/// either the base scorer or canonical prepared Match override. Codecs supply
+/// decoded child plans and value objects; the example reuses existing children
+/// and uses the portable prepared-state constructor from `lance-index`.
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use lance::{io::exec::fts::CompoundQueryExec, Error, Result};
+/// # use lance_index::scalar::inverted::PreparedBm25Query;
+/// # fn rebuild(exec: &CompoundQueryExec) -> Result<CompoundQueryExec> {
+/// let mut rebuilt = if let Some(segments) = exec.preset_segments() {
+///     CompoundQueryExec::new_with_segments(
+///         exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+///         exec.prefilter_source().clone(), segments.to_vec(),
+///     )
+/// } else {
+///     let uuids = exec.explicit_segment_uuids()
+///         .ok_or_else(|| Error::invalid_input("compound FTS needs an explicit selection"))?;
+///     CompoundQueryExec::new_with_segment_uuids(
+///         exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+///         exec.prefilter_source().clone(), uuids,
+///     )
+/// }.with_external_mask(exec.external_mask().cloned());
+/// if let Some(scorer) = exec.base_scorer() {
+///     rebuilt = rebuilt.with_base_scorer(scorer.clone());
+/// }
+/// if let Some(prepared) = exec.prepared_match() {
+///     rebuilt = rebuilt.with_prepared_match(Arc::new(PreparedBm25Query::from_parts(
+///         prepared.tokens().clone(), prepared.scorer().clone(),
+///         prepared.has_all_query_positions(),
+///     )));
+/// }
+/// # Ok(rebuilt)
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct CompoundQueryExec {
     dataset: Arc<Dataset>,
@@ -175,7 +211,6 @@ impl CompoundQueryExec {
     ///
     /// This is required for distributed fuzzy execution over a segment subset;
     /// a scorer alone cannot preserve the globally capped rewrite.
-    #[doc(hidden)]
     pub fn with_prepared_match(mut self, prepared: Arc<PreparedBm25Query>) -> Self {
         self.prepared_match = Some(prepared);
         self.base_scorer = None;
@@ -200,6 +235,29 @@ impl CompoundQueryExec {
 
     pub fn base_scorer(&self) -> Option<&Arc<MemBM25Scorer>> {
         self.base_scorer.as_ref()
+    }
+
+    /// Canonical root-Match vocabulary and scorer, or `None` for native
+    /// preparation. Restore its values with [`PreparedBm25Query::from_parts`]
+    /// so dictionary term IDs and other local preparation caches are not copied.
+    /// See [`Self`] for a reconstruction example.
+    pub fn prepared_match(&self) -> Option<&Arc<PreparedBm25Query>> {
+        self.prepared_match.as_ref()
+    }
+
+    /// Additional candidate mask in the indices' row-id domain, or `None` for
+    /// no external restriction. It does not narrow the statistics corpus.
+    /// See [`Self`] for a reconstruction example.
+    pub fn external_mask(&self) -> Option<&Arc<RowAddrMask>> {
+        self.external_mask.as_ref()
+    }
+
+    /// Exact resolved metadata in its original order. `None` denotes deferred
+    /// UUID selection; use [`Self::explicit_segment_uuids`] in that case.
+    /// An empty resolved selection remains explicit and must not widen to all
+    /// committed segments. See [`Self`] for a reconstruction example.
+    pub fn preset_segments(&self) -> Option<&[IndexMetadata]> {
+        self.segment_selection.preset_segments()
     }
 
     /// Re-cut this scorer at `limit`, keeping its segment selection, prepared
