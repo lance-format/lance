@@ -6,12 +6,14 @@ mod entry;
 pub(crate) use entry::{
     EncodedEntry, current_frag_reuse_history, encode_frag_reuse_entry, encode_frag_reuse_entry_at,
     encode_inline_frag_reuse_entry, load_frag_reuse_history, load_proposed_frag_reuse_history,
+    read_raw_history,
 };
+use entry::{fri_external_location, read_fri_external_file};
 
 use crate::Dataset;
 use crate::index::frag_reuse_reader::SegmentPlanParts;
 use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
-use crate::session::index_caches::{FragReuseContent, FragReuseContentKey, FragReuseDetailsKey};
+use crate::session::index_caches::FragReuseDetailsKey;
 use lance_core::Error;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
 use lance_core::deepsize::DeepSizeOf;
@@ -21,13 +23,13 @@ use lance_index::frag_reuse::{
 };
 use lance_index::scalar::{BatchRowIdRemapper, MetricsCollector, RowIdRemapper};
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
+use lance_table::format::pb::FragmentReuseIndexDetails;
 use lance_table::format::pb::fragment_reuse_index_details::{
     self as pb_fri, Content, InlineContent,
 };
-use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
 use lance_table::format::{Fragment, IndexMetadata, Manifest};
 use lance_table::system_index::frag_reuse::gate::{BareRewriteRefusal, covered_bare_rewrite};
-use lance_table::system_index::frag_reuse::history::{FragReuseHistory, Record};
+use lance_table::system_index::frag_reuse::history::{FragReuseHistory, HistoryFormat, Record};
 use lance_table::system_index::frag_reuse::ledger::FragReuseLedger;
 use lance_table::transaction::RewriteGroup;
 use object_store::path::Path;
@@ -776,66 +778,6 @@ pub async fn load_frag_reuse_index_details(
     }
 }
 
-/// Where an FRI entry's external details live, honoring the entry's base:
-/// a shallow-cloned entry's `details.binpb` lives in the SOURCE dataset, so
-/// the path and store come from the entry's `base_id` (like every other
-/// base-aware index file) instead of the current dataset root.
-async fn fri_external_location(
-    dataset: &Dataset,
-    index: &IndexMetadata,
-    file: &ExternalFile,
-) -> lance_core::Result<(Arc<ObjectStore>, Path)> {
-    let path = dataset
-        .indice_files_dir(index)?
-        .join(index.uuid.to_string())
-        .join(file.path.as_str());
-    Ok((dataset.object_store_for_index(index).await?, path))
-}
-
-async fn read_fri_external_range(
-    store: &ObjectStore,
-    path: &Path,
-    file: &ExternalFile,
-) -> lance_core::Result<bytes::Bytes> {
-    let end = file
-        .offset
-        .checked_add(file.size)
-        .and_then(|n| usize::try_from(n).ok())
-        .ok_or_else(|| Error::corrupt_file_named("FRI details", "external FRI range overflow"))?;
-    store
-        .open(path)
-        .await?
-        .get_range(file.offset as usize..end)
-        .await
-        .map_err(Error::from)
-}
-
-/// An FRI entry's raw external details bytes, read once per session.
-async fn read_fri_external_file(
-    dataset: &Dataset,
-    index: &IndexMetadata,
-    file: &ExternalFile,
-) -> lance_core::Result<bytes::Bytes> {
-    let (store, path) = fri_external_location(dataset, index, file).await?;
-    let content = dataset
-        .index_cache
-        .get_or_insert_with_key(
-            FragReuseContentKey {
-                store_identity: &store.store_prefix,
-                path: &path,
-                offset: file.offset,
-                size: file.size,
-            },
-            || async {
-                read_fri_external_range(&store, &path, file)
-                    .await
-                    .map(FragReuseContent)
-            },
-        )
-        .await?;
-    Ok(content.0.clone())
-}
-
 /// open fragment reuse index based on its metadata details
 pub(crate) async fn open_frag_reuse_index(
     uuid: Uuid,
@@ -857,7 +799,7 @@ pub(crate) async fn build_new_frag_reuse_index(
         dataset_version,
         groups: frag_reuse_groups,
     };
-    let (_, history) = current_frag_reuse_history(dataset, 0).await?;
+    let (_, history) = current_frag_reuse_history(dataset, HistoryFormat::Legacy).await?;
     let history = history.insert_legacy_version(pb_fri::Version::from(&new_version))?;
     encode_frag_reuse_entry(dataset, &history, dataset_version).await
 }
@@ -1160,7 +1102,7 @@ pub async fn frag_reuse_entry_appending(
              stable-row-id datasets; this rewrite cannot carry transition intent here",
         ));
     }
-    let (_, history) = current_frag_reuse_history(dataset, 1).await?;
+    let (_, history) = current_frag_reuse_history(dataset, HistoryFormat::Tagged).await?;
     let history = history.into_tagged()?.append_transitions(&transitions)?;
     Ok(encode_inline_frag_reuse_entry(
         &history,
@@ -1510,7 +1452,7 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
 
     let existing = stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME);
     let (history, base_entry_version) = match existing {
-        None => (FragReuseHistory::empty(1)?, None),
+        None => (FragReuseHistory::empty(HistoryFormat::Tagged), None),
         Some(entry) => (
             load_frag_reuse_history(dataset, entry)
                 .await?
@@ -1594,7 +1536,7 @@ pub(crate) async fn relocate_tagged_entry_for_clone(
     // `Dataset`: the same rule as `read_fri_external_file`, against the
     // source manifest's `base_paths`.
     let registry = store_registry.clone();
-    let history = FragReuseHistory::decode(entry.index_version, details, |file| async move {
+    let raw = read_raw_history(entry.index_version, details, |file| async move {
         let end = file
             .offset
             .checked_add(file.size)
@@ -1643,9 +1585,12 @@ pub(crate) async fn relocate_tagged_entry_for_clone(
             .map_err(Error::from)
     })
     .await?;
+    // The source entry is committed, so it is read as stored history. A
+    // tagged history is never repaired, so nothing is dropped from it here.
+    let (history, _) = raw.repair()?;
 
     let relocated =
-        history.remap_stable_partition_bases(|base_id| match (&base_remap, base_id) {
+        history.remap_stable_partition_bases(&|base_id| match (&base_remap, base_id) {
             // Deep clone materializes every referenced map into the clone's
             // own `_fri/`, so every stamp clears to unset.
             (CloneBaseRemap::Deep, _) => Ok(None),

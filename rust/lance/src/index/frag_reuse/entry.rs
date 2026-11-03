@@ -5,8 +5,10 @@
 //! [`FragReuseHistory`] here, so the inline-or-spill choice, the fragment
 //! bitmap and the `index_version` follow one rule.
 
+use std::future::Future;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use lance_core::{Error, Result};
 use lance_index::frag_reuse::{
     FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails,
@@ -15,13 +17,15 @@ use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb::ExternalFile;
 use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
-use lance_table::system_index::frag_reuse::history::{FragReuseHistory, length_delimited};
+use lance_table::system_index::frag_reuse::history::{
+    FragReuseHistory, HistoryFormat, RawHistory, length_delimited,
+};
+use lance_table::system_index::frag_reuse::ledger::{DetailsContent, verify_external_content};
 use object_store::path::Path;
 use prost::Message;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-use super::{fri_external_location, read_fri_external_file};
 use crate::Dataset;
 use crate::session::index_caches::{FragReuseContent, FragReuseContentKey, FragReuseDetailsKey};
 
@@ -34,6 +38,43 @@ const INLINE_CONTENT_FIELD: u32 = 1;
 /// `FragmentReuseIndexDetails.external`.
 const EXTERNAL_CONTENT_FIELD: u32 = 2;
 
+/// The unchecked history FRI `details` of `index_version` hold, reading
+/// external content through `read_external`, which must return exactly the
+/// referenced byte range.
+pub async fn read_raw_history<F, Fut>(
+    index_version: i32,
+    details: &prost_types::Any,
+    read_external: F,
+) -> Result<RawHistory>
+where
+    F: FnOnce(ExternalFile) -> Fut,
+    Fut: Future<Output = Result<Bytes>>,
+{
+    let format = HistoryFormat::from_index_version(index_version)?;
+    let content = match DetailsContent::of(details)? {
+        DetailsContent::Inline(content) => content,
+        DetailsContent::External(file) => {
+            let content = read_external(file.clone()).await?;
+            verify_external_content(&file, &content)?;
+            content
+        }
+    };
+    Ok(RawHistory::new(format, content))
+}
+
+/// The unchecked history `entry` holds, reading external details through the
+/// entry's base once per session.
+async fn read_entry_raw_history(
+    dataset: &Dataset,
+    entry: &IndexMetadata,
+    details: &prost_types::Any,
+) -> Result<RawHistory> {
+    read_raw_history(entry.index_version, details, |file| async move {
+        read_fri_external_file(dataset, entry, &file).await
+    })
+    .await
+}
+
 /// The history a committed FRI entry holds, resolving external details
 /// through the entry's base.
 pub async fn load_frag_reuse_history(
@@ -44,11 +85,9 @@ pub async fn load_frag_reuse_history(
         .index_details
         .as_ref()
         .ok_or_else(|| Error::index("Index details is not for the fragment reuse index"))?;
-    let (history, dropped) =
-        FragReuseHistory::decode_stored(entry.index_version, details, |file| async move {
-            read_fri_external_file(dataset, entry, &file).await
-        })
-        .await?;
+    let (history, dropped) = read_entry_raw_history(dataset, entry, details)
+        .await?
+        .repair()?;
     if !dropped.is_empty() {
         log::warn!(
             "fragment reuse entry {} records invalid versions {dropped:?}; they are dropped, and \
@@ -69,9 +108,11 @@ pub async fn load_proposed_frag_reuse_history(
         .index_details
         .as_ref()
         .ok_or_else(|| Error::invalid_input("the proposed fragment reuse entry has no details"))?;
-    FragReuseHistory::decode(entry.index_version, details, |file| async move {
-        read_fri_external_file(dataset, entry, &file).await
-    })
+    async {
+        read_entry_raw_history(dataset, entry, details)
+            .await?
+            .validate()
+    }
     .await
     .map_err(|error| match error {
         Error::CorruptFile { source, .. } => Error::invalid_input(format!(
@@ -81,11 +122,11 @@ pub async fn load_proposed_frag_reuse_history(
     })
 }
 
-/// The current FRI entry's history, or an empty history in the format of
-/// `index_version` when the table has none.
+/// The current FRI entry's history, or an empty history in `format` when the
+/// table has none.
 pub async fn current_frag_reuse_history(
     dataset: &Dataset,
-    index_version: i32,
+    format: HistoryFormat,
 ) -> Result<(Option<IndexMetadata>, FragReuseHistory)> {
     let current = super::super::loading::load_all_indices(dataset)
         .await?
@@ -94,7 +135,7 @@ pub async fn current_frag_reuse_history(
         .cloned();
     let history = match &current {
         Some(entry) => load_frag_reuse_history(dataset, entry).await?,
-        None => FragReuseHistory::empty(index_version)?,
+        None => FragReuseHistory::empty(format),
     };
     Ok((current, history))
 }
@@ -226,13 +267,73 @@ fn entry_with_details(
             type_url: DETAILS_TYPE_URL.into(),
             value: details,
         })),
-        index_version: history.index_version(),
+        index_version: history.format().index_version(),
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: None,
         clustering_id: None,
         metadata: Default::default(),
     }
+}
+
+/// Where an FRI entry's external details live, honoring the entry's base:
+/// a shallow-cloned entry's `details.binpb` lives in the SOURCE dataset, so
+/// the path and store come from the entry's `base_id` (like every other
+/// base-aware index file) instead of the current dataset root.
+pub(super) async fn fri_external_location(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+    file: &ExternalFile,
+) -> lance_core::Result<(Arc<ObjectStore>, Path)> {
+    let path = dataset
+        .indice_files_dir(index)?
+        .join(index.uuid.to_string())
+        .join(file.path.as_str());
+    Ok((dataset.object_store_for_index(index).await?, path))
+}
+
+async fn read_fri_external_range(
+    store: &ObjectStore,
+    path: &Path,
+    file: &ExternalFile,
+) -> lance_core::Result<bytes::Bytes> {
+    let end = file
+        .offset
+        .checked_add(file.size)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| Error::corrupt_file_named("FRI details", "external FRI range overflow"))?;
+    store
+        .open(path)
+        .await?
+        .get_range(file.offset as usize..end)
+        .await
+        .map_err(Error::from)
+}
+
+/// An FRI entry's raw external details bytes, read once per session.
+pub(super) async fn read_fri_external_file(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+    file: &ExternalFile,
+) -> lance_core::Result<bytes::Bytes> {
+    let (store, path) = fri_external_location(dataset, index, file).await?;
+    let content = dataset
+        .index_cache
+        .get_or_insert_with_key(
+            FragReuseContentKey {
+                store_identity: &store.store_prefix,
+                path: &path,
+                offset: file.offset,
+                size: file.size,
+            },
+            || async {
+                read_fri_external_range(&store, &path, file)
+                    .await
+                    .map(FragReuseContent)
+            },
+        )
+        .await?;
+    Ok(content.0.clone())
 }
 
 fn external_file(details: &prost_types::Any) -> Result<Option<ExternalFile>> {

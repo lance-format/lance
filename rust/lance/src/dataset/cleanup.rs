@@ -2272,7 +2272,7 @@ impl<'a> CleanupTask<'a> {
             .as_ref()
             .filter(|details| details.type_url.ends_with("FragmentReuseIndexDetails"))
             .ok_or_else(|| Error::index("Index details is not for the fragment reuse index"))?;
-        let history = lance_table::system_index::frag_reuse::history::FragReuseHistory::decode(
+        let raw = crate::index::frag_reuse::read_raw_history(
             entry.index_version,
             details,
             |file| async move {
@@ -2331,6 +2331,9 @@ impl<'a> CleanupTask<'a> {
             },
         )
         .await?;
+        // The branch's entry is committed, so it is read as stored history. A
+        // tagged history is never repaired, so nothing is dropped from it here.
+        let (history, _) = raw.repair()?;
         let ledger = history.ledger();
         if !history.is_fully_interpretable() {
             return Err(Error::not_supported(

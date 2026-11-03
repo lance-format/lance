@@ -42,6 +42,8 @@ use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_f
 use roaring::{RoaringBitmap, RoaringTreemap};
 use uuid::Uuid;
 
+use super::history::HistoryFormat;
+use crate::format::pb::ExternalFile;
 use crate::format::pb::fragment_reuse_index_details::{self as pb, transition};
 
 /// A decoded mapping. External labels remain unopened until address resolution.
@@ -95,7 +97,7 @@ impl Transition {
 }
 
 /// Supported transitions in fragment-lineage order, independent of serialization order.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct FragReuseLedger {
     transitions: Vec<Transition>,
     consumers: HashMap<u32, usize>,
@@ -126,36 +128,44 @@ fn content_field(details: &prost_types::Any) -> Result<(u32, Bytes)> {
     content.ok_or_else(|| corrupt("missing FRI content"))
 }
 
-/// The serialized history an FRI `index_details` holds, resolving an external
-/// reference through `read_external`, which must return exactly the
-/// referenced byte range.
-pub(super) async fn load_content<F, Fut>(
-    details: &prost_types::Any,
-    read_external: F,
-) -> Result<Bytes>
-where
-    F: FnOnce(crate::format::pb::ExternalFile) -> Fut,
-    Fut: Future<Output = Result<Bytes>>,
-{
-    let (tag, content) = content_field(details)?;
-    if tag == 1 {
-        return Ok(content);
+/// Where FRI `index_details` keep the serialized history.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DetailsContent {
+    /// The serialized history itself.
+    Inline(Bytes),
+    /// A byte range of a file in the entry's directory. The caller reads it
+    /// and checks what it read with [`verify_external_content`].
+    External(ExternalFile),
+}
+
+impl DetailsContent {
+    /// The content of FRI `details`, refusing an external range whose end
+    /// overflows before anything is read.
+    pub fn of(details: &prost_types::Any) -> Result<Self> {
+        let (tag, content) = content_field(details)?;
+        if tag == 1 {
+            return Ok(Self::Inline(content));
+        }
+        let file = ExternalFile::decode(content).map_err(|e| corrupt(e.to_string()))?;
+        file.offset
+            .checked_add(file.size)
+            .and_then(|end| usize::try_from(end).ok())
+            .ok_or_else(|| corrupt("external FRI range overflow"))?;
+        Ok(Self::External(file))
     }
-    let file =
-        crate::format::pb::ExternalFile::decode(content).map_err(|e| corrupt(e.to_string()))?;
-    file.offset
-        .checked_add(file.size)
-        .and_then(|end| usize::try_from(end).ok())
-        .ok_or_else(|| corrupt("external FRI range overflow"))?;
-    let expected = file.size;
-    let bytes = read_external(file).await?;
-    if bytes.len() as u64 != expected {
+}
+
+/// Refuse `content` read for the external reference `file` unless it is
+/// exactly the referenced range.
+pub fn verify_external_content(file: &ExternalFile, content: &Bytes) -> Result<()> {
+    if content.len() as u64 != file.size {
         return Err(corrupt(format!(
-            "external FRI size mismatch: expected {expected}, received {}",
-            bytes.len()
+            "external FRI size mismatch: expected {}, received {}",
+            file.size,
+            content.len()
         )));
     }
-    Ok(bytes)
+    Ok(())
 }
 
 /// Whether a serialized transition holds only fields this implementation
@@ -193,22 +203,29 @@ impl FragReuseLedger {
         read_external: F,
     ) -> Result<Self>
     where
-        F: FnOnce(crate::format::pb::ExternalFile) -> Fut,
+        F: FnOnce(ExternalFile) -> Fut,
         Fut: Future<Output = Result<Bytes>>,
     {
-        validate_index_version(index_version)?;
-        let content = load_content(details, read_external).await?;
-        Self::decode_content(index_version, content)
+        let format = HistoryFormat::from_index_version(index_version)?;
+        let content = match DetailsContent::of(details)? {
+            DetailsContent::Inline(content) => content,
+            DetailsContent::External(file) => {
+                let content = read_external(file.clone()).await?;
+                verify_external_content(&file, &content)?;
+                content
+            }
+        };
+        Self::decode_content(format, content)
     }
 
     /// Decode FRI details whose history is stored inline, without any I/O.
     /// `Ok(None)` when the history lives in an external file, which only
     /// [`Self::decode`] can resolve.
     pub fn decode_inline(index_version: i32, details: &prost_types::Any) -> Result<Option<Self>> {
-        validate_index_version(index_version)?;
+        let format = HistoryFormat::from_index_version(index_version)?;
         let (tag, content) = content_field(details)?;
         if tag == 1 {
-            Self::decode_content(index_version, content).map(Some)
+            Self::decode_content(format, content).map(Some)
         } else {
             Ok(None)
         }
@@ -216,8 +233,7 @@ impl FragReuseLedger {
 
     // Each legacy group owns a compaction remap. Address resolution follows its
     // fragment lineage, rather than searching every group in a legacy version.
-    pub(super) fn decode_content(index_version: i32, content: Bytes) -> Result<Self> {
-        validate_index_version(index_version)?;
+    pub(super) fn decode_content(format: HistoryFormat, content: Bytes) -> Result<Self> {
         let mut remaining = content;
         let mut transitions = Vec::new();
         let mut has_unsupported_transitions = false;
@@ -243,7 +259,7 @@ impl FragReuseLedger {
                     }
                 }
                 2 => {
-                    if index_version == 0 {
+                    if format == HistoryFormat::Legacy {
                         return Err(corrupt("tagged transitions require FRI index_version 1"));
                     }
                     let raw = require_message(tag, payload)?;
@@ -356,21 +372,17 @@ impl DeepSizeOf for FragReuseLedger {
 const ORDERED_COMPACTION_FIELD: u32 = 3;
 pub(super) const STABLE_PARTITION_FIELD: u32 = 4;
 
-pub(super) fn validate_index_version(index_version: i32) -> Result<()> {
-    if !matches!(index_version, 0 | 1) {
-        return Err(Error::not_supported(format!(
-            "Unsupported FRI index_version {index_version}; supported versions are 0 and 1. Please upgrade to a newer version of Lance."
-        )));
-    }
-    Ok(())
-}
-
 pub(super) fn corrupt(message: impl Into<String>) -> Error {
     Error::corrupt_file_named("FRI details", message)
 }
 
-// Keep length-delimited payloads as zero-copy slices of the original history.
-fn next_field(input: &mut Bytes) -> Result<(u32, Option<Bytes>)> {
+/// Split one field off `input`: its tag, and its payload if it is
+/// length-delimited, as a zero-copy slice of `input`.
+///
+/// Envelopes are framed by hand, while each known payload is still decoded by
+/// prost, because prost drops unknown fields on decode: records and nested
+/// fields from newer writers must be carried forward byte-for-byte.
+pub(super) fn next_field(input: &mut Bytes) -> Result<(u32, Option<Bytes>)> {
     let (tag, wire) = decode_key(input).map_err(|e| corrupt(e.to_string()))?;
     let payload = if wire == WireType::LengthDelimited {
         let length = decode_varint(input).map_err(|e| corrupt(e.to_string()))?;
@@ -389,7 +401,7 @@ fn next_field(input: &mut Bytes) -> Result<(u32, Option<Bytes>)> {
     Ok((tag, payload))
 }
 
-fn require_message(tag: u32, payload: Option<Bytes>) -> Result<Bytes> {
+pub(super) fn require_message(tag: u32, payload: Option<Bytes>) -> Result<Bytes> {
     payload.ok_or_else(|| corrupt(format!("field {tag} must be length-delimited")))
 }
 
@@ -650,14 +662,15 @@ mod tests {
             transitions: vec![],
         }
         .encode_to_vec();
-        let legacy = FragReuseLedger::decode_content(0, legacy.into()).unwrap();
-        let tagged = FragReuseLedger::decode_content(1, history(vec![mapping])).unwrap();
+        let legacy = FragReuseLedger::decode_content(HistoryFormat::Legacy, legacy.into()).unwrap();
+        let tagged =
+            FragReuseLedger::decode_content(HistoryFormat::Tagged, history(vec![mapping])).unwrap();
         assert_eq!(
             legacy.transitions()[0].fingerprint(),
             tagged.transitions()[0].fingerprint()
         );
         let different = FragReuseLedger::decode_content(
-            1,
+            HistoryFormat::Tagged,
             history(vec![ordered(
                 vec![digest(1, 3, 1)],
                 vec![digest(2, 2, 0)],
@@ -697,7 +710,7 @@ mod tests {
         }
         .encode_to_vec()
         .into();
-        let ledger = FragReuseLedger::decode_content(1, content).unwrap();
+        let ledger = FragReuseLedger::decode_content(HistoryFormat::Tagged, content).unwrap();
         for (position, transition) in ledger.transitions().iter().enumerate() {
             for source in transition.sources() {
                 assert_eq!(ledger.consumer(source.id as u32), Some(position));
@@ -738,7 +751,8 @@ mod tests {
         prost::encoding::encode_varint(100, &mut raw);
         let mut content = Vec::new();
         message_field(2, &raw, &mut content);
-        let ledger = FragReuseLedger::decode_content(1, content.into()).unwrap();
+        let ledger =
+            FragReuseLedger::decode_content(HistoryFormat::Tagged, content.into()).unwrap();
         assert!(ledger.transitions().is_empty());
         assert!(ledger.has_unsupported_transitions());
     }
@@ -751,7 +765,8 @@ mod tests {
     fn unknown_envelope_record_marks_ledger_unsupported() {
         let mut content = history(vec![partition(1, 2)]).to_vec();
         message_field(9, b"future envelope record", &mut content);
-        let ledger = FragReuseLedger::decode_content(1, content.into()).unwrap();
+        let ledger =
+            FragReuseLedger::decode_content(HistoryFormat::Tagged, content.into()).unwrap();
         assert_eq!(ledger.transitions().len(), 1);
         assert!(ledger.has_unsupported_transitions());
 
@@ -759,7 +774,8 @@ mod tests {
         let mut content = history(vec![partition(1, 2)]).to_vec();
         prost::encoding::encode_key(9, WireType::Varint, &mut content);
         prost::encoding::encode_varint(7, &mut content);
-        let ledger = FragReuseLedger::decode_content(1, content.into()).unwrap();
+        let ledger =
+            FragReuseLedger::decode_content(HistoryFormat::Tagged, content.into()).unwrap();
         assert!(ledger.has_unsupported_transitions());
     }
 
@@ -772,7 +788,8 @@ mod tests {
         let mut content =
             history(vec![partition(3, 4), partition(1, 2), partition(10, 11)]).to_vec();
         message_field(2, &raw, &mut content);
-        let ledger = FragReuseLedger::decode_content(1, content.into()).unwrap();
+        let ledger =
+            FragReuseLedger::decode_content(HistoryFormat::Tagged, content.into()).unwrap();
         assert!(ledger.has_unsupported_transitions());
         assert_eq!(ledger.transitions().len(), 3);
         assert!(ledger.consumer(1).is_some());
@@ -788,7 +805,7 @@ mod tests {
     #[case::self_cycle(vec![partition(1, 1)], "cycle")]
     fn rejects_invalid_lineage(#[case] transitions: Vec<pb::Transition>, #[case] message: &str) {
         assert_corrupt(
-            FragReuseLedger::decode_content(1, history(transitions)),
+            FragReuseLedger::decode_content(HistoryFormat::Tagged, history(transitions)),
             message,
         );
     }
@@ -803,7 +820,9 @@ mod tests {
             vec![digest(4, 3, 0)],
             &[address(3, 1), address(2, 0), address(2, 1)],
         );
-        let ledger = FragReuseLedger::decode_content(1, history(vec![second, first])).unwrap();
+        let ledger =
+            FragReuseLedger::decode_content(HistoryFormat::Tagged, history(vec![second, first]))
+                .unwrap();
         assert_eq!(ledger.transitions()[0].sources()[0].id, 1);
         assert_eq!(ledger.transitions()[1].sources()[0].id, 3);
         let Mapping::OrderedCompaction(remap) = ledger.transitions()[1].mapping() else {
@@ -828,7 +847,10 @@ mod tests {
         }
         let mut content = Vec::new();
         message_field(2, &raw, &mut content);
-        assert_corrupt(FragReuseLedger::decode_content(1, content.into()), message);
+        assert_corrupt(
+            FragReuseLedger::decode_content(HistoryFormat::Tagged, content.into()),
+            message,
+        );
     }
 
     #[rstest]
@@ -837,7 +859,10 @@ mod tests {
     #[case::wrong_mapping_wire(vec![0x12, 2, 0x20, 0], "length-delimited")]
     #[case::invalid_key(vec![0], "invalid tag")]
     fn rejects_malformed_wire(#[case] content: Vec<u8>, #[case] message: &str) {
-        assert_corrupt(FragReuseLedger::decode_content(1, content.into()), message);
+        assert_corrupt(
+            FragReuseLedger::decode_content(HistoryFormat::Tagged, content.into()),
+            message,
+        );
     }
 
     #[rstest]
@@ -849,7 +874,7 @@ mod tests {
         let mut transition = partition(1, 2);
         transition.sources = vec![source];
         assert_corrupt(
-            FragReuseLedger::decode_content(1, history(vec![transition])),
+            FragReuseLedger::decode_content(HistoryFormat::Tagged, history(vec![transition])),
             message,
         );
     }
@@ -859,7 +884,10 @@ mod tests {
         let mut second = partition(2, 3);
         second.sources[0] = digest(2, 3, 1);
         assert_corrupt(
-            FragReuseLedger::decode_content(1, history(vec![partition(1, 2), second])),
+            FragReuseLedger::decode_content(
+                HistoryFormat::Tagged,
+                history(vec![partition(1, 2), second]),
+            ),
             "inconsistent physical_rows",
         );
     }
@@ -872,7 +900,7 @@ mod tests {
             &[address(1, 2)],
         );
         assert_corrupt(
-            FragReuseLedger::decode_content(1, history(vec![transition])),
+            FragReuseLedger::decode_content(HistoryFormat::Tagged, history(vec![transition])),
             "outside",
         );
         let transition = ordered(
@@ -881,7 +909,7 @@ mod tests {
             &[address(9, 0)],
         );
         assert_corrupt(
-            FragReuseLedger::decode_content(1, history(vec![transition])),
+            FragReuseLedger::decode_content(HistoryFormat::Tagged, history(vec![transition])),
             "survivors",
         );
         let mut transition = partition(1, 2);
@@ -890,7 +918,7 @@ mod tests {
         };
         reference.map_id = "../escape".into();
         assert_corrupt(
-            FragReuseLedger::decode_content(1, history(vec![transition])),
+            FragReuseLedger::decode_content(HistoryFormat::Tagged, history(vec![transition])),
             "map_id",
         );
     }
@@ -898,7 +926,9 @@ mod tests {
     #[test]
     fn all_deleted_source_has_no_destinations() {
         let transition = ordered(vec![digest(1, 2, 2)], vec![], &[]);
-        let ledger = FragReuseLedger::decode_content(1, history(vec![transition])).unwrap();
+        let ledger =
+            FragReuseLedger::decode_content(HistoryFormat::Tagged, history(vec![transition]))
+                .unwrap();
         let Mapping::OrderedCompaction(remap) = ledger.transitions()[0].mapping() else {
             unreachable!()
         };
@@ -908,16 +938,16 @@ mod tests {
     #[test]
     fn version_gate() {
         assert!(
-            FragReuseLedger::decode_content(0, Bytes::new())
+            FragReuseLedger::decode_content(HistoryFormat::Legacy, Bytes::new())
                 .unwrap()
                 .transitions()
                 .is_empty()
         );
-        let error = FragReuseLedger::decode_content(2, Bytes::new()).unwrap_err();
+        let error = HistoryFormat::from_index_version(2).unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }));
         assert!(error.to_string().contains("index_version 2"));
         assert_corrupt(
-            FragReuseLedger::decode_content(0, history(vec![partition(1, 2)])),
+            FragReuseLedger::decode_content(HistoryFormat::Legacy, history(vec![partition(1, 2)])),
             "index_version 1",
         );
     }
@@ -1017,9 +1047,11 @@ mod tests {
 
     #[test]
     fn independent_transitions_keep_serialized_order() {
-        let ledger =
-            FragReuseLedger::decode_content(1, history(vec![partition(10, 11), partition(1, 2)]))
-                .unwrap();
+        let ledger = FragReuseLedger::decode_content(
+            HistoryFormat::Tagged,
+            history(vec![partition(10, 11), partition(1, 2)]),
+        )
+        .unwrap();
         assert_eq!(
             ledger
                 .transitions()
@@ -1091,7 +1123,7 @@ mod tests {
     proptest::proptest! {
         #[test]
         fn arbitrary_inline_bytes_do_not_panic(raw in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..4096)) {
-            let _ = FragReuseLedger::decode_content(1, raw.into());
+            let _ = FragReuseLedger::decode_content(HistoryFormat::Tagged, raw.into());
         }
 
         #[test]

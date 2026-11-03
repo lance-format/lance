@@ -26,7 +26,7 @@ use lance_table::format::overlay::OverlayCoverage;
 use lance_table::format::overlay::staleness::{field_affects_index, overlay_affects_index};
 use lance_table::format::pb::fragment_reuse_index_details::{self as pb_fri, Transition};
 use lance_table::system_index::frag_reuse::FragReuseVersion;
-use lance_table::system_index::frag_reuse::history::{FragReuseHistory, Record};
+use lance_table::system_index::frag_reuse::history::{FragReuseHistory, HistoryFormat, Record};
 use lance_table::system_index::frag_reuse::lineage::TaggedLineage;
 use lance_table::system_index::frag_reuse::metadata::is_tagged;
 use lance_table::system_index::is_system_index;
@@ -3200,7 +3200,7 @@ impl<'a> TransactionRebase<'a> {
                 if current_uses_tagged {
                     let base = match self.reuse.read_entry.as_ref() {
                         Some(entry) => load_frag_reuse_history(dataset, entry).await?,
-                        None => FragReuseHistory::empty(0)?,
+                        None => FragReuseHistory::empty(HistoryFormat::Legacy),
                     };
                     let added = load_proposed_frag_reuse_history(dataset, proposed)
                         .await?
@@ -3333,7 +3333,11 @@ impl<'a> TransactionRebase<'a> {
                 // an older writer left them invalid; the rewrite's own version is
                 // this caller's input and must be valid as given.
                 let (mut history, dropped) = FragReuseHistory::repair_legacy_versions(
-                    new_fri_details.versions.iter().map(pb_fri::Version::from),
+                    new_fri_details
+                        .versions
+                        .iter()
+                        .map(pb_fri::Version::from)
+                        .collect(),
                 )?;
                 if !dropped.is_empty() {
                     log::warn!(
@@ -3404,7 +3408,7 @@ async fn rewrite_reuse_state(
         }
         let base = match read_entry.as_ref() {
             Some(entry) => load_frag_reuse_history(&read_version, entry).await?,
-            None => FragReuseHistory::empty(1)?,
+            None => FragReuseHistory::empty(HistoryFormat::Tagged),
         };
         let added = load_proposed_frag_reuse_history(dataset, proposed)
             .await?
@@ -3433,8 +3437,9 @@ async fn rewrite_reuse_state(
 
 /// `versions` as [`FragReuseHistory::repair_legacy_versions`] keeps them.
 fn repaired_legacy_versions(versions: &[FragReuseVersion]) -> Result<Vec<FragReuseVersion>> {
-    let (history, _) =
-        FragReuseHistory::repair_legacy_versions(versions.iter().map(pb_fri::Version::from))?;
+    let (history, _) = FragReuseHistory::repair_legacy_versions(
+        versions.iter().map(pb_fri::Version::from).collect(),
+    )?;
     history
         .records()
         .filter_map(|record| match record {

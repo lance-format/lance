@@ -643,14 +643,15 @@ pub async fn frag_reuse_records(
 
 /// The lineage view of serialized history `content`.
 pub fn frag_reuse_ledger_from_content(
-    index_version: i32,
+    format: lance_table::system_index::frag_reuse::history::HistoryFormat,
     content: &[u8],
 ) -> lance_core::Result<Arc<lance_table::system_index::frag_reuse::ledger::FragReuseLedger>> {
     Ok(
-        lance_table::system_index::frag_reuse::history::FragReuseHistory::from_content(
-            index_version,
+        lance_table::system_index::frag_reuse::history::RawHistory::new(
+            format,
             bytes::Bytes::copy_from_slice(content),
-        )?
+        )
+        .validate()?
         .ledger()
         .clone(),
     )
