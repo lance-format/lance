@@ -819,15 +819,24 @@ class NgramRowAddressDomainIndex(UpgradeDowngradeTest):
     min_version is 0.39.0, not NgramIndex's 0.36.0, because this test's whole
     point is an old build correctly ignoring an index format version newer
     than it understands -- and that mechanism itself was only introduced in
-    0.39.0 (#4906).
+    0.39.0 (#4906). Before that, an old build doesn't inspect index_version
+    at all and will happily misuse a too-new NGRAM index.
 
     NGRAM was changed to store physical row addresses (``_rowaddr``) instead
     of row ids, which bumped its on-disk format version to 1. This dataset
     enables stable row ids, so the two domains genuinely differ and updating
-    a pre-change segment must rebuild it rather than merge new data into it.
-    An older build must ignore an index the current build has touched (its
-    format version is too new) but still answer every query correctly via a
-    full scan, and must not error out when writing to the dataset afterwards.
+    a pre-change segment must rebuild it rather than merge new data into it
+    (a merge would otherwise silently combine row ids and row addresses in
+    the same column). This test checks the full story:
+
+    - An old-format (row-id domain) NGRAM index is loaded and used correctly
+      by the current build.
+    - Updating it (inserting rows, then optimizing) with the current build
+      keeps both old and new rows queryable.
+    - Stable readers that do not support the updated index must ignore it and
+      answer correctly via a full scan. Readers from 15.0.0 onward must use
+      it. Stable writers without the row-address capability must reject
+      inserts and unsafe updates without changing the dataset.
 
     Without stable row ids the current build keeps writing format version 0,
     which NgramIndex above checks every build keeps using.
@@ -835,6 +844,11 @@ class NgramRowAddressDomainIndex(UpgradeDowngradeTest):
 
     def __init__(self, path: Path):
         self.path = path
+
+    def _supports_row_address_index(self) -> bool:
+        return not self._running_in_old_venv or Version(self.compat_version) >= Version(
+            "15.0.0"
+        )
 
     def create(self):
         """Create a stable-row-id dataset with an NGRAM index."""
@@ -871,22 +885,25 @@ class NgramRowAddressDomainIndex(UpgradeDowngradeTest):
             )
 
     def check_read(self):
-        """An old-format index must be used by the current build; a
-        too-new one must be safely ignored (but answers must stay correct)
-        by an older build."""
-        self._assert_queryable(expect_index_used=not self._running_in_old_venv)
+        """Use supported index formats and safely ignore too-new ones."""
+        self._assert_queryable(expect_index_used=self._supports_row_address_index())
 
     def check_write(self):
-        """Insert a row and update the index, then verify old and new rows
-        both stay correct -- whether or not this build can even see the
-        index."""
+        """Fence old writers; verify current writes and index maintenance."""
         ds = lance.dataset(self.path)
+        new_key = ds.count_rows()
+        word = f"word{new_key}"
         data = pa.table(
             {
-                "idx": pa.array([1000]),
-                "ngram": pa.array(["word1000"]),
+                "idx": pa.array([new_key]),
+                "ngram": pa.array([word]),
             }
         )
+        if self._running_in_old_venv and not _writer_supports_row_address_indices(
+            self.compat_version
+        ):
+            _assert_row_address_writes_fenced(ds, data, self.compat_version)
+            return
         ds.insert(data)
         # For the current build updating a legacy row-id-domain segment,
         # this must rebuild (not merge) the index -- see the class docstring.
@@ -896,10 +913,8 @@ class NgramRowAddressDomainIndex(UpgradeDowngradeTest):
         ds = lance.dataset(self.path)
         table = ds.to_table(filter="contains(ngram, 'word7')")
         assert table.num_rows == 111
-        # `check_write` runs more than once across the upgrade/downgrade
-        # round trip, each time inserting another `word1000` row.
-        table = ds.to_table(filter="contains(ngram, 'word1000')")
-        assert table.num_rows >= 1
+        table = ds.to_table(filter=f"contains(ngram, '{word}')")
+        assert table.num_rows == 1
 
 
 @compat_test(min_version="0.36.0")

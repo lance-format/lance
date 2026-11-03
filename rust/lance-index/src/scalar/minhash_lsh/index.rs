@@ -241,7 +241,8 @@ fn check_index_file(
 ) -> Result<u32> {
     let corrupt = |message: String| Error::corrupt_file_named(file, message);
     let row_addr_domain = reader.schema().field(ROW_ADDR).is_some();
-    let expected = lance_core::datatypes::Schema::try_from(expected_schema(row_addr_domain).as_ref())?;
+    let expected =
+        lance_core::datatypes::Schema::try_from(expected_schema(row_addr_domain).as_ref())?;
     reader
         .schema()
         .check_compatible(&expected, &SchemaCompareOptions::default())
@@ -278,8 +279,12 @@ impl MinHashLshIndex {
             store.open_index_file(SIGNATURES_FILENAME)
         )?;
 
-        let bands_version =
-            check_index_file(bands.as_ref(), BANDS_FILENAME, |_| BANDS_SCHEMA.clone(), &params)?;
+        let bands_version = check_index_file(
+            bands.as_ref(),
+            BANDS_FILENAME,
+            |_| BANDS_SCHEMA.clone(),
+            &params,
+        )?;
         let signatures_version = check_index_file(
             signatures.as_ref(),
             SIGNATURES_FILENAME,

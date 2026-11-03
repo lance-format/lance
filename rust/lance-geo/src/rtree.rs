@@ -414,7 +414,14 @@ impl RTreeIndex {
         results_are_row_addresses: bool,
     ) -> Result<Arc<Self>> {
         lance_index_core::remapping::check_batch_remapping_entry()?;
-        Self::load_inner(store, None, remapping, index_cache, results_are_row_addresses).await
+        Self::load_inner(
+            store,
+            None,
+            remapping,
+            index_cache,
+            results_are_row_addresses,
+        )
+        .await
     }
 
     async fn load_inner(
