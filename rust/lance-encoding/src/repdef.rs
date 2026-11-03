@@ -2590,6 +2590,12 @@ pub enum ControlWordParser {
     DEF16,
     DEF32,
     NIL,
+    /// Like [`Self::NIL`], but every control word still takes one zero byte.
+    ///
+    /// Writers before #9018 wrote these for pages whose rep/def buffers were present
+    /// but all zero, while the layout recorded zero rep and def bits. The decoder
+    /// switches to this parser when it detects such a page.
+    NIL8,
 }
 
 impl ControlWordParser {
@@ -2750,6 +2756,7 @@ impl ControlWordParser {
             Self::DEF16 => 2,
             Self::DEF32 => 4,
             Self::NIL => 0,
+            Self::NIL8 => 1,
         }
     }
 
@@ -2776,7 +2783,7 @@ impl ControlWordParser {
             Self::DEF8 => Self::parse_one::<1>(src, dst_def),
             Self::DEF16 => Self::parse_one::<2>(src, dst_def),
             Self::DEF32 => Self::parse_one::<4>(src, dst_def),
-            Self::NIL => {}
+            Self::NIL | Self::NIL8 => {}
         }
     }
 
@@ -2789,7 +2796,7 @@ impl ControlWordParser {
             | Self::REP8
             | Self::REP16
             | Self::REP32 => true,
-            Self::DEF8 | Self::DEF16 | Self::DEF32 | Self::NIL => false,
+            Self::DEF8 | Self::DEF16 | Self::DEF32 | Self::NIL | Self::NIL8 => false,
         }
     }
 
@@ -2823,7 +2830,7 @@ impl ControlWordParser {
             Self::DEF8 => Self::parse_def_desc_one::<1>(src),
             Self::DEF16 => Self::parse_def_desc_one::<2>(src),
             Self::DEF32 => Self::parse_def_desc_one::<4>(src),
-            Self::NIL => ControlWordDesc {
+            Self::NIL | Self::NIL8 => ControlWordDesc {
                 is_new_row: true,
                 is_valid_item: true,
                 is_visible: true,

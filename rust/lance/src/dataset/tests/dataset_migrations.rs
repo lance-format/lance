@@ -20,6 +20,7 @@ use lance_table::rowids::read_row_ids;
 
 use crate::dataset::write::{WriteMode, WriteParams};
 use arrow::compute::concat_batches;
+use arrow_array::types::{Float32Type, Int64Type};
 use arrow_array::{
     Array, ArrayRef, Float32Array, Int32Array, Int64Array, ListArray, RecordBatchIterator,
     StructArray, UInt32Array,
@@ -826,6 +827,78 @@ async fn test_v10_0_0_dictionary_merged_past_key_type() {
         .map(|i| (i % 100 % 25 != 3).then(|| format!("v{i:03}")))
         .collect::<Vec<_>>();
     assert_eq!(actual, expected);
+}
+
+/// Lance 11.0.0 wrote a zero control-word byte before each value of the second file's
+/// full-zip pages while their layouts record no control-word bits. The binary column
+/// could not be read and the vector column read back shifted by one byte per value.
+#[rstest]
+#[case::scan(None)]
+#[case::take(Some(vec![2, 5, 7]))]
+#[tokio::test]
+async fn test_v11_0_0_fullzip_padded_control_words(#[case] rows: Option<Vec<u64>>) {
+    let test_dir = copy_test_data_to_tmp("v11.0.0/fullzip_padded_control_words.lance").unwrap();
+    let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let (batch, rows) = match rows {
+        Some(rows) => {
+            let schema = Arc::new(dataset.schema().clone());
+            (dataset.take(&rows, schema).await.unwrap(), rows)
+        }
+        None => (
+            dataset.scan().try_into_batch().await.unwrap(),
+            (0..8).collect(),
+        ),
+    };
+    let binary = batch["binary"].as_fixed_size_list();
+    let vector = batch["vector"].as_fixed_size_list();
+    let binary_items = binary.values().as_struct().column_by_name("b").unwrap();
+    let binary_items = binary_items.as_binary::<i64>();
+    let vector_items = vector.values().as_struct().column_by_name("v").unwrap();
+    let vector_items = vector_items.as_fixed_size_list();
+    for (index, row) in rows.into_iter().enumerate() {
+        // Rows 0 and 1 are null lists.
+        assert_eq!(binary.is_valid(index), row >= 2, "row {row}");
+        assert_eq!(vector.is_valid(index), row >= 2, "row {row}");
+        if row < 2 {
+            continue;
+        }
+        for item in [row as u32 * 2, row as u32 * 2 + 1] {
+            let position = index * 2 + (item % 2) as usize;
+            assert_eq!(binary_items.value(position), item.to_le_bytes().repeat(75));
+            let expected = (item * 128..(item + 1) * 128)
+                .map(|value| value as f32)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                vector_items
+                    .value(position)
+                    .as_primitive::<Float32Type>()
+                    .values(),
+                expected.as_slice()
+            );
+        }
+    }
+}
+
+/// Lance 4.0.1 wrote a zero control-word byte before each value that a merge_insert
+/// updating only some columns stored, while the page layout records no control-word
+/// bits (#6338).
+#[tokio::test]
+async fn test_v4_0_1_merge_insert_padded_control_words() {
+    let test_dir = copy_test_data_to_tmp("v4.0.1/merge_insert_padded_control_words.lance").unwrap();
+    let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+
+    let mut scanner = dataset.scan();
+    scanner.project(&["id", "a"]).unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+    let ids = batch["id"].as_primitive::<Int64Type>();
+    let values = batch["a"].as_binary::<i32>();
+    let mut rows = (0..batch.num_rows())
+        .map(|row| (ids.value(row), values.value(row).to_vec()))
+        .collect::<Vec<_>>();
+    rows.sort();
+    assert_eq!(rows, [(0, vec![1_u8; 256]), (1, vec![2_u8; 256])]);
 }
 
 // Helper: create a simple dataset with one fragment of `n` rows at the given URI.
