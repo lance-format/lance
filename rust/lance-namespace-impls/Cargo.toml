@@ -95,6 +95,7 @@ tempfile.workspace = true
 wiremock.workspace = true
 rstest.workspace = true
 serde = { workspace = true, features = ["derive"] }
+serde-saphyr = { version = "2", default-features = false, features = ["deserialize"] }
 
 [[example]]
 name = "manifest_bench"

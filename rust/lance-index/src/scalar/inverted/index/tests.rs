@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::scalar::inverted::document_tokenizer::DocType;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use lance_core::cache::{LanceCache, QuickCacheBackend};
 use lance_core::utils::tempfile::TempObjDir;
@@ -39,6 +39,8 @@ use crate::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_tokenizer::{Language, SimpleTokenizer, StopWordFilter, TextAnalyzer};
 
 use super::*;
+
+const TEST_GROUP_TOKENS: usize = 128;
 
 async fn write_single_partition_index(
     store: Arc<LanceIndexStore>,
@@ -102,7 +104,7 @@ fn empty_doc_stream() -> SendableRecordBatchStream {
     ]));
     Box::pin(RecordBatchStreamAdapter::new(
         schema,
-        stream::iter(Vec::<datafusion::error::Result<RecordBatch>>::new()),
+        stream::iter(Vec::<datafusion_common::Result<RecordBatch>>::new()),
     ))
 }
 

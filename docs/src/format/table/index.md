@@ -51,6 +51,11 @@ references. It then records the largest ID assigned after activation. When a man
 
 </details>
 
+The manifest also has a `config` map for table-level configuration. Keys prefixed with
+`lance.` are reserved for the Lance library; conforming readers and writers are expected
+to recognize and honor them. See the [Table Config Specification](table_config.md) for
+the full list of known `lance.` configuration keys and their meanings.
+
 ## Schema & Fields
 
 The schema of the table is written as a series of fields, plus a schema metadata map.
@@ -184,6 +189,22 @@ or independently of column indices due to variable encoding widths (for Lance fi
 
     See the [5.0.0 migration guide](../../guide/migration.md#500) for a detailed example.
 
+### File Metadata Size Hints
+
+`DataFile.file_metadata_size_bytes` and `IndexFile.file_metadata_size_bytes`
+record the size in bytes of a file's metadata suffix, or 0 if unknown. For a
+Lance file of format version 2.0 or later, this is the file size minus the
+position of global buffer 0, which holds the file's `FileDescriptor`. That
+position is stored in the first entry of the global buffer offset table, which
+the footer locates; see the [file layout](../file/index.md#detailed-overview).
+It is always 0 for legacy (0.1) files and for index files in other formats.
+Writers record either this exact value or 0.
+
+The hint is advisory: it lets a reader fetch the last
+`file_metadata_size_bytes` bytes of the file before decoding the footer. The
+footer stays authoritative. Readers must ignore a value larger than the file
+and read any metadata the footer references outside the hinted range.
+
 ## Deletion Files
 
 Deletion files (a.k.a. deletion vectors) track deleted rows without rewriting data files.
@@ -230,6 +251,18 @@ versioning, index integration, compaction, and a worked example — see the
 
 
 ## Related Specifications
+
+### Blob v2
+
+Logical blob inputs, physical descriptors, payload objects, and snapshot ownership.
+
+See [Blob v2 Specification](blob.md)
+
+### Table Config
+
+Standard `lance.`-prefixed table configuration keys and their meanings.
+
+See [Table Config Specification](table_config.md)
 
 ### Storage Layout
 

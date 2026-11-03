@@ -822,10 +822,14 @@ pub(crate) fn transform_fts_document_stream(
             .column_by_name(&resolved.root_column)
             .or_else(|| batch.column_by_name(VALUE_COLUMN_NAME))
             .expect("FTS document input schema was validated");
-        let documents = resolved
+        let mut documents = resolved
             .documents_from_array(source, batch.num_rows())
             .map_err(DataFusionError::from)?;
         let input_row_ids = batch[ROW_ID].as_primitive::<arrow_array::types::UInt64Type>();
+        // The row-ID validity bitmap can carry the scan's selection vector.
+        if input_row_ids.null_count() > 0 {
+            documents.retain(|document| input_row_ids.is_valid(document.row_index));
+        }
         let texts =
             StringArray::from_iter_values(documents.iter().map(|document| document.text.as_str()));
         let row_ids = UInt64Array::from_iter_values(
@@ -1061,13 +1065,21 @@ pub(crate) async fn merge_segments(
         source_indices.push(Arc::new(inverted_index.clone()));
     }
 
+    // Like the BTree merge, each source keeps only its rows still stored in the
+    // fragments it covers, so a stale posting for a row that moved into another
+    // source's fragment is not carried into the merged segment.
+    let segment_refs = segments.iter().collect::<Vec<_>>();
+    let (_, old_data_filters) =
+        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, false)
+            .await?;
+
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
     let created_index = InvertedIndex::merge_segments(
         &source_indices,
         empty_inverted_update_stream(dataset, &resolved)?,
         &new_store,
-        None,
+        &old_data_filters,
         lance_index::progress::noop_progress(),
     )
     .await?;
@@ -1081,6 +1093,8 @@ pub(crate) async fn merge_segments(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(index_files_to_table(created_index.files)),
+        clustering_id: None,
+        metadata: Default::default(),
         ..segments[0].clone()
     })
 }
@@ -1356,6 +1370,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let details =
             normalize_inverted_details(&metadata, InvertedIndexDetails::default()).unwrap();
@@ -1380,6 +1396,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let details = InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
 

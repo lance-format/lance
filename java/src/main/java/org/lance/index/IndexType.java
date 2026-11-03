@@ -25,6 +25,7 @@ public enum IndexType {
   ZONEMAP(8),
   BLOOM_FILTER(9),
   RTREE(10),
+  FM(11),
   MINHASH_LSH(12),
   VECTOR(100),
   IVF_FLAT(101),

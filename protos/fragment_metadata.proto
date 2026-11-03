@@ -29,8 +29,6 @@ message DataFragment {
   // File that indicates which rows, if any, should be considered deleted.
   DeletionFile deletion_file = 3;
 
-  // TODO: What's the simplest way we can allow an inline tombstone bitmap?
-
   /* A serialized RowIdSequence message (see rowids.proto).
    *
    * These are the row ids for the fragment, in order of the rows as they appear.
@@ -195,6 +193,21 @@ message DataFile {
    * Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.
    */
   optional uint32 base_id = 7;
+
+  /* Size in bytes of the file's metadata suffix, or 0 if unknown.
+   *
+   * For a Lance file of format version 2.0 or later, this is the file size minus
+   * the position of global buffer 0, which holds the file's `FileDescriptor`.
+   * That position is stored in the first entry of the global buffer offset
+   * table, which the footer locates. It is always 0 for legacy (0.1) files.
+   * Writers record either this exact value or 0.
+   *
+   * This advisory hint lets a reader fetch the last `file_metadata_size_bytes`
+   * bytes of the file before decoding the footer. The footer stays
+   * authoritative: readers must ignore a value larger than the file and read
+   * any metadata the footer references outside the hinted range.
+   */
+  uint64 file_metadata_size_bytes = 8;
 } // DataFile
 
 /* An overlay file supplies new values for a subset of (row offset, field) cells
@@ -268,6 +281,9 @@ message FieldCoverage {
  * The path of the deletion file is constructed as:
  *   {root}/_deletions/{fragment_id}-{read_version}-{id}.{extension}
  * where {extension} depends on DeletionFileType.
+ *
+ * When `inline` is set there is no such file: the deletion vector lives in the
+ * manifest itself.
  */
 message DeletionFile {
   /* Type of deletion file, intended as a way to increase efficiency of the storage of deleted row
@@ -293,6 +309,13 @@ message DeletionFile {
   uint64 id = 3;
   // The number of rows that are marked as deleted.
   uint64 num_deleted_rows = 4;
+  /* The deletion vector itself, stored in the manifest instead of in a file.
+   * Always the BITMAP encoding (a serialized Roaring bitmap of deleted row
+   * offsets), whatever `file_type` says. A reader that reads one request per
+   * deletion file otherwise pays one request per fragment on a table whose
+   * every fragment has a few deleted rows. Requires FLAG_INLINE_DELETIONS.
+   */
+  optional bytes inline = 8;
   /* The base path index of the deletion file. Used when the file is imported or referred from another
    * dataset. Lance uses it as key of the base_paths field in Manifest to determine the actual base
    * path of the deletion file.

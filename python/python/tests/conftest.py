@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
+import os
 import sys
+import tempfile
 from typing import Optional
 
 import pytest
@@ -104,6 +106,15 @@ def pytest_configure(config):
 
     workerinput = getattr(config, "workerinput", None)
     if workerinput is not None:
+        # Windows cannot replace a generated kernel module held open by another
+        # worker. Set the cache before collection imports torch.compile kernels.
+        cache_root = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(
+            tempfile.gettempdir(), "lance_torchinductor"
+        )
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(
+            cache_root, workerinput["workerid"]
+        )
+
         from compat.compat_decorator import use_version_snapshot
 
         use_version_snapshot(workerinput["lance_compat_versions"])
@@ -112,8 +123,8 @@ def pytest_configure(config):
 def pytest_configure_node(node):
     """Resolve the compat version list once, on the xdist controller.
 
-    The compat tests are parametrized over the pylance releases published to
-    PyPI and fury.io, and collecting `python/tests` imports them whether or not
+    The compat tests are parametrized over the stable pylance releases published
+    to PyPI, and collecting `python/tests` imports them whether or not
     --run-compat was passed. Left to itself every worker queries for that list
     while collecting, so a request that times out or a release that lands
     mid-run gives one worker a different parameter set, and xdist aborts the

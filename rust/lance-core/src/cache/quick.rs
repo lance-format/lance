@@ -206,6 +206,10 @@ impl QuickCacheBackend {
 
 #[async_trait]
 impl CacheBackend for QuickCacheBackend {
+    fn uses_entry_sizes(&self) -> bool {
+        self.capacity > 0
+    }
+
     async fn get_resident(&self, key: &InternalCacheKey) -> Option<CacheEntry> {
         self.priority
             .lock()
@@ -328,6 +332,10 @@ impl CacheBackend for QuickCacheBackend {
 
     fn capacity_bytes(&self) -> Option<usize> {
         Some(self.capacity)
+    }
+
+    fn max_entry_bytes(&self) -> Option<u64> {
+        Some((self.capacity / self.cache.num_shards()) as u64)
     }
 
     fn approx_num_entries(&self) -> usize {
@@ -598,6 +606,13 @@ mod tests {
             QuickCacheBackend::with_capacity(1 << 20).capacity_bytes(),
             Some(1 << 20)
         );
+        for capacity in [0, 1 << 20, 16 << 30] {
+            let backend = QuickCacheBackend::with_capacity(capacity);
+            assert_eq!(
+                backend.max_entry_bytes(),
+                Some((capacity / backend.cache.num_shards()) as u64)
+            );
+        }
     }
 
     fn keys_in_shard(
