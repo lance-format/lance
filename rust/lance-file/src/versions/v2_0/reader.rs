@@ -285,7 +285,7 @@ pub fn prepared_read_length(prepared: &PreparedProjection) -> Result<u64> {
                 prepared.column_infos.len()
             ))
         })?;
-        normalized_column_num_rows(info)
+        normalized_column_num_rows(info, 1)
     };
     let mut cursor = 0;
     let mut field_lengths = Vec::with_capacity(prepared.decoder_projection.schema.fields.len());

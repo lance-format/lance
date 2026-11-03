@@ -429,6 +429,8 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }];
         let mut next_row_id = 0;
 
@@ -468,6 +470,8 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }];
         let mut next_row_id = 100;
 
@@ -492,6 +496,8 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: Some(inline_versions(50, 7)),
             created_at_version_meta: Some(RowDatasetVersionMeta::Column),
+            clustering_id: None,
+            metadata: Default::default(),
         }];
 
         resolve_update_version_metadata(&[], &mut new_fragments, 9, &Default::default()).unwrap();
@@ -519,6 +525,8 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: Some(inline_versions(50, 2)),
             created_at_version_meta: Some(RowDatasetVersionMeta::Column),
+            clustering_id: None,
+            metadata: Default::default(),
         }];
         let mut new_fragments = vec![Fragment {
             id: 2,
@@ -531,6 +539,8 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: Some(RowDatasetVersionMeta::Column),
+            clustering_id: None,
+            metadata: Default::default(),
         }];
 
         resolve_update_version_metadata(&existing, &mut new_fragments, 9, &Default::default())
@@ -562,6 +572,8 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: Some(inline_versions(10, 3)),
             created_at_version_meta: Some(inline_versions(10, 3)),
+            clustering_id: None,
+            metadata: Default::default(),
         }];
         let mut new_fragments = vec![Fragment {
             id: 2,
@@ -572,6 +584,8 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: Some(inline_versions(10, 7)),
+            clustering_id: None,
+            metadata: Default::default(),
         }];
 
         resolve_update_version_metadata(&existing, &mut new_fragments, 9, &Default::default())
@@ -601,6 +615,8 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: Some(inline_versions(placed_rows, 3)),
+            clustering_id: None,
+            metadata: Default::default(),
         }];
 
         let result = resolve_update_version_metadata(&[], &mut fragments, 9, &Default::default());
@@ -641,6 +657,8 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: Some(inline_versions(50, 2)),
             created_at_version_meta: Some(RowDatasetVersionMeta::Column),
+            clustering_id: None,
+            metadata: Default::default(),
         }];
         let new_fragment = |ids: std::ops::Range<u64>| Fragment {
             id: 2,
@@ -653,6 +671,8 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let mut new_fragments = vec![new_fragment(10..12)];
@@ -717,6 +737,8 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }];
         let mut next_row_id = 100;
 
@@ -750,6 +772,8 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }];
         let mut next_row_id = 100;
 
@@ -786,6 +810,8 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }];
         let mut next_row_id = 100;
 
@@ -815,6 +841,8 @@ mod tests {
                 deletion_file: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
             Fragment {
                 id: 2,
@@ -825,6 +853,8 @@ mod tests {
                 deletion_file: None,
                 last_updated_at_version_meta: None,
                 created_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
         ];
         let mut next_row_id = 1000;
@@ -870,6 +900,8 @@ mod tests {
             deletion_file: None,
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }];
         let mut next_row_id = 0;
 
@@ -903,6 +935,8 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&created_at_seq).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let new_seq = RowIdSequence::from([100u64, 102].as_slice());
@@ -915,6 +949,8 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
@@ -955,6 +991,8 @@ mod tests {
                     RowDatasetVersionMeta::from_sequence(&frag_a_created).unwrap(),
                 ),
                 last_updated_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
             Fragment {
                 id: 2,
@@ -967,6 +1005,8 @@ mod tests {
                     RowDatasetVersionMeta::from_sequence(&frag_b_created).unwrap(),
                 ),
                 last_updated_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
         ]);
 
@@ -981,6 +1021,8 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let (result, _) = update_txn(vec![new_fragment])
@@ -1020,6 +1062,8 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&existing_created).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         // New fragment has row 10 (UPDATE branch) and row 999 (INSERT branch)
@@ -1033,6 +1077,8 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         // update_txn uses read_version 4 → new_version is 5
@@ -1075,6 +1121,8 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&existing_created).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let new_seq = RowIdSequence::from([10u64, 500, 11, 501].as_slice());
@@ -1087,6 +1135,8 @@ mod tests {
             physical_rows: Some(4),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         // update_txn uses read_version 4 → new_version is 5
@@ -1116,6 +1166,8 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let new_seq = RowIdSequence::from([50u64].as_slice());
@@ -1128,6 +1180,8 @@ mod tests {
             physical_rows: Some(1),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
@@ -1152,6 +1206,8 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let new_fragment = Fragment {
@@ -1163,6 +1219,8 @@ mod tests {
             physical_rows: Some(3),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
@@ -1191,6 +1249,8 @@ mod tests {
                 vec![0xFFu8; 8].as_slice(),
             ))),
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let new_seq = RowIdSequence::from([10u64].as_slice());
@@ -1203,6 +1263,8 @@ mod tests {
             physical_rows: Some(1),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
@@ -1240,6 +1302,8 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&in_range_created).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         // Fragment outside range – IDs [1000, 1001], created_at = 99 (must never appear)
@@ -1261,6 +1325,8 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&out_of_range_created).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         // New fragment rewrites both rows from the in-range fragment
@@ -1274,6 +1340,8 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let manifest = make_stable_row_id_manifest(vec![in_range_frag, out_of_range_frag]);
@@ -1308,6 +1376,8 @@ mod tests {
             physical_rows: Some(3),
             created_at_version_meta: Some(RowDatasetVersionMeta::from_sequence(&created).unwrap()),
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         // New fragment takes the boundary IDs: 10 (min) and 12 (max)
@@ -1321,6 +1391,8 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let manifest = make_stable_row_id_manifest(vec![existing]);
@@ -1365,6 +1437,8 @@ mod tests {
                 RowDatasetVersionMeta::from_sequence(&src_created).unwrap(),
             ),
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         // New fragment rewrites all 100 rows preserving their stable IDs.
@@ -1378,6 +1452,8 @@ mod tests {
             physical_rows: Some(100),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let manifest = make_stable_row_id_manifest(vec![src_frag]);
@@ -1423,6 +1499,8 @@ mod tests {
                     RowDatasetVersionMeta::from_sequence(&created_a).unwrap(),
                 ),
                 last_updated_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
             Fragment {
                 id: 2,
@@ -1435,6 +1513,8 @@ mod tests {
                     RowDatasetVersionMeta::from_sequence(&created_b).unwrap(),
                 ),
                 last_updated_at_version_meta: None,
+                clustering_id: None,
+                metadata: Default::default(),
             },
         ]);
 
@@ -1449,6 +1529,8 @@ mod tests {
             physical_rows: Some(2),
             created_at_version_meta: None,
             last_updated_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let (result, _) = update_txn(vec![new_frag])

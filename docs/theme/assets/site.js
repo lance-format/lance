@@ -92,6 +92,42 @@
       setTimeout(function () { copy.textContent = "Copy"; }, 1400);
     });
 
+    // Synced language tabs (Python / Rust / Java across the page and across navigation).
+    var SYNC_LANGS = { python: 1, rust: 1, java: 1 };
+    function selectLanguageTabs(langKey, anchorEl) {
+      var beforeTop = anchorEl ? anchorEl.getBoundingClientRect().top : 0;
+      article.querySelectorAll(".tabbed-set").forEach(function (set) {
+        var labels = set.querySelectorAll(":scope > .tabbed-labels > label");
+        for (var i = 0; i < labels.length; i++) {
+          if (labels[i].textContent.trim().toLowerCase() === langKey) {
+            var targetInput = document.getElementById(labels[i].getAttribute("for"));
+            if (targetInput && !targetInput.checked) targetInput.checked = true;
+            break;
+          }
+        }
+      });
+      if (anchorEl) {
+        var afterTop = anchorEl.getBoundingClientRect().top;
+        if (afterTop !== beforeTop) window.scrollBy(0, afterTop - beforeTop);
+      }
+    }
+    try {
+      var savedLang = (localStorage.getItem("ld-code-lang") || "").toLowerCase();
+      if (SYNC_LANGS[savedLang]) selectLanguageTabs(savedLang, null);
+    } catch (e) { /* private mode */ }
+    article.addEventListener("change", function (e) {
+      var input = e.target;
+      if (!input.matches || !input.matches(".tabbed-set > input[type='radio']")) return;
+      if (!input.checked || !input.id) return;
+      var set = input.parentElement;
+      var label = set && set.querySelector(':scope > .tabbed-labels > label[for="' + input.id + '"]');
+      if (!label) return;
+      var langKey = label.textContent.trim().toLowerCase();
+      if (!SYNC_LANGS[langKey]) return;
+      try { localStorage.setItem("ld-code-lang", langKey); } catch (err) { /* ignore */ }
+      selectLanguageTabs(langKey, set);
+    });
+
     // Tables: wrap for horizontal overflow.
     article.querySelectorAll("table").forEach(function (t) {
       if (t.closest(".ld-tablewrap")) return;

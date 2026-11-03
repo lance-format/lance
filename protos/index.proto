@@ -306,10 +306,6 @@ message JsonIndexDetails {
    * rebuild happens to see. See JSON_TARGET_DATA_TYPE_UNSPECIFIED for how to
    * recover the type when it is absent.
    *
-   * This completes the description of the extracted values only. These details
-   * still do not record the target index's format version, so they are not a
-   * general, lossless description of the index and must not be read as one.
-   *
    * An implementation that rewrites these details without retraining the target
    * index -- compacting or updating it -- must preserve a recorded type
    * exactly. Every value other than JSON_TARGET_DATA_TYPE_UNSPECIFIED is
@@ -322,6 +318,16 @@ message JsonIndexDetails {
    * may replace it.
    */
   JsonTargetDataType target_data_type = 3;
+
+  /* The target index's own persisted format version, i.e. the
+   * `CreatedIndex::index_version` it reported when it was built.
+   *
+   * Unset for details written before this field existed; readers should
+   * fall back to the target plugin's current version in that case, which
+   * matches those indexes' actual format since they always came from a
+   * fresh training pass in the same codebase.
+   */
+  optional uint32 target_index_version = 4;
 }
 message BloomFilterIndexDetails {}
 

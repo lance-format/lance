@@ -9,10 +9,9 @@ use arrow_array::{Array, FixedSizeListArray};
 use arrow_data::ArrayData;
 use chrono::{DateTime, Utc};
 use lance::dataset::Dataset as LanceDataset;
-use lance::index::DatasetIndexExt;
-use lance::index::IndexSegment;
 use lance::index::vector::ivf::builder::write_vector_storage;
 use lance::index::vector::pq::build_pq_model_in_fragments;
+use lance::index::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
 use lance::io::ObjectStore;
 use lance_index::progress::NoopIndexBuildProgress;
 use lance_index::vector::ivf::shuffler::{IvfShuffler, shuffle_vectors};
@@ -23,7 +22,7 @@ use lance_index::vector::{
 use lance_linalg::distance::DistanceType;
 use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
 use pyo3::Bound;
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyModuleMethods;
 use pyo3::{
@@ -35,7 +34,7 @@ use pyo3::{
 use lance::index::DatasetIndexInternalExt;
 
 use crate::fragment::FileFragment;
-use crate::utils::PyJson;
+use crate::utils::{PyJson, PyLance};
 use crate::{
     dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, rt,
 };
@@ -97,6 +96,49 @@ impl PyIndexSegment {
             self.index_version()
         )
     }
+}
+
+pub(crate) fn index_metadata_to_segment(metadata: IndexMetadata) -> PyResult<IndexSegment> {
+    metadata.into_index_segment().infer_error()
+}
+
+pub(crate) fn extract_index_segments(segments: &Bound<'_, PyAny>) -> PyResult<Vec<IndexSegment>> {
+    let mut extracted = Vec::new();
+    for item in segments.try_iter()? {
+        let item = item?;
+        match item.extract::<PyRef<'_, PyIndexSegment>>() {
+            Ok(segment) => extracted.push(segment.inner.clone()),
+            Err(segment_err) => match item.extract::<PyLance<IndexMetadata>>() {
+                Ok(metadata) => extracted.push(index_metadata_to_segment(metadata.0)?),
+                Err(metadata_err) => {
+                    return Err(PyTypeError::new_err(format!(
+                        "commit_existing_index_segments expected IndexSegment or Index items; \
+                         failed to read item as IndexSegment ({segment_err}) or Index ({metadata_err})"
+                    )));
+                }
+            },
+        }
+    }
+    Ok(extracted)
+}
+
+pub(crate) fn parse_index_segment_ids(
+    index_segments: Option<Vec<String>>,
+) -> PyResult<Option<Vec<Uuid>>> {
+    index_segments
+        .map(|segments| {
+            segments
+                .into_iter()
+                .map(|segment| {
+                    Uuid::parse_str(&segment).map_err(|err| {
+                        PyValueError::new_err(format!(
+                            "invalid index segment uuid '{segment}': {err}"
+                        ))
+                    })
+                })
+                .collect::<PyResult<Vec<_>>>()
+        })
+        .transpose()
 }
 
 #[pyclass(name = "IvfModel", module = "lance.indices", skip_from_py_object)]
@@ -426,13 +468,23 @@ pub fn transform_vectors(
         num_bits as usize,
     )
     .infer_error()?;
+    let (_, value_type) =
+        lance::index::vector::utils::get_vector_type(dataset.ds.schema(), column).infer_error()?;
+    lance_index::vector::pq::validate_codebook_value_type(&codebook.value_type(), &value_type)
+        .infer_error()?;
     let distance_type = DistanceType::try_from(distance_type).unwrap();
+    // The IVF transform normalizes the vectors for Cosine, so the codes are
+    // computed with L2, as every other PQ build does.
+    let pq_distance_type = match distance_type {
+        DistanceType::Cosine => DistanceType::L2,
+        other => other,
+    };
     let pq = ProductQuantizer::new(
         num_subvectors as usize,
         num_bits,
         dimension,
         codebook,
-        distance_type,
+        pq_distance_type,
     );
     rt().block_on(
         Some(py),
@@ -549,6 +601,8 @@ async fn do_load_shuffled_vectors(
         created_at: Some(Utc::now()),
         base_id: None,
         files: Some(files),
+        clustering_id: None,
+        metadata: Default::default(),
     };
     ds.commit_existing_index_segments(index_name, column, vec![metadata])
         .await
@@ -596,6 +650,10 @@ pub fn load_shuffled_vectors(
         num_bits as usize,
     )
     .infer_error()?;
+    let (_, value_type) =
+        lance::index::vector::utils::get_vector_type(dataset.ds.schema(), column).infer_error()?;
+    lance_index::vector::pq::validate_codebook_value_type(&codebook.value_type(), &value_type)
+        .infer_error()?;
 
     let distance_type = DistanceType::try_from(distance_type).unwrap();
     let pq_model = ProductQuantizer::new(

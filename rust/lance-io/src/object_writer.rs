@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use object_store::{MultipartUpload, PutMode, PutMultipartOptions, PutOptions};
+use object_store::{MultipartUpload, ObjectStoreExt};
 use object_store::{ObjectStore, path::Path};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinSet;
@@ -112,7 +112,6 @@ pub struct ObjectWriter {
     cursor: usize,
     upload_parallelism: NonZeroUsize,
     buffer: Vec<u8>,
-    put_mode: PutMode,
     // TODO: use constant size to support R2
     use_constant_size_upload_parts: bool,
 }
@@ -246,7 +245,7 @@ enum UploadState {
 
 /// Methods for state transitions.
 impl UploadState {
-    fn started_to_putting_single(&mut self, path: Arc<Path>, buffer: Vec<u8>, put_mode: PutMode) {
+    fn started_to_putting_single(&mut self, path: Arc<Path>, buffer: Vec<u8>) {
         // To get owned self, we temporarily swap with Done.
         let this = std::mem::replace(self, Self::Done(WriteResult::default()));
         *self = match this {
@@ -255,26 +254,16 @@ impl UploadState {
                 let started_at = Instant::now();
                 let fut = async move {
                     let size = buffer.len();
-                    let res = store
-                        .put_opts(
-                            &path,
-                            buffer.into(),
-                            PutOptions {
-                                mode: put_mode,
-                                ..Default::default()
-                            },
+                    let res = store.put(&path, buffer.into()).await.map_err(|source| {
+                        UploadFailure::new(
+                            format!(
+                                "single PUT of {path} failed after {:?} ({size} bytes, {})",
+                                started_at.elapsed(),
+                                upload_settings()
+                            ),
+                            source,
                         )
-                        .await
-                        .map_err(|source| {
-                            UploadFailure::new(
-                                format!(
-                                    "single PUT of {path} failed after {:?} ({size} bytes, {})",
-                                    started_at.elapsed(),
-                                    upload_settings()
-                                ),
-                                source,
-                            )
-                        })?;
+                    })?;
                     Ok(WriteResult {
                         size,
                         e_tag: res.e_tag,
@@ -337,21 +326,12 @@ impl ObjectWriter {
     /// Creates a writer, rejecting `LANCE_UPLOAD_CONCURRENCY=0` before allocating
     /// an upload buffer or issuing any requests.
     pub async fn new(object_store: &LanceObjectStore, path: &Path) -> Result<Self> {
-        Self::new_with_mode(object_store, path, PutMode::Overwrite).await
-    }
-
-    pub(crate) async fn new_with_mode(
-        object_store: &LanceObjectStore,
-        path: &Path,
-        put_mode: PutMode,
-    ) -> Result<Self> {
-        Self::with_upload_parallelism(object_store, path, put_mode, max_upload_parallelism())
+        Self::with_upload_parallelism(object_store, path, max_upload_parallelism())
     }
 
     fn with_upload_parallelism(
         object_store: &LanceObjectStore,
         path: &Path,
-        put_mode: PutMode,
         upload_parallelism: usize,
     ) -> Result<Self> {
         let upload_parallelism = NonZeroUsize::new(upload_parallelism).ok_or_else(|| {
@@ -365,7 +345,6 @@ impl ObjectWriter {
             upload_parallelism,
             path: Arc::new(path.clone()),
             buffer: Vec::with_capacity(initial_upload_size()),
-            put_mode,
             use_constant_size_upload_parts: object_store.use_constant_size_upload_parts,
         })
     }
@@ -547,19 +526,9 @@ impl AsyncWrite for ObjectWriter {
                     UploadState::Started(store) => {
                         let path = mut_self.path.clone();
                         let store = store.clone();
-                        let put_mode = mut_self.put_mode.clone();
                         let started_at = Instant::now();
                         let fut = Box::pin(async move {
-                            store
-                                .put_multipart_opts(
-                                    path.as_ref(),
-                                    PutMultipartOptions {
-                                        mode: put_mode,
-                                        ..Default::default()
-                                    },
-                                )
-                                .await
-                                .map_err(|source| {
+                            store.put_multipart(path.as_ref()).await.map_err(|source| {
                                     UploadFailure::new(
                                         format!(
                                             "failed to create multipart upload for {path} after {:?} ({})",
@@ -666,8 +635,7 @@ impl AsyncWrite for ObjectWriter {
                     // If we didn't start a multipart upload, we can just do a single put.
                     let part = std::mem::take(&mut mut_self.buffer);
                     let path = mut_self.path.clone();
-                    let put_mode = mut_self.put_mode.clone();
-                    self.state.started_to_putting_single(path, part, put_mode);
+                    self.state.started_to_putting_single(path, part);
                 }
                 UploadState::InProgress {
                     upload,
@@ -746,6 +714,56 @@ impl Writer for ObjectWriter {
 pub struct LocalWriter {
     path: Path,
     state: LocalWriteState,
+    fsync: bool,
+}
+
+#[cfg(test)]
+static INJECTED_CLOSE_FAILURE: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+fn close_file(file: std::fs::File, path: &std::path::Path) -> io::Result<()> {
+    #[cfg(not(test))]
+    let _ = path;
+
+    let result = close_file_raw(file);
+
+    #[cfg(test)]
+    if result.is_ok() {
+        let mut injected = INJECTED_CLOSE_FAILURE.lock().unwrap();
+        if injected.as_deref() == Some(path) {
+            *injected = None;
+            return Err(io::Error::other("injected close failure"));
+        }
+    }
+
+    result
+}
+
+#[cfg(target_family = "unix")]
+fn close_file_raw(file: std::fs::File) -> io::Result<()> {
+    use std::os::fd::IntoRawFd;
+
+    nix::unistd::close(file.into_raw_fd()).map_err(|error| error.into())
+}
+
+#[cfg(target_family = "windows")]
+fn close_file_raw(file: std::fs::File) -> io::Result<()> {
+    use std::os::windows::io::IntoRawHandle;
+
+    // SAFETY: `into_raw_handle` transfers ownership of the handle, and
+    // `CloseHandle` consumes it exactly once.
+    let result = unsafe { windows_sys::Win32::Foundation::CloseHandle(file.into_raw_handle()) };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_family = "unix", target_family = "windows")))]
+fn close_file_raw(file: std::fs::File) -> io::Result<()> {
+    drop(file);
+    Ok(())
 }
 
 #[derive(Default)]
@@ -781,6 +799,7 @@ impl LocalWriter {
     ) -> Self {
         Self {
             path,
+            fsync: false,
             state: LocalWriteState::Writing(Box::new(WritingState {
                 writer: tokio::io::BufWriter::new(file),
                 cursor: 0,
@@ -789,6 +808,11 @@ impl LocalWriter {
                 io_tracker,
             })),
         }
+    }
+
+    pub(crate) fn with_fsync(mut self, fsync: bool) -> Self {
+        self.fsync = fsync;
+        self
     }
 
     fn already_closed_err(path: &Path) -> io::Error {
@@ -803,29 +827,66 @@ impl LocalWriter {
     }
 
     async fn persist(
+        file: tokio::fs::File,
         temp_path: tempfile::TempPath,
         final_path: Path,
         size: usize,
+        fsync: bool,
         io_tracker: Arc<IOTracker>,
         metrics: IoMetricsGuard,
     ) -> Result<WriteResult> {
         let local_path = crate::local::to_local_path(&final_path);
-        let persisted = tokio::task::spawn_blocking(move || -> Result<String> {
-            temp_path.persist(&local_path).map_err(|e| {
-                Error::io(format!(
-                    "failed to persist temp file to {}: {}",
-                    local_path, e.error
-                ))
-            })?;
+        let persisted = async {
+            if fsync {
+                file.sync_all().await.map_err(|e| {
+                    Error::io(format!(
+                        "failed to sync temp file for {}: {}",
+                        final_path, e
+                    ))
+                })?;
+            }
+            let file = file.into_std().await;
+            let final_path_for_close = final_path.clone();
 
-            let metadata = std::fs::metadata(&local_path).map_err(|e| {
-                Error::io(format!("failed to read metadata for {}: {}", local_path, e))
-            })?;
-            Ok(get_etag(&metadata))
-        })
-        .await
-        .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))
-        .and_then(|e_tag| e_tag);
+            tokio::task::spawn_blocking(move || -> Result<String> {
+                close_file(file, std::path::Path::new(&local_path)).map_err(|e| {
+                    Error::io(format!(
+                        "failed to close temp file for {}: {}",
+                        final_path_for_close, e
+                    ))
+                })?;
+
+                temp_path.persist(&local_path).map_err(|e| {
+                    Error::io(format!(
+                        "failed to persist temp file to {}: {}",
+                        local_path, e.error
+                    ))
+                })?;
+
+                #[cfg(unix)]
+                if fsync {
+                    let parent = std::path::Path::new(&local_path).parent().ok_or_else(|| {
+                        Error::io(format!("file {} has no parent directory", local_path))
+                    })?;
+                    std::fs::File::open(parent)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(|e| {
+                            Error::io(format!(
+                                "failed to sync parent directory of {}: {}",
+                                local_path, e
+                            ))
+                        })?;
+                }
+
+                let metadata = std::fs::metadata(&local_path).map_err(|e| {
+                    Error::io(format!("failed to read metadata for {}: {}", local_path, e))
+                })?;
+                Ok(get_etag(&metadata))
+            })
+            .await
+            .map_err(|e| Error::io(format!("spawn_blocking failed: {}", e)))?
+        }
+        .await;
 
         metrics.record(&persisted, size as u64);
         let e_tag = persisted?;
@@ -875,8 +936,13 @@ impl AsyncWrite for LocalWriter {
         loop {
             match &mut mut_self.state {
                 LocalWriteState::Writing(state) => {
-                    if Pin::new(&mut state.writer).poll_shutdown(cx).is_pending() {
-                        return Poll::Pending;
+                    match Pin::new(&mut state.writer).poll_shutdown(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Err(err)) => {
+                            mut_self.state = LocalWriteState::Poisoned;
+                            return Poll::Ready(Err(err));
+                        }
+                        Poll::Ready(Ok(())) => {}
                     }
 
                     // Write is complete, we can transition to persisting.
@@ -889,9 +955,11 @@ impl AsyncWrite for LocalWriter {
                     mut_self.state = LocalWriteState::Finishing {
                         size,
                         future: Box::pin(Self::persist(
+                            state.writer.into_inner(),
                             state.temp_path,
                             mut_self.path.clone(),
                             size,
+                            mut_self.fsync,
                             state.io_tracker,
                             state.metrics,
                         )),
@@ -900,6 +968,7 @@ impl AsyncWrite for LocalWriter {
                 LocalWriteState::Finishing { future, .. } => match future.poll_unpin(cx) {
                     Poll::Ready(Ok(result)) => mut_self.state = LocalWriteState::Done(result),
                     Poll::Ready(Err(e)) => {
+                        mut_self.state = LocalWriteState::Poisoned;
                         return Poll::Ready(Err(io::Error::other(e)));
                     }
                     Poll::Pending => return Poll::Pending,
@@ -1519,7 +1588,7 @@ mod tests {
     fn test_zero_upload_parallelism_rejected() {
         let store = LanceObjectStore::memory();
         let path = Path::from("zero-concurrency.lance");
-        let error = ObjectWriter::with_upload_parallelism(&store, &path, PutMode::Overwrite, 0)
+        let error = ObjectWriter::with_upload_parallelism(&store, &path, 0)
             .err()
             .expect("zero concurrency must be rejected");
 
@@ -1543,13 +1612,9 @@ mod tests {
         let store = LanceObjectStore::memory();
         let path = Path::from("round-trip.lance");
         let mut writer = match upload_parallelism {
-            Some(upload_parallelism) => ObjectWriter::with_upload_parallelism(
-                &store,
-                &path,
-                PutMode::Overwrite,
-                upload_parallelism,
-            )
-            .unwrap(),
+            Some(upload_parallelism) => {
+                ObjectWriter::with_upload_parallelism(&store, &path, upload_parallelism).unwrap()
+            }
             None => ObjectWriter::new(&store, &path).await.unwrap(),
         };
         let size = (initial_upload_size() * full_parts)
@@ -1574,13 +1639,9 @@ mod tests {
         let observations = store.observations.clone();
         let mut lance_store = LanceObjectStore::memory();
         lance_store.inner = Arc::new(store);
-        let mut writer = ObjectWriter::with_upload_parallelism(
-            &lance_store,
-            &Path::from("gated-tail.lance"),
-            PutMode::Overwrite,
-            1,
-        )
-        .unwrap();
+        let mut writer =
+            ObjectWriter::with_upload_parallelism(&lance_store, &Path::from("gated-tail.lance"), 1)
+                .unwrap();
         let payload = (0..initial_upload_size() + 16)
             .map(|i| i as u8)
             .collect::<Vec<_>>();
@@ -1767,6 +1828,86 @@ mod tests {
         let stats = io_tracker.stats();
         assert_eq!(stats.write_iops, 1);
         assert_eq!(stats.written_bytes, data.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_local_writer_flush_failure_does_not_publish() {
+        let tmp = lance_core::utils::tempfile::TempStdDir::default();
+        let file_path = tmp.join("flush_failed.bin");
+        let os_path = Path::from_absolute_path(&file_path).unwrap();
+        let named_temp = tempfile::NamedTempFile::new_in(&*tmp).unwrap();
+        let temp_file_path = named_temp.path().to_owned();
+        let (temp_file, temp_path) = named_temp.into_parts();
+        drop(temp_file);
+
+        let read_only = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&temp_file_path)
+            .unwrap();
+        let mut writer = LocalWriter::new(
+            tokio::fs::File::from_std(read_only),
+            os_path,
+            temp_path,
+            Arc::new(IOTracker::default()),
+        );
+        writer.write_all(b"data").await.unwrap();
+
+        assert!(Writer::shutdown(&mut writer).await.is_err());
+        assert!(!file_path.exists());
+        assert!(!temp_file_path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_local_writer_sync_failure_does_not_publish() {
+        let tmp = lance_core::utils::tempfile::TempStdDir::default();
+        let file_path = tmp.join("unsynced.bin");
+        let os_path = Path::from_absolute_path(&file_path).unwrap();
+        let named_temp = tempfile::NamedTempFile::new_in(&*tmp).unwrap();
+        let temp_file_path = named_temp.path().to_owned();
+        let (temp_file, temp_path) = named_temp.into_parts();
+        drop(temp_file);
+
+        let unsyncable = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let mut writer = LocalWriter::new(
+            tokio::fs::File::from_std(unsyncable),
+            os_path,
+            temp_path,
+            Arc::new(IOTracker::default()),
+        )
+        .with_fsync(true);
+        writer.write_all(b"data").await.unwrap();
+
+        let error = Writer::shutdown(&mut writer).await.unwrap_err();
+        assert!(error.to_string().contains("failed to sync temp file"));
+        assert!(!file_path.exists());
+        assert!(!temp_file_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_local_writer_close_failure_does_not_publish() {
+        let tmp = lance_core::utils::tempfile::TempStdDir::default();
+        let file_path = tmp.join("close_failed.bin");
+        let os_path = Path::from_absolute_path(&file_path).unwrap();
+        let named_temp = tempfile::NamedTempFile::new_in(&*tmp).unwrap();
+        let temp_file_path = named_temp.path().to_owned();
+        let (std_file, temp_path) = named_temp.into_parts();
+        let file = tokio::fs::File::from_std(std_file);
+        let mut writer = LocalWriter::new(file, os_path, temp_path, Arc::new(IOTracker::default()))
+            .with_fsync(true);
+        writer.write_all(b"data").await.unwrap();
+
+        *INJECTED_CLOSE_FAILURE.lock().unwrap() = Some(std::path::PathBuf::from(
+            crate::local::to_local_path(&writer.path),
+        ));
+
+        let error = Writer::shutdown(&mut writer).await.unwrap_err();
+        assert!(error.to_string().contains("failed to close temp file"));
+        assert!(!file_path.exists());
+        assert!(!temp_file_path.exists());
     }
 
     #[tokio::test]

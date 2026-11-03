@@ -108,6 +108,8 @@ pprof.workspace = true
 lzma-sys = { version = "0.1" }
 
 [dev-dependencies]
+metrics.workspace = true
+metrics-util.workspace = true
 lance-test-macros = { workspace = true }
 lance-datagen = { workspace = true }
 lance-datafusion = { workspace = true, features = ["datagen"] }
@@ -177,10 +179,12 @@ goosefs = ["lance-io/goosefs"]
 tos = ["lance-io/tos"]
 huggingface = ["lance-io/huggingface"]
 # Publish object store metrics via the `metrics` crate.
-metrics = ["lance-io/metrics"]
+metrics = ["lance-core/metrics", "lance-io/metrics"]
 geo = ["lance-datafusion/geo", "lance-index/geo"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []
+# Expose internal update-join controls to the dedicated benchmark target.
+update-join-bench = []
 # Compile the RocksDB comparison arm of the (disabled) mem_wal_kv_point_lookup
 # bench. Commented out so it stays out of CI's all-features build.
 # bench-rocksdb = ["dep:rocksdb"]
@@ -208,6 +212,11 @@ harness = false
 [[bench]]
 name = "merge_insert"
 harness = false
+
+[[bench]]
+name = "update_join"
+harness = false
+required-features = ["update-join-bench"]
 
 [[bench]]
 name = "scan"
