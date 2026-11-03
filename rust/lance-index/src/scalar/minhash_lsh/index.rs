@@ -1875,8 +1875,15 @@ mod cache_tests {
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+    use arrow_array::StringArray;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+    use lance_core::utils::tempfile::TempObjDir;
+    use lance_io::object_store::ObjectStore;
     use rstest::rstest;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
+
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::scalar::lance_format::LanceIndexStore;
 
     #[rstest]
     #[case::sparse(0)]
@@ -2045,5 +2052,127 @@ mod selection_tests {
             bands >= HEAP_MIN_BUCKETS
         );
         assert!(scan.heap.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_real_sparse_postings_enter_heap_and_refill_windows() {
+        let query = (0..40)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let texts: Vec<String> = (0..300)
+            .map(|row| {
+                (0..40)
+                    .map(|word| {
+                        if word < 4 {
+                            format!("word{}", (row % 37) + word)
+                        } else {
+                            format!("unique{row}_{word}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let params = MinHashLshIndexParams {
+            num_hashes: 256,
+            num_bands: 256,
+            ..Default::default()
+        };
+        let builder = MinHashLshIndexBuilder::try_new(params)
+            .unwrap()
+            .with_page_rows(1)
+            .unwrap();
+        let details = builder.params().details_any().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, false),
+            Field::new(ROW_ID, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(
+                    texts.iter().map(String::as_str).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(UInt64Array::from_iter_values(0..texts.len() as u64)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let input = RecordBatchStreamAdapter::new(schema, futures::stream::iter([Ok(batch)]));
+        builder
+            .train(Box::pin(input), store.as_ref())
+            .await
+            .unwrap();
+
+        let cache = LanceCache::no_cache();
+        let mut loaded = MinHashLshIndex::load(store, &details, None, &cache)
+            .await
+            .unwrap();
+        // One row per page and one page per refill make every later row of a
+        // bucket prove that the production window path read another page.
+        Arc::get_mut(&mut loaded).unwrap().window_pages = 1;
+        let index = loaded;
+        let signature = index.query_signature(&query).unwrap();
+        let query_keys: HashSet<u64> = signature.band_keys.iter().copied().collect();
+        let expected = {
+            let batch = index
+                .bands
+                .read_range(0..index.bands.num_rows(), None)
+                .await
+                .unwrap();
+            let page = BandPage::try_from_batch(&batch).unwrap();
+            let (keys, doc_ids) = page.columns().unwrap();
+            let mut counts = BTreeMap::new();
+            for (&key, &doc_id) in keys.iter().zip(doc_ids) {
+                if query_keys.contains(&key) {
+                    *counts.entry(doc_id).or_insert(0u32) += 1;
+                }
+            }
+            counts.into_iter().collect::<Vec<_>>()
+        };
+
+        let mut scan = index
+            .open_buckets(&signature.band_keys, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(index.page_max_keys.len() > 1);
+        assert!(scan.cursors.len() >= HEAP_MIN_BUCKETS);
+        let initial = scan
+            .cursors
+            .iter()
+            .map(|cursor| (cursor.next, cursor.window.as_slice().len()))
+            .collect::<Vec<_>>();
+        let mut actual = Vec::new();
+        let mut heap_admitted = false;
+        let mut refilled = false;
+        while let Some(candidate) = index
+            .next_candidate(&mut scan, &NoOpMetricsCollector)
+            .await
+            .unwrap()
+        {
+            actual.push(candidate);
+            if actual.len() == HEAP_SAMPLE_CANDIDATES {
+                assert!(
+                    matches!(scan.strategy, SelectionStrategy::Heap),
+                    "fixture did not admit the heap after {HEAP_SAMPLE_CANDIDATES} candidates"
+                );
+                heap_admitted = true;
+            }
+            refilled |= scan
+                .cursors
+                .iter()
+                .zip(&initial)
+                .any(|(cursor, &(start, initial_len))| cursor.next > start + initial_len);
+        }
+        assert!(heap_admitted);
+        assert!(refilled, "the scan never consumed a refilled window");
+        assert_eq!(actual, expected);
     }
 }
