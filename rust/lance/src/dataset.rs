@@ -74,6 +74,7 @@ mod data_file;
 mod data_file_part;
 pub mod deletions;
 pub mod delta;
+pub mod expire;
 pub mod files;
 pub mod fragment;
 pub(crate) mod fragment_slice;
@@ -121,6 +122,7 @@ pub mod update_join_bench;
 mod update_join_options;
 pub mod updater;
 mod utils;
+pub mod version_retention;
 pub(crate) mod versions;
 pub mod write;
 
