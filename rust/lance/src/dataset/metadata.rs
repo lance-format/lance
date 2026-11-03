@@ -410,6 +410,69 @@ mod tests {
         );
     }
 
+    /// Appends are otherwise compatible with metadata updates, so this test
+    /// distinguishes the opt-in version fence from the baseline Restore rules.
+    #[rstest]
+    #[case::default_rebases_append(false)]
+    #[case::expected_version_rejects_append(true)]
+    #[tokio::test]
+    async fn field_metadata_append_race_respects_expected_version(#[case] fenced: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let data = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(4), BatchCount::from(1));
+        let mut latest = Dataset::write(data, uri, None).await.unwrap();
+        let expected_latest_version = latest.version_id();
+        let mut stale = latest.clone();
+
+        let appended = gen_batch()
+            .col("i", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(4), BatchCount::from(1));
+        latest.append(appended, None).await.unwrap();
+        assert_eq!(latest.version_id(), expected_latest_version + 1);
+        assert_eq!(latest.count_rows(None).await.unwrap(), 8);
+
+        let update = stale
+            .update_field_metadata()
+            .update("i", [("fixture.freshness", "committed")])
+            .unwrap();
+        if fenced {
+            let error = update
+                .with_expected_latest_version(expected_latest_version)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "{error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("latest version advanced from the expected"),
+                "{error}"
+            );
+        } else {
+            update.await.unwrap();
+        }
+
+        stale.checkout_latest().await.unwrap();
+        assert_eq!(
+            stale.version_id(),
+            expected_latest_version + if fenced { 1 } else { 2 }
+        );
+        assert_eq!(stale.count_rows(None).await.unwrap(), 8);
+        assert_eq!(
+            stale
+                .schema()
+                .field("i")
+                .unwrap()
+                .metadata
+                .contains_key("fixture.freshness"),
+            !fenced
+        );
+    }
+
     #[tokio::test]
     async fn field_metadata_expected_latest_version_rejects_restore_race() {
         let data = gen_batch()
