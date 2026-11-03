@@ -440,10 +440,13 @@ impl Schema {
                     "Blob v2 fields nested in {kind} field '{container_path}' are not supported; Blob v2 can be nested only in Struct, List and LargeList"
                 )));
             }
-            let container = match field.data_type() {
-                DataType::Map(..) => Some(("Map", path)),
-                DataType::FixedSizeList(..) => Some(("FixedSizeList", path)),
-                _ => container,
+            // The logical type, not `data_type()`, which rebuilds the whole subtree.
+            let container = if field.logical_type.is_map() {
+                Some(("Map", path))
+            } else if field.logical_type.is_fixed_size_list_struct() {
+                Some(("FixedSizeList", path))
+            } else {
+                container
             };
             for child in &field.children {
                 check(child, &format!("{path}.{}", child.name), container, rejects)?;

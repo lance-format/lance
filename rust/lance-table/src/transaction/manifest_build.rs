@@ -2002,32 +2002,6 @@ impl Transaction {
             )
         };
 
-        // Every schema change lands here, including the Blob v2 promotion above.
-        // An Overwrite defines a new table, so its schema is checked in full.
-        // Otherwise a field the parent schema already nested this way may stay,
-        // e.g. to be dropped.
-        let unsupported = |manifest: &Manifest, field: &lance_core::datatypes::Field| {
-            field.is_blob_v2()
-                || matches!(
-                    manifest.data_storage_format.lance_file_format(),
-                    ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
-                )
-        };
-        let already_nested = |field: &lance_core::datatypes::Field| {
-            !matches!(self.operation, Operation::Overwrite { .. })
-                && current_manifest.is_some_and(|current| {
-                    current
-                        .schema
-                        .check_blob_nesting(|prior| {
-                            prior.id == field.id && unsupported(current, prior)
-                        })
-                        .is_err()
-                })
-        };
-        manifest
-            .schema
-            .check_blob_nesting(|field| unsupported(&manifest, field) && !already_nested(field))?;
-
         if config.activate_non_reusable_field_ids {
             let already_active = current_manifest
                 .map(|manifest| manifest.uses_non_reusable_field_ids())
@@ -2256,6 +2230,33 @@ impl Transaction {
             }
             _ => {}
         }
+
+        // Every schema change lands here: the Blob v2 promotion and the field
+        // metadata updates above, which can turn a nested field into a blob.
+        // An Overwrite defines a new table, so its schema is checked in full.
+        // Otherwise a field the parent schema already nested this way may stay,
+        // e.g. to be dropped.
+        let unsupported = |manifest: &Manifest, field: &lance_core::datatypes::Field| {
+            field.is_blob_v2()
+                || matches!(
+                    manifest.data_storage_format.lance_file_format(),
+                    ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+                )
+        };
+        let already_nested = |field: &lance_core::datatypes::Field| {
+            !matches!(self.operation, Operation::Overwrite { .. })
+                && current_manifest.is_some_and(|current| {
+                    current
+                        .schema
+                        .check_blob_nesting(|prior| {
+                            prior.id == field.id && unsupported(current, prior)
+                        })
+                        .is_err()
+                })
+        };
+        manifest
+            .schema
+            .check_blob_nesting(|field| unsupported(&manifest, field) && !already_nested(field))?;
 
         if changes_auto_cleanup_config(&self.operation) {
             validate_auto_cleanup_config(&manifest)?;
