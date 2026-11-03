@@ -2836,6 +2836,7 @@ mod tests {
         writer.force_freeze_active().await.unwrap();
         writer.wait_for_flush_drain().await.unwrap();
         let manifest = writer.manifest().await.unwrap().unwrap();
+        let dir_id = writer.config().dir_id.clone();
         writer.close().await.unwrap();
         let [sstable] = manifest.sstables.as_slice() else {
             panic!(
@@ -2843,9 +2844,11 @@ mod tests {
                 manifest.sstables
             );
         };
-        let generation = Dataset::open(&format!(
-            "{uri}/_mem_wal/{}/{}",
-            manifest.shard_id, sstable.path
+        let generation = Dataset::open(&sstable_uri(
+            uri,
+            &dir_id,
+            &manifest.shard_id,
+            &sstable.path,
         ))
         .await
         .unwrap();
@@ -2866,6 +2869,7 @@ mod tests {
             vec![snapshot],
             vec!["id".to_string()],
         )
+        .with_mem_wal_dir_id(dir_id)
         .filter(filter)
         .unwrap()
         .try_into_stream()
