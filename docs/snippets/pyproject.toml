@@ -1,0 +1,19 @@
+# Pins for the runnable docs snippets that CI executes (see
+# .github/workflows/docs-snippets.yml). Dependabot bumps these; the install
+# commands shown on the pages live in quickstart/*-install.sh and are checked
+# against the locked versions by tests/test_quickstart.py.
+[project]
+name = "lance-docs-snippets"
+version = "0.0.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "lancedb==0.40.0",
+    "pandas==3.1.0",
+    "pyspark==4.2.1",
+]
+
+[dependency-groups]
+dev = ["packaging==26.3", "pytest==9.1.1"]
+
+[tool.uv]
+package = false

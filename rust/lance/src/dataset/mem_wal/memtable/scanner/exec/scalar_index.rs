@@ -14,8 +14,11 @@ use arrow_buffer::BooleanBufferBuilder;
 use arrow_schema::SchemaRef;
 use datafusion::common::ScalarValue;
 use datafusion::common::stats::Precision;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::apply_expression_roots;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{
     Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
@@ -30,9 +33,10 @@ use futures::stream::{self, StreamExt};
 use lance_core::Result;
 use lance_index::scalar::expression::ScalarIndexExpr;
 
+use crate::dataset::mem_wal::index::IndexStore;
 use crate::dataset::mem_wal::index::{SearchContext, evaluate_index_filter};
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// An index may decline a search matching more than the visible rows divided
 /// by this; reading them all is then expected to be cheaper.
@@ -445,6 +449,13 @@ impl ExecutionPlan for ScalarMemIndexExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        apply_expression_roots(&self.recheck, f)
     }
 
     fn with_new_children(

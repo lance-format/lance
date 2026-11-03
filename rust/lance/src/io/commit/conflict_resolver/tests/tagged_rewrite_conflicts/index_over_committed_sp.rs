@@ -112,7 +112,9 @@ async fn index_built_before_a_stable_partition_lands_translating() {
     assert_eq!(stale.manifest.version, tagged.manifest.version + 1);
 
     let dataset = fresh_session(dir.as_str()).await;
-    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     assert_eq!(
         stored.iter().find(|idx| idx.name == "idx").unwrap().uuid,
         segment.uuid
@@ -149,7 +151,9 @@ async fn index_covering_part_of_a_partition_lands_claiming_nothing() {
         .unwrap();
     assert_eq!(stale.manifest.version, tagged.manifest.version + 1);
     let dataset = fresh_session(dir.as_str()).await;
-    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     assert_eq!(stored_bitmap(&stored), RoaringBitmap::from_iter([0u32]));
     let derived = dataset.load_indices().await.unwrap();
     assert!(
@@ -236,7 +240,9 @@ async fn index_off_the_rewritten_fragments_lands_directly() {
         .unwrap();
     assert_eq!(stale.manifest.version, tagged.manifest.version + 1);
     let dataset = fresh_session(dir.as_str()).await;
-    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     assert_eq!(stored_bitmap(&stored), RoaringBitmap::from_iter([2u32]));
     let derived = dataset.load_indices().await.unwrap();
     assert_eq!(stored_bitmap(&derived), RoaringBitmap::from_iter([2u32]));
@@ -298,7 +304,9 @@ async fn index_built_before_a_stable_partition_and_a_column_rewrite_preserves_va
         .await
         .unwrap();
     let mut dataset = fresh_session(dir.as_str()).await;
-    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     assert_eq!(
         stored.iter().find(|idx| idx.name == "idx").unwrap().uuid,
         segment.uuid

@@ -25,7 +25,9 @@ use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::fragment::FragmentAddColumnsCleanup as LanceFragmentAddColumnsCleanup;
 use lance::dataset::scanner::{ColumnOrdering, MaterializationStyle};
 use lance::dataset::transaction::{Operation, Transaction};
-use lance::dataset::{InsertBuilder, NewColumnTransform, WriteParams};
+use lance::dataset::{
+    InsertBuilder, NewColumnTransform, UpdateJoinOptions, UpdateJoinStrategy, WriteParams,
+};
 use lance_core::datatypes::BlobHandling;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::overlay::DataOverlayFile;
@@ -35,11 +37,11 @@ use lance_table::format::{
 use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
 use pyo3::basic::CompareOp;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyList, PyTuple};
 use pyo3::{exceptions::*, types::PyDict};
 use pyo3::{intern, prelude::*};
 
-use crate::dataset::{PyWriteDest, get_write_params, transforms_from_python};
+use crate::dataset::write::{PyWriteDest, get_write_params, transforms_from_python};
 use crate::error::PythonErrorExt;
 use crate::schema::{LanceSchema, logical_schema_from_lance};
 use crate::utils::{PyLance, export_vec, extract_vec};
@@ -127,7 +129,13 @@ impl FileFragment {
             .collect::<Vec<_>>()
             .join(", ");
         write!(s, "{}]", file_path).unwrap();
-        if let Some(deletion) = &self.fragment.metadata().deletion_file {
+        if let Some(deletion) = self
+            .fragment
+            .metadata()
+            .deletion_file
+            .as_ref()
+            .filter(|deletion| !deletion.is_inline())
+        {
             let path = deletion_file_path(&Default::default(), self.id() as u64, deletion);
             write!(s, ", deletion_file='{}'", path).unwrap();
         }
@@ -264,7 +272,7 @@ impl FileFragment {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None, use_scalar_index=None, io_buffer_size=None, late_materialization=None, include_deleted_rows=None, batch_size_bytes=None, strict_batch_size=None, substrait_filter=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None, blob_handling=None, order_by=None, use_scalar_index=None, ignored_scalar_indices=None, io_buffer_size=None, late_materialization=None, include_deleted_rows=None, batch_size_bytes=None, strict_batch_size=None, substrait_filter=None, scan_stats_callback=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -279,12 +287,14 @@ impl FileFragment {
         blob_handling: Option<Bound<PyAny>>,
         order_by: Option<Vec<PyLance<ColumnOrdering>>>,
         use_scalar_index: Option<bool>,
+        ignored_scalar_indices: Option<Vec<String>>,
         io_buffer_size: Option<u64>,
         late_materialization: Option<Bound<PyAny>>,
         include_deleted_rows: Option<bool>,
         batch_size_bytes: Option<u64>,
         strict_batch_size: Option<bool>,
         substrait_filter: Option<Vec<u8>>,
+        scan_stats_callback: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Scanner> {
         let mut scanner = self_.fragment.scan();
 
@@ -367,6 +377,9 @@ impl FileFragment {
         if let Some(use_scalar_index) = use_scalar_index {
             scanner.use_scalar_index(use_scalar_index);
         }
+        if let Some(ignored_scalar_indices) = ignored_scalar_indices {
+            scanner.with_ignored_scalar_indices(ignored_scalar_indices);
+        }
         if let Some(late_materialization) = late_materialization {
             if let Ok(style_as_bool) = late_materialization.extract::<bool>() {
                 if style_as_bool {
@@ -393,6 +406,10 @@ impl FileFragment {
         }
         if let Some(strict_batch_size) = strict_batch_size {
             scanner.strict_batch_size(strict_batch_size);
+        }
+        if let Some(scan_stats_callback) = scan_stats_callback {
+            let callback = Dataset::make_scan_stats_callback(scan_stats_callback.clone())?;
+            scanner.scan_stats_callback(callback);
         }
         let scn = Arc::new(scanner);
         Ok(Scanner::new(scn))
@@ -464,18 +481,54 @@ impl FileFragment {
         Ok((PyLance(fragment), LanceSchema(schema)))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature=(reader, left_on, right_on, with_offsets=false, strategy="auto", max_hash_rows=None, max_hash_bytes=None, external_memory_pool_bytes=None, max_temp_directory_bytes=None))]
     fn update_columns(
         &mut self,
         reader: PyArrowType<ArrowArrayStreamReader>,
         left_on: String,
         right_on: String,
         with_offsets: bool,
+        strategy: &str,
+        max_hash_rows: Option<usize>,
+        max_hash_bytes: Option<usize>,
+        external_memory_pool_bytes: Option<u64>,
+        max_temp_directory_bytes: Option<u64>,
     ) -> PyResult<UpdateColumnsResult> {
+        let strategy = match strategy {
+            "auto" => UpdateJoinStrategy::Auto,
+            "hash" => UpdateJoinStrategy::Hash,
+            "sort_merge" => UpdateJoinStrategy::SortMerge,
+            value => {
+                return Err(PyValueError::new_err(format!(
+                    "strategy must be one of 'auto', 'hash', or 'sort_merge', got '{value}'"
+                )));
+            }
+        };
+        let mut options = UpdateJoinOptions::default().with_strategy(strategy);
+        match (max_hash_rows, max_hash_bytes) {
+            (Some(max_rows), Some(max_bytes)) => {
+                options = options.with_hash_thresholds(max_rows, max_bytes);
+            }
+            (None, None) => {}
+            _ => {
+                return Err(PyValueError::new_err(
+                    "max_hash_rows and max_hash_bytes must be specified together",
+                ));
+            }
+        }
+        if let Some(bytes) = external_memory_pool_bytes {
+            options = options.with_external_memory_pool_bytes(bytes);
+        }
+        if let Some(bytes) = max_temp_directory_bytes {
+            options = options.with_max_temp_directory_bytes(bytes);
+        }
+
         let mut fragment = self.fragment.clone();
         let result = rt()
             .spawn(None, async move {
                 fragment
-                    .update_columns_with_offsets(reader.0, &left_on, &right_on)
+                    .update_columns_with_options(reader.0, &left_on, &right_on, options)
                     .await
             })?
             .infer_error()?;
@@ -564,6 +617,7 @@ impl FileFragment {
     fn deletion_file(&self) -> PyResult<Option<String>> {
         let deletion = self.fragment.metadata().deletion_file.clone();
         Ok(deletion
+            .filter(|d| !d.is_inline())
             .map(|d| deletion_file_path(&Default::default(), self.id() as u64, &d).to_string()))
     }
 
@@ -667,13 +721,16 @@ pub struct PyDeletionFile(pub DeletionFile);
 #[pymethods]
 impl PyDeletionFile {
     #[new]
+    #[pyo3(signature = (read_version, id, file_type, num_deleted_rows, base_id=None, inline=None))]
     fn new(
         read_version: u64,
         id: u64,
         file_type: &str,
         num_deleted_rows: usize,
         base_id: Option<u32>,
+        inline: Option<Vec<u8>>,
     ) -> PyResult<Self> {
+        let inline = inline.map(bytes::Bytes::from);
         let file_type = match file_type {
             "array" => DeletionFileType::Array,
             "bitmap" => DeletionFileType::Bitmap,
@@ -690,6 +747,7 @@ impl PyDeletionFile {
             file_type,
             num_deleted_rows: Some(num_deleted_rows),
             base_id,
+            inline,
         }))
     }
 
@@ -704,6 +762,14 @@ impl PyDeletionFile {
             slf.0.num_deleted_rows,
         )?;
         dict.set_item(intern!(slf.py(), "base_id"), slf.0.base_id)?;
+        // A list of ints rather than bytes, so the dict stays JSON-serializable.
+        let inline = match &slf.0.inline {
+            Some(bytes) => PyList::new(slf.py(), bytes.iter().copied())?
+                .into_any()
+                .unbind(),
+            None => slf.py().None(),
+        };
+        dict.set_item(intern!(slf.py(), "inline"), inline)?;
 
         Ok(dict)
     }
@@ -746,8 +812,19 @@ impl PyDeletionFile {
         &self.0.base_id
     }
 
+    /// The serialized deletion bitmap when it is stored in the manifest, else None.
+    #[getter]
+    fn inline(&self) -> Option<Vec<u8>> {
+        self.0.inline.as_ref().map(|bytes| bytes.to_vec())
+    }
+
+    /// The path of the deletion file, or None when the vector is stored inline
+    /// and no file exists.
     #[pyo3(signature = (fragment_id, base_uri=None))]
-    fn path(&self, fragment_id: u64, base_uri: Option<&str>) -> PyResult<String> {
+    fn path(&self, fragment_id: u64, base_uri: Option<&str>) -> PyResult<Option<String>> {
+        if self.0.is_inline() {
+            return Ok(None);
+        }
         let base_path = if let Some(base_uri) = base_uri {
             Path::from_url_path(base_uri).map_err(|e| {
                 PyValueError::new_err(format!("Invalid base URI: {}: {}", base_uri, e))
@@ -755,7 +832,9 @@ impl PyDeletionFile {
         } else {
             Path::default()
         };
-        Ok(deletion_file_path(&base_path, fragment_id, &self.0).to_string())
+        Ok(Some(
+            deletion_file_path(&base_path, fragment_id, &self.0).to_string(),
+        ))
     }
 
     pub fn json(&self) -> PyResult<String> {
@@ -960,6 +1039,16 @@ impl FromPyObject<'_, '_> for PyLance<Fragment> {
             // fragments back (a manual Delete/Update/Merge commit). Sorting
             // newest-last is deferred to the manifest reload after commit.
             overlays: extract_vec::<DataOverlayFile>(&ob.getattr("overlays")?)?,
+            // Tolerate objects predating these attributes; absent means no
+            // clustering reference and no generic metadata.
+            clustering_id: match ob.getattr("clustering_id") {
+                Ok(value) => value.extract::<Option<u32>>()?,
+                Err(_) => None,
+            },
+            metadata: match ob.getattr("metadata") {
+                Ok(value) => value.extract()?,
+                Err(_) => Default::default(),
+            },
         }))
     }
 }
@@ -1003,6 +1092,8 @@ impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
             created_at_version_meta,
             last_updated_at_version_meta,
             overlays,
+            self.0.clustering_id,
+            self.0.metadata.clone(),
         ))
     }
 }

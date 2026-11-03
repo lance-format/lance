@@ -567,6 +567,105 @@ fn bench_shot_table(c: &mut Criterion) {
     group.finish();
 }
 
+/// Warm batch lookup with independently recorded physical addresses. Set
+/// BENCH_NUM_ROWS, BENCH_BATCH_FRAGMENTS and BENCH_BATCH_LAYOUT (shuffled,
+/// disjoint or sorted) to exercise overlapping arrays and sparse probe trees.
+fn bench_batch_lookup(c: &mut Criterion) {
+    let rows = num_rows() as usize;
+    let fragment_count = std::env::var("BENCH_BATCH_FRAGMENTS")
+        .map(|s| s.parse::<usize>().unwrap())
+        .unwrap_or(10);
+    let layout = std::env::var("BENCH_BATCH_LAYOUT").unwrap_or_else(|_| "shuffled".into());
+    assert!(matches!(
+        layout.as_str(),
+        "shuffled" | "disjoint" | "sorted"
+    ));
+    assert!(fragment_count > 0 && fragment_count <= rows);
+    let mut ids: Vec<u64> = (0..rows as u64).map(|id| id * 2).collect();
+    if layout == "shuffled" {
+        ids.shuffle(&mut SmallRng::seed_from_u64(42));
+    }
+    let per_fragment = rows.div_ceil(fragment_count);
+    let fragments: Vec<_> = ids
+        .chunks(per_fragment)
+        .enumerate()
+        .map(|(fragment_id, chunk)| {
+            let segment = if layout == "sorted" {
+                U64Segment::SortedArray(chunk.to_vec().into())
+            } else {
+                // Reverse disjoint chunks to keep the Array lookup while
+                // leaving fragment ranges disjoint.
+                U64Segment::Array(if layout == "disjoint" {
+                    chunk.iter().copied().rev().collect::<Vec<_>>().into()
+                } else {
+                    chunk.to_vec().into()
+                })
+            };
+            FragmentRowIdIndex {
+                fragment_id: fragment_id as u32,
+                row_id_sequence: Arc::new(
+                    read_row_ids(
+                        &pb::RowIdSequence {
+                            segments: vec![segment.into()],
+                        }
+                        .encode_to_vec(),
+                    )
+                    .unwrap(),
+                ),
+                deletion_vector: Arc::new(DeletionVector::default()),
+            }
+        })
+        .collect();
+    let index = RowIdIndex::new(&fragments).unwrap();
+    let mut rng = SmallRng::seed_from_u64(7);
+    let mut group = c.benchmark_group(format!("row_id_index_batch/{layout}/f{fragment_count}"));
+    group.sample_size(20);
+    group.warm_up_time(std::time::Duration::from_secs(1));
+    group.measurement_time(std::time::Duration::from_secs(3));
+    for count in [1, 31, 32, 33, 1000] {
+        let batches: Vec<_> = (0..16)
+            .map(|_| {
+                let mut keys = Vec::with_capacity(count);
+                let mut expected = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let physical = rng.random_range(0..rows);
+                    keys.push(ids[physical]);
+                    let fragment = physical / per_fragment;
+                    let offset = if layout == "disjoint" {
+                        (rows - fragment * per_fragment).min(per_fragment)
+                            - 1
+                            - physical % per_fragment
+                    } else {
+                        physical % per_fragment
+                    };
+                    expected.push(Some(RowAddress::new_from_parts(
+                        fragment as u32,
+                        offset as u32,
+                    )));
+                }
+                assert_eq!(index.get_many(&keys).unwrap(), expected);
+                keys
+            })
+            .collect();
+        group.throughput(criterion::Throughput::Elements(count as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &batches,
+            |b, batches| {
+                let mut next = 0;
+                b.iter(|| {
+                    let result = index
+                        .get_many(std::hint::black_box(&batches[next]))
+                        .unwrap();
+                    next = (next + 1) % batches.len();
+                    std::hint::black_box(result)
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 fn bench_bitmap_mask_density(c: &mut Criterion) {
     let span = 1_000_000_u64;
     let live: Vec<u64> = (0..span).filter(|id| id % 17 != 0).collect();
@@ -647,7 +746,7 @@ fn bench_broad_dataset_wide_mask(c: &mut Criterion) {
 criterion_group!(
     name = benches;
     config=Criterion::default().with_profiler(lance_testing::pprof::PProfProfiler::new(100, lance_testing::pprof::Output::Flamegraph(None)));
-    targets=bench_creation, bench_get_single, bench_apply_row_id, bench_shot_table, bench_bitmap_mask_density, bench_broad_dataset_wide_mask);
+    targets=bench_creation, bench_get_single, bench_apply_row_id, bench_shot_table, bench_batch_lookup, bench_bitmap_mask_density, bench_broad_dataset_wide_mask);
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     benches,
@@ -655,6 +754,7 @@ criterion_group!(
     bench_get_single,
     bench_apply_row_id,
     bench_shot_table,
+    bench_batch_lookup,
     bench_bitmap_mask_density,
     bench_broad_dataset_wide_mask
 );
