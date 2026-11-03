@@ -1,0 +1,41 @@
+name: Rust module size
+
+# Annotates PRs that grow a Rust module past 3,000 lines and fails PRs that grow
+# one past 400 KB, where GitHub stops syntax highlighting the diff. Modules in
+# ci/module_size_exceptions.txt only get a warning. The thresholds live in
+# ci/check_module_size.py.
+
+on:
+  pull_request:
+    branches:
+      - main
+      - release/**
+    paths:
+      - "**.rs"
+      - ci/check_module_size.py
+      - ci/module_size_exceptions.txt
+      - .github/workflows/module-size.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check Rust module sizes
+    runs-on: ubuntu-slim
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history (without blobs) is needed to find the merge base.
+          fetch-depth: 0
+          filter: blob:none
+      # The checkout is the PR's test merge commit. Comparing it with HEAD^1
+      # (the current base branch) measures only the PR's growth, and checks the
+      # exceptions list against what main will look like after merging.
+      - name: Check module sizes
+        run: python3 ci/check_module_size.py HEAD^1 HEAD --summary "$GITHUB_STEP_SUMMARY"

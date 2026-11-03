@@ -19,6 +19,8 @@ import org.lance.TestVectorDataset;
 import org.lance.index.vector.IvfBuildParams;
 import org.lance.index.vector.PQBuildParams;
 import org.lance.index.vector.RQBuildParams;
+import org.lance.index.vector.RQModel;
+import org.lance.index.vector.RQRotationType;
 import org.lance.index.vector.SQBuildParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.index.vector.VectorTrainer;
@@ -33,13 +35,14 @@ import org.apache.arrow.vector.ipc.ArrowReader;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
-import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -139,9 +142,9 @@ public class VectorIndexTest {
   }
 
   @ParameterizedTest
-  @ValueSource(booleans = {false, true})
-  public void testCreateIvfFlatIndexDistributively(boolean async, @TempDir Path tempDir)
-      throws Exception {
+  @CsvSource({"false, 0.0", "false, 1.0", "true, 0.0", "true, 1.0"})
+  public void testCreateIvfFlatIndexDistributively(
+      boolean async, double effort, @TempDir Path tempDir) throws Exception {
     try (TestVectorDataset testVectorDataset =
         new TestVectorDataset(tempDir.resolve("merge_ivfflat_index_metadata"))) {
       try (Dataset dataset = testVectorDataset.create()) {
@@ -214,7 +217,8 @@ public class VectorIndexTest {
                 .setColumn(TestVectorDataset.vectorColumnName)
                 .setKey(key)
                 .setK(5)
-                .setNprobes(2)
+                .setSearchEffort(effort)
+                .setNprobes(1)
                 .build();
         // Each fragment repeats the vectors but has distinct row IDs. Selecting a segment
         // must exclude equally close rows in the other segments and unindexed fragments.
@@ -222,23 +226,35 @@ public class VectorIndexTest {
           ScanOptions options =
               new ScanOptions.Builder()
                   .nearest(query)
+                  .collectStats(!async)
                   .indexSegments(List.of(segment == 0 ? firstSegment.uuid() : secondSegment.uuid()))
                   .build();
           try (RootAllocator allocator = new RootAllocator();
               AutoCloseable scanner =
                   async
                       ? AsyncScanner.create(dataset, options, allocator)
-                      : dataset.newScan(options);
-              ArrowReader reader =
-                  async
-                      ? ((AsyncScanner) scanner).scanBatchesAsync().get(10, TimeUnit.SECONDS)
-                      : ((LanceScanner) scanner).scanBatches()) {
+                      : dataset.newScan(options)) {
             Set<Integer> actual = new HashSet<>();
-            while (reader.loadNextBatch()) {
-              IntVector ids = (IntVector) reader.getVectorSchemaRoot().getVector("i");
-              for (int row = 0; row < ids.getValueCount(); row++) {
-                actual.add(ids.get(row));
+            try (ArrowReader reader =
+                async
+                    ? ((AsyncScanner) scanner).scanBatchesAsync().get(10, TimeUnit.SECONDS)
+                    : ((LanceScanner) scanner).scanBatches()) {
+              while (reader.loadNextBatch()) {
+                IntVector ids = (IntVector) reader.getVectorSchemaRoot().getVector("i");
+                for (int row = 0; row < ids.getValueCount(); row++) {
+                  actual.add(ids.get(row));
+                }
               }
+            }
+            if (!async) {
+              assertEquals(
+                  effort == 0 ? 1L : 2L,
+                  ((LanceScanner) scanner)
+                      .getStats()
+                      .orElseThrow()
+                      .getAllCounts()
+                      .get("partitions_searched")
+                      .longValue());
             }
             int base = segment * 80;
             assertEquals(Set.of(base, base + 1, base + 2, base + 3, base + 4), actual);
@@ -252,10 +268,21 @@ public class VectorIndexTest {
                 new ScanOptions.Builder()
                     .nearest(query)
                     .indexSegments(List.of(UUID.randomUUID()))
+                    .build(),
+                new ScanOptions.Builder()
+                    .nearest(
+                        new Query.Builder()
+                            .setColumn(TestVectorDataset.vectorColumnName)
+                            .setKey(key)
+                            .setSearchEffort(Double.NaN)
+                            .build())
                     .build());
         List<String> errors =
             List.of(
-                "empty segment list", "only supported for vector search", "unknown index segments");
+                "empty segment list",
+                "only supported for vector search",
+                "unknown index segments",
+                "search_effort");
         for (int i = 0; i < invalidOptions.size(); i++) {
           ScanOptions options = invalidOptions.get(i);
           Exception failure =
@@ -453,7 +480,11 @@ public class VectorIndexTest {
     try (TestVectorDataset testVectorDataset = new TestVectorDataset(datasetPath)) {
       try (Dataset dataset = testVectorDataset.create()) {
         IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(2).build();
-        RQBuildParams rq = new RQBuildParams.Builder().setNumBits((byte) 1).build();
+        RQBuildParams rq =
+            new RQBuildParams.Builder()
+                .setNumBits((byte) 1)
+                .setRotationType(RQRotationType.MATRIX)
+                .build();
 
         VectorIndexParams vectorIndexParams =
             VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, rq);
@@ -486,7 +517,141 @@ public class VectorIndexTest {
         assertTrue(
             indexType == IndexType.VECTOR || indexType == IndexType.IVF_RQ,
             "IndexType for IVF_RQ index should be VECTOR or IVF_RQ but was " + indexType);
+        Map<String, Object> stats = dataset.getIndexStatistics(TestVectorDataset.indexName);
+        List<?> segments = (List<?>) stats.get("segments");
+        Map<?, ?> segment = (Map<?, ?>) segments.get(0);
+        assertEquals("matrix", ((Map<?, ?>) segment.get("sub_index")).get("rotation_type"));
       }
+    }
+  }
+
+  @Test
+  public void testIvfRqSharedModelEnablesPhysicalMerge(@TempDir Path tempDir) throws Exception {
+    try (TestVectorDataset fixture = new TestVectorDataset(tempDir.resolve("ivf_rq_shared_model"));
+        Dataset dataset = fixture.create()) {
+      List<Fragment> fragments = dataset.getFragments();
+      IvfBuildParams training =
+          new IvfBuildParams.Builder().setNumPartitions(2).setMaxIters(1).build();
+      float[] centroids =
+          VectorTrainer.trainIvfCentroids(dataset, TestVectorDataset.vectorColumnName, training);
+      IvfBuildParams ivf =
+          new IvfBuildParams.Builder()
+              .setNumPartitions(2)
+              .setMaxIters(1)
+              .setCentroids(centroids)
+              .build();
+      RQModel model = RQModel.fromBytes(RQModel.build(32, (byte) 1).toBytes());
+      RQBuildParams rq = new RQBuildParams.Builder().setNumBits((byte) 1).setModel(model).build();
+      IndexParams params =
+          IndexParams.builder()
+              .setVectorIndexParams(VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, rq))
+              .build();
+
+      Index first =
+          dataset.createIndex(
+              IndexOptions.builder(
+                      List.of(TestVectorDataset.vectorColumnName), IndexType.IVF_RQ, params)
+                  .withIndexName(TestVectorDataset.indexName)
+                  .withFragmentIds(List.of(fragments.get(0).getId()))
+                  .build());
+      Index second =
+          dataset.createIndex(
+              IndexOptions.builder(
+                      List.of(TestVectorDataset.vectorColumnName), IndexType.IVF_RQ, params)
+                  .withIndexName(TestVectorDataset.indexName)
+                  .withFragmentIds(List.of(fragments.get(1).getId()))
+                  .build());
+      Index merged = dataset.mergeExistingIndexSegments(List.of(first, second));
+      assertEquals(
+          Set.of(fragments.get(0).getId(), fragments.get(1).getId()),
+          new HashSet<>(merged.fragments().orElseThrow()));
+      assertEquals(
+          1,
+          dataset
+              .commitExistingIndexSegments(
+                  TestVectorDataset.indexName, TestVectorDataset.vectorColumnName, List.of(merged))
+              .size());
+
+      float[] key = new float[32];
+      for (int i = 0; i < key.length; i++) {
+        key[i] = 32 + i;
+      }
+      Query query =
+          new Query.Builder()
+              .setColumn(TestVectorDataset.vectorColumnName)
+              .setKey(key)
+              .setK(2)
+              .setNprobes(2)
+              .build();
+      ScanOptions options =
+          new ScanOptions.Builder().nearest(query).indexSegments(List.of(merged.uuid())).build();
+      try (LanceScanner scanner = dataset.newScan(options);
+          ArrowReader reader = scanner.scanBatches()) {
+        Set<Integer> actual = new HashSet<>();
+        while (reader.loadNextBatch()) {
+          IntVector ids = (IntVector) reader.getVectorSchemaRoot().getVector("i");
+          for (int row = 0; row < ids.getValueCount(); row++) {
+            actual.add(ids.get(row));
+          }
+        }
+        assertEquals(2, actual.size());
+        actual.retainAll(Set.of(1, 81));
+        assertTrue(actual.size() >= 1, "Expected Recall@2 >= 0.5, got " + actual.size() / 2.0);
+      }
+    }
+  }
+
+  @Test
+  public void testIvfRqModelDimensionMismatch(@TempDir Path tempDir) throws Exception {
+    try (TestVectorDataset fixture = new TestVectorDataset(tempDir.resolve("ivf_rq_wrong_dim"));
+        Dataset dataset = fixture.create()) {
+      IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(2).build();
+      RQBuildParams rq =
+          new RQBuildParams.Builder()
+              .setNumBits((byte) 1)
+              .setModel(RQModel.build(64, (byte) 1))
+              .build();
+      IndexParams params =
+          IndexParams.builder()
+              .setVectorIndexParams(VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, rq))
+              .build();
+      RuntimeException error =
+          assertThrows(
+              RuntimeException.class,
+              () ->
+                  dataset.createIndex(
+                      IndexOptions.builder(
+                              List.of(TestVectorDataset.vectorColumnName), IndexType.IVF_RQ, params)
+                          .build()));
+      assertTrue(causeChainContains(error, "dimension=64"), error.toString());
+      assertTrue(causeChainContains(error, "dimension=32"), error.toString());
+    }
+  }
+
+  @Test
+  public void testIvfRqModelSettingsMismatch(@TempDir Path tempDir) throws Exception {
+    try (TestVectorDataset fixture =
+            new TestVectorDataset(tempDir.resolve("ivf_rq_wrong_settings"));
+        Dataset dataset = fixture.create()) {
+      IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(2).build();
+      RQModel model = RQModel.build(32, (byte) 3);
+
+      assertCreateIvfRqIndexFails(
+          dataset,
+          ivf,
+          new RQBuildParams.Builder().setNumBits((byte) 1).setModel(model).build(),
+          "num_bits=3",
+          "requested num_bits=1");
+      assertCreateIvfRqIndexFails(
+          dataset,
+          ivf,
+          new RQBuildParams.Builder()
+              .setNumBits((byte) 3)
+              .setRotationType(RQRotationType.MATRIX)
+              .setModel(model)
+              .build(),
+          "rotation_type=Fast",
+          "requested rotation_type=Matrix");
     }
   }
 
@@ -580,5 +745,26 @@ public class VectorIndexTest {
       }
     }
     return false;
+  }
+
+  private static void assertCreateIvfRqIndexFails(
+      Dataset dataset, IvfBuildParams ivf, RQBuildParams rq, String... expectedCauseMessages) {
+    IndexParams params =
+        IndexParams.builder()
+            .setVectorIndexParams(VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, rq))
+            .build();
+    RuntimeException error =
+        assertThrows(
+            RuntimeException.class,
+            () ->
+                dataset.createIndex(
+                    IndexOptions.builder(
+                            List.of(TestVectorDataset.vectorColumnName), IndexType.IVF_RQ, params)
+                        .build()));
+    for (String expected : expectedCauseMessages) {
+      assertTrue(
+          causeChainContains(error, expected),
+          "Expected cause containing '" + expected + "', got: " + error);
+    }
   }
 }

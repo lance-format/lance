@@ -160,6 +160,63 @@ impl RowAddrMask {
         }
     }
 
+    /// Whether this mask can select a row of any of `fragments`, judged by
+    /// fragment key alone: an allow list must hold rows under one of the
+    /// keys, a block list must leave one of them less than whole. Addresses
+    /// name their fragment in the high 32 bits; row ids do not, so this is
+    /// only meaningful for address-domain masks.
+    pub fn may_select_fragments(&self, fragments: &RoaringBitmap) -> bool {
+        match self {
+            Self::AllowList(allow) => fragments.iter().any(|fragment| match allow.get(&fragment) {
+                None => false,
+                Some(RowAddrSelection::Full) => true,
+                Some(RowAddrSelection::Partial(rows)) => !rows.is_empty(),
+            }),
+            Self::BlockList(block) => fragments
+                .iter()
+                .any(|fragment| !matches!(block.get(&fragment), Some(RowAddrSelection::Full))),
+        }
+    }
+
+    /// Whether this mask can select any of `rows`, without building the
+    /// intersection. A whole fragment of `rows` against a partial block is
+    /// taken as selectable: the block would have to name every offset of
+    /// the fragment to rule it out, which the map cannot tell.
+    pub fn may_select_any(&self, rows: &RowAddrTreeMap) -> bool {
+        match self {
+            Self::AllowList(allow) => {
+                rows.iter().any(
+                    |(fragment, selection)| match (allow.get(fragment), selection) {
+                        (None, _) => false,
+                        (Some(RowAddrSelection::Full), RowAddrSelection::Full) => true,
+                        (Some(RowAddrSelection::Full), RowAddrSelection::Partial(rows))
+                        | (Some(RowAddrSelection::Partial(rows)), RowAddrSelection::Full) => {
+                            !rows.is_empty()
+                        }
+                        (
+                            Some(RowAddrSelection::Partial(allowed)),
+                            RowAddrSelection::Partial(rows),
+                        ) => !allowed.is_disjoint(rows),
+                    },
+                )
+            }
+            Self::BlockList(block) => {
+                rows.iter().any(
+                    |(fragment, selection)| match (block.get(fragment), selection) {
+                        (None, RowAddrSelection::Full) => true,
+                        (None, RowAddrSelection::Partial(rows)) => !rows.is_empty(),
+                        (Some(RowAddrSelection::Full), _) => false,
+                        (Some(RowAddrSelection::Partial(_)), RowAddrSelection::Full) => true,
+                        (
+                            Some(RowAddrSelection::Partial(blocked)),
+                            RowAddrSelection::Partial(rows),
+                        ) => !rows.is_subset(blocked),
+                    },
+                )
+            }
+        }
+    }
+
     /// Also allow the given addrs
     pub fn also_allow(self, allow_list: RowAddrTreeMap) -> Self {
         match self {
@@ -681,6 +738,24 @@ impl RowAddrTreeMap {
             .retain(|frag_id, _| frag_id_set.contains(frag_id));
     }
 
+    /// Optimize partial fragment selections for compact serialization.
+    ///
+    /// ```
+    /// use lance_select::RowAddrTreeMap;
+    ///
+    /// let mut rows = RowAddrTreeMap::from_iter(0..1_000_000);
+    /// let unoptimized_size = rows.serialized_size();
+    /// rows.optimize();
+    /// assert!(rows.serialized_size() < unoptimized_size);
+    /// ```
+    pub fn optimize(&mut self) {
+        for selection in self.inner.values_mut() {
+            if let RowAddrSelection::Partial(bitmap) = selection {
+                bitmap.optimize();
+            }
+        }
+    }
+
     /// Compute the serialized size of the set.
     pub fn serialized_size(&self) -> usize {
         // Starts at 4 because of the u32 num_entries
@@ -846,7 +921,22 @@ impl std::ops::BitOr<&Self> for RowAddrTreeMap {
 
 impl std::ops::BitOrAssign<Self> for RowAddrTreeMap {
     fn bitor_assign(&mut self, rhs: Self) {
-        *self |= &rhs;
+        for (fragment, rhs_set) in rhs.inner {
+            match (self.inner.get_mut(&fragment), rhs_set) {
+                (None, rhs_set) => {
+                    self.inner.insert(fragment, rhs_set);
+                }
+                (Some(RowAddrSelection::Full), _) => {}
+                (Some(lhs_set), RowAddrSelection::Full) => *lhs_set = RowAddrSelection::Full,
+                (
+                    Some(RowAddrSelection::Partial(lhs_bitmap)),
+                    RowAddrSelection::Partial(rhs_bitmap),
+                ) => {
+                    // Keep Roaring's borrowed merge path for occupied fragments.
+                    *lhs_bitmap |= &rhs_bitmap;
+                }
+            }
+        }
     }
 }
 
@@ -1375,6 +1465,48 @@ mod tests {
     }
 
     #[test]
+    fn may_select_checks_fragments_and_rows_without_intersecting() {
+        let addr = |fragment: u32, offset: u32| (u64::from(fragment) << 32) | u64::from(offset);
+        let frags = |ids: &[u32]| ids.iter().copied().collect::<RoaringBitmap>();
+
+        let mut allow = RowAddrTreeMap::new();
+        allow.insert(addr(1, 3));
+        allow.insert_fragment(2);
+        let allow = RowAddrMask::from_allowed(allow);
+        assert!(allow.may_select_fragments(&frags(&[1])));
+        assert!(allow.may_select_fragments(&frags(&[2, 9])));
+        assert!(!allow.may_select_fragments(&frags(&[0, 9])));
+        assert!(!allow.may_select_fragments(&frags(&[])));
+
+        let mut block = RowAddrTreeMap::new();
+        block.insert(addr(1, 3));
+        block.insert_fragment(2);
+        let block = RowAddrMask::from_block(block);
+        assert!(block.may_select_fragments(&frags(&[1])));
+        assert!(!block.may_select_fragments(&frags(&[2])));
+        assert!(block.may_select_fragments(&frags(&[2, 7])));
+        assert!(!RowAddrMask::allow_nothing().may_select_fragments(&frags(&[0])));
+        assert!(RowAddrMask::all_rows().may_select_fragments(&frags(&[0])));
+
+        let mut rows = RowAddrTreeMap::new();
+        rows.insert(addr(1, 4));
+        rows.insert(addr(1, 5));
+        assert!(!allow.may_select_any(&rows));
+        assert!(block.may_select_any(&rows));
+        rows.insert(addr(1, 3));
+        assert!(allow.may_select_any(&rows));
+        let mut whole = RowAddrTreeMap::new();
+        whole.insert_fragment(2);
+        assert!(allow.may_select_any(&whole));
+        assert!(!block.may_select_any(&whole));
+        let mut only_blocked = RowAddrTreeMap::new();
+        only_blocked.insert(addr(1, 3));
+        assert!(!block.may_select_any(&only_blocked));
+        assert!(!RowAddrMask::allow_nothing().may_select_any(&whole));
+        assert!(RowAddrMask::all_rows().may_select_any(&only_blocked));
+    }
+
+    #[test]
     fn test_row_addr_mask_construction() {
         let full_mask = RowAddrMask::all_rows();
         assert_eq!(full_mask.max_len(), None);
@@ -1577,6 +1709,22 @@ mod tests {
         assert!(
             err.to_string().contains("only 0 bytes remain"),
             "expected a length complaint, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_row_addr_tree_map_optimize_compacts_dense_ranges() {
+        let mut rows = RowAddrTreeMap::from_iter(0..1_000_000);
+        let unoptimized_size = rows.serialized_size();
+
+        rows.optimize();
+
+        assert!(rows.serialized_size() < unoptimized_size);
+        let mut serialized = Vec::with_capacity(rows.serialized_size());
+        rows.serialize_into(&mut serialized).unwrap();
+        assert_eq!(
+            RowAddrTreeMap::deserialize_from(serialized.as_slice()).unwrap(),
+            rows
         );
     }
 
@@ -2243,25 +2391,41 @@ mod tests {
 
     #[test]
     fn test_bitor_assign_full_fragment() {
-        // Test BitOrAssign when LHS has Full and RHS has Partial
-        let mut map1 = RowAddrTreeMap::default();
-        map1.insert_fragment(0);
-        let mut map2 = RowAddrTreeMap::default();
-        map2.insert(5);
+        let addr = |fragment, offset| u64::from(RowAddress::new_from_parts(fragment, offset));
+        let mut left = rows(&[addr(1, 1), addr(2, 1)]);
+        left.insert_fragment(0);
+        left.insert_fragment(3);
+        left.insert_bitmap(6, RoaringBitmap::new());
 
-        map1 |= &map2;
-        // Full | Partial = Full
-        assert!(map1.contains(0) && map1.contains(5) && map1.contains(100));
+        let mut right = rows(&[addr(0, 5), addr(2, 1), addr(2, 2), addr(4, 1)]);
+        right.insert_fragment(1);
+        right.insert_fragment(3);
+        right.insert_fragment(5);
+        right.insert_bitmap(7, RoaringBitmap::new());
 
-        // Test BitOrAssign when LHS has Partial and RHS has Full
-        let mut map3 = RowAddrTreeMap::default();
-        map3.insert(5);
-        let mut map4 = RowAddrTreeMap::default();
-        map4.insert_fragment(0);
+        // Cover Full/Partial in both directions, Full/Full, overlapping
+        // partials, disjoint fragments, and empty partial bitmaps.
+        let mut expected = rows(&[addr(2, 1), addr(2, 2), addr(4, 1)]);
+        for fragment in [0, 1, 3, 5] {
+            expected.insert_fragment(fragment);
+        }
+        for fragment in [6, 7] {
+            expected.insert_bitmap(fragment, RoaringBitmap::new());
+        }
 
-        map3 |= &map4;
-        // Partial | Full = Full
-        assert!(map3.contains(0) && map3.contains(5) && map3.contains(100));
+        let mut borrowed = left.clone();
+        borrowed |= &right;
+        assert_eq!(borrowed, expected);
+
+        let mut owned = left.clone();
+        owned |= right.clone();
+        assert_eq!(owned, expected);
+        assert_eq!(left.clone() | &right, expected);
+        assert_eq!(left.clone() | right.clone(), expected);
+
+        assert_eq!(left.clone() | RowAddrTreeMap::new(), left);
+        assert_eq!(RowAddrTreeMap::new() | right.clone(), right);
+        assert_eq!(left.clone() | left.clone(), left);
     }
 
     #[test]
