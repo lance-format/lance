@@ -8,7 +8,9 @@
 use super::*;
 use crate::scalar::RowAddrTranslatorRef;
 use lance_arrow::deepcopy::deep_copy_batch_sliced;
-use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
+use lance_core::cache::{
+    CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheLoadOrigin,
+};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 
 use std::cmp::Reverse;
@@ -1503,6 +1505,7 @@ impl Index for MinHashLshIndex {
             }
             budget -= bytes;
             self.cache
+                .with_load_origin(CacheLoadOrigin::Warm)
                 .get_or_insert_with_key(
                     SignatureChunkKey {
                         chunk: chunks_loaded as u32,
@@ -1528,6 +1531,7 @@ impl Index for MinHashLshIndex {
                     batch.slice(range.start - first_page * self.page_rows, range.len());
                 let band_page = Arc::new(BandPage::try_from_batch(&page_batch)?);
                 self.cache
+                    .with_load_origin(CacheLoadOrigin::Warm)
                     .insert_with_key(&BandPageKey { page: page as u32 }, band_page)
                     .await;
             }

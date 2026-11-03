@@ -2004,10 +2004,9 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         for &plane in &planes {
             for part_id in 0..self.num_partitions() {
                 if plane > 0
-                    && cache
-                        .get_resident_with_key(&self.plane_key(part_id, 0))
+                    && !cache
+                        .peek_resident_with_key(&self.plane_key(part_id, 0))
                         .await
-                        .is_none()
                 {
                     continue;
                 }
@@ -2142,9 +2141,8 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         }
         let sign_resident = plane == 0
             || cache
-                .get_resident_with_key(&self.plane_key(part_id, 0))
-                .await
-                .is_some();
+                .peek_resident_with_key(&self.plane_key(part_id, 0))
+                .await;
         let batch = if sign_resident {
             cache
                 .get_or_insert_with_key_hit(key, || async {

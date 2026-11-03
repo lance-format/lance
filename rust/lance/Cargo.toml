@@ -108,6 +108,8 @@ pprof.workspace = true
 lzma-sys = { version = "0.1" }
 
 [dev-dependencies]
+metrics.workspace = true
+metrics-util.workspace = true
 lance-test-macros = { workspace = true }
 lance-datagen = { workspace = true }
 lance-datafusion = { workspace = true, features = ["datagen"] }
@@ -177,7 +179,7 @@ goosefs = ["lance-io/goosefs"]
 tos = ["lance-io/tos"]
 huggingface = ["lance-io/huggingface"]
 # Publish object store metrics via the `metrics` crate.
-metrics = ["lance-io/metrics"]
+metrics = ["lance-core/metrics", "lance-io/metrics"]
 geo = ["lance-datafusion/geo", "lance-index/geo"]
 # Enable slow integration tests (disabled by default in CI)
 slow_tests = []
