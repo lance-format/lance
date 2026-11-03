@@ -702,7 +702,9 @@ mod test {
     async fn test_visibility_retries_spilled_row_id_read() {
         let batch = sequence_batch(0..8);
         let directory = lance_core::utils::tempfile::TempStrDir::default();
-        let uri = format!("file-object-store://{}", directory.as_str());
+        let test_uri = directory.as_str();
+        let path_prefix = if test_uri.starts_with('/') { "" } else { "/" };
+        let uri = format!("file-object-store://{path_prefix}{test_uri}");
         let mut dataset = Dataset::write(
             RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
             &uri,
