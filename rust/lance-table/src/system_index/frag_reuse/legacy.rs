@@ -13,12 +13,17 @@ use lance_core::{Error, Result};
 use prost::Message;
 use roaring::RoaringBitmap;
 
+use super::FragReuseVersion;
 use super::history::{
     FragReuseHistory, HistoryFormat, LEGACY_VERSION_FIELD, Record, length_delimited, split_records,
 };
 use super::imp::{FriImpl, Records, StoredRecord, concat, invalid_edit};
+use super::legacy_srid::LegacySridHistory;
+use super::plan::{ReadContext, ReadPlan, SegmentSummary, TranslationPlan};
 use super::tagged::TaggedHistory;
+use crate::format::IndexMetadata;
 use crate::format::pb::fragment_reuse_index_details as pb;
+use crate::system_index::is_system_index;
 
 #[derive(Debug, Default)]
 pub struct LegacyHistory(Records);
@@ -99,6 +104,136 @@ pub fn repair_versions(mut versions: Vec<pb::Version>) -> Result<(FragReuseHisto
     Ok((from_versions(kept)?, dropped))
 }
 
+/// Every fragment the reuse chain touches (old + new) across all versions. An
+/// index disjoint from this set holds no row address the FRI remaps, so trimming
+/// can never strand it (fragment ids are never reused).
+pub fn reuse_chain_frag_bitmap(versions: &[FragReuseVersion]) -> RoaringBitmap {
+    let mut bitmap = RoaringBitmap::new();
+    for version in versions {
+        bitmap.extend(version.old_frag_ids().iter().map(|&id| id as u32));
+        bitmap.extend(version.new_frag_ids().iter().map(|&id| id as u32));
+    }
+    bitmap
+}
+
+/// Whether `index_meta` is caught up with one compaction version, so the
+/// version can be trimmed for it. `chain_frag_bitmap` is
+/// [`reuse_chain_frag_bitmap`] of the whole history. `InvalidInput` when the
+/// index covers part of a rewrite group, which only a corrupted version
+/// records.
+pub fn is_index_remap_caught_up(
+    frag_reuse_version: &FragReuseVersion,
+    index_meta: &IndexMetadata,
+    chain_frag_bitmap: &RoaringBitmap,
+) -> Result<bool> {
+    if is_system_index(index_meta) {
+        return Ok(true);
+    }
+    if index_meta.fragment_bitmap.is_none()
+        && index_meta.dataset_version > frag_reuse_version.dataset_version
+    {
+        log::warn!(
+            "Index {} ({}) missing fragment bitmap, cannot determine if it is caught up with the fragment reuse version, consider retraining the index",
+            index_meta.name,
+            index_meta.uuid
+        );
+    }
+    is_caught_up_with_version(
+        frag_reuse_version.dataset_version,
+        frag_reuse_version
+            .groups
+            .iter()
+            .map(|group| group.old_frags.iter().map(|frag| frag.id).collect()),
+        index_meta.fragment_bitmap.as_ref(),
+        index_meta.dataset_version,
+        chain_frag_bitmap,
+    )
+}
+
+/// The legacy caught-up rule for one compaction version stamped
+/// `version_stamp`, whose groups consume `group_sources`.
+fn is_caught_up_with_version(
+    version_stamp: u64,
+    group_sources: impl IntoIterator<Item = Vec<u64>>,
+    fragment_bitmap: Option<&RoaringBitmap>,
+    segment_version: u64,
+    chain_frag_bitmap: &RoaringBitmap,
+) -> Result<bool> {
+    // Disjoint coverage => caught up regardless of dataset_version, bypassing the
+    // stale-version gate below. The chain includes NEW fragments
+    // deliberately: a deferred-remap commit advances a covering index's bitmap
+    // onto them before its data is remapped, so an old-frag-only check would
+    // clear a still-stale index and trim a version it needs.
+    if let Some(index_frag_bitmap) = fragment_bitmap
+        && index_frag_bitmap.is_disjoint(chain_frag_bitmap)
+    {
+        return Ok(true);
+    }
+
+    // Inclusive: an index built at dataset_version predates the rewrite.
+    if segment_version <= version_stamp {
+        return Ok(false);
+    }
+
+    // Without a bitmap released writers took the index as caught up.
+    let Some(index_frag_bitmap) = fragment_bitmap else {
+        return Ok(true);
+    };
+    for old_frags in group_sources {
+        let old_frag_in_index = old_frags
+            .iter()
+            .filter(|&&id| index_frag_bitmap.contains(id as u32))
+            .count();
+        if old_frag_in_index > 0 {
+            if old_frag_in_index != old_frags.len() {
+                // This should never happen because we always commit a full rewrite group
+                // and we always reindex either the entire group or nothing.
+                // We use invalid input to be consistent with
+                // dataset::transaction::recalculate_fragment_bitmap
+                return Err(Error::invalid_input(format!(
+                    "The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {old_frags:?}"
+                )));
+            }
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+impl LegacyHistory {
+    fn versions(&self) -> impl Iterator<Item = &pb::Version> {
+        self.0
+            .stored
+            .iter()
+            .filter_map(|stored| match &stored.record {
+                Record::LegacyVersion(version) => Some(version),
+                _ => None,
+            })
+    }
+
+    fn plan_segment(&self, context: &ReadContext, segment: &SegmentSummary) -> ReadPlan {
+        let coverage = segment
+            .fragment_bitmap
+            .as_ref()
+            .map(|bitmap| bitmap & context.live_fragments)
+            .unwrap_or_default();
+        let is_direct =
+            segment.fragment_bitmap.as_ref().is_some_and(|bitmap| {
+                !bitmap.is_empty() && bitmap.is_subset(context.live_fragments)
+            }) && self.is_caught_up(context.entry_version, segment);
+        if is_direct {
+            ReadPlan::Direct
+        } else {
+            ReadPlan::Translate(TranslationPlan::new(
+                &self.0.ledger,
+                coverage,
+                RoaringBitmap::new(),
+                &[],
+            ))
+        }
+    }
+}
+
 impl FriImpl for LegacyHistory {
     fn format(&self) -> HistoryFormat {
         HistoryFormat::Legacy
@@ -166,6 +301,55 @@ impl FriImpl for LegacyHistory {
     ) -> Result<Arc<dyn FriImpl>> {
         self.0.require_fully_interpretable("relocate")?;
         Ok(self)
+    }
+
+    fn on_stable_row_ids(self: Arc<Self>) -> Result<Arc<dyn FriImpl>> {
+        Ok(Arc::new(LegacySridHistory::new(self)))
+    }
+
+    /// Caught up with every compaction version under the rule trimming
+    /// applies; a version the segment covers part of a group of is never
+    /// caught up with.
+    fn is_caught_up(&self, _entry_version: u64, segment: &SegmentSummary) -> bool {
+        let mut chain = RoaringBitmap::new();
+        for version in self.versions() {
+            for group in &version.groups {
+                chain.extend(group.old_fragments.iter().map(|digest| digest.id as u32));
+                chain.extend(group.new_fragments.iter().map(|digest| digest.id as u32));
+            }
+        }
+        self.versions().all(|version| {
+            matches!(
+                is_caught_up_with_version(
+                    version.dataset_version,
+                    version.groups.iter().map(|group| group
+                        .old_fragments
+                        .iter()
+                        .map(|digest| digest.id)
+                        .collect()),
+                    segment.fragment_bitmap.as_ref(),
+                    segment.dataset_version,
+                    &chain,
+                ),
+                Ok(true)
+            )
+        })
+    }
+
+    // The legacy reader applies the history to every segment it opens and
+    // trusts every kind to translate.
+    fn needs_translation_support(&self, _context: &ReadContext, _segment: &SegmentSummary) -> bool {
+        false
+    }
+
+    /// Every segment that is not caught up translates its live coverage: the
+    /// stored bitmap a legacy reader projected onto destinations already
+    /// names it.
+    fn plan(&self, context: &ReadContext, group: &[SegmentSummary]) -> Vec<ReadPlan> {
+        group
+            .iter()
+            .map(|segment| self.plan_segment(context, segment))
+            .collect()
     }
 }
 

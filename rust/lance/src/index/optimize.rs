@@ -92,7 +92,7 @@ use super::append::{
     index_field_path, is_definition_only_segment, merge_indices_with_unindexed_frags,
     partition_dormant_vector_segments, select_segments_to_merge, tagged_segment_coverage,
 };
-use super::frag_reuse::{OpenPurpose, SegmentRemappingPlan};
+use super::frag_reuse::{OpenPurpose, ReadPlan};
 use super::loading::{DatasetIndexInternalExt, load_all_indices};
 use super::scalar;
 use super::segment::{
@@ -1147,7 +1147,7 @@ impl OptimizeIndexTask {
                 .open_vector_index_from_metadata_with_plan(
                     &field_path,
                     &self.reference,
-                    Some(&SegmentRemappingPlan::Identity),
+                    Some(&ReadPlan::Direct),
                     OpenPurpose::Maintenance,
                     &NoOpMetricsCollector,
                 )
@@ -1285,7 +1285,7 @@ async fn merge_vector_segments(
             .open_vector_index_from_metadata_with_plan(
                 &field_path,
                 metadata,
-                Some(&SegmentRemappingPlan::Identity),
+                Some(&ReadPlan::Direct),
                 OpenPurpose::Maintenance,
                 &NoOpMetricsCollector,
             )

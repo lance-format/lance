@@ -77,7 +77,7 @@ pub(super) async fn plan_index(
             .open_vector_index_from_metadata_with_plan(
                 &field_path,
                 segment,
-                Some(&SegmentRemappingPlan::Identity),
+                Some(&ReadPlan::Direct),
                 OpenPurpose::Maintenance,
                 &NoOpMetricsCollector,
             )

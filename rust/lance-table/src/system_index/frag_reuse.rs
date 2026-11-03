@@ -8,10 +8,14 @@ pub mod history;
 mod imp;
 pub mod ledger;
 mod legacy;
+mod legacy_srid;
 pub mod lineage;
 pub mod metadata;
+pub mod plan;
 pub mod policy;
 mod tagged;
+
+pub use legacy::{is_index_remap_caught_up, reuse_chain_frag_bitmap};
 
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 

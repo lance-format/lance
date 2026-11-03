@@ -11,8 +11,7 @@ pub(crate) use entry::{
 use entry::{fri_external_location, read_fri_external_file};
 
 use crate::Dataset;
-use crate::index::frag_reuse_reader::SegmentPlanParts;
-use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
+use crate::index::loading::DatasetIndexInternalExt;
 use crate::session::index_caches::FragReuseDetailsKey;
 use lance_core::Error;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
@@ -31,6 +30,9 @@ use lance_table::format::{Fragment, IndexMetadata, Manifest};
 use lance_table::system_index::frag_reuse::gate::{BareRewriteRefusal, covered_bare_rewrite};
 use lance_table::system_index::frag_reuse::history::{FragReuseHistory, HistoryFormat, Record};
 use lance_table::system_index::frag_reuse::ledger::FragReuseLedger;
+pub(crate) use lance_table::system_index::frag_reuse::plan::{
+    ReadPlan, RowDomain, SegmentSummary, TranslationPlan, TranslationSupport,
+};
 use lance_table::system_index::frag_reuse::policy::FriPolicy;
 use lance_table::transaction::RewriteGroup;
 use object_store::path::Path;
@@ -58,7 +60,7 @@ pub(crate) enum ResolvedRemapping {
     V1Translate {
         remapper: Arc<dyn BatchRowIdRemapper>,
         /// The segment's translation identity (see
-        /// [`super::frag_reuse_reader::FragmentReuseIndex::translation_fingerprint`]).
+        /// [`TranslationPlan::fingerprint`]).
         fingerprint: [u8; 32],
     },
 }
@@ -141,7 +143,7 @@ pub(crate) fn fri_cache_id(resolved: &Option<(Uuid, ResolvedRemapping)>) -> Opti
 ///   and the entry, in place.
 ///
 /// Soundness rests on the fingerprint covering every input of
-/// `remap_row_ids_excluding` (see `translation_fingerprint`); cached
+/// `remap_row_ids_excluding` (see [`TranslationPlan::fingerprint`]); cached
 /// translated objects hold the `FragmentReuseIndex` they were filled with, so
 /// a stale one must never be served under a changed state.
 pub(crate) fn scoped_index_cache(
@@ -176,24 +178,6 @@ fn translated_namespace(fingerprint: &[u8; 32]) -> String {
 pub(crate) enum OpenPurpose {
     Query,
     Maintenance,
-}
-
-/// The translation inputs one segment needs under a tagged history.
-#[derive(Clone, Debug)]
-pub(crate) enum SegmentRemappingPlan {
-    /// The segment's stored coverage cannot intersect any rewritten path.
-    Identity,
-    /// The rewritten query coverage plus the fragments owned by other
-    /// selected sibling segments of the same logical index, and the
-    /// translation identity derived from them.
-    Translate {
-        coverage: RoaringBitmap,
-        excluded_fragments: RoaringBitmap,
-        fingerprint: [u8; 32],
-    },
-    /// Committed metadata exists but the reader derives no query coverage
-    /// for this segment; the reason decides what maintenance may do with it.
-    MissingCoverage(MissingCoverageReason),
 }
 
 /// Why the reader derives no coverage for a registered segment. Queries
@@ -231,39 +215,72 @@ impl std::fmt::Display for MissingCoverageReason {
     }
 }
 
-/// The plan of a registered segment the snapshot plan does not know (a
-/// stale cached plan): nothing is derived for it.
-const PLAN_MISS: SegmentRemappingPlan =
-    SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::NoDerivedCoverage);
+/// Why the reader derives no coverage for `segment` under `plan`, or `None`
+/// when it derives some.
+fn missing_coverage_reason(
+    mapping: &super::frag_reuse_reader::FragmentReuseIndex,
+    segment: &SegmentSummary,
+    plan: &ReadPlan,
+) -> Option<MissingCoverageReason> {
+    match plan {
+        ReadPlan::Direct => None,
+        ReadPlan::Translate(translation) if translation.coverage().is_empty() => Some(
+            if segment
+                .fragment_bitmap
+                .as_ref()
+                .is_some_and(|bitmap| bitmap.is_empty())
+            {
+                MissingCoverageReason::Withdrawn
+            } else {
+                MissingCoverageReason::NoDerivedCoverage
+            },
+        ),
+        ReadPlan::Translate(_) => None,
+        ReadPlan::Excluded => Some(
+            if mapping.has_unsupported_transitions() || segment.fragment_bitmap.is_none() {
+                MissingCoverageReason::Unsupported
+            } else if segment.translation == TranslationSupport::Uninterpretable {
+                MissingCoverageReason::Corrupt
+            } else {
+                MissingCoverageReason::Unsupported
+            },
+        ),
+    }
+}
+
+/// One committed segment's read plan on a snapshot.
+#[derive(Clone, Debug)]
+pub(crate) struct PlannedSegment {
+    pub(crate) read: ReadPlan,
+    pub(crate) missing: Option<MissingCoverageReason>,
+}
 
 /// Snapshot-level plan of every committed segment's translation inputs.
 ///
 /// Which rows a segment owns is decided once per manifest snapshot, from one
-/// pass over the same `load_indices` output every per-open resolution used to
-/// re-scan. Openers only look their segment up by UUID.
+/// pass over the stored segments. Openers only look their segment up by UUID.
 #[derive(Clone, Debug)]
 pub(crate) struct FriQueryPlan {
-    pub(crate) segments: HashMap<Uuid, SegmentRemappingPlan>,
+    pub(crate) segments: HashMap<Uuid, PlannedSegment>,
+    /// The plan of a registered segment the snapshot plan does not know (a
+    /// stale cached plan): nothing is derived for it.
+    miss: PlannedSegment,
 }
 
 impl DeepSizeOf for FriQueryPlan {
     fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
         self.segments
             .values()
-            .map(|segment| match segment {
-                SegmentRemappingPlan::Translate {
-                    coverage,
-                    excluded_fragments,
-                    fingerprint,
-                } => {
-                    coverage.serialized_size()
-                        + excluded_fragments.serialized_size()
-                        + fingerprint.len()
+            .map(|segment| match &segment.read {
+                ReadPlan::Translate(plan) => {
+                    plan.coverage().serialized_size()
+                        + plan.excluded_fragments().serialized_size()
+                        + plan.fingerprint().len()
                 }
                 _ => 0,
             })
             .sum::<usize>()
-            + self.segments.len() * std::mem::size_of::<(Uuid, SegmentRemappingPlan)>()
+            + self.segments.len() * std::mem::size_of::<(Uuid, PlannedSegment)>()
     }
 }
 
@@ -284,7 +301,7 @@ impl CacheKey for FriQueryPlanKey<'_> {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.index.fri-query-plan", 1)
+        CacheKeySchema::new("lance.index.fri-query-plan", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
@@ -295,9 +312,9 @@ impl CacheKey for FriQueryPlanKey<'_> {
 /// Build or fetch the snapshot's FRI query plan.
 ///
 /// Cached in the tagged (manifest-path scoped) namespace; concurrent opens
-/// coalesce on one build. Everything only needed to BUILD the plan (notably
-/// `load_indices` and its tagged coverage post-processing) runs inside the
-/// loader, so warm opens never recompute coverage.
+/// coalesce on one build. Each logical index is planned as the listing plans
+/// it, from its usable segments; a segment this build cannot use is planned
+/// alone, so it never takes coverage from a usable sibling.
 async fn fri_query_plan(
     dataset: &Dataset,
     fri: &IndexMetadata,
@@ -312,85 +329,58 @@ async fn fri_query_plan(
                 fri_uuid: &fri.uuid,
             },
             || async {
-                // The filtered listing carries the rewritten query coverage;
-                // `stored` keeps provenance from before that rewrite. Callers
-                // hold metadata returned by load_indices and cannot supply
-                // this distinction.
-                let indices = dataset.load_indices().await?;
-                let stored_by_uuid: HashMap<Uuid, &IndexMetadata> =
-                    stored.iter().map(|entry| (entry.uuid, entry)).collect();
-                // Group the filtered listing by logical index name; the
-                // backtrack derives each member's sibling exclusions from the
-                // stored provenance of the whole group in one pass, so
-                // "direct coverage wins" is owned by one algorithm.
-                let mut filtered_by_uuid: HashMap<Uuid, &IndexMetadata> =
-                    HashMap::with_capacity(indices.len());
-                let mut groups: HashMap<&str, Vec<Uuid>> = HashMap::new();
-                for entry in indices.iter() {
-                    filtered_by_uuid.insert(entry.uuid, entry);
-                    if entry.name != FRAG_REUSE_INDEX_NAME {
-                        groups
-                            .entry(entry.name.as_str())
-                            .or_default()
-                            .push(entry.uuid);
+                let mut groups: Vec<Vec<&IndexMetadata>> = Vec::new();
+                let mut by_name: HashMap<&str, usize> = HashMap::new();
+                for entry in stored {
+                    if lance_table::system_index::is_system_index(entry) {
+                        continue;
                     }
-                }
-                let mut parts_by_uuid: HashMap<Uuid, SegmentPlanParts> = HashMap::new();
-                for members in groups.into_values() {
-                    let provenance: Vec<RoaringBitmap> = members
-                        .iter()
-                        .map(|uuid| {
-                            stored_by_uuid
-                                .get(uuid)
-                                .and_then(|source| source.fragment_bitmap.clone())
-                                .unwrap_or_default()
-                        })
-                        .collect();
-                    for (uuid, parts) in members.iter().zip(mapping.segment_plans(&provenance)) {
-                        parts_by_uuid.insert(*uuid, parts);
+                    if super::segment::index_is_usable(entry) {
+                        let group = *by_name.entry(entry.name.as_str()).or_insert_with(|| {
+                            groups.push(Vec::new());
+                            groups.len() - 1
+                        });
+                        groups[group].push(entry);
+                    } else {
+                        groups.push(vec![entry]);
                     }
                 }
                 let mut segments = HashMap::with_capacity(stored.len());
-                for source in stored.iter() {
-                    let plan = if source
-                        .fragment_bitmap
-                        .as_ref()
-                        .is_some_and(|bitmap| bitmap.is_empty())
-                    {
-                        // An empty bitmap needs no translation, but its pages
-                        // may still hold the withdrawn rows: never identity.
-                        SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Withdrawn)
-                    } else if !mapping.may_need_translation(source.fragment_bitmap.as_ref()) {
-                        SegmentRemappingPlan::Identity
-                    } else if let Some(entry) = filtered_by_uuid.get(&source.uuid)
-                        && let Some(bitmap) = &entry.fragment_bitmap
-                        // Listed with empty coverage: it derives none.
-                        && !bitmap.is_empty()
-                    {
-                        let coverage = bitmap & dataset.fragment_bitmap.as_ref();
-                        // Other selected segments own their direct coverage.
-                        // Drop paths entering those fragments before later
-                        // mappings can merge them with this segment's
-                        // contribution.
-                        let parts = parts_by_uuid.remove(&source.uuid).unwrap_or_default();
-                        let fingerprint = mapping.translation_fingerprint(
-                            &coverage,
-                            &parts.excluded,
-                            &parts.path,
-                        );
-                        SegmentRemappingPlan::Translate {
-                            coverage,
-                            excluded_fragments: parts.excluded,
-                            fingerprint,
-                        }
-                    } else {
-                        SegmentRemappingPlan::MissingCoverage(
-                            missing_coverage_reason(dataset, mapping, source).await?,
-                        )
-                    };
-                    segments.insert(source.uuid, plan);
+                for members in groups {
+                    let summaries = mapping.segment_summaries(dataset, &members).await?;
+                    let plans = mapping.history().plan(&mapping.context(), &summaries);
+                    for ((entry, summary), read) in members.iter().zip(&summaries).zip(plans) {
+                        let is_usable = super::segment::index_is_usable(entry);
+                        let read = match read {
+                            // An unusable segment establishes no coverage.
+                            ReadPlan::Translate(_) if !is_usable => {
+                                ReadPlan::Translate(TranslationPlan::empty(mapping.history()))
+                            }
+                            read => read,
+                        };
+                        let missing = if is_usable {
+                            missing_coverage_reason(mapping, summary, &read)
+                        } else {
+                            match &read {
+                                ReadPlan::Direct => None,
+                                ReadPlan::Translate(_) => {
+                                    Some(MissingCoverageReason::NoDerivedCoverage)
+                                }
+                                ReadPlan::Excluded => {
+                                    missing_coverage_reason(mapping, summary, &read)
+                                }
+                            }
+                        };
+                        segments.insert(entry.uuid, PlannedSegment { read, missing });
+                    }
                 }
-                Ok(FriQueryPlan { segments })
+                Ok(FriQueryPlan {
+                    segments,
+                    miss: PlannedSegment {
+                        read: ReadPlan::Translate(TranslationPlan::empty(mapping.history())),
+                        missing: Some(MissingCoverageReason::NoDerivedCoverage),
+                    },
+                })
             },
         )
         .await
@@ -441,7 +431,10 @@ pub(crate) async fn resolve_query_segment_coverages(
     segments
         .iter()
         .map(|segment| match plan.segments.get(&segment.uuid) {
-            Some(SegmentRemappingPlan::Identity) => {
+            Some(PlannedSegment {
+                read: ReadPlan::Direct,
+                ..
+            }) => {
                 let stored = stored_by_uuid.get(&segment.uuid).ok_or_else(|| {
                     Error::invalid_input(format!(
                         "Index segment {} is not registered in the manifest",
@@ -450,16 +443,15 @@ pub(crate) async fn resolve_query_segment_coverages(
                 })?;
                 direct(stored)
             }
-            Some(SegmentRemappingPlan::Translate { coverage, .. }) => Ok(coverage.clone()),
-            Some(SegmentRemappingPlan::MissingCoverage(
-                MissingCoverageReason::Withdrawn | MissingCoverageReason::NoDerivedCoverage,
-            )) => Ok(RoaringBitmap::new()),
-            Some(SegmentRemappingPlan::MissingCoverage(reason)) => {
-                Err(Error::not_supported(format!(
-                    "FRI query coverage is unavailable for segment {} ({reason})",
-                    segment.uuid
-                )))
-            }
+            Some(PlannedSegment {
+                read: ReadPlan::Translate(translation),
+                ..
+            }) => Ok(translation.coverage().clone()),
+            Some(PlannedSegment { missing, .. }) => Err(Error::not_supported(format!(
+                "FRI query coverage is unavailable for segment {} ({})",
+                segment.uuid,
+                missing.unwrap_or(MissingCoverageReason::Unsupported)
+            ))),
             None if stored_by_uuid.contains_key(&segment.uuid) => {
                 Err(Error::not_supported(format!(
                     "FRI query coverage is unavailable for segment {} (the reader derives no \
@@ -496,55 +488,27 @@ pub(crate) async fn segment_coverage_reason(
     let mapping = super::frag_reuse_reader::FragmentReuseIndex::open(dataset, fri).await?;
     let plan = fri_query_plan(dataset, fri, &stored, &mapping).await?;
     Ok(match plan.segments.get(&index.uuid) {
-        Some(SegmentRemappingPlan::MissingCoverage(reason)) => Some(*reason),
-        Some(_) => None,
+        Some(planned) => planned.missing,
         None => Some(MissingCoverageReason::NoDerivedCoverage),
     })
-}
-
-/// Why the reader derives no coverage for `source`, from what it can see of
-/// the segment without opening its files.
-async fn missing_coverage_reason(
-    dataset: &Dataset,
-    mapping: &super::frag_reuse_reader::FragmentReuseIndex,
-    source: &IndexMetadata,
-) -> lance_core::Result<MissingCoverageReason> {
-    if mapping.has_unsupported_transitions() {
-        return Ok(MissingCoverageReason::Unsupported);
-    }
-    match &source.fragment_bitmap {
-        Some(bitmap) if bitmap.is_empty() => return Ok(MissingCoverageReason::Withdrawn),
-        None => return Ok(MissingCoverageReason::Unsupported),
-        Some(_) => {}
-    }
-    if source.index_details.is_none() {
-        return Ok(MissingCoverageReason::Corrupt);
-    }
-    Ok(
-        match super::frag_reuse_reader::segment_supports_batch_remapping(dataset, source).await? {
-            Some(true) => MissingCoverageReason::NoDerivedCoverage,
-            Some(false) => MissingCoverageReason::Unsupported,
-            None => MissingCoverageReason::Corrupt,
-        },
-    )
 }
 
 /// Translation plans for segments the manifest does not list: a staged
 /// (uncommitted) build about to be merged, planned as one group by
 /// [`plan_staged_segments`]. Keyed by segment uuid.
-pub(crate) type StagedRemappingPlans = HashMap<Uuid, SegmentRemappingPlan>;
+pub(crate) type StagedRemappingPlans = HashMap<Uuid, ReadPlan>;
 
-/// Plan `segments` as ONE group with the reader's own algorithm, for segments
+/// Plan `segments` as ONE group with the reader's own planning, for segments
 /// the snapshot plan cannot know about (a staged build being merged).
 ///
-/// Every step is the one `fri_query_plan` runs per committed group
-/// (`may_need_translation`, `segment_plans`, `translation_fingerprint`), so a
-/// staged segment translates exactly as it would once committed: its
+/// A staged segment translates exactly as it would once committed: its
 /// provenance is its stored bitmap, its siblings for direct coverage and
 /// exclusions are the other staged segments, and a destination the group only
 /// partly covers is simply absent from its coverage (the caller shrinks what it
-/// claims; nothing is claimed that the group cannot serve). `None` on a table
-/// without a tagged history, where the snapshot lookup applies.
+/// claims; nothing is claimed that the group cannot serve). The merge opens
+/// every staged segment through a translating loader, so each is planned as
+/// able to translate. `None` on a table without a tagged history, where the
+/// snapshot lookup applies.
 pub(crate) async fn plan_staged_segments(
     dataset: &Dataset,
     segments: &[IndexMetadata],
@@ -565,34 +529,32 @@ pub(crate) async fn plan_staged_segments(
     }
     lance_index::scalar::check_batch_remapping_entry()?;
     let mapping = super::frag_reuse_reader::FragmentReuseIndex::open(dataset, fri).await?;
-    let provenance: Vec<RoaringBitmap> = segments
+    let summaries = segments
         .iter()
         .map(|segment| {
-            segment.fragment_bitmap.clone().ok_or_else(|| {
+            let fragment_bitmap = segment.fragment_bitmap.clone().ok_or_else(|| {
                 Error::invalid_input(format!(
                     "CreateIndex: segment {} is missing fragment coverage",
                     segment.uuid
                 ))
+            })?;
+            Ok(SegmentSummary {
+                uuid: segment.uuid,
+                fragment_bitmap: Some(fragment_bitmap),
+                dataset_version: segment.dataset_version,
+                domain: RowDomain::Address,
+                translation: TranslationSupport::Supported,
             })
         })
-        .collect::<lance_core::Result<_>>()?;
-    let parts = mapping.segment_plans(&provenance);
-    let mut plans = HashMap::with_capacity(segments.len());
-    for (segment, parts) in segments.iter().zip(parts) {
-        let plan = if !mapping.may_need_translation(segment.fragment_bitmap.as_ref()) {
-            SegmentRemappingPlan::Identity
-        } else {
-            let fingerprint =
-                mapping.translation_fingerprint(&parts.coverage, &parts.excluded, &parts.path);
-            SegmentRemappingPlan::Translate {
-                coverage: parts.coverage,
-                excluded_fragments: parts.excluded,
-                fingerprint,
-            }
-        };
-        plans.insert(segment.uuid, plan);
-    }
-    Ok(Some(plans))
+        .collect::<lance_core::Result<Vec<_>>>()?;
+    let plans = mapping.history().plan(&mapping.context(), &summaries);
+    Ok(Some(
+        segments
+            .iter()
+            .map(|segment| segment.uuid)
+            .zip(plans)
+            .collect(),
+    ))
 }
 
 /// Resolve the FRI remapper shared by scalar and vector index loading, with
@@ -612,13 +574,12 @@ pub(super) async fn open_row_id_remapping(
 pub(super) async fn open_row_id_remapping_with_plan(
     dataset: &Dataset,
     index: &IndexMetadata,
-    staged: Option<&SegmentRemappingPlan>,
+    staged: Option<&ReadPlan>,
     purpose: OpenPurpose,
     metrics: &dyn MetricsCollector,
 ) -> lance_core::Result<Option<(Uuid, ResolvedRemapping)>> {
-    // The cheap cached stored listing decides the generation; the filtered
-    // listing (whose tagged post-processing recomputes coverage) is only
-    // consulted inside the once-per-snapshot plan build.
+    // The cheap cached stored listing decides the generation; the per-segment
+    // planning is only done inside the once-per-snapshot plan build.
     let stored = super::loading::load_all_indices(dataset).await?;
     let Some(fri) = stored
         .iter()
@@ -649,16 +610,16 @@ pub(super) async fn open_row_id_remapping_with_plan(
     lance_index::scalar::check_batch_remapping_entry()?;
     let mapping = super::frag_reuse_reader::FragmentReuseIndex::open(dataset, fri).await?;
     let snapshot_plan;
-    let plan = match staged {
-        Some(plan) => plan,
+    let (read, missing) = match staged {
+        Some(read) => (read, None),
         None => {
             snapshot_plan = fri_query_plan(dataset, fri, &stored, &mapping).await?;
-            match snapshot_plan.segments.get(&index.uuid) {
-                Some(plan) => plan,
+            let planned = match snapshot_plan.segments.get(&index.uuid) {
+                Some(planned) => planned,
                 // A registered segment the reader left out of the plan: it
                 // derives no coverage, so it is out of the listing too. What
                 // that means depends on who asks (below).
-                None if stored.iter().any(|entry| entry.uuid == index.uuid) => &PLAN_MISS,
+                None if stored.iter().any(|entry| entry.uuid == index.uuid) => &snapshot_plan.miss,
                 None => {
                     return Err(Error::not_supported(format!(
                         "FRI remapping requires committed segment metadata for {}; a staged \
@@ -666,67 +627,49 @@ pub(super) async fn open_row_id_remapping_with_plan(
                         index.uuid
                     )));
                 }
-            }
+            };
+            (&planned.read, planned.missing)
         }
     };
-    match plan {
-        SegmentRemappingPlan::Identity => Ok(Some((fri.uuid, ResolvedRemapping::V1Identity))),
+    match read {
+        ReadPlan::Direct => Ok(Some((fri.uuid, ResolvedRemapping::V1Identity))),
+        // Segments this build cannot translate stay refused.
+        ReadPlan::Excluded => {
+            let reason = missing.unwrap_or(MissingCoverageReason::Unsupported);
+            match (purpose, reason) {
+                (OpenPurpose::Query, reason) => Err(Error::not_supported(format!(
+                    "FRI query coverage is unavailable for segment {} ({reason}): the reader \
+                     excludes it from the index listing on this snapshot; open it through the \
+                     listing, not by uuid",
+                    index.uuid
+                ))),
+                (OpenPurpose::Maintenance, MissingCoverageReason::Corrupt) => {
+                    Err(Error::index(format!(
+                        "segment {} has metadata this build cannot interpret; the index must be \
+                         rebuilt",
+                        index.uuid
+                    )))
+                }
+                (OpenPurpose::Maintenance, _) => Err(Error::not_supported(format!(
+                    "segment {} cannot be translated by this build under the tagged fragment \
+                     reuse history; leave it for a rebuild or a newer version of Lance",
+                    index.uuid
+                ))),
+            }
+        }
         // A segment that derives no coverage is listed with empty coverage,
         // so every one of its fragments is scanned; it opens as an empty
         // segment (every stored row translates to nothing), and maintenance
-        // replaces it. Segments this build cannot translate stay refused.
-        SegmentRemappingPlan::MissingCoverage(
-            reason @ (MissingCoverageReason::Unsupported | MissingCoverageReason::Corrupt),
-        ) if purpose == OpenPurpose::Query => Err(Error::not_supported(format!(
-            "FRI query coverage is unavailable for segment {} ({reason}): the reader \
-                 excludes it from the index listing on this snapshot; open it through the \
-                 listing, not by uuid",
-            index.uuid
-        ))),
-        SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Unsupported) => {
-            Err(Error::not_supported(format!(
-                "segment {} cannot be translated by this build under the tagged fragment reuse \
-                 history; leave it for a rebuild or a newer version of Lance",
-                index.uuid
-            )))
-        }
-        SegmentRemappingPlan::MissingCoverage(MissingCoverageReason::Corrupt) => {
-            Err(Error::index(format!(
-                "segment {} has metadata this build cannot interpret; the index must be \
-                 rebuilt",
-                index.uuid
-            )))
-        }
-        SegmentRemappingPlan::MissingCoverage(
-            MissingCoverageReason::Withdrawn | MissingCoverageReason::NoDerivedCoverage,
-        ) => {
-            let empty = RoaringBitmap::new();
-            let fingerprint = mapping.translation_fingerprint(&empty, &empty, &[]);
-            Ok(Some((
-                fri.uuid,
-                ResolvedRemapping::V1Translate {
-                    remapper: Arc::new(super::frag_reuse_remapping::QueryRowIdRemapper::new(
-                        mapping,
-                        RoaringBitmap::new(),
-                        RoaringBitmap::new(),
-                    )),
-                    fingerprint,
-                },
-            )))
-        }
-        SegmentRemappingPlan::Translate {
-            coverage,
-            excluded_fragments,
-            fingerprint,
-        } => Ok(Some((
+        // replaces it.
+        ReadPlan::Translate(translation) => Ok(Some((
             fri.uuid,
             ResolvedRemapping::V1Translate {
                 remapper: Arc::new(super::frag_reuse_remapping::QueryRowIdRemapper::new(
                     mapping,
-                    coverage.clone(),
-                    excluded_fragments.clone(),
+                    translation.coverage().clone(),
+                    translation.excluded_fragments().clone(),
                 )),
-                fingerprint: *fingerprint,
+                fingerprint: *translation.fingerprint(),
             },
         ))),
     }

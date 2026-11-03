@@ -882,7 +882,7 @@ pub(crate) async fn open_scalar_index_with_plan(
     dataset: &Dataset,
     column: &str,
     index: &IndexMetadata,
-    staged: Option<&super::frag_reuse::SegmentRemappingPlan>,
+    staged: Option<&super::frag_reuse::ReadPlan>,
     purpose: super::frag_reuse::OpenPurpose,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {

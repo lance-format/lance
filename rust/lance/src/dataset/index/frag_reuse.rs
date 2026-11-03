@@ -20,6 +20,7 @@ use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
 use lance_table::io::manifest::read_manifest_indexes;
 use lance_table::system_index::frag_reuse::history::{FragReuseHistory, HistoryFormat, Record};
 use lance_table::system_index::frag_reuse::policy::FriPolicy;
+use lance_table::system_index::frag_reuse::{is_index_remap_caught_up, reuse_chain_frag_bitmap};
 use log::warn;
 use roaring::RoaringBitmap;
 
@@ -247,79 +248,6 @@ fn warn_dropped_versions(dropped: &[u64]) {
             "dropping invalid fragment reuse versions {dropped:?}; rows they translated are \
              scanned until their indices are rebuilt"
         );
-    }
-}
-
-/// Every fragment the reuse chain touches (old + new) across all versions. An
-/// index disjoint from this set holds no row address the FRI remaps, so trimming
-/// can never strand it (fragment ids are never reused).
-pub(crate) fn reuse_chain_frag_bitmap(versions: &[FragReuseVersion]) -> RoaringBitmap {
-    let mut bitmap = RoaringBitmap::new();
-    for version in versions {
-        bitmap.extend(version.old_frag_ids().iter().map(|&id| id as u32));
-        bitmap.extend(version.new_frag_ids().iter().map(|&id| id as u32));
-    }
-    bitmap
-}
-
-pub(crate) fn is_index_remap_caught_up(
-    frag_reuse_version: &FragReuseVersion,
-    index_meta: &IndexMetadata,
-    chain_frag_bitmap: &RoaringBitmap,
-) -> lance_core::Result<bool> {
-    if is_system_index(index_meta) {
-        return Ok(true);
-    }
-
-    // Disjoint coverage => caught up regardless of dataset_version, bypassing the
-    // stale-version gate below (see fn docs). The chain includes NEW fragments
-    // deliberately: a deferred-remap commit advances a covering index's bitmap
-    // onto them before its data is remapped, so an old-frag-only check would
-    // clear a still-stale index and trim a version it needs.
-    if let Some(index_frag_bitmap) = &index_meta.fragment_bitmap
-        && index_frag_bitmap.is_disjoint(chain_frag_bitmap)
-    {
-        return Ok(true);
-    }
-
-    // Inclusive: an index built at dataset_version predates the rewrite.
-    if index_meta.dataset_version <= frag_reuse_version.dataset_version {
-        return Ok(false);
-    }
-
-    match index_meta.fragment_bitmap.clone() {
-        Some(index_frag_bitmap) => {
-            for group in frag_reuse_version.groups.iter() {
-                let mut old_frag_in_index = 0;
-                for old_frag in group.old_frags.iter() {
-                    if index_frag_bitmap.contains(old_frag.id as u32) {
-                        old_frag_in_index += 1;
-                    }
-                }
-
-                if old_frag_in_index > 0 {
-                    if old_frag_in_index != group.old_frags.len() {
-                        // This should never happen because we always commit a full rewrite group
-                        // and we always reindex either the entire group or nothing.
-                        // We use invalid input to be consistent with
-                        // dataset::transaction::recalculate_fragment_bitmap
-                        return Err(Error::invalid_input(format!(
-                            "The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
-                            group.old_frags
-                        )));
-                    }
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        }
-        None => {
-            warn!(
-                "Index {} ({}) missing fragment bitmap, cannot determine if it is caught up with the fragment reuse version, consider retraining the index",
-                index_meta.name, index_meta.uuid
-            );
-            Ok(true)
-        }
     }
 }
 

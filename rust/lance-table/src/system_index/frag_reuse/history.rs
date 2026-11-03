@@ -25,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes};
+use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use prost::Message;
 use prost::encoding::WireType;
@@ -33,6 +34,7 @@ use roaring::RoaringBitmap;
 use super::imp::{FriImpl, StoredRecord, concat};
 use super::ledger::{FragReuseLedger, corrupt, is_interpretable_transition, next_field};
 use super::legacy::{self, LegacyHistory};
+use super::plan::{ReadContext, ReadPlan, SegmentSummary};
 use super::tagged::TaggedHistory;
 use crate::format::pb::fragment_reuse_index_details as pb;
 
@@ -253,6 +255,69 @@ impl FragReuseHistory {
         self.0.clone().remap_stable_partition_bases(remap).map(Self)
     }
 
+    /// The same history, read on a table with stable row IDs. Its read plans
+    /// also exclude every segment that does not store row addresses or whose
+    /// kind cannot apply the history, whether or not it is caught up: the
+    /// legacy reader applies the history to every segment it opens, so it
+    /// would rewrite stable row IDs as if they were addresses. Only a legacy
+    /// history can describe such a table.
+    pub fn on_stable_row_ids(self) -> Result<Self> {
+        self.0.on_stable_row_ids().map(Self)
+    }
+
+    /// Whether `segment` holds no address the history still moves, so it can
+    /// be used without translation, and no record is needed for it.
+    ///
+    /// `entry_version` is the `dataset_version` of the FRI entry holding the
+    /// history (see [`ReadContext::entry_version`]). A segment without a
+    /// recorded fragment bitmap is caught up only under the legacy rule, which
+    /// released writers relied on.
+    pub fn is_caught_up(&self, entry_version: u64, segment: &SegmentSummary) -> bool {
+        self.0.is_caught_up(entry_version, segment)
+    }
+
+    /// Whether [`Self::plan`] consults `segment.translation`. Computing it can
+    /// require reading the segment's files, so a caller may skip it (and pass
+    /// any value) for a segment this returns false for.
+    pub fn needs_translation_support(
+        &self,
+        context: &ReadContext,
+        segment: &SegmentSummary,
+    ) -> bool {
+        self.0.needs_translation_support(context, segment)
+    }
+
+    /// How a reader uses each segment of one logical index, in `group`
+    /// order. A logical index is planned as a whole: a fragment one segment
+    /// covers directly is never translated into for another.
+    pub fn plan(&self, context: &ReadContext, group: &[SegmentSummary]) -> Vec<ReadPlan> {
+        self.0.plan(context, group)
+    }
+
+    /// The live fragments each segment of `group` answers for, as planned by
+    /// [`Self::plan`]: every live fragment of a direct segment, the remaining
+    /// coverage of a translated one, nothing for an excluded one. A fragment
+    /// no segment claims is scanned.
+    pub fn effective_coverage(
+        &self,
+        context: &ReadContext,
+        group: &[SegmentSummary],
+    ) -> Vec<RoaringBitmap> {
+        self.plan(context, group)
+            .into_iter()
+            .zip(group)
+            .map(|(plan, segment)| match plan {
+                ReadPlan::Direct => segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .map(|bitmap| bitmap & context.live_fragments)
+                    .unwrap_or_default(),
+                ReadPlan::Translate(plan) => plan.coverage().clone(),
+                ReadPlan::Excluded => RoaringBitmap::new(),
+            })
+            .collect()
+    }
+
     /// The records `self` adds to `base`, refusing anything else: a rewrite
     /// appends history, so every record `base` holds must still be present
     /// with the same content. Transitions are identified by their source and
@@ -297,6 +362,18 @@ impl FragReuseHistory {
             })
             .cloned()
             .collect())
+    }
+}
+
+impl DeepSizeOf for FragReuseHistory {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        let records = self.0.records();
+        records
+            .stored
+            .iter()
+            .map(|stored| stored.raw.len())
+            .sum::<usize>()
+            + records.ledger.deep_size_of_children(context)
     }
 }
 

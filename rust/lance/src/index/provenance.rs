@@ -23,7 +23,7 @@ use roaring::RoaringBitmap;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::api::IndexSegment;
 use crate::index::append;
-use crate::index::frag_reuse::{self, SegmentRemappingPlan};
+use crate::index::frag_reuse::{self, ReadPlan};
 use crate::index::loading::{DatasetIndexInternalExt, load_all_indices};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{Error, Result, dataset::Dataset};
@@ -64,13 +64,13 @@ pub(super) async fn remap_merged_segment_coverage(
                 provenance |= bitmap;
             }
             let coverage = match plans.get(&segment.uuid) {
-                Some(SegmentRemappingPlan::Translate { coverage, .. }) => coverage.clone(),
-                Some(SegmentRemappingPlan::Identity) => segment
+                Some(ReadPlan::Translate(translation)) => translation.coverage().clone(),
+                Some(ReadPlan::Direct) => segment
                     .fragment_bitmap
                     .as_ref()
                     .map(|bitmap| bitmap & dataset.fragment_bitmap.as_ref())
                     .unwrap_or_default(),
-                Some(SegmentRemappingPlan::MissingCoverage(_)) | None => {
+                Some(ReadPlan::Excluded) | None => {
                     return Err(Error::not_supported(format!(
                         "FRI query coverage is unavailable for staged segment {}",
                         segment.uuid

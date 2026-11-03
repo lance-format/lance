@@ -17,6 +17,9 @@ use roaring::RoaringBitmap;
 use super::history::{HistoryFormat, Record, TRANSITION_FIELD, length_delimited};
 use super::imp::{FriImpl, Records, StoredRecord, concat, invalid_edit};
 use super::ledger::{STABLE_PARTITION_FIELD, corrupt, next_field, require_message};
+use super::plan::{
+    ReadContext, ReadPlan, SegmentSummary, TranslationPlan, TranslationSupport, segment_plans,
+};
 use crate::format::pb::fragment_reuse_index_details::{self as pb, transition};
 
 /// `StablePartition.base_id`.
@@ -30,6 +33,21 @@ impl TaggedHistory {
         let records = Records::decode(HistoryFormat::Tagged, content)?;
         validate_records(&records.stored)?;
         Ok(Self(records))
+    }
+}
+
+impl TaggedHistory {
+    /// Whether the segment's stored addresses are usable as they are: every
+    /// fragment it covers is live and it is caught up with the history.
+    /// Dead fragments may belong to an omitted unknown mapping; those must
+    /// not get an identity read merely because they are absent from the
+    /// graph.
+    fn is_direct(&self, context: &ReadContext, segment: &SegmentSummary) -> bool {
+        segment
+            .fragment_bitmap
+            .as_ref()
+            .is_some_and(|bitmap| bitmap.is_subset(context.live_fragments))
+            && self.is_caught_up(context.entry_version, segment)
     }
 }
 
@@ -121,6 +139,74 @@ impl FriImpl for TaggedHistory {
             });
         }
         self.rebuilt(concat(&records))
+    }
+
+    fn on_stable_row_ids(self: Arc<Self>) -> Result<Arc<dyn FriImpl>> {
+        Err(Error::not_supported(
+            "a tagged fragment reuse history cannot describe a table with stable row IDs, which \
+             supports only index_version 0",
+        ))
+    }
+
+    /// A projected bitmap can name only destinations while the files still
+    /// hold source addresses, so a segment is caught up only when it covers
+    /// no fragment of the lineage. A dropped unknown transition leaves no
+    /// record of which fragments it touched, so no segment can be proven
+    /// untouched by it.
+    fn is_caught_up(&self, _entry_version: u64, segment: &SegmentSummary) -> bool {
+        let ledger = &self.0.ledger;
+        !ledger.has_unsupported_transitions()
+            && segment.fragment_bitmap.as_ref().is_some_and(|bitmap| {
+                bitmap
+                    .iter()
+                    .all(|fragment| !ledger.contains_fragment(fragment))
+            })
+    }
+
+    fn needs_translation_support(&self, context: &ReadContext, segment: &SegmentSummary) -> bool {
+        !self.is_direct(context, segment)
+    }
+
+    fn plan(&self, context: &ReadContext, group: &[SegmentSummary]) -> Vec<ReadPlan> {
+        let ledger = &self.0.ledger;
+        let mut plans = vec![ReadPlan::Excluded; group.len()];
+        // Only segments the reader can use establish coverage: a destination
+        // needs all of its contributing sources.
+        let mut members = Vec::with_capacity(group.len());
+        let mut provenance = Vec::with_capacity(group.len());
+        for (position, segment) in group.iter().enumerate() {
+            let Some(bitmap) = &segment.fragment_bitmap else {
+                continue;
+            };
+            if ledger.has_unsupported_transitions()
+                || (!self.is_direct(context, segment)
+                    && segment.translation != TranslationSupport::Supported)
+            {
+                continue;
+            }
+            members.push(position);
+            provenance.push(bitmap.clone());
+        }
+        let parts = segment_plans(ledger, context.live_fragments, &provenance);
+        for ((position, bitmap), parts) in members.into_iter().zip(&provenance).zip(parts) {
+            plans[position] = if bitmap.is_empty() {
+                // Nothing needs translating, but the segment's files may still
+                // hold the rows whose coverage was withdrawn: never direct.
+                ReadPlan::Translate(TranslationPlan::nothing(ledger))
+            } else if self.is_direct(context, &group[position]) {
+                ReadPlan::Direct
+            } else if parts.coverage.is_empty() {
+                ReadPlan::Translate(TranslationPlan::nothing(ledger))
+            } else {
+                ReadPlan::Translate(TranslationPlan::new(
+                    ledger,
+                    parts.coverage,
+                    parts.excluded,
+                    &parts.path,
+                ))
+            };
+        }
+        plans
     }
 }
 

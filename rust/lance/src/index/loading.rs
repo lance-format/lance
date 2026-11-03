@@ -895,7 +895,7 @@ impl Dataset {
         &self,
         column: &str,
         index_meta: &IndexMetadata,
-        staged: Option<&frag_reuse::SegmentRemappingPlan>,
+        staged: Option<&frag_reuse::ReadPlan>,
         purpose: frag_reuse::OpenPurpose,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {

@@ -18,6 +18,7 @@ use roaring::RoaringBitmap;
 
 use super::history::{HistoryFormat, Record, split_records};
 use super::ledger::FragReuseLedger;
+use super::plan::{ReadContext, ReadPlan, SegmentSummary};
 use crate::format::pb::fragment_reuse_index_details as pb;
 
 /// One FRI format's rules over its records.
@@ -43,6 +44,18 @@ pub trait FriImpl: Send + Sync + Debug {
         self: Arc<Self>,
         remap: &dyn Fn(Option<u32>) -> Result<Option<u32>>,
     ) -> Result<Arc<dyn FriImpl>>;
+
+    /// See [`FragReuseHistory::on_stable_row_ids`](super::history::FragReuseHistory::on_stable_row_ids).
+    fn on_stable_row_ids(self: Arc<Self>) -> Result<Arc<dyn FriImpl>>;
+
+    /// See [`FragReuseHistory::is_caught_up`](super::history::FragReuseHistory::is_caught_up).
+    fn is_caught_up(&self, entry_version: u64, segment: &SegmentSummary) -> bool;
+
+    /// See [`FragReuseHistory::needs_translation_support`](super::history::FragReuseHistory::needs_translation_support).
+    fn needs_translation_support(&self, context: &ReadContext, segment: &SegmentSummary) -> bool;
+
+    /// See [`FragReuseHistory::plan`](super::history::FragReuseHistory::plan).
+    fn plan(&self, context: &ReadContext, group: &[SegmentSummary]) -> Vec<ReadPlan>;
 }
 
 /// The records every format stores: each record's exact wire bytes in
