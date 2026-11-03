@@ -31,7 +31,7 @@ use super::GenericWriter;
 use crate::Dataset;
 use crate::index::scalar::zonemap::stored_null_bitmap_policy;
 use crate::index::scalar::{IndexDetails, fetch_index_details};
-use crate::index::{index_is_usable, load_all_indices};
+use crate::index::{loading::load_all_indices, segment::index_is_usable};
 
 /// The unresolved same-column conflict is a configuration fact, so it is
 /// reported once per process and at debug level afterwards.

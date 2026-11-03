@@ -468,7 +468,7 @@ impl FixedSizeListBlock {
 
     /// Try to flatten a FixedSizeListBlock into a FixedWidthDataBlock
     ///
-    /// Returns None if any children are nullable
+    /// Returns None if any children are nullable or are not fixed width
     pub fn try_into_flat(self) -> Option<FixedWidthDataBlock> {
         match *self.child {
             // Cannot flatten a nullable child
@@ -484,10 +484,7 @@ impl FixedSizeListBlock {
                 inner.num_values /= self.dimension;
                 Some(inner)
             }
-            _ => panic!(
-                "Expected FixedSizeList or FixedWidth data block but found {:?}",
-                self
-            ),
+            _ => None,
         }
     }
 

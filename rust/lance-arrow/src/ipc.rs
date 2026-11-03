@@ -26,8 +26,8 @@ use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
 use arrow_ipc::convert::fb_to_schema;
 use arrow_ipc::reader::FileDecoder;
-use arrow_ipc::root_as_message;
 use arrow_ipc::writer::StreamWriter;
+use arrow_ipc::{Block, MessageHeader, MetadataVersion, root_as_message};
 use arrow_schema::ArrowError;
 use bytes::Bytes;
 
@@ -99,18 +99,34 @@ where
     sw.finish()
 }
 
+/// One complete Arrow IPC message accepted by the decoder.
+struct IpcMessage {
+    buffer: Buffer,
+    prefix_len: usize,
+    metadata_len: usize,
+    body_len: usize,
+    header_type: MessageHeader,
+    version: MetadataVersion,
+}
+
+enum IpcMessageRead {
+    Message(IpcMessage),
+    End { consumed: usize },
+}
+
 /// Read one complete Arrow IPC stream message from `data` as a zero-copy [`Buffer`].
 ///
-/// Parses the first message starting at byte 0 of `data`. Returns `None` on
-/// EOS (size field == 0) or empty input. The returned [`Buffer`] is backed by
-/// `data`'s allocation — no bytes are copied.
+/// Parses the first message starting at byte 0 of `data`. Returns the bytes
+/// consumed by EOS (size field == 0) or empty input. The returned [`Buffer`]
+/// is backed by `data`'s allocation — no bytes are copied.
 ///
-/// The caller should advance its position by `buf.len()` after each call.
-fn read_one_ipc_message(data: &Bytes) -> Result<Option<Buffer>, ArrowError> {
+/// The caller should advance its position by either the message buffer length
+/// or the EOS length after each call.
+fn read_one_ipc_message(data: &Bytes) -> Result<IpcMessageRead, ArrowError> {
     let bytes = data.as_ref();
 
     if bytes.is_empty() {
-        return Ok(None);
+        return Ok(IpcMessageRead::End { consumed: 0 });
     }
     if bytes.len() < 4 {
         return Err(ArrowError::IoError(
@@ -137,7 +153,9 @@ fn read_one_ipc_message(data: &Bytes) -> Result<Option<Buffer>, ArrowError> {
 
     let meta_size = u32::from_le_bytes(size_bytes) as usize;
     if meta_size == 0 {
-        return Ok(None); // EOS
+        return Ok(IpcMessageRead::End {
+            consumed: prefix_len,
+        });
     }
 
     let meta_end = prefix_len + meta_size;
@@ -162,7 +180,78 @@ fn read_one_ipc_message(data: &Bytes) -> Result<Option<Buffer>, ArrowError> {
 
     // Zero-copy: Bytes::slice shares the backing allocation; Buffer::from
     // wraps it without copying.
-    Ok(Some(Buffer::from(data.slice(0..total))))
+    Ok(IpcMessageRead::Message(IpcMessage {
+        buffer: Buffer::from(data.slice(0..total)),
+        prefix_len,
+        metadata_len: meta_end,
+        body_len,
+        header_type: msg.header_type(),
+        version: msg.version(),
+    }))
+}
+
+/// Decode one IPC stream and return the bytes accepted by the decoder.
+///
+/// The consumed length includes the schema, every batch or dictionary message
+/// read by the decoder, EOS when present, and the unsupported message that ends
+/// decoding. It excludes bytes after that stopping point.
+fn decode_ipc_stream(data: &Bytes) -> Result<(Vec<RecordBatch>, usize), ArrowError> {
+    let mut offset = 0usize;
+
+    let schema_message = match read_one_ipc_message(&data.slice(offset..))? {
+        IpcMessageRead::Message(message) => message,
+        IpcMessageRead::End { .. } => {
+            return Err(ArrowError::ParseError(
+                "IPC stream: expected schema message, got EOS".into(),
+            ));
+        }
+    };
+    offset += schema_message.buffer.len();
+
+    let IpcMessage {
+        buffer,
+        prefix_len,
+        metadata_len,
+        version,
+        ..
+    } = schema_message;
+    let schema_msg = root_as_message(&buffer[prefix_len..metadata_len])
+        .map_err(|e| ArrowError::ParseError(format!("IPC schema parse error: {e}")))?;
+    let schema = Arc::new(fb_to_schema(schema_msg.header_as_schema().ok_or_else(
+        || ArrowError::ParseError("IPC stream: first message is not a schema".into()),
+    )?));
+    let mut decoder = FileDecoder::new(schema, version);
+
+    let mut batches = Vec::new();
+
+    loop {
+        let message = match read_one_ipc_message(&data.slice(offset..))? {
+            IpcMessageRead::Message(message) => message,
+            IpcMessageRead::End { consumed } => {
+                offset += consumed;
+                break;
+            }
+        };
+        offset += message.buffer.len();
+
+        // Block offset = 0 since the buffer starts at the message boundary.
+        // metaDataLength = prefix_len + meta_size (prefix + flatbuf + padding).
+        let block = Block::new(0, message.metadata_len as i32, message.body_len as i64);
+
+        match message.header_type {
+            MessageHeader::RecordBatch => {
+                if let Some(batch) = decoder.read_record_batch(&block, &message.buffer)? {
+                    batches.push(batch);
+                }
+            }
+            MessageHeader::DictionaryBatch => {
+                decoder.read_dictionary(&block, &message.buffer)?;
+            }
+            _ => break,
+        }
+    }
+
+    Ok((batches, offset))
 }
 
 /// Read a length-prefixed byte slice at `offset` in `data`, advancing `offset`.
@@ -204,45 +293,7 @@ pub fn read_ipc_stream_at(
     data: &Bytes,
     offset: &mut usize,
 ) -> Result<Vec<RecordBatch>, ArrowError> {
-    let batches = read_ipc_stream(&data.slice(*offset..))?;
-
-    // Recompute how many bytes were consumed by re-parsing message sizes.
-    // We can't get this from read_ipc_stream directly, so we re-walk the
-    // message headers (metadata only, no body re-read) to sum up lengths.
-    let slice = &data.as_ref()[*offset..];
-    let mut consumed = 0usize;
-    loop {
-        let rem = &slice[consumed..];
-        if rem.is_empty() {
-            break;
-        }
-        let has_cont = rem.len() >= 4 && rem[..4] == IPC_CONTINUATION;
-        let (size_bytes, prefix_len): ([u8; 4], usize) = if has_cont {
-            if rem.len() < 8 {
-                break;
-            }
-            (rem[4..8].try_into().unwrap(), 8)
-        } else {
-            if rem.len() < 4 {
-                break;
-            }
-            (rem[..4].try_into().unwrap(), 4)
-        };
-        let meta_size = u32::from_le_bytes(size_bytes) as usize;
-        if meta_size == 0 {
-            // EOS — consume it and stop.
-            consumed += prefix_len;
-            break;
-        }
-        let meta_end = prefix_len + meta_size;
-        if rem.len() < meta_end {
-            break;
-        }
-        let msg = root_as_message(&rem[prefix_len..meta_end])
-            .map_err(|e| ArrowError::ParseError(format!("IPC message parse error: {e}")))?;
-        let body_len = msg.bodyLength() as usize;
-        consumed += meta_end + body_len;
-    }
+    let (batches, consumed) = decode_ipc_stream(&data.slice(*offset..))?;
     *offset += consumed;
 
     Ok(batches)
@@ -265,31 +316,6 @@ pub fn read_ipc_stream_single_at(
     }
 }
 
-/// Extract the prefix length and metadata size from a raw IPC message buffer.
-///
-/// Modern IPC streams have an 8-byte prefix `[continuation: 4][size: 4]`.
-/// Legacy streams have a 4-byte prefix `[size: 4]`. Returns `(prefix_len, meta_size)`.
-fn parse_ipc_message_prefix(buf: &Buffer) -> Result<(usize, usize), ArrowError> {
-    let has_continuation = buf.len() >= 4 && buf[..4] == IPC_CONTINUATION;
-    if has_continuation {
-        if buf.len() < 8 {
-            return Err(ArrowError::ParseError(
-                "IPC message buffer too short".into(),
-            ));
-        }
-        let meta_size = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
-        Ok((8, meta_size))
-    } else {
-        if buf.len() < 4 {
-            return Err(ArrowError::ParseError(
-                "IPC message buffer too short".into(),
-            ));
-        }
-        let meta_size = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
-        Ok((4, meta_size))
-    }
-}
-
 /// Read all [`RecordBatch`]es from one Arrow IPC stream.
 ///
 /// Zero-copy: each batch's array data buffers are borrowed from the input
@@ -299,52 +325,7 @@ fn parse_ipc_message_prefix(buf: &Buffer) -> Result<(usize, usize), ArrowError> 
 /// known edge case where `StreamDecoder` does not produce a batch for messages
 /// with a zero-length body when the message exactly fills the decode buffer.
 pub fn read_ipc_stream(data: &Bytes) -> Result<Vec<RecordBatch>, ArrowError> {
-    let mut offset = 0usize;
-
-    let schema_buf = read_one_ipc_message(&data.slice(offset..))?.ok_or_else(|| {
-        ArrowError::ParseError("IPC stream: expected schema message, got EOS".into())
-    })?;
-    offset += schema_buf.len();
-
-    let (prefix_len, meta_size) = parse_ipc_message_prefix(&schema_buf)?;
-    let schema_msg = root_as_message(&schema_buf[prefix_len..prefix_len + meta_size])
-        .map_err(|e| ArrowError::ParseError(format!("IPC schema parse error: {e}")))?;
-    let schema = Arc::new(fb_to_schema(schema_msg.header_as_schema().ok_or_else(
-        || ArrowError::ParseError("IPC stream: first message is not a schema".into()),
-    )?));
-    let mut decoder = FileDecoder::new(schema, schema_msg.version());
-
-    let mut batches = Vec::new();
-
-    loop {
-        let Some(buf) = read_one_ipc_message(&data.slice(offset..))? else {
-            break;
-        };
-        offset += buf.len();
-
-        let (prefix_len, meta_size) = parse_ipc_message_prefix(&buf)?;
-        let msg = root_as_message(&buf[prefix_len..prefix_len + meta_size])
-            .map_err(|e| ArrowError::ParseError(format!("IPC message parse error: {e}")))?;
-        let body_len = msg.bodyLength() as usize;
-
-        // Block offset = 0 since the buffer starts at the message boundary.
-        // metaDataLength = prefix_len + meta_size (prefix + flatbuf + padding).
-        let block = arrow_ipc::Block::new(0, (prefix_len + meta_size) as i32, body_len as i64);
-
-        match msg.header_type() {
-            arrow_ipc::MessageHeader::RecordBatch => {
-                if let Some(batch) = decoder.read_record_batch(&block, &buf)? {
-                    batches.push(batch);
-                }
-            }
-            arrow_ipc::MessageHeader::DictionaryBatch => {
-                decoder.read_dictionary(&block, &buf)?;
-            }
-            _ => break,
-        }
-    }
-
-    Ok(batches)
+    decode_ipc_stream(data).map(|(batches, _)| batches)
 }
 
 /// Read exactly one [`RecordBatch`] from one Arrow IPC stream.
@@ -503,10 +484,51 @@ pub fn read_ipc_section_batches_at(
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{ArrayRef, record_batch};
+    use arrow_array::{
+        Array, ArrayRef, builder::StringDictionaryBuilder, record_batch, types::Int8Type,
+    };
+    use arrow_schema::{DataType, Field, Schema};
     use rstest::rstest;
 
     use super::*;
+
+    fn write_ipc_stream_for_test(batches: &[RecordBatch]) -> Vec<u8> {
+        let first = batches.first().unwrap();
+        let mut buf = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut buf, first.schema_ref()).unwrap();
+        for batch in batches {
+            writer.write(batch).unwrap();
+        }
+        writer.finish().unwrap();
+        buf
+    }
+
+    fn assert_buffers_share_input(data: &Bytes, batches: &[RecordBatch]) {
+        fn check_data(data_base: usize, data_end: usize, array_data: &arrow_data::ArrayData) {
+            for buffer in array_data.buffers() {
+                if buffer.is_empty() {
+                    continue;
+                }
+                let ptr = buffer.as_ptr() as usize;
+                assert!(
+                    ptr >= data_base && ptr < data_end,
+                    "buffer at {ptr:#x} is not backed by the input Bytes allocation \
+                     [{data_base:#x}..{data_end:#x})"
+                );
+            }
+            for child in array_data.child_data() {
+                check_data(data_base, data_end, child);
+            }
+        }
+
+        let data_base = data.as_ptr() as usize;
+        let data_end = data_base + data.len();
+        for batch in batches {
+            for column in batch.columns() {
+                check_data(data_base, data_end, &column.to_data());
+            }
+        }
+    }
 
     #[rstest]
     #[case::truncated_padding(42, 42)]
@@ -569,6 +591,127 @@ mod tests {
             assert_col_zero_copy(batch.column(0));
             assert_col_zero_copy(batch.column(1));
         }
+    }
+
+    #[test]
+    fn test_ipc_stream_at_single_pass_offsets_and_zero_copy() {
+        let batch1 = record_batch!(("v", Int64, [1i64, 2, 3])).unwrap();
+        let batch2 = record_batch!(("v", Int64, [4i64, 5])).unwrap();
+        let stream = write_ipc_stream_for_test(&[batch1.clone(), batch2.clone()]);
+
+        let mut blob = vec![0xAB; IPC_SECTION_ALIGNMENT];
+        blob.extend_from_slice(&stream);
+        let stream_end = blob.len();
+        blob.extend_from_slice(&[0xDE, 0xAD, 0xBE]);
+
+        let data = aligned_bytes(&blob);
+        let mut offset = IPC_SECTION_ALIGNMENT;
+        let read = read_ipc_stream_at(&data, &mut offset).unwrap();
+
+        assert_eq!(read, vec![batch1, batch2]);
+        assert_eq!(
+            offset, stream_end,
+            "the offset must stop after EOS, not consume trailing data"
+        );
+        assert_eq!(&data[offset..], &[0xDE, 0xAD, 0xBE]);
+        assert_buffers_share_input(&data, &read);
+    }
+
+    #[test]
+    fn test_ipc_stream_at_dictionary_batch() {
+        let mut builder = StringDictionaryBuilder::<Int8Type>::new();
+        builder.append("alpha").unwrap();
+        builder.append("beta").unwrap();
+        builder.append("alpha").unwrap();
+        let dictionary = builder.finish();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "dict",
+            dictionary.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(dictionary) as ArrayRef]).unwrap();
+
+        let data = Bytes::from(write_ipc_stream_for_test(std::slice::from_ref(&batch)));
+        let mut offset = 0;
+        let read = read_ipc_stream_at(&data, &mut offset).unwrap();
+
+        assert_eq!(read, vec![batch]);
+        assert_eq!(offset, data.len());
+        assert_buffers_share_input(&data, &read);
+    }
+
+    #[test]
+    fn test_ipc_stream_at_stops_after_unsupported_message() {
+        let batch_a = record_batch!(("v", Int64, [1i64, 2, 3])).unwrap();
+        let batch_b = record_batch!(("v", Int64, [4i64, 5])).unwrap();
+        let mut stream_a = write_ipc_stream_for_test(std::slice::from_ref(&batch_a));
+        let stream_b = write_ipc_stream_for_test(std::slice::from_ref(&batch_b));
+        stream_a.truncate(stream_a.len() - 8);
+        let stream_a_len = stream_a.len();
+        let schema_b_len = match read_one_ipc_message(&Bytes::from(stream_b.clone())).unwrap() {
+            IpcMessageRead::Message(message) => message.buffer.len(),
+            IpcMessageRead::End { .. } => panic!("expected schema message"),
+        };
+
+        // The second stream starts with a complete schema message, which is
+        // unsupported after the first schema. Leave its record batch, EOS, and
+        // malformed trailing bytes unread so this locks the exact stop offset.
+        let malformed = [0xFF, 0xFF, 0xFF, 0xFF];
+        let mut blob = stream_a;
+        blob.extend_from_slice(&stream_b);
+        blob.extend_from_slice(&malformed);
+
+        let data = Bytes::from(blob);
+        let mut offset = 0;
+        let read = read_ipc_stream_at(&data, &mut offset).unwrap();
+
+        assert_eq!(read, vec![batch_a]);
+        assert_eq!(offset, stream_a_len + schema_b_len);
+        assert_eq!(
+            &data[offset..],
+            [&stream_b[schema_b_len..], &malformed].concat()
+        );
+    }
+
+    #[test]
+    fn test_ipc_stream_at_zero_length_body() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let batch = RecordBatch::new_empty(schema);
+        let data = Bytes::from(write_ipc_stream_for_test(std::slice::from_ref(&batch)));
+
+        let schema_message = match read_one_ipc_message(&data).unwrap() {
+            IpcMessageRead::Message(message) => message,
+            IpcMessageRead::End { .. } => panic!("expected schema message"),
+        };
+        let batch_message =
+            match read_one_ipc_message(&data.slice(schema_message.buffer.len()..)).unwrap() {
+                IpcMessageRead::Message(message) => message,
+                IpcMessageRead::End { .. } => panic!("expected record batch message"),
+            };
+        assert_eq!(batch_message.body_len, 0);
+
+        let mut offset = 0;
+        let read = read_ipc_stream_at(&data, &mut offset).unwrap();
+        assert_eq!(read, vec![batch]);
+        assert_eq!(offset, data.len());
+    }
+
+    #[test]
+    fn test_ipc_stream_at_error_preserves_offset() {
+        let batch = record_batch!(("v", Int64, [1i64, 2, 3])).unwrap();
+        let mut stream = write_ipc_stream_for_test(&[batch]);
+        stream.truncate(stream.len() - 8);
+
+        let mut blob = vec![0xAA; 3];
+        blob.extend_from_slice(&stream);
+        blob.push(0xFF);
+        let data = Bytes::from(blob);
+        let mut offset = 3;
+
+        let error = read_ipc_stream_at(&data, &mut offset).unwrap_err();
+        assert!(matches!(error, ArrowError::IoError(_, _)), "{error}");
+        assert!(error.to_string().contains("truncated header"), "{error}");
+        assert_eq!(offset, 3, "a failed read must preserve the offset");
     }
 
     /// Allocate a [`Bytes`] whose base address is 64-byte aligned, modelling a

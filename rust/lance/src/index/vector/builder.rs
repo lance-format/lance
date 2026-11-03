@@ -3723,7 +3723,7 @@ mod tests {
     async fn optimize_split_after_append_pushes_partition_over_threshold() {
         use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
         use crate::index::vector::VectorIndexParams;
-        use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+        use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
         use arrow_array::RecordBatchIterator;
         use arrow_schema::Schema as ArrowSchema;
         use lance_index::optimize::OptimizeOptions;
@@ -4052,7 +4052,7 @@ mod tests {
     }
 
     async fn open_single_segment(dataset: &crate::Dataset) -> Arc<dyn VectorIndex> {
-        use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+        use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
         let indices = dataset.load_indices_by_name("idx").await.unwrap();
         assert_eq!(
             indices.len(),
@@ -4229,7 +4229,7 @@ mod tests {
         let indices = dataset.load_indices_by_name("idx").await.unwrap();
         assert_eq!(indices.len(), 2, "steady state is a no-op");
         for index in &indices {
-            use crate::index::DatasetIndexInternalExt;
+            use crate::index::loading::DatasetIndexInternalExt;
             let opened = dataset
                 .open_vector_index("vec", &index.uuid, &NoOpMetricsCollector)
                 .await

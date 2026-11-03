@@ -544,12 +544,26 @@ fn indexed_projection_column_count(field: &Field) -> Option<usize> {
 // error (naming each column's length) when they differ. Ordinary files always
 // pass; only files written with `FileWriter::write_column` whose columns ended up
 // unequal can fail, and those must be read separately.
-pub(crate) fn normalized_column_num_rows(info: &ColumnInfo) -> Result<u64> {
+pub(crate) fn normalize_dense_page_rows(encoded_rows: u64, row_scale: u64) -> Result<u64> {
+    if row_scale == 0 || !encoded_rows.is_multiple_of(row_scale) {
+        return Err(Error::invalid_input(format!(
+            "dense page row count {encoded_rows} is not divisible by fixed-size-list row scale {row_scale}"
+        )));
+    }
+    Ok(encoded_rows / row_scale)
+}
+
+pub(crate) fn normalized_column_num_rows(info: &ColumnInfo, dense_row_scale: u64) -> Result<u64> {
     info.page_infos.iter().try_fold(0_u64, |rows, page| {
+        // Sparse planar pages carry their row scale in the page layout. Stable
+        // structural pages and dense planar pages use the projection's scale.
         let page_rows = match &page.encoding {
+            PageEncoding::Structural(_) => {
+                normalize_dense_page_rows(page.num_rows, dense_row_scale)?
+            }
             PageEncoding::Planar(layout) => match layout.sparse() {
                 Some(sparse) => sparse.row_count_and_scale(page.num_rows)?.0,
-                None => page.num_rows,
+                None => normalize_dense_page_rows(page.num_rows, dense_row_scale)?,
             },
             _ => page.num_rows,
         };
@@ -5757,6 +5771,33 @@ mod tests {
         assert!(
             msg.contains("differing lengths") && msg.contains('b'),
             "expected a child-length error naming 'b', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_fixed_size_list_struct_row_scale() {
+        let fixed_size_list = DataType::FixedSizeList(
+            Arc::new(Field::new(
+                "item",
+                DataType::Struct(Fields::from(vec![Field::new("x", DataType::Int32, true)])),
+                true,
+            )),
+            2,
+        );
+        let arrow = ArrowSchema::new(vec![Field::new("points", fixed_size_list, true)]);
+        let schema = Schema::try_from(&arrow).unwrap();
+
+        assert_eq!(
+            versions::v2_1::test_projection_length(&schema, &[0], &[4]).unwrap(),
+            2
+        );
+
+        let err = versions::v2_1::test_projection_length(&schema, &[0], &[3]).unwrap_err();
+        assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
+        assert!(
+            err.to_string()
+                .contains("dense page row count 3 is not divisible by fixed-size-list row scale 2"),
+            "expected an invalid row-scale error, got: {err}"
         );
     }
 
