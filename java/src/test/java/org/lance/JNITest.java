@@ -19,6 +19,8 @@ import org.lance.index.vector.HnswBuildParams;
 import org.lance.index.vector.IvfBuildParams;
 import org.lance.index.vector.PQBuildParams;
 import org.lance.index.vector.RQBuildParams;
+import org.lance.index.vector.RQModel;
+import org.lance.index.vector.RQRotationType;
 import org.lance.index.vector.SQBuildParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.ipc.ApproxMode;
@@ -32,6 +34,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.util.Arrays;
 import java.util.Optional;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -165,6 +168,20 @@ public class JNITest {
   @Test
   public void testRqBuildParamsDefaultNumBits() {
     assertEquals((byte) 5, new RQBuildParams.Builder().build().getNumBits());
+  }
+
+  @Test
+  public void testRqModelSerializationAndValidation() {
+    RQModel model = RQModel.build(32, (byte) 3);
+    RQModel restored = RQModel.fromBytes(model.toBytes());
+    assertArrayEquals(model.toBytes(), restored.toBytes());
+    assertEquals(32, restored.getDimension());
+    assertEquals((byte) 3, restored.getNumBits());
+    assertEquals(RQRotationType.FAST, restored.getRotationType());
+
+    assertThrows(IllegalArgumentException.class, () -> RQModel.build(31, (byte) 3));
+    assertThrows(IllegalArgumentException.class, () -> RQModel.build(32, (byte) 0));
+    assertThrows(IllegalArgumentException.class, () -> RQModel.fromBytes(new byte[] {1, 2, 3}));
   }
 
   @Test
