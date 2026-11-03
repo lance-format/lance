@@ -761,10 +761,10 @@ impl Footprint {
     /// `fragment`, leaving the rest as they were.
     ///
     /// As [`Self::write_field_data`], the definition of every committed field
-    /// is required and the values count as written whichever fragment they go
-    /// in, so a minted fragment still depends on the schema it was prepared
-    /// against. Only a committed fragment has cells a concurrent writer can
-    /// name.
+    /// and the new-row schema are required and the values count as written
+    /// whichever fragment they go in, so a minted fragment still depends on
+    /// the schema it was prepared against. Only a committed fragment has cells
+    /// a concurrent writer can name.
     pub(super) fn write_partial_field_data(
         &mut self,
         fragment: Ref,
@@ -773,7 +773,8 @@ impl Footprint {
         let committed_fragment = fragment.committed();
         for field in fields.into_iter().filter_map(committed_field) {
             self.require(Coordinate::FieldDefinition(field));
-            self.values_written.insert(field);
+            self.require(Coordinate::NewRowSchema);
+            self.values_written = true;
             if let Some(fragment) = committed_fragment {
                 self.write_part(Coordinate::FieldData { fragment, field });
             }
