@@ -942,6 +942,7 @@ fn tag(e: &Compression) -> &'static str {
         Delta(_) => "delta",
         AxisDelta(_) => "axis_delta",
         Alp(_) => "alp",
+        Pcodec(_) => "pcodec",
     }
 }
 
@@ -989,6 +990,7 @@ fn child(c: &Compression) -> Option<Vec<&CompressiveEncoding>> {
             Some(children)
         }
         FixedSizeList(f) => f.values.as_ref().map(|b| vec![b.as_ref()]),
+        Pcodec(p) => p.values.as_ref().map(|b| vec![b.as_ref()]),
         VariablePackedStruct(v) => {
             let nested: Vec<&CompressiveEncoding> = v
                 .fields
@@ -1388,7 +1390,7 @@ async fn check_round_trip_encoding_inner(
         let mut mutable = MutableArrayData::with_capacities(array_data, false, capacities);
 
         for (i, a) in data.iter().enumerate() {
-            mutable.extend(i, 0, a.len())
+            mutable.try_extend(i, 0, a.len()).unwrap();
         }
 
         Some(make_array(mutable.freeze()))

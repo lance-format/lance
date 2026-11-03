@@ -240,6 +240,19 @@ public class AsyncScannerTest {
             assertEquals(5, countRows(reader));
             reader.close();
           }
+
+          // Without an index query, fast search falls back to both fragments. A dropped
+          // ignore list in the async JNI path would incorrectly return only five rows.
+          ScanOptions ignoredOptions =
+              new ScanOptions.Builder()
+                  .filter("id < 5")
+                  .fastSearch(true)
+                  .ignoredScalarIndices(Collections.singletonList("id_btree_index"))
+                  .build();
+          try (AsyncScanner scanner = AsyncScanner.create(appended, ignoredOptions, allocator);
+              ArrowReader reader = scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS)) {
+            assertEquals(10, countRows(reader));
+          }
         }
       }
     }

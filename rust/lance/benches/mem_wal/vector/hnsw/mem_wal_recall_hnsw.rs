@@ -27,7 +27,8 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use lance::dataset::mem_wal::DatasetMemWalExt;
-use lance::dataset::mem_wal::write::{MemTableScanner, ShardWriterConfig};
+use lance::dataset::mem_wal::MemTableScanner;
+use lance::dataset::mem_wal::write::ShardWriterConfig;
 use lance::dataset::{Dataset, WriteParams};
 use lance::index::vector::VectorIndexParams;
 use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
@@ -274,7 +275,7 @@ fn make_batch(start_id: i64, vectors: &[f32], schema: Arc<ArrowSchema>) -> Recor
 }
 
 fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
-    DistanceType::Cosine.func()(a, b)
+    DistanceType::Cosine.try_func().unwrap()(a, b)
 }
 
 fn brute_force_top_k(corpus: &[f32], n: usize, query: &[f32], k: usize) -> Vec<(f32, i64)> {

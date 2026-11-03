@@ -23,7 +23,7 @@ pub use field::{
     OnTypeMismatch, SchemaCompareOptions,
 };
 pub use schema::{
-    BlobHandling, FieldRef, OnMissing, Projectable, Projection, Schema,
+    BlobHandling, FieldRef, NEW_TABLE_FIELD_ID_LIMIT, OnMissing, Projectable, Projection, Schema,
     escape_field_path_for_project, format_field_path, format_field_path_minimal, parse_field_path,
     validate_fixed_size_list_dimensions,
 };
@@ -259,15 +259,20 @@ impl fmt::Display for LogicalType {
 }
 
 impl LogicalType {
-    fn is_list(&self) -> bool {
+    /// The logical type as a string, e.g. `int32` or `fixed_size_list:struct:3`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_list(&self) -> bool {
         self.0 == "list" || self.0 == "list.struct"
     }
 
-    fn is_large_list(&self) -> bool {
+    pub fn is_large_list(&self) -> bool {
         self.0 == "large_list" || self.0 == "large_list.struct"
     }
 
-    fn is_fixed_size_list_struct(&self) -> bool {
+    pub fn is_fixed_size_list_struct(&self) -> bool {
         self.0.starts_with("fixed_size_list:struct:")
     }
 
@@ -279,7 +284,7 @@ impl LogicalType {
         self.0 == BLOB_LOGICAL_TYPE
     }
 
-    fn is_map(&self) -> bool {
+    pub fn is_map(&self) -> bool {
         self.0 == "map"
     }
 }

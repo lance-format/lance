@@ -24,8 +24,10 @@ use super::{
 };
 #[cfg(feature = "geo")]
 use super::{GeoQuery, RelationQuery};
+use crate::scalar::inverted::InvertedIndexParams;
+use crate::scalar::inverted::query::try_collect_query_tokens;
 use lance_core::{Error, Result};
-use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
+use lance_datafusion_exec::expr::{column_names_in_expr, safe_coerce_scalar};
 use lance_select::{IndexExprResult, NullableIndexExprResult, NullableRowAddrMask};
 use roaring::RoaringBitmap;
 use tracing::instrument;
@@ -1131,6 +1133,7 @@ fn apply_regex_flags(pattern: &str, flags_expr: &Expr) -> Option<String> {
 pub struct FtsQueryParser {
     index_name: String,
     index_type: String,
+    tokenizer_params: Option<InvertedIndexParams>,
 }
 
 impl FtsQueryParser {
@@ -1138,7 +1141,26 @@ impl FtsQueryParser {
         Self {
             index_name: name,
             index_type,
+            tokenizer_params: None,
         }
+    }
+
+    /// The tokenizer settings of the index. A query the index tokenizer reduces
+    /// to no tokens, such as one made only of stop words, is left to the scan,
+    /// since the index cannot narrow the rows it matches.
+    pub fn with_tokenizer_params(mut self, params: InvertedIndexParams) -> Self {
+        self.tokenizer_params = Some(params);
+        self
+    }
+
+    fn has_index_tokens(&self, query: &str) -> bool {
+        let Some(params) = &self.tokenizer_params else {
+            return true;
+        };
+        params
+            .build()
+            .and_then(|mut tokenizer| try_collect_query_tokens(query, &mut tokenizer))
+            .is_ok_and(|tokens| !tokens.is_empty())
     }
 }
 
@@ -1186,13 +1208,17 @@ impl ScalarQueryParser for FtsQueryParser {
         let scalar = maybe_scalar(&args[1], data_type)?;
         if let ScalarValue::Utf8(Some(scalar_str)) = scalar
             && func.name() == "contains_tokens"
+            && self.has_index_tokens(&scalar_str)
         {
             let query = TokenQuery::TokensContains(scalar_str);
-            return Some(IndexedExpression::index_query(
+            // The index tokenizer can lowercase, fold and drop stop words, so
+            // its rows are candidates the scan still has to check.
+            return Some(IndexedExpression::index_query_with_recheck(
                 column.to_string(),
                 self.index_name.clone(),
                 self.index_type.clone(),
                 Arc::new(query),
+                true,
             ));
         }
         None
@@ -2648,14 +2674,14 @@ impl FilterPlan {
     pub fn all_columns(&self) -> Vec<String> {
         self.full_expr
             .as_ref()
-            .map(Planner::column_names_in_expr)
+            .map(column_names_in_expr)
             .unwrap_or_default()
     }
 
     pub fn refine_columns(&self) -> Vec<String> {
         self.refine_expr
             .as_ref()
-            .map(Planner::column_names_in_expr)
+            .map(column_names_in_expr)
             .unwrap_or_default()
     }
 
@@ -2684,49 +2710,39 @@ impl FilterPlan {
     }
 }
 
-pub trait PlannerIndexExt {
-    /// Determine how to apply a provided filter
-    ///
-    /// We parse the filter into a logical expression.  We then
-    /// split the logical expression into a portion that can be
-    /// satisfied by an index search (of one or more indices) and
-    /// a refine portion that must be applied after the index search
-    fn create_filter_plan(
-        &self,
-        filter: Expr,
-        index_info: &dyn IndexInformationProvider,
-        use_scalar_index: bool,
-    ) -> Result<FilterPlan>;
-}
-
-impl PlannerIndexExt for Planner {
-    fn create_filter_plan(
-        &self,
-        filter: Expr,
-        index_info: &dyn IndexInformationProvider,
-        use_scalar_index: bool,
-    ) -> Result<FilterPlan> {
-        let logical_expr = self.optimize_expr(filter)?;
-        if use_scalar_index {
-            let indexed_expr = apply_scalar_indices(logical_expr.clone(), index_info)?;
-            let mut skip_recheck = false;
-            if let Some(scalar_query) = indexed_expr.scalar_query.as_ref() {
-                skip_recheck = !scalar_query.needs_recheck();
-            }
-            Ok(FilterPlan {
-                index_query: indexed_expr.scalar_query,
-                refine_expr: indexed_expr.refine_expr,
-                full_expr: Some(logical_expr),
-                skip_recheck,
-            })
-        } else {
-            Ok(FilterPlan {
-                index_query: None,
-                skip_recheck: true,
-                refine_expr: Some(logical_expr.clone()),
-                full_expr: Some(logical_expr),
-            })
+/// Determine how to apply a provided filter
+///
+/// The filter is split into a portion that can be satisfied by an index
+/// search (of one or more indices) and a refine portion that must be applied
+/// after the index search.
+///
+/// `filter` should already be optimized (e.g. by `Planner::optimize_expr` in
+/// `lance-datafusion`), since index matching relies on the simplified and
+/// type-coerced form of the expression.
+pub fn create_filter_plan(
+    filter: Expr,
+    index_info: &dyn IndexInformationProvider,
+    use_scalar_index: bool,
+) -> Result<FilterPlan> {
+    if use_scalar_index {
+        let indexed_expr = apply_scalar_indices(filter.clone(), index_info)?;
+        let mut skip_recheck = false;
+        if let Some(scalar_query) = indexed_expr.scalar_query.as_ref() {
+            skip_recheck = !scalar_query.needs_recheck();
         }
+        Ok(FilterPlan {
+            index_query: indexed_expr.scalar_query,
+            refine_expr: indexed_expr.refine_expr,
+            full_expr: Some(filter),
+            skip_recheck,
+        })
+    } else {
+        Ok(FilterPlan {
+            index_query: None,
+            skip_recheck: true,
+            refine_expr: Some(filter.clone()),
+            full_expr: Some(filter),
+        })
     }
 }
 
@@ -2740,6 +2756,7 @@ mod tests {
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::simplify::SimplifyContext;
     use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
+    use lance_datafusion::planner::Planner;
     use lance_select::result::IndexExprResultWireFormat;
     use roaring::RoaringBitmap;
     use rstest::rstest;
@@ -3001,9 +3018,8 @@ mod tests {
         let filter = planner
             .parse_filter("user_profile.basic.age > 900")
             .unwrap();
-        let plan = planner
-            .create_filter_plan(filter, &index_info, true)
-            .unwrap();
+        let plan =
+            create_filter_plan(planner.optimize_expr(filter).unwrap(), &index_info, true).unwrap();
         let expected = IndexedExpression::index_query(
             column.to_string(),
             format!("{column}_idx"),
@@ -3036,7 +3052,19 @@ mod tests {
     #[case("temp = 1", SargableQuery::Equals(f16_scalar(1.0)))]
     #[case(
         "temp < 1.0",
-        SargableQuery::Range(Bound::Unbounded, Bound::Excluded(f16_scalar(1.0)))
+        SargableQuery::Range(
+            Bound::Included(f16_scalar(f32::NEG_INFINITY)),
+            Bound::Excluded(f16_scalar(1.0))
+        )
+    )]
+    // A two-sided bound needs neither negative-NaN range, so it stays one range.
+    #[case(
+        "temp BETWEEN 1.0 AND 2.5",
+        SargableQuery::Range(Bound::Included(f16_scalar(1.0)), Bound::Included(f16_scalar(2.5)))
+    )]
+    #[case(
+        "temp > 0.0 AND temp < 2.5",
+        SargableQuery::Range(Bound::Excluded(f16_scalar(0.0)), Bound::Excluded(f16_scalar(2.5)))
     )]
     #[case(
         // Four elements so DataFusion's `ShortenInListSimplifier` leaves the list
@@ -3066,9 +3094,8 @@ mod tests {
 
         let planner = Planner::new(Arc::new(schema));
         let filter = planner.parse_filter(expr).unwrap();
-        let plan = planner
-            .create_filter_plan(filter, &index_info, true)
-            .unwrap();
+        let plan =
+            create_filter_plan(planner.optimize_expr(filter).unwrap(), &index_info, true).unwrap();
         let wanted = IndexedExpression::index_query(
             "temp".to_string(),
             "temp_idx".to_string(),
@@ -4165,9 +4192,8 @@ mod tests {
         expr: Expr,
         index_info: &dyn IndexInformationProvider,
     ) -> FilterPlan {
-        Planner::new(Arc::new(schema))
-            .create_filter_plan(expr, index_info, true)
-            .unwrap()
+        let planner = Planner::new(Arc::new(schema));
+        create_filter_plan(planner.optimize_expr(expr).unwrap(), index_info, true).unwrap()
     }
 
     fn like_expr(pattern: ScalarValue) -> Expr {
@@ -4326,7 +4352,8 @@ mod tests {
         let expr = planner
             .parse_filter("cast(color as bigint) is null")
             .unwrap();
-        let plan = planner.create_filter_plan(expr, &index_info, true).unwrap();
+        let plan =
+            create_filter_plan(planner.optimize_expr(expr).unwrap(), &index_info, true).unwrap();
 
         assert!(plan.index_query.is_none());
         assert_eq!(plan.refine_expr, plan.full_expr);

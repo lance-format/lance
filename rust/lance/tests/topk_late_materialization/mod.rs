@@ -21,7 +21,9 @@ use datafusion::execution::{SendableRecordBatchStream, SessionStateBuilder, Task
 use datafusion::logical_expr::var_provider::{VarProvider, VarType};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::expressions::col;
-use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr};
+use datafusion::physical_expr::{
+    EquivalenceProperties, LexOrdering, PhysicalExpr, PhysicalSortExpr,
+};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_optimizer::sanity_checker::SanityCheckPlan;
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
@@ -283,6 +285,13 @@ impl ExecutionPlan for MetadataEraserExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -508,6 +517,13 @@ impl ExecutionPlan for AdjustCatExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -580,7 +596,7 @@ async fn sort_stays_above_a_take_that_extends_a_struct(#[case] field_name: &str)
     use arrow_schema::Field;
     use datafusion::common::DFSchema;
     use datafusion::functions::core::expr_fn::get_field;
-    use datafusion::physical_optimizer::enforce_sorting::EnforceSorting;
+    use datafusion::physical_optimizer::ensure_requirements::EnsureRequirements;
     use datafusion::prelude::col as logical_col;
     use lance_core::datatypes::OnMissing;
 
@@ -645,7 +661,7 @@ async fn sort_stays_above_a_take_that_extends_a_struct(#[case] field_name: &str)
         Arc::new(SortExec::new(ordering, take)) as Arc<dyn ExecutionPlan>
     };
     let expected = execute(make_plan()).await;
-    let optimized = EnforceSorting::new()
+    let optimized = EnsureRequirements::new()
         .optimize(make_plan(), &ConfigOptions::default())
         .unwrap();
     let shown = displayable(optimized.as_ref()).indent(true).to_string();

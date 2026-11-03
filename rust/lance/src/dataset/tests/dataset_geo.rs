@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::vec;
 
 use crate::Dataset;
+use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::tests::dataset_transactions::execute_sql;
 use crate::dataset::transaction::{Operation, Transaction, UpdateMode};
 use crate::dataset::{
@@ -15,11 +16,12 @@ use crate::dataset::{
 use crate::index::DatasetIndexExt;
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchIterator;
+use arrow_array::UInt32Array;
 use arrow_array::cast::AsArray;
 use arrow_array::record_batch;
-use arrow_array::types::{Float64Type, Int32Type, Int64Type};
+use arrow_array::types::{Float64Type, Int32Type, Int64Type, UInt32Type};
 use arrow_array::{Float64Array, Int64Array, StringArray};
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Schema};
 use datafusion::common::{assert_contains, assert_not_contains};
 use geo_types::{Rect, coord, line_string};
 use geoarrow_array::{
@@ -31,6 +33,7 @@ use lance_arrow::RecordBatchExt;
 use lance_core::ROW_ID;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::IndexType;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::ScalarIndexParams;
 use rstest::rstest;
 
@@ -243,6 +246,95 @@ async fn test_geo_rtree_index() {
 }
 
 #[rstest]
+#[case::without_crs(None, false)]
+#[case::crs_at_build(Some(r#"{"crs":"OGC:CRS84"}"#), true)]
+#[case::crs_added_before_refresh(Some(r#"{"crs":"OGC:CRS84"}"#), false)]
+#[tokio::test]
+async fn test_rtree_crs(#[case] crs_metadata: Option<&str>, #[case] has_crs_at_build: bool) {
+    let point_type = PointType::new(Dimension::XY, Default::default());
+    let mut points = PointBuilder::new(point_type.clone());
+    for x in [Some(1.0), None, Some(10.0), None, Some(2.0), None] {
+        points.push_point(x.map(|x| geo_types::point!(x: x, y: x)).as_ref());
+    }
+    let mut point_field = point_type.to_field("point", true);
+    if has_crs_at_build {
+        point_field.metadata_mut().insert(
+            "ARROW:extension:metadata".to_string(),
+            crs_metadata.unwrap().to_string(),
+        );
+    }
+    let batch = record_batch!(("id", Int32, [0, 1, 2, 3, 4, 5]))
+        .unwrap()
+        .try_with_column(point_field, points.finish().to_array_ref())
+        .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.slice(0, 4))], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    dataset
+        .create_index(
+            &["point"],
+            IndexType::RTree,
+            Some("point_idx".to_string()),
+            &ScalarIndexParams::new("RTree".to_string()),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(batch.slice(4, 2))], batch.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+    if let Some(metadata) = crs_metadata {
+        dataset
+            .update_field_metadata()
+            .update("point", [("ARROW:extension:metadata", metadata)])
+            .unwrap()
+            .await
+            .unwrap();
+    }
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(1))
+        .await
+        .unwrap();
+    let stats: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics("point_idx").await.unwrap()).unwrap();
+    assert_eq!(stats["num_unindexed_rows"], 0);
+    if let Some(metadata) = crs_metadata {
+        assert_eq!(
+            dataset.schema().field("point").unwrap().metadata["ARROW:extension:metadata"],
+            metadata
+        );
+    }
+    for (predicate, expected) in [
+        (
+            "ST_Intersects(point, ST_GeomFromText('POLYGON ((0 0, 3 0, 3 3, 0 3, 0 0))'))",
+            vec![0, 4],
+        ),
+        ("point IS NULL", vec![1, 3, 5]),
+    ] {
+        let mut scan = dataset.scan();
+        scan.project(&["id"]).unwrap().filter(predicate).unwrap();
+        assert_contains!(scan.explain_plan(false).await.unwrap(), "ScalarIndexQuery");
+        let result = scan.try_into_batch().await.unwrap();
+        let mut ids = result["id"].as_primitive::<Int32Type>().values().to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, expected, "predicate: {predicate}");
+    }
+}
+
+#[rstest]
 #[case::stale_unspecified(false, None)]
 #[case::latest_unspecified(true, None)]
 #[case::stale_rewrite_columns(false, Some(UpdateMode::RewriteColumns))]
@@ -327,6 +419,7 @@ async fn test_staged_rtree_after_rewrite_columns(
                     fields_modified,
                     removed_fragment_ids: vec![],
                     new_fragments: vec![],
+                    mem_wal_dir_id: None,
                     compacted_sstables: vec![],
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode,
@@ -670,4 +763,133 @@ async fn test_geo_constant_first_merge_insert_delete_if(#[values(false, true)] h
         .unwrap();
     assert_eq!(stats.num_deleted_rows, 1);
     assert_eq!(ids(&merged, "true").await, vec![0, 2, 3, 4, 5, 6]);
+}
+
+#[rstest::rstest]
+#[case::row_addresses(false, false)]
+#[case::stable_row_ids(true, false)]
+#[case::fragment_reuse(false, true)]
+#[tokio::test]
+async fn test_rtree_optimize_drops_rewritten_rows(
+    #[case] enable_stable_row_ids: bool,
+    #[case] compact: bool,
+) {
+    let point_type = PointType::new(Dimension::XY, Default::default());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt32, false),
+        point_type.clone().to_field("point", true),
+        point_type.clone().to_field("replacement", true),
+    ]));
+    let mut points = PointBuilder::new(point_type.clone());
+    let mut replacements = PointBuilder::new(point_type);
+    for id in 0..8 {
+        if id % 2 == 0 {
+            points.push_null();
+            replacements.push_point(Some(&geo_types::point!(x: 10.0, y: 10.0)));
+        } else {
+            points.push_point(Some(&geo_types::point!(x: 1.0, y: 1.0)));
+            replacements.push_null();
+        }
+    }
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from_iter_values(0..8)),
+            points.finish().to_array_ref(),
+            replacements.finish().to_array_ref(),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            enable_stable_row_ids,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    dataset
+        .create_index(
+            &["point"],
+            IndexType::RTree,
+            Some("rtree_index".to_string()),
+            &ScalarIndexParams::new("RTree".to_string()),
+            true,
+        )
+        .await
+        .unwrap();
+    if compact {
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+    }
+    // Keep other rows in the source fragment live while replacing a NULL with
+    // a point and a point with a NULL. Stable IDs are reused by the replacements.
+    dataset = UpdateBuilder::new(Arc::new(dataset))
+        .update_where("id < 2")
+        .unwrap()
+        .set("point", "replacement")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap()
+        .new_dataset
+        .as_ref()
+        .clone();
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(1))
+        .await
+        .unwrap();
+    let indices = dataset.load_indices_by_name("rtree_index").await.unwrap();
+    assert_eq!(indices.len(), 1);
+
+    for (predicate, expected) in [
+        ("point IS NULL", vec![1, 2, 4, 6]),
+        (
+            "ST_Intersects(point, ST_GeomFromText('POLYGON ((0 0, 2 0, 2 2, 0 2, 0 0))'))",
+            vec![3, 5, 7],
+        ),
+        (
+            "ST_Intersects(point, ST_GeomFromText('POLYGON ((9 9, 11 9, 11 11, 9 11, 9 9))'))",
+            vec![0],
+        ),
+    ] {
+        let mut indexed = dataset.scan();
+        indexed.project(&["id"]).unwrap().filter(predicate).unwrap();
+        assert_contains!(
+            indexed.explain_plan(false).await.unwrap(),
+            "ScalarIndexQuery"
+        );
+        let indexed = indexed.try_into_batch().await.unwrap();
+        let scanned = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .filter(predicate)
+            .unwrap()
+            .use_scalar_index(false)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let mut indexed_ids = indexed["id"].as_primitive::<UInt32Type>().values().to_vec();
+        let mut scanned_ids = scanned["id"].as_primitive::<UInt32Type>().values().to_vec();
+        indexed_ids.sort_unstable();
+        scanned_ids.sort_unstable();
+        assert_eq!(indexed_ids, expected, "indexed predicate: {predicate}");
+        assert_eq!(indexed_ids, scanned_ids, "predicate: {predicate}");
+    }
 }
