@@ -3512,6 +3512,17 @@ pub trait StructuralPageDecoder: std::fmt::Debug + Send {
             "decoded_bytes is not implemented for this page decoder".to_string(),
         ))
     }
+
+    /// Returns a byte bound when physical dictionary values are expanded into
+    /// ordinary Binary/Utf8 arrays, rather than preserved as Arrow dictionaries.
+    fn decoded_expanded_bytes(&self, num_rows: u64) -> Result<u64> {
+        if self.dictionary_len().is_some() {
+            return Err(Error::not_supported(
+                "expanded dictionary byte size is unknown",
+            ));
+        }
+        self.decoded_bytes(num_rows)
+    }
 }
 
 #[derive(Debug)]

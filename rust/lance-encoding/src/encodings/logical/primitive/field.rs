@@ -985,7 +985,19 @@ impl StructuralPrimitiveFieldDecoder {
             };
             let take = available.min(remaining);
             total = total
-                .checked_add(page.decoded_bytes(take)?)
+                .checked_add(
+                    if matches!(
+                        self.field.data_type(),
+                        DataType::Binary
+                            | DataType::Utf8
+                            | DataType::LargeBinary
+                            | DataType::LargeUtf8
+                    ) {
+                        page.decoded_expanded_bytes(take)?
+                    } else {
+                        page.decoded_bytes(take)?
+                    },
+                )
                 .ok_or_else(|| {
                     lance_core::Error::not_supported(
                         "plan_decoded_bytes: decoded byte count overflowed u64".to_string(),
@@ -1026,20 +1038,7 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
         // Schema estimates and post-decode feedback cannot protect the first
         // batch from overflowing when consecutive pages are concatenated.
         let mut rows = num_rows;
-        let planned_bytes = if self
-            .page_decoders
-            .iter()
-            .any(|page| page.dictionary_len().is_some())
-        {
-            // Page byte counts describe compact dictionaries, but a plain
-            // Binary/Utf8 field expands their values before concatenation.
-            Err(Error::not_supported(
-                "expanded dictionary byte size is unknown",
-            ))
-        } else {
-            self.decoded_bytes_for_rows(rows)
-        };
-        let mut bytes = match planned_bytes {
+        let mut bytes = match self.decoded_bytes_for_rows(rows) {
             Ok(bytes) => bytes,
             Err(Error::NotSupported { .. }) => {
                 // Without a reliable size, never concatenate multiple rows into
