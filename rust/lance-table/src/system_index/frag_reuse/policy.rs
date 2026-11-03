@@ -10,40 +10,21 @@
 //!
 //! ```
 //! use lance_table::format::Manifest;
-//! use lance_table::system_index::frag_reuse::policy::{FriPolicy, RecordForm};
+//! use lance_table::system_index::frag_reuse::history::HistoryFormat;
+//! use lance_table::system_index::frag_reuse::policy::FriPolicy;
 //!
 //! # fn example(manifest: &Manifest) {
 //! let policy = FriPolicy::new(manifest, &[]);
-//! assert_eq!(policy.record_form(), RecordForm::Legacy);
+//! assert_eq!(policy.history_format(), HistoryFormat::Legacy);
 //! # }
 //! ```
 
 use lance_core::{Error, Result};
 
 use super::FRAG_REUSE_INDEX_NAME;
+use super::history::HistoryFormat;
 use super::metadata::{is_tagged, uses_tagged_fri};
 use crate::format::{Fragment, IndexMetadata, Manifest};
-
-/// The format a new fragment reuse record takes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecordForm {
-    /// `index_version` 0 compaction versions, which every released reader
-    /// and writer understands.
-    Legacy,
-    /// `index_version` 1 transitions. Once a table carries them it keeps the
-    /// format (the feature flag is sticky).
-    Tagged,
-}
-
-impl RecordForm {
-    /// The `IndexMetadata::index_version` of an entry in this format.
-    pub fn index_version(self) -> i32 {
-        match self {
-            Self::Legacy => 0,
-            Self::Tagged => 1,
-        }
-    }
-}
 
 /// The fragment reuse rules of one table snapshot.
 #[derive(Debug, Clone, Copy)]
@@ -76,11 +57,11 @@ impl<'a> FriPolicy<'a> {
 
     /// The format a rewrite records in: tagged once the table is tagged (by
     /// its sticky flag or its entry), the legacy format otherwise.
-    pub fn record_form(&self) -> RecordForm {
+    pub fn history_format(&self) -> HistoryFormat {
         if uses_tagged_fri(self.manifest, self.entry) {
-            RecordForm::Tagged
+            HistoryFormat::Tagged
         } else {
-            RecordForm::Legacy
+            HistoryFormat::Legacy
         }
     }
 
@@ -176,22 +157,22 @@ mod tests {
     }
 
     #[test]
-    fn the_sticky_flag_decides_the_record_form_without_an_entry() {
+    fn the_sticky_flag_decides_the_history_format_without_an_entry() {
         let untagged = manifest(false);
         assert_eq!(
-            FriPolicy::new(&untagged, &[]).record_form(),
-            RecordForm::Legacy
+            FriPolicy::new(&untagged, &[]).history_format(),
+            HistoryFormat::Legacy
         );
         let legacy = [entry(0)];
         assert_eq!(
-            FriPolicy::new(&untagged, &legacy).record_form(),
-            RecordForm::Legacy
+            FriPolicy::new(&untagged, &legacy).history_format(),
+            HistoryFormat::Legacy
         );
 
         let flagged = manifest(true);
         assert_eq!(
-            FriPolicy::new(&flagged, &[]).record_form(),
-            RecordForm::Tagged
+            FriPolicy::new(&flagged, &[]).history_format(),
+            HistoryFormat::Tagged
         );
         assert!(!FriPolicy::new(&flagged, &[]).has_tagged_history());
         let tagged = [entry(1)];

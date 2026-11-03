@@ -34,7 +34,8 @@ use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};
 use lance_core::{Error, Result};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_table::format::Fragment;
-use lance_table::system_index::frag_reuse::policy::{FriPolicy, RecordForm};
+use lance_table::system_index::frag_reuse::history::HistoryFormat;
+use lance_table::system_index::frag_reuse::policy::FriPolicy;
 use roaring::{RoaringBitmap, RoaringTreemap};
 
 /// Returns the version the reservation committed at; `dataset` is not moved to it.
@@ -500,7 +501,7 @@ pub async fn commit_compaction(
         // identically.
         let stored = load_all_indices(dataset).await?;
         let policy = FriPolicy::new(&dataset.manifest, &stored);
-        if policy.record_form() == RecordForm::Tagged {
+        if policy.history_format() == HistoryFormat::Tagged {
             policy.require_tagged_sources_supported(
                 rewrite_groups
                     .iter()

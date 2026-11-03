@@ -18,8 +18,8 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
 use lance_table::io::manifest::read_manifest_indexes;
-use lance_table::system_index::frag_reuse::history::{FragReuseHistory, Record};
-use lance_table::system_index::frag_reuse::policy::{FriPolicy, RecordForm};
+use lance_table::system_index::frag_reuse::history::{FragReuseHistory, HistoryFormat, Record};
+use lance_table::system_index::frag_reuse::policy::FriPolicy;
 use log::warn;
 use roaring::RoaringBitmap;
 
@@ -146,7 +146,7 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
     // A tagged table trims per record, a v0 entry under the sticky flag
     // included (it is lifted, as compaction lifts it); a v0 table keeps the
     // v0 path exactly as it was.
-    if FriPolicy::new(&dataset.manifest, &indices).record_form() == RecordForm::Tagged {
+    if FriPolicy::new(&dataset.manifest, &indices).history_format() == HistoryFormat::Tagged {
         return cleanup_tagged_frag_reuse_index(dataset).await;
     }
 
@@ -856,7 +856,7 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
     else {
         return Ok(TaggedTrimOutcome::NothingToTrim);
     };
-    if FriPolicy::new(&dataset.manifest, &indices).record_form() == RecordForm::Legacy {
+    if FriPolicy::new(&dataset.manifest, &indices).history_format() == HistoryFormat::Legacy {
         // Reachable only through a rebase whose table is no longer tagged;
         // nothing tagged remains to trim.
         return Ok(TaggedTrimOutcome::NothingToTrim);

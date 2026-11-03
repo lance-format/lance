@@ -12,8 +12,9 @@
 //! reason that says what to do instead.
 
 use super::FRAG_REUSE_INDEX_NAME;
+use super::history::HistoryFormat;
 use super::metadata::is_tagged;
-use super::policy::{FriPolicy, RecordForm};
+use super::policy::FriPolicy;
 use crate::format::{IndexMetadata, Manifest};
 use crate::system_index::mem_wal::MEM_WAL_INDEX_NAME;
 use crate::transaction::{FragReuseUpdate, Operation};
@@ -153,8 +154,8 @@ pub fn classify(
         _ => false,
     };
     if !current_indices.iter().any(is_tagged) {
-        // The sticky flag is the final authority on the record form
-        // (`FriPolicy::record_form`): once a manifest carries
+        // The sticky flag is the final authority on the history format
+        // (`FriPolicy::history_format`): once a manifest carries
         // FLAG_FRAGMENT_REUSE_INDEX every fragment reuse write is tagged,
         // even after a trim removed a fully drained entry. A v0 snapshot
         // would silently downgrade the table back to whole-history
@@ -164,7 +165,7 @@ pub fn classify(
         // writer that skipped both arrives here.
         if publishes_legacy_entry
             && current_manifest.is_some_and(|manifest| {
-                FriPolicy::new(manifest, current_indices).record_form() == RecordForm::Tagged
+                FriPolicy::new(manifest, current_indices).history_format() == HistoryFormat::Tagged
             })
         {
             return Err(Error::invalid_input(

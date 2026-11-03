@@ -29,7 +29,7 @@ use lance_table::system_index::frag_reuse::FragReuseVersion;
 use lance_table::system_index::frag_reuse::history::{FragReuseHistory, HistoryFormat, Record};
 use lance_table::system_index::frag_reuse::lineage::TaggedLineage;
 use lance_table::system_index::frag_reuse::metadata::is_tagged;
-use lance_table::system_index::frag_reuse::policy::{FriPolicy, RecordForm};
+use lance_table::system_index::frag_reuse::policy::FriPolicy;
 use lance_table::system_index::is_system_index;
 use lance_table::transaction::TaggedRewriteAssembly;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
@@ -582,7 +582,7 @@ impl<'a> TransactionRebase<'a> {
             return Ok(());
         }
         let policy = FriPolicy::new(&dataset.manifest, indices);
-        if policy.record_form() == RecordForm::Tagged {
+        if policy.history_format() == HistoryFormat::Tagged {
             return Ok(());
         }
         let entry = policy.entry();
@@ -3189,7 +3189,9 @@ impl<'a> TransactionRebase<'a> {
             // before this point.
             if self.reuse.added_transitions.is_none() && proposed.index_version == 0 {
                 let stored = crate::index::loading::load_all_indices(dataset).await?;
-                if FriPolicy::new(&dataset.manifest, &stored).record_form() == RecordForm::Tagged {
+                if FriPolicy::new(&dataset.manifest, &stored).history_format()
+                    == HistoryFormat::Tagged
+                {
                     let base = match self.reuse.read_entry.as_ref() {
                         Some(entry) => load_frag_reuse_history(dataset, entry).await?,
                         None => FragReuseHistory::empty(HistoryFormat::Legacy),
