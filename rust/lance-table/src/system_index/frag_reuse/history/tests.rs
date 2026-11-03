@@ -5,7 +5,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
 use roaring::RoaringTreemap;
-use rstest::rstest;
 
 use super::*;
 use crate::format::pb::fragment_reuse_index_details::transition;
@@ -27,9 +26,9 @@ pub fn address(fragment: u64, offset: u64) -> u64 {
 /// offsets are deleted.
 #[derive(Debug, Clone)]
 pub struct Source {
-    id: u64,
-    physical_rows: u64,
-    deleted: BTreeSet<u64>,
+    pub id: u64,
+    pub physical_rows: u64,
+    pub deleted: BTreeSet<u64>,
 }
 
 impl Source {
@@ -44,7 +43,7 @@ impl Source {
     }
 }
 
-fn changed_row_addrs(sources: &[Source]) -> Vec<u8> {
+pub fn changed_row_addrs(sources: &[Source]) -> Vec<u8> {
     let survivors: RoaringTreemap = sources.iter().flat_map(Source::survivors).collect();
     let mut bytes = Vec::new();
     survivors.serialize_into(&mut bytes).unwrap();
@@ -109,12 +108,12 @@ pub const MAP_A: &str = "00000000-0000-0000-0000-00000000000a";
 pub const MAP_B: &str = "00000000-0000-0000-0000-00000000000b";
 
 /// An envelope field no released writer emits.
-fn unknown_record() -> Vec<u8> {
+pub fn unknown_record() -> Vec<u8> {
     length_delimited(9, b"future")
 }
 
 /// A transition carrying a field this implementation does not know.
-fn transition_with_unknown_field() -> Vec<u8> {
+pub fn transition_with_unknown_field() -> Vec<u8> {
     let mut payload = ordered(&[whole(7, 2)], &[(8, 2)]).encode_to_vec();
     payload.extend_from_slice(&length_delimited(15, b"future"));
     length_delimited(TRANSITION_FIELD, &payload)
@@ -151,71 +150,6 @@ fn content_round_trips_byte_for_byte() {
     );
 }
 
-#[rstest]
-#[case::unknown_envelope_record(unknown_record())]
-#[case::transition_with_unknown_field(transition_with_unknown_field())]
-fn whole_history_edits_refuse_records_they_cannot_interpret(#[case] record: Vec<u8>) {
-    let history = RawHistory::new(HistoryFormat::Tagged, record.into())
-        .validate()
-        .unwrap();
-    let assert_refused = |result: Result<FragReuseHistory>| {
-        let error = result.unwrap_err();
-        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
-        assert!(error.to_string().contains("cannot maintain"), "{error}");
-    };
-    assert_refused(history.retain(&mut |_| true));
-    assert_refused(history.append_transitions(&[ordered(&[whole(1, 1)], &[(2, 1)])]));
-    assert_refused(history.remap_stable_partition_bases(&Ok));
-}
-
-#[test]
-fn record_kinds_require_their_format() {
-    let error = FragReuseHistory::empty(HistoryFormat::Legacy)
-        .append_transitions(&[ordered(&[whole(0, 1)], &[(1, 1)])])
-        .unwrap_err();
-    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-    let error = FragReuseHistory::empty(HistoryFormat::Tagged)
-        .insert_legacy_version(legacy(1, &[whole(0, 1)], &[(1, 1)]))
-        .unwrap_err();
-    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-}
-
-#[test]
-fn fragment_bitmap_follows_the_format() {
-    let v0 = FragReuseHistory::empty(HistoryFormat::Legacy)
-        .insert_legacy_version(legacy(1, &[whole(0, 1)], &[(1, 1)]))
-        .unwrap();
-    assert_eq!(v0.fragment_bitmap(), RoaringBitmap::from_iter([1]));
-    let tagged = v0
-        .into_tagged()
-        .unwrap()
-        .append_transitions(&[ordered(&[whole(1, 1)], &[(2, 1)])])
-        .unwrap();
-    assert_eq!(
-        tagged.fragment_bitmap(),
-        RoaringBitmap::from_iter([0, 1, 2])
-    );
-}
-
-#[test]
-fn retain_drops_only_the_rejected_records() {
-    let history = FragReuseHistory::empty(HistoryFormat::Tagged)
-        .append_transitions(&[
-            ordered(&[whole(0, 1)], &[(1, 1)]),
-            ordered(&[whole(5, 1)], &[(6, 1)]),
-        ])
-        .unwrap();
-    let trimmed = history
-        .retain(&mut |record| match record {
-            Record::Transition(transition) => transition.sources[0].id != 0,
-            _ => true,
-        })
-        .unwrap();
-    assert_eq!(trimmed.ledger().transitions().len(), 1);
-    assert_eq!(trimmed.ledger().consumer(5), Some(0));
-    assert_eq!(trimmed.ledger().consumer(0), None);
-}
-
 #[test]
 fn records_added_since_is_append_only() {
     let base = FragReuseHistory::empty(HistoryFormat::Tagged)
@@ -249,32 +183,6 @@ fn records_added_since_is_append_only() {
         .unwrap();
     let error = changed.records_added_since(&recorded).unwrap_err();
     assert!(error.to_string().contains("changes"), "{error}");
-}
-
-#[test]
-fn only_committed_legacy_content_is_repaired() {
-    let first = legacy(1, &[whole(0, 2)], &[(1, 2)]);
-    let reconsumes = legacy(2, &[whole(0, 2)], &[(2, 2)]);
-    let content: Bytes = [&first, &reconsumes]
-        .iter()
-        .flat_map(|version| length_delimited(LEGACY_VERSION_FIELD, &version.encode_to_vec()))
-        .collect::<Vec<u8>>()
-        .into();
-
-    let raw = RawHistory::new(HistoryFormat::Legacy, content.clone());
-    let error = raw.clone().validate().unwrap_err();
-    assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
-    let (repaired, dropped) = raw.repair().unwrap();
-    assert_eq!(dropped, [2]);
-    assert_eq!(
-        repaired,
-        FragReuseHistory::from_legacy_versions(vec![first]).unwrap()
-    );
-
-    let error = RawHistory::new(HistoryFormat::Tagged, content)
-        .repair()
-        .unwrap_err();
-    assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
 }
 
 /// One rewrite the model applies: which live fragments it consumes, which of
