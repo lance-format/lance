@@ -216,6 +216,98 @@ async fn index_build_withdraws_columns_rewritten_before_cleanup(
     );
 }
 
+#[rstest::rstest]
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn index_build_after_cleanup_withdraws_rewritten_retired_provenance(
+    #[values(false, true)] has_cleanup: bool,
+    #[values(false, true)] is_staged: bool,
+) {
+    let dir = TempStrDir::default();
+    let mut stale = fixture(dir.as_str()).await;
+    let segment = if is_staged {
+        Some(stage(&stale, "text", IndexType::BTree, vec![0, 1]).await.1)
+    } else {
+        None
+    };
+    let source =
+        arrow_array::record_batch!(("i", Int32, [0]), ("text", Utf8, ["patched"])).unwrap();
+    let (latest, _) = MergeInsertBuilder::try_new(Arc::new(stale.clone()), vec!["i".into()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .write_mode(MergeInsertWriteMode::RewriteColumns)
+        .try_build()
+        .unwrap()
+        .execute_batches(vec![source])
+        .await
+        .unwrap();
+    // The changed column no longer shares any fragment IDs with the build.
+    let latest = make_tagged(latest.as_ref().clone()).await;
+    let partition_version = latest.version().version;
+    let latest = crate::dataset::CommitBuilder::new(Arc::new(latest))
+        .execute(Transaction::new(
+            partition_version,
+            Operation::ReserveFragments { num_fragments: 1 },
+            None,
+        ))
+        .await
+        .unwrap();
+    if has_cleanup {
+        let stats = latest
+            .cleanup(
+                CleanupPolicyBuilder::default()
+                    .versions((1..=partition_version).collect())
+                    .unwrap()
+                    .build(),
+            )
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(stats.old_versions, partition_version);
+    }
+    if let Some(segment) = segment {
+        stale
+            .commit_existing_index_segments("idx", "text", vec![segment])
+            .await
+            .unwrap();
+    } else {
+        stale
+            .create_index(
+                &["text"],
+                IndexType::BTree,
+                Some("idx".into()),
+                &ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(
+        i_values(&dataset, Some("text = 'patched'"), false).await,
+        vec![0]
+    );
+    for predicate in ["text = 'patched'", "text = 'document'"] {
+        assert_eq!(
+            i_values(&dataset, Some(predicate), true).await,
+            i_values(&dataset, Some(predicate), false).await,
+            "has_cleanup={has_cleanup}, is_staged={is_staged}, predicate={predicate}"
+        );
+    }
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_bitmap(&stored),
+        if has_cleanup {
+            RoaringBitmap::new()
+        } else {
+            RoaringBitmap::from_iter([1u32])
+        }
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial(frag_reuse_maintenance)]
 async fn index_built_before_a_stable_partition_lands_translating() {

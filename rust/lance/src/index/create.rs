@@ -9,6 +9,7 @@ use crate::{
     },
     index::{
         DatasetIndexExt, IntoIndexSegment,
+        frag_reuse::OpenPurpose,
         frag_reuse_with_stable_row_ids::{
             ensure_index_allowed_with_frag_reuse, ensure_index_kind_allowed_with_frag_reuse,
         },
@@ -735,13 +736,11 @@ impl<'a> CreateIndexBuilder<'a> {
             .apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
 
-        // Fetch the committed index metadata from the dataset.
-        // This ensures we return the version that may have been modified by the commit.
-        let indices = self.dataset.load_indices().await?;
-        indices
-            .iter()
-            .find(|idx| idx.uuid == index_uuid)
-            .cloned()
+        // Rebasing may withdraw all query coverage while keeping the committed
+        // segment's definition for rebuilding. Include that stored metadata.
+        self.dataset
+            .load_index_with_purpose(&index_uuid, OpenPurpose::Maintenance)
+            .await?
             .ok_or_else(|| {
                 Error::internal(format!(
                     "Index with UUID {} not found after commit",
