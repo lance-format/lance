@@ -433,6 +433,7 @@ impl ChildState {
     fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
         let mut safe_rows = 0;
         let mut bytes = 0u64;
+        let mut dictionary_rows: Option<u64> = None;
         let mut budget = byte_budget;
         let mut remaining = num_rows;
         for decoder in &self.scheduled {
@@ -443,6 +444,12 @@ impl ChildState {
             let page_limit = decoder.max_rows_to_drain(rows_in_page, budget)?;
             safe_rows += page_limit.rows;
             bytes = bytes.saturating_add(page_limit.bytes);
+            dictionary_rows = match (dictionary_rows, page_limit.dictionary_rows) {
+                (Some(current), Some(page)) => Some(current.min(page)),
+                (Some(current), None) => Some(current),
+                (None, Some(page)) => Some(page),
+                (None, None) => None,
+            };
             if page_limit.rows < rows_in_page {
                 break;
             }
@@ -452,6 +459,7 @@ impl ChildState {
         Ok(DrainLimit {
             rows: safe_rows,
             bytes,
+            dictionary_rows,
         })
     }
 }
@@ -580,6 +588,7 @@ impl LogicalPageDecoder for SimpleStructDecoder {
             DrainLimit {
                 rows: num_rows,
                 bytes: 0,
+                dictionary_rows: None,
             },
             |limit, child| {
                 child
@@ -587,6 +596,13 @@ impl LogicalPageDecoder for SimpleStructDecoder {
                     .map(|child_limit| DrainLimit {
                         rows: limit.rows.min(child_limit.rows),
                         bytes: limit.bytes.max(child_limit.bytes),
+                        dictionary_rows: match (limit.dictionary_rows, child_limit.dictionary_rows)
+                        {
+                            (Some(current), Some(child)) => Some(current.min(child)),
+                            (Some(current), None) => Some(current),
+                            (None, Some(child)) => Some(child),
+                            (None, None) => None,
+                        },
                     })
             },
         )

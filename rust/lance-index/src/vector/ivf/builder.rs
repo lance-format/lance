@@ -69,11 +69,12 @@ pub struct IvfBuildParams {
 
     /// Precomputed partitions file (row_id -> partition_id)
     /// mutually exclusive with `precomputed_shuffle_buffers`
+    /// requires `centroids` to be set and `retrain` to be false
     pub precomputed_partitions_file: Option<String>,
 
     /// Precomputed shuffle buffers (row_id -> partition_id, pq_code)
     /// mutually exclusive with `precomputed_partitions_file`
-    /// requires `centroids` to be set
+    /// requires `centroids` to be set and `retrain` to be false
     ///
     /// The input is expected to be (/dir/to/buffers, [buffer1.lance, buffer2.lance, ...])
     pub precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
@@ -140,6 +141,53 @@ impl IvfBuildParams {
             centroids: Some(centroids),
             ..Default::default()
         })
+    }
+
+    /// Check the field combinations the precomputed inputs above declare.
+    ///
+    /// Both precomputed inputs carry partition ids that were assigned against
+    /// one particular set of centroids, so neither says anything about an index
+    /// whose centroids are trained from the data instead, and supplying both at
+    /// once means one of the two assignments is silently unused.
+    pub fn validate(&self) -> Result<()> {
+        if self.precomputed_shuffle_buffers.is_some() && self.precomputed_partitions_file.is_some()
+        {
+            return Err(Error::invalid_input(
+                "precomputed_shuffle_buffers and precomputed_partitions_file are mutually \
+                 exclusive, but both were set",
+            ));
+        }
+        if self.retrain {
+            if self.precomputed_shuffle_buffers.is_some() {
+                return Err(Error::invalid_input(
+                    "precomputed_shuffle_buffers cannot be used with retrain=true: the buffers \
+                     hold partition ids assigned against the original centroids, but retraining \
+                     changes the centroids",
+                ));
+            }
+            if self.precomputed_partitions_file.is_some() {
+                return Err(Error::invalid_input(
+                    "precomputed_partitions_file cannot be used with retrain=true: the file \
+                     holds partition ids assigned against the original centroids, but retraining \
+                     changes the centroids",
+                ));
+            }
+        }
+        if self.centroids.is_none() {
+            if self.precomputed_shuffle_buffers.is_some() {
+                return Err(Error::invalid_input(
+                    "precomputed_shuffle_buffers requires centroids to be set: the buffers hold \
+                     partition ids assigned against the centroids they were built with",
+                ));
+            }
+            if self.precomputed_partitions_file.is_some() {
+                return Err(Error::invalid_input(
+                    "precomputed_partitions_file requires centroids to be set: the file holds \
+                     partition ids assigned against the centroids it was built with",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -216,7 +264,97 @@ mod tests {
     use arrow_array::RecordBatch;
     use arrow_array::{Float32Array, Int64Array, UInt32Array, UInt64Array};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use lance_arrow::FixedSizeListArrayExt;
     use lance_io::stream::RecordBatchStreamAdapter;
+    use rstest::rstest;
+
+    fn centroids(num_partitions: usize) -> Arc<FixedSizeListArray> {
+        let values = Float32Array::from(vec![0.0_f32; num_partitions * 2]);
+        Arc::new(FixedSizeListArray::try_new_from_values(values, 2).unwrap())
+    }
+
+    fn buffers() -> (Path, Vec<String>) {
+        (Path::from("buffers/data"), vec!["buffer1.lance".to_owned()])
+    }
+
+    #[rstest]
+    #[case::buffers_and_partitions_file(true, true, true, false, "mutually exclusive")]
+    #[case::buffers_with_retrained_centroids(
+        true,
+        false,
+        true,
+        true,
+        "precomputed_shuffle_buffers cannot be used with retrain=true"
+    )]
+    #[case::partitions_file_with_retrained_centroids(
+        false,
+        true,
+        true,
+        true,
+        "precomputed_partitions_file cannot be used with retrain=true"
+    )]
+    #[case::buffers_without_centroids(
+        true,
+        false,
+        false,
+        false,
+        "precomputed_shuffle_buffers requires centroids"
+    )]
+    #[case::partitions_file_without_centroids(
+        false,
+        true,
+        false,
+        false,
+        "precomputed_partitions_file requires centroids"
+    )]
+    fn test_validate_rejects_precomputed_inputs(
+        #[case] with_buffers: bool,
+        #[case] with_partitions_file: bool,
+        #[case] with_centroids: bool,
+        #[case] with_retrain: bool,
+        #[case] expected: &str,
+    ) {
+        let mut params = IvfBuildParams::new(2);
+        if with_buffers {
+            params.precomputed_shuffle_buffers = Some(buffers());
+        }
+        if with_partitions_file {
+            params.precomputed_partitions_file = Some("partitions.lance".to_owned());
+        }
+        if with_centroids {
+            params.centroids = Some(centroids(2));
+        }
+        params.retrain = with_retrain;
+
+        let err = params.validate().unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains(expected),
+            "expected the message to mention {expected:?}, got: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case::nothing_precomputed(false, false)]
+    #[case::buffers_with_centroids(true, false)]
+    #[case::partitions_file_with_centroids(false, true)]
+    fn test_validate_accepts_supported_combinations(
+        #[case] with_buffers: bool,
+        #[case] with_partitions_file: bool,
+    ) {
+        let mut params = IvfBuildParams::try_with_centroids(2, centroids(2)).unwrap();
+        if with_buffers {
+            params.precomputed_shuffle_buffers = Some(buffers());
+        }
+        if with_partitions_file {
+            params.precomputed_partitions_file = Some("partitions.lance".to_owned());
+        }
+
+        params.validate().unwrap();
+    }
 
     fn stream_of(batches: Vec<RecordBatch>) -> impl RecordBatchStream + Unpin {
         let schema = batches[0].schema();

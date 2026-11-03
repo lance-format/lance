@@ -8,10 +8,10 @@
 //! an MPSC channel, and the thread handles submission and completion processing.
 
 use super::DEFAULT_URING_QUEUE_DEPTH;
-use super::requests::IoRequest;
+use super::requests::{IoRequest, PendingRequests};
 use io_uring::{IoUring, opcode, types};
-use std::collections::HashMap;
 use std::io;
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, LazyLock};
@@ -189,7 +189,7 @@ fn run_uring_thread(
     thread_id: usize,
 ) {
     let queue_depth = ring.submission().capacity();
-    let mut pending: HashMap<u64, Arc<IoRequest>> = HashMap::with_capacity(queue_depth);
+    let mut pending = PendingRequests::with_capacity(queue_depth);
     let poll_timeout = get_poll_timeout();
     let submit_batch_size = get_submit_batch_size();
     let mut last_log = Instant::now();
@@ -349,7 +349,7 @@ fn submit_all(mut queued: usize, mut submit: impl FnMut() -> io::Result<usize>) 
 
 fn shutdown_with_error(
     ring: IoUring,
-    mut pending: HashMap<u64, Arc<IoRequest>>,
+    pending: PendingRequests,
     request_rx: &Receiver<QueuedRequest>,
     is_alive: &AtomicBool,
     thread_id: usize,
@@ -359,12 +359,12 @@ fn shutdown_with_error(
     let error_message = format!("io_uring worker {thread_id} stopped: {error}");
     log::error!("{}", error_message);
 
-    // Closing the ring cancels in-flight operations before their request buffers
-    // can be released by the futures receiving the errors below.
     drop(ring);
     is_alive.store(false, Ordering::Release);
 
-    for request in pending.drain().map(|(_, request)| request) {
+    // Closing the ring need not wait for reads already in flight. The failed requests stay in
+    // `pending`, whose drop leaks them, so the kernel never writes into a freed buffer.
+    for request in pending.values() {
         request.fail(io::Error::new(error_kind, error_message.clone()));
     }
     for request in request_rx.try_iter() {
@@ -378,7 +378,7 @@ fn shutdown_with_error(
 /// and pushes it to the SQ. The caller is responsible for calling ring.submit().
 pub(super) fn push_to_sq(
     ring: &mut IoUring,
-    pending: &mut HashMap<u64, Arc<IoRequest>>,
+    pending: &mut PendingRequests,
     request: Arc<IoRequest>,
 ) -> io::Result<()> {
     // Generate unique user_data
@@ -386,18 +386,18 @@ pub(super) fn push_to_sq(
 
     // Get buffer pointer, adjusting for any bytes already read (short read retry)
     let (buffer_ptr, read_offset, read_length) = {
-        let state = request.state.lock().unwrap();
+        let mut state = request.state.lock().unwrap();
         let br = state.bytes_read;
         (
-            unsafe { state.buffer.as_ptr().add(br) as *mut u8 },
+            state.buffer[br..].as_mut_ptr(),
             request.offset + br as u64,
             (request.length - br) as u32,
         )
     };
 
     // Prepare read operation
-    let read_op =
-        opcode::Read::new(types::Fd(request.fd), buffer_ptr, read_length).offset(read_offset);
+    let read_op = opcode::Read::new(types::Fd(request.file.as_raw_fd()), buffer_ptr, read_length)
+        .offset(read_offset);
 
     // Get submission queue
     let mut sq = ring.submission();
@@ -416,6 +416,11 @@ pub(super) fn push_to_sq(
     }
 
     // Push to SQ
+    // SAFETY: the read writes into `request`'s buffer from the file that `request` keeps open.
+    // `pending` keeps `request` alive until this read's completion is reaped, and leaks it if
+    // the ring goes away first. Nothing resizes or takes the buffer before that reap: a future
+    // takes it only on success, and after a failure it returns the error once (`get_range` and
+    // `get_all` wrap it in `map`, which panics if polled again).
     unsafe {
         if sq.push(&read_op.build().user_data(user_data)).is_err() {
             drop(sq);
@@ -446,7 +451,7 @@ struct CompletionResult {
 /// Returns completion stats and a list of requests needing resubmission.
 fn process_completions(
     ring: &mut IoUring,
-    pending: &mut HashMap<u64, Arc<IoRequest>>,
+    pending: &mut PendingRequests,
 ) -> io::Result<CompletionResult> {
     let mut iops = 0;
     let mut sectors = 0;
@@ -520,14 +525,32 @@ fn process_completions(
 
 #[cfg(test)]
 mod tests {
-    use super::{QueuedRequest, start_uring_thread, submit_all};
-    use crate::uring::requests::{IoRequest, RequestState};
+    use super::{QueuedRequest, shutdown_with_error, start_uring_thread, submit_all};
+    use crate::uring::requests::{IoRequest, PendingRequests, RequestState};
     use bytes::BytesMut;
+    use io_uring::IoUring;
     use std::collections::VecDeque;
     use std::io;
+    use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::sync_channel;
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
+
+    fn new_request() -> Arc<IoRequest> {
+        Arc::new(IoRequest {
+            file: Arc::new(tempfile::tempfile().unwrap()),
+            offset: 0,
+            length: 1,
+            thread_id: thread::current().id(),
+            state: Mutex::new(RequestState {
+                completed: false,
+                waker: None,
+                err: None,
+                buffer: BytesMut::zeroed(1),
+                bytes_read: 0,
+            }),
+        })
+    }
 
     #[test]
     fn test_submit_all_retries_interrupted_and_partial_submissions() {
@@ -559,19 +582,7 @@ mod tests {
 
     #[test]
     fn test_late_queued_request_is_failed_when_worker_receiver_drops() {
-        let request = Arc::new(IoRequest {
-            fd: -1,
-            offset: 0,
-            length: 1,
-            thread_id: thread::current().id(),
-            state: Mutex::new(RequestState {
-                completed: false,
-                waker: None,
-                err: None,
-                buffer: BytesMut::zeroed(1),
-                bytes_read: 0,
-            }),
-        });
+        let request = new_request();
         let (request_tx, request_rx) = sync_channel(1);
         let drained = Arc::new(Barrier::new(2));
         let request_sent = Arc::new(Barrier::new(2));
@@ -599,5 +610,36 @@ mod tests {
             state.err.as_ref().unwrap().kind(),
             io::ErrorKind::BrokenPipe
         );
+    }
+
+    #[test]
+    fn test_shutdown_with_error_fails_and_leaks_pending_requests() {
+        // Without io_uring support there is no ring to shut down.
+        let Ok(ring) = IoUring::new(2) else {
+            return;
+        };
+        let request = new_request();
+        let mut pending = PendingRequests::default();
+        pending.insert(1, Arc::clone(&request));
+        let (_request_tx, request_rx) = sync_channel(1);
+
+        shutdown_with_error(
+            ring,
+            pending,
+            &request_rx,
+            &AtomicBool::new(true),
+            0,
+            io::Error::other("submit failed"),
+        );
+
+        let state = request.state.lock().unwrap();
+        assert!(state.completed);
+        let error = state.err.as_ref().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("submit failed"), "{error}");
+        drop(state);
+        // The request was left in `pending`, so dropping `pending` leaked it instead of freeing a
+        // buffer the kernel may still be writing.
+        assert_eq!(Arc::strong_count(&request), 2);
     }
 }

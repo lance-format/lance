@@ -1498,12 +1498,18 @@ pub struct HnswQueryParams {
 
 impl From<&Query> for HnswQueryParams {
     fn from(query: &Query) -> Self {
+        Self::from_query(query, query.dist_q_c)
+    }
+}
+
+impl HnswQueryParams {
+    pub(crate) fn from_query(query: &Query, dist_q_c: f32) -> Self {
         let k = query.k * query.refine_factor.unwrap_or(1) as usize;
         Self {
             ef: query.ef.unwrap_or_else(|| (k + k / 2).max(DEFAULT_MIN_EF)),
             lower_bound: query.lower_bound,
             upper_bound: query.upper_bound,
-            dist_q_c: query.dist_q_c,
+            dist_q_c,
             use_acorn: query.approx_mode == ApproxMode::Fast,
         }
     }
@@ -1512,6 +1518,21 @@ impl From<&Query> for HnswQueryParams {
 impl IvfSubIndex for HNSW {
     type BuildParams = HnswBuildParams;
     type QueryParams = HnswQueryParams;
+
+    fn query_params(query: &Query, _query_key: &ArrayRef, dist_q_c: f32) -> Self::QueryParams {
+        Self::QueryParams::from_query(query, dist_q_c)
+    }
+
+    fn empty_partition_metadata(build_params: Option<&Self::BuildParams>) -> Option<String> {
+        let params = build_params.cloned().unwrap_or_default();
+        let max_level = params.max_level;
+        let metadata = HnswMetadata {
+            entry_point: 0,
+            params,
+            level_offsets: vec![0; max_level as usize + 1],
+        };
+        Some(serde_json::to_string(&metadata).expect("valid HnswMetadata always serializes"))
+    }
 
     fn load(data: RecordBatch) -> Result<Self>
     where

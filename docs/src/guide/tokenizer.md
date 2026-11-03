@@ -113,6 +113,17 @@ the first position with a length covering all subwords. With
 `with_position=True`, phrase queries can match subword sequences inside a single
 identifier, such as `'user name'` within `getUserName`.
 
+For BM25 scoring, tokens at the same position in split code identifiers count
+once toward document length, whether or not positions are stored. The preserved
+original remains searchable and contributes to term frequency. For example,
+`getUserName`, `get_user_name`, and `get user name` each have length 3. The
+average document length uses the sum of these discounted lengths divided by
+the document count.
+
+Rebuild existing code indices to apply this normalization to all documents.
+Appending data or optimizing an index retains the lengths stored in existing
+partitions.
+
 ## Language Models of Jieba
 
 ### Downloading the Model
