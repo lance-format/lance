@@ -128,7 +128,9 @@ fn content_round_trips_byte_for_byte() {
         &ordered(&[whole(1, 2)], &[(2, 2)]).encode_to_vec(),
     ));
     let content = Bytes::from(content);
-    let history = FragReuseHistory::from_content(1, content.clone()).unwrap();
+    let history = RawHistory::new(HistoryFormat::Tagged, content.clone())
+        .validate()
+        .unwrap();
     assert_eq!(history.content(), content);
     assert!(!history.is_fully_interpretable());
     assert_eq!(
@@ -148,21 +150,22 @@ fn content_round_trips_byte_for_byte() {
 #[case::unknown_envelope_record(unknown_record())]
 #[case::transition_with_unknown_field(transition_with_unknown_field())]
 fn whole_history_edits_refuse_records_they_cannot_interpret(#[case] record: Vec<u8>) {
-    let history = FragReuseHistory::from_content(1, record.into()).unwrap();
+    let history = RawHistory::new(HistoryFormat::Tagged, record.into())
+        .validate()
+        .unwrap();
     let assert_refused = |result: Result<FragReuseHistory>| {
         let error = result.unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }), "{error}");
         assert!(error.to_string().contains("cannot maintain"), "{error}");
     };
-    assert_refused(history.retain(|_| true));
+    assert_refused(history.retain(&mut |_| true));
     assert_refused(history.append_transitions(&[ordered(&[whole(1, 1)], &[(2, 1)])]));
-    assert_refused(history.remap_stable_partition_bases(Ok));
+    assert_refused(history.remap_stable_partition_bases(&Ok));
 }
 
 #[test]
 fn appended_transitions_are_validated_against_the_whole_lineage() {
-    let history = FragReuseHistory::empty(1)
-        .unwrap()
+    let history = FragReuseHistory::empty(HistoryFormat::Tagged)
         .append_transitions(&[ordered(&[whole(0, 2)], &[(1, 2)])])
         .unwrap();
     let error = history
@@ -173,8 +176,7 @@ fn appended_transitions_are_validated_against_the_whole_lineage() {
 
 #[test]
 fn a_row_map_belongs_to_one_transition() {
-    let history = FragReuseHistory::empty(1)
-        .unwrap()
+    let history = FragReuseHistory::empty(HistoryFormat::Tagged)
         .append_transitions(&[partition(0, 1, MAP_A)])
         .unwrap();
     let error = history
@@ -191,13 +193,11 @@ fn a_row_map_belongs_to_one_transition() {
 
 #[test]
 fn record_kinds_require_their_format() {
-    let error = FragReuseHistory::empty(0)
-        .unwrap()
+    let error = FragReuseHistory::empty(HistoryFormat::Legacy)
         .append_transitions(&[ordered(&[whole(0, 1)], &[(1, 1)])])
         .unwrap_err();
     assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-    let error = FragReuseHistory::empty(1)
-        .unwrap()
+    let error = FragReuseHistory::empty(HistoryFormat::Tagged)
         .insert_legacy_version(legacy(1, &[whole(0, 1)], &[(1, 1)]))
         .unwrap_err();
     assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
@@ -205,8 +205,7 @@ fn record_kinds_require_their_format() {
 
 #[test]
 fn legacy_versions_stay_ordered_by_dataset_version() {
-    let history = FragReuseHistory::empty(0)
-        .unwrap()
+    let history = FragReuseHistory::empty(HistoryFormat::Legacy)
         .insert_legacy_version(legacy(5, &[whole(0, 1)], &[(1, 1)]))
         .unwrap()
         .insert_legacy_version(legacy(3, &[whole(2, 1)], &[(3, 1)]))
@@ -223,8 +222,7 @@ fn legacy_versions_stay_ordered_by_dataset_version() {
 
 #[test]
 fn fragment_bitmap_follows_the_format() {
-    let v0 = FragReuseHistory::empty(0)
-        .unwrap()
+    let v0 = FragReuseHistory::empty(HistoryFormat::Legacy)
         .insert_legacy_version(legacy(1, &[whole(0, 1)], &[(1, 1)]))
         .unwrap();
     assert_eq!(v0.fragment_bitmap(), RoaringBitmap::from_iter([1]));
@@ -241,15 +239,14 @@ fn fragment_bitmap_follows_the_format() {
 
 #[test]
 fn retain_drops_only_the_rejected_records() {
-    let history = FragReuseHistory::empty(1)
-        .unwrap()
+    let history = FragReuseHistory::empty(HistoryFormat::Tagged)
         .append_transitions(&[
             ordered(&[whole(0, 1)], &[(1, 1)]),
             ordered(&[whole(5, 1)], &[(6, 1)]),
         ])
         .unwrap();
     let trimmed = history
-        .retain(|record| match record {
+        .retain(&mut |record| match record {
             Record::Transition(transition) => transition.sources[0].id != 0,
             _ => true,
         })
@@ -278,12 +275,15 @@ fn base_relocation_keeps_unknown_nested_fields() {
         STABLE_PARTITION_FIELD,
         &partition_payload,
     ));
-    let history =
-        FragReuseHistory::from_content(1, length_delimited(TRANSITION_FIELD, &transition).into())
-            .unwrap();
+    let history = RawHistory::new(
+        HistoryFormat::Tagged,
+        length_delimited(TRANSITION_FIELD, &transition).into(),
+    )
+    .validate()
+    .unwrap();
 
     let relocated = history
-        .remap_stable_partition_bases(|base| {
+        .remap_stable_partition_bases(&|base| {
             assert_eq!(base, Some(2));
             Ok(Some(7))
         })
@@ -304,8 +304,7 @@ fn base_relocation_keeps_unknown_nested_fields() {
 
 #[test]
 fn records_added_since_is_append_only() {
-    let base = FragReuseHistory::empty(1)
-        .unwrap()
+    let base = FragReuseHistory::empty(HistoryFormat::Tagged)
         .append_transitions(&[ordered(&[whole(0, 1)], &[(1, 1)])])
         .unwrap();
     let added = ordered(&[whole(1, 1)], &[(2, 1)]);
@@ -317,8 +316,7 @@ fn records_added_since_is_append_only() {
         vec![Record::Transition(added)]
     );
 
-    let dropped = FragReuseHistory::empty(1)
-        .unwrap()
+    let dropped = FragReuseHistory::empty(HistoryFormat::Tagged)
         .append_transitions(&[ordered(&[whole(1, 1)], &[(2, 1)])])
         .unwrap();
     let error = dropped.records_added_since(&base).unwrap_err();
@@ -329,12 +327,10 @@ fn records_added_since_is_append_only() {
         physical_rows: 2,
         deleted: BTreeSet::from([deleted]),
     };
-    let recorded = FragReuseHistory::empty(1)
-        .unwrap()
+    let recorded = FragReuseHistory::empty(HistoryFormat::Tagged)
         .append_transitions(&[ordered(&[survivor(1)], &[(1, 1)])])
         .unwrap();
-    let changed = FragReuseHistory::empty(1)
-        .unwrap()
+    let changed = FragReuseHistory::empty(HistoryFormat::Tagged)
         .append_transitions(&[ordered(&[survivor(0)], &[(1, 1)])])
         .unwrap();
     let error = changed.records_added_since(&recorded).unwrap_err();
@@ -353,7 +349,7 @@ fn repair_drops_versions_that_break_the_kept_lineage() {
     miscounted.groups[0].new_fragments[0].physical_rows = 1;
     let chained = legacy(5, &[whole(1, 2)], &[(8, 2)]);
 
-    let error = FragReuseHistory::from_legacy_versions([
+    let error = FragReuseHistory::from_legacy_versions(vec![
         first.clone(),
         reconsumes.clone(),
         reproduces.clone(),
@@ -363,7 +359,7 @@ fn repair_drops_versions_that_break_the_kept_lineage() {
     .unwrap_err();
     assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
 
-    let (repaired, dropped) = FragReuseHistory::repair_legacy_versions([
+    let (repaired, dropped) = FragReuseHistory::repair_legacy_versions(vec![
         chained, miscounted, reproduces, reconsumes, first,
     ])
     .unwrap();
@@ -380,6 +376,32 @@ fn repair_drops_versions_that_break_the_kept_lineage() {
         translate(repaired.ledger(), address(0, 1)),
         Some(address(8, 1))
     );
+}
+
+#[test]
+fn only_committed_legacy_content_is_repaired() {
+    let first = legacy(1, &[whole(0, 2)], &[(1, 2)]);
+    let reconsumes = legacy(2, &[whole(0, 2)], &[(2, 2)]);
+    let content: Bytes = [&first, &reconsumes]
+        .iter()
+        .flat_map(|version| length_delimited(LEGACY_VERSION_FIELD, &version.encode_to_vec()))
+        .collect::<Vec<u8>>()
+        .into();
+
+    let raw = RawHistory::new(HistoryFormat::Legacy, content.clone());
+    let error = raw.clone().validate().unwrap_err();
+    assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
+    let (repaired, dropped) = raw.repair().unwrap();
+    assert_eq!(dropped, [2]);
+    assert_eq!(
+        repaired,
+        FragReuseHistory::from_legacy_versions(vec![first]).unwrap()
+    );
+
+    let error = RawHistory::new(HistoryFormat::Tagged, content)
+        .repair()
+        .unwrap_err();
+    assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
 }
 
 /// One rewrite the model applies: which live fragments it consumes, which of
@@ -425,7 +447,7 @@ fn simulate(
         .flat_map(|source| (0..source.physical_rows).map(move |o| address(source.id, o)))
         .map(|addr| (addr, Some(addr)))
         .collect();
-    let mut history = FragReuseHistory::empty(0).unwrap();
+    let mut history = FragReuseHistory::empty(HistoryFormat::Legacy);
     for (step, rewrite) in rewrites.iter().enumerate() {
         if live.is_empty() {
             break;
@@ -519,7 +541,7 @@ proptest! {
             prop_assert_eq!(translate(history.ledger(), original), expected, "address {:#x}", original);
         }
 
-        let decoded = FragReuseHistory::from_content(history.index_version(), history.content()).unwrap();
+        let decoded = RawHistory::new(history.format(), history.content()).validate().unwrap();
         prop_assert_eq!(&decoded, &history);
         prop_assert_eq!(decoded.fragment_bitmap(), history.fragment_bitmap());
     }

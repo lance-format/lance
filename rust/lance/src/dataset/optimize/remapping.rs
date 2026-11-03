@@ -1228,6 +1228,7 @@ mod tests {
     mod tagged_remap_plan {
         use super::*;
         use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
+        use lance_table::system_index::frag_reuse::history::HistoryFormat;
         use prost::Message;
 
         fn digest(id: u64, rows: u64, deleted: u64) -> pb_fri::FragmentDigest {
@@ -1300,7 +1301,8 @@ mod tests {
                 transitions,
             }
             .encode_to_vec();
-            crate::utils::test::frag_reuse_ledger_from_content(1, &content).unwrap()
+            crate::utils::test::frag_reuse_ledger_from_content(HistoryFormat::Tagged, &content)
+                .unwrap()
         }
 
         fn coverage(fragments: &[u32]) -> RoaringBitmap {
@@ -1406,7 +1408,8 @@ mod tests {
                 transitions,
             }
             .encode_to_vec();
-            crate::utils::test::frag_reuse_ledger_from_content(1, &content).unwrap()
+            crate::utils::test::frag_reuse_ledger_from_content(HistoryFormat::Tagged, &content)
+                .unwrap()
         }
 
         /// Two lifted v0 rounds (v10 `{2,3} -> D`, v12 `{0,1,D} -> X`) and a

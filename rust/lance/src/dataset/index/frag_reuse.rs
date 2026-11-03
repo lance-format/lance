@@ -178,7 +178,10 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
     }
 
     let (retained, dropped) = FragReuseHistory::repair_legacy_versions(
-        retained_versions.into_iter().map(pb_fri::Version::from),
+        retained_versions
+            .into_iter()
+            .map(pb_fri::Version::from)
+            .collect(),
     )?;
     warn_dropped_versions(&dropped);
     let new_index_meta =
@@ -216,7 +219,8 @@ async fn cleanup_stable_row_id_history(
     let (retained, dropped) = FragReuseHistory::repair_legacy_versions(
         details.versions[trimmed..]
             .iter()
-            .map(pb_fri::Version::from),
+            .map(pb_fri::Version::from)
+            .collect(),
     )?;
     warn_dropped_versions(&dropped);
     let new_index_meta =
@@ -876,7 +880,7 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
     }
 
     let mut kept = retained.into_iter();
-    let trimmed = history.retain(|_| kept.next().unwrap_or(true))?;
+    let trimmed = history.retain(&mut |_| kept.next().unwrap_or(true))?;
     let new_entry = encode_frag_reuse_entry(dataset, &trimmed, dataset.manifest.version).await?;
     Ok(TaggedTrimOutcome::Replace {
         new_entry: Box::new(new_entry),
@@ -1316,6 +1320,7 @@ mod tests {
         use lance_index::IndexType;
         use lance_index::scalar::ScalarIndexParams;
         use lance_table::format::Fragment;
+        use lance_table::system_index::frag_reuse::history::{HistoryFormat, RawHistory};
         use lance_table::system_index::frag_reuse::ledger::Mapping;
         use lance_table::transaction::RewriteGroup;
         use uuid::Uuid;
@@ -2149,12 +2154,16 @@ mod tests {
             prost::encoding::encode_varint(6, &mut content);
             content.extend_from_slice(b"future");
 
-            let history = FragReuseHistory::from_content(1, content.clone().into()).unwrap();
+            let history = RawHistory::new(HistoryFormat::Tagged, content.clone().into())
+                .validate()
+                .unwrap();
             let Err(error) = trim_elements(&history) else {
                 panic!("an unknown envelope record must refuse the splice")
             };
             assert!(matches!(error, Error::NotSupported { .. }), "{error}");
-            let ledger = crate::utils::test::frag_reuse_ledger_from_content(1, &content).unwrap();
+            let ledger =
+                crate::utils::test::frag_reuse_ledger_from_content(HistoryFormat::Tagged, &content)
+                    .unwrap();
             assert!(
                 ledger.has_unsupported_transitions(),
                 "the ledger must report envelope-level unknowns so every \

@@ -12,30 +12,28 @@
 //!
 //! ```
 //! use lance_table::format::pb::fragment_reuse_index_details as pb;
-//! use lance_table::system_index::frag_reuse::history::FragReuseHistory;
+//! use lance_table::system_index::frag_reuse::history::{FragReuseHistory, HistoryFormat};
 //!
 //! # fn example(transition: pb::Transition) -> lance_core::Result<()> {
-//! let history = FragReuseHistory::empty(1)?.append_transitions(&[transition])?;
+//! let history = FragReuseHistory::empty(HistoryFormat::Tagged).append_transitions(&[transition])?;
 //! assert_eq!(history.ledger().transitions().len(), 1);
 //! # Ok(())
 //! # }
 //! ```
 
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes, BytesMut};
 use lance_core::{Error, Result};
 use prost::Message;
-use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_field};
+use prost::encoding::{WireType, decode_key, decode_varint};
 use roaring::RoaringBitmap;
 
 use super::ledger::{
-    FragReuseLedger, STABLE_PARTITION_FIELD, corrupt, is_interpretable_transition, load_content,
-    validate_index_version,
+    FragReuseLedger, STABLE_PARTITION_FIELD, corrupt, is_interpretable_transition, next_field,
+    require_message,
 };
-use crate::format::pb::ExternalFile;
 use crate::format::pb::fragment_reuse_index_details::{self as pb, transition};
 
 /// `InlineContent.legacy_versions`.
@@ -44,6 +42,40 @@ const LEGACY_VERSION_FIELD: u32 = 1;
 const TRANSITION_FIELD: u32 = 2;
 /// `StablePartition.base_id`.
 const STABLE_PARTITION_BASE_ID_FIELD: u32 = 3;
+
+/// How an FRI entry's records are interpreted, as its `index_version` says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryFormat {
+    /// `index_version` 0: compaction versions only, which every released
+    /// reader and writer understands.
+    Legacy,
+    /// `index_version` 1: compaction versions and tagged transitions. Once a
+    /// table carries them it keeps the format (the feature flag is sticky).
+    Tagged,
+}
+
+impl HistoryFormat {
+    /// The format of an entry stamped `index_version`. A version this build
+    /// does not know is refused with `NotSupported`: only a newer Lance can
+    /// interpret it.
+    pub fn from_index_version(index_version: i32) -> Result<Self> {
+        match index_version {
+            0 => Ok(Self::Legacy),
+            1 => Ok(Self::Tagged),
+            _ => Err(Error::not_supported(format!(
+                "Unsupported FRI index_version {index_version}; supported versions are 0 and 1. Please upgrade to a newer version of Lance."
+            ))),
+        }
+    }
+
+    /// The `IndexMetadata::index_version` of an entry in this format.
+    pub fn index_version(self) -> i32 {
+        match self {
+            Self::Legacy => 0,
+            Self::Tagged => 1,
+        }
+    }
+}
 
 /// One record of the history, decoded.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,23 +98,74 @@ struct StoredRecord {
     record: Record,
 }
 
+/// The serialized records of an FRI entry, not yet checked against the
+/// history's rules. Whether a history that breaks them is refused or repaired
+/// depends on who wrote it, so the caller decides by how it consumes this:
+/// [`Self::validate`] for an entry a caller proposes, [`Self::repair`] for an
+/// entry already committed.
+#[derive(Debug, Clone)]
+pub struct RawHistory {
+    format: HistoryFormat,
+    content: Bytes,
+}
+
+impl RawHistory {
+    /// The serialized `InlineContent` `content`, interpreted under `format`.
+    pub fn new(format: HistoryFormat, content: Bytes) -> Self {
+        Self { format, content }
+    }
+
+    /// The history, refusing one that breaks the rules with `CorruptFile`.
+    /// An entry a caller proposes is never repaired: an invalid proposal is
+    /// the caller's error.
+    pub fn validate(self) -> Result<FragReuseHistory> {
+        FragReuseHistory::from_content(self.format, self.content)
+    }
+
+    /// The history a committed entry stores, repairing a version 0 history
+    /// that an older writer left invalid (see
+    /// [`FragReuseHistory::repair_legacy_versions`]). Returns the history and
+    /// the dataset versions repair dropped. A tagged history is never
+    /// repaired, since every writer of that format validates it: one that
+    /// breaks the rules is refused as by [`Self::validate`].
+    pub fn repair(self) -> Result<(FragReuseHistory, Vec<u64>)> {
+        match FragReuseHistory::from_content(self.format, self.content.clone()) {
+            Ok(history) => Ok((history, Vec::new())),
+            Err(Error::CorruptFile { .. }) if self.format == HistoryFormat::Legacy => {
+                let versions = split_records(self.content)?
+                    .into_iter()
+                    .filter_map(|stored| match stored.record {
+                        Record::LegacyVersion(version) => Some(version),
+                        _ => None,
+                    })
+                    .collect();
+                FragReuseHistory::repair_legacy_versions(versions)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
 /// A validated fragment reuse history and its lineage view.
 #[derive(Debug, Clone)]
 pub struct FragReuseHistory {
-    index_version: i32,
+    format: HistoryFormat,
     records: Vec<StoredRecord>,
     ledger: Arc<FragReuseLedger>,
 }
 
 impl FragReuseHistory {
-    /// A history with no records, in the format of `index_version`.
-    pub fn empty(index_version: i32) -> Result<Self> {
-        Self::from_content(index_version, Bytes::new())
+    /// A history with no records, in `format`.
+    pub fn empty(format: HistoryFormat) -> Self {
+        Self {
+            format,
+            records: Vec::new(),
+            ledger: Arc::new(FragReuseLedger::default()),
+        }
     }
 
     /// A version 0 history holding `versions`, ordered by dataset version.
-    pub fn from_legacy_versions(versions: impl IntoIterator<Item = pb::Version>) -> Result<Self> {
-        let mut versions: Vec<pb::Version> = versions.into_iter().collect();
+    pub fn from_legacy_versions(mut versions: Vec<pb::Version>) -> Result<Self> {
         versions.sort_by_key(|version| version.dataset_version);
         let mut content = BytesMut::new();
         for version in &versions {
@@ -91,54 +174,7 @@ impl FragReuseHistory {
                 &version.encode_to_vec(),
             ));
         }
-        Self::from_content(0, content.freeze())
-    }
-
-    /// Decode FRI `index_details`, resolving external content through
-    /// `read_external`, which must return exactly the referenced byte range.
-    pub async fn decode<F, Fut>(
-        index_version: i32,
-        details: &prost_types::Any,
-        read_external: F,
-    ) -> Result<Self>
-    where
-        F: FnOnce(ExternalFile) -> Fut,
-        Fut: Future<Output = Result<Bytes>>,
-    {
-        validate_index_version(index_version)?;
-        let content = load_content(details, read_external).await?;
-        Self::from_content(index_version, content)
-    }
-
-    /// Decode the history a committed entry stores, repairing a version 0
-    /// history that violates the rules (see [`Self::repair_legacy_versions`]).
-    /// Returns the history and the dataset versions repair dropped. A tagged
-    /// history is never repaired: every writer of that format validates it.
-    pub async fn decode_stored<F, Fut>(
-        index_version: i32,
-        details: &prost_types::Any,
-        read_external: F,
-    ) -> Result<(Self, Vec<u64>)>
-    where
-        F: FnOnce(ExternalFile) -> Fut,
-        Fut: Future<Output = Result<Bytes>>,
-    {
-        validate_index_version(index_version)?;
-        let content = load_content(details, read_external).await?;
-        match Self::from_content(index_version, content.clone()) {
-            Ok(history) => Ok((history, Vec::new())),
-            Err(Error::CorruptFile { .. }) if index_version == 0 => {
-                let versions =
-                    split_records(content)?
-                        .into_iter()
-                        .filter_map(|stored| match stored.record {
-                            Record::LegacyVersion(version) => Some(version),
-                            _ => None,
-                        });
-                Self::repair_legacy_versions(versions)
-            }
-            Err(error) => Err(error),
-        }
+        Self::from_content(HistoryFormat::Legacy, content.freeze())
     }
 
     /// A version 0 history of the `versions` that can be kept, and the dataset
@@ -150,10 +186,7 @@ impl FragReuseHistory {
     /// producing a fragment that is already consumed). Dropping a version only
     /// loses the translation it records: rows an index reaches only through it
     /// are scanned instead.
-    pub fn repair_legacy_versions(
-        versions: impl IntoIterator<Item = pb::Version>,
-    ) -> Result<(Self, Vec<u64>)> {
-        let mut versions: Vec<pb::Version> = versions.into_iter().collect();
+    pub fn repair_legacy_versions(mut versions: Vec<pb::Version>) -> Result<(Self, Vec<u64>)> {
         versions.sort_by_key(|version| version.dataset_version);
         let mut kept = Vec::with_capacity(versions.len());
         let mut dropped = Vec::new();
@@ -170,7 +203,7 @@ impl FragReuseHistory {
                     !produced.contains_key(&destination.id) && !consumed.contains(&destination.id)
                 })
             });
-            if !fits_lineage || Self::from_legacy_versions([version.clone()]).is_err() {
+            if !fits_lineage || Self::from_legacy_versions(vec![version.clone()]).is_err() {
                 dropped.push(version.dataset_version);
                 continue;
             }
@@ -188,27 +221,25 @@ impl FragReuseHistory {
         Ok((Self::from_legacy_versions(kept)?, dropped))
     }
 
-    /// Build a history from serialized `InlineContent` bytes.
-    pub fn from_content(index_version: i32, content: Bytes) -> Result<Self> {
-        validate_index_version(index_version)?;
-        let ledger = FragReuseLedger::decode_content(index_version, content.clone())?;
+    fn from_content(format: HistoryFormat, content: Bytes) -> Result<Self> {
+        let ledger = FragReuseLedger::decode_content(format, content.clone())?;
         let records = split_records(content)?;
-        validate_records(index_version, &records)?;
+        validate_records(format, &records)?;
         Ok(Self {
-            index_version,
+            format,
             records,
             ledger: Arc::new(ledger),
         })
     }
 
     /// The FRI format these records are interpreted under.
-    pub fn index_version(&self) -> i32 {
-        self.index_version
+    pub fn format(&self) -> HistoryFormat {
+        self.format
     }
 
-    /// Whether the history uses the tagged format (`index_version >= 1`).
+    /// Whether the history uses the tagged format.
     pub fn is_tagged(&self) -> bool {
-        self.index_version >= 1
+        self.format == HistoryFormat::Tagged
     }
 
     /// The lineage view used for translation.
@@ -237,12 +268,13 @@ impl FragReuseHistory {
         content.freeze()
     }
 
-    /// The fragment bitmap the entry stores.
+    /// The `fragment_bitmap` for this history's FRI entry.
     ///
-    /// Version 0 records the destinations of every compaction version, as
-    /// every released writer has. The tagged format records every fragment
-    /// the retained lineage names, sources included, so a rewrite of a
-    /// fragment the history still translates from is seen as covered.
+    /// Which fragments it names is an encoding rule of the format. Version 0
+    /// keeps what released writers stored: the destinations of every
+    /// compaction version. The tagged format names every fragment of the
+    /// retained lineage, sources included, so a rewrite of a fragment the
+    /// history still translates from is seen as covered.
     pub fn fragment_bitmap(&self) -> RoaringBitmap {
         let mut bitmap = RoaringBitmap::new();
         let mut insert = |digests: &[pb::FragmentDigest]| {
@@ -274,7 +306,7 @@ impl FragReuseHistory {
         if self.is_tagged() {
             return Ok(self);
         }
-        Self::from_content(1, self.content())
+        Self::from_content(HistoryFormat::Tagged, self.content())
     }
 
     /// Append `transitions` after every existing record.
@@ -293,7 +325,7 @@ impl FragReuseHistory {
                 &transition.encode_to_vec(),
             ));
         }
-        Self::from_content(self.index_version, content.freeze()).map_err(invalid_edit)
+        Self::from_content(self.format, content.freeze()).map_err(invalid_edit)
     }
 
     /// Insert a compaction version into a version 0 history, keeping
@@ -325,7 +357,7 @@ impl FragReuseHistory {
     }
 
     /// Keep only the records `keep` accepts.
-    pub fn retain(&self, mut keep: impl FnMut(&Record) -> bool) -> Result<Self> {
+    pub fn retain(&self, keep: &mut dyn FnMut(&Record) -> bool) -> Result<Self> {
         self.require_fully_interpretable("trim")?;
         let records: Vec<StoredRecord> = self
             .records
@@ -341,7 +373,7 @@ impl FragReuseHistory {
     /// a digest survive.
     pub fn remap_stable_partition_bases(
         &self,
-        remap: impl Fn(Option<u32>) -> Result<Option<u32>>,
+        remap: &dyn Fn(Option<u32>) -> Result<Option<u32>>,
     ) -> Result<Self> {
         self.require_fully_interpretable("relocate")?;
         let mut records = Vec::with_capacity(self.records.len());
@@ -352,8 +384,9 @@ impl FragReuseHistory {
                     ..
                 }) => {
                     let mut field = stored.raw.clone();
-                    let (_, payload) = split_field(&mut field)?;
-                    let patched = patch_transition_stable_partition(&payload, &remap)?;
+                    let (tag, payload) = next_field(&mut field)?;
+                    let patched =
+                        patch_transition_stable_partition(&require_message(tag, payload)?, remap)?;
                     length_delimited(TRANSITION_FIELD, &patched).into()
                 }
                 _ => stored.raw.clone(),
@@ -427,13 +460,13 @@ impl FragReuseHistory {
         for stored in records {
             content.extend_from_slice(&stored.raw);
         }
-        Self::from_content(self.index_version, content.freeze())
+        Self::from_content(self.format, content.freeze())
     }
 }
 
 impl PartialEq for FragReuseHistory {
     fn eq(&self, other: &Self) -> bool {
-        self.index_version == other.index_version && self.content() == other.content()
+        self.format == other.format && self.content() == other.content()
     }
 }
 
@@ -473,31 +506,13 @@ impl std::fmt::Display for RecordIdentity {
     }
 }
 
-/// Split one field off `input`, returning its tag and payload. Only
-/// length-delimited fields carry a payload; other wire types are skipped.
-fn split_field(input: &mut Bytes) -> Result<(u32, Bytes)> {
-    let (tag, wire_type) = decode_key(input).map_err(|e| corrupt(e.to_string()))?;
-    if wire_type != WireType::LengthDelimited {
-        skip_field(wire_type, tag, input, DecodeContext::default())
-            .map_err(|e| corrupt(e.to_string()))?;
-        return Ok((tag, Bytes::new()));
-    }
-    let length = decode_varint(input).map_err(|e| corrupt(e.to_string()))?;
-    if length > input.remaining() as u64 {
-        return Err(corrupt(format!(
-            "field {tag} length {length} exceeds remaining {} bytes",
-            input.remaining()
-        )));
-    }
-    Ok((tag, input.split_to(length as usize)))
-}
-
 fn split_records(content: Bytes) -> Result<Vec<StoredRecord>> {
     let mut remaining = content.clone();
     let mut records = Vec::new();
     while remaining.has_remaining() {
         let start = content.len() - remaining.len();
-        let (tag, payload) = split_field(&mut remaining)?;
+        let (tag, payload) = next_field(&mut remaining)?;
+        let payload = payload.unwrap_or_default();
         let end = content.len() - remaining.len();
         let record = match tag {
             LEGACY_VERSION_FIELD => Record::LegacyVersion(
@@ -519,8 +534,8 @@ fn split_records(content: Bytes) -> Result<Vec<StoredRecord>> {
 /// Rules the lineage decode does not see. Each stable-partition transition
 /// owns its row map: cleanup deletes a map once no retained transition
 /// references it, so a shared map would be deleted while still in use.
-fn validate_records(index_version: i32, records: &[StoredRecord]) -> Result<()> {
-    if index_version == 0 {
+fn validate_records(format: HistoryFormat, records: &[StoredRecord]) -> Result<()> {
+    if format == HistoryFormat::Legacy {
         return Ok(());
     }
     let mut map_ids = HashSet::new();
@@ -564,15 +579,15 @@ pub fn length_delimited(tag: u32, payload: &[u8]) -> Vec<u8> {
 /// field's bytes as written.
 fn patch_transition_stable_partition(
     raw: &Bytes,
-    remap: &impl Fn(Option<u32>) -> Result<Option<u32>>,
+    remap: &dyn Fn(Option<u32>) -> Result<Option<u32>>,
 ) -> Result<Vec<u8>> {
     let mut remaining = raw.clone();
     let mut output = Vec::with_capacity(raw.len() + 8);
     while remaining.has_remaining() {
         let start = raw.len() - remaining.len();
-        let (tag, payload) = split_field(&mut remaining)?;
+        let (tag, payload) = next_field(&mut remaining)?;
         if tag == STABLE_PARTITION_FIELD {
-            let patched = patch_stable_partition_base(&payload, remap)?;
+            let patched = patch_stable_partition_base(&require_message(tag, payload)?, remap)?;
             output.extend_from_slice(&length_delimited(STABLE_PARTITION_FIELD, &patched));
         } else {
             output.extend_from_slice(&raw[start..raw.len() - remaining.len()]);
@@ -585,7 +600,7 @@ fn patch_transition_stable_partition(
 /// value) and append the remapped value; every other byte is kept.
 fn patch_stable_partition_base(
     raw: &Bytes,
-    remap: &impl Fn(Option<u32>) -> Result<Option<u32>>,
+    remap: &dyn Fn(Option<u32>) -> Result<Option<u32>>,
 ) -> Result<Vec<u8>> {
     let mut remaining = raw.clone();
     let mut output = Vec::with_capacity(raw.len() + 8);
@@ -605,7 +620,7 @@ fn patch_stable_partition_base(
                 })?);
             remaining = peek;
         } else {
-            split_field(&mut remaining)?;
+            next_field(&mut remaining)?;
             output.extend_from_slice(&raw[start..raw.len() - remaining.len()]);
         }
     }
