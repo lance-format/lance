@@ -18,36 +18,129 @@ If you're unsure about whether you need a blob column in the first place (and wh
 
 ## Quick Start: Blob v2
 
-This page focuses on blob workflows in Python and uses Lance file format terminology.
+The core Blob v2 write and file-like read workflows below are available in the Python, Rust, and Java SDKs (the planned batch-read helpers later on this page use the Python API).
 
 - `data_storage_version` means the Lance **file format version** of a dataset.
 - A dataset has a default file format version. Append and compaction can select
   another exact `2.x` version without rewriting existing files or changing that default.
 - File format `0.1` cannot be mixed with the `2.x` family.
 
-```python
-import lance
-import pyarrow as pa
-from lance import blob_array, blob_field
+=== "Python"
 
-schema = pa.schema([
-    pa.field("id", pa.int64()),
-    blob_field("blob"),
-])
+    ```python
+    import lance
+    import pyarrow as pa
+    from lance import blob_array, blob_field
 
-table = pa.table(
-    {
-        "id": [1],
-        "blob": blob_array([b"hello blob v2"]),
-    },
-    schema=schema,
-)
+    schema = pa.schema([
+        pa.field("id", pa.int64()),
+        blob_field("blob"),
+    ])
 
-ds = lance.write_dataset(table, "./blobs_v22.lance", data_storage_version="2.2")
+    table = pa.table(
+        {
+            "id": [1],
+            "blob": blob_array([b"hello blob v2"]),
+        },
+        schema=schema,
+    )
 
-_row_address, payload = ds.read_blobs("blob", indices=[0])[0]
-assert payload == b"hello blob v2"
-```
+    ds = lance.write_dataset(table, "./blobs_v22.lance", data_storage_version="2.2")
+
+    _row_address, payload = ds.read_blobs("blob", indices=[0])[0]
+    assert payload == b"hello blob v2"
+    ```
+
+=== "Rust"
+
+    ```rust
+    use std::sync::Arc;
+    use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field, Schema};
+    use lance::blob::{blob_field, BlobArrayBuilder};
+    use lance::dataset::{WriteMode, WriteParams};
+    use lance::Dataset;
+    use lance_file::version::LanceFileVersion;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        blob_field("blob", true),
+    ]));
+    let mut blob_builder = BlobArrayBuilder::new(1);
+    blob_builder.push_bytes(b"hello blob v2")?;
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            blob_builder.finish()?,
+        ],
+    )?;
+
+    let params = WriteParams {
+        mode: WriteMode::Overwrite,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let ds = Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "./blobs_v22.lance",
+            Some(params),
+        )
+        .await?,
+    );
+
+    let blobs = ds.take_blobs_by_indices(&[0], "blob").await?;
+    if let Some(blob) = &blobs[0] {
+        let payload = blob.read().await?;
+        assert_eq!(payload.as_ref(), b"hello blob v2");
+    }
+    ```
+
+=== "Java"
+
+    ```java
+    import org.apache.arrow.vector.types.pojo.ArrowType;
+    import org.apache.arrow.vector.types.pojo.Field;
+    import org.apache.arrow.vector.types.pojo.FieldType;
+    import org.apache.arrow.vector.types.pojo.Schema;
+    import org.lance.BlobFile;
+    import org.lance.Dataset;
+    import org.lance.WriteParams;
+    import java.nio.charset.StandardCharsets;
+    import java.util.Arrays;
+    import java.util.List;
+    import java.util.Map;
+
+    Field blobField =
+        new Field(
+            "blob",
+            new FieldType(
+                true,
+                ArrowType.Struct.INSTANCE,
+                null,
+                Map.of("ARROW:extension:name", "lance.blob.v2")),
+            Arrays.asList(
+                Field.nullable("data", ArrowType.LargeBinary.INSTANCE),
+                Field.nullable("uri", ArrowType.Utf8.INSTANCE)));
+    Schema schema =
+        new Schema(Arrays.asList(Field.notNullable("id", new ArrowType.Int(64, true)), blobField));
+
+    try (Dataset ds =
+        Dataset.write()
+            .allocator(allocator)
+            .reader(reader) // ArrowReader matching `schema`
+            .uri("./blobs_v22.lance")
+            .mode(WriteParams.WriteMode.OVERWRITE)
+            .dataStorageVersion("2.2")
+            .execute()) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(List.of(0L), "blob");
+      try (BlobFile blob = blobs.get(0)) {
+        byte[] payload = blob.read();
+        assert Arrays.equals(payload, "hello blob v2".getBytes(StandardCharsets.UTF_8));
+      }
+    }
+    ```
 
 ## Version Compatibility
 
@@ -466,17 +559,54 @@ Sequential reads are buffered, 512 KiB by default. Pass `buffer_size=0`
 for unbuffered reads. `read_range` and `read_ranges` do not use this
 buffer.
 
-```python
-import lance
+=== "Python"
 
-ds = lance.dataset("./blobs_v22.lance")
-blobs = ds.take_blobs("blob", indices=[0, 1])
+    ```python
+    import lance
 
-blob = blobs[0]
-if blob is not None:
-    with blob as f:
-        header = f.read(1024)
-```
+    ds = lance.dataset("./blobs_v22.lance")
+    blobs = ds.take_blobs("blob", indices=[0, 1])
+
+    blob = blobs[0]
+    if blob is not None:
+        with blob as f:
+            header = f.read(1024)
+    ```
+
+=== "Rust"
+
+    ```rust
+    use std::sync::Arc;
+    use lance::Dataset;
+
+    let ds = Arc::new(Dataset::open("./blobs_v22.lance").await?);
+    let blobs = ds.take_blobs_by_indices(&[0, 1], "blob").await?;
+
+    if let Some(blob) = &blobs[0] {
+        let header = blob.read_up_to(1024).await?;
+    }
+    ```
+
+=== "Java"
+
+    ```java
+    import org.lance.BlobFile;
+    import org.lance.Dataset;
+    import java.util.List;
+
+    try (Dataset ds = Dataset.open("./blobs_v22.lance", allocator)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(List.of(0L, 1L), "blob");
+      try {
+        if (blobs.get(0) != null) {
+          byte[] header = blobs.get(0).readUpTo(1024);
+        }
+      } finally {
+        for (BlobFile blob : blobs) {
+          if (blob != null) blob.close();
+        }
+      }
+    }
+    ```
 
 ### Example: decode video frames lazily
 
