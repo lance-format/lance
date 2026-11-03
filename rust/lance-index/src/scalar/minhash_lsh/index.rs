@@ -22,6 +22,8 @@ use std::collections::{BinaryHeap, VecDeque};
 const HEAP_MIN_BUCKETS: usize = 32;
 const HEAP_SAMPLE_CANDIDATES: usize = 64;
 
+use arrow_array::BooleanArray;
+use arrow_select::filter::filter_record_batch;
 use futures::future::try_join_all;
 use smallvec::SmallVec;
 
@@ -340,6 +342,64 @@ impl MinHashLshIndex {
     /// Number of documents (rows with at least one token) in this segment.
     pub fn num_docs(&self) -> usize {
         self.num_docs
+    }
+
+    /// Stream the stored signatures selected by `mask`, without reading text.
+    ///
+    /// Batches contain a non-null [`ROW_ID`] column and [`SIGNATURE_COL`] as
+    /// `FixedSizeList<UInt16, num_hashes>`. Rows with no tokens were not indexed.
+    /// Deferred row-ID remapping is applied before the mask, as in similarity
+    /// search. The caller supplies a mask for its pinned dataset snapshot;
+    /// this segment does not discover later deletions or unindexed rows.
+    /// Reads and output batches are bounded independently of the segment size.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use futures::TryStreamExt;
+    /// # use lance_index::scalar::minhash_lsh::MinHashLshIndex;
+    /// # use lance_select::RowAddrMask;
+    /// # async fn example(index: &MinHashLshIndex, live: Arc<RowAddrMask>) -> lance_core::Result<()> {
+    /// let mut signatures = index.scan_signatures(live);
+    /// while let Some(batch) = signatures.try_next().await? {
+    ///     // Consume each batch before requesting the next one.
+    ///     assert!(batch.column_by_name("signature").is_some());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn scan_signatures(
+        &self,
+        mask: Arc<RowAddrMask>,
+    ) -> Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> {
+        let num_hashes = self.params.num_hashes as usize;
+        let remapper = self.frag_reuse_index.clone();
+        scan_rows(
+            self.signatures.clone(),
+            0,
+            self.num_docs,
+            rows_per_batch(signature_row_bytes(num_hashes)),
+        )
+        .map(move |batch| {
+            let batch = batch?;
+            let (stored_ids, _) = signature_columns(&batch, num_hashes)?;
+            let mut row_ids = Vec::with_capacity(batch.num_rows());
+            let selected = BooleanArray::from_iter(stored_ids.values().iter().map(|&stored| {
+                let row_id = match remapper.as_deref() {
+                    Some(remapper) => remapper.remap_row_id(stored),
+                    None => Some(stored),
+                };
+                let keep = row_id.filter(|&row_id| mask.selected(row_id));
+                if let Some(row_id) = keep {
+                    row_ids.push(row_id);
+                }
+                Some(keep.is_some())
+            }));
+            let filtered = filter_record_batch(&batch, &selected)?;
+            let mut columns = filtered.columns().to_vec();
+            columns[filtered.schema().index_of(ROW_ID)?] = Arc::new(UInt64Array::from(row_ids));
+            Ok(RecordBatch::try_new(filtered.schema(), columns)?)
+        })
+        .boxed()
     }
 
     fn signature_source<'a>(&self, transform: RowIdTransform<'a>) -> SignatureSource<'a> {
@@ -1403,10 +1463,9 @@ pub(super) fn scan_rows(
     num_rows: usize,
     rows_per_read: usize,
 ) -> impl Stream<Item = Result<RecordBatch>> + Send {
-    let ranges: Vec<Range<usize>> = (first_row..num_rows)
+    let ranges = (first_row..num_rows)
         .step_by(rows_per_read.max(1))
-        .map(|start| start..(start + rows_per_read).min(num_rows))
-        .collect();
+        .map(move |start| start..(start + rows_per_read).min(num_rows));
     futures::stream::iter(ranges)
         .map(move |range| {
             let reader = reader.clone();
