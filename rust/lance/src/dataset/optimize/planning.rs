@@ -114,10 +114,16 @@ pub struct CompactionOptions {
     /// This does not affect which fragments need compaction, but does affect
     /// how they are re-written if selected.
     pub max_rows_per_group: usize,
-    /// Max number of bytes per file
+    /// Max number of bytes per output data file.
     ///
-    /// This does not affect which frgamnets need compaction, but does affect
-    /// how they are re-written if selected.
+    /// By default, this only affects how selected fragments are rewritten.
+    /// With [`DefaultCompactionPlanner::with_byte_aware_consolidation`], the
+    /// effective limit also gates ordinary consolidation when the fragment's
+    /// main-file size is reliable: one data file, without deletions, overlays,
+    /// or obsolete columns. In that case, fragments at or above 95% of the
+    /// limit are left out of ordinary consolidation, while forced deletion,
+    /// overlay, and dead-column rewrites remain eligible. Unknown and complex
+    /// layouts retain row-only candidacy.
     ///
     /// If not specified then the default (see [`crate::dataset::WriteParams`]) will be used.
     pub max_bytes_per_file: Option<usize>,
@@ -636,6 +642,17 @@ impl DefaultCompactionPlanner {
     ///
     /// Deletion and overlay rewrites remain eligible. Unknown sizes retain
     /// row-only behavior. See [`super::consolidation`] for measurement details.
+    ///
+    /// ```
+    /// use lance::dataset::optimize::{CompactionOptions, DefaultCompactionPlanner};
+    /// let options = CompactionOptions {
+    ///     max_bytes_per_file: Some(64 * 1024 * 1024),
+    ///     ..Default::default()
+    /// };
+    /// let planner = DefaultCompactionPlanner::new(options)?
+    ///     .with_byte_aware_consolidation();
+    /// # Ok::<(), lance::Error>(())
+    /// ```
     pub fn with_byte_aware_consolidation(mut self) -> Self {
         self.byte_aware_consolidation = true;
         self

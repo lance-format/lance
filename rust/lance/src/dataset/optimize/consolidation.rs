@@ -14,6 +14,27 @@ use crate::dataset::WriteParams;
 /// estimate rather than a sum of source sizes. Return unknown for those layouts.
 /// Blob sidecars are intentionally excluded: the output-file cap applies to the
 /// main data file, not to its referenced payloads. No object-store I/O is issued.
+///
+/// `schema_field_ids` contains the field IDs from the current dataset schema.
+///
+/// ```
+/// use std::collections::HashSet;
+/// use std::num::NonZero;
+///
+/// use lance::dataset::optimize::consolidation::fragment_file_bytes;
+/// use lance_file::version::ConcreteFileVersion;
+/// use lance_table::format::Fragment;
+///
+/// let fragment = Fragment::new(0).with_file(
+///     "data.lance",
+///     vec![7],
+///     vec![0],
+///     ConcreteFileVersion::V2_2,
+///     NonZero::new(1024),
+/// );
+/// let schema_field_ids = HashSet::from([7]);
+/// assert_eq!(fragment_file_bytes(&fragment, &schema_field_ids), Some(1024));
+/// ```
 pub fn fragment_file_bytes(fragment: &Fragment, schema_field_ids: &HashSet<i32>) -> Option<u64> {
     if fragment.files.len() != 1
         || fragment.deletion_file.is_some()
