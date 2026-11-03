@@ -306,7 +306,12 @@ async fn test_prepare_bm25_query_fetches_segment_stats_concurrently() {
     .await
     .unwrap();
 
-    let window = indices[0].store.io_parallelism().min(indices.len());
+    let window = indices
+        .iter()
+        .map(|index| index.store.io_parallelism())
+        .max()
+        .unwrap_or(1)
+        .min(indices.len());
     assert!(
         counter.max_reads_in_flight() >= window.min(2),
         "at most {} statistics reads were in flight at once",

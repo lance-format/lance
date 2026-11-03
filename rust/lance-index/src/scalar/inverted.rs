@@ -371,9 +371,9 @@ pub async fn prepare_bm25_query(
         (scorer, true)
     } else {
         // Read the segments' statistics together rather than one segment
-        // after another, bounded by the store's IO parallelism, so uncached
-        // term statistics cost about one storage round trip per window of
-        // segments instead of one per segment.
+        // after another, up to the largest IO parallelism among the segments'
+        // stores, so uncached statistics cost about one segment's read latency
+        // per window instead of the sum over all segments.
         let parallelism = indices
             .iter()
             .map(|index| index.store.io_parallelism())
