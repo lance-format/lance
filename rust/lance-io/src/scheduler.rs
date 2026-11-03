@@ -742,22 +742,36 @@ struct Watchdog {
 }
 
 impl Watchdog {
+    /// Checks every live registered queue once, emitting a warning for any
+    /// that are stuck, and prunes closed queues from the registry.
+    ///
+    /// The registry lock is held only long enough to prune and snapshot the
+    /// still-live queues - never while checking a queue's state or emitting
+    /// its warning. `warn_stuck` runs a `tracing`/`log` event, which may
+    /// reach arbitrary subscriber code; if that code opens a new standard
+    /// scheduler (calling back into `spawn_watchdog` on this same thread)
+    /// while this thread still held the registry lock, it would deadlock on
+    /// that same, non-reentrant `std::sync::Mutex`.
+    fn tick(&self) {
+        let alive: Vec<Arc<IoQueue>> = {
+            let mut queues = self.queues.lock().unwrap();
+            queues.retain(|queue| queue.strong_count() > 0);
+            queues.iter().filter_map(Weak::upgrade).collect()
+        };
+        for queue in alive {
+            let stuck = queue.state.lock().unwrap().check_watchdog();
+            if let Some((event, stuck_for)) = stuck {
+                event.warn_stuck(stuck_for);
+            }
+        }
+    }
+
     /// Body of the watchdog's single background thread: wakes up every
-    /// `WATCHDOG_CHECK_INTERVAL`, checks every still-live registered queue,
-    /// and drops any that have been closed.
+    /// `WATCHDOG_CHECK_INTERVAL` and runs one `tick`.
     fn run(&self) {
         loop {
             std::thread::sleep(WATCHDOG_CHECK_INTERVAL);
-            self.queues.lock().unwrap().retain(|queue| {
-                let Some(queue) = queue.upgrade() else {
-                    return false;
-                };
-                let stuck = queue.state.lock().unwrap().check_watchdog();
-                if let Some((event, stuck_for)) = stuck {
-                    event.warn_stuck(stuck_for);
-                }
-                true
-            });
+            self.tick();
         }
     }
 }
@@ -2051,6 +2065,74 @@ mod tests {
             after <= before + 4,
             "spawn_watchdog must share a single background thread across queues, \
              not spawn one per queue (before={before}, after={after})"
+        );
+    }
+
+    #[test]
+    fn test_watchdog_tick_releases_registry_lock_before_warning() {
+        // Regression test: `Watchdog::tick` must release its registry lock
+        // before checking queue state and emitting the stuck warning. A
+        // subscriber that reacts to the warning by constructing a new
+        // standard scheduler (calling back into `spawn_watchdog`, on this
+        // same thread, to register it) must not deadlock on that same,
+        // non-reentrant registry `Mutex`.
+        struct ReentrantSubscriber {
+            watchdog: Arc<Watchdog>,
+            reentered: Arc<AtomicBool>,
+        }
+        impl tracing::Subscriber for ReentrantSubscriber {
+            fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
+            }
+            fn event(&self, _event: &tracing::Event<'_>) {
+                self.reentered.store(true, Ordering::SeqCst);
+                // Same-thread reentrant call into the watchdog: this is what
+                // would deadlock if `tick` still held the registry lock here.
+                self.watchdog.tick();
+            }
+            fn enter(&self, _span: &tracing::span::Id) {}
+            fn exit(&self, _span: &tracing::span::Id) {}
+        }
+
+        let watchdog = Arc::new(Watchdog {
+            queues: Mutex::new(Vec::new()),
+        });
+        let queue = Arc::new(IoQueue::new(4, 1, IoStats::new()));
+        {
+            let mut state = queue.state.lock().unwrap();
+            state.pending_requests.push(make_task(0, false));
+            state.last_progress =
+                Instant::now() - WATCHDOG_STUCK_THRESHOLD - Duration::from_secs(1);
+        }
+        watchdog.queues.lock().unwrap().push(Arc::downgrade(&queue));
+
+        let reentered = Arc::new(AtomicBool::new(false));
+        let subscriber = ReentrantSubscriber {
+            watchdog: watchdog.clone(),
+            reentered: reentered.clone(),
+        };
+
+        // Run on a background thread with a hard join timeout: a deadlock
+        // would otherwise hang the test suite instead of failing this test.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            tracing::subscriber::with_default(subscriber, || watchdog.tick());
+            let _ = tx.send(());
+        });
+
+        rx.recv_timeout(Duration::from_secs(5)).expect(
+            "watchdog tick deadlocked: the registry lock must be released before \
+             checking queue state and emitting the stuck warning",
+        );
+        assert!(
+            reentered.load(Ordering::SeqCst),
+            "test did not actually exercise the warning path"
         );
     }
 
