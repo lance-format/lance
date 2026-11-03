@@ -3,9 +3,10 @@
 
 //! Which versions of a dataset must survive, and which may be discarded.
 //!
-//! Shared by [`cleanup`](super::cleanup) and [`expire`](super::expire). The two differ
-//! only in what they delete and in where they get a version's age from; the rules for
-//! what is protected are the same and live here so they cannot drift apart.
+//! Used by [`expire`](super::expire), which follows the protection rules already
+//! implemented by [`cleanup`](super::cleanup). Expiry and cleanup differ in what
+//! they delete and in where they get a version's age from; the rules for what must
+//! survive are kept aligned here.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;

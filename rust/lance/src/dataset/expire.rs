@@ -35,6 +35,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt, stream};
+use lance_table::format::is_detached_version;
 use lance_table::io::commit::ManifestLocation;
 use log::{debug, warn};
 use tokio::time::{MissedTickBehavior, interval};
@@ -211,6 +212,17 @@ pub async fn plan_expire_versions(
     dataset: &Dataset,
     policy: &ExpireVersionsPolicy,
 ) -> Result<(ExpireVersionsPlan, Vec<ManifestLocation>)> {
+    // A detached handle's high-bit version would dominate the attached latest
+    // version and let an otherwise ordinary policy remove the attached history.
+    // This is the same boundary cleanup enforces.
+    let read_version = dataset.version().version;
+    if is_detached_version(read_version) {
+        return Err(Error::invalid_input(format!(
+            "cannot expire versions from detached version {read_version}; \
+             check out an attached version of the dataset first"
+        )));
+    }
+
     let protected = ProtectedVersions::resolve(dataset).await?;
 
     let locations: Vec<ManifestLocation> = dataset
@@ -432,15 +444,16 @@ pub async fn expire_versions(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use all_asserts::assert_gt;
     use arrow_array::{RecordBatch, RecordBatchIterator, UInt32Array};
     use arrow_schema::{DataType, Field, Schema};
     use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
 
     use super::*;
-    use crate::dataset::WriteParams;
+    use crate::dataset::{CommitBuilder, DeleteBuilder, WriteParams};
 
     /// A dataset at version `versions`, each version an overwrite.
     async fn dataset_with_versions(uri: &str, versions: u32) -> Dataset {
@@ -482,6 +495,89 @@ mod tests {
             .await
             .unwrap()
             .len()
+    }
+
+    #[tokio::test]
+    async fn expire_rejects_a_detached_checkout() {
+        let uri = TempStrDir::default();
+        let dataset = Arc::new(dataset_with_versions(&uri, 3).await);
+        let before = version_count(&dataset).await;
+        let staged = DeleteBuilder::new(dataset.clone(), "true")
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let detached = CommitBuilder::new(dataset.clone())
+            .with_detached(true)
+            .execute(staged.transaction)
+            .await
+            .unwrap();
+        assert!(is_detached_version(detached.version_id()));
+
+        let policy = ExpireVersionsPolicyBuilder::default()
+            .before_version(u64::MAX)
+            .build();
+        for error in [
+            expire_versions(&detached, policy.clone())
+                .await
+                .unwrap_err(),
+            explain_expire_versions(&detached, &policy)
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(
+                error.to_string().contains("detached version"),
+                "unexpected error: {error}"
+            );
+        }
+
+        assert_eq!(
+            version_count(&dataset).await,
+            before,
+            "detached planning must not remove attached history"
+        );
+        assert!(Dataset::open(&uri).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn expire_fails_closed_when_the_version_hint_cannot_be_read() {
+        let uri = TempStrDir::default();
+        let mut dataset = dataset_with_versions(&uri, 4).await;
+        let before = version_count(&dataset).await;
+        lance_table::io::commit::write_version_hint(&dataset.object_store, &dataset.base, 3).await;
+
+        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+        policy.lock().unwrap().set_before_policy(
+            "fail_hint_read",
+            Arc::new(|method, path| {
+                if method == "get_opts" && path.filename() == Some("latest_version_hint.json") {
+                    Err(Error::internal("hint unavailable".to_string()))
+                } else {
+                    Ok(())
+                }
+            }),
+        );
+        let original = dataset.object_store.inner.clone();
+        let object_store = Arc::make_mut(&mut dataset.object_store);
+        object_store.inner = Arc::new(ProxyObjectStore::new(original, policy));
+
+        let error = expire_versions(
+            &dataset,
+            ExpireVersionsPolicyBuilder::default()
+                .before_version(u64::MAX)
+                .build(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("hint unavailable"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            version_count(&dataset).await,
+            before,
+            "a failed hint read must not license deletion"
+        );
     }
 
     #[tokio::test]
@@ -587,10 +683,31 @@ mod tests {
     async fn expire_does_not_delete_data_files() {
         // The whole point: history goes, data stays for cleanup to reclaim.
         let uri = TempStrDir::default();
-        let dataset = dataset_with_versions(&uri, 4).await;
+        let mut dataset = dataset_with_versions(&uri, 4).await;
         let data_before = count_data_files(&dataset).await;
 
-        expire_versions(
+        let policy = Arc::new(Mutex::new(ProxyObjectStorePolicy::new()));
+        policy.lock().unwrap().set_before_policy(
+            "reject_manifest_reads",
+            Arc::new(|method, path| {
+                if method == "get_opts"
+                    && path
+                        .filename()
+                        .is_some_and(|filename| filename.ends_with(".manifest"))
+                {
+                    Err(Error::internal(format!(
+                        "expiry unexpectedly read manifest {path}"
+                    )))
+                } else {
+                    Ok(())
+                }
+            }),
+        );
+        let original = dataset.object_store.inner.clone();
+        let object_store = Arc::make_mut(&mut dataset.object_store);
+        object_store.inner = Arc::new(ProxyObjectStore::new(original, policy));
+
+        let stats = expire_versions(
             &dataset,
             ExpireVersionsPolicyBuilder::default()
                 .before_version(dataset.manifest.version)
@@ -598,6 +715,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(stats.versions_removed, 3);
 
         assert_eq!(
             count_data_files(&dataset).await,
