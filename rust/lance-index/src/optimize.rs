@@ -77,9 +77,7 @@ pub struct OptimizeOptions {
     ///
     /// Existing segments and new tasks are packed into output segments of at
     /// most this many rows; `None` merges everything into one segment. See
-    /// `max_rows_per_task` for what setting it changes. With
-    /// [`Self::consolidate_segments`], it bounds each consolidated output's
-    /// live rows instead.
+    /// `max_rows_per_task` for what setting it changes.
     pub max_rows_per_segment: Option<u64>,
 
     /// Consolidate the newest vector segments within this physical-row budget
@@ -92,28 +90,13 @@ pub struct OptimizeOptions {
     /// entries and its current covered fragments' physical rows, including
     /// deleted rows. This bounds both direct merges and raw-vector scans.
     /// Cannot be combined with retraining, partition rebalancing, an explicit
-    /// merge count, or, unless [`Self::consolidate_segments`] is set,
-    /// `max_rows_per_segment`. `max_rows_per_task` may bound the re-encoding
-    /// tasks, but fragments are indivisible and must fit that bound.
+    /// merge count, or `max_rows_per_segment`. `max_rows_per_task` may bound the
+    /// re-encoding tasks, but fragments are indivisible and must fit that bound.
     pub max_rows_to_consolidate: Option<u64>,
-    /// Consolidate these segments of one vector index, by UUID, instead of the
-    /// newest ones that fit [`Self::max_rows_to_consolidate`]. Default: unset.
-    ///
-    /// Any segments of the index may be chosen, so older segments that have
-    /// lost most of their rows to deletes can be rewritten. Each selected
-    /// segment is re-encoded from its current fragments with the model of the
-    /// index's newest segment, the one appends use, so deleted rows do not
-    /// carry over, even when the segments share one model. The outputs join
-    /// the end of the index. Selected segments are packed whole, in
-    /// index order, into outputs of at most [`Self::max_rows_per_segment`] live
-    /// rows; a segment larger than that becomes one output on its own.
-    ///
-    /// Selected segments the index no longer has are skipped: a delete that
-    /// empties a segment's fragments removes the segment.
-    ///
-    /// Requires exactly one index name and a row budget, which here bounds
-    /// the physical rows the selection reads: exceeding it is an error, not a
-    /// shorter selection.
+    /// Consolidate these segments of one vector index instead of the newest
+    /// ones. They are re-encoded into one segment with the model of the
+    /// newest live segment, dropping deleted rows. Reading more than
+    /// `max_rows_to_consolidate` rows is an error. Default: unset.
     pub consolidate_segments: Option<Vec<Uuid>>,
 }
 
@@ -219,8 +202,7 @@ impl OptimizeOptions {
         self
     }
 
-    /// Consolidate exactly these segments; see [`Self::consolidate_segments`]
-    /// (the field).
+    /// See [`Self::consolidate_segments`].
     pub fn consolidate_segments(mut self, segments: Vec<Uuid>) -> Self {
         self.consolidate_segments = Some(segments);
         self
