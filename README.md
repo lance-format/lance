@@ -37,6 +37,15 @@ Lance is an open lakehouse format for multimodal AI. It contains a file format, 
 2. Large-scale ML training requiring high performance IO and random access.
 3. Storing, querying, and managing multimodal data including images, videos, audio, text, and embeddings.
 
+### Which Python package should I use?
+
+Lance has two Python packages:
+
+- **[`lancedb`](https://pypi.org/project/lancedb/)** (`pip install lancedb`): the recommended starting point for applications and data work on Lance datasets. It opens existing Lance datasets (`lancedb.connect(parent_dir).open_table(name)`), and covers filtered reads and scans, vector, full-text and hybrid search, upserts, versioning and tags. See the [LanceDB docs](https://docs.lancedb.com).
+- **[`pylance`](https://pypi.org/project/pylance/)** (`pip install pylance`, `import lance`): the low-level format library, for building query engines and connectors that need fragment-level control, such as writing fragments and committing them manually.
+
+If you are not building a query engine or connector, start with `lancedb`.
+
 The key features of Lance include:
 
 - **Expressive hybrid search:** Combine vector similarity search, full-text search (BM25), and SQL analytics on the same dataset with accelerated secondary indices.

@@ -14,6 +14,12 @@
       </div>
     </section>
 
+    <section class="ld-what" id="which-python-package">
+      <h2>Which Python package should I use?</h2>
+      <p class="ld-what__body"><strong><code>lancedb</code></strong> (<code>pip install lancedb</code>) is the recommended starting point for applications and data work on Lance datasets: open an existing dataset with <code>lancedb.connect(parent_dir).open_table(name)</code>, then filter, scan, search, upsert and version it. <strong><code>pylance</code></strong> (<code>import lance</code>) is the low-level format library for building query engines and connectors that need fragment-level control.</p>
+      <p class="ld-what__more">Not building an engine or connector? Start with <a class="ld-inline-link" href="https://docs.lancedb.com" target="_blank" rel="noopener">LanceDB</a>.</p>
+    </section>
+
     <section class="ld-band">
       <div class="ld-stats">
         <div class="ld-stat">

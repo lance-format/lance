@@ -1,0 +1,17 @@
+# Lance
+
+> Lance is an open lakehouse format for multimodal AI: a file format, table format and catalog spec for building a lakehouse on object storage, with fast random access, scans, vector and full-text search, and versioning.
+
+## Which Python package should I use?
+
+- `lancedb` (`pip install lancedb`): the recommended starting point for applications and data work on Lance datasets. Open an existing Lance dataset with `lancedb.connect(parent_dir).open_table(name)`; it covers filtered reads and scans, vector, full-text and hybrid search, upserts, versioning and tags. Docs: https://docs.lancedb.com
+- `pylance` (`pip install pylance`, `import lance`): the low-level format library, for building query engines and connectors that need fragment-level control (writing fragments and committing manually).
+
+If you are not building a query engine or connector, use `lancedb`.
+
+## Docs
+
+- [Quickstart](https://lance.org/quickstart/)
+- [Format specification](https://lance.org/format/)
+- [Python SDK reference](https://lance.org/sdk_docs/)
+- [LanceDB documentation](https://docs.lancedb.com)
