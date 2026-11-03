@@ -2987,7 +2987,7 @@ class LanceDataset(pa.dataset.Dataset):
         everything.
         """
         return self._ds.expire_versions(
-            td_to_micros(before) if before else None,
+            td_to_micros(before) if before is not None else None,
             before_version,
             td_to_micros(keep_one_per) if keep_one_per is not None else None,
             error_if_tagged_old_versions,
@@ -3008,7 +3008,7 @@ class LanceDataset(pa.dataset.Dataset):
         Takes the same arguments as :meth:`expire_versions`.
         """
         return self._ds.explain_expire_versions(
-            td_to_micros(before) if before else None,
+            td_to_micros(before) if before is not None else None,
             before_version,
             td_to_micros(keep_one_per) if keep_one_per is not None else None,
             error_if_tagged_old_versions,

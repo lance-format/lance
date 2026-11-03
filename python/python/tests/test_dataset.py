@@ -1959,6 +1959,23 @@ def test_expire_versions_keeps_tagged(tmp_path):
     assert lance.dataset(base_dir, version=2).count_rows() == 10
 
 
+def test_expire_versions_zero_before_is_a_cutoff(tmp_path):
+    table = pa.Table.from_pydict({"a": range(10)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+    for _ in range(2):
+        lance.write_dataset(table, base_dir, mode="overwrite")
+
+    dataset = lance.dataset(base_dir)
+    # timedelta(0) is falsy, but it is still an explicit cutoff at the current time.
+    plan = dataset.explain_expire_versions(before=timedelta(0))
+    assert plan.versions == [1, 2]
+
+    stats = dataset.expire_versions(before=timedelta(0))
+    assert stats.versions_removed == 2
+    assert len(lance.dataset(base_dir).versions()) == 1
+
+
 def test_expire_versions_keep_one_per(tmp_path):
     table = pa.Table.from_pydict({"a": range(10)})
     base_dir = tmp_path / "test"
