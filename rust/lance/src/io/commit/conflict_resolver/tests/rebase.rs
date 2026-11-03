@@ -3,6 +3,52 @@
 
 use super::*;
 
+/// The first-activation fence judges each read field by its own identity:
+/// a child added under a struct the writer read is fine, while a child of
+/// that struct renamed, retyped or moved is not.
+#[test]
+fn additive_merge_keeps_every_read_field_but_a_changed_child_does_not() {
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    let schema = |children: Vec<Field>| {
+        lance_core::datatypes::Schema::try_from(&ArrowSchema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("info", DataType::Struct(children.into()), true),
+        ]))
+        .unwrap()
+    };
+    let zip = Field::new("zip", DataType::Int32, true);
+    let read = schema(vec![zip.clone()]);
+    // Added child under the read struct: every read field keeps its identity.
+    let added = schema(vec![zip, Field::new("note", DataType::Utf8, true)]);
+    assert!(keeps_every_field_identity(&read, &added));
+    // Renamed, retyped or missing child: not the same field any more.
+    assert!(!keeps_every_field_identity(
+        &read,
+        &schema(vec![Field::new("postcode", DataType::Int32, true)])
+    ));
+    assert!(!keeps_every_field_identity(
+        &read,
+        &schema(vec![Field::new("zip", DataType::Int64, true)])
+    ));
+    assert!(!keeps_every_field_identity(&read, &schema(vec![])));
+    // Moved: the same name and type under a different parent.
+    let moved = lance_core::datatypes::Schema::try_from(&ArrowSchema::new(vec![
+        Field::new("a", DataType::Int64, false),
+        Field::new("info", DataType::Struct(Vec::<Field>::new().into()), true),
+        Field::new("zip", DataType::Int32, true),
+    ]))
+    .unwrap();
+    let mut moved = moved;
+    // Give the moved column the read child's id so only its parent differs.
+    let read_zip = read.field("info.zip").unwrap().id;
+    for field in moved.fields.iter_mut() {
+        if field.name == "zip" {
+            field.id = read_zip;
+        }
+    }
+    assert!(!keeps_every_field_identity(&read, &moved));
+}
+
 #[tokio::test]
 async fn tagged_fri_rebase_returns_error_instead_of_panicking() {
     let dataset = test_dataset(4, 2).await;
@@ -18,6 +64,8 @@ async fn tagged_fri_rebase_returns_error_instead_of_panicking() {
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     let operation = Operation::Rewrite {
         groups: vec![],
@@ -39,29 +87,42 @@ async fn tagged_fri_rebase_returns_error_instead_of_panicking() {
 #[case::config(false)]
 #[case::table_metadata(true)]
 #[tokio::test]
-async fn test_merge_preserves_unrelated_update_config_compatibility(
+async fn test_schema_change_preserves_unrelated_update_config_compatibility(
     #[case] update_table_metadata: bool,
-    #[values(true, false)] merge_commits_first: bool,
+    #[values("merge", "drop", "rename")] schema_change: &str,
+    #[values(true, false)] schema_change_commits_first: bool,
 ) {
-    let dataset = Arc::new(test_dataset(5, 1).await);
+    let dataset = Arc::new(test_dataset(4, 2).await);
     let read_version = dataset.manifest.version;
 
-    let mut merged_schema = dataset.schema().clone();
-    merged_schema
+    let mut schema = dataset.schema().clone();
+    schema
         .metadata
-        .insert("merge.schema".to_string(), "preserved".to_string());
-    let field_id = merged_schema.fields[0].id;
-    merged_schema.fields[0]
+        .insert("schema.key".to_string(), "preserved".to_string());
+    let field_id = schema.fields[0].id;
+    schema.fields[0]
         .metadata
-        .insert("merge.field".to_string(), "preserved".to_string());
-    let merge = Transaction::new_from_version(
-        read_version,
-        Operation::Merge {
+        .insert("field.key".to_string(), "preserved".to_string());
+    let operation = match schema_change {
+        "merge" => Operation::Merge {
             fragments: dataset.manifest.fragments.as_ref().clone(),
-            schema: merged_schema,
+            schema,
             preserves_nullability: true,
         },
-    );
+        "drop" | "rename" => {
+            if schema_change == "drop" {
+                schema.fields.truncate(1);
+            } else {
+                schema.fields[1].name = "renamed_b".to_string();
+            }
+            Operation::Project {
+                schema,
+                preserves_nullability: true,
+            }
+        }
+        _ => unreachable!(),
+    };
+    let schema_transaction = Transaction::new_from_version(read_version, operation);
 
     let replacement = UpdateMap {
         update_entries: vec![("key", Some("value")).into()],
@@ -77,10 +138,10 @@ async fn test_merge_preserves_unrelated_update_config_compatibility(
         },
     );
 
-    let (first, stale) = if merge_commits_first {
-        (merge, update_config)
+    let (first, stale) = if schema_change_commits_first {
+        (schema_transaction, update_config)
     } else {
-        (update_config, merge)
+        (update_config, schema_transaction)
     };
     CommitBuilder::new(dataset.clone())
         .execute(first)
@@ -92,7 +153,7 @@ async fn test_merge_preserves_unrelated_update_config_compatibility(
         latest_dataset
             .schema()
             .metadata
-            .get("merge.schema")
+            .get("schema.key")
             .map(String::as_str),
         Some("preserved")
     );
@@ -102,7 +163,7 @@ async fn test_merge_preserves_unrelated_update_config_compatibility(
             .field_by_id(field_id)
             .unwrap()
             .metadata
-            .get("merge.field")
+            .get("field.key")
             .map(String::as_str),
         Some("preserved")
     );
@@ -118,30 +179,43 @@ async fn test_merge_preserves_unrelated_update_config_compatibility(
 #[case::schema_metadata(true)]
 #[case::field_metadata(false)]
 #[tokio::test]
-async fn test_concurrent_merge_and_metadata_update_conflict(
+async fn test_concurrent_schema_change_and_metadata_update_conflict(
     #[case] replace_schema_metadata: bool,
+    #[values("merge", "drop", "rename")] schema_change: &str,
     #[values(true, false)] replace: bool,
-    #[values(true, false)] merge_commits_first: bool,
+    #[values(true, false)] schema_change_commits_first: bool,
 ) {
-    let dataset = Arc::new(test_dataset(5, 1).await);
+    let dataset = Arc::new(test_dataset(4, 2).await);
     let read_version = dataset.manifest.version;
 
-    let mut merged_schema = dataset.schema().clone();
-    merged_schema
+    let mut schema = dataset.schema().clone();
+    schema
         .metadata
-        .insert("merge.schema".to_string(), "coordinated".to_string());
-    let field_id = merged_schema.fields[0].id;
-    merged_schema.fields[0]
+        .insert("schema.key".to_string(), "coordinated".to_string());
+    let field_id = schema.fields[0].id;
+    schema.fields[0]
         .metadata
-        .insert("merge.field".to_string(), "coordinated".to_string());
-    let merge = Transaction::new_from_version(
-        read_version,
-        Operation::Merge {
+        .insert("field.key".to_string(), "coordinated".to_string());
+    let operation = match schema_change {
+        "merge" => Operation::Merge {
             fragments: dataset.manifest.fragments.as_ref().clone(),
-            schema: merged_schema,
+            schema,
             preserves_nullability: true,
         },
-    );
+        "drop" | "rename" => {
+            if schema_change == "drop" {
+                schema.fields.truncate(1);
+            } else {
+                schema.fields[1].name = "renamed_b".to_string();
+            }
+            Operation::Project {
+                schema,
+                preserves_nullability: true,
+            }
+        }
+        _ => unreachable!(),
+    };
+    let schema_transaction = Transaction::new_from_version(read_version, operation);
 
     let metadata_update = UpdateMap {
         update_entries: vec![("replacement", Some("coordinated")).into()],
@@ -161,10 +235,10 @@ async fn test_concurrent_merge_and_metadata_update_conflict(
         },
     );
 
-    let (first, stale) = if merge_commits_first {
-        (merge, update_config)
+    let (first, stale) = if schema_change_commits_first {
+        (schema_transaction, update_config)
     } else {
-        (update_config, merge)
+        (update_config, schema_transaction)
     };
     CommitBuilder::new(dataset.clone())
         .execute(first)
@@ -176,6 +250,7 @@ async fn test_concurrent_merge_and_metadata_update_conflict(
         .unwrap_err();
 
     assert!(matches!(error, Error::RetryableCommitConflict { .. }));
+    assert!(error.to_string().contains("Please retry"), "{error}");
 }
 
 #[tokio::test]
@@ -186,6 +261,7 @@ async fn test_non_overlapping_rebase_delete_update() {
         removed_fragment_ids: vec![],
         new_fragments: vec![],
         fields_modified: vec![],
+        mem_wal_dir_id: None,
         compacted_sstables: Vec::new(),
         fields_for_preserving_frag_bitmap: vec![],
         update_mode: None,
@@ -199,6 +275,7 @@ async fn test_non_overlapping_rebase_delete_update() {
             removed_fragment_ids: vec![2],
             new_fragments: vec![],
             fields_modified: vec![],
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,
@@ -215,6 +292,7 @@ async fn test_non_overlapping_rebase_delete_update() {
             updated_fragments: vec![Fragment::new(4)],
             new_fragments: vec![],
             fields_modified: vec![],
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,
@@ -302,6 +380,7 @@ async fn test_rebase_errors_when_read_version_was_cleaned_up() {
         removed_fragment_ids: vec![],
         new_fragments: vec![],
         fields_modified: vec![],
+        mem_wal_dir_id: None,
         compacted_sstables: Vec::new(),
         fields_for_preserving_frag_bitmap: vec![],
         update_mode: None,
@@ -346,6 +425,7 @@ async fn test_non_conflicting_rebase_delete_update() {
             removed_fragment_ids: vec![],
             new_fragments: vec![sample_file.clone()],
             fields_modified: vec![],
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,
@@ -362,6 +442,7 @@ async fn test_non_conflicting_rebase_delete_update() {
             removed_fragment_ids: vec![],
             new_fragments: vec![sample_file],
             fields_modified: vec![],
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,
@@ -492,6 +573,7 @@ async fn test_conflicting_rebase(
                 removed_fragment_ids: vec![0],
                 new_fragments: vec![sample_file.clone()],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
@@ -506,6 +588,7 @@ async fn test_conflicting_rebase(
                 removed_fragment_ids: vec![],
                 new_fragments: vec![sample_file.clone()],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,

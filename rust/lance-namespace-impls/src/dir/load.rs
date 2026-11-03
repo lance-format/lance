@@ -292,6 +292,18 @@ impl DirectoryNamespace {
         version: Option<i64>,
         operation: &str,
     ) -> Result<Dataset> {
+        self.load_branch_dataset(table_uri, None, version, operation)
+            .await
+    }
+
+    /// Like [`Self::load_dataset`], on `branch` when it names one.
+    pub(super) async fn load_branch_dataset(
+        &self,
+        table_uri: &str,
+        branch: Option<&str>,
+        version: Option<i64>,
+        operation: &str,
+    ) -> Result<Dataset> {
         if let Some(version) = version
             && version < 0
         {
@@ -304,15 +316,20 @@ impl DirectoryNamespace {
             .into());
         }
 
-        let builder = self.configured_builder(table_uri);
-
-        let dataset = builder.load().await.map_err(|e| {
-            let message = format!(
-                "Failed to open table at '{}' for {}: {}",
-                table_uri, operation, e
-            );
-            Self::map_open_error(e, NamespaceError::TableNotFound { message })
-        })?;
+        let dataset = match Self::normalized_branch(branch)? {
+            Some(branch) => self.open_validated_branch(table_uri, branch).await?,
+            None => self
+                .configured_builder(table_uri)
+                .load()
+                .await
+                .map_err(|e| {
+                    let message = format!(
+                        "Failed to open table at '{}' for {}: {}",
+                        table_uri, operation, e
+                    );
+                    Self::map_open_error(e, NamespaceError::TableNotFound { message })
+                })?,
+        };
 
         if let Some(version) = version {
             return dataset.checkout_version(version as u64).await.map_err(|e| {

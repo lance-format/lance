@@ -19,6 +19,8 @@ fn test_conflicts() {
         created_at: None, // Test index, not setting timestamp
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     let fragment0 = Fragment::new(0);
     let fragment1 = Fragment::new(1);
@@ -65,6 +67,7 @@ fn test_conflicts() {
             updated_fragments: vec![fragment0.clone()],
             new_fragments: vec![fragment2.clone()],
             fields_modified: vec![0],
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,
@@ -273,6 +276,7 @@ fn test_conflicts() {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![fragment2],
                 fields_modified: vec![0],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
@@ -542,6 +546,7 @@ fn test_data_overlay_conflicts() {
         updated_fragments: vec![],
         new_fragments: vec![],
         fields_modified: vec![],
+        mem_wal_dir_id: None,
         compacted_sstables: Vec::new(),
         fields_for_preserving_frag_bitmap: vec![],
         update_mode: None,
@@ -561,6 +566,7 @@ fn test_data_overlay_conflicts() {
         updated_fragments: updated,
         new_fragments: new,
         fields_modified: vec![],
+        mem_wal_dir_id: None,
         compacted_sstables: Vec::new(),
         fields_for_preserving_frag_bitmap: vec![],
         update_mode: Some(UpdateMode::RewriteRows),
@@ -572,6 +578,7 @@ fn test_data_overlay_conflicts() {
         updated_fragments: updated,
         new_fragments: vec![],
         fields_modified: vec![0],
+        mem_wal_dir_id: None,
         compacted_sstables: Vec::new(),
         fields_for_preserving_frag_bitmap: vec![],
         update_mode: Some(UpdateMode::RewriteColumns),
@@ -589,6 +596,13 @@ fn test_data_overlay_conflicts() {
 
     let fragment0 = Fragment::new(0);
     let fragment1 = Fragment::new(1);
+    // Fields 0 and 1; our overlay covers field 0.
+    let two_field_schema =
+        lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("a", arrow_schema::DataType::Int32, true),
+            arrow_schema::Field::new("b", arrow_schema::DataType::Int32, true),
+        ]))
+        .unwrap();
 
     // Each case is checked against our overlay on fragment 1.
     let cases: Vec<(Operation, ConflictResult)> = vec![
@@ -653,6 +667,22 @@ fn test_data_overlay_conflicts() {
             Retryable,
         ),
         (Operation::Restore { version: 1 }, NotCompatible),
+        // A projection that keeps our overlaid field 0 is compatible; one that
+        // drops it would leave our overlay covering a missing field.
+        (
+            Operation::Project {
+                schema: two_field_schema.clone(),
+                preserves_nullability: true,
+            },
+            Compatible,
+        ),
+        (
+            Operation::Project {
+                schema: two_field_schema.project_by_ids(&[1], true),
+                preserves_nullability: true,
+            },
+            Retryable,
+        ),
         // Overwrite/Restore replace the dataset, and UpdateMemWalState does
         // not rebase against data operations — all hard conflicts.
         (
@@ -666,6 +696,7 @@ fn test_data_overlay_conflicts() {
         ),
         (
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![],
             },
             NotCompatible,
@@ -803,6 +834,7 @@ fn test_update_conflicts_with_data_overlay() {
             updated_fragments: vec![Fragment::new(1)],
             new_fragments,
             fields_modified: vec![0],
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode,
@@ -921,22 +953,49 @@ fn test_update_conflicts_with_data_overlay() {
     }
 }
 
-/// An append is the one value-write that rebases across a committed merge,
-/// so a merge introducing a required field must claim: the append's
-/// fragments omit the new column and its rows would read as null. A merge
-/// without the claim keeps the long-standing behavior of appends passing
-/// over nullable column adds. The reverse order conflicts regardless of
-/// the claim, because a rebasing merge rewrites the whole fragment list.
-#[test]
-fn test_merge_claim_blocks_stale_append() {
+/// Appends can cross merges only if their written fields survive and no
+/// nullability claim is invalidated. A projection can drop written fields,
+/// since it writes no replacement data. A merge in the reverse order always
+/// conflicts because it replaces the fragment list.
+#[rstest::rstest]
+#[case::surviving_fields(vec![0, 1, 2], false)]
+#[case::removed_field(vec![0, 3], true)]
+#[case::removed_nested_field(vec![0, 1, 3], true)]
+#[case::unwritten_field(vec![0], false)]
+#[case::reserved_ids(vec![0, -2, -3, -4, -5], false)]
+fn test_schema_change_blocks_stale_append(
+    #[case] written_fields: Vec<i32>,
+    #[case] field_removed: bool,
+    #[values(false, true)] project: bool,
+) {
     for claims in [true, false] {
-        let merge = Operation::Merge {
-            fragments: vec![Fragment::new(0)],
-            schema: lance_core::datatypes::Schema::default(),
-            preserves_nullability: !claims,
+        let schema = (&Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new_struct("s", vec![Field::new("x", DataType::Int64, true)], true),
+        ]))
+            .try_into()
+            .unwrap();
+        let schema_change = if project {
+            Operation::Project {
+                schema,
+                preserves_nullability: !claims,
+            }
+        } else {
+            Operation::Merge {
+                fragments: vec![Fragment::new(0)],
+                schema,
+                preserves_nullability: !claims,
+            }
         };
         let append = Operation::Append {
-            fragments: vec![Fragment::new(1)],
+            fragments: vec![Fragment {
+                files: vec![DataFile::new_legacy_from_fields(
+                    "append.lance",
+                    written_fields.clone(),
+                    None,
+                )],
+                ..Fragment::new(1)
+            }],
         };
 
         let mut append_rebase = TransactionRebase {
@@ -955,15 +1014,15 @@ fn test_merge_claim_blocks_stale_append() {
             reuse: Default::default(),
             staged_replay: false,
         };
-        let result = append_rebase.check_txn(&Transaction::new(0, merge.clone(), None), 1);
+        let result = append_rebase.check_txn(&Transaction::new(0, schema_change.clone(), None), 1);
         assert_eq!(
             matches!(result, Err(Error::RetryableCommitConflict { .. })),
-            claims,
-            "append rebasing over merge/claims={claims}: got {result:?}"
+            claims || (!project && field_removed),
+            "append rebasing over {schema_change}/claims={claims}: got {result:?}"
         );
 
-        let mut merge_rebase = TransactionRebase {
-            transaction: Transaction::new(0, merge, None),
+        let mut schema_rebase = TransactionRebase {
+            transaction: Transaction::new(0, schema_change.clone(), None),
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::from_iter([0]),
             affected_rows: None,
@@ -978,10 +1037,11 @@ fn test_merge_claim_blocks_stale_append() {
             reuse: Default::default(),
             staged_replay: false,
         };
-        let result = merge_rebase.check_txn(&Transaction::new(0, append, None), 1);
-        assert!(
+        let result = schema_rebase.check_txn(&Transaction::new(0, append, None), 1);
+        assert_eq!(
             matches!(result, Err(Error::RetryableCommitConflict { .. })),
-            "merge rebasing over append/claims={claims}: got {result:?}"
+            claims || !project,
+            "{schema_change} rebasing over append/claims={claims}: got {result:?}"
         );
     }
 }
@@ -1008,6 +1068,7 @@ fn test_non_null_claim_barrier() {
                 updated_fragments: vec![Fragment::new(0)],
                 new_fragments: vec![],
                 fields_modified: vec![0],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(UpdateMode::RewriteColumns),
@@ -1095,6 +1156,7 @@ fn test_column_rewrite_conflicts_with_a_projection_that_dropped_its_field(
         updated_fragments: vec![Fragment::new(0)],
         new_fragments: vec![],
         fields_modified: vec![field_modified],
+        mem_wal_dir_id: None,
         compacted_sstables: Vec::new(),
         fields_for_preserving_frag_bitmap: vec![],
         update_mode: Some(UpdateMode::RewriteColumns),
@@ -1165,6 +1227,7 @@ async fn test_data_overlay_finish_conflicts_with_row_moving_update(
         removed_fragment_ids: vec![],
         new_fragments: vec![moved_fragment],
         fields_modified: vec![],
+        mem_wal_dir_id: None,
         compacted_sstables: Vec::new(),
         fields_for_preserving_frag_bitmap: vec![],
         update_mode: Some(UpdateMode::RewriteRows),
@@ -1239,6 +1302,8 @@ fn test_create_index_rebase_prunes_updated_field_coverage(
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     let mut rebase = TransactionRebase {
         transaction: Transaction::new(
@@ -1270,6 +1335,7 @@ fn test_create_index_rebase_prunes_updated_field_coverage(
             removed_fragment_ids: vec![],
             new_fragments: vec![],
             fields_modified: vec![field_modified],
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
@@ -1288,6 +1354,204 @@ fn test_create_index_rebase_prunes_updated_field_coverage(
         new_indices[0].fragment_bitmap.as_ref().unwrap(),
         &RoaringBitmap::from_iter(expected_fragment_ids)
     );
+}
+
+const KEYED: i32 = 0;
+const CARRIED: i32 = 1;
+const UNRELATED: i32 = 2;
+
+/// Released writers repeat each carried column at the end of `fields`;
+/// the keys-only shape lists it in `covering_fields` alone.
+#[derive(Debug, Clone, Copy)]
+enum CoveringShape {
+    Suffix,
+    KeysOnly,
+}
+
+impl CoveringShape {
+    fn index(self) -> IndexMetadata {
+        IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "covered".to_string(),
+            fields: match self {
+                Self::Suffix => vec![KEYED, CARRIED],
+                Self::KeysOnly => vec![KEYED],
+            },
+            covering_fields: vec![CARRIED],
+            dataset_version: 1,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0])),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            clustering_id: None,
+            metadata: Default::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CoveringConflictSite {
+    /// The index, on a tagged table, over an `alter_columns` cast.
+    IndexOverCast,
+    IndexOverUntaggedCast,
+    IndexOverProjection,
+    IndexOverDataReplacement,
+    DataReplacementOverIndex,
+    IndexOverFoldedOverlay,
+}
+
+impl CoveringConflictSite {
+    /// Whether the rebase retries, or withdraws the index's coverage of
+    /// fragment 0, when the concurrent change reaches field `changed`.
+    fn invalidates(self, index: IndexMetadata, changed: i32) -> bool {
+        let schema = lance_core::datatypes::Schema::try_from(&Schema::new(
+            ["keyed", "carried", "unrelated"]
+                .map(|name| Field::new(name, DataType::Int32, false))
+                .to_vec(),
+        ))
+        .unwrap();
+        let rebase_of = |ours: Operation| TransactionRebase {
+            transaction: Transaction::new(1, ours, None),
+            initial_fragments: HashMap::new(),
+            modified_fragment_ids: HashSet::new(),
+            affected_rows: None,
+            frag_reuse_base: None,
+            conflicting_mem_wal_compacted_sstables: Vec::new(),
+            current_lineage: None,
+            untagged_reuse: None,
+            current_live: None,
+            current_schema: None,
+            read_fragments: None,
+            read_schema: None,
+            reuse: Default::default(),
+            staged_replay: false,
+        };
+        let create_index = Operation::CreateIndex {
+            new_indices: vec![index],
+            removed_indices: vec![],
+        };
+        let replacement = Operation::DataReplacement {
+            replacements: vec![DataReplacementGroup(
+                0,
+                DataFile::new_legacy_from_fields("replaced.lance", vec![changed], None),
+            )],
+        };
+        let (mut rebase, theirs) = match self {
+            Self::IndexOverCast | Self::IndexOverUntaggedCast | Self::IndexOverProjection => {
+                let mut rebase = rebase_of(create_index);
+                let history = IndexMetadata {
+                    uuid: Uuid::new_v4(),
+                    name: FRAG_REUSE_INDEX_NAME.to_string(),
+                    fields: vec![],
+                    covering_fields: vec![],
+                    dataset_version: 1,
+                    fragment_bitmap: None,
+                    index_details: None,
+                    index_version: 1,
+                    created_at: None,
+                    base_id: None,
+                    files: None,
+                    clustering_id: None,
+                    metadata: Default::default(),
+                };
+                if matches!(self, Self::IndexOverCast) {
+                    rebase.current_lineage = Some(TaggedLineage::new(&history, None));
+                }
+                rebase.read_schema = Some(schema.clone());
+                let kept: Vec<i32> = [KEYED, CARRIED, UNRELATED]
+                    .into_iter()
+                    .filter(|field| *field != changed)
+                    .collect();
+                // A cast moves the column to a new field id; a projection drops it.
+                let schema = schema.project_by_ids(&kept, true);
+                let change = if matches!(self, Self::IndexOverProjection) {
+                    Operation::Project {
+                        schema,
+                        preserves_nullability: true,
+                    }
+                } else {
+                    Operation::Merge {
+                        fragments: vec![],
+                        schema,
+                        preserves_nullability: true,
+                    }
+                };
+                (rebase, change)
+            }
+            Self::IndexOverDataReplacement => (rebase_of(create_index), replacement),
+            Self::DataReplacementOverIndex => (rebase_of(replacement), create_index),
+            Self::IndexOverFoldedOverlay => {
+                let mut rebase = rebase_of(create_index);
+                rebase.untagged_reuse = Some(Box::new(UntaggedReuse {
+                    groups: HashSet::from([Arc::from([0u64])]),
+                    sources: HashMap::from([(7, Arc::from([0u64]))]),
+                    manifest: Arc::new(lance_table::format::Manifest::new(
+                        schema,
+                        Arc::new(vec![]),
+                        Default::default(),
+                        HashMap::new(),
+                    )),
+                }));
+                let mut overlaid = Fragment::new(0);
+                overlaid.overlays = vec![lance_table::format::overlay::DataOverlayFile {
+                    data_file: DataFile::new_legacy_from_fields(
+                        "overlay.lance",
+                        vec![changed],
+                        None,
+                    ),
+                    coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+                    committed_version: 2,
+                }];
+                let compaction = Operation::Rewrite {
+                    groups: vec![RewriteGroup {
+                        old_fragments: vec![overlaid],
+                        new_fragments: vec![Fragment::new(7)],
+                    }],
+                    rewritten_indices: vec![],
+                    frag_reuse_index: None,
+                };
+                (rebase, compaction)
+            }
+        };
+        match rebase.check_txn(&Transaction::new(1, theirs, None), 2) {
+            Err(Error::RetryableCommitConflict { .. }) => true,
+            Err(error) => panic!("{self:?}: {error}"),
+            Ok(()) => match &rebase.transaction.operation {
+                Operation::CreateIndex { new_indices, .. } => {
+                    !new_indices[0].fragment_bitmap.as_ref().unwrap().contains(0)
+                }
+                _ => false,
+            },
+        }
+    }
+}
+
+/// A concurrent change to a new index's keyed or carried column makes
+/// the rebase retry or withdraw coverage, whether or not `fields`
+/// repeats the carried column; a change to another column does not.
+#[rstest::rstest]
+#[case::index_over_cast(CoveringConflictSite::IndexOverCast)]
+#[case::index_over_untagged_cast(CoveringConflictSite::IndexOverUntaggedCast)]
+#[case::index_over_projection(CoveringConflictSite::IndexOverProjection)]
+#[case::index_over_data_replacement(CoveringConflictSite::IndexOverDataReplacement)]
+#[case::data_replacement_over_index(CoveringConflictSite::DataReplacementOverIndex)]
+#[case::index_over_folded_overlay(CoveringConflictSite::IndexOverFoldedOverlay)]
+fn test_covering_dependency(#[case] site: CoveringConflictSite) {
+    for shape in [CoveringShape::Suffix, CoveringShape::KeysOnly] {
+        for (column, changed, invalidates) in [
+            ("keyed", KEYED, true),
+            ("carried", CARRIED, true),
+            ("unrelated", UNRELATED, false),
+        ] {
+            assert_eq!(
+                site.invalidates(shape.index(), changed),
+                invalidates,
+                "{site:?}, {shape:?}: a change to the {column} column"
+            );
+        }
+    }
 }
 
 /// A restore rewinds schema and field metadata with the rest of the
@@ -1434,6 +1698,7 @@ async fn test_conflicts_data_replacement() {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![],
                 fields_modified: vec![2],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(RewriteColumns),
@@ -1453,6 +1718,7 @@ async fn test_conflicts_data_replacement() {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![Fragment::new(5)],
                 fields_modified: vec![2],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(RewriteColumns),
@@ -1471,6 +1737,7 @@ async fn test_conflicts_data_replacement() {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![],
                 fields_modified: vec![1],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(RewriteColumns),
@@ -1489,6 +1756,7 @@ async fn test_conflicts_data_replacement() {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![Fragment::new(5)],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(RewriteRows),
@@ -1507,6 +1775,7 @@ async fn test_conflicts_data_replacement() {
                 removed_fragment_ids: vec![0],
                 new_fragments: vec![],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
@@ -1525,6 +1794,7 @@ async fn test_conflicts_data_replacement() {
                 removed_fragment_ids: vec![],
                 new_fragments: vec![Fragment::new(5)],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: Vec::new(),
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(RewriteRows),
@@ -1594,6 +1864,8 @@ async fn test_conflicts_data_replacement() {
                     created_at: None,
                     base_id: None,
                     files: None,
+                    clustering_id: None,
+                    metadata: Default::default(),
                 }],
                 removed_indices: vec![],
             },

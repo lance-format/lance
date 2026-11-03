@@ -23,7 +23,7 @@ use lance_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
 use lance_table::format::overlay::OverlayCoverage;
-use lance_table::format::overlay::staleness::overlay_affects_index;
+use lance_table::format::overlay::staleness::{field_affects_index, overlay_affects_index};
 use lance_table::format::pb::fragment_reuse_index_details::{InlineContent, Transition};
 use lance_table::system_index::frag_reuse::FragReuseVersion;
 use lance_table::system_index::frag_reuse::lineage::TaggedLineage;
@@ -70,7 +70,7 @@ pub struct TransactionRebase<'a> {
     /// The fragments and schema at the read version, kept for a CreateIndex
     /// so a concurrent `Merge` can be told which columns it rewrote in place
     /// and which fields it removed or retyped.
-    read_fragments: Option<Vec<Fragment>>,
+    read_fragments: Option<Arc<Vec<Fragment>>>,
     read_schema: Option<lance_core::datatypes::Schema>,
     /// For a `Rewrite` carrying a fragment reuse entry: what it adds relative
     /// to the entry at its read version (`RewriteReuseState`).
@@ -162,7 +162,7 @@ impl FragReuseBase {
 }
 
 async fn stored_frag_reuse_entry(dataset: &Dataset) -> Result<Option<IndexMetadata>> {
-    Ok(crate::index::load_all_indices(dataset)
+    Ok(crate::index::loading::load_all_indices(dataset)
         .await?
         .iter()
         .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
@@ -220,9 +220,9 @@ fn supplies_values(operation: &Operation) -> bool {
     )
 }
 
-/// Whether an operation changes schema-level or per-field metadata. A merge
-/// carries the complete schema from its read version, so rebasing either
-/// operation over the other can discard one side's metadata changes.
+/// Whether an operation changes schema-level or per-field metadata. A merge or
+/// projection carries the complete schema from its read version, so rebasing
+/// either operation over the other can discard one side's metadata changes.
 fn updates_schema_or_field_metadata(operation: &Operation) -> bool {
     let Operation::UpdateConfig {
         schema_metadata_updates,
@@ -326,6 +326,64 @@ fn overlay_group_coverage(group: &DataOverlayGroup) -> RoaringBitmap {
     union
 }
 
+/// Refuse a concurrent transaction that could hand one of an allocating
+/// clustering submission's key field ids to another column.
+///
+/// A definition keys on field ids the writer resolved in `read_schema`, a
+/// snapshot that still used reusable ids. Until the allocation itself
+/// activates the non-reusable contract, a schema replacement in the window
+/// (an overwrite, a drop, a restore, or a merge that does not keep every read
+/// field under its id with the same name, parent and type) may reassign an id,
+/// and a drop followed by a re-add with the same name and type hides that in
+/// the final shape. So the transaction, not the landing schema, is judged.
+/// Appends, deletes, updates, index builds and additive merges rebase as usual.
+pub(crate) fn refuse_field_identity_change(
+    read_schema: &lance_core::datatypes::Schema,
+    other_transaction: &Transaction,
+    other_version: u64,
+) -> Result<()> {
+    let may_change_identity = match &other_transaction.operation {
+        Operation::Overwrite { .. } | Operation::Project { .. } | Operation::Restore { .. } => true,
+        Operation::Merge { schema, .. } => !keeps_every_field_identity(read_schema, schema),
+        _ => false,
+    };
+    if may_change_identity {
+        return Err(Error::incompatible_transaction_source(
+            format!(
+                "This UpdateConfig allocates clustering definitions keyed on field ids read \
+                 before concurrent transaction {} at version {other_version}, which may have \
+                 given one of those ids to another column; reload the table and rebuild the list.",
+                other_transaction.operation
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Every field of `read` is still the same field under the same id in
+/// `landing`: same name, logical type and parent. Since every read field is
+/// checked, a parent's own identity covers the path above it, and a child's
+/// covers the shape below. Added fields are fine; a missing, renamed, moved
+/// or retyped one is not, while metadata and nullability edits are. One map
+/// of the landing fields keeps this linear on wide schemas.
+fn keeps_every_field_identity(
+    read: &lance_core::datatypes::Schema,
+    landing: &lance_core::datatypes::Schema,
+) -> bool {
+    let landed: HashMap<i32, &lance_core::datatypes::Field> = landing
+        .fields_pre_order()
+        .map(|field| (field.id, field))
+        .collect();
+    read.fields_pre_order().all(|field| {
+        landed.get(&field.id).is_some_and(|other| {
+            other.name == field.name
+                && other.logical_type == field.logical_type
+                && other.parent_id == field.parent_id
+        })
+    })
+}
+
 fn wrong_operation_err(op: &Operation) -> Error {
     Error::internal(format!("function called against a wrong operation: {}", op))
 }
@@ -376,11 +434,12 @@ impl UntaggedReuse {
     ) -> bool {
         for group in groups {
             for index in indices.iter_mut() {
+                let dependency_fields = index.dependency_fields();
                 let folded = group.old_fragments.iter().any(|fragment| {
                     fragment.overlays.iter().any(|overlay| {
                         overlay_affects_index(
                             overlay,
-                            &index.fields,
+                            &dependency_fields,
                             index.dataset_version,
                             &self.manifest.schema,
                         )

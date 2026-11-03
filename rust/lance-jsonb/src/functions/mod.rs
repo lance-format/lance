@@ -4,4 +4,6 @@
 // Adapted from databendlabs/jsonb at commit fba895c5ebe77ce2539e187f9c652f51cbf195c3.
 
 mod path;
+
+pub use path::ArrayElementIterator;
 mod scalar;

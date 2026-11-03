@@ -1,108 +1,56 @@
 ---
-title: Quickstart
-description: Get started with Lance - create datasets, convert from Parquet, and learn the basics
+title: Getting Started with Lance
+description: Choose the right entry point in the Lance stack — LanceDB, Python/Rust/Java SDKs, or SQL and compute engines
 ---
 
-# Getting Started with Lance Tables
+# Getting Started with Lance
 
-This quickstart guide will walk you through the core features of Lance including creating datasets, versioning, and vector search.
+Lance is an open lakehouse and columnar table format for multimodal AI. Every tool in the Lance ecosystem reads and writes the same on-disk format, so you can start at the layer that matches your application and interoperate across layers without copying or converting data.
 
-By the end of this tutorial, you'll be able to create Lance datasets from pandas DataFrames and convert existing Parquet files to Lance format. You'll also understand the basic workflow for working with Lance datasets and be prepared to explore advanced features like versioning and vector search.
+## The Lance Stack
 
-## Install the Python SDK
-
-The easiest way to get started with Lance is via our Python SDK `pylance`:
-
-```bash
-pip install pylance
+```text
++---------------------------------------------------------------------+
+| 1. Database                LanceDB (Embedded & Distributed)         |
++---------------------------------------------------------------------+
+| 2. Language SDKs           Python (PyLance), Rust, Java             |
++---------------------------------------------------------------------+
+| 3. Query & Compute Engines Spark, DuckDB, Trino, DataFusion, Ray    |
++=====================================================================+
+|                    Lance Open Format & Catalog Spec                 |
+|        (Columnar Files, ACID Versioning, Blob v2, Indexes)          |
++---------------------------------------------------------------------+
 ```
 
-For the latest features and bug fixes, you can install the preview version:
+## Choose Your Entry Point
 
-=== "pip"
+### 1. Database — LanceDB
 
-    ```bash
-    pip install --pre --extra-index-url https://pypi.fury.io/lance-format pylance
-    ```
+Choose **LanceDB** when you are building an AI application, RAG pipeline, or search service and want table management, vector search, BM25 full-text search, and hybrid reranking out of the box.
 
-=== "uv"
+- **[LanceDB Quickstart](lancedb.md)** — Create a table, run vector and keyword search, update rows, and time travel in 5 minutes.
+- **[LanceDB Documentation ↗](https://docs.lancedb.com/)** — Embeddings, hybrid reranking, TypeScript/Python/Rust database clients, and Cloud/Enterprise deployments.
 
-    ```bash
-    uv venv
-    uv pip install --prerelease allow --index https://pypi.fury.io/lance-format pylance
+### 2. Language SDKs — Python, Rust, and Java
 
-    # To add to pyproject.toml, just do:
-    uv add --prerelease allow --index https://pypi.fury.io/lance-format pylance
-    ```
+Choose a **Language SDK** when you want direct, low-level control over Lance datasets, fragments, custom Arrow schemas, multimodal [Blob v2 columns](../guide/blob.md), or [distributed write transactions](../guide/distributed_write.md).
 
-!!! note
-    Preview releases receive the same level of testing as regular releases.
+| Language | Package | Quickstart | API Reference |
+|---|---|---|---|
+| **Python** | `pylance` | **[Python (PyLance) Quickstart](pylance.md)** · [Versioning](versioning.md) · [Vector Search](vector-search.md) · [Full-Text Search](full-text-search.md) | [Python API Docs ↗](https://lance-format.github.io/lance-python-doc) |
+| **Rust** | `lance` | **[Rust Quickstart](rust.md)** | [docs.rs/lance ↗](https://docs.rs/lance/latest/lance) |
+| **Java** | `org.lance:lance-core` | **[Java Quickstart](java.md)** | [Javadoc ↗](https://www.javadoc.io/doc/org.lance/lance-core/latest/index.html) |
 
-## Set Up Your Environment
+### 3. Query & Compute Engines
 
-First, let's import the necessary libraries:
+Choose a **Query or Compute Engine** when you want to run distributed SQL, lakehouse ETL, analytics, or large-scale ML training over Lance tables alongside existing data pipelines.
 
-```python
-import shutil
-import lance
-import numpy as np
-import pandas as pd
-import pyarrow as pa
-```
+| Engine | Typical Workload | Get Started |
+|---|---|---|
+| **Apache Spark** | Distributed SQL, DDL/DML, and batch ETL with Spark SQL and PySpark | **[Spark Quickstart](spark.md)** · [Spark Guide](../guide/spark/index.md) |
+| **DuckDB / Trino / DataFusion** | Interactive SQL analytics and federated queries over Lance datasets | [DataFusion](../integrations/datafusion.md) · [All SQL Integrations](../integrations/index.md#query-engines-and-sql) |
+| **Ray / PyTorch / Flink** | Distributed data processing, streaming ingestion, and ML training loaders | [PyTorch](../integrations/pytorch.md) · [All ML & Stream Integrations](../integrations/index.md#machine-learning-and-ai) |
 
-## Create Your First Dataset
+## One Format Across Every Layer
 
-Lance is built on top of Apache Arrow, making it incredibly easy to work with pandas DataFrames and Arrow tables. You can create Lance datasets from various data sources including pandas DataFrames, Arrow tables, and existing Parquet files. Lance automatically handles the conversion and optimization for you.
-
-### Create a Simple Dataset
-
-You'll create a simple dataframe and then write it to Lance format. This demonstrates the basic workflow for creating Lance datasets.
-
-Create a simple dataframe:
-
-```python
-df = pd.DataFrame({"a": [5]})
-df
-```
-
-Now you'll write this dataframe to Lance format and verify the data was saved correctly:
-
-```python
-shutil.rmtree("/tmp/test.lance", ignore_errors=True)
-
-dataset = lance.write_dataset(df, "/tmp/test.lance")
-dataset.to_table().to_pandas()
-```
-
-### Convert Your Existing Parquet Files
-
-You'll convert an existing Parquet file to Lance format. This shows how to migrate your existing data to Lance.
-
-First, you'll create a Parquet file and then convert it to Lance:
-
-```python
-shutil.rmtree("/tmp/test.parquet", ignore_errors=True)
-shutil.rmtree("/tmp/test.lance", ignore_errors=True)
-
-tbl = pa.Table.from_pandas(df)
-pa.dataset.write_dataset(tbl, "/tmp/test.parquet", format='parquet')
-
-parquet = pa.dataset.dataset("/tmp/test.parquet")
-parquet.to_table().to_pandas()
-```
-
-Now you'll convert the Parquet dataset to Lance format in a single line:
-
-```python
-dataset = lance.write_dataset(parquet, "/tmp/test.lance")
-
-# Make sure it's the same
-dataset.to_table().to_pandas()
-```
-
-## Next Steps
-
-Now that you've mastered the basics of creating Lance datasets, here's what you can explore next:
-
-- **[Versioning Your Datasets with Lance](versioning.md)** - Learn how to track changes over time with native versioning
-- **[Vector Indexing and Vector Search With Lance](vector-search.md)** - Build high-performance vector search capabilities with ANN indices
+Because all layers share the [Lance format specification](../format/index.md), you can mix tools freely in a single pipeline — for example, ingest and backfill features at scale with **Apache Spark**, build vector and full-text indexes with the **Python or Rust SDK**, and serve low-latency hybrid queries from **LanceDB**.

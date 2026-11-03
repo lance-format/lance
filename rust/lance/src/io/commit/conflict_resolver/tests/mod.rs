@@ -136,6 +136,7 @@ async fn apply_deletion(
         dataset.manifest.version,
         &current_deletions,
         dataset.object_store.as_ref(),
+        0,
     )
     .await
     .unwrap();

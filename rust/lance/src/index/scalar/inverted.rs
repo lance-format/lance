@@ -822,10 +822,14 @@ pub(crate) fn transform_fts_document_stream(
             .column_by_name(&resolved.root_column)
             .or_else(|| batch.column_by_name(VALUE_COLUMN_NAME))
             .expect("FTS document input schema was validated");
-        let documents = resolved
+        let mut documents = resolved
             .documents_from_array(source, batch.num_rows())
             .map_err(DataFusionError::from)?;
         let input_row_ids = batch[ROW_ID].as_primitive::<arrow_array::types::UInt64Type>();
+        // The row-ID validity bitmap can carry the scan's selection vector.
+        if input_row_ids.null_count() > 0 {
+            documents.retain(|document| input_row_ids.is_valid(document.row_index));
+        }
         let texts =
             StringArray::from_iter_values(documents.iter().map(|document| document.text.as_str()));
         let row_ids = UInt64Array::from_iter_values(
@@ -938,10 +942,10 @@ pub(crate) async fn finalize_segment_files_if_needed(
 fn single_segment_keeps_row_addresses(
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
     uuid: &Uuid,
-    has_remapped_source_coverage: bool,
+    source_coverage_moved: bool,
 ) -> bool {
     use crate::index::frag_reuse::SegmentRemappingPlan;
-    if has_remapped_source_coverage {
+    if source_coverage_moved {
         return false;
     }
     match staged.and_then(|plans| plans.get(uuid)) {
@@ -989,7 +993,7 @@ pub(crate) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
-    has_remapped_source_coverage: bool,
+    source_coverage_moved: bool,
 ) -> Result<IndexMetadata> {
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
@@ -1018,7 +1022,7 @@ pub(crate) async fn merge_segments(
     load_segment_details(dataset, &resolved.canonical_path, &segments).await?;
 
     if let [segment] = segments.as_slice()
-        && single_segment_keeps_row_addresses(staged, &segment.uuid, has_remapped_source_coverage)
+        && single_segment_keeps_row_addresses(staged, &segment.uuid, source_coverage_moved)
     {
         return promote_finalized_segment(dataset, segment, details).await;
     }
@@ -1061,13 +1065,21 @@ pub(crate) async fn merge_segments(
         source_indices.push(Arc::new(inverted_index.clone()));
     }
 
+    // Like the BTree merge, each source keeps only its rows still stored in the
+    // fragments it covers, so a stale posting for a row that moved into another
+    // source's fragment is not carried into the merged segment.
+    let segment_refs = segments.iter().collect::<Vec<_>>();
+    let (_, old_data_filters) =
+        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, false)
+            .await?;
+
     let new_uuid = Uuid::new_v4();
     let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
     let created_index = InvertedIndex::merge_segments(
         &source_indices,
         empty_inverted_update_stream(dataset, &resolved)?,
         &new_store,
-        None,
+        &old_data_filters,
         lance_index::progress::noop_progress(),
     )
     .await?;
@@ -1081,6 +1093,8 @@ pub(crate) async fn merge_segments(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(index_files_to_table(created_index.files)),
+        clustering_id: None,
+        metadata: Default::default(),
         ..segments[0].clone()
     })
 }
@@ -1356,6 +1370,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let details =
             normalize_inverted_details(&metadata, InvertedIndexDetails::default()).unwrap();
@@ -1380,6 +1396,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let details = InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
 
@@ -1472,7 +1490,8 @@ mod tests {
     async fn write_text_dataset(uri: &str, rows_per_fragment: usize, fragments: usize) -> Dataset {
         use lance_datagen::{BatchCount, RowCount, array, gen_batch};
         let reader = gen_batch()
-            .col("id", array::step::<arrow_array::types::Int32Type>())
+            // Named `i` so the fragment-reuse test helpers can label its rows.
+            .col("i", array::step::<arrow_array::types::Int32Type>())
             .col("text", array::random_sentence(4, 12, false))
             .into_reader_rows(
                 RowCount::from(rows_per_fragment as u64),
@@ -1675,5 +1694,192 @@ mod tests {
         let actual = fts_hits(&dataset, "text", &first_word).await;
         assert!(!expected.is_empty());
         assert_eq!(expected, actual);
+    }
+
+    /// Under a tagged fragment-reuse history a staged segment whose fragments
+    /// no rewrite touched keeps its row addresses, so merging it alone still
+    /// promotes it under its own uuid; a segment over rewritten fragments is
+    /// translated into a new one.
+    #[tokio::test]
+    async fn test_single_intermediate_promotion_under_tagged_history() {
+        use crate::index::frag_reuse_reader::tests::{install, prepare_partition};
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_index::IndexType;
+        use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
+        use prost::Message;
+
+        for rewrite_indexed_fragments in [false, true] {
+            let test_dir = TempStrDir::default();
+            let mut dataset = write_text_dataset(&test_dir, 50, 4).await;
+            let fragment_ids = dataset
+                .get_fragments()
+                .iter()
+                .map(|fragment| fragment.id() as u32)
+                .collect::<Vec<_>>();
+            let (indexed, rewritten): (Vec<u32>, Vec<u32>) = if rewrite_indexed_fragments {
+                (fragment_ids[2..].to_vec(), fragment_ids[2..].to_vec())
+            } else {
+                (fragment_ids[2..].to_vec(), fragment_ids[..2].to_vec())
+            };
+            let segment = dataset
+                .create_index_builder(
+                    &["text"],
+                    IndexType::Inverted,
+                    &InvertedIndexParams::default(),
+                )
+                .name("text_idx".to_string())
+                .fragments(indexed.clone())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+
+            // Reference: the same rows in the same fragments, indexed over the
+            // same fragments through the same staged path, on an untagged
+            // table. Partial coverage is part of the scenario, so a full
+            // fresh index would not score the same.
+            let rows = dataset
+                .scan()
+                .project(&["i", "text"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let reference_dir = TempStrDir::default();
+            let mut reference = Dataset::write(
+                arrow_array::RecordBatchIterator::new(vec![Ok(rows.clone())], rows.schema()),
+                &reference_dir,
+                Some(crate::dataset::WriteParams {
+                    max_rows_per_file: 50,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let reference_segment = reference
+                .create_index_builder(
+                    &["text"],
+                    IndexType::Inverted,
+                    &InvertedIndexParams::default(),
+                )
+                .name("text_idx".to_string())
+                .fragments(indexed.clone())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            let reference_merged = reference
+                .merge_existing_index_segments(vec![reference_segment])
+                .await
+                .unwrap();
+            reference
+                .commit_existing_index_segments("text_idx", "text", vec![reference_merged])
+                .await
+                .unwrap();
+
+            // The rewrite replaces the manifest's fragment list with the
+            // destinations, so the fragments it did not touch are carried
+            // over and stay live.
+            let rewritten_ids = rewritten.iter().map(|id| *id as u64).collect::<Vec<_>>();
+            let (transition, mut destinations) =
+                prepare_partition(&dataset, &rewritten_ids, 10).await;
+            destinations.extend(
+                dataset
+                    .fragments()
+                    .iter()
+                    .filter(|fragment| !rewritten_ids.contains(&fragment.id))
+                    .cloned(),
+            );
+            let content = InlineContent {
+                legacy_versions: vec![],
+                transitions: vec![transition],
+            }
+            .encode_to_vec();
+            let reuse_index = install(&mut dataset, content, destinations, false).await;
+
+            let merged = dataset
+                .merge_existing_index_segments(vec![segment.clone()])
+                .await
+                .unwrap();
+            let index_dirs = dataset
+                .object_store
+                .read_dir(dataset.indices_dir())
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|dir| dir != &reuse_index.uuid.to_string())
+                .count();
+            if rewrite_indexed_fragments {
+                assert_ne!(
+                    merged.uuid, segment.uuid,
+                    "translated rows need a new segment"
+                );
+                assert_eq!(index_dirs, 2, "the staged segment and its rewrite");
+            } else {
+                assert_eq!(
+                    merged.uuid, segment.uuid,
+                    "untouched coverage keeps the uuid"
+                );
+                assert_eq!(index_dirs, 1, "no second index directory is written");
+            }
+
+            // Either way the committed index answers like the reference,
+            // compared by the `i` column since the rewrite changed row addresses.
+            dataset
+                .commit_existing_index_segments("text_idx", "text", vec![merged])
+                .await
+                .unwrap();
+            // A long word: short ones are mostly stop words and match nothing.
+            let texts = rows.column_by_name("text").unwrap().as_string::<i32>();
+            let probe = texts
+                .iter()
+                .flatten()
+                .flat_map(|text| text.split_whitespace())
+                .find(|word| word.len() >= 6)
+                .unwrap()
+                .to_string();
+            let expected = fts_hits_by_id(&reference, "text", &probe).await;
+            let actual = fts_hits_by_id(&dataset, "text", &probe).await;
+            assert!(!expected.is_empty());
+            assert_eq!(
+                expected, actual,
+                "rewrite_indexed_fragments={rewrite_indexed_fragments}"
+            );
+        }
+    }
+
+    /// FTS hits keyed by the `i` column rather than the row address, for
+    /// datasets whose rows were rewritten; ordered by score then id, scores
+    /// compared bit for bit.
+    async fn fts_hits_by_id(dataset: &Dataset, column: &str, terms: &str) -> Vec<(i32, u32)> {
+        use lance_index::scalar::FullTextSearchQuery;
+        let mut scan = dataset.scan();
+        scan.full_text_search(
+            FullTextSearchQuery::new(terms.to_string())
+                .with_column(column.to_string())
+                .unwrap()
+                .limit(Some(1_000_000)),
+        )
+        .unwrap();
+        scan.project(&["i"]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let ids = batch
+            .column_by_name("i")
+            .unwrap()
+            .as_primitive::<arrow_array::types::Int32Type>();
+        let scores = batch
+            .column_by_name(lance_index::scalar::inverted::SCORE_COL)
+            .unwrap()
+            .as_primitive::<arrow_array::types::Float32Type>();
+        let mut hits = ids
+            .values()
+            .iter()
+            .zip(scores.values())
+            .map(|(id, score)| (*id, score.to_bits()))
+            .collect::<Vec<_>>();
+        hits.sort_by(|a, b| {
+            f32::from_bits(b.1)
+                .total_cmp(&f32::from_bits(a.1))
+                .then(a.0.cmp(&b.0))
+        });
+        hits
     }
 }

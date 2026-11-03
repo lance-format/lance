@@ -23,7 +23,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateBases { .. } => {
                 let is_create_index =
                     matches!(transaction.operation, Operation::CreateIndex { .. });
-                let read_fragments = is_create_index.then(|| dataset.fragments().as_ref().clone());
+                let read_fragments = is_create_index.then(|| dataset.fragments().clone());
                 let read_schema = is_create_index.then(|| dataset.schema().clone());
                 let frag_reuse_base = match &transaction.operation {
                     Operation::CreateIndex { new_indices, .. }
@@ -248,7 +248,7 @@ impl<'a> TransactionRebase<'a> {
         if !matches!(self.transaction.operation, Operation::CreateIndex { .. }) {
             return Ok(());
         }
-        let indices = crate::index::load_all_indices(dataset).await?;
+        let indices = crate::index::loading::load_all_indices(dataset).await?;
         let Some(entry) = indices
             .iter()
             .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))
@@ -313,27 +313,66 @@ impl<'a> TransactionRebase<'a> {
         Ok(())
     }
 
-    /// Whether a version cleaned up from this attempt's window could hide a
-    /// change this CreateIndex must account for: it covers the source fragments
-    /// of a recorded deferred compaction, whose values must stay unchanged from
-    /// the build until that compaction read them, and its output's after.
-    /// Compactions before the build do not count: the index covers their
-    /// output under its own id.
-    pub(crate) fn needs_versions(&self, missing: &[u64]) -> bool {
+    /// Refuse gaps in the transaction history required to safely rebase.
+    pub(crate) fn check_missing_versions(
+        &self,
+        missing: &[u64],
+        latest_version: u64,
+    ) -> Result<()> {
+        if missing.is_empty() {
+            return Ok(());
+        }
+        // A missing transaction may have changed a source fragment or inserted
+        // the same keys without touching any shared fragment. Neither conflict
+        // check can establish safety across a gap.
+        if !self.modified_fragment_ids.is_empty()
+            || matches!(
+                &self.transaction.operation,
+                Operation::Update {
+                    inserted_rows_filter: Some(_),
+                    ..
+                }
+            )
+        {
+            return Err(Error::retryable_commit_conflict_source(
+                latest_version,
+                format!(
+                    "versions {missing:?} between transaction read version {} and latest \
+                     version {latest_version} were cleaned up, so {} cannot safely check \
+                     conflicts for existing fragments or inserted keys; retry the operation \
+                     on the latest version",
+                    self.transaction.read_version, self.transaction.operation
+                )
+                .into(),
+            ));
+        }
+
+        // Gaps can hide changes to the source fragments an index covers, or to
+        // their outputs after a deferred compaction. Compactions before the build
+        // do not count: the index covers their output under its own id.
         let (Some(reuse), Operation::CreateIndex { new_indices, .. }) =
             (&self.untagged_reuse, &self.transaction.operation)
         else {
-            return false;
+            return Ok(());
         };
-        !missing.is_empty()
-            && reuse.groups.iter().any(|sources| {
-                new_indices.iter().any(|index| {
-                    index
-                        .fragment_bitmap
-                        .as_ref()
-                        .is_none_or(|bitmap| sources.iter().any(|id| bitmap.contains(*id as u32)))
-                })
+        if reuse.groups.iter().any(|sources| {
+            new_indices.iter().any(|index| {
+                index
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_none_or(|bitmap| sources.iter().any(|id| bitmap.contains(*id as u32)))
             })
+        }) {
+            return Err(Error::retryable_commit_conflict_source(
+                latest_version,
+                format!(
+                    "versions {missing:?} were cleaned up, so this index cannot be carried \
+                     through the deferred compaction it covers; rebuild it"
+                )
+                .into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -357,7 +396,7 @@ async fn rewrite_reuse_state(
     } else {
         Cow::Borrowed(dataset)
     };
-    let read_entry = crate::index::load_all_indices(&read_version)
+    let read_entry = crate::index::loading::load_all_indices(&read_version)
         .await?
         .iter()
         .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)

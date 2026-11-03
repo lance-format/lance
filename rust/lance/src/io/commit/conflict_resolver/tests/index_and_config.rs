@@ -17,6 +17,8 @@ fn test_mem_wal_install_conflicts_with_merge() {
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     let column_index = IndexMetadata {
         uuid: uuid::Uuid::new_v4(),
@@ -110,6 +112,8 @@ fn test_create_index_conflicts_only_on_same_name() {
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     let index1 = IndexMetadata {
         uuid: uuid::Uuid::new_v4(),
@@ -185,6 +189,8 @@ fn test_create_index_conflicts_only_on_same_name() {
                     created_at: None,
                     base_id: None,
                     files: None,
+                    clustering_id: None,
+                    metadata: Default::default(),
                 }],
                 removed_indices: vec![],
             },
@@ -233,6 +239,8 @@ fn test_create_index_conflicts_with_concurrent_drop(
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     let drop_operation = Operation::CreateIndex {
         new_indices: vec![],
@@ -297,6 +305,8 @@ fn test_concurrent_index_drops_are_compatible() {
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     let drop_operation = Operation::CreateIndex {
         new_indices: vec![],
@@ -341,6 +351,8 @@ fn test_index_replacement_compatible_with_removing_disjoint_segment() {
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     let replaced = index(Uuid::new_v4());
     let concurrently_removed = index(Uuid::new_v4());
@@ -394,6 +406,8 @@ fn test_create_ngram_index_conflicts_with_overlapping_deferred_rewrite() {
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     let frag_reuse_index = IndexMetadata {
         uuid: Uuid::new_v4(),
@@ -407,6 +421,8 @@ fn test_create_ngram_index_conflicts_with_overlapping_deferred_rewrite() {
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     let rewrite = Transaction::new(
         1,
@@ -477,6 +493,8 @@ fn test_create_index_conflicts_with_deferred_rewrite_under_stable_row_ids() {
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     let frag_reuse_index = IndexMetadata {
         uuid: Uuid::new_v4(),
@@ -490,6 +508,8 @@ fn test_create_index_conflicts_with_deferred_rewrite_under_stable_row_ids() {
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
 
     // The rewrite's own `old_fragments` are what the SRID inference reads:
@@ -744,6 +764,7 @@ async fn test_add_bases_no_conflict_with_data_operations() {
             removed_fragment_ids: vec![],
             new_fragments: vec![],
             fields_modified: vec![],
+            mem_wal_dir_id: None,
             compacted_sstables: Vec::new(),
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,
@@ -896,6 +917,7 @@ fn test_compacted_sstables_conflict_lower_generation_fails() {
     let committed_txn = Transaction::new(
         0,
         Operation::UpdateMemWalState {
+            dir_id: String::new(),
             compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
         },
         None,
@@ -904,6 +926,7 @@ fn test_compacted_sstables_conflict_lower_generation_fails() {
     let to_commit_txn = Transaction::new(
         0,
         Operation::UpdateMemWalState {
+            dir_id: String::new(),
             compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
         },
         None,
@@ -942,6 +965,7 @@ fn test_compacted_sstables_conflict_equal_generation_fails() {
     let committed_txn = Transaction::new(
         0,
         Operation::UpdateMemWalState {
+            dir_id: String::new(),
             compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
         },
         None,
@@ -950,6 +974,7 @@ fn test_compacted_sstables_conflict_equal_generation_fails() {
     let to_commit_txn = Transaction::new(
         0,
         Operation::UpdateMemWalState {
+            dir_id: String::new(),
             compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
         },
         None,
@@ -989,6 +1014,7 @@ fn test_compacted_sstables_conflict_higher_generation_retryable() {
     let committed_txn = Transaction::new(
         0,
         Operation::UpdateMemWalState {
+            dir_id: String::new(),
             compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
         },
         None,
@@ -997,6 +1023,7 @@ fn test_compacted_sstables_conflict_higher_generation_retryable() {
     let to_commit_txn = Transaction::new(
         0,
         Operation::UpdateMemWalState {
+            dir_id: String::new(),
             compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
         },
         None,
@@ -1036,6 +1063,7 @@ fn test_compacted_sstables_different_shards_ok() {
     let committed_txn = Transaction::new(
         0,
         Operation::UpdateMemWalState {
+            dir_id: String::new(),
             compacted_sstables: vec![CompactedSsTable::new(shard1, 10)],
         },
         None,
@@ -1044,6 +1072,7 @@ fn test_compacted_sstables_different_shards_ok() {
     let to_commit_txn = Transaction::new(
         0,
         Operation::UpdateMemWalState {
+            dir_id: String::new(),
             compacted_sstables: vec![CompactedSsTable::new(shard2, 5)],
         },
         None,
@@ -1102,6 +1131,7 @@ fn test_update_mem_wal_state_vs_create_index_with_compacted_sstables() {
     let to_commit_txn = Transaction::new(
         0,
         Operation::UpdateMemWalState {
+            dir_id: String::new(),
             compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
         },
         None,
@@ -1135,6 +1165,7 @@ fn test_update_mem_wal_state_vs_create_index_with_compacted_sstables() {
     let to_commit_txn_higher = Transaction::new(
         0,
         Operation::UpdateMemWalState {
+            dir_id: String::new(),
             compacted_sstables: vec![CompactedSsTable::new(shard, 15)],
         },
         None,
@@ -1189,6 +1220,7 @@ fn test_create_index_vs_update_mem_wal_state_rebase() {
     let committed_txn = Transaction::new(
         0,
         Operation::UpdateMemWalState {
+            dir_id: String::new(),
             compacted_sstables: vec![CompactedSsTable::new(shard, 10)],
         },
         None,

@@ -186,9 +186,8 @@ impl<'a> TransactionRebase<'a> {
                     }
                     Ok(())
                 }
-                // Merge, reserve, and project don't change row ids. The MemWAL
-                // index is the exception: its install validates schema-dependent
-                // state, which a concurrent schema change invalidates.
+                // Merge preserves row ids. The MemWAL index's install validates
+                // schema-dependent state, which a concurrent schema change invalidates.
                 Operation::Merge {
                     fragments, schema, ..
                 } => {
@@ -196,13 +195,11 @@ impl<'a> TransactionRebase<'a> {
                         return Err(self.retryable_conflict_err(other_transaction, other_version));
                     }
                     // A merge that removed or retyped a field our index keys
-                    // on (an `alter_columns` cast rewrites the column under a
-                    // new field id) leaves the index describing a column that
-                    // no longer exists on a tagged table's destinations; the
-                    // build is redone against the new field.
-                    if self.current_lineage.is_some()
-                        && let Some(read_schema) = self.read_schema.as_ref()
-                    {
+                    // on or carries (an `alter_columns` cast rewrites the
+                    // column under a new field id) leaves the index describing
+                    // a column that no longer exists; the build is redone
+                    // against the new field, regardless of fragment reuse history.
+                    if let Some(read_schema) = self.read_schema.as_ref() {
                         let gone: HashSet<i32> = read_schema
                             .fields_pre_order()
                             .filter(|field| {
@@ -212,10 +209,12 @@ impl<'a> TransactionRebase<'a> {
                             })
                             .map(|field| field.id)
                             .collect();
-                        if new_indices
-                            .iter()
-                            .any(|index| index.fields.iter().any(|field| gone.contains(field)))
-                        {
+                        if new_indices.iter().any(|index| {
+                            index
+                                .dependency_fields()
+                                .iter()
+                                .any(|field| gone.contains(field))
+                        }) {
                             return Err(self.retryable_conflict_err(other_transaction, other_version));
                         }
                     }
@@ -227,7 +226,7 @@ impl<'a> TransactionRebase<'a> {
                     // a fragment that did not exist then (a destination the
                     // rewrite produced afterwards) shows an in-place rewrite
                     // by a tombstoned field in its files, and is then treated
-                    // as rewritten in every indexed field.
+                    // as rewritten in every dependency field.
                     if let (Some(lineage), Some(live), Some(read_fragments)) = (
                         self.current_lineage.as_ref(),
                         self.current_live.as_ref(),
@@ -240,10 +239,10 @@ impl<'a> TransactionRebase<'a> {
                         );
                         let read_ids: HashSet<u64> =
                             read_fragments.iter().map(|fragment| fragment.id).collect();
-                        let every_indexed: Vec<u32> = new_indices
+                        let every_dependency_field: Vec<u32> = new_indices
                             .iter()
-                            .flat_map(|index| index.fields.iter())
-                            .filter_map(|field| u32::try_from(*field).ok())
+                            .flat_map(|index| index.dependency_fields().into_owned())
+                            .filter_map(|field| u32::try_from(field).ok())
                             .collect();
                         rewrites.extend(
                             fragments
@@ -257,7 +256,7 @@ impl<'a> TransactionRebase<'a> {
                                         })
                                     })
                                 })
-                                .map(|fragment| (fragment.id, every_indexed.clone())),
+                                .map(|fragment| (fragment.id, every_dependency_field.clone())),
                         );
                         Transaction::withdraw_in_place_rewrites(
                             new_indices,
@@ -270,7 +269,21 @@ impl<'a> TransactionRebase<'a> {
                     Ok(())
                 }
                 Operation::ReserveFragments { .. } => Ok(()),
-                Operation::Project { .. } => Ok(()),
+                // A projection removes existing indices on dropped fields.
+                // An index built before it must not reintroduce those dependencies.
+                Operation::Project { schema, .. } => {
+                    if new_indices.iter().any(|index| {
+                        !is_system_index(index)
+                            && index
+                                .dependency_fields()
+                                .iter()
+                                .any(|field| schema.field_by_id(*field).is_none())
+                    }) {
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
                 // Should be compatible with rewrite if it didn't move the rows
                 // we indexed. If it did, we could retry.
                 // TODO: this will change with stable row ids.
@@ -293,17 +306,26 @@ impl<'a> TransactionRebase<'a> {
                     // the rewritten rows under their old fragments. On an untagged table
                     // the remap was deferred if the rewrite carries a reuse update
                     // (visible only in the process that committed it) or the latest
-                    // reuse index records it.
+                    // reuse index records it. On a stable-row-id table only the latest
+                    // reuse index counts: a cleanup there may have trimmed the record
+                    // since, leaving an index built before the rewrite nothing to
+                    // translate through.
                     // A frag_reuse_index cleanup is checked against the latest entry in
                     // `finish_create_index`. A tagged entry (an in-process rewrite on a
                     // tagged history) takes the durable-evidence path below instead.
-                    let deferred = frag_reuse_index
+                    let is_recorded = self
+                        .untagged_reuse
                         .as_ref()
-                        .is_some_and(|entry| !is_tagged(entry))
-                        || self
-                            .untagged_reuse
-                            .as_ref()
-                            .is_some_and(|reuse| reuse.records(groups));
+                        .is_some_and(|reuse| reuse.records(groups));
+                    let has_stable_row_ids = self
+                        .untagged_reuse
+                        .as_ref()
+                        .is_some_and(|reuse| reuse.manifest.uses_stable_row_ids());
+                    let deferred = is_recorded
+                        || (!has_stable_row_ids
+                            && frag_reuse_index
+                                .as_ref()
+                                .is_some_and(|entry| !is_tagged(entry)));
                     if deferred {
                         if let Some(reuse) = &self.untagged_reuse
                             && !reuse.withdraw_folded_overlays(groups, new_indices)
@@ -340,8 +362,8 @@ impl<'a> TransactionRebase<'a> {
                             .iter()
                             .any(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
                         {
-                            // this should not happen today since we don't support committing
-                            // a mixture of frag_reuse_index and other indices.
+                            // A frag_reuse_index replacement mixed with other indices is a
+                            // shape this resolver does not reason about, so refuse it.
                             if new_indices.len() != 1 || removed_indices.len() != 1 {
                                 return Err(self
                                     .incompatible_conflict_err(other_transaction, other_version));
@@ -415,8 +437,8 @@ impl<'a> TransactionRebase<'a> {
                 Operation::UpdateConfig { .. } => Ok(()),
                 Operation::DataReplacement { replacements } => {
                     // A data replacement only conflicts if it is updating a field the
-                    // index depends on -- whether keyed on or merely carried, since
-                    // `fields` lists both (see `IndexMetadata::covering_fields`).
+                    // index depends on -- whether keyed on or merely carried (see
+                    // `IndexMetadata::dependency_fields`).
                     // On a tagged table the replaced column's coverage is
                     // withdrawn along the lineage instead, like the Update arm.
                     if let (Some(lineage), Some(live), Some(schema)) = (
@@ -438,13 +460,21 @@ impl<'a> TransactionRebase<'a> {
                         );
                         return Ok(());
                     }
-                    let newly_depended_fields = new_indices
+                    let mut newly_depended_fields = new_indices
                         .iter()
-                        .flat_map(|idx| idx.fields.iter())
-                        .collect::<HashSet<_>>();
+                        .flat_map(|idx| idx.dependency_fields().into_owned())
+                        .collect::<Vec<_>>();
+                    newly_depended_fields.sort_unstable();
+                    newly_depended_fields.dedup();
                     for replacement in replacements {
                         for field in replacement.1.fields.iter() {
-                            if newly_depended_fields.contains(&field) {
+                            // A packed parent's file also replaces the indexed
+                            // values of its children.
+                            if newly_depended_fields.contains(field)
+                                || self.read_schema.as_ref().is_some_and(|schema| {
+                                    field_affects_index(*field, &newly_depended_fields, schema)
+                                })
+                            {
                                 return Err(
                                     self.retryable_conflict_err(other_transaction, other_version)
                                 );

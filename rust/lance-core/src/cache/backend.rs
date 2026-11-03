@@ -67,6 +67,19 @@ pub enum CacheTier {
 /// backend authors only need to implement storage and eviction.
 #[async_trait]
 pub trait CacheBackend: Send + Sync + std::fmt::Debug {
+    /// Whether this backend consumes the entry sizes passed to
+    /// [`insert`](Self::insert) and [`get_or_insert`](Self::get_or_insert)
+    /// for eviction accounting. Backends that drop entries without
+    /// accounting (e.g. a zero-capacity cache) return `false` so loaders can
+    /// skip the deep-size traversal.
+    ///
+    /// Returning `false` also gives up per-entry size reporting, since the
+    /// traversal that registers a type's deep-size accessor is what gets
+    /// skipped. Only return `false` from a backend that retains nothing.
+    fn uses_entry_sizes(&self) -> bool {
+        true
+    }
+
     /// Look up RAM only, without reading or promoting a persistent entry.
     /// Backends without a resident lookup return a miss safely.
     async fn get_resident(&self, _key: &InternalCacheKey) -> Option<CacheEntry> {
@@ -161,6 +174,14 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
         loader: Pin<Box<dyn Future<Output = Result<(CacheEntry, usize)>> + Send + 'a>>,
         codec: Option<CacheCodec>,
     ) -> Result<(CacheEntry, bool)>;
+
+    /// Largest entry size the backend admits to RAM, in bytes. Defaults to
+    /// the total capacity; sharded backends may report a smaller limit.
+    /// `None` means the backend does not expose an admission limit.
+    /// Admission never guarantees that an entry will remain cached.
+    fn max_entry_bytes(&self) -> Option<u64> {
+        self.capacity_bytes().map(|bytes| bytes as u64)
+    }
 
     /// Remove all entries.
     async fn clear(&self);

@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::vec;
 
 use crate::dataset::optimize::{CompactionOptions, compact_files};
-use crate::dataset::{ColumnAlteration, InsertBuilder, NewColumnTransform};
+use crate::dataset::transaction::Operation;
+use crate::dataset::{ColumnAlteration, CommitBuilder, InsertBuilder, NewColumnTransform};
 use crate::index::DatasetIndexExt;
 use crate::utils::test::copy_test_data_to_tmp;
 use crate::{Dataset, Error, Result};
@@ -23,7 +24,7 @@ use arrow_array::{
     Array, ArrayRef, Float32Array, Int32Array, Int64Array, ListArray, RecordBatchIterator,
     StructArray, UInt32Array,
 };
-use arrow_array::{RecordBatch, record_batch};
+use arrow_array::{RecordBatch, cast::AsArray, record_batch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_file::version::LanceFileVersion;
 
@@ -770,6 +771,63 @@ async fn test_v6_0_1_miniblock_level_count_overflow() {
     assert!(captions.is_null(66_048));
 }
 
+fn int8_dictionary_strings(array: &ArrayRef) -> Vec<Option<String>> {
+    assert_eq!(
+        array.data_type(),
+        &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8))
+    );
+    arrow::compute::cast(array, &DataType::Utf8)
+        .unwrap()
+        .as_string::<i32>()
+        .iter()
+        .map(|value| value.map(str::to_owned))
+        .collect()
+}
+
+/// Lance 10.0.0 appended a null slot at index 128 to this full Int8 dictionary
+/// and stored its indices as 32 bits under the declared Int8 key type.
+#[tokio::test]
+async fn test_v10_0_0_dictionary_null_slot_past_key_type() {
+    let test_dir = copy_test_data_to_tmp("v10.0.0/null_slot_v2_0.lance").unwrap();
+    let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+
+    let expected = (0..128)
+        .map(|i| Some(format!("v{i:03}")))
+        .chain([None, Some("v005".to_owned()), None])
+        .collect::<Vec<_>>();
+    assert_eq!(int8_dictionary_strings(&batch["d"]), expected);
+}
+
+/// Lance 10.0.0 merged two chunks of 100 distinct Int8 dictionary values into one
+/// page and stored its indices as 32 bits under the declared Int8 key type.
+#[tokio::test]
+async fn test_v10_0_0_dictionary_merged_past_key_type() {
+    let test_dir = copy_test_data_to_tmp("v10.0.0/disjoint_v2_1.lance").unwrap();
+    let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+
+    let batches = dataset
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    // Each batch carries its own Int8 dictionary, and together they do not fit one.
+    assert!(batches.iter().all(|batch| batch.num_rows() <= 128));
+    let actual = batches
+        .iter()
+        .flat_map(|batch| int8_dictionary_strings(&batch["d"]))
+        .collect::<Vec<_>>();
+
+    let expected = (0..200)
+        .map(|i| (i % 100 % 25 != 3).then(|| format!("v{i:03}")))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+}
+
 // Helper: create a simple dataset with one fragment of `n` rows at the given URI.
 async fn make_simple_dataset(uri: &str, n: i64) -> Dataset {
     let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -1091,31 +1149,59 @@ async fn test_non_reusable_field_id_multi_cast_uses_schema_order() {
     );
 }
 
+fn field_with_id(name: &str, id: i32) -> ArrowField {
+    ArrowField::new(name, DataType::Int32, true).with_metadata(HashMap::from([(
+        "lance:field_id".to_string(),
+        id.to_string(),
+    )]))
+}
+
+async fn write_new_dataset(uri: &str, fields: Vec<ArrowField>) -> Result<Dataset> {
+    let schema = Arc::new(ArrowSchema::new(fields));
+    let columns = (0..schema.fields().len())
+        .map(|_| Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef)
+        .collect();
+    let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+    Dataset::write(RecordBatchIterator::new(vec![Ok(batch)], schema), uri, None).await
+}
+
 #[tokio::test]
-async fn test_new_dataset_ignores_hostile_arrow_field_id() {
-    let source_uri = TempStrDir::default();
-    let schema = Arc::new(ArrowSchema::new(vec![
-        ArrowField::new("a", DataType::Int32, false).with_metadata(HashMap::from([(
-            "lance:field_id".to_string(),
-            i32::MAX.to_string(),
-        )])),
-    ]));
-    let batch =
-        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))]).unwrap();
-    let mut dataset = Dataset::write(
-        RecordBatchIterator::new(vec![Ok(batch)], schema),
-        source_uri.as_str(),
-        None,
+async fn test_new_dataset_keeps_supplied_field_ids() {
+    let uri = TempStrDir::default();
+    let mut dataset = write_new_dataset(
+        uri.as_str(),
+        vec![
+            field_with_id("a", 0),
+            field_with_id("b", 3),
+            ArrowField::new("c", DataType::Int32, true),
+        ],
     )
     .await
     .unwrap();
 
-    assert_eq!(dataset.schema().field("a").unwrap().id, 0);
-    assert_eq!(dataset.manifest.max_allocated_field_id, None);
+    let ids = |dataset: &Dataset| {
+        dataset
+            .schema()
+            .fields
+            .iter()
+            .map(|field| (field.name.clone(), field.id))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(&dataset),
+        vec![
+            ("a".to_string(), 0),
+            ("b".to_string(), 3),
+            ("c".to_string(), 4)
+        ]
+    );
+    let fragment = dataset.get_fragments()[0].metadata().clone();
+    assert_eq!(fragment.files[0].fields.as_ref(), &[0, 3, 4]);
+
     dataset
         .add_columns(
             NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                "b",
+                "d",
                 DataType::Int32,
                 true,
             )]))),
@@ -1124,7 +1210,133 @@ async fn test_new_dataset_ignores_hostile_arrow_field_id() {
         )
         .await
         .unwrap();
-    assert_eq!(dataset.schema().field("b").unwrap().id, 1);
+    assert_eq!(dataset.schema().field("d").unwrap().id, 5);
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.column_by_name("b").unwrap().null_count(), 0);
+}
+
+/// Overwriting a table with non-reusable IDs writes fresh IDs (`a`=2, `b`=3).
+/// A commit schema supplying them swapped is refused instead of swapping the
+/// columns.
+#[tokio::test]
+async fn test_overwrite_refuses_supplied_ids_that_permute_written_ones() {
+    let uri = TempStrDir::default();
+    let mut dataset = write_new_dataset(
+        uri.as_str(),
+        vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ],
+    )
+    .await
+    .unwrap();
+    dataset.migrate_to_non_reusable_field_ids().await.unwrap();
+
+    let supplied = Arc::new(ArrowSchema::new(vec![
+        field_with_id("a", 3),
+        field_with_id("b", 2),
+    ]));
+    let batch = RecordBatch::try_new(
+        supplied.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![10, 20])),
+            Arc::new(Int32Array::from(vec![100, 200])),
+        ],
+    )
+    .unwrap();
+    let params = WriteParams {
+        mode: WriteMode::Overwrite,
+        ..Default::default()
+    };
+    let dataset = Arc::new(dataset);
+    let mut transaction = InsertBuilder::new(dataset.clone())
+        .with_params(&params)
+        .execute_uncommitted(vec![batch])
+        .await
+        .unwrap();
+    let Operation::Overwrite { schema, .. } = &mut transaction.operation else {
+        panic!("expected Overwrite");
+    };
+    assert_eq!(schema.field_ids(), vec![2, 3]);
+    *schema = lance_core::datatypes::Schema::try_from(supplied.as_ref()).unwrap();
+
+    let err = CommitBuilder::new(dataset)
+        .execute(transaction)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("ambiguous"), "{err}");
+}
+
+/// A MemWAL flush keeps its base table's field IDs even at or past the new-table
+/// limit: the generation's own column can get an ID at the limit, and a column
+/// added to the base table can already have one.
+#[rstest::rstest]
+#[case::at_the_limit(lance_core::datatypes::NEW_TABLE_FIELD_ID_LIMIT - 1, false)]
+#[case::added_column_past_the_limit(lance_core::datatypes::NEW_TABLE_FIELD_ID_LIMIT - 1, true)]
+#[case::ordinary(42, false)]
+#[tokio::test]
+async fn test_memwal_flush_keeps_base_ids_past_the_new_table_limit(
+    #[case] supplied_id: i32,
+    #[case] add_column: bool,
+) {
+    use crate::dataset::mem_wal::{DatasetMemWalExt, write::ShardWriterConfig};
+    use std::time::Duration;
+
+    let uri = TempStrDir::default();
+    let mut dataset = write_new_dataset(uri.as_str(), vec![field_with_id("id", supplied_id)])
+        .await
+        .unwrap();
+    if add_column {
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "value",
+                    DataType::Int32,
+                    true,
+                )]))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            dataset.schema().field("value").unwrap().id,
+            lance_core::datatypes::NEW_TABLE_FIELD_ID_LIMIT
+        );
+    }
+    dataset.initialize_mem_wal().execute().await.unwrap();
+    let shard_id = uuid::Uuid::new_v4();
+    let writer = dataset
+        .mem_wal_writer(
+            shard_id,
+            ShardWriterConfig::new(shard_id).with_max_wal_flush_interval(Duration::from_millis(5)),
+        )
+        .await
+        .unwrap();
+    let schema = Arc::new(ArrowSchema::from(dataset.schema()));
+    let columns = (0..schema.fields().len())
+        .map(|_| Arc::new(Int32Array::from(vec![7])) as ArrayRef)
+        .collect();
+    writer
+        .put(vec![RecordBatch::try_new(schema, columns).unwrap()])
+        .await
+        .unwrap();
+    let fence = writer.force_freeze_active().await.unwrap();
+    let flushed = fence.wait().await;
+    writer.abort().await.unwrap();
+    flushed.unwrap();
+}
+
+#[tokio::test]
+async fn test_new_dataset_rejects_a_field_id_that_leaves_no_room() {
+    let uri = TempStrDir::default();
+    let err = write_new_dataset(uri.as_str(), vec![field_with_id("a", 1 << 30)])
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("too large for a new table"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
@@ -1585,13 +1797,21 @@ async fn test_count_rows_falls_back_to_files() {
     dataset.manifest = Arc::new(manifest);
     assert_eq!(dataset.count_rows(None).await.unwrap(), 24);
 
-    // A fragment without data files is an error, even when the manifest has
-    // its counts.
+    // A fragment without data files is valid when the manifest carries a
+    // trustworthy row count (as when the only physical column is dropped);
+    // the cached count then supplies the length.
     let mut no_files = dataset.clone();
     let mut manifest = no_files.manifest.as_ref().clone();
     let mut fragments = manifest.fragments.as_ref().clone();
     fragments[2].files.clear();
     manifest.fragments = Arc::new(fragments);
+    no_files.manifest = Arc::new(manifest);
+    assert_eq!(no_files.count_rows(None).await.unwrap(), 24);
+
+    // Without a writer version the cached count of a file-less fragment is not
+    // trusted (#1531), so count_rows reports an error.
+    let mut manifest = no_files.manifest.as_ref().clone();
+    manifest.writer_version = None;
     no_files.manifest = Arc::new(manifest);
     let err = no_files.count_rows(None).await.unwrap_err();
     assert!(matches!(err, Error::NotFound { .. }), "{err}");

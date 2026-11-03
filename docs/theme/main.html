@@ -1,24 +1,62 @@
 {% extends "base.html" %}
 
-{#- Render one nav section as sidenav groups: its direct pages/links under the
-    section's own label, then each child section as a further group. -#}
-{%- macro sidenav_section(sec, label) -%}
-  {%- set direct = sec.children | selectattr("is_section", "ne", true) | list -%}
-  {%- if direct -%}
+{#- Resolve the first concrete page inside a nested navigation section. -#}
+{%- macro track_first_url(item) -%}
+  {%- set found = namespace(matched=false, url=item.url) -%}
+  {{- find_first_page(item, found) -}}
+  {{- found.url -}}
+{%- endmacro -%}
+
+{#- Render leaf links and collapsible nested subsections inside a group. -#}
+{%- macro sidenav_item(item) -%}
+  {%- if item.is_section %}
+    <details class="ld-sidenav__sub"{% if item.active %} open="open"{% endif %}>
+      <summary class="ld-sidenav__sub-toggle">
+        <span>{{ item.title }}</span>
+        <svg class="ld-sidenav__chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+      </summary>
+      <div class="ld-sidenav__sub-items">
+        {%- for sub in item.children %}
+        {{ sidenav_item(sub) }}
+        {%- endfor %}
+      </div>
+    </details>
+  {%- elif item.is_link %}
+    <a href="{{ item.url }}" target="_blank" rel="noopener">{{ item.title }} <span class="ext">↗</span></a>
+  {%- else %}
+    <a{% if item == page %} class="active"{% endif %} href="{{ item.url | url }}">{{ item.title }}</a>
+  {%- endif %}
+{%- endmacro -%}
+
+{%- macro sidenav_group(children, label=none) -%}
   <div class="ld-sidenav__group">
+    {%- if label %}
     <div class="ld-sidenav__label">{{ label }}</div>
-    {%- for child in direct %}
-    {%- if child.is_link %}
-    <a href="{{ child.url }}" target="_blank" rel="noopener">{{ child.title }} <span class="ext">↗</span></a>
-    {%- else %}
-    <a{% if child == page %} class="active"{% endif %} href="{{ child.url | url }}">{{ child.title }}</a>
     {%- endif %}
+    {%- for child in children %}
+      {{ sidenav_item(child) }}
     {%- endfor %}
   </div>
-  {%- endif -%}
-  {%- for child in sec.children if child.is_section -%}
-    {{ sidenav_section(child, child.title) }}
-  {%- endfor -%}
+{%- endmacro -%}
+
+{%- macro render_section_groups(children, root_label=none) -%}
+  {%- set direct = namespace(items=[], used_root=false) -%}
+  {%- for item in children %}
+    {%- if item.is_section %}
+      {%- if direct.items %}
+        {{ sidenav_group(direct.items, root_label if not direct.used_root else none) }}
+        {%- set direct.items = [] -%}
+        {%- set direct.used_root = true -%}
+      {%- endif %}
+      {{ sidenav_group(item.children, item.title) }}
+      {%- set direct.used_root = true -%}
+    {%- else %}
+      {%- set direct.items = direct.items + [item] -%}
+    {%- endif %}
+  {%- endfor %}
+  {%- if direct.items %}
+    {{ sidenav_group(direct.items, root_label if not direct.used_root else none) }}
+  {%- endif %}
 {%- endmacro -%}
 
 {% block container %}
@@ -32,10 +70,44 @@
     </button>
     <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
       {%- if active_section.item and active_section.item.is_section %}
-        {{ sidenav_section(active_section.item, active_section.item.title) }}
+        {%- set tracks = namespace(has_direct_page=false, count=0, active=none) -%}
+        {%- for child in active_section.item.children -%}
+          {%- if child.is_page -%}
+            {%- set tracks.has_direct_page = true -%}
+          {%- else -%}
+            {%- set tracks.count = tracks.count + 1 -%}
+            {%- if child.active -%}
+              {%- set tracks.active = child -%}
+            {%- endif -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- if not tracks.has_direct_page and tracks.count >= 2 %}
+          <div class="ld-sidenav__group ld-sidenav__group--tracks">
+            <div class="ld-sidenav__label ld-sidenav__label--root">{{ active_section.item.title }}</div>
+            <div class="ld-sidenav__tracks" role="navigation" aria-label="{{ active_section.item.title }} tracks">
+              {%- for track in active_section.item.children %}
+              {%- if track.is_link %}
+              <a class="ld-sidenav__track" href="{{ track.url }}" target="_blank" rel="noopener">
+                <span>{{ track.title }}</span>
+                <span class="ext">↗</span>
+              </a>
+              {%- else %}
+              <a class="ld-sidenav__track{% if track.active %} active{% endif %}" href="{{ track_first_url(track) | url }}">
+                <span>{{ track.title }}</span>
+              </a>
+              {%- endif %}
+              {%- endfor %}
+            </div>
+          </div>
+          {%- if tracks.active and tracks.active.children %}
+            {{ render_section_groups(tracks.active.children) }}
+          {%- endif %}
+        {%- else %}
+          {{ render_section_groups(active_section.item.children, active_section.item.title) }}
+        {%- endif %}
       {%- elif active_section.item %}
       <div class="ld-sidenav__group">
-        <div class="ld-sidenav__label">{{ active_section.item.title }}</div>
+        <div class="ld-sidenav__label ld-sidenav__label--root">{{ active_section.item.title }}</div>
         <a class="active" href="{{ active_section.item.url | url }}">{{ active_section.item.title }}</a>
       </div>
       {%- endif %}

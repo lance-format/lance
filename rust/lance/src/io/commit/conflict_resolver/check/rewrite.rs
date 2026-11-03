@@ -12,6 +12,7 @@ impl<'a> TransactionRebase<'a> {
         if let Operation::Rewrite {
             groups,
             frag_reuse_index,
+            rewritten_indices,
             ..
         } = &self.transaction.operation
         {
@@ -60,7 +61,11 @@ impl<'a> TransactionRebase<'a> {
                         Ok(())
                     }
                 }
-                Operation::Rewrite { groups, .. } => {
+                Operation::Rewrite {
+                    groups,
+                    rewritten_indices: other_rewritten_indices,
+                    ..
+                } => {
                     // Double consumption: the committed rewrite replaced
                     // fragments our tagged transitions read from or produce,
                     // so appending our transitions would record row movement
@@ -114,6 +119,37 @@ impl<'a> TransactionRebase<'a> {
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
+                        let mut replacement_source_counts = HashMap::new();
+                        for rewritten_index in rewritten_indices {
+                            *replacement_source_counts
+                                .entry(rewritten_index.new_id)
+                                .or_insert(0) += 1;
+                        }
+                        let merged_sources = rewritten_indices
+                            .iter()
+                            .filter(|rewritten_index| {
+                                replacement_source_counts[&rewritten_index.new_id] > 1
+                            })
+                            .map(|rewritten_index| rewritten_index.old_id)
+                            .collect::<HashSet<_>>();
+                        let replaced_source =
+                            other_rewritten_indices.iter().find_map(|rewritten_index| {
+                                (rewritten_index.old_id != rewritten_index.new_id
+                                    && merged_sources.contains(&rewritten_index.old_id))
+                                .then_some(rewritten_index.old_id)
+                            });
+                        if let Some(source_id) = replaced_source {
+                            return Err(Error::incompatible_transaction_source(
+                                format!(
+                                    "A concurrent rewrite at version {} replaced source index \
+                                     segment {}, which this rewrite planned to merge. The stale \
+                                     compaction plan can never succeed as committed; replan \
+                                     compaction from the latest dataset.",
+                                    other_version, source_id
+                                )
+                                .into(),
+                            ));
+                        }
                         Ok(())
                     }
                 }
@@ -156,9 +192,9 @@ impl<'a> TransactionRebase<'a> {
                         // cleanup trim); `finish_rewrite` works from the
                         // CURRENT manifest entry every attempt.
                         (Some(_), true) => {
-                            // An FRI replacement commits alone. A CreateIndex
-                            // mixing it with user indices is a shape this
-                            // resolver does not reason about (the user-index
+                            // A cleanup commits an FRI replacement alone. A
+                            // CreateIndex mixing it with user indices is a shape
+                            // this resolver does not reason about (the user-index
                             // straddle check below never runs for it), so
                             // refuse it instead of guessing.
                             if new_indices.len() != 1 || removed_indices.len() != 1 {
@@ -226,8 +262,8 @@ impl<'a> TransactionRebase<'a> {
                         }
                         // Rewrite with remapping and frag_reuse_index creation can commit without conflict
                         (Some(_), false) => {
-                            // this should not happen today since we don't support committing
-                            // a mixture of frag_reuse_index and other indices.
+                            // As above, a replacement mixed with other indices is
+                            // refused rather than reasoned about.
                             if new_indices.len() != 1 || removed_indices.len() != 1 {
                                 Err(self
                                     .incompatible_conflict_err(other_transaction, other_version))

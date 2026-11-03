@@ -16,11 +16,13 @@ impl<'a> TransactionRebase<'a> {
         {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
-        // Merge carries a complete schema from its read version. In either
-        // commit order, rebasing it with a metadata update can keep one side's
-        // schema while discarding metadata from the other side.
-        if (matches!(ours, Operation::Merge { .. }) && updates_schema_or_field_metadata(theirs))
-            || (updates_schema_or_field_metadata(ours) && matches!(theirs, Operation::Merge { .. }))
+        // Merge and Project carry complete schemas from their read versions.
+        // In either commit order, rebasing them with a metadata update can keep
+        // one side's schema while discarding metadata from the other side.
+        if (matches!(ours, Operation::Merge { .. } | Operation::Project { .. })
+            && updates_schema_or_field_metadata(theirs))
+            || (updates_schema_or_field_metadata(ours)
+                && matches!(theirs, Operation::Merge { .. } | Operation::Project { .. }))
         {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
@@ -499,6 +501,9 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
+        let Operation::Append { fragments } = &self.transaction.operation else {
+            return Err(wrong_operation_err(&self.transaction.operation));
+        };
         match &other_transaction.operation {
             // Append is not compatible with any operation that completely
             // overwrites the schema.
@@ -506,6 +511,21 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Restore { .. }
             | Operation::UpdateMemWalState { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
+            Operation::Merge { schema, .. } => {
+                // Casts and dropped-and-readded columns replace field ids. Files
+                // staged with the old ids would silently read back as null.
+                // Negative ids are tombstones or internal fields outside the schema.
+                if fragments
+                    .iter()
+                    .flat_map(|fragment| &fragment.files)
+                    .flat_map(|file| file.fields.iter())
+                    .any(|field| *field >= 0 && schema.field_by_id(*field).is_none())
+                {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                } else {
+                    Ok(())
+                }
             }
             Operation::Append { .. }
             | Operation::Rewrite { .. }
@@ -515,7 +535,6 @@ impl<'a> TransactionRebase<'a> {
             | Operation::ReserveFragments { .. }
             | Operation::Project { .. }
             | Operation::UpdateBases { .. }
-            | Operation::Merge { .. }
             | Operation::UpdateConfig { .. }
             | Operation::Clone { .. }
             | Operation::DataReplacement { .. }
@@ -624,8 +643,8 @@ impl<'a> TransactionRebase<'a> {
                 }
                 Operation::CreateIndex { new_indices, .. } => {
                     // A data replacement only conflicts if it is updating a field the
-                    // index depends on -- whether keyed on or merely carried, since
-                    // `fields` lists both (see `IndexMetadata::covering_fields`).
+                    // index depends on -- whether keyed on or merely carried (see
+                    // `IndexMetadata::dependency_fields`).
                     //
                     // TODO: We could potentially just drop the fragments being replaced from
                     // the index's fragment bitmap, which would lead to fewer conflicts.  However
@@ -633,11 +652,11 @@ impl<'a> TransactionRebase<'a> {
                     // yet.  For now, we don't allow this case.
                     let newly_depended_fields = new_indices
                         .iter()
-                        .flat_map(|idx| idx.fields.iter())
+                        .flat_map(|idx| idx.dependency_fields().into_owned())
                         .collect::<HashSet<_>>();
                     for replacement in replacements {
                         for field in replacement.1.fields.iter() {
-                            if newly_depended_fields.contains(&field) {
+                            if newly_depended_fields.contains(field) {
                                 return Err(
                                     self.retryable_conflict_err(other_transaction, other_version)
                                 );
@@ -703,12 +722,13 @@ impl<'a> TransactionRebase<'a> {
     /// and the version gate keeps indexes correct. A concurrent operation
     /// conflicts when it takes precedence over the overlay for cells the overlay
     /// covers, dropping the overlay's values: retryably when it rewrites the
-    /// physical layout of one of our fragments (Rewrite, Merge) or re-creates the
-    /// covered rows from the pre-overlay base (a row-moving Update — checked
-    /// row-by-row in `finish_data_overlay`), or removes an overlaid fragment
-    /// outright (a Delete / Update that drops the fragment); and incompatibly for
-    /// whole-dataset replacements (Overwrite / Restore) and MemWAL state updates
-    /// (UpdateMemWalState), which do not rebase against data operations.
+    /// physical layout of one of our fragments (Rewrite, Merge), drops a field
+    /// we overlay (Project), or re-creates the covered rows from the pre-overlay
+    /// base (a row-moving Update — checked row-by-row in `finish_data_overlay`),
+    /// or removes an overlaid fragment outright (a Delete / Update that drops the
+    /// fragment); and incompatibly for whole-dataset replacements (Overwrite /
+    /// Restore) and MemWAL state updates (UpdateMemWalState), which do not rebase
+    /// against data operations.
     fn check_data_overlay_txn(
         &mut self,
         other_transaction: &Transaction,
@@ -718,12 +738,33 @@ impl<'a> TransactionRebase<'a> {
             Operation::Append { .. }
             | Operation::CreateIndex { .. }
             | Operation::ReserveFragments { .. }
-            | Operation::Project { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. }
             | Operation::Clone { .. }
             | Operation::DataReplacement { .. }
             | Operation::DataOverlay { .. } => Ok(()),
+            // A concurrent Project that dropped a field we overlay discards our
+            // values for it. Project only prunes the overlays already committed,
+            // so ours would otherwise land covering a field that no longer exists.
+            Operation::Project { schema, .. } => {
+                let Operation::DataOverlay { groups } = &self.transaction.operation else {
+                    return Err(wrong_operation_err(&self.transaction.operation));
+                };
+                let remaining_field_ids = schema
+                    .fields_pre_order()
+                    .map(|f| f.id)
+                    .collect::<HashSet<_>>();
+                let drops_our_field = groups
+                    .iter()
+                    .flat_map(|g| g.overlays.iter())
+                    .flat_map(|o| o.data_file.fields.iter())
+                    .any(|id| !remaining_field_ids.contains(id));
+                if drops_our_field {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                } else {
+                    Ok(())
+                }
+            }
             // A concurrent Delete only tombstones rows via a deletion vector,
             // which preserves physical offsets; the overlay value for a deleted
             // offset is simply inert. Conflict only if the whole overlaid

@@ -157,6 +157,7 @@ impl<'a> TransactionRebase<'a> {
                         dataset.manifest.version,
                         &dv,
                         dataset.object_store.as_ref(),
+                        dataset.inline_deletions_max_bytes()?,
                     )
                     .await?;
 
@@ -331,12 +332,12 @@ impl<'a> TransactionRebase<'a> {
                         new_entry,
                         current_entry,
                     } => {
-                        *new_indices = vec![new_entry];
-                        *removed_indices = vec![current_entry];
+                        *new_indices = vec![*new_entry];
+                        *removed_indices = vec![*current_entry];
                     }
                     TaggedTrimOutcome::Delete { current_entry } => {
                         new_indices.clear();
-                        *removed_indices = vec![current_entry];
+                        *removed_indices = vec![*current_entry];
                     }
                 }
                 return Ok(self.transaction);
@@ -477,7 +478,7 @@ impl<'a> TransactionRebase<'a> {
             // tagged support are fenced off by the writer feature flag
             // before this point.
             if self.reuse.added_transitions.is_none() && proposed.index_version == 0 {
-                let stored = crate::index::load_all_indices(dataset).await?;
+                let stored = crate::index::loading::load_all_indices(dataset).await?;
                 let current_uses_tagged =
                     lance_table::system_index::frag_reuse::metadata::uses_tagged_fri(
                         &dataset.manifest,

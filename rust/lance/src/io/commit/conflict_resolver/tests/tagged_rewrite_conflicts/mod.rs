@@ -108,7 +108,9 @@ async fn commit_sp(dataset: &Dataset, read_version: u64, operation: Operation) -
 }
 
 async fn fri_ledger(dataset: &Dataset) -> (IndexMetadata, FragReuseLedger) {
-    let stored = crate::index::load_all_indices(dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(dataset)
+        .await
+        .unwrap();
     let entry = stored
         .iter()
         .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
@@ -677,7 +679,9 @@ async fn sp_rebases_over_concurrent_fri_trim() {
 
     // Writer A trims the oldest legacy version, as v0 cleanup does.
     let mut writer_a = dataset.clone();
-    let stored = crate::index::load_all_indices(&writer_a).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&writer_a)
+        .await
+        .unwrap();
     let old_entry = stored
         .iter()
         .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
@@ -760,7 +764,9 @@ async fn sp_lands_over_concurrent_user_index_and_blocks_v0_trim() {
     .await
     .unwrap();
 
-    let stored = crate::index::load_all_indices(&committed).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&committed)
+        .await
+        .unwrap();
     let scalar = stored.iter().find(|idx| idx.name == "i_idx").unwrap();
     assert_eq!(
         scalar.fragment_bitmap.as_ref().unwrap(),
@@ -1160,7 +1166,9 @@ async fn sp_vs_sp_disjoint_merges_fresh_session() {
     assert_eq!(filtered("i = 1").await, vec![1]);
     assert_eq!(filtered("i = 9").await, vec![9]);
     assert_eq!(filtered("i >= 14").await, vec![14, 15]);
-    let stored = crate::index::load_all_indices(&verify).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&verify)
+        .await
+        .unwrap();
     let scalar = stored.iter().find(|idx| idx.name == "i_idx").unwrap();
     assert_eq!(
         scalar.fragment_bitmap.as_ref().unwrap(),
@@ -1281,7 +1289,9 @@ async fn with_mem_wal(dataset: Dataset) -> Dataset {
     )
     .await
     .unwrap();
-    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     let entry = stored
         .iter()
         .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
@@ -1298,7 +1308,9 @@ fn i_idx(indices: &[IndexMetadata]) -> &IndexMetadata {
 /// `i_idx` is as it was and still agrees with the scan.
 async fn assert_mixed_rewrite_refused(mut dataset: Dataset) {
     let version = dataset.manifest.version;
-    let stored_before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored_before = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     assert_eq!(
         i_idx(&stored_before).fragment_bitmap.as_ref().unwrap(),
         &RoaringBitmap::from_iter([0u32, 1, 2, 3])
@@ -1315,7 +1327,9 @@ async fn assert_mixed_rewrite_refused(mut dataset: Dataset) {
         dataset.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
         vec![0, 1, 2, 3]
     );
-    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     assert_eq!(stored.len(), stored_before.len());
     assert_eq!(i_idx(&stored).uuid, i_idx(&stored_before).uuid);
     assert_eq!(
@@ -1334,7 +1348,9 @@ async fn assert_mixed_rewrite_refused(mut dataset: Dataset) {
 /// destinations are scanned.
 async fn assert_mixed_rewrite_lands(dataset: Dataset) {
     let version = dataset.manifest.version;
-    let stored_before = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored_before = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     assert_eq!(
         i_idx(&stored_before).fragment_bitmap.as_ref().unwrap(),
         &RoaringBitmap::from_iter([0u32, 1])
@@ -1352,7 +1368,9 @@ async fn assert_mixed_rewrite_lands(dataset: Dataset) {
     );
     let (_, ledger) = fri_ledger(&committed).await;
     assert_eq!(ledger.transitions().len(), 1);
-    let stored = crate::index::load_all_indices(&committed).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&committed)
+        .await
+        .unwrap();
     assert_eq!(stored.len(), stored_before.len() + 1, "the entry was added");
     assert_eq!(i_idx(&stored).uuid, i_idx(&stored_before).uuid);
     assert_eq!(
@@ -1436,7 +1454,9 @@ async fn bare_group_covered_by_a_concurrent_index_is_refused_on_retry() {
     let version = writer_a.manifest.version;
     let operation = mixed_rewrite(&writer_a).await;
     let writer_b = concurrent_index(&writer_a, vec![2, 3]).await;
-    let stored_b = crate::index::load_all_indices(&writer_b).await.unwrap();
+    let stored_b = crate::index::loading::load_all_indices(&writer_b)
+        .await
+        .unwrap();
     assert_eq!(
         late_idx(&stored_b).fragment_bitmap.as_ref().unwrap(),
         &RoaringBitmap::from_iter([2u32, 3])
@@ -1460,7 +1480,9 @@ async fn bare_group_covered_by_a_concurrent_index_is_refused_on_retry() {
             .collect::<Vec<_>>(),
         vec![0, 1, 2, 3]
     );
-    let stored = crate::index::load_all_indices(&writer_a).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&writer_a)
+        .await
+        .unwrap();
     assert_eq!(stored.len(), stored_b.len());
     assert_eq!(late_idx(&stored).uuid, late_idx(&stored_b).uuid);
     assert_eq!(
@@ -1488,7 +1510,9 @@ async fn bare_group_uncovered_by_a_concurrent_index_lands_on_retry() {
     let version = writer_a.manifest.version;
     let operation = mixed_rewrite(&writer_a).await;
     let writer_b = concurrent_index(&writer_a, vec![0, 1]).await;
-    let stored_b = crate::index::load_all_indices(&writer_b).await.unwrap();
+    let stored_b = crate::index::loading::load_all_indices(&writer_b)
+        .await
+        .unwrap();
 
     let committed = commit_sp(&writer_a, version, operation).await.unwrap();
     assert_eq!(committed.manifest.version, writer_b.manifest.version + 1);
@@ -1502,7 +1526,9 @@ async fn bare_group_uncovered_by_a_concurrent_index_lands_on_retry() {
     );
     let (_, ledger) = fri_ledger(&committed).await;
     assert_eq!(ledger.transitions().len(), 1);
-    let stored = crate::index::load_all_indices(&committed).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&committed)
+        .await
+        .unwrap();
     assert_eq!(stored.len(), stored_b.len() + 1, "the entry was added");
     for (name, pick) in [
         (
@@ -1820,7 +1846,9 @@ async fn sp_merges_onto_swapped_transition_with_equal_count() {
         unreachable!()
     };
     mapping.map_id = Uuid::new_v4().to_string();
-    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     let indices: Vec<IndexMetadata> = stored
         .iter()
         .map(|idx| {
@@ -2059,6 +2087,8 @@ async fn sp_rejects_mixed_fri_create_index() {
         created_at: None,
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     };
     let ours = Transaction::new(
         1,

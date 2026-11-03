@@ -18,7 +18,8 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use crate::{
-    Dataset, Error, Result, dataset::index::LanceIndexStoreExt, index::DatasetIndexInternalExt,
+    Dataset, Error, Result, dataset::index::LanceIndexStoreExt,
+    index::loading::DatasetIndexInternalExt,
 };
 
 async fn collect_ngram_segment_stores(
@@ -155,6 +156,8 @@ pub(in crate::index) async fn merge_segments(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(index_files_to_table(created_index.files)),
+        clustering_id: None,
+        metadata: Default::default(),
     })
 }
 

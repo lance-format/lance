@@ -16,7 +16,7 @@ use arrow::array::AsArray;
 use arrow::datatypes;
 use arrow_array::{Array, BinaryArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion_execution::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::iter_str_array;
 use lance_arrow::json::JsonEncoding;
@@ -24,6 +24,7 @@ use lance_bitpacking::{BitPacker, BitPacker4x};
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::{IO_CORE_RESERVATION, get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID, Result};
@@ -76,6 +77,9 @@ static LANCE_FTS_POSTING_BATCH_ROWS: LazyLock<usize> = LazyLock::new(|| {
         .expect("failed to parse LANCE_FTS_POSTING_BATCH_ROWS")
 });
 const MAX_RETAINED_TOKEN_IDS: usize = 8 * 1024;
+// Bound the payload copied into each v3 write batch. A single posting can
+// exceed this target; it remains indivisible in the current format.
+const POSTING_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 fn default_num_workers() -> usize {
     let total_cpus = get_num_compute_intensive_cpus() + *IO_CORE_RESERVATION;
@@ -303,7 +307,11 @@ impl InvertedIndexBuilder {
             .await?;
         let mut files = self.update_index(new_data, dest_store).await?;
 
-        if let Some(OldIndexDataFilter::Fragments { to_remove, .. }) = old_data_filter {
+        if let Some(
+            OldIndexDataFilter::Fragments { to_remove, .. }
+            | OldIndexDataFilter::RowAddresses { to_remove, .. },
+        ) = old_data_filter
+        {
             self.deleted_fragments.extend(to_remove);
         }
 
@@ -317,7 +325,7 @@ impl InvertedIndexBuilder {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
         old_segments: &[Arc<InvertedIndex>],
-        old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
+        old_data_filters: &[Option<crate::scalar::OldIndexDataFilter>],
     ) -> Result<Vec<IndexFile>> {
         validate_format_version_block_size(self.format_version, self.params.block_size)?;
         let schema = new_data.schema();
@@ -330,7 +338,7 @@ impl InvertedIndexBuilder {
         }
 
         let mut files = self
-            .merge_existing_segments(dest_store, old_segments, old_data_filter.as_ref())
+            .merge_existing_segments(dest_store, old_segments, old_data_filters)
             .await?;
 
         let new_data = document_input(new_data, doc_col)?;
@@ -349,13 +357,21 @@ impl InvertedIndexBuilder {
         &mut self,
         dest_store: &dyn IndexStore,
         old_segments: &[Arc<InvertedIndex>],
-        old_data_filter: Option<&crate::scalar::OldIndexDataFilter>,
+        old_data_filters: &[Option<crate::scalar::OldIndexDataFilter>],
     ) -> Result<Vec<IndexFile>> {
+        if old_data_filters.len() != old_segments.len() {
+            return Err(Error::invalid_input(format!(
+                "inverted merge: expected one old-data filter per source segment \
+                 (segments={}, filters={})",
+                old_segments.len(),
+                old_data_filters.len()
+            )));
+        }
         let num_workers = resolve_num_workers(&self.params);
         let memory_limit_bytes = resolve_worker_memory_limit_bytes(&self.params, num_workers);
         let mut merged: Option<InnerBuilder> = None;
         let mut files = Vec::new();
-        for index in old_segments {
+        for (index, old_data_filter) in old_segments.iter().zip(old_data_filters) {
             if old_data_filter.is_none() {
                 self.deleted_fragments
                     .extend(index.deleted_fragments().iter());
@@ -487,6 +503,8 @@ impl InvertedIndexBuilder {
                     progress
                         .stage_progress("tokenize_docs", tokenized_count)
                         .await?;
+                    // A ready async-channel receiver does not consume Tokio's cooperative budget.
+                    tokio::task::yield_now().await;
                 }
                 worker.finish().await
             });
@@ -751,6 +769,18 @@ impl InvertedIndexBuilder {
                 self.params.block_size.to_string(),
             ),
         ]);
+        // The build-time memory configuration is not part of the persisted
+        // params, but the finalize that consolidates these partitions sizes
+        // its work from it, so the staged metadata carries it along.
+        if let Some(memory_limit_mb) = self.params.memory_limit_mb {
+            metadata.insert(
+                STAGED_MEMORY_LIMIT_MB_KEY.to_owned(),
+                memory_limit_mb.to_string(),
+            );
+        }
+        if let Some(num_workers) = self.params.num_workers {
+            metadata.insert(STAGED_NUM_WORKERS_KEY.to_owned(), num_workers.to_string());
+        }
         if self.params.with_position && self.format_version.uses_shared_position_stream() {
             metadata.insert(
                 POSITIONS_LAYOUT_KEY.to_owned(),
@@ -1084,10 +1114,22 @@ impl InnerBuilder {
                     to_keep.contains((*row_id >> 32) as u32)
                 }
                 OldIndexDataFilter::RowIds(valid_row_ids) => valid_row_ids.contains(*row_id),
+                OldIndexDataFilter::RowAddresses {
+                    to_keep,
+                    deleted_rows,
+                    ..
+                } => {
+                    to_keep.contains(RowAddress::from(*row_id).fragment_id())
+                        && !deleted_rows.contains(*row_id)
+                }
             };
             if !keep {
                 mapping.insert(*row_id, None);
             }
+        }
+        // Remapping rebuilds every posting list, which is wasted work when nothing is dropped.
+        if mapping.is_empty() {
+            return Ok(());
         }
         self.remap(&RowAddrRemap::direct(mapping)).await
     }
@@ -1285,7 +1327,10 @@ impl InnerBuilder {
                             &mut batch_builder,
                             format_version,
                         )?;
-                        if batch_builder.len() >= batch_rows {
+                        if batch_builder.len() >= batch_rows
+                            || (format_version == InvertedListFormatVersion::V3
+                                && batch_builder.payload_bytes() >= POSTING_BATCH_BYTES)
+                        {
                             batch = Some(batch_builder.finish()?);
                             break;
                         }
@@ -1652,6 +1697,7 @@ impl IndexWorker {
         doc_index: &[u32],
     ) -> Result<()> {
         let with_position = self.has_position();
+        let discount_overlaps = self.tokenizer.discount_overlaps();
         let builder_was_empty = self.builder.docs.is_empty();
         let old_temporary_memory_size = self.temporary_memory_size();
         let old_token_memory_size = self.builder.tokens.memory_size() as u64;
@@ -1676,6 +1722,7 @@ impl IndexWorker {
                 let mut process_text = |text: &str| -> Result<()> {
                     doc_length_bytes += text.len();
                     let mut token_stream = tokenizer.token_stream_for_doc(text);
+                    let mut last_position = None;
                     while token_stream.advance() {
                         let token = token_stream.token();
                         let position = Self::checked_token_position(row_id, token.position)?;
@@ -1708,7 +1755,14 @@ impl IndexWorker {
                         let new_posting_memory_size = posting_list.size();
                         posting_memory_delta +=
                             new_posting_memory_size as i64 - old_posting_memory_size as i64;
-                        token_num += 1;
+                        if !discount_overlaps || last_position != Some(token.position) {
+                            token_num = token_num.checked_add(1).ok_or_else(|| {
+                                Error::invalid_input(format!(
+                                    "document length overflow for row_id={row_id}"
+                                ))
+                            })?;
+                        }
+                        last_position = Some(token.position);
                     }
                     Ok(())
                 };
@@ -1734,21 +1788,31 @@ impl IndexWorker {
                 let tokenizer = &mut self.tokenizer;
                 let builder = &mut self.builder;
                 let token_ids = &mut self.token_ids;
-                let mut process_text = |text: &str| {
+                let mut process_text = |text: &str| -> Result<()> {
                     doc_length_bytes += text.len();
                     let mut token_stream = tokenizer.token_stream_for_doc(text);
+                    let mut last_position = None;
                     while token_stream.advance() {
-                        let token_id = builder.tokens.get_or_add(&token_stream.token().text);
+                        let token = token_stream.token();
+                        let token_id = builder.tokens.get_or_add(&token.text);
                         token_ids.push(token_id);
-                        token_num += 1;
+                        if !discount_overlaps || last_position != Some(token.position) {
+                            token_num = token_num.checked_add(1).ok_or_else(|| {
+                                Error::invalid_input(format!(
+                                    "document length overflow for row_id={row_id}"
+                                ))
+                            })?;
+                        }
+                        last_position = Some(token.position);
                     }
+                    Ok(())
                 };
 
                 match document {
-                    DocumentSource::Text(doc) => process_text(doc),
+                    DocumentSource::Text(doc) => process_text(doc)?,
                     DocumentSource::StringList(elements) => {
                         let doc = Self::materialize_string_list(elements);
-                        process_text(&doc);
+                        process_text(&doc)?;
                     }
                 }
             }
@@ -2238,6 +2302,10 @@ fn empty_part_metadata_file_path(fragment_mask: u64) -> String {
 
 const PARTITION_FILE_SUFFIXES: [&str; 3] = [TOKENS_FILE, INVERT_LIST_FILE, DOCS_FILE];
 const STAGED_PARTITION_DIR: &str = "staging";
+/// Staged partition metadata keys for the build-time memory configuration,
+/// which the persisted params leave out.
+const STAGED_MEMORY_LIMIT_MB_KEY: &str = "build_memory_limit_mb";
+const STAGED_NUM_WORKERS_KEY: &str = "build_num_workers";
 
 fn partition_file_path(partition_id: u64, suffix: &str) -> String {
     format!("part_{}_{}", partition_id, suffix)
@@ -2307,12 +2375,26 @@ fn estimated_merge_working_set_bytes(stored_bytes: u64) -> u64 {
         / MERGE_WORKING_SET_DEN
 }
 
-/// Memory one finalize may hold across its copies and merge groups. The index
-/// params' `memory_limit_mb` is the build's own budget and bounds the
-/// finalize the same way. Without it the budget is one merge group's working
-/// set plus the copies, derived from the per-worker limit alone: the staged
-/// params do not record the worker count, and the finalize host's core count
-/// says nothing about what the index needs.
+/// Memory one finalize may hold across its copies and merge groups. The
+/// build's `memory_limit_mb`, carried in the staged metadata, is its own
+/// budget and bounds the finalize the same way. Without it the budget is one
+/// merge group's working set plus the copies, derived from the per-worker
+/// limit alone: the finalize host's core count says nothing about what the
+/// index needs.
+/// Bounds for planning merge groups: the largest stored size a consolidation
+/// candidate may have, and the largest estimated decoded size of one group.
+/// A group is planned to the worker limit, but its working set must also fit
+/// the whole finalize budget, which a build with fewer workers than the
+/// working-set factor makes the tighter bound; the candidate ceiling follows
+/// the same cap so two candidates always fit one group.
+fn consolidation_limits(memory_limit_bytes: u64, total_budget_bytes: u64) -> (u64, u64) {
+    let group_max_decoded_bytes =
+        memory_limit_bytes.min(total_budget_bytes * MERGE_WORKING_SET_DEN / MERGE_WORKING_SET_NUM);
+    let candidate_max_stored_bytes =
+        group_max_decoded_bytes * DECODED_PER_STORED_DEN / (2 * DECODED_PER_STORED_NUM);
+    (candidate_max_stored_bytes, group_max_decoded_bytes)
+}
+
 fn finalize_budget_bytes(params: &InvertedIndexParams, memory_limit_bytes: u64) -> u64 {
     params
         .memory_limit_mb
@@ -2411,10 +2493,22 @@ fn plan_finalize(
     FinalizePlan { copies, groups }
 }
 
-/// One finished finalize task: the final ids it produced and their files.
-enum FinalizedPartitions {
-    Copied(Vec<u64>, Vec<IndexFile>),
-    Merged(Vec<u64>, Vec<IndexFile>),
+/// Progress of the single finalize stage, shared by every copy and merge
+/// task: counts are incremented and reported under one lock so the callback
+/// sees them in order.
+struct FileProgress {
+    completed: tokio::sync::Mutex<u64>,
+    progress: Arc<dyn IndexBuildProgress>,
+}
+
+impl FileProgress {
+    async fn advance(&self, files: u64) -> Result<()> {
+        let mut completed = self.completed.lock().await;
+        *completed += files;
+        self.progress
+            .stage_progress("remap_partition_files", *completed)
+            .await
+    }
 }
 
 /// Memory and I/O the concurrent copies and merges of one finalize share.
@@ -2449,9 +2543,17 @@ impl FinalizeBudget {
     }
 
     /// Reserve `bytes`, waiting for others to release. A request above the
-    /// whole budget takes the whole budget rather than waiting forever.
+    /// whole budget takes the whole budget rather than waiting forever; the
+    /// planner keeps groups under the budget, so that is worth a warning.
     async fn reserve(&self, bytes: u64) -> Result<BudgetLease> {
         let units = Self::units_of(bytes, self.total_units);
+        if units == self.total_units && bytes > (self.total_units as u64) << BUDGET_UNIT_SHIFT {
+            tracing::warn!(
+                requested_bytes = bytes,
+                budget_bytes = (self.total_units as u64) << BUDGET_UNIT_SHIFT,
+                "FTS finalize reservation exceeds the whole memory budget; proceeding with the budget"
+            );
+        }
         let permit = self
             .bytes
             .clone()
@@ -2680,10 +2782,19 @@ async fn read_staged_metadata(
             let params_str = metadata
                 .get("params")
                 .ok_or(Error::index(format!("params not found in {}", file_name)))?;
-            params = Some(
-                serde_json::from_str::<InvertedIndexParams>(params_str)
-                    .map_err(|e| Error::index(format!("Failed to parse params: {}", e)))?,
-            );
+            let mut parsed = serde_json::from_str::<InvertedIndexParams>(params_str)
+                .map_err(|e| Error::index(format!("Failed to parse params: {}", e)))?;
+            parsed.memory_limit_mb = metadata
+                .get(STAGED_MEMORY_LIMIT_MB_KEY)
+                .map(|value| value.parse::<u64>())
+                .transpose()
+                .map_err(|e| Error::index(format!("Failed to parse build memory limit: {e}")))?;
+            parsed.num_workers = metadata
+                .get(STAGED_NUM_WORKERS_KEY)
+                .map(|value| value.parse::<usize>())
+                .transpose()
+                .map_err(|e| Error::index(format!("Failed to parse build worker count: {e}")))?;
+            params = Some(parsed);
         }
 
         if token_set_format.is_none()
@@ -2772,18 +2883,18 @@ async fn finalize_staged_partitions(
 
     let num_workers = resolve_num_workers(&staged.params);
     let memory_limit_bytes = resolve_worker_memory_limit_bytes(&staged.params, num_workers);
-    let candidate_max_stored_bytes = if options.consolidate_small_partitions {
-        memory_limit_bytes * DECODED_PER_STORED_DEN / (2 * DECODED_PER_STORED_NUM)
-    } else {
-        0
-    };
+    let total_budget_bytes = finalize_budget_bytes(&staged.params, memory_limit_bytes);
+    let (candidate_max_stored_bytes, group_max_decoded_bytes) =
+        consolidation_limits(memory_limit_bytes, total_budget_bytes);
     let plan = plan_finalize(
         partitions.clone(),
-        candidate_max_stored_bytes,
-        memory_limit_bytes,
+        if options.consolidate_small_partitions {
+            candidate_max_stored_bytes
+        } else {
+            0
+        },
+        group_max_decoded_bytes,
     );
-
-    let total_budget_bytes = finalize_budget_bytes(&staged.params, memory_limit_bytes);
     let max_copied_file_bytes = partitions
         .iter()
         .map(|partition| partition.max_file_bytes)
@@ -2805,34 +2916,27 @@ async fn finalize_staged_partitions(
         "FTS finalize plan"
     );
 
-    let total_copies = plan.copies.len() as u64 * PARTITION_FILE_SUFFIXES.len() as u64;
+    // One progress stage covers the whole staged payload: every staged
+    // partition's files count once, whether the partition is copied or
+    // decoded into a merge group, so the callback sees a single stream of
+    // `remap_partition_files` work and never two open stages.
+    let total_files = partitions.len() as u64 * PARTITION_FILE_SUFFIXES.len() as u64;
     progress
-        .stage_start("remap_partition_files", Some(total_copies), "files")
+        .stage_start("remap_partition_files", Some(total_files), "files")
         .await?;
-    if !plan.groups.is_empty() {
-        progress
-            .stage_start(
-                "consolidate_partitions",
-                Some(plan.groups.len() as u64),
-                "groups",
-            )
-            .await?;
-    }
 
     // Every copy and merge group is its own task: decoding a partition is
     // CPU work inline in the task, so polling them all from one future would
     // run the groups one after another and stall the copies meanwhile.
-    // Progress counts are incremented and reported under one lock so the
-    // callback sees them in order.
-    let copy_progress = Arc::new(tokio::sync::Mutex::new(0u64));
-    let group_progress = Arc::new(tokio::sync::Mutex::new(0u64));
-    let total_groups = plan.groups.len();
+    let file_progress = Arc::new(FileProgress {
+        completed: tokio::sync::Mutex::new(0),
+        progress: progress.clone(),
+    });
     let mut tasks = JoinSet::new();
     for &(old_id, new_id) in &plan.copies {
         let store = store.clone();
         let budget = budget.clone();
-        let progress = progress.clone();
-        let copy_progress = copy_progress.clone();
+        let file_progress = file_progress.clone();
         tasks.spawn(async move {
             let _slot = budget.copy_slot().await?;
             let _lease = budget.reserve(budget.per_copy_bytes).await?;
@@ -2845,68 +2949,40 @@ async fn finalize_staged_partitions(
                         .copy_index_file_to(&staged_path, &final_path, store.as_ref())
                         .await?,
                 );
-                let mut completed = copy_progress.lock().await;
-                *completed += 1;
-                progress
-                    .stage_progress("remap_partition_files", *completed)
-                    .await?;
+                file_progress.advance(1).await?;
             }
-            Result::Ok(FinalizedPartitions::Copied(vec![new_id], files))
+            Result::Ok((vec![new_id], files))
         });
     }
     for group in plan.groups {
         let store = store.clone();
         let budget = budget.clone();
-        let progress = progress.clone();
-        let group_progress = group_progress.clone();
+        let file_progress = file_progress.clone();
         let token_set_format = staged.token_set_format;
         tasks.spawn(async move {
-            let written =
-                consolidate_group(store, group, &budget, memory_limit_bytes, token_set_format)
-                    .await?;
-            let mut completed = group_progress.lock().await;
-            *completed += 1;
-            progress
-                .stage_progress("consolidate_partitions", *completed)
-                .await?;
-            Result::Ok(FinalizedPartitions::Merged(written.0, written.1))
+            consolidate_group(
+                store,
+                group,
+                &budget,
+                memory_limit_bytes,
+                token_set_format,
+                &file_progress,
+            )
+            .await
         });
     }
 
-    // Each stage completes when its own last task does, so the two overlapping
-    // stages report their own spans rather than the whole finalize.
-    let total_copies_tasks = plan.copies.len();
-    let mut copies_done = 0usize;
-    let mut groups_done = 0usize;
-    if plan.copies.is_empty() {
-        progress.stage_complete("remap_partition_files").await?;
-    }
     let mut final_ids = Vec::new();
     let mut files = Vec::new();
     while let Some(joined) = tasks.join_next().await {
-        let result = joined.map_err(|error| {
+        let (ids, partition_files) = joined.map_err(|error| {
             Error::internal(format!("FTS finalize task failed to complete: {error}"))
-        })?;
-        let (ids, partition_files) = match result? {
-            FinalizedPartitions::Copied(ids, files) => {
-                copies_done += 1;
-                if copies_done == total_copies_tasks {
-                    progress.stage_complete("remap_partition_files").await?;
-                }
-                (ids, files)
-            }
-            FinalizedPartitions::Merged(ids, files) => {
-                groups_done += 1;
-                if groups_done == total_groups {
-                    progress.stage_complete("consolidate_partitions").await?;
-                }
-                (ids, files)
-            }
-        };
+        })??;
         final_ids.extend(ids);
         files.extend(partition_files);
     }
     final_ids.sort_unstable();
+    progress.stage_complete("remap_partition_files").await?;
 
     // The root metadata is the finalization marker: every final file must
     // exist before it does.
@@ -2947,6 +3023,7 @@ async fn consolidate_group(
     budget: &FinalizeBudget,
     memory_limit_bytes: u64,
     token_set_format: TokenSetFormat,
+    file_progress: &FileProgress,
 ) -> Result<(Vec<u64>, Vec<IndexFile>)> {
     let estimated_bytes = group
         .members
@@ -2979,6 +3056,10 @@ async fn consolidate_group(
             num_docs = builder.docs.len(),
             "FTS finalize decoded a staged partition for consolidation"
         );
+        // A decoded member's files are consumed as surely as a copied one's.
+        file_progress
+            .advance(PARTITION_FILE_SUFFIXES.len() as u64)
+            .await?;
         if builder.is_empty() {
             continue;
         }
@@ -3094,7 +3175,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use async_trait::async_trait;
     use bytes::Bytes;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream::{self, BoxStream};
     use lance_core::ROW_ID;
     use lance_core::cache::LanceCache;
@@ -4611,8 +4692,15 @@ mod tests {
         Ok(())
     }
 
+    #[rstest::rstest]
+    #[case::single_worker(1)]
+    #[case::multiple_workers(3)]
     #[tokio::test]
-    async fn test_zero_token_string_documents_are_skipped_in_corpus_stats() -> Result<()> {
+    async fn test_zero_token_string_documents_are_skipped_in_corpus_stats(
+        #[case] workers: usize,
+        #[values(false, true)] with_position: bool,
+        #[values(128, 256)] block_size: usize,
+    ) -> Result<()> {
         let index_dir = TempDir::default();
         let store = Arc::new(LanceIndexStore::new(
             ObjectStore::local().into(),
@@ -4628,14 +4716,18 @@ mod tests {
             None,
             Some("hello"),
         ]);
-        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let batches = (0..batch.num_rows())
+            .map(|row| Ok(batch.slice(row, 1)))
+            .collect::<Vec<_>>();
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(batches));
         let params =
             InvertedIndexParams::new("whitespace".to_string(), lance_tokenizer::Language::English)
-                .with_position(false)
+                .with_position(with_position)
                 .remove_stop_words(true)
                 .stem(false)
                 .max_token_length(Some(6))
-                .num_workers(1);
+                .block_size(block_size)?
+                .num_workers(workers);
 
         let mut builder = InvertedIndexBuilder::new(params);
         builder
@@ -5006,6 +5098,7 @@ mod tests {
         .await?;
 
         let events = progress.recorded_events();
+        assert_stages_do_not_overlap(&events);
         let tags = events
             .iter()
             .map(|(kind, stage, _)| format!("{kind}:{stage}"))
@@ -5699,7 +5792,7 @@ mod tests {
             let first_callback_started = first_callback_started.clone();
             async move {
                 first_callback_started.notified().await;
-                Err(datafusion::error::DataFusionError::Execution(
+                Err(datafusion_common::DataFusionError::Execution(
                     "injected stream failure".to_owned(),
                 ))
             }
@@ -6016,6 +6109,67 @@ mod tests {
         );
     }
 
+    /// Progress stages are sequential: no stage starts while another is open.
+    fn assert_stages_do_not_overlap(events: &[(String, String, u64)]) {
+        let mut open: Option<&str> = None;
+        for (kind, stage, _) in events {
+            match kind.as_str() {
+                "start" => {
+                    assert!(
+                        open.is_none(),
+                        "stage {stage} started while {open:?} was still open: {events:?}"
+                    );
+                    open = Some(stage);
+                }
+                "complete" => {
+                    assert_eq!(open, Some(stage.as_str()), "{events:?}");
+                    open = None;
+                }
+                _ => {}
+            }
+        }
+        assert!(open.is_none(), "stage {open:?} never completed");
+    }
+
+    /// The staged metadata carries the build's memory configuration, and the
+    /// finalize derives its budget and worker limit from it.
+    #[tokio::test]
+    async fn test_staged_metadata_carries_build_memory_config() -> Result<()> {
+        let index_dir = TempDir::default();
+        let object_store = Arc::new(ObjectStore::local());
+        let store = Arc::new(LanceIndexStore::new(
+            object_store.clone(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let (fragment_mask, batch) = consolidation_corpus(1, 5).remove(0);
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let mut builder = InvertedIndexBuilder::new_with_fragment_mask(
+            consolidation_params().memory_limit_mb(64).num_workers(2),
+            Some(fragment_mask),
+        );
+        builder
+            .update(Box::pin(stream), store.as_ref(), None)
+            .await?;
+
+        let index_files = list_index_files(object_store.as_ref(), &index_dir.obj_path()).await?;
+        let store_dyn: Arc<dyn IndexStore> = store.clone();
+        let staged =
+            read_staged_metadata(&store_dyn, &metadata_files(&index_files), &noop_progress())
+                .await?;
+        assert_eq!(staged.params.memory_limit_mb, Some(64));
+        assert_eq!(staged.params.num_workers, Some(2));
+        let num_workers = resolve_num_workers(&staged.params);
+        assert_eq!(num_workers, 2);
+        let worker_limit = resolve_worker_memory_limit_bytes(&staged.params, num_workers);
+        assert_eq!(worker_limit, 32 << 20);
+        assert_eq!(
+            finalize_budget_bytes(&staged.params, worker_limit),
+            64 << 20
+        );
+        Ok(())
+    }
+
     fn staged_for_plan(old_id: u64, stored_bytes: u64) -> StagedPartition {
         StagedPartition {
             old_id,
@@ -6110,6 +6264,39 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(ids, vec![(vec![1, 2], 1..3), (vec![3, 4], 3..5)]);
+    }
+
+    /// A build with fewer workers than the working-set factor makes the
+    /// finalize budget the tighter bound on a merge group.
+    #[test]
+    fn test_consolidation_limits_keep_groups_within_budget() {
+        let limit = 1u64 << 30;
+        let two = vec![staged_for_plan(1, 340 << 20), staged_for_plan(2, 340 << 20)];
+
+        // memory_limit_mb = 1024 with one worker: the budget is the limit, so a
+        // group may only be planned to a quarter of it and both are copied.
+        let (ceiling, group_max) = consolidation_limits(limit, limit);
+        assert_eq!(group_max, limit / 4);
+        assert!((340u64 << 20) >= ceiling);
+        let plan = plan_finalize(two.clone(), ceiling, group_max);
+        assert!(plan.groups.is_empty());
+        assert_eq!(plan.copies, vec![(1, 0), (2, 1)]);
+
+        // An 8 GiB budget leaves the worker limit as the bound: one group.
+        let (ceiling, group_max) = consolidation_limits(limit, 8 * limit);
+        assert_eq!(group_max, limit);
+        let plan = plan_finalize(two, ceiling, group_max);
+        assert_eq!(plan.groups.len(), 1);
+        assert!(plan.copies.is_empty());
+        let reserved = plan.groups[0]
+            .members
+            .iter()
+            .map(|member| estimated_merge_working_set_bytes(member.stored_bytes))
+            .sum::<u64>();
+        assert!(
+            reserved <= 8 * limit,
+            "the group's working set fits the budget"
+        );
     }
 
     #[test]
@@ -6302,19 +6489,34 @@ mod tests {
             1,
             "six tiny staged partitions should consolidate into one"
         );
-        let tags = progress
-            .recorded_events()
-            .into_iter()
+        let events = progress.recorded_events();
+        assert_stages_do_not_overlap(&events);
+        let tags = events
+            .iter()
             .map(|(kind, stage, _)| format!("{kind}:{stage}"))
             .collect::<Vec<_>>();
-        assert!(tags.contains(&"complete:consolidate_partitions".to_string()));
         assert!(
             tags.iter()
-                .position(|tag| tag == "complete:consolidate_partitions")
+                .position(|tag| tag == "complete:remap_partition_files")
                 < tags
                     .iter()
                     .position(|tag| tag == "start:write_merged_metadata"),
-            "root metadata must be published after every partition is written"
+            "root metadata must be published after every partition is consumed"
+        );
+        let remap_progress = events
+            .iter()
+            .filter_map(|(kind, stage, completed)| {
+                (kind == "progress" && stage == "remap_partition_files").then_some(*completed)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            remap_progress.windows(2).all(|pair| pair[0] < pair[1]),
+            "progress must be reported in increasing order: {remap_progress:?}"
+        );
+        assert_eq!(
+            remap_progress.last().copied(),
+            Some(6 * PARTITION_FILE_SUFFIXES.len() as u64),
+            "every staged partition's files are counted once, copied or merged"
         );
 
         // The returned files are exactly what the directory holds, with no
@@ -6460,8 +6662,19 @@ mod tests {
 
         // A one-byte limit makes every accumulated builder exceed the guard,
         // so each member is written on its own inside the reserved range.
-        let (ids, files) =
-            consolidate_group(store_dyn, group, &budget, 1, staged.token_set_format).await?;
+        let file_progress = FileProgress {
+            completed: tokio::sync::Mutex::new(0),
+            progress: noop_progress(),
+        };
+        let (ids, files) = consolidate_group(
+            store_dyn,
+            group,
+            &budget,
+            1,
+            staged.token_set_format,
+            &file_progress,
+        )
+        .await?;
         assert_eq!(ids, vec![10, 11, 12]);
         assert_eq!(files.len(), 3 * PARTITION_FILE_SUFFIXES.len());
         for id in ids {
