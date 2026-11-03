@@ -287,6 +287,18 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
             })
     }
 
+    /// Resize the backend's weighted capacity, evicting entries as needed so
+    /// that the resident weight fits the new budget.
+    ///
+    /// Growing the capacity only raises the budget; evicted entries are
+    /// reloaded on demand. Backends that cannot change capacity after
+    /// construction keep the default implementation, which reports an error.
+    fn set_capacity(&self, _capacity: usize) -> Result<()> {
+        Err(crate::Error::not_supported(
+            "this cache backend does not support resizing its capacity",
+        ))
+    }
+
     /// Remove all entries.
     async fn clear(&self);
 

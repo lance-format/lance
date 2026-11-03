@@ -163,6 +163,11 @@ Use `dataset.session().cache_diagnostics()` to inspect the index and metadata ca
 The index cache is not shared between tables. For best performance you should create a single table and
 share it across your application.
 
+A session's cache capacities can be changed after construction with
+`session.set_index_cache_capacity(...)` and `session.set_metadata_cache_capacity(...)`. Shrinking a
+capacity evicts entries as needed, so an application that manages several sessions can bound their
+combined memory usage without dropping or recreating them.
+
 **Note**: `index_cache_size` (specified in entries) was deprecated since version 0.30.0. Use
 `index_cache_size_bytes` (specified in bytes) for new code.
 

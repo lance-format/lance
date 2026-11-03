@@ -557,6 +557,26 @@ impl Session {
         );
         SessionCacheDiagnostics { index, metadata }
     }
+
+    /// Resize the index cache, evicting entries as needed to fit the new
+    /// weighted capacity.
+    ///
+    /// This lets a caller that manages several sessions bound their combined
+    /// memory without dropping or recreating them. Growing the capacity only
+    /// raises the budget; evicted entries are reloaded on demand. Clones of
+    /// this session share the cache, so they all observe the new capacity.
+    ///
+    /// Returns an error when the index cache backend cannot resize after
+    /// construction.
+    pub fn set_index_cache_capacity(&self, capacity: usize) -> Result<()> {
+        self.index_cache.0.set_capacity(capacity)
+    }
+
+    /// Resize the metadata cache, evicting entries as needed to fit the new
+    /// weighted capacity; see [`Self::set_index_cache_capacity`].
+    pub fn set_metadata_cache_capacity(&self, capacity: usize) -> Result<()> {
+        self.metadata_cache.0.set_capacity(capacity)
+    }
 }
 
 impl Default for Session {
@@ -966,6 +986,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn set_cache_capacity_resizes_both_caches() {
+        let session = Session::new(1 << 20, 1 << 20, Default::default());
+        for index in 0..4u64 {
+            session
+                .index_cache
+                .insert_with_key(&WeightedKey(index), Arc::new(DeclaredWeight(40)))
+                .await;
+            session
+                .metadata_cache
+                .0
+                .insert_with_key(&WeightedKey(index), Arc::new(DeclaredWeight(40)))
+                .await;
+        }
+        let entry_bytes = session.index_cache.size_bytes().await / 4;
+        assert!(entry_bytes > 0);
+        assert_eq!(session.metadata_cache.0.size_bytes().await, 4 * entry_bytes);
+
+        // Clones share the cache, so every handle observes the new capacity.
+        let clone = session.clone();
+        session.set_index_cache_capacity(2 * entry_bytes).unwrap();
+        session
+            .set_metadata_cache_capacity(2 * entry_bytes)
+            .unwrap();
+        for cache in [&session.index_cache, &clone.index_cache] {
+            assert_eq!(cache.capacity_bytes(), Some(2 * entry_bytes));
+            assert!(cache.size_bytes().await <= 2 * entry_bytes);
+            assert!(cache.size().await <= 2);
+        }
+        assert_eq!(
+            session.metadata_cache.0.capacity_bytes(),
+            Some(2 * entry_bytes)
+        );
+        assert!(session.metadata_cache.0.size_bytes().await <= 2 * entry_bytes);
+    }
+
+    #[tokio::test]
+    async fn set_cache_capacity_reports_unsupported_backends() {
+        use lance_core::cache::build_from_uri;
+
+        let backend = build_from_uri("moka://?capacity=1048576").unwrap();
+        let session = Session::with_cache_backends(
+            CacheSpec::Backend(backend),
+            CacheSpec::Default,
+            Default::default(),
+        );
+        let err = session.set_index_cache_capacity(1024).unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+
+        // The default metadata backend supports resizing.
+        session.set_metadata_cache_capacity(1024).unwrap();
+        assert_eq!(session.metadata_cache.0.capacity_bytes(), Some(1024));
     }
 
     #[tokio::test]
