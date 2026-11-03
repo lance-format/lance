@@ -194,13 +194,57 @@ Each rewrite that defers index remapping records its mapping: a reuse version
 in FRI index version 0, or transitions in index version 1. A rewrite publishes
 its mapping atomically, replacing the FRI entry in the same commit. A
 transition must reference only fragments committed no later than itself.
-Fragments not covered by any index are served by scanning, so correctness
-never depends on a mapping being present.
+Queries scan fragments that no index covers. An in-progress job may still need
+their movements recorded, as described below.
 
-Once all dependent indices have caught up, the corresponding history can be
-trimmed. Cleanup must retain intermediate transitions still needed to translate
-old addresses. External mapping files can be deleted only when no retained
-dataset version references them.
+### Cleanup
+
+FRI history is needed as long as an index or another consumer uses its row
+translations. For example, an index may return row addresses in fragments A
+and B after compaction has moved those rows into C. The movements from A and B
+to C must remain available until the index no longer needs those translations.
+
+An in-progress job can have the same dependency before its index exists.
+Building an index against A and B may take hours. If compaction moves those
+rows during the build, the job still needs the movements to C when it publishes
+the index. Checking only published indices would miss that requirement.
+
+[Ongoing-work pins](../../table/ongoing_work_pins.md) record these dependencies.
+For each pin, resolve its source version's complete fragment metadata using
+the declared layout, then use all fragment IDs. This reads metadata, not the
+rows; an empty inline list on a fragment-tree table is not an empty source.
+Unresolvable metadata must not become empty coverage. Cleanup must consider
+both active pins and existing consumers before removing history.
+
+FRI version 0 uses an inclusive source-version boundary. FRI version 1 follows
+movements from the pinned source fragments and retains the downstream records
+needed to complete those paths. A version 1 history may contain legacy records;
+when any group in one of those records is needed, retain the whole record and
+all its downstream dependencies. Version 1 transitions do not carry a dataset
+version stamp. The exact rules are defined in
+[Retention and data operations](../../table/ongoing_work_pins.md#retention-and-data-operations).
+
+Every operation that trims or replaces history must recheck all consumers'
+requirements against the current table version before committing, even if it
+was planned before a pin registered. A pin may be excluded only if its release
+or expiration is published in that same commit; passing its deadline alone is
+insufficient. Recheck removals after conflicts so a renewal is not lost.
+Restore and Overwrite apply this check to
+the resulting current history; they may discard translation paths while
+preserving the remaining pins and their retained versions.
+
+Compaction must record the movements the remaining pins need and recheck those
+pins before committing. Reject a result lacking required mappings so the caller can
+replan. A pin does not require mappings solely into a discarded intermediate
+layout, establish index freshness, or authorize publication of an old result.
+
+History can be trimmed when no active pin or other consumer needs it, including
+any intermediate movements needed to translate old addresses. External mapping
+files remain protected while any retained version or required history
+references them, including files added after registration. Replacing FRI
+metadata does not release those files. Creating a pin does not cancel an
+earlier deletion decision; see the examples in
+[Cleanup and deletion races](../../table/ongoing_work_pins.md#cleanup-and-deletion-races).
 
 ## Stable Row IDs
 
@@ -231,7 +275,7 @@ The first commit publishing FRI index version 1 sets
 `FLAG_FRAGMENT_REUSE_INDEX` (1024) in both manifest flag fields. Subsequent
 manifests retain both bits. FRI index version 0 does not require this flag.
 
-Tables using stable row IDs do not support tagged histories; writers must not
+Tables using stable row IDs do not support FRI version 1; writers must not
 publish `index_version >= 1` on them.
 
 The reader flag prevents older clients from partially interpreting the new

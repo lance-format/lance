@@ -136,8 +136,12 @@ pub const FLAG_ROW_ADDR_INDICES: u64 = 1 << 18;
 /// (`DeletionFile.inline`) rather than in a file under `_deletions/`. A reader
 /// without this flag would look for a file that does not exist.
 pub const FLAG_INLINE_DELETIONS: u64 = 1 << 19;
+/// Writer-only retention requirements for ongoing work pins in the current manifest.
+/// Reserved and unsupported until pin-aware writes and maintenance are implemented.
+/// Ordinary reads do not require support for the pin metadata.
+pub const FLAG_ONGOING_WORK_PINS: u64 = 1 << 20;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 20;
+pub const FLAG_UNKNOWN: u64 = 1 << 21;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -158,6 +162,7 @@ const _: () = assert!(FLAG_ZONE_WRITE_SEEDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_OBJECT_METADATA < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_ROW_ADDR_INDICES < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_INLINE_DELETIONS < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_ONGOING_WORK_PINS < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_FRAGMENT_REUSE_INDEX
@@ -487,6 +492,7 @@ fn supported_flags_when(
     mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
     mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
     mark_supported(&mut supported, FLAG_OBJECT_METADATA, true);
+    mark_supported(&mut supported, FLAG_ONGOING_WORK_PINS, false);
     supported
 }
 
@@ -765,6 +771,38 @@ mod tests {
         // the module-level `const _` assertion keeps it at or above that boundary.
     }
 
+    #[rstest::rstest]
+    fn test_ongoing_work_pin_flag_fences_writes_without_blocking_reads(
+        #[values(false, true)] overlay_enabled: bool,
+        #[values(false, true)] frag_reuse_with_stable_row_ids_enabled: bool,
+    ) {
+        let flag = FLAG_ONGOING_WORK_PINS;
+        let mut manifest = empty_manifest();
+        manifest.writer_feature_flags = flag;
+        ensure_can_read_manifest(&manifest).unwrap();
+        let error = ensure_can_write_manifest(&manifest).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("cannot be written"));
+        assert!(!can_read_dataset(flag));
+        assert!(!can_write_dataset(flag));
+        assert_eq!(flag, 1 << 20);
+        let supported =
+            supported_flags_when(overlay_enabled, frag_reuse_with_stable_row_ids_enabled);
+        assert_eq!(supported & flag, 0);
+        let implemented_flags = FLAG_ROW_ADDR_INDICES | FLAG_INLINE_DELETIONS;
+        assert_eq!(
+            supported & implemented_flags,
+            implemented_flags,
+            "reserving the pin bit must not disable implemented features"
+        );
+        // The zone seed bit is supported; ongoing-work pins remain reserved.
+        assert!(can_read_dataset(FLAG_ZONE_WRITE_SEEDS));
+        assert!(can_write_dataset(FLAG_ZONE_WRITE_SEEDS));
+        assert_eq!(FLAG_UNKNOWN, 1 << 21);
+        assert!(!can_read_dataset(FLAG_UNKNOWN));
+        assert!(!can_write_dataset(FLAG_UNKNOWN));
+    }
+
     #[test]
     fn test_object_metadata_flag_is_supported_and_derived() {
         assert_eq!(FLAG_OBJECT_METADATA, 1 << 17);
@@ -773,7 +811,7 @@ mod tests {
         assert_eq!(FLAG_INLINE_DELETIONS, 1 << 19);
         assert!(can_read_dataset(FLAG_INLINE_DELETIONS));
         assert!(can_write_dataset(FLAG_INLINE_DELETIONS));
-        assert_eq!(FLAG_UNKNOWN, 1 << 20);
+        assert_eq!(FLAG_UNKNOWN, 1 << 21);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
 

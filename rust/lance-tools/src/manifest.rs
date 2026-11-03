@@ -1128,6 +1128,15 @@ fn write_transaction_operation(
                 .sum::<usize>();
             write_kv(f, indent, "overlays", &overlay_count.to_string())
         }
+        // The format reserves these operations ahead of their implementation.
+        pb::transaction::Operation::RegisterPin(_)
+        | pb::transaction::Operation::RenewPin(_)
+        | pb::transaction::Operation::ReleasePin(_) => write_kv(
+            f,
+            indent,
+            "operation",
+            "unsupported ongoing-work pin operation",
+        ),
     }
 }
 

@@ -6,6 +6,7 @@ syntax = "proto3";
 import "file.proto";
 import "table.proto";
 import "google/protobuf/any.proto";
+import "google/protobuf/timestamp.proto";
 
 package lance.table;
 
@@ -35,6 +36,16 @@ message Transaction {
    * __lance_commit_message is a reserved key
    */
   map<string, string> transaction_properties = 4;
+
+  /* Optional pin to release atomically with this transaction's operation.
+   * Absent means no explicit release. Present requires exactly 16 UUID bytes;
+   * a missing target is a no-op for release, not for the accompanying operation.
+   * Valid only on an ordinary attached operation, not a pin operation or Clone.
+   * Apply normal publication checks before removal; set sticky writer bit 20.
+   * Persist this transaction inline or in a referenced sidecar before publication,
+   * even when no pins remain. Reject if neither representation can be stored.
+   */
+  UUID release_pin_id = 5;
 
   // Add new rows to the dataset.
   message Append {
@@ -424,6 +435,43 @@ message Transaction {
     repeated BasePath new_bases = 1;
   }
 
+  /* Register retention of the version this commit creates. Transaction.uuid
+   * must parse as a UUID and supplies the pin ID. Registration may rebase;
+   * the successful publishing version becomes the fixed source_version.
+   */
+  message RegisterPin {
+    /* UTC request creation time, fixed before the first send.
+     * Absent is invalid. The pin retains this value through retries/renewals.
+     */
+    google.protobuf.Timestamp created_at = 2;
+    /* Absolute UTC expiry time fixed before the first send.
+     * Absent or not later than created_at is invalid.
+     * Fresh registration requires a future deadline at each attempt's validation.
+     */
+    google.protobuf.Timestamp expires_at = 3;
+    /* Optional immutable context. Absent or empty means no label.
+     * Recovering an active registration returns its existing label.
+     */
+    optional string job_label = 4;
+  }
+
+  // Extend an existing pin; this operation never creates a missing pin.
+  message RenewPin {
+    // Target pin ID. Absent or any length other than 16 UUID bytes is invalid.
+    UUID pin_id = 1;
+    /* Fixed requested absolute UTC expiry time. Absent is invalid.
+     * The current pin must still be unexpired at each attempt's validation.
+     * A current expires_at that meets or exceeds this request is a successful no-op.
+     */
+    google.protobuf.Timestamp expires_at = 2;
+  }
+
+  // Remove one pin; an absent target is a successful no-op.
+  message ReleasePin {
+    // Target pin ID. Absent or any length other than 16 UUID bytes is invalid.
+    UUID pin_id = 1;
+  }
+
   /* The operation of this transaction.
    *
    * Field numbers 100-199 are reserved for operations. A reader that sees a
@@ -447,6 +495,9 @@ message Transaction {
     Clone clone = 113;
     UpdateBases update_bases = 114;
     DataOverlay data_overlay = 115;
+    RegisterPin register_pin = 116;
+    RenewPin renew_pin = 117;
+    ReleasePin release_pin = 118;
   }
 
   // Fields 200/202 (`blob_append` / `blob_overwrite`) previously represented blob dataset ops.

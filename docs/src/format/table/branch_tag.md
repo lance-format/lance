@@ -45,6 +45,44 @@ Each branch metadata file is a JSON file with the following fields:
 | `createAt`       | number |          | Unix timestamp (seconds since epoch) when the branch was created.              |
 | `manifestSize`   | number |          | Size of the initial manifest file in bytes.                                    |
 | `metadata`       | object | Yes      | String key/value metadata map. If absent, it is treated as an empty object.    |
+| `identifier`     | object | Yes      | Branch identity. Older files may omit it; see [Branch identity](#branch-identity). |
+
+### Branch Identity
+
+`identifier.version_mapping` is an ordered JSON array of pairs. Each pair
+contains an unsigned 64-bit parent version and a UUID string. A new branch
+copies its parent's mapping and appends its own pair: the parent version it
+branched from and a fresh UUID. Newly generated UUIDs use 32 lowercase
+hexadecimal digits without hyphens. Main's mapping is empty.
+
+Compare the complete ordered mapping by value. Preserve an existing identifier
+when updating branch metadata. Pin requests retain the identifier read during
+acquisition and reject a different identifier on later inspection. This
+documents the existing branch representation; pins add no identity field.
+
+For an older file without `identifier`, derive a stable identifier from its
+branch name, `parentBranch`, `parentVersion`, and `createAt`. Apply the same
+fallback to the placeholder mapping containing one pair with version zero and
+the string `00000000000000000000000000000000`. The existing derivation is:
+
+1. Encode four lines as UTF-8, separated by a single LF byte, with no trailing
+   newline: `branch_name=<name>`, `parent_branch=<parent>`,
+   `parent_version=<version>`, and `create_at=<time>`. Use the unescaped branch
+   names, an empty parent for absent/null `parentBranch`, and unsigned decimal
+   integers without leading zeros.
+2. Hash those bytes twice. Start the first hash at `0xcbf29ce484222325`; start
+   the second at that value XOR `0x9e3779b97f4a7c15`. For each byte, XOR it into
+   the hash, then multiply by `0x100000001b3`, modulo `2^64`.
+3. Concatenate the two 8-byte hash values in big-endian order and encode the
+   resulting 16 bytes as 32 lowercase hexadecimal digits. The derived mapping
+   contains one pair: version zero and that string.
+
+The fallback is stable across reads, not a unique record of each creation.
+Recreating an older branch with identical inputs produces the same identifier.
+Applications must coordinate such recreation and must not reuse old pin
+requests or handles across it. Main's empty mapping likewise does not identify
+a particular creation of the whole table. No branch names are retired and no
+stored metadata needs migration.
 
 ### Branch Dataset Layout
 
@@ -83,6 +121,38 @@ which means `/` would create a logical subdirectory (e.g., `bugfix/issue-123`, `
                 _versions/
                     1.manifest
 ```
+
+### Deletion with ongoing work pins
+
+Deletion must resolve the [authoritative head](versioning.md#current-state-for-pin-decisions)
+and reject if its active-pin list is nonempty, identifying the blocking pins.
+A pin past `expires_at` still blocks deletion until removed by a committed
+release or expiration in an attached commit. On a quiet table, use explicit
+ReleasePin to remove a blocking pin without waiting for another write.
+Deletion does not implicitly revoke pins. Force deletion
+must perform the same check. Existing tag and dependent-branch checks also apply.
+
+For force deletion of an orphan with no branch reference, the pin check may be
+skipped only when authoritative resolution definitively establishes that no
+attached manifest exists. A listing or resolution failure, or a manifest that
+exists but cannot be read or validated, must fail deletion. If a selected head
+disappears during inspection, restart resolution as specified in
+[Format Versioning](versioning.md#current-state-for-pin-decisions); do not treat
+that failed read alone as proof of absence.
+
+A corrupt current manifest therefore requires repair or administrator recovery
+outside the ordinary branch-deletion protocol. `force` does not bypass pin
+protection; this proposal defines no operator override.
+
+This follows existing tag protection: the check is separate from physical
+deletion and is not atomic with concurrent acquisition. Registration after a
+deleter's inspection does not force that deleter to observe the new pin.
+Delayed deletion after recovery and name reuse also remains a known gap. See
+[Cleanup and deletion races](ongoing_work_pins.md#cleanup-and-deletion-races).
+
+Resolving those existing coordination gaps is outside the pin proposal. Branch
+names remain reusable; pins add no name-retirement record, deletion marker,
+branch layout, or reference-history format.
 
 ## Tagging
 
