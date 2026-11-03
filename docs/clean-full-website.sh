@@ -52,6 +52,10 @@ mkdir -p "$docs_src/format/namespace/supported-catalogs"
 
 mkdir -p "$docs_src/guide/spark/operations/dql"
 
+cat > "$docs_src/guide/spark/operations/dql/.pages" <<'EOF'
+title: DQL
+EOF
+
 cat > "$docs_src/guide/spark/index.md" <<'EOF'
 # Apache Spark Integration
 
