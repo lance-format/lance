@@ -7,9 +7,6 @@ use std::arch::aarch64::*;
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
 
-#[allow(unused_imports)]
-use lance_core::utils::cpu::{SIMD_SUPPORT, SimdSupport};
-
 pub const PERM0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
 pub const PERM0_INVERSE: [usize; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15];
 pub const BATCH_SIZE: usize = 32;
@@ -18,63 +15,78 @@ pub const BATCH_SIZE: usize = 32;
 /// Callers that cannot cap their table must use [`sum_4bit_dist_table_u32`].
 pub const SAFE_U16_CODE_LEN: usize = 128;
 
-/// Which kernel a `dist_table` entry point prefers on this host. An entry point
-/// with no arm for the chosen backend falls through to scalar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DistTableBackend {
-    Avx512,
-    Avx2,
-    Neon,
-    Scalar,
+/// Sums row-major 4-bit codes into `u16`s: `(codes, dist_table, code_len,
+/// dists)` sums `dists.len()` rows, a multiple of [`BATCH_SIZE`], and
+/// initializes every slot of `dists`.
+type SumU16Fn = unsafe fn(&[u8], &[u8], usize, &mut [MaybeUninit<u16>]);
+
+lance_core::dispatch! {
+    static SUM_U16: Dispatch<SumU16Fn> = {
+        #[cfg(all(target_arch = "x86_64", kernel_support = "avx512_dist_table"))]
+        {
+            &[SUM_U16_AVX512, SUM_U16_AVX2, SUM_U16_SCALAR]
+        }
+        #[cfg(all(target_arch = "x86_64", not(kernel_support = "avx512_dist_table")))]
+        {
+            &[SUM_U16_AVX2, SUM_U16_SCALAR]
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            &[SUM_U16_NEON, SUM_U16_SCALAR]
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            &[SUM_U16_SCALAR]
+        }
+    };
 }
 
-/// Picks the kernel from a tier and two feature bits passed in, reading neither
-/// `SIMD_SUPPORT` nor the CPU, so the consequences of the tier ladder are
-/// testable without a host of each kind.
-///
-/// `avx512_kernel` says whether the calling entry point has an AVX-512 kernel to
-/// offer: `sum_4bit_dist_table_uninit` has one behind
-/// `kernel_support = "avx512_dist_table"`, `sum_4bit_dist_table_transposed` and
-/// `filter_4bit_dist_table_transposed` have a Rust one on every x86_64 build
-/// with no `kernel_support` cfg, the exact `f32` entry points pass `true` on
-/// every build since only an x86_64 tier can select it, and the hacc entry
-/// point has none.
-fn dist_table_backend(
-    support: SimdSupport,
-    avx512_kernel: bool,
-    has_avx512bw: bool,
-    has_avx2: bool,
-) -> DistTableBackend {
-    match support {
-        SimdSupport::Avx512 | SimdSupport::Avx512FP16 if avx512_kernel && has_avx512bw => {
-            DistTableBackend::Avx512
+/// [`SumU16Fn`] for the high-accuracy table, which holds `64` bytes per code
+/// byte and sums into `u32`s.
+type SumHaccFn = unsafe fn(&[u8], &[u8], usize, &mut [MaybeUninit<u32>]);
+
+lance_core::dispatch! {
+    static SUM_HACC: Dispatch<SumHaccFn> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[SUM_HACC_AVX2, SUM_HACC_SCALAR]
         }
-        // `SIMD_SUPPORT` is a single exclusive tier, so an AVX-512 host reports
-        // `Avx512` or `Avx512FP16` and never `Avx2`. Naming only `Avx2` here
-        // would send an AVX-512 host that missed the arm above down the scalar
-        // path while it has AVX2.
-        SimdSupport::Avx512 | SimdSupport::Avx512FP16 | SimdSupport::Avx2 if has_avx2 => {
-            DistTableBackend::Avx2
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[SUM_HACC_SCALAR]
         }
-        SimdSupport::Neon => DistTableBackend::Neon,
-        _ => DistTableBackend::Scalar,
-    }
+    };
 }
 
-/// The two feature bits [`dist_table_backend`] needs, or `false` off x86_64.
+/// Checks the bounds the row-major kernels rely on to sum `n` rows. Products
+/// are checked: a wrapped one would let short slices past the unchecked pointer
+/// arithmetic of the SIMD kernels.
 #[inline]
-fn x86_dist_table_features() -> (bool, bool) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        (
-            std::arch::is_x86_feature_detected!("avx512bw"),
-            std::arch::is_x86_feature_detected!("avx2"),
-        )
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        (false, false)
-    }
+fn assert_row_major_bounds(
+    n: usize,
+    code_len: usize,
+    codes: &[u8],
+    dist_table: &[u8],
+    table_bytes_per_code: usize,
+) {
+    assert!(
+        n.is_multiple_of(BATCH_SIZE),
+        "n = {n} is not a multiple of {BATCH_SIZE}"
+    );
+    assert!(
+        n.checked_mul(code_len)
+            .is_some_and(|needed| codes.len() >= needed),
+        "codes has {} bytes, fewer than n * code_len = {n} * {code_len}",
+        codes.len()
+    );
+    assert!(
+        code_len
+            .checked_mul(table_bytes_per_code)
+            .is_some_and(|needed| dist_table.len() >= needed),
+        "dist_table has {} bytes, fewer than {table_bytes_per_code} * code_len = \
+         {table_bytes_per_code} * {code_len}",
+        dist_table.len()
+    );
 }
 
 // This function is used to sum the distance table for 4-bit codes.
@@ -99,91 +111,130 @@ pub fn sum_4bit_dist_table(
     dist_table: &[u8],
     dists: &mut [u16],
 ) {
-    assert!(n.is_multiple_of(BATCH_SIZE));
-    assert!(dists.len() >= n);
-    assert!(codes.len() >= n * code_len);
-    assert!(dist_table.len() >= BATCH_SIZE * code_len);
     // A `u16` slice is also a valid `MaybeUninit<u16>` slice. The dispatched
     // kernels overwrite every output slot.
     let dists = unsafe {
         std::slice::from_raw_parts_mut(dists.as_mut_ptr().cast::<MaybeUninit<u16>>(), dists.len())
     };
-    unsafe { sum_4bit_dist_table_uninit(n, code_len, codes, dist_table, dists) };
+    sum_4bit_dist_table_uninit(n, code_len, codes, dist_table, dists);
 }
 
 /// Sum a 4-bit distance table into potentially uninitialized output storage.
 ///
 /// Every element in `dists[..n]` is initialized before this function returns.
 ///
-/// # Safety
+/// # Panics
 ///
-/// `n` must be a multiple of [`BATCH_SIZE`], `codes` must contain at least
-/// `n * code_len` bytes, `dist_table` must contain at least
-/// `BATCH_SIZE * code_len` bytes, and `dists` must contain at least `n` slots.
+/// Unless `n` is a multiple of [`BATCH_SIZE`], `codes` holds at least
+/// `n * code_len` bytes, `dist_table` at least `BATCH_SIZE * code_len` bytes
+/// and `dists` at least `n` slots.
 #[inline]
-pub unsafe fn sum_4bit_dist_table_uninit(
+pub fn sum_4bit_dist_table_uninit(
     n: usize,
     code_len: usize,
     codes: &[u8],
     dist_table: &[u8],
     dists: &mut [MaybeUninit<u16>],
 ) {
-    debug_assert!(n.is_multiple_of(BATCH_SIZE));
-    debug_assert!(dists.len() >= n);
-    debug_assert!(codes.len() >= n * code_len);
-    debug_assert!(dist_table.len() >= BATCH_SIZE * code_len);
+    SUM_U16
+        .get()
+        .call(codes, dist_table, code_len, &mut dists[..n]);
+}
 
-    let (has_avx512bw, has_avx2) = x86_dist_table_features();
-    match dist_table_backend(
-        *SIMD_SUPPORT,
-        cfg!(all(
-            kernel_support = "avx512_dist_table",
-            target_arch = "x86_64"
-        )),
-        has_avx512bw,
-        has_avx2,
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(SUM_U16_SCALAR: SumU16Fn)]
+    fn sum_u16_scalar(
+        codes: &[u8],
+        dist_table: &[u8],
+        code_len: usize,
+        dists: &mut [MaybeUninit<u16>],
     ) {
-        #[cfg(all(kernel_support = "avx512_dist_table", target_arch = "x86_64"))]
-        DistTableBackend::Avx512 => {
-            for i in (0..n).step_by(BATCH_SIZE) {
-                let codes = &codes[i * code_len..(i + BATCH_SIZE) * code_len];
-                unsafe {
-                    sum_4bit_dist_table_32bytes_batch_avx512(
-                        codes.as_ptr(),
-                        codes.len(),
-                        dist_table.as_ptr(),
-                        dists[i..i + BATCH_SIZE].as_mut_ptr().cast::<u16>(),
-                    )
-                }
-            }
-        }
-        #[cfg(target_arch = "x86_64")]
-        DistTableBackend::Avx2 => unsafe {
-            for i in (0..n).step_by(BATCH_SIZE) {
+        let n = dists.len();
+        assert_row_major_bounds(n, code_len, codes, dist_table, BATCH_SIZE);
+        dists.fill(MaybeUninit::new(0));
+        // Every slot was initialized immediately above.
+        let dists = unsafe { std::slice::from_raw_parts_mut(dists.as_mut_ptr().cast::<u16>(), n) };
+        sum_4bit_dist_table_scalar(code_len, &codes[..n * code_len], dist_table, dists);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+lance_core::target_kernel! {
+    #[target_features("avx2")]
+    #[candidate(SUM_U16_AVX2: SumU16Fn)]
+    fn sum_u16_avx2(
+        codes: &[u8],
+        dist_table: &[u8],
+        code_len: usize,
+        dists: &mut [MaybeUninit<u16>],
+    ) {
+        let n = dists.len();
+        assert_row_major_bounds(n, code_len, codes, dist_table, BATCH_SIZE);
+        for i in (0..n).step_by(BATCH_SIZE) {
+            // The bounds asserted above cover every load of the batch.
+            unsafe {
                 sum_dist_table_32bytes_batch_avx2(
                     &codes[i * code_len..(i + BATCH_SIZE) * code_len],
                     dist_table,
                     &mut dists[i..i + BATCH_SIZE],
                 )
             }
-        },
-        #[cfg(target_arch = "aarch64")]
-        DistTableBackend::Neon => unsafe {
-            for i in (0..n).step_by(BATCH_SIZE) {
+        }
+    }
+}
+
+// The C object adds only `-mavx512f -mavx512bw` to the build's baseline
+// target (see build.rs).
+#[cfg(all(target_arch = "x86_64", kernel_support = "avx512_dist_table"))]
+lance_core::target_kernel! {
+    #[target_features("avx512f", "avx512bw")]
+    #[candidate(SUM_U16_AVX512: SumU16Fn)]
+    fn sum_u16_avx512(
+        codes: &[u8],
+        dist_table: &[u8],
+        code_len: usize,
+        dists: &mut [MaybeUninit<u16>],
+    ) {
+        let n = dists.len();
+        assert_row_major_bounds(n, code_len, codes, dist_table, BATCH_SIZE);
+        for i in (0..n).step_by(BATCH_SIZE) {
+            let codes = &codes[i * code_len..(i + BATCH_SIZE) * code_len];
+            // The kernel reads `codes.len()` bytes of the codes and of the
+            // table, whose bounds are asserted above, and stores 32 outputs.
+            unsafe {
+                sum_4bit_dist_table_32bytes_batch_avx512(
+                    codes.as_ptr(),
+                    codes.len(),
+                    dist_table.as_ptr(),
+                    dists[i..i + BATCH_SIZE].as_mut_ptr().cast::<u16>(),
+                )
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+lance_core::target_kernel! {
+    #[target_features("neon")]
+    #[candidate(SUM_U16_NEON: SumU16Fn)]
+    fn sum_u16_neon(
+        codes: &[u8],
+        dist_table: &[u8],
+        code_len: usize,
+        dists: &mut [MaybeUninit<u16>],
+    ) {
+        let n = dists.len();
+        assert_row_major_bounds(n, code_len, codes, dist_table, BATCH_SIZE);
+        for i in (0..n).step_by(BATCH_SIZE) {
+            // The bounds asserted above cover every load of the batch.
+            unsafe {
                 sum_dist_table_32bytes_batch_neon(
                     &codes[i * code_len..(i + BATCH_SIZE) * code_len],
                     dist_table,
                     &mut dists[i..i + BATCH_SIZE],
                 )
             }
-        },
-        // `Scalar`.
-        _ => {
-            dists[..n].fill(MaybeUninit::new(0));
-            // Every slot was initialized immediately above.
-            let dists =
-                unsafe { std::slice::from_raw_parts_mut(dists.as_mut_ptr().cast::<u16>(), n) };
-            sum_4bit_dist_table_scalar(code_len, &codes[..n * code_len], dist_table, dists);
         }
     }
 }
@@ -235,45 +286,42 @@ pub fn sum_4bit_dist_table_u32(
     dist_table: &[u8],
     dists: &mut [u32],
 ) {
-    assert!(n.is_multiple_of(BATCH_SIZE));
-    assert!(dists.len() >= n);
-    assert!(codes.len() >= n * code_len);
-    assert!(dist_table.len() >= BATCH_SIZE * code_len);
     // A `u32` slice is also a valid `MaybeUninit<u32>` slice. The chunk loop
     // overwrites every output slot.
     let dists = unsafe {
         std::slice::from_raw_parts_mut(dists.as_mut_ptr().cast::<MaybeUninit<u32>>(), dists.len())
     };
-    unsafe { sum_4bit_dist_table_u32_uninit(n, code_len, codes, dist_table, dists) };
+    sum_4bit_dist_table_u32_uninit(n, code_len, codes, dist_table, dists);
 }
 
 /// Sum a 4-bit distance table into potentially uninitialized `u32` output.
 ///
 /// Every element in `dists[..n]` is initialized before this function returns.
 ///
-/// # Safety
+/// # Panics
 ///
-/// `n` must be a multiple of [`BATCH_SIZE`], `codes` must contain at least
-/// `n * code_len` bytes, `dist_table` must contain at least
-/// `BATCH_SIZE * code_len` bytes, and `dists` must contain at least `n` slots.
+/// Unless `n` is a multiple of [`BATCH_SIZE`], `codes` holds at least
+/// `n * code_len` bytes, `dist_table` at least `BATCH_SIZE * code_len` bytes
+/// and `dists` at least `n` slots.
 #[inline]
-pub unsafe fn sum_4bit_dist_table_u32_uninit(
+pub fn sum_4bit_dist_table_u32_uninit(
     n: usize,
     code_len: usize,
     codes: &[u8],
     dist_table: &[u8],
     dists: &mut [MaybeUninit<u32>],
 ) {
-    debug_assert!(n.is_multiple_of(BATCH_SIZE));
-    debug_assert!(dists.len() >= n);
-    debug_assert!(codes.len() >= n * code_len);
-    debug_assert!(dist_table.len() >= BATCH_SIZE * code_len);
+    // The chunk kernels check only their own chunk, so the whole input is
+    // checked here for a clear panic.
+    assert_row_major_bounds(n, code_len, codes, dist_table, BATCH_SIZE);
+    let dists = &mut dists[..n];
 
     if code_len == 0 {
-        dists[..n].fill(MaybeUninit::new(0));
+        dists.fill(MaybeUninit::new(0));
         return;
     }
 
+    let sum_u16 = SUM_U16.get();
     for i in (0..n).step_by(BATCH_SIZE) {
         let batch_codes = &codes[i * code_len..(i + BATCH_SIZE) * code_len];
         let mut sums = [0u32; BATCH_SIZE];
@@ -282,15 +330,12 @@ pub unsafe fn sum_4bit_dist_table_u32_uninit(
             // Bytes are grouped by sub-vector, so one range slices both arrays.
             let bytes = chunk_start * BATCH_SIZE..chunk_end * BATCH_SIZE;
             let mut chunk_dists = [MaybeUninit::<u16>::uninit(); BATCH_SIZE];
-            unsafe {
-                sum_4bit_dist_table_uninit(
-                    BATCH_SIZE,
-                    chunk_end - chunk_start,
-                    &batch_codes[bytes.clone()],
-                    &dist_table[bytes],
-                    &mut chunk_dists,
-                );
-            }
+            sum_u16.call(
+                &batch_codes[bytes.clone()],
+                &dist_table[bytes],
+                chunk_end - chunk_start,
+                &mut chunk_dists,
+            );
             // The dispatched kernel initialized every chunk output slot.
             let chunk_dists = unsafe {
                 std::slice::from_raw_parts(chunk_dists.as_ptr().cast::<u16>(), BATCH_SIZE)
@@ -355,62 +400,51 @@ pub fn sum_4bit_hacc_dist_table(
     hacc_dist_table: &[u8],
     dists: &mut [u32],
 ) {
-    assert!(n.is_multiple_of(BATCH_SIZE));
-    assert!(dists.len() >= n);
-    assert!(codes.len() >= n * code_len);
-    assert!(hacc_dist_table.len() >= code_len * 64);
     // A `u32` slice is also a valid `MaybeUninit<u32>` slice. The dispatched
     // kernels overwrite every output slot.
     let dists = unsafe {
         std::slice::from_raw_parts_mut(dists.as_mut_ptr().cast::<MaybeUninit<u32>>(), dists.len())
     };
-    unsafe { sum_4bit_hacc_dist_table_uninit(n, code_len, codes, hacc_dist_table, dists) };
+    sum_4bit_hacc_dist_table_uninit(n, code_len, codes, hacc_dist_table, dists);
 }
 
 /// Sum a high-accuracy 4-bit distance table into uninitialized output storage.
 ///
 /// Every element in `dists[..n]` is initialized before this function returns.
 ///
-/// # Safety
+/// # Panics
 ///
-/// `n` must be a multiple of [`BATCH_SIZE`], `codes` must contain at least
-/// `n * code_len` bytes, `hacc_dist_table` must contain at least
-/// `code_len * 64` bytes, and `dists` must contain at least `n` slots.
+/// Unless `n` is a multiple of [`BATCH_SIZE`], `codes` holds at least
+/// `n * code_len` bytes, `hacc_dist_table` at least `code_len * 64` bytes and
+/// `dists` at least `n` slots.
 #[inline]
-pub unsafe fn sum_4bit_hacc_dist_table_uninit(
+pub fn sum_4bit_hacc_dist_table_uninit(
     n: usize,
     code_len: usize,
     codes: &[u8],
     hacc_dist_table: &[u8],
     dists: &mut [MaybeUninit<u32>],
 ) {
-    debug_assert!(n.is_multiple_of(BATCH_SIZE));
-    debug_assert!(dists.len() >= n);
-    debug_assert!(codes.len() >= n * code_len);
-    debug_assert!(hacc_dist_table.len() >= code_len * 64);
+    SUM_HACC
+        .get()
+        .call(codes, hacc_dist_table, code_len, &mut dists[..n]);
+}
 
-    // `false` for the AVX-512 kernel: this entry point has none, so an AVX-512
-    // host with AVX2 takes AVX2 here. It has no NEON kernel either, and an
-    // aarch64 tier is `Neon` or `None`, so the selector returns `Neon` or
-    // `Scalar` and both land on the scalar `_` arm.
-    let (has_avx512bw, has_avx2) = x86_dist_table_features();
-    match dist_table_backend(*SIMD_SUPPORT, false, has_avx512bw, has_avx2) {
-        #[cfg(target_arch = "x86_64")]
-        DistTableBackend::Avx2 => {
-            sum_4bit_hacc_dist_table_avx2(n, code_len, codes, hacc_dist_table, dists);
-        }
-        _ => {
-            dists[..n].fill(MaybeUninit::new(0));
-            // Every slot was initialized immediately above.
-            let dists =
-                unsafe { std::slice::from_raw_parts_mut(dists.as_mut_ptr().cast::<u32>(), n) };
-            sum_4bit_hacc_dist_table_scalar(
-                code_len,
-                &codes[..n * code_len],
-                hacc_dist_table,
-                dists,
-            );
-        }
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(SUM_HACC_SCALAR: SumHaccFn)]
+    fn sum_hacc_scalar(
+        codes: &[u8],
+        hacc_dist_table: &[u8],
+        code_len: usize,
+        dists: &mut [MaybeUninit<u32>],
+    ) {
+        let n = dists.len();
+        assert_row_major_bounds(n, code_len, codes, hacc_dist_table, 64);
+        dists.fill(MaybeUninit::new(0));
+        // Every slot was initialized immediately above.
+        let dists = unsafe { std::slice::from_raw_parts_mut(dists.as_mut_ptr().cast::<u32>(), n) };
+        sum_4bit_hacc_dist_table_scalar(code_len, &codes[..n * code_len], hacc_dist_table, dists);
     }
 }
 
@@ -489,59 +523,64 @@ pub fn sum_4bit_dist_table_u16_scalar(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[inline]
-fn sum_4bit_hacc_dist_table_avx2(
-    n: usize,
-    code_len: usize,
-    codes: &[u8],
-    hacc_dist_table: &[u8],
-    dists: &mut [MaybeUninit<u32>],
-) {
-    for i in (0..n).step_by(BATCH_SIZE) {
-        let batch_codes = &codes[i * code_len..(i + BATCH_SIZE) * code_len];
-        let batch_dists = &mut dists[i..i + BATCH_SIZE];
+lance_core::target_kernel! {
+    #[target_features("avx2")]
+    #[candidate(SUM_HACC_AVX2: SumHaccFn)]
+    fn sum_hacc_avx2(
+        codes: &[u8],
+        hacc_dist_table: &[u8],
+        code_len: usize,
+        dists: &mut [MaybeUninit<u32>],
+    ) {
+        let n = dists.len();
+        assert_row_major_bounds(n, code_len, codes, hacc_dist_table, 64);
+        for i in (0..n).step_by(BATCH_SIZE) {
+            let batch_codes = &codes[i * code_len..(i + BATCH_SIZE) * code_len];
+            let batch_dists = &mut dists[i..i + BATCH_SIZE];
 
-        if code_len == 0 {
-            batch_dists.fill(MaybeUninit::new(0));
-            continue;
-        }
+            if code_len == 0 {
+                batch_dists.fill(MaybeUninit::new(0));
+                continue;
+            }
 
-        for code_start in (0..code_len).step_by(SAFE_U16_CODE_LEN) {
-            let code_end = (code_start + SAFE_U16_CODE_LEN).min(code_len);
-            let code_range = code_start * BATCH_SIZE..code_end * BATCH_SIZE;
-            let table_range = code_start * 64..code_end * 64;
-            if code_start == 0 {
-                unsafe {
-                    sum_hacc_dist_table_32bytes_batch_avx2(
-                        &batch_codes[code_range],
-                        &hacc_dist_table[table_range],
-                        batch_dists,
-                    );
+            for code_start in (0..code_len).step_by(SAFE_U16_CODE_LEN) {
+                let code_end = (code_start + SAFE_U16_CODE_LEN).min(code_len);
+                let code_range = code_start * BATCH_SIZE..code_end * BATCH_SIZE;
+                let table_range = code_start * 64..code_end * 64;
+                if code_start == 0 {
+                    // The bounds asserted above cover every load of the chunk.
+                    unsafe {
+                        sum_hacc_dist_table_32bytes_batch_avx2(
+                            &batch_codes[code_range],
+                            &hacc_dist_table[table_range],
+                            batch_dists,
+                        );
+                    }
+                } else {
+                    let mut chunk_dists = [MaybeUninit::<u32>::uninit(); BATCH_SIZE];
+                    unsafe {
+                        sum_hacc_dist_table_32bytes_batch_avx2(
+                            &batch_codes[code_range],
+                            &hacc_dist_table[table_range],
+                            &mut chunk_dists,
+                        );
+                    }
+                    // The kernel above initializes every temporary output slot.
+                    let chunk_dists = unsafe {
+                        std::slice::from_raw_parts(chunk_dists.as_ptr().cast::<u32>(), BATCH_SIZE)
+                    };
+                    // The first code chunk initialized every output slot.
+                    let batch_dists = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            batch_dists.as_mut_ptr().cast::<u32>(),
+                            BATCH_SIZE,
+                        )
+                    };
+                    batch_dists
+                        .iter_mut()
+                        .zip(chunk_dists.iter())
+                        .for_each(|(dist, chunk_dist)| *dist += *chunk_dist);
                 }
-            } else {
-                let mut chunk_dists = [MaybeUninit::<u32>::uninit(); BATCH_SIZE];
-                unsafe {
-                    sum_hacc_dist_table_32bytes_batch_avx2(
-                        &batch_codes[code_range],
-                        &hacc_dist_table[table_range],
-                        &mut chunk_dists,
-                    );
-                }
-                // The kernel above initializes every temporary output slot.
-                let chunk_dists = unsafe {
-                    std::slice::from_raw_parts(chunk_dists.as_ptr().cast::<u32>(), BATCH_SIZE)
-                };
-                // The first code chunk initialized every output slot.
-                let batch_dists = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        batch_dists.as_mut_ptr().cast::<u32>(),
-                        BATCH_SIZE,
-                    )
-                };
-                batch_dists
-                    .iter_mut()
-                    .zip(chunk_dists.iter())
-                    .for_each(|(dist, chunk_dist)| *dist += *chunk_dist);
             }
         }
     }
@@ -801,55 +840,142 @@ pub fn sum_4bit_dist_table_transposed(
     dist_table: &[u8],
     dists: &mut [u16],
 ) {
-    // Checked products: a wrapped one would let short slices past the
-    // unchecked pointer arithmetic of the kernels.
+    let dist_table = column_tables(dist_table, code_len);
+    SUM_TRANSPOSED.get().call(codes, dist_table, n, dists);
+}
+
+/// Sums `n` rows of column-major 4-bit codes into `u16`s: `(codes,
+/// dist_table, n, dists)`, with one column per 32 entries of `dist_table`.
+type SumTransposedFn = unsafe fn(&[u8], &[u8], usize, &mut [u16]);
+
+lance_core::dispatch! {
+    static SUM_TRANSPOSED: Dispatch<SumTransposedFn> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[SUM_TRANSPOSED_AVX512, SUM_TRANSPOSED_AVX2, SUM_TRANSPOSED_SCALAR]
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            &[SUM_TRANSPOSED_NEON, SUM_TRANSPOSED_SCALAR]
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            &[SUM_TRANSPOSED_SCALAR]
+        }
+    };
+}
+
+/// The first `32 * code_len` entries of `dist_table`: one low and one high
+/// table of 16 entries per code column.
+///
+/// # Panics
+///
+/// If `dist_table` has fewer entries.
+#[inline]
+fn column_tables<T>(dist_table: &[T], code_len: usize) -> &[T] {
+    let table_len = code_len.checked_mul(32);
+    assert!(
+        table_len.is_some_and(|needed| dist_table.len() >= needed),
+        "dist_table has {} entries, fewer than 32 * code_len = 32 * {code_len}",
+        dist_table.len()
+    );
+    &dist_table[..32 * code_len]
+}
+
+/// The number of code columns `dist_table` has tables for, after checking
+/// that `codes` holds `n` rows of each. The product is checked: a wrapped one
+/// would let short slices past the unchecked pointer arithmetic of the SIMD
+/// kernels.
+#[inline]
+fn transposed_code_len<T>(n: usize, codes: &[u8], dist_table: &[T]) -> usize {
+    let code_len = dist_table.len() / 32;
     assert!(
         n.checked_mul(code_len)
             .is_some_and(|needed| codes.len() >= needed),
         "codes has {} bytes, fewer than n * code_len = {n} * {code_len}",
         codes.len()
     );
-    assert!(
-        code_len
-            .checked_mul(32)
-            .is_some_and(|needed| dist_table.len() >= needed),
-        "dist_table has {} entries, fewer than 32 * code_len = 32 * {code_len}",
-        dist_table.len()
-    );
-    assert!(dists.len() >= n);
-    // The SIMD kernels offset the code pointer by the first row before the
-    // column loop, which with no columns would point past empty `codes`.
-    if code_len == 0 {
-        dists[..n].fill(0);
-        return;
-    }
+    code_len
+}
 
-    let (has_avx512bw, has_avx2) = x86_dist_table_features();
-    let simd_len = match dist_table_backend(
-        *SIMD_SUPPORT,
-        cfg!(target_arch = "x86_64"),
-        has_avx512bw,
-        has_avx2,
-    ) {
-        #[cfg(target_arch = "x86_64")]
-        DistTableBackend::Avx512 => {
-            // The asserts above bound every full-width access; the tail is masked.
-            unsafe { sum_transposed_avx512(n, code_len, codes, dist_table, dists) };
-            n
+/// The `n` slots of `dists` the transposed kernels store to. The SIMD kernels
+/// store through raw pointers, so this check is what keeps them in bounds.
+#[inline]
+fn transposed_dists<T>(dists: &mut [T], n: usize) -> &mut [T] {
+    assert!(
+        dists.len() >= n,
+        "dists has {} slots, fewer than n = {n}",
+        dists.len()
+    );
+    &mut dists[..n]
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(SUM_TRANSPOSED_SCALAR: SumTransposedFn)]
+    fn sum_transposed_scalar(codes: &[u8], dist_table: &[u8], n: usize, dists: &mut [u16]) {
+        let code_len = transposed_code_len(n, codes, dist_table);
+        let dists = transposed_dists(dists, n);
+        sum_4bit_dist_table_transposed_scalar(0, n, code_len, codes, dist_table, dists);
+    }
+}
+
+// The SIMD kernels offset the code pointer by the first row before the column
+// loop, which with no columns would point past empty `codes`, so they leave
+// that case to scalar code.
+
+#[cfg(target_arch = "x86_64")]
+lance_core::target_kernel! {
+    #[target_features("avx512f", "avx512bw")]
+    #[candidate(SUM_TRANSPOSED_AVX512: SumTransposedFn)]
+    fn sum_transposed_avx512(codes: &[u8], dist_table: &[u8], n: usize, dists: &mut [u16]) {
+        let code_len = transposed_code_len(n, codes, dist_table);
+        let dists = transposed_dists(dists, n);
+        if code_len == 0 {
+            dists.fill(0);
+            return;
         }
-        #[cfg(target_arch = "x86_64")]
-        DistTableBackend::Avx2 => sum_transposed_in_batches(n, |start| {
-            // The asserts above bound every load and store of the batch.
-            unsafe { sum_transposed_batch_avx2(start, n, code_len, codes, dist_table, dists) }
-        }),
-        #[cfg(target_arch = "aarch64")]
-        DistTableBackend::Neon => sum_transposed_in_batches(n, |start| {
-            // The asserts above bound every load and store of the batch.
-            unsafe { sum_transposed_batch_neon(start, n, code_len, codes, dist_table, dists) }
-        }),
-        _ => 0,
-    };
-    sum_4bit_dist_table_transposed_scalar(simd_len, n, code_len, codes, dist_table, dists);
+        // The checks above bound every full-width access; the tail is masked.
+        unsafe { sum_transposed_all_avx512(n, code_len, codes, dist_table, dists) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+lance_core::target_kernel! {
+    #[target_features("avx2")]
+    #[candidate(SUM_TRANSPOSED_AVX2: SumTransposedFn)]
+    fn sum_transposed_avx2(codes: &[u8], dist_table: &[u8], n: usize, dists: &mut [u16]) {
+        let code_len = transposed_code_len(n, codes, dist_table);
+        let dists = transposed_dists(dists, n);
+        let simd_len = if code_len == 0 {
+            0
+        } else {
+            sum_transposed_in_batches(n, |start| {
+                // The checks above bound every load and store of the batch.
+                unsafe { sum_transposed_batch_avx2(start, n, code_len, codes, dist_table, dists) }
+            })
+        };
+        sum_4bit_dist_table_transposed_scalar(simd_len, n, code_len, codes, dist_table, dists);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+lance_core::target_kernel! {
+    #[target_features("neon")]
+    #[candidate(SUM_TRANSPOSED_NEON: SumTransposedFn)]
+    fn sum_transposed_neon(codes: &[u8], dist_table: &[u8], n: usize, dists: &mut [u16]) {
+        let code_len = transposed_code_len(n, codes, dist_table);
+        let dists = transposed_dists(dists, n);
+        let simd_len = if code_len == 0 {
+            0
+        } else {
+            sum_transposed_in_batches(n, |start| {
+                // The checks above bound every load and store of the batch.
+                unsafe { sum_transposed_batch_neon(start, n, code_len, codes, dist_table, dists) }
+            })
+        };
+        sum_4bit_dist_table_transposed_scalar(simd_len, n, code_len, codes, dist_table, dists);
+    }
 }
 
 /// Rows summed per SIMD batch by [`sum_4bit_dist_table_transposed`], and rows
@@ -950,86 +1076,129 @@ pub fn filter_4bit_dist_table_transposed(
     threshold: u16,
     mut on_batch: impl FnMut(usize, u64, &[u16; TRANSPOSED_BATCH_SIZE]) -> u16,
 ) {
-    let (has_avx512bw, has_avx2) = x86_dist_table_features();
-    let backend = dist_table_backend(
-        *SIMD_SUPPORT,
-        cfg!(target_arch = "x86_64"),
-        has_avx512bw,
-        has_avx2,
-    );
-    // `Avx512` needs `avx512bw`, which implies the `avx512f` its kernel also
-    // uses, and `Avx2` needs `avx2`.
-    unsafe {
-        filter_transposed_with_backend(
-            backend,
-            n,
-            code_len,
-            codes,
-            dist_table,
-            threshold,
-            &mut on_batch,
-        )
+    let dist_table = column_tables(dist_table, code_len);
+    // `call` cannot take `&mut OnBatch<'_>`: the trait object's lifetime is
+    // its own, so no `Kernel::call` signature matches it.
+    let kernel = FILTER_TRANSPOSED.get().as_fn();
+    // SAFETY: `get` returns only a kernel the host supports, and every
+    // `FILTER_TRANSPOSED` candidate is a safe `target_kernel!` function that
+    // checks its own bounds, so the target features are its only precondition.
+    unsafe { kernel(codes, dist_table, n, threshold, &mut on_batch) };
+}
+
+/// The callback of [`filter_4bit_dist_table_transposed`].
+type OnBatch<'a> = dyn FnMut(usize, u64, &[u16; TRANSPOSED_BATCH_SIZE]) -> u16 + 'a;
+
+/// [`filter_4bit_dist_table_transposed`] over `n` rows: `(codes, dist_table, n,
+/// threshold, on_batch)`, with one column per 32 entries of `dist_table`. The
+/// callback is a trait object because a candidate is a function pointer.
+type FilterTransposedFn = unsafe fn(&[u8], &[u8], usize, u16, &mut OnBatch<'_>);
+
+lance_core::dispatch! {
+    static FILTER_TRANSPOSED: Dispatch<FilterTransposedFn> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[FILTER_TRANSPOSED_AVX512, FILTER_TRANSPOSED_AVX2, FILTER_TRANSPOSED_SCALAR]
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            &[FILTER_TRANSPOSED_NEON, FILTER_TRANSPOSED_SCALAR]
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            &[FILTER_TRANSPOSED_SCALAR]
+        }
     };
 }
 
-/// [`filter_4bit_dist_table_transposed`] on `backend`; a backend without a
-/// kernel here, or fewer than 64 rows for the AVX2 and NEON batches, runs the
-/// scalar path.
-///
-/// # Safety
-///
-/// The host must support `avx512f` and `avx512bw` when `backend` is `Avx512`
-/// and `avx2` when it is `Avx2`.
-unsafe fn filter_transposed_with_backend(
-    backend: DistTableBackend,
-    n: usize,
-    code_len: usize,
-    codes: &[u8],
-    dist_table: &[u8],
-    threshold: u16,
-    on_batch: &mut impl FnMut(usize, u64, &[u16; TRANSPOSED_BATCH_SIZE]) -> u16,
-) {
-    // Checked products: a wrapped one would let short slices past the
-    // unchecked pointer arithmetic of the kernels.
-    assert!(
-        n.checked_mul(code_len)
-            .is_some_and(|needed| codes.len() >= needed),
-        "codes has {} bytes, fewer than n * code_len = {n} * {code_len}",
-        codes.len()
-    );
-    assert!(
-        code_len
-            .checked_mul(32)
-            .is_some_and(|needed| dist_table.len() >= needed),
-        "dist_table has {} entries, fewer than 32 * code_len = 32 * {code_len}",
-        dist_table.len()
-    );
-    match backend {
-        // The SIMD kernels offset the code pointer by the first row before the
-        // column loop, which with no columns would point past empty `codes`.
-        // Every row then sums to 0, which the scalar path reports.
-        _ if code_len == 0 => {
-            filter_transposed_scalar(n, code_len, codes, dist_table, threshold, on_batch)
+// As in the sum kernels, the SIMD paths leave `code_len == 0` to scalar code,
+// which reports every row with its sum of 0.
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(FILTER_TRANSPOSED_SCALAR: FilterTransposedFn)]
+    fn filter_transposed_scalar(
+        codes: &[u8],
+        dist_table: &[u8],
+        n: usize,
+        threshold: u16,
+        on_batch: &mut OnBatch<'_>,
+    ) {
+        let code_len = transposed_code_len(n, codes, dist_table);
+        filter_transposed_rows_scalar(n, code_len, codes, dist_table, threshold, on_batch);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+lance_core::target_kernel! {
+    #[target_features("avx512f", "avx512bw")]
+    #[candidate(FILTER_TRANSPOSED_AVX512: FilterTransposedFn)]
+    fn filter_transposed_avx512(
+        codes: &[u8],
+        dist_table: &[u8],
+        n: usize,
+        threshold: u16,
+        on_batch: &mut OnBatch<'_>,
+    ) {
+        let code_len = transposed_code_len(n, codes, dist_table);
+        if code_len == 0 {
+            filter_transposed_rows_scalar(n, code_len, codes, dist_table, threshold, on_batch);
+            return;
         }
-        // The asserts above bound every full-width access; the tail is masked.
-        #[cfg(target_arch = "x86_64")]
-        DistTableBackend::Avx512 => {
-            filter_transposed_avx512(n, code_len, codes, dist_table, threshold, on_batch)
+        // The check above bounds every full-width access; the tail is masked.
+        unsafe {
+            filter_transposed_all_avx512(n, code_len, codes, dist_table, threshold, on_batch)
+        };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+lance_core::target_kernel! {
+    #[target_features("avx2")]
+    #[candidate(FILTER_TRANSPOSED_AVX2: FilterTransposedFn)]
+    fn filter_transposed_avx2(
+        codes: &[u8],
+        dist_table: &[u8],
+        n: usize,
+        threshold: u16,
+        on_batch: &mut OnBatch<'_>,
+    ) {
+        let code_len = transposed_code_len(n, codes, dist_table);
+        if code_len == 0 || n < TRANSPOSED_BATCH_SIZE {
+            filter_transposed_rows_scalar(n, code_len, codes, dist_table, threshold, on_batch);
+            return;
         }
-        // The asserts above bound every load of a batch within `0..n`.
-        #[cfg(target_arch = "x86_64")]
-        DistTableBackend::Avx2 if n >= TRANSPOSED_BATCH_SIZE => {
-            filter_transposed_in_batches(n, threshold, on_batch, |start, threshold, sums| {
+        filter_transposed_in_batches(n, threshold, on_batch, |start, threshold, sums| {
+            // The check above bounds every load of a batch within `0..n`.
+            unsafe {
                 filter_transposed_batch_avx2(start, n, code_len, codes, dist_table, threshold, sums)
-            })
+            }
+        })
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+lance_core::target_kernel! {
+    #[target_features("neon")]
+    #[candidate(FILTER_TRANSPOSED_NEON: FilterTransposedFn)]
+    fn filter_transposed_neon(
+        codes: &[u8],
+        dist_table: &[u8],
+        n: usize,
+        threshold: u16,
+        on_batch: &mut OnBatch<'_>,
+    ) {
+        let code_len = transposed_code_len(n, codes, dist_table);
+        if code_len == 0 || n < TRANSPOSED_BATCH_SIZE {
+            filter_transposed_rows_scalar(n, code_len, codes, dist_table, threshold, on_batch);
+            return;
         }
-        #[cfg(target_arch = "aarch64")]
-        DistTableBackend::Neon if n >= TRANSPOSED_BATCH_SIZE => {
-            filter_transposed_in_batches(n, threshold, on_batch, |start, threshold, sums| {
+        filter_transposed_in_batches(n, threshold, on_batch, |start, threshold, sums| {
+            // The check above bounds every load of a batch within `0..n`.
+            unsafe {
                 filter_transposed_batch_neon(start, n, code_len, codes, dist_table, threshold, sums)
-            })
-        }
-        _ => filter_transposed_scalar(n, code_len, codes, dist_table, threshold, on_batch),
+            }
+        })
     }
 }
 
@@ -1041,7 +1210,7 @@ unsafe fn filter_transposed_with_backend(
 fn filter_transposed_in_batches(
     n: usize,
     mut threshold: u16,
-    on_batch: &mut impl FnMut(usize, u64, &[u16; TRANSPOSED_BATCH_SIZE]) -> u16,
+    on_batch: &mut OnBatch<'_>,
     mut batch: impl FnMut(usize, u16, &mut [u16; TRANSPOSED_BATCH_SIZE]) -> u64,
 ) {
     debug_assert!(n >= TRANSPOSED_BATCH_SIZE);
@@ -1063,13 +1232,13 @@ fn filter_transposed_in_batches(
 }
 
 /// Scalar [`filter_4bit_dist_table_transposed`].
-fn filter_transposed_scalar(
+fn filter_transposed_rows_scalar(
     n: usize,
     code_len: usize,
     codes: &[u8],
     dist_table: &[u8],
     mut threshold: u16,
-    on_batch: &mut impl FnMut(usize, u64, &[u16; TRANSPOSED_BATCH_SIZE]) -> u16,
+    on_batch: &mut OnBatch<'_>,
 ) {
     let mut sums = [0u16; TRANSPOSED_BATCH_SIZE];
     for start in (0..n).step_by(TRANSPOSED_BATCH_SIZE) {
@@ -1228,11 +1397,13 @@ unsafe fn filter_transposed_batch_avx2(
 ///
 /// # Safety
 ///
-/// The host must support `avx512f` and `avx512bw`, and the slices must satisfy
-/// the bounds `sum_4bit_dist_table_transposed` asserts.
+/// The host must support `avx512f` and `avx512bw`.
+/// `codes` and `dist_table` must hold the `n * code_len` bytes and
+/// `32 * code_len` entries [`transposed_code_len`] checks, and `dists` at
+/// least the `n` slots [`transposed_dists`] checks.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn sum_transposed_avx512(
+unsafe fn sum_transposed_all_avx512(
     n: usize,
     code_len: usize,
     codes: &[u8],
@@ -1364,16 +1535,16 @@ unsafe fn transposed_block_sums_avx512<const REGS: usize, const MASKED: bool>(
 /// # Safety
 ///
 /// The host must support `avx512f` and `avx512bw`, and the slices must satisfy
-/// the bounds `filter_4bit_dist_table_transposed` asserts.
+/// the bounds [`transposed_code_len`] checks.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn filter_transposed_avx512(
+unsafe fn filter_transposed_all_avx512(
     n: usize,
     code_len: usize,
     codes: &[u8],
     dist_table: &[u8],
     mut threshold: u16,
-    on_batch: &mut impl FnMut(usize, u64, &[u16; TRANSPOSED_BATCH_SIZE]) -> u16,
+    on_batch: &mut OnBatch<'_>,
 ) {
     let mut sums = [0u16; TRANSPOSED_BATCH_SIZE];
     let mut start = 0;
@@ -1433,7 +1604,7 @@ unsafe fn emit_rows_at_most_avx512(
     row_mask: u64,
     threshold: u16,
     sums: &mut [u16; TRANSPOSED_BATCH_SIZE],
-    on_batch: &mut impl FnMut(usize, u64, &[u16; TRANSPOSED_BATCH_SIZE]) -> u16,
+    on_batch: &mut OnBatch<'_>,
 ) -> u16 {
     let limit = _mm512_set1_epi16(threshold as i16);
     let mask = (u64::from(_mm512_cmple_epu16_mask(first, limit))
@@ -1570,8 +1741,9 @@ pub fn sum_4bit_dist_table_f32_row(
     row: usize,
 ) -> f32 {
     assert!(row < n, "row {row} is out of range for {n} rows");
-    assert_f32_table_bounds(n, code_len, codes, dist_table);
-    f32_row_sum(n, codes, f32_tables(dist_table, code_len), row)
+    let dist_table = column_tables(dist_table, code_len);
+    transposed_code_len(n, codes, dist_table);
+    f32_row_sum(n, codes, f32_tables(dist_table), row)
 }
 
 /// Exact `f32` sums of all `n` rows of a 4-bit PQ distance table over
@@ -1609,11 +1781,8 @@ pub fn sum_4bit_dist_table_f32_transposed(
     dist_table: &[f32],
     dists: &mut [f32],
 ) {
-    let (has_avx512bw, has_avx2) = x86_dist_table_features();
-    let backend = dist_table_backend(*SIMD_SUPPORT, true, has_avx512bw, has_avx2);
-    // `Avx512` needs `avx512bw`, which implies the `avx512f` its kernel uses,
-    // and `Avx2` needs `avx2`.
-    unsafe { sum_f32_transposed_with_backend(backend, n, code_len, codes, dist_table, dists) };
+    let dist_table = column_tables(dist_table, code_len);
+    SUM_F32_TRANSPOSED.get().call(codes, dist_table, n, dists);
 }
 
 /// Exact `f32` sums of the selected `rows`, writing the sum of `rows[i]` to
@@ -1649,10 +1818,48 @@ pub fn sum_4bit_dist_table_f32_rows(
     rows: &[u32],
     dists: &mut [f32],
 ) {
-    let (has_avx512bw, has_avx2) = x86_dist_table_features();
-    let backend = dist_table_backend(*SIMD_SUPPORT, true, has_avx512bw, has_avx2);
-    // Same backend contract as `sum_4bit_dist_table_f32_transposed`.
-    unsafe { sum_f32_rows_with_backend(backend, n, code_len, codes, dist_table, rows, dists) };
+    let dist_table = column_tables(dist_table, code_len);
+    SUM_F32_ROWS.get().call(codes, dist_table, n, rows, dists);
+}
+
+/// Exact `f32` sums of all `n` rows: `(codes, dist_table, n, dists)`, with one
+/// column per 32 entries of `dist_table`.
+type SumF32TransposedFn = unsafe fn(&[u8], &[f32], usize, &mut [f32]);
+
+lance_core::dispatch! {
+    static SUM_F32_TRANSPOSED: Dispatch<SumF32TransposedFn> = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[SUM_F32_TRANSPOSED_AVX512, SUM_F32_TRANSPOSED_AVX2, SUM_F32_TRANSPOSED_SCALAR]
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            &[SUM_F32_TRANSPOSED_NEON, SUM_F32_TRANSPOSED_SCALAR]
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            &[SUM_F32_TRANSPOSED_SCALAR]
+        }
+    };
+}
+
+/// Exact `f32` sums of selected rows: `(codes, dist_table, n, rows, dists)`.
+type SumF32RowsFn = unsafe fn(&[u8], &[f32], usize, &[u32], &mut [f32]);
+
+lance_core::dispatch! {
+    static SUM_F32_ROWS: Dispatch<SumF32RowsFn> = {
+        // A NEON kernel measured no faster than scalar on Graviton3: per 16
+        // rows it gathers the code bytes and deinterleaves every column's
+        // tables, which costs more than its lookups save.
+        #[cfg(target_arch = "x86_64")]
+        {
+            &[SUM_F32_ROWS_AVX512, SUM_F32_ROWS_AVX2, SUM_F32_ROWS_SCALAR]
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            &[SUM_F32_ROWS_SCALAR]
+        }
+    };
 }
 
 /// Rows per `f32` lane group: one `zmm` register on AVX-512, two `ymm` on AVX2,
@@ -1663,29 +1870,11 @@ const F32_GROUP_ROWS: usize = 16;
 /// building the 256 pairs of a column costs about as much as summing 256 rows.
 const F32_PAIR_TABLE_BLOCK_ROWS: usize = 256;
 
-/// Bounds the unchecked pointer arithmetic of the SIMD kernels, so the products
-/// are checked: a wrapped one would let short slices pass.
-#[inline]
-fn assert_f32_table_bounds(n: usize, code_len: usize, codes: &[u8], dist_table: &[f32]) {
-    let codes_needed = n.checked_mul(code_len);
-    assert!(
-        codes_needed.is_some_and(|needed| codes.len() >= needed),
-        "codes has {} bytes, fewer than n * code_len = {n} * {code_len}",
-        codes.len()
-    );
-    let table_needed = code_len.checked_mul(32);
-    assert!(
-        table_needed.is_some_and(|needed| dist_table.len() >= needed),
-        "dist_table has {} entries, fewer than 32 * code_len = 32 * {code_len}",
-        dist_table.len()
-    );
-}
-
 /// One 32-entry table per code column: 16 entries for the low nibble, then 16
 /// for the high one.
 #[inline]
-fn f32_tables(dist_table: &[f32], code_len: usize) -> &[[f32; 32]] {
-    dist_table[..32 * code_len].as_chunks::<32>().0
+fn f32_tables(dist_table: &[f32]) -> &[[f32; 32]] {
+    dist_table.as_chunks::<32>().0
 }
 
 #[inline]
@@ -1700,67 +1889,81 @@ fn f32_row_sum(n: usize, codes: &[u8], tables: &[[f32; 32]], row: usize) -> f32 
         })
 }
 
-/// [`sum_4bit_dist_table_f32_transposed`] on `backend`; any other backend than
-/// `Avx512`, `Avx2` and `Neon` runs the scalar path.
-///
-/// # Safety
-///
-/// The host must support `avx512f` when `backend` is `Avx512` and `avx2` when
-/// it is `Avx2`.
-unsafe fn sum_f32_transposed_with_backend(
-    backend: DistTableBackend,
-    n: usize,
-    code_len: usize,
-    codes: &[u8],
-    dist_table: &[f32],
-    dists: &mut [f32],
-) {
-    assert_f32_table_bounds(n, code_len, codes, dist_table);
-    assert!(
-        dists.len() >= n,
-        "dists has {} slots, fewer than n = {n}",
-        dists.len()
-    );
-    match backend {
-        // The SIMD kernels offset the code pointer by the first row before the
-        // column loop, which with no columns would point past empty `codes`.
-        // Every sum is then `-0.0`, which the scalar path returns.
-        _ if code_len == 0 => {
-            sum_f32_transposed_scalar(n, codes, f32_tables(dist_table, code_len), dists)
-        }
-        // The asserts above bound every load and store of the kernels, which
-        // need at least one full lane group.
-        #[cfg(target_arch = "x86_64")]
-        DistTableBackend::Avx512 if n >= F32_GROUP_ROWS => {
-            sum_f32_transposed_avx512(n, code_len, codes, dist_table, dists)
-        }
-        #[cfg(target_arch = "x86_64")]
-        DistTableBackend::Avx2 if n >= F32_GROUP_ROWS / 2 => {
-            sum_f32_transposed_avx2(n, code_len, codes, dist_table, dists)
-        }
-        #[cfg(target_arch = "aarch64")]
-        DistTableBackend::Neon if n >= F32_GROUP_ROWS => {
-            sum_f32_transposed_neon(n, code_len, codes, dist_table, dists)
-        }
-        _ => sum_f32_transposed_scalar(n, codes, f32_tables(dist_table, code_len), dists),
+// The SIMD kernels offset the code pointer by the first row before the column
+// loop, which with no columns would point past empty `codes`, so they leave
+// that case, where every sum is `-0.0`, to scalar code. They also need at
+// least one full lane group.
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(SUM_F32_TRANSPOSED_SCALAR: SumF32TransposedFn)]
+    fn sum_f32_transposed_scalar(codes: &[u8], dist_table: &[f32], n: usize, dists: &mut [f32]) {
+        transposed_code_len(n, codes, dist_table);
+        let dists = transposed_dists(dists, n);
+        sum_f32_transposed_rows_scalar(n, codes, f32_tables(dist_table), dists);
     }
 }
 
-/// [`sum_4bit_dist_table_f32_rows`] on `backend`.
-///
-/// # Safety
-///
-/// As for [`sum_f32_transposed_with_backend`].
-unsafe fn sum_f32_rows_with_backend(
-    backend: DistTableBackend,
-    n: usize,
-    code_len: usize,
+#[cfg(target_arch = "x86_64")]
+lance_core::target_kernel! {
+    #[target_features("avx512f")]
+    #[candidate(SUM_F32_TRANSPOSED_AVX512: SumF32TransposedFn)]
+    fn sum_f32_transposed_avx512(codes: &[u8], dist_table: &[f32], n: usize, dists: &mut [f32]) {
+        let code_len = transposed_code_len(n, codes, dist_table);
+        let dists = transposed_dists(dists, n);
+        if code_len == 0 || n < F32_GROUP_ROWS {
+            sum_f32_transposed_rows_scalar(n, codes, f32_tables(dist_table), dists);
+            return;
+        }
+        // The checks above bound every load and store of the kernel.
+        unsafe { sum_f32_transposed_all_avx512(n, code_len, codes, dist_table, dists) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+lance_core::target_kernel! {
+    #[target_features("avx2")]
+    #[candidate(SUM_F32_TRANSPOSED_AVX2: SumF32TransposedFn)]
+    fn sum_f32_transposed_avx2(codes: &[u8], dist_table: &[f32], n: usize, dists: &mut [f32]) {
+        let code_len = transposed_code_len(n, codes, dist_table);
+        let dists = transposed_dists(dists, n);
+        if code_len == 0 || n < F32_GROUP_ROWS / 2 {
+            sum_f32_transposed_rows_scalar(n, codes, f32_tables(dist_table), dists);
+            return;
+        }
+        // The checks above bound every load and store of the kernel.
+        unsafe { sum_f32_transposed_all_avx2(n, code_len, codes, dist_table, dists) };
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+lance_core::target_kernel! {
+    #[target_features("neon")]
+    #[candidate(SUM_F32_TRANSPOSED_NEON: SumF32TransposedFn)]
+    fn sum_f32_transposed_neon(codes: &[u8], dist_table: &[f32], n: usize, dists: &mut [f32]) {
+        let code_len = transposed_code_len(n, codes, dist_table);
+        let dists = transposed_dists(dists, n);
+        if code_len == 0 || n < F32_GROUP_ROWS {
+            sum_f32_transposed_rows_scalar(n, codes, f32_tables(dist_table), dists);
+            return;
+        }
+        // The checks above bound every load and store of the kernel.
+        unsafe { sum_f32_transposed_all_neon(n, code_len, codes, dist_table, dists) };
+    }
+}
+
+/// Checks the bounds of [`SumF32RowsFn`] and returns the code column count and
+/// the `dists` slots of `rows`. Together these keep every gathered code byte,
+/// table load and store in bounds.
+#[inline]
+fn f32_rows_bounds<'a>(
     codes: &[u8],
     dist_table: &[f32],
+    n: usize,
     rows: &[u32],
-    dists: &mut [f32],
-) {
-    assert_f32_table_bounds(n, code_len, codes, dist_table);
+    dists: &'a mut [f32],
+) -> (usize, &'a mut [f32]) {
+    let code_len = transposed_code_len(n, codes, dist_table);
     assert!(
         dists.len() >= rows.len(),
         "dists has {} slots, fewer than the {} rows",
@@ -1772,25 +1975,60 @@ unsafe fn sum_f32_rows_with_backend(
         max_row.is_none_or(|&row| (row as usize) < n),
         "row {max_row:?} is out of range for {n} rows"
     );
-    let dists = &mut dists[..rows.len()];
-    match backend {
-        // The asserts above keep every gathered code byte, table load and store
-        // in bounds.
-        #[cfg(target_arch = "x86_64")]
-        DistTableBackend::Avx512 => {
-            sum_f32_rows_avx512(n, code_len, codes, dist_table, rows, dists)
-        }
-        #[cfg(target_arch = "x86_64")]
-        DistTableBackend::Avx2 => sum_f32_rows_avx2(n, code_len, codes, dist_table, rows, dists),
-        // A NEON kernel measured no faster than scalar on Graviton3: per
-        // 16 rows it gathers the code bytes and deinterleaves every column's
-        // tables, which costs more than its lookups save.
-        _ => sum_f32_rows_scalar(n, codes, f32_tables(dist_table, code_len), rows, dists),
+    (code_len, &mut dists[..rows.len()])
+}
+
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(SUM_F32_ROWS_SCALAR: SumF32RowsFn)]
+    fn sum_f32_rows_scalar(
+        codes: &[u8],
+        dist_table: &[f32],
+        n: usize,
+        rows: &[u32],
+        dists: &mut [f32],
+    ) {
+        let (_, dists) = f32_rows_bounds(codes, dist_table, n, rows, dists);
+        sum_f32_selected_rows_scalar(n, codes, f32_tables(dist_table), rows, dists);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+lance_core::target_kernel! {
+    #[target_features("avx512f")]
+    #[candidate(SUM_F32_ROWS_AVX512: SumF32RowsFn)]
+    fn sum_f32_rows_avx512(
+        codes: &[u8],
+        dist_table: &[f32],
+        n: usize,
+        rows: &[u32],
+        dists: &mut [f32],
+    ) {
+        let (code_len, dists) = f32_rows_bounds(codes, dist_table, n, rows, dists);
+        // The checks above bound every access of the kernel.
+        unsafe { sum_f32_selected_rows_avx512(n, code_len, codes, dist_table, rows, dists) };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+lance_core::target_kernel! {
+    #[target_features("avx2")]
+    #[candidate(SUM_F32_ROWS_AVX2: SumF32RowsFn)]
+    fn sum_f32_rows_avx2(
+        codes: &[u8],
+        dist_table: &[f32],
+        n: usize,
+        rows: &[u32],
+        dists: &mut [f32],
+    ) {
+        let (code_len, dists) = f32_rows_bounds(codes, dist_table, n, rows, dists);
+        // The checks above bound every access of the kernel.
+        unsafe { sum_f32_selected_rows_avx2(n, code_len, codes, dist_table, rows, dists) };
     }
 }
 
 /// Scalar [`sum_4bit_dist_table_f32_transposed`].
-fn sum_f32_transposed_scalar(n: usize, codes: &[u8], tables: &[[f32; 32]], dists: &mut [f32]) {
+fn sum_f32_transposed_rows_scalar(n: usize, codes: &[u8], tables: &[[f32; 32]], dists: &mut [f32]) {
     let dists = &mut dists[..n];
     if n < F32_PAIR_TABLE_BLOCK_ROWS {
         for (row, dist) in dists.iter_mut().enumerate() {
@@ -1823,7 +2061,7 @@ fn sum_f32_transposed_scalar(n: usize, codes: &[u8], tables: &[[f32; 32]], dists
 
 /// Scalar [`sum_4bit_dist_table_f32_rows`]. Eight rows at a time overlap their
 /// otherwise serial add chains.
-fn sum_f32_rows_scalar(
+fn sum_f32_selected_rows_scalar(
     n: usize,
     codes: &[u8],
     tables: &[[f32; 32]],
@@ -1902,11 +2140,13 @@ fn lookup_pair_avx512(code: __m512i, low_table: __m512, high_table: __m512) -> _
 ///
 /// # Safety
 ///
-/// The host must support `avx512f`, `n >= 16`, and the slices must satisfy
-/// the bounds `sum_f32_transposed_with_backend` asserts.
+/// The host must support `avx512f` and `n >= 16`.
+/// `codes` and `dist_table` must hold the `n * code_len` bytes and
+/// `32 * code_len` entries [`transposed_code_len`] checks, and `dists` at
+/// least the `n` slots [`transposed_dists`] checks.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-unsafe fn sum_f32_transposed_avx512(
+unsafe fn sum_f32_transposed_all_avx512(
     n: usize,
     code_len: usize,
     codes: &[u8],
@@ -1975,10 +2215,10 @@ unsafe fn sum_f32_transposed_block_avx512<const GROUPS: usize>(
 /// # Safety
 ///
 /// The host must support `avx512f`, and the slices must satisfy the bounds
-/// `sum_f32_rows_with_backend` asserts, with `dists.len() == rows.len()`.
+/// [`f32_rows_bounds`] checks, with `dists.len() == rows.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-unsafe fn sum_f32_rows_avx512(
+unsafe fn sum_f32_selected_rows_avx512(
     n: usize,
     code_len: usize,
     codes: &[u8],
@@ -2053,15 +2293,17 @@ unsafe fn load_tables_avx2(dist_table: *const f32, column: usize) -> ([__m256; 2
 }
 
 /// Sums all `n` rows in 32-row blocks, then 8-row groups, ending with the 8
-/// rows that end at `n` like [`sum_f32_transposed_avx512`].
+/// rows that end at `n` like [`sum_f32_transposed_all_avx512`].
 ///
 /// # Safety
 ///
-/// The host must support `avx2`, `n >= 8`, and the slices must satisfy the
-/// bounds `sum_f32_transposed_with_backend` asserts.
+/// The host must support `avx2` and `n >= 8`.
+/// `codes` and `dist_table` must hold the `n * code_len` bytes and
+/// `32 * code_len` entries [`transposed_code_len`] checks, and `dists` at
+/// least the `n` slots [`transposed_dists`] checks.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn sum_f32_transposed_avx2(
+unsafe fn sum_f32_transposed_all_avx2(
     n: usize,
     code_len: usize,
     codes: &[u8],
@@ -2119,10 +2361,10 @@ unsafe fn sum_f32_transposed_block_avx2<const GROUPS: usize>(
 ///
 /// # Safety
 ///
-/// As for [`sum_f32_rows_avx512`], with `avx2` in place of `avx512f`.
+/// As for [`sum_f32_selected_rows_avx512`], with `avx2` in place of `avx512f`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn sum_f32_rows_avx2(
+unsafe fn sum_f32_selected_rows_avx2(
     n: usize,
     code_len: usize,
     codes: &[u8],
@@ -2209,11 +2451,13 @@ fn lookup_pair_neon(
 ///
 /// # Safety
 ///
-/// `n >= 16`, and the slices must satisfy the bounds
-/// `sum_f32_transposed_with_backend` asserts.
+/// `n >= 16`.
+/// `codes` and `dist_table` must hold the `n * code_len` bytes and
+/// `32 * code_len` entries [`transposed_code_len`] checks, and `dists` at
+/// least the `n` slots [`transposed_dists`] checks.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn sum_f32_transposed_neon(
+unsafe fn sum_f32_transposed_all_neon(
     n: usize,
     code_len: usize,
     codes: &[u8],
@@ -2294,80 +2538,6 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `avx512_kernel` false covers every caller that reaches it: the hacc entry
-    /// point, which has no AVX-512 kernel at all,
-    /// `sum_4bit_dist_table_transposed` on every non-x86_64 build, and
-    /// `sum_4bit_dist_table_uninit` wherever its
-    /// `cfg!(all(kernel_support = "avx512_dist_table", target_arch = "x86_64"))`
-    /// is false, which is every non-x86_64 build as well as an x86_64 one that
-    /// compiled no AVX-512 C.
-    #[rstest::rstest]
-    // An AVX-512 host whose entry point has an AVX-512 kernel and `avx512bw`
-    // present takes it.
-    #[case::avx512_ready(SimdSupport::Avx512, true, true, true, DistTableBackend::Avx512)]
-    #[case::avx512fp16_ready(SimdSupport::Avx512FP16, true, true, true, DistTableBackend::Avx512)]
-    // The two ways an AVX-512 host with AVX2 misses the AVX-512 arm. Both must
-    // reach AVX2 rather than scalar.
-    #[case::avx512_no_bw(SimdSupport::Avx512, true, false, true, DistTableBackend::Avx2)]
-    #[case::avx512_kernel_absent(SimdSupport::Avx512, false, true, true, DistTableBackend::Avx2)]
-    #[case::avx512fp16_no_bw(SimdSupport::Avx512FP16, true, false, true, DistTableBackend::Avx2)]
-    #[case::avx512fp16_kernel_absent(
-        SimdSupport::Avx512FP16,
-        false,
-        true,
-        true,
-        DistTableBackend::Avx2
-    )]
-    #[case::avx2_tier(SimdSupport::Avx2, true, false, true, DistTableBackend::Avx2)]
-    // The tier alone must not authorize the AVX2 kernel: it is
-    // `#[target_feature(enable = "avx2")]`. No host produces this pair, since
-    // `cpu.rs` selects `Avx2` only when the same `avx2` detection returned true,
-    // so this row pins the selector's contract rather than a real configuration.
-    #[case::avx2_tier_without_the_feature(
-        SimdSupport::Avx2,
-        false,
-        false,
-        false,
-        DistTableBackend::Scalar
-    )]
-    // Without AVX2 there is nothing to fall back to; this row pins the selector.
-    #[case::avx512_no_avx2(SimdSupport::Avx512, false, false, false, DistTableBackend::Scalar)]
-    #[case::avx_fma(SimdSupport::AvxFma, false, false, false, DistTableBackend::Scalar)]
-    #[case::avx(SimdSupport::Avx, false, false, false, DistTableBackend::Scalar)]
-    // An `Avx` tier that reports AVX2. `cpu.rs` notes that every shipping AVX2
-    // part has FMA, so no shipping part produces this pair, though a masked or
-    // feature-forced build can: the tier alone leaves it on scalar, even though
-    // the kernel needs no FMA.
-    #[case::avx_tier_with_avx2(SimdSupport::Avx, false, false, true, DistTableBackend::Scalar)]
-    // `Sse` is a variant the x86 ladder never produces, so this row pins the
-    // selector rather than a real host.
-    #[case::sse(SimdSupport::Sse, false, false, false, DistTableBackend::Scalar)]
-    #[case::none(SimdSupport::None, false, false, false, DistTableBackend::Scalar)]
-    #[case::neon(SimdSupport::Neon, false, false, false, DistTableBackend::Neon)]
-    // loongarch64 has LSX and LASX kernels elsewhere in this crate but none for
-    // this table, so both tiers belong on the scalar route.
-    #[case::lsx(SimdSupport::Lsx, false, false, false, DistTableBackend::Scalar)]
-    #[case::lasx(SimdSupport::Lasx, false, false, false, DistTableBackend::Scalar)]
-    // The exact `f32` entry points pass `avx512_kernel = true` on every build,
-    // so a non-AVX-512 tier must ignore it and pick what it would without it.
-    #[case::f32_entry_neon(SimdSupport::Neon, true, false, false, DistTableBackend::Neon)]
-    #[case::f32_entry_avx2(SimdSupport::Avx2, true, false, true, DistTableBackend::Avx2)]
-    #[case::f32_entry_avx_fma(SimdSupport::AvxFma, true, false, false, DistTableBackend::Scalar)]
-    #[case::f32_entry_lasx(SimdSupport::Lasx, true, false, false, DistTableBackend::Scalar)]
-    #[case::f32_entry_none(SimdSupport::None, true, false, false, DistTableBackend::Scalar)]
-    fn dist_table_backend_follows_the_tier_ladder(
-        #[case] support: SimdSupport,
-        #[case] avx512_kernel: bool,
-        #[case] has_avx512bw: bool,
-        #[case] has_avx2: bool,
-        #[case] expected: DistTableBackend,
-    ) {
-        assert_eq!(
-            dist_table_backend(support, avx512_kernel, has_avx512bw, has_avx2),
-            expected
-        );
-    }
 
     #[test]
     fn test_perm0_inverse_matches_perm0() {
@@ -2497,100 +2667,90 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_sum_4bit_hacc_dist_table_matches_u16_reference_multi_batch() {
+    /// Every hacc candidate, and the dispatched entry point, sums a full-range
+    /// `u16` table exactly, across [`SAFE_U16_CODE_LEN`] chunk boundaries.
+    #[rstest::rstest]
+    fn test_sum_4bit_hacc_dist_table_candidates_match_u16_reference(
+        #[values(1, 3, 16, 191, 192, 1024)] code_len: usize,
+    ) {
         use rand::{Rng, SeedableRng};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(101);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(101 + code_len as u64);
+        let n = BATCH_SIZE * 4;
+        let codes: Vec<u8> = (0..n * code_len).map(|_| rng.random::<u8>()).collect();
+        let dist_table: Vec<u16> = (0..BATCH_SIZE * code_len)
+            .map(|_| rng.random::<u16>())
+            .collect();
+        let mut hacc_dist_table = Vec::new();
+        transfer_4bit_dist_table_u16(&dist_table, &mut hacc_dist_table);
 
-        for code_len in [1, 3, 16, 191, 192, 1024] {
-            let n = BATCH_SIZE * 4;
-            let codes: Vec<u8> = (0..n * code_len).map(|_| rng.random::<u8>()).collect();
-            let dist_table: Vec<u16> = (0..BATCH_SIZE * code_len)
-                .map(|_| rng.random::<u16>())
-                .collect();
+        let mut expected = vec![0u32; n];
+        sum_4bit_dist_table_u16_scalar(code_len, &codes, &dist_table, &mut expected);
 
-            let mut hacc_dist_table = Vec::new();
-            transfer_4bit_dist_table_u16(&dist_table, &mut hacc_dist_table);
-
-            let mut expected = vec![0u32; n];
-            sum_4bit_dist_table_u16_scalar(code_len, &codes, &dist_table, &mut expected);
-
-            let mut actual = vec![u32::MAX; n];
-            sum_4bit_hacc_dist_table(n, code_len, &codes, &hacc_dist_table, &mut actual);
-
+        for candidate in SUM_HACC.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let mut actual = vec![MaybeUninit::new(u32::MAX); n];
+            kernel.call(&codes, &hacc_dist_table, code_len, &mut actual);
+            let actual = actual
+                .iter()
+                .map(|dist| unsafe { dist.assume_init() })
+                .collect::<Vec<_>>();
             assert_eq!(
                 actual,
                 expected,
-                "hacc dist-table mismatch for code_len={} (DIM={})",
-                code_len,
-                code_len * 8,
+                "{} at code_len {code_len}",
+                candidate.name()
             );
         }
+        let mut actual = vec![u32::MAX; n];
+        sum_4bit_hacc_dist_table(n, code_len, &codes, &hacc_dist_table, &mut actual);
+        assert_eq!(actual, expected, "entry point at code_len {code_len}");
     }
 
-    /// SIMD against scalar over the range the `u16` entry point is contracted
-    /// for; longer codes belong to [`sum_4bit_dist_table_u32`].
-    #[test]
-    fn test_simd_matches_scalar_varied_dimensions() {
+    /// Every candidate, and the dispatched entry point, matches scalar within
+    /// the `u16` contract: a full-range table up to [`SAFE_U16_CODE_LEN`], and
+    /// past it a table capped so no sum overflows, as the ex-code FastScan LUT
+    /// does. Three batches check that rows do not bleed across batch boundaries.
+    #[rstest::rstest]
+    fn test_sum_4bit_dist_table_candidates_match_scalar(
+        #[values(1, 2, 3, 16, 95, 96, 128, 191, 192, 1024, 8192)] code_len: usize,
+        #[values(1, 3)] num_batches: usize,
+    ) {
         use rand::{Rng, SeedableRng};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut rng = rand::rngs::StdRng::seed_from_u64((code_len * 100 + num_batches) as u64);
+        let n = BATCH_SIZE * num_batches;
+        let max_entry = (u16::MAX as usize / (2 * code_len)).min(u8::MAX as usize) as u8;
+        let codes: Vec<u8> = (0..n * code_len).map(|_| rng.random::<u8>()).collect();
+        let dist_table: Vec<u8> = (0..BATCH_SIZE * code_len)
+            .map(|_| rng.random_range(0..=max_entry))
+            .collect();
 
-        // code_len = dim / 8 for 1-bit quantization; 128 is DIM=1024.
-        for code_len in [1, 2, 3, 16, 95, 96, 128] {
-            let n = BATCH_SIZE;
+        let mut expected = vec![0u16; n];
+        sum_4bit_dist_table_scalar(code_len, &codes, &dist_table, &mut expected);
 
-            let codes: Vec<u8> = (0..n * code_len).map(|_| rng.random::<u8>()).collect();
-            // `quantize_dist_table_into` spans the whole u8 range, so must this.
-            let dist_table: Vec<u8> = (0..BATCH_SIZE * code_len)
-                .map(|_| rng.random::<u8>())
-                .collect();
-
-            let mut expected = vec![0u16; n];
-            sum_4bit_dist_table_scalar(code_len, &codes, &dist_table, &mut expected);
-
-            let mut actual = vec![0u16; n];
-            sum_4bit_dist_table(n, code_len, &codes, &dist_table, &mut actual);
-
+        for candidate in SUM_U16.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let mut actual = vec![MaybeUninit::new(u16::MAX); n];
+            kernel.call(&codes, &dist_table, code_len, &mut actual);
+            let actual = actual
+                .iter()
+                .map(|dist| unsafe { dist.assume_init() })
+                .collect::<Vec<_>>();
             assert_eq!(
                 actual,
                 expected,
-                "SIMD and scalar mismatch for code_len={} (DIM={})",
-                code_len,
-                code_len * 8,
+                "{} at code_len {code_len}",
+                candidate.name()
             );
         }
+        let mut actual = vec![u16::MAX; n];
+        sum_4bit_dist_table(n, code_len, &codes, &dist_table, &mut actual);
+        assert_eq!(actual, expected, "entry point at code_len {code_len}");
     }
 
-    /// Test with multiple batches to verify accumulation across batch boundaries.
-    #[test]
-    fn test_simd_matches_scalar_multi_batch() {
-        use rand::{Rng, SeedableRng};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(123);
-
-        for code_len in [1, 3, 16, 95, 96, 128] {
-            let n = BATCH_SIZE * 10; // 320 vectors = 10 batches
-
-            let codes: Vec<u8> = (0..n * code_len).map(|_| rng.random::<u8>()).collect();
-            let dist_table: Vec<u8> = (0..BATCH_SIZE * code_len)
-                .map(|_| rng.random::<u8>())
-                .collect();
-
-            let mut expected = vec![0u16; n];
-            sum_4bit_dist_table_scalar(code_len, &codes, &dist_table, &mut expected);
-
-            let mut actual = vec![0u16; n];
-            sum_4bit_dist_table(n, code_len, &codes, &dist_table, &mut actual);
-
-            assert_eq!(
-                actual,
-                expected,
-                "SIMD and scalar mismatch for multi-batch code_len={} (DIM={}, n={})",
-                code_len,
-                code_len * 8,
-                n,
-            );
-        }
-    }
     /// Exact reference: the `u16`-table scalar kernel already sums into `u32`.
     fn reference_u32_sums(n: usize, code_len: usize, codes: &[u8], dist_table: &[u8]) -> Vec<u32> {
         let dist_table: Vec<u16> = dist_table.iter().map(|value| *value as u16).collect();
@@ -2653,40 +2813,6 @@ mod tests {
         assert!(wide.iter().all(|dist| *dist == expected));
     }
 
-    /// The ex-code FastScan LUT runs codes far longer than
-    /// [`SAFE_U16_CODE_LEN`] through the `u16` kernels, staying in range by
-    /// capping the table instead. Model that cap so those lengths keep coverage.
-    #[test]
-    fn test_simd_matches_scalar_capped_table_long_code_len() {
-        use rand::{Rng, SeedableRng};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(8192);
-
-        for code_len in [191, 192, 512, 1024, 8192] {
-            let n = BATCH_SIZE;
-            let max_val = (u16::MAX as usize / (2 * code_len)).min(u8::MAX as usize) as u8;
-            assert!(2 * code_len * max_val as usize <= u16::MAX as usize);
-
-            let codes: Vec<u8> = (0..n * code_len).map(|_| rng.random::<u8>()).collect();
-            let dist_table: Vec<u8> = (0..BATCH_SIZE * code_len)
-                .map(|_| rng.random_range(0..=max_val))
-                .collect();
-
-            let mut expected = vec![0u16; n];
-            sum_4bit_dist_table_scalar(code_len, &codes, &dist_table, &mut expected);
-
-            let mut actual = vec![0u16; n];
-            sum_4bit_dist_table(n, code_len, &codes, &dist_table, &mut actual);
-
-            assert_eq!(
-                actual,
-                expected,
-                "SIMD and scalar mismatch for capped code_len={} (DIM={})",
-                code_len,
-                code_len * 8,
-            );
-        }
-    }
-
     #[test]
     fn test_sum_4bit_dist_table_u32_zero_code_len() {
         let n = BATCH_SIZE;
@@ -2694,27 +2820,6 @@ mod tests {
         sum_4bit_dist_table_u32(n, 0, &[], &[], &mut dists);
         assert!(dists.iter().all(|dist| *dist == 0));
     }
-    /// Whether this host can run `backend`'s column-major kernels.
-    fn transposed_backend_available(backend: DistTableBackend) -> bool {
-        match backend {
-            #[cfg(target_arch = "x86_64")]
-            DistTableBackend::Avx512 => is_x86_feature_detected!("avx512bw"),
-            #[cfg(target_arch = "x86_64")]
-            DistTableBackend::Avx2 => is_x86_feature_detected!("avx2"),
-            #[cfg(target_arch = "aarch64")]
-            DistTableBackend::Neon => true,
-            DistTableBackend::Scalar => true,
-            _ => false,
-        }
-    }
-
-    const TRANSPOSED_BACKENDS: [DistTableBackend; 4] = [
-        DistTableBackend::Scalar,
-        DistTableBackend::Avx2,
-        DistTableBackend::Avx512,
-        DistTableBackend::Neon,
-    ];
-
     /// Random column-major codes, a full-range `u8` table and an `f32` table.
     fn transposed_case(n: usize, code_len: usize) -> (Vec<u8>, Vec<u8>, Vec<f32>) {
         use rand::{Rng, SeedableRng};
@@ -2727,11 +2832,11 @@ mod tests {
         (codes, u8_table, f32_table)
     }
 
-    /// Every backend of the `u16` store and filter kernels sums like the
+    /// Every candidate of the `u16` store and filter kernels sums like the
     /// reference, and the filter reports exactly the rows at most its threshold.
     #[rstest::rstest]
     fn test_sum_4bit_dist_table_transposed_matches_reference(
-        #[values(0, 65, 1000)] n: usize,
+        #[values(0, 17, 65, 128, 1000)] n: usize,
         #[values(0, 3, 48)] code_len: usize,
     ) {
         let (codes, table, _) = transposed_case(n, code_len);
@@ -2746,9 +2851,17 @@ mod tests {
                     .sum::<u16>()
             })
             .collect::<Vec<_>>();
+        for candidate in SUM_TRANSPOSED.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let mut actual = vec![u16::MAX; n];
+            kernel.call(&codes, &table, n, &mut actual);
+            assert_eq!(actual, expected, "{}", candidate.name());
+        }
         let mut actual = vec![u16::MAX; n];
         sum_4bit_dist_table_transposed(n, code_len, &codes, &table, &mut actual);
-        assert_eq!(actual, expected);
+        assert_eq!(actual, expected, "entry point");
 
         let mut sorted = expected.clone();
         sorted.sort_unstable();
@@ -2759,39 +2872,32 @@ mod tests {
             .filter(|(_, sum)| **sum <= threshold)
             .map(|(row, sum)| (row, *sum))
             .collect::<Vec<_>>();
-        for backend in TRANSPOSED_BACKENDS {
-            if !transposed_backend_available(backend) {
+        for candidate in FILTER_TRANSPOSED.candidates() {
+            let Some(kernel) = candidate.kernel() else {
                 continue;
-            }
-            let mut found = Vec::new();
-            // The host supports `backend`, checked just above.
-            unsafe {
-                filter_transposed_with_backend(
-                    backend,
-                    n,
-                    code_len,
-                    &codes,
-                    &table,
-                    threshold,
-                    &mut |start, mut mask, sums: &[u16; TRANSPOSED_BATCH_SIZE]| {
-                        while mask != 0 {
-                            let i = mask.trailing_zeros() as usize;
-                            found.push((start + i, sums[i]));
-                            mask &= mask - 1;
-                        }
-                        threshold
-                    },
-                )
             };
-            assert_eq!(found, wanted, "{backend:?}");
+            let mut found = Vec::new();
+            let mut on_batch = |start, mut mask: u64, sums: &[u16; TRANSPOSED_BATCH_SIZE]| {
+                while mask != 0 {
+                    let i = mask.trailing_zeros() as usize;
+                    found.push((start + i, sums[i]));
+                    mask &= mask - 1;
+                }
+                threshold
+            };
+            // `as_fn` because no `call` signature takes `&mut OnBatch<'_>`.
+            // SAFETY: `kernel` exists only because the host supports it, and
+            // the candidate checks its own bounds.
+            unsafe { kernel.as_fn()(&codes, &table, n, threshold, &mut on_batch) };
+            assert_eq!(found, wanted, "{}", candidate.name());
         }
     }
 
-    /// Every backend of the exact `f32` kernels matches the per-row fold bit
+    /// Every candidate of the exact `f32` kernels matches the per-row fold bit
     /// for bit, over all rows and over selected rows.
     #[rstest::rstest]
     fn test_sum_4bit_dist_table_f32_matches_fold(
-        #[values(0, 17, 1000)] n: usize,
+        #[values(0, 7, 17, 1000)] n: usize,
         #[values(0, 3, 48)] code_len: usize,
     ) {
         let (codes, _, table) = transposed_case(n, code_len);
@@ -2812,27 +2918,237 @@ mod tests {
             .map(|&row| fold(row as usize))
             .collect::<Vec<_>>();
         let bits = |dists: &[f32]| dists.iter().map(|d| d.to_bits()).collect::<Vec<_>>();
-        for backend in TRANSPOSED_BACKENDS {
-            if !transposed_backend_available(backend) {
+        for candidate in SUM_F32_TRANSPOSED.candidates() {
+            let Some(kernel) = candidate.kernel() else {
                 continue;
-            }
+            };
             let mut dists = vec![f32::NAN; n];
+            kernel.call(&codes, &table, n, &mut dists);
+            assert_eq!(bits(&dists), expected, "{}", candidate.name());
+        }
+        for candidate in SUM_F32_ROWS.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
             let mut row_dists = vec![f32::NAN; rows.len()];
-            // The host supports `backend`, checked just above.
-            unsafe {
-                sum_f32_transposed_with_backend(backend, n, code_len, &codes, &table, &mut dists);
-                sum_f32_rows_with_backend(
-                    backend,
-                    n,
-                    code_len,
-                    &codes,
-                    &table,
-                    &rows,
-                    &mut row_dists,
-                );
-            }
-            assert_eq!(bits(&dists), expected, "{backend:?}");
-            assert_eq!(bits(&row_dists), expected_rows, "{backend:?}");
+            kernel.call(&codes, &table, n, &rows, &mut row_dists);
+            assert_eq!(bits(&row_dists), expected_rows, "{}", candidate.name());
+        }
+    }
+
+    /// Runs `f`, which must panic, and returns its panic message.
+    fn panic_message(f: impl FnOnce()) -> String {
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+            .expect_err("expected a panic");
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|message| message.to_string())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Every row-major candidate rejects inputs its SIMD loads would overrun,
+    /// including an `n * code_len` that wraps to zero.
+    #[rstest::rstest]
+    #[case::n_not_a_batch_multiple(33, 1, 33, 1, "is not a multiple of")]
+    #[case::short_codes(32, 2, 63, 2, "codes has")]
+    #[case::short_dist_table(32, 2, 64, 1, "dist_table has")]
+    #[case::wrapping_codes_product(32, usize::MAX / 32 + 1, 0, 0, "codes has")]
+    fn test_row_major_candidates_check_bounds(
+        #[case] n: usize,
+        #[case] code_len: usize,
+        #[case] codes_len: usize,
+        #[case] table_codes: usize,
+        #[case] expected: &str,
+    ) {
+        let codes = vec![0u8; codes_len];
+        let table = vec![0u8; table_codes * BATCH_SIZE];
+        for candidate in SUM_U16.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let mut dists = vec![MaybeUninit::<u16>::uninit(); n];
+            let message = panic_message(|| kernel.call(&codes, &table, code_len, &mut dists));
+            assert!(
+                message.contains(expected),
+                "{}: {message}",
+                candidate.name()
+            );
+        }
+        let hacc_table = vec![0u8; table_codes * 64];
+        for candidate in SUM_HACC.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let mut dists = vec![MaybeUninit::<u32>::uninit(); n];
+            let message = panic_message(|| kernel.call(&codes, &hacc_table, code_len, &mut dists));
+            assert!(
+                message.contains(expected),
+                "{}: {message}",
+                candidate.name()
+            );
+        }
+    }
+
+    /// The `u32` entry point checks the whole input, not just each chunk.
+    #[rstest::rstest]
+    #[case::n_not_a_batch_multiple(33, 1, 64, 1, "is not a multiple of")]
+    #[case::short_codes(32, 2, 63, 2, "codes has")]
+    #[case::short_dist_table(32, 2, 64, 1, "dist_table has")]
+    fn test_sum_4bit_dist_table_u32_checks_bounds(
+        #[case] n: usize,
+        #[case] code_len: usize,
+        #[case] codes_len: usize,
+        #[case] table_codes: usize,
+        #[case] expected: &str,
+    ) {
+        let codes = vec![0u8; codes_len];
+        let table = vec![0u8; table_codes * BATCH_SIZE];
+        let mut dists = vec![0u32; 64];
+        let message =
+            panic_message(|| sum_4bit_dist_table_u32(n, code_len, &codes, &table, &mut dists));
+        assert!(message.contains(expected), "{message}");
+    }
+
+    /// Every transposed candidate rejects inputs its SIMD loads or stores would
+    /// overrun, including an `n * code_len` that wraps to zero.
+    #[rstest::rstest]
+    #[case::short_codes(65, 2, 129, 65, "codes has")]
+    #[case::wrapping_codes_product(usize::MAX / 2 + 1, 2, 0, 0, "codes has")]
+    #[case::short_dists(65, 2, 130, 64, "dists has")]
+    fn test_transposed_candidates_check_bounds(
+        #[case] n: usize,
+        #[case] code_len: usize,
+        #[case] codes_len: usize,
+        #[case] dists_len: usize,
+        #[case] expected: &str,
+    ) {
+        let codes = vec![0u8; codes_len];
+        let u8_table = vec![0u8; 32 * code_len];
+        let f32_table = vec![0.0f32; 32 * code_len];
+        for candidate in SUM_TRANSPOSED.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let mut dists = vec![0u16; dists_len];
+            let message = panic_message(|| kernel.call(&codes, &u8_table, n, &mut dists));
+            assert!(
+                message.contains(expected),
+                "{}: {message}",
+                candidate.name()
+            );
+        }
+        for candidate in SUM_F32_TRANSPOSED.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let mut dists = vec![0.0f32; dists_len];
+            let message = panic_message(|| kernel.call(&codes, &f32_table, n, &mut dists));
+            assert!(
+                message.contains(expected),
+                "{}: {message}",
+                candidate.name()
+            );
+        }
+        // The filter stores no sums, so only the `codes` bound applies to it.
+        if expected != "codes has" {
+            return;
+        }
+        for candidate in FILTER_TRANSPOSED.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let mut on_batch = |_, _, _: &[u16; TRANSPOSED_BATCH_SIZE]| u16::MAX;
+            let message = panic_message(|| {
+                // SAFETY: `kernel` exists only because the host supports it,
+                // and the candidate checks its own bounds.
+                unsafe { kernel.as_fn()(&codes, &u8_table, n, u16::MAX, &mut on_batch) }
+            });
+            assert!(
+                message.contains(expected),
+                "{}: {message}",
+                candidate.name()
+            );
+        }
+    }
+
+    /// Every selected-rows candidate rejects a row past `n` and short slices.
+    #[rstest::rstest]
+    #[case::row_out_of_range(&[0, 4], 2, 4, "out of range")]
+    #[case::short_dists(&[0, 1], 1, 4, "dists has")]
+    #[case::short_codes(&[0], 1, 3, "codes has")]
+    fn test_f32_rows_candidates_check_bounds(
+        #[case] rows: &[u32],
+        #[case] dists_len: usize,
+        #[case] codes_len: usize,
+        #[case] expected: &str,
+    ) {
+        let n = 4;
+        let codes = vec![0u8; codes_len];
+        let table = vec![0.0f32; 32];
+        for candidate in SUM_F32_ROWS.candidates() {
+            let Some(kernel) = candidate.kernel() else {
+                continue;
+            };
+            let mut dists = vec![0.0f32; dists_len];
+            let message = panic_message(|| kernel.call(&codes, &table, n, rows, &mut dists));
+            assert!(
+                message.contains(expected),
+                "{}: {message}",
+                candidate.name()
+            );
+        }
+    }
+
+    /// The transposed entry points reject a short table before dispatching,
+    /// including a `32 * code_len` that wraps to zero.
+    #[rstest::rstest]
+    #[case::short_dist_table(1, 2, 63)]
+    #[case::wrapping_table_product(0, usize::MAX / 32 + 1, 0)]
+    fn test_transposed_entry_points_check_dist_table(
+        #[case] n: usize,
+        #[case] code_len: usize,
+        #[case] table_len: usize,
+    ) {
+        let codes = [0u8; 2];
+        let message = panic_message(|| {
+            sum_4bit_dist_table_transposed(n, code_len, &codes, &vec![0; table_len], &mut [0; 1])
+        });
+        assert!(message.contains("dist_table has"), "{message}");
+        let message = panic_message(|| {
+            sum_4bit_dist_table_f32_transposed(
+                n,
+                code_len,
+                &codes,
+                &vec![0.0; table_len],
+                &mut [0.0; 1],
+            )
+        });
+        assert!(message.contains("dist_table has"), "{message}");
+    }
+
+    /// Each entry point's best candidate on x86_64 and aarch64 is a SIMD one,
+    /// so a host with the features never falls through to scalar.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn test_every_entry_point_has_a_simd_candidate() {
+        let firsts = [
+            SUM_U16.candidates()[0].features(),
+            SUM_TRANSPOSED.candidates()[0].features(),
+            FILTER_TRANSPOSED.candidates()[0].features(),
+            SUM_F32_TRANSPOSED.candidates()[0].features(),
+        ];
+        for features in firsts {
+            assert!(!features.is_empty());
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(!SUM_HACC.candidates()[0].features().is_empty());
+            assert!(!SUM_F32_ROWS.candidates()[0].features().is_empty());
         }
     }
 }

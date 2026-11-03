@@ -156,10 +156,16 @@ async fn concatenates_parts_in_caller_order_without_reusing_staging_files() {
             .sum::<u64>(),
         only_fragment(&dataset).physical_rows().await.unwrap() as u64,
     );
-    let data_file = dataset
-        .concat_data_file_parts(&target, &ordered_parts)
-        .await
-        .unwrap();
+    let assembly_dataset = dataset.clone();
+    let assembly_target = target.clone();
+    let data_file = tokio::spawn(async move {
+        assembly_dataset
+            .concat_data_file_parts(&assembly_target, &ordered_parts)
+            .await
+    })
+    .await
+    .unwrap()
+    .unwrap();
     let replacement = DataReplacementGroup(only_fragment(&dataset).id() as u64, data_file);
     assert_eq!(replacement.1.path, target.file_name.as_str());
     let dataset = commit(&dataset, replacement).await.unwrap();

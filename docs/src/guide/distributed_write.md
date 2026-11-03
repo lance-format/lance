@@ -172,9 +172,11 @@ Output:
 
 Currently, Lance supports the fragment level update columns ability to update existing columns in a distributed manner.
 
-This operation performs a left-outer-hash-join with the right table (new data)
-on the column specified by `left_on` and `right_on`. For every row in the current
-fragment, the updated column value is:
+This operation performs a left-outer join with the right table (new data) on the column specified
+by `left_on` and `right_on`. Lance can use an in-memory hash join or a spillable sort-merge join;
+see [Update Join Strategies](update_join.md) for selection and resource controls. For every row in
+the current fragment, the updated column value is:
+
 1. If no matched row on the right side, the column value of the left side row.
 2. If there is exactly one corresponding row on the right side, the column value
    of the matching row.

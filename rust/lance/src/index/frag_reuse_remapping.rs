@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use lance_core::Result;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
 use lance_core::utils::address::RowAddress;
+use lance_index::INDEX_FILE_NAME;
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
 use std::sync::Arc;
@@ -91,12 +92,12 @@ pub async fn vector_supports_batch_remapping(
             let path = dataset
                 .indice_files_dir(index)?
                 .join(index.uuid.to_string())
-                .join(super::INDEX_FILE_NAME);
+                .join(INDEX_FILE_NAME);
             let store = dataset.object_store_for_index(index).await?;
             let reader = super::vector::open_index_file(
                 store.as_ref(),
                 &path,
-                super::INDEX_FILE_NAME,
+                INDEX_FILE_NAME,
                 &index.file_size_map(),
             )
             .await?;
