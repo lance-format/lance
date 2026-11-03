@@ -129,6 +129,9 @@ struct ReadMarks {
     fragment: Option<u64>,
     field: i32,
     base: u32,
+    /// The read version's row id watermark; `None` when it has no stable row
+    /// ids, so no row id could have been reserved.
+    next_row_id: Option<u64>,
 }
 
 impl ReadMarks {
@@ -137,6 +140,9 @@ impl ReadMarks {
             fragment: manifest.max_fragment_id(),
             field: manifest.max_field_id(),
             base: max_base_id(manifest),
+            next_row_id: manifest
+                .uses_stable_row_ids()
+                .then_some(manifest.next_row_id),
         }
     }
 }
@@ -805,7 +811,7 @@ impl<'a> ApplyState<'a> {
         let Some(next_row_id) = next_row_id.as_mut() else {
             return Ok(());
         };
-        self.validate_supplied_row_ids(*next_row_id)?;
+        self.validate_supplied_row_ids()?;
         let minted_ids = std::mem::take(&mut self.new_fragments);
         // The manifest assembly sorts fragments by id, so partitioning them here
         // does not disturb the final order.
@@ -843,9 +849,15 @@ impl<'a> ApplyState<'a> {
     /// them. An id at or above the watermark was never reserved, and the next
     /// append would hand it out a second time.
     ///
-    /// Two fragments of this operation carrying the same id are rejected too:
-    /// a row id names one row.
-    fn validate_supplied_row_ids(&self, next_row_id: u64) -> Result<()> {
+    /// The watermark is the read version's, not the one applied onto: a
+    /// concurrent append mints ids above the read watermark without claiming
+    /// them in its footprint, so an id the writer guessed there may already
+    /// name one of that append's rows.
+    ///
+    /// A row id names one row, so an id carried twice -- by two fragments of
+    /// this operation, or twice within one fragment -- is rejected too.
+    fn validate_supplied_row_ids(&self) -> Result<()> {
+        let reserved_below = self.read_marks.next_row_id.unwrap_or(0);
         let mut supplied: Vec<(u64, RoaringTreemap)> = Vec::new();
         for fragment in &self.fragments {
             if !self.new_fragments.contains(&fragment.id) {
@@ -858,6 +870,18 @@ impl<'a> ApplyState<'a> {
             };
             let sequence = read_row_ids(data)?;
             let row_ids = sequence.to_treemap();
+            // The treemap collapses repeats, so only a shorter treemap means a
+            // repeat worth paying a second pass to name.
+            let mut seen = RoaringTreemap::new();
+            if row_ids.len() != sequence.len()
+                && let Some(duplicate) = sequence.iter().find(|row_id| !seen.insert(*row_id))
+            {
+                return Err(Error::invalid_input(format!(
+                    "fragment {} carries row id {duplicate} more than once; a row id names one \
+                     row",
+                    fragment.id
+                )));
+            }
             for (other, other_row_ids) in &supplied {
                 if let Some(shared) = (&row_ids & other_row_ids).min() {
                     return Err(Error::invalid_input(format!(
@@ -871,12 +895,12 @@ impl<'a> ApplyState<'a> {
                 continue;
             };
             supplied.push((fragment.id, row_ids));
-            if *range.end() >= next_row_id {
+            if *range.end() >= reserved_below {
                 return Err(Error::invalid_input(format!(
-                    "fragment {} is added carrying row id {}, which no commit has reserved: \
-                     only ids below {next_row_id} are reserved. Reserve a range with \
-                     ReserveRowIds and read the committed manifest's next_row_id back before \
-                     supplying row ids.",
+                    "fragment {} is added carrying row id {}, which no commit has reserved as of \
+                     the read version: only ids below {reserved_below} are reserved. Reserve a \
+                     range with ReserveRowIds and read the committed manifest's next_row_id back \
+                     before supplying row ids.",
                     fragment.id,
                     range.end()
                 )));
@@ -1072,8 +1096,8 @@ mod tests {
         new_mem_wal_index_meta,
     };
     use crate::transaction::action::test_support::{
-        added_field, apply, apply_with_indices, backed_manifest, manifest_with_base, mint_base,
-        one_column_file,
+        added_field, apply, apply_after_reading, apply_with_indices, backed_manifest,
+        manifest_with_base, mint_base, one_column_file,
     };
     use crate::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, CompositeOperation,
@@ -1808,33 +1832,6 @@ mod tests {
             matches!(error, Error::CorruptFile { .. }),
             "unexpected error: {error:?}"
         );
-    }
-
-    /// Apply `actions` on top of `current` as an operation that read `read`,
-    /// the shape of a retry after a concurrent commit.
-    fn apply_after_reading(
-        read: &Manifest,
-        current: &Manifest,
-        actions: Vec<Action>,
-    ) -> Result<Manifest> {
-        Transaction::new(
-            read.version,
-            Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
-                "step", actions,
-            )])),
-            None,
-        )
-        .build_manifest_with_read_version(
-            Some(current),
-            Vec::new(),
-            "tx.txn",
-            &default_build_config(),
-            Some(ReadVersionState {
-                manifest: read,
-                indices: &[],
-            }),
-        )
-        .map(|(manifest, _)| manifest)
     }
 
     fn assert_rejected_beyond_read_mark(result: Result<Manifest>, named: &str) {

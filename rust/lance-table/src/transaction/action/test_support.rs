@@ -6,7 +6,7 @@
 use super::{Action, CompositeOperation, Footprint, UserStep};
 use crate::format::{BasePath, DataFile, Fragment, IndexMetadata, Manifest};
 use crate::transaction::test_support::{default_build_config, sample_manifest};
-use crate::transaction::{Operation, Transaction};
+use crate::transaction::{Operation, ReadVersionState, Transaction};
 use arrow_schema::{DataType, Field as ArrowField};
 use lance_core::Result;
 use lance_core::datatypes::Field;
@@ -30,6 +30,33 @@ pub(super) fn apply_with_indices(
         None,
     );
     transaction.build_manifest(Some(manifest), indices, "tx.txn", &default_build_config())
+}
+
+/// Apply `actions` on top of `current` as an operation that read `read`,
+/// the shape of a retry after a concurrent commit.
+pub(super) fn apply_after_reading(
+    read: &Manifest,
+    current: &Manifest,
+    actions: Vec<Action>,
+) -> Result<Manifest> {
+    Transaction::new(
+        read.version,
+        Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+            "step", actions,
+        )])),
+        None,
+    )
+    .build_manifest_with_read_version(
+        Some(current),
+        Vec::new(),
+        "tx.txn",
+        &default_build_config(),
+        Some(ReadVersionState {
+            manifest: read,
+            indices: &[],
+        }),
+    )
+    .map(|(manifest, _)| manifest)
 }
 
 /// The footprint of one action set, for pair tests. Every conflict test in the

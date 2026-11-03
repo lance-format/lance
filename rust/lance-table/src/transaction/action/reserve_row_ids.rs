@@ -69,7 +69,9 @@ mod tests {
     use super::*;
     use crate::format::{Fragment, RowIdMeta};
     use crate::rowids::{RowIdSequence, read_row_ids, write_row_ids};
-    use crate::transaction::action::test_support::{apply, backed_manifest, footprint};
+    use crate::transaction::action::test_support::{
+        apply, apply_after_reading, backed_manifest, footprint,
+    };
     use crate::transaction::action::{Action, AddFragment, Ref};
     use crate::transaction::test_support::make_stable_row_id_manifest;
     use rstest::rstest;
@@ -224,8 +226,10 @@ mod tests {
         assert!(error.to_string().contains("overflows"), "{error}");
     }
 
+    /// The infallible conversion, so a test can hand apply a sequence with
+    /// repeats, as a writer encoding its own could.
     fn supplied(local: u32, row_ids: Vec<u64>) -> Action {
-        let sequence = RowIdSequence::try_from_iter(row_ids.iter().copied()).unwrap();
+        let sequence = RowIdSequence::from(row_ids.as_slice());
         Action::AddFragment(AddFragment {
             id: Ref::Local(local),
             physical_rows: row_ids.len() as u64,
@@ -236,13 +240,17 @@ mod tests {
         })
     }
 
-    /// A row id names one row, so two fragments of one operation carrying the
-    /// same supplied id would give it two rows.
+    /// A row id names one row, so a supplied id carried by two fragments of
+    /// one operation, or twice by one fragment, would give it two rows.
     #[rstest]
     #[case::disjoint(vec![supplied(0, (10..15).collect()), supplied(1, (15..20).collect())], None)]
     #[case::overlapping(
         vec![supplied(0, (10..15).collect()), supplied(1, (14..20).collect())],
         Some("carries row id 14, which fragment 2 also added in this operation carries")
+    )]
+    #[case::repeated_within_a_fragment(
+        vec![supplied(0, vec![11, 10, 10, 12, 13])],
+        Some("fragment 2 carries row id 10 more than once")
     )]
     fn test_supplied_row_ids_are_disjoint_within_an_operation(
         #[case] actions: Vec<Action>,
@@ -278,5 +286,42 @@ mod tests {
 
         assert_eq!(ours.conflicts_with(&theirs), expected);
         assert_eq!(theirs.conflicts_with(&ours), expected);
+    }
+
+    /// Ids are reserved as of the version the writer read. A concurrent
+    /// append mints past the read watermark without claiming its ids in its
+    /// footprint, so a writer that guessed ids there is rejected on the
+    /// retry, while one that reserved them before the read still commits.
+    #[rstest]
+    #[case::reserved_before_the_read(true, None)]
+    #[case::minted_by_a_concurrent_append(
+        false,
+        Some("no commit has reserved as of the read version")
+    )]
+    fn test_supplied_row_ids_must_be_reserved_at_the_read_version(
+        #[case] reserved: bool,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let mut read = stable_manifest();
+        if reserved {
+            read = apply(&read, vec![reserve(10)]).unwrap();
+        }
+        let first_unminted = read.next_row_id;
+        let current = apply(&read, vec![add_fragment(0, 10)]).unwrap();
+        assert_eq!(current.next_row_id, first_unminted + 10);
+
+        let result =
+            apply_after_reading(&read, &current, vec![supplied(0, (1000..1005).collect())]);
+
+        match expected_error {
+            None => {
+                result.unwrap();
+            }
+            Some(message) => {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+                assert!(error.to_string().contains(message), "{error}");
+            }
+        }
     }
 }
