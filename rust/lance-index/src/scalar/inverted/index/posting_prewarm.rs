@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use lance_core::cache::CacheLoadOrigin;
 
 struct PackedPostingChunk {
     groups: Vec<(u32, u32, PostingListGroup)>,
@@ -22,6 +23,23 @@ impl PostingListReader {
         (postings_resident, positions_resident)
     }
 
+    /// Verify query readiness after prewarm without treating an unsupported
+    /// non-counting probe as proof that an entry is absent. The fallback reads
+    /// through a temporary warm handle because this is still prewarm work.
+    pub(super) async fn prewarm_readiness_status(
+        &self,
+        with_position: bool,
+    ) -> (bool, Option<bool>) {
+        let (postings_resident, positions_resident) =
+            self.prewarm_residency_status(with_position).await;
+        let postings_ready = postings_resident || self.postings_present_after_prewarm().await;
+        let positions_ready = match positions_resident {
+            Some(false) => Some(self.positions_present_after_prewarm().await),
+            ready => ready,
+        };
+        (postings_ready, positions_ready)
+    }
+
     async fn postings_resident_now(&self) -> bool {
         if self.is_empty() {
             return true;
@@ -31,16 +49,46 @@ impl PostingListReader {
         for token_id in 0..self.len() as u32 {
             if let Some((start, end)) = self.group_range_for_token(token_id) {
                 if seen_groups.insert((start, end))
-                    && self
+                    && !self
                         .index_cache
+                        .peek_resident_with_key(&posting_list_group_cache_key(
+                            start,
+                            end,
+                            self.has_impacts,
+                        ))
+                        .await
+                {
+                    return false;
+                }
+            } else if !self
+                .index_cache
+                .peek_resident_with_key(&posting_list_cache_key(token_id, self.has_impacts))
+                .await
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn postings_present_after_prewarm(&self) -> bool {
+        if self.is_empty() {
+            return true;
+        }
+
+        let warm_cache = self.index_cache.with_load_origin(CacheLoadOrigin::Warm);
+        let mut seen_groups = BTreeSet::new();
+        for token_id in 0..self.len() as u32 {
+            if let Some((start, end)) = self.group_range_for_token(token_id) {
+                if seen_groups.insert((start, end))
+                    && warm_cache
                         .get_with_key(&posting_list_group_cache_key(start, end, self.has_impacts))
                         .await
                         .is_none()
                 {
                     return false;
                 }
-            } else if self
-                .index_cache
+            } else if warm_cache
                 .get_with_key(&posting_list_cache_key(token_id, self.has_impacts))
                 .await
                 .is_none()
@@ -53,8 +101,21 @@ impl PostingListReader {
 
     async fn positions_resident_now(&self) -> bool {
         for token_id in 0..self.len() as u32 {
-            if self
+            if !self
                 .index_cache
+                .peek_resident_with_key(&PositionKey { token_id })
+                .await
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn positions_present_after_prewarm(&self) -> bool {
+        let warm_cache = self.index_cache.with_load_origin(CacheLoadOrigin::Warm);
+        for token_id in 0..self.len() as u32 {
+            if warm_cache
                 .get_with_key(&PositionKey { token_id })
                 .await
                 .is_none()
@@ -295,12 +356,14 @@ impl PostingListReader {
         let chunk_ranges = prewarm_chunk_ranges(&grouping, token_count, chunk_tokens);
         let chunk_count = chunk_ranges.len();
         let chunk_concurrency = chunk_concurrency.max(1);
+        let warm_cache = self.index_cache.with_load_origin(CacheLoadOrigin::Warm);
 
         let read_build_start = Instant::now();
         stream::iter(chunk_ranges)
             .map(|(tok_start, tok_end)| {
                 let state = state.as_ref();
                 let grouping = &grouping;
+                let warm_cache = &warm_cache;
                 async move {
                     if use_packed_groups {
                         let chunk = self
@@ -315,12 +378,12 @@ impl PostingListReader {
                         // Keep per-term keys so persisted positions remain independently
                         // readable after their posting group leaves memory.
                         for (token_id, positions) in chunk.positions {
-                            self.index_cache
+                            warm_cache
                                 .insert_with_key(&PositionKey { token_id }, Arc::new(positions))
                                 .await;
                         }
                         for (start, end, group) in chunk.groups {
-                            self.index_cache
+                            warm_cache
                                 .insert_with_key(
                                     &posting_list_group_cache_key(start, end, self.has_impacts),
                                     Arc::new(group),
@@ -618,12 +681,13 @@ impl PostingListReader {
         token_count: usize,
         with_position: bool,
     ) {
+        let warm_cache = self.index_cache.with_load_origin(CacheLoadOrigin::Warm);
         match grouping {
             PostingGrouping::None => {
                 for (token_id, mut posting_list) in posting_lists {
-                    self.cache_positions(&mut posting_list, token_id, with_position)
+                    self.cache_positions(&warm_cache, &mut posting_list, token_id, with_position)
                         .await;
-                    self.index_cache
+                    warm_cache
                         .insert_with_key(
                             &posting_list_cache_key(token_id, self.has_impacts),
                             Arc::new(posting_list),
@@ -634,7 +698,7 @@ impl PostingListReader {
             PostingGrouping::SyntheticFixed { .. } | PostingGrouping::Bytes { .. } => {
                 let mut chunk_postings = Vec::with_capacity(posting_lists.len());
                 for (token_id, mut posting_list) in posting_lists {
-                    self.cache_positions(&mut posting_list, token_id, with_position)
+                    self.cache_positions(&warm_cache, &mut posting_list, token_id, with_position)
                         .await;
                     chunk_postings.push(posting_list);
                 }
@@ -647,7 +711,7 @@ impl PostingListReader {
                     let lo = start_usize - tok_start;
                     let hi = end as usize - tok_start;
                     let group = PostingListGroup::new(chunk_postings[lo..hi].to_vec());
-                    self.index_cache
+                    warm_cache
                         .insert_with_key(
                             &posting_list_group_cache_key(start, end, self.has_impacts),
                             Arc::new(group),
@@ -662,12 +726,13 @@ impl PostingListReader {
     /// dedicated per-token position cache, leaving the posting list positions-free.
     async fn cache_positions(
         &self,
+        warm_cache: &WeakLanceCache,
         posting_list: &mut PostingList,
         token_id: u32,
         with_position: bool,
     ) {
         if with_position && let Some(positions) = posting_list.take_positions() {
-            self.index_cache
+            warm_cache
                 .insert_with_key(&PositionKey { token_id }, Arc::new(Positions(positions)))
                 .await;
         }

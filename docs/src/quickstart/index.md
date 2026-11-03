@@ -1,56 +1,144 @@
 ---
-title: Getting Started with Lance
-description: Choose the right entry point in the Lance stack — LanceDB, Python/Rust/Java SDKs, or SQL and compute engines
+title: LanceDB Quickstart
+description: Get started with Lance using LanceDB - create a table, query it, and run vector and full-text search
 ---
 
-# Getting Started with Lance
+# Getting Started with LanceDB
 
-Lance is an open lakehouse and columnar table format for multimodal AI. Every tool in the Lance ecosystem reads and writes the same on-disk format, so you can start at the layer that matches your application and interoperate across layers without copying or converting data.
+Lance is an open table format. You can work with Lance tables from many engines, and this quickstart covers:
 
-## The Lance Stack
+- **LanceDB** (this page) is a retrieval database built on Lance. It runs embedded in your application or as a distributed service.
+- **[Apache Spark](spark.md)** runs SQL and distributed data processing on Lance tables.
+- **Format SDKs ([PyLance](pylance.md), [Rust](rust.md), [Java](java.md))** provide low-level control over Lance datasets when building custom engines or pipelines.
 
-```text
-+---------------------------------------------------------------------+
-| 1. Database                LanceDB (Embedded & Distributed)         |
-+---------------------------------------------------------------------+
-| 2. Language SDKs           Python (PyLance), Rust, Java             |
-+---------------------------------------------------------------------+
-| 3. Query & Compute Engines Spark, DuckDB, Trino, DataFusion, Ray    |
-+=====================================================================+
-|                    Lance Open Format & Catalog Spec                 |
-|        (Columnar Files, ACID Versioning, Blob v2, Indexes)          |
-+---------------------------------------------------------------------+
+All of these tools read and write the same format, so a table you create with one of them can be opened with the others.
+
+In this guide, you'll create a small product catalog with LanceDB, filter it, search it by vector similarity and by keyword, modify it, and look back at earlier versions.
+
+## Install LanceDB
+
+This guide displays results as pandas DataFrames, so install pandas as well:
+
+```bash
+--8<-- "snippets/quickstart/lancedb-install.sh"
 ```
 
-## Choose Your Entry Point
+## Connect to a Database
 
-### 1. Database — LanceDB
+This guide uses LanceDB in embedded mode, where a database is a directory of Lance tables, on local disk or in object storage such as `s3://`. Connect to a local path; LanceDB creates it if it doesn't exist:
 
-Choose **LanceDB** when you are building an AI application, RAG pipeline, or search service and want table management, vector search, BM25 full-text search, and hybrid reranking out of the box.
+```python
+--8<-- "snippets/quickstart/lancedb_quickstart.py:connect"
+```
 
-- **[LanceDB Quickstart](lancedb.md)** — Create a table, run vector and keyword search, update rows, and time travel in 5 minutes.
-- **[LanceDB Documentation ↗](https://docs.lancedb.com/)** — Embeddings, hybrid reranking, TypeScript/Python/Rust database clients, and Cloud/Enterprise deployments.
+The same client connects to a distributed LanceDB deployment when you pass a `db://` URI instead of a path.
 
-### 2. Language SDKs — Python, Rust, and Java
+## Create a Table
 
-Choose a **Language SDK** when you want direct, low-level control over Lance datasets, fragments, custom Arrow schemas, multimodal [Blob v2 columns](../guide/blob.md), or [distributed write transactions](../guide/distributed_write.md).
+Create a table from a list of dictionaries. LanceDB infers the schema and stores the `vector` column as a fixed-size vector:
 
-| Language | Package | Quickstart | API Reference |
-|---|---|---|---|
-| **Python** | `pylance` | **[Python (PyLance) Quickstart](pylance.md)** · [Versioning](versioning.md) · [Vector Search](vector-search.md) · [Full-Text Search](full-text-search.md) | [Python API Docs ↗](https://lance-format.github.io/lance-python-doc) |
-| **Rust** | `lance` | **[Rust Quickstart](rust.md)** | [docs.rs/lance ↗](https://docs.rs/lance/latest/lance) |
-| **Java** | `org.lance:lance-core` | **[Java Quickstart](java.md)** | [Javadoc ↗](https://www.javadoc.io/doc/org.lance/lance-core/latest/index.html) |
+```python
+--8<-- "snippets/quickstart/lancedb_quickstart.py:create"
+```
 
-### 3. Query & Compute Engines
+```output
+--8<-- "snippets/quickstart/outputs/lancedb_quickstart.py.create.txt"
+```
 
-Choose a **Query or Compute Engine** when you want to run distributed SQL, lakehouse ETL, analytics, or large-scale ML training over Lance tables alongside existing data pipelines.
+LanceDB also accepts pandas DataFrames, Polars DataFrames, and Arrow tables as input.
 
-| Engine | Typical Workload | Get Started |
-|---|---|---|
-| **Apache Spark** | Distributed SQL, DDL/DML, and batch ETL with Spark SQL and PySpark | **[Spark Quickstart](spark.md)** · [Spark Connector Docs](../integrations/spark/index.md) |
-| **DuckDB / Trino / DataFusion** | Interactive SQL analytics and federated queries over Lance datasets | [DataFusion](../integrations/datafusion.md) · [All SQL Integrations](../integrations/index.md#query-engines-and-sql) |
-| **Ray / PyTorch / Flink** | Distributed data processing, streaming ingestion, and ML training loaders | [PyTorch](../integrations/pytorch.md) · [All ML & Stream Integrations](../integrations/index.md#machine-learning-and-ai) |
+## Filter Rows
 
-## One Format Across Every Layer
+Use SQL expressions to filter rows and choose columns:
 
-Because all layers share the [Lance format specification](../format/index.md), you can mix tools freely in a single pipeline — for example, ingest and backfill features at scale with **Apache Spark**, build vector and full-text indexes with the **Python or Rust SDK**, and serve low-latency hybrid queries from **LanceDB**.
+```python
+--8<-- "snippets/quickstart/lancedb_quickstart.py:filter"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/lancedb_quickstart.py.filter.txt"
+```
+
+## Search by Vector Similarity
+
+Pass a query vector to `search` to find the nearest rows. The `_distance` column holds each row's distance from the query:
+
+```python
+--8<-- "snippets/quickstart/lancedb_quickstart.py:vector-search"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/lancedb_quickstart.py.vector-search.txt"
+```
+
+You can combine vector search with a filter:
+
+```python
+--8<-- "snippets/quickstart/lancedb_quickstart.py:filtered-vector-search"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/lancedb_quickstart.py.filtered-vector-search.txt"
+```
+
+On a small table like this one, LanceDB compares the query against every vector. For larger tables, create a [vector index](https://docs.lancedb.com/indexing) to keep searches fast.
+
+## Search by Keyword
+
+Create a full-text search index on a text column, then search it with keywords. The `_score` column holds each row's relevance score:
+
+```python
+--8<-- "snippets/quickstart/lancedb_quickstart.py:fts"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/lancedb_quickstart.py.fts.txt"
+```
+
+## Add, Update, and Delete Rows
+
+```python
+--8<-- "snippets/quickstart/lancedb_quickstart.py:modify"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/lancedb_quickstart.py.modify.txt"
+```
+
+## Time Travel
+
+Every change creates a new version of the table:
+
+```python
+--8<-- "snippets/quickstart/lancedb_quickstart.py:version"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/lancedb_quickstart.py.version.txt"
+```
+
+Earlier versions stay readable. Check out version 1 to see the table as it was when you created it:
+
+```python
+--8<-- "snippets/quickstart/lancedb_quickstart.py:checkout"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/lancedb_quickstart.py.checkout.txt"
+```
+
+Return to the latest version to continue making changes:
+
+```python
+--8<-- "snippets/quickstart/lancedb_quickstart.py:checkout-latest"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/lancedb_quickstart.py.checkout-latest.txt"
+```
+
+## Next Steps
+
+- Read the [LanceDB documentation](https://docs.lancedb.com/) for embeddings, hybrid search, reranking, distributed deployments, and the TypeScript and Rust SDKs.
+- See the [Spark quickstart](spark.md) to process Lance tables at scale with SQL.
+- See the format SDK quickstarts for [PyLance](pylance.md), [Rust](rust.md), and [Java](java.md) to work directly with the Lance format.
