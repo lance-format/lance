@@ -430,15 +430,24 @@ impl ObjectStore for IoTrackingStore {
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
         let _guard = self.stage_guard();
+        let is_head = options.head;
         let range = match &options.range {
             Some(GetRange::Bounded(range)) => Some(range.clone()),
             _ => None, // TODO: fill in other options.
         };
         let result = self.target.get_opts(location, options).await;
         if let Ok(result) = &result {
-            let num_bytes = result.range.end - result.range.start;
-
-            self.record_read("get_opts", location.to_owned(), num_bytes, range);
+            let num_bytes = if is_head {
+                0
+            } else {
+                result.range.end - result.range.start
+            };
+            self.record_read(
+                if is_head { "head" } else { "get_opts" },
+                location.to_owned(),
+                num_bytes,
+                range,
+            );
         }
         result
     }

@@ -37,8 +37,10 @@ use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
 use lance_table::format::Fragment;
 use lance_table::rowids::RowIdSequence;
 use lance_table::rowids::segment::U64Segment;
+use lance_table::rowids::version::{RowDatasetVersionMeta, read_dataset_versions};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::warn;
 
 /// Rows per batch of [`DatasetDelta::get_deleted_row_ids`], taken from the
 /// scanner so it matches the sibling readers.
@@ -241,6 +243,13 @@ pub struct DatasetDelta {
     pub(crate) end_timestamp: Option<DateTime<Utc>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum RowChange {
+    Inserted,
+    Updated,
+    Upserted,
+}
+
 impl DatasetDelta {
     /// Resolve the effective version range for this delta.
     ///
@@ -419,8 +428,12 @@ impl DatasetDelta {
 
     /// Get inserted rows between the two versions.
     ///
+    /// Requires stable row ids at both nonzero endpoints; version 0 is the empty snapshot.
+    ///
     /// This returns rows where `_row_created_at_version` is greater than `begin_version`
     /// and less than or equal to `end_version`.
+    /// Rows and their values are read as of the resolved end version.
+    /// Available inline row-version metadata is used to prune fragments before reading data files.
     ///
     /// The result always includes:
     /// - `_row_created_at_version`: Version when the row was created
@@ -449,36 +462,18 @@ impl DatasetDelta {
     /// # }
     /// ```
     pub async fn get_inserted_rows(&self) -> Result<DatasetRecordBatchStream> {
-        let mut scanner = self.base_dataset.scan();
-
-        // Enable version columns
-        scanner.project(&[
-            WILDCARD,
-            ROW_ID,
-            ROW_CREATED_AT_VERSION,
-            ROW_LAST_UPDATED_AT_VERSION,
-        ])?;
-
-        // Filter for rows created in the version range
-        let filter = self.build_inserted_rows_filter().await?;
-        scanner.filter(&filter)?;
-
-        scanner.try_into_stream().await
-    }
-
-    async fn build_inserted_rows_filter(&self) -> Result<String> {
-        let (begin_version, end_version) = self.resolve_range().await?;
-        Ok(format!(
-            "_row_created_at_version > {} AND _row_created_at_version <= {}",
-            begin_version, end_version
-        ))
+        self.scan_rows(RowChange::Inserted).await
     }
 
     /// Get updated rows between the two versions.
     ///
+    /// Requires stable row ids at both nonzero endpoints; version 0 is the empty snapshot.
+    ///
     /// This returns rows where `_row_last_updated_at_version` is greater than `begin_version`
     /// and less than or equal to `end_version`, but `_row_created_at_version` is less than
     /// or equal to `begin_version` (to exclude newly inserted rows).
+    /// Rows and their values are read as of the resolved end version.
+    /// Available inline row-version metadata is used to prune fragments before reading data files.
     ///
     /// The result always includes:
     /// - `_row_created_at_version`: Version when the row was created
@@ -507,32 +502,12 @@ impl DatasetDelta {
     /// # }
     /// ```
     pub async fn get_updated_rows(&self) -> Result<DatasetRecordBatchStream> {
-        let mut scanner = self.base_dataset.scan();
-
-        // Enable version columns
-        scanner.project(&[
-            WILDCARD,
-            ROW_ID,
-            ROW_CREATED_AT_VERSION,
-            ROW_LAST_UPDATED_AT_VERSION,
-        ])?;
-
-        // Filter for rows that were updated (not inserted) in the version range
-        let filter = self.build_updated_rows_batch_filter().await?;
-        scanner.filter(&filter)?;
-
-        scanner.try_into_stream().await
-    }
-
-    async fn build_updated_rows_batch_filter(&self) -> Result<String> {
-        let (begin_version, end_version) = self.resolve_range().await?;
-        Ok(format!(
-            "_row_created_at_version <= {} AND _row_last_updated_at_version > {} AND _row_last_updated_at_version <= {}",
-            begin_version, begin_version, end_version
-        ))
+        self.scan_rows(RowChange::Updated).await
     }
 
     /// Get upserted rows between the two versions.
+    ///
+    /// Requires stable row ids at both nonzero endpoints; version 0 is the empty snapshot.
     ///
     /// This returns rows meet following conditions:
     /// Condition 1:
@@ -542,6 +517,8 @@ impl DatasetDelta {
     /// Condition 2:
     ///     This returns rows where `_row_created_at_version` is greater than `begin_version`
     ///     and less than or equal to `end_version`.
+    /// Rows and their values are read as of the resolved end version.
+    /// Available inline row-version metadata is used to prune fragments before reading data files.
     ///
     /// The result always includes:
     /// - `_row_created_at_version`: Version when the row was created
@@ -570,9 +547,84 @@ impl DatasetDelta {
     /// # }
     /// ```
     pub async fn get_upserted_rows(&self) -> Result<DatasetRecordBatchStream> {
-        let mut scanner = self.base_dataset.scan();
+        self.scan_rows(RowChange::Upserted).await
+    }
 
-        // Enable version columns
+    async fn scan_rows(&self, change: RowChange) -> Result<DatasetRecordBatchStream> {
+        let (begin_version, end_version) = self.resolve_range().await?;
+        // Version 0 is the empty snapshot and has no manifest to check out.
+        let dataset = if end_version == 0 || end_version == self.base_dataset.version().version {
+            self.base_dataset.clone()
+        } else {
+            self.base_dataset.checkout_version(end_version).await?
+        };
+        if begin_version != 0 && begin_version != end_version {
+            let begin = if begin_version == self.base_dataset.version().version {
+                self.base_dataset.clone()
+            } else {
+                self.base_dataset.checkout_version(begin_version).await?
+            };
+            if !begin.manifest.uses_stable_row_ids() {
+                return Err(Error::invalid_input(format!(
+                    "row changes require stable row ids, version {begin_version} does not use them"
+                )));
+            }
+        }
+        if end_version != 0 && !dataset.manifest.uses_stable_row_ids() {
+            return Err(Error::invalid_input(format!(
+                "row changes require stable row ids, version {end_version} does not use them"
+            )));
+        }
+        let inserted_filter = || {
+            format!(
+                "{ROW_CREATED_AT_VERSION} > {begin_version} AND {ROW_CREATED_AT_VERSION} <= {end_version}"
+            )
+        };
+        let updated_filter = || {
+            format!(
+                "{ROW_CREATED_AT_VERSION} <= {begin_version} AND {ROW_LAST_UPDATED_AT_VERSION} > {begin_version} AND {ROW_LAST_UPDATED_AT_VERSION} <= {end_version}"
+            )
+        };
+        let filter = match change {
+            RowChange::Inserted => inserted_filter(),
+            RowChange::Updated => updated_filter(),
+            RowChange::Upserted => format!("({}) OR ({})", inserted_filter(), updated_filter()),
+        };
+
+        let fragments = pruned_fragments(&dataset.manifest.fragments, |fragment| {
+            let in_range = |version| version > begin_version && version <= end_version;
+            let may_have_inserts = || {
+                version_meta_may_match(
+                    fragment.id,
+                    ROW_CREATED_AT_VERSION,
+                    fragment.created_at_version_meta.as_ref(),
+                    in_range,
+                )
+            };
+            let may_have_updates = || {
+                version_meta_may_match(
+                    fragment.id,
+                    ROW_LAST_UPDATED_AT_VERSION,
+                    fragment.last_updated_at_version_meta.as_ref(),
+                    in_range,
+                ) && version_meta_may_match(
+                    fragment.id,
+                    ROW_CREATED_AT_VERSION,
+                    fragment.created_at_version_meta.as_ref(),
+                    |version| version <= begin_version,
+                )
+            };
+            match change {
+                RowChange::Inserted => may_have_inserts(),
+                RowChange::Updated => may_have_updates(),
+                RowChange::Upserted => may_have_inserts() || may_have_updates(),
+            }
+        });
+
+        let mut scanner = dataset.scan();
+        if let Some(fragments) = fragments {
+            scanner.with_fragments(fragments);
+        }
         scanner.project(&[
             WILDCARD,
             ROW_ID,
@@ -580,21 +632,49 @@ impl DatasetDelta {
             ROW_LAST_UPDATED_AT_VERSION,
         ])?;
 
-        // Filter for rows that were updated or inserted in the version range
-        let filter = self.build_upserted_rows_filter().await?;
+        // Fragment pruning is conservative; the row filter determines the exact result.
         scanner.filter(&filter)?;
-
         scanner.try_into_stream().await
     }
+}
 
-    async fn build_upserted_rows_filter(&self) -> Result<String> {
-        let inserted_row_filter = self.build_inserted_rows_filter().await?;
-        let updated_rows_filter = self.build_updated_rows_batch_filter().await?;
-        Ok(format!(
-            "({}) OR ({})",
-            inserted_row_filter, updated_rows_filter
-        ))
-    }
+fn pruned_fragments(
+    fragments: &[Fragment],
+    may_match: impl Fn(&Fragment) -> bool,
+) -> Option<Vec<Fragment>> {
+    // Reuse the manifest's shared list unless pruning excludes a fragment.
+    let mut remaining = fragments.iter();
+    let first_excluded = remaining.position(|fragment| !may_match(fragment))?;
+    let mut surviving = Vec::with_capacity(first_excluded);
+    surviving.extend(fragments[..first_excluded].iter().cloned());
+    surviving.extend(remaining.filter(|fragment| may_match(fragment)).cloned());
+    Some(surviving)
+}
+
+fn version_meta_may_match(
+    fragment_id: u64,
+    column: &str,
+    meta: Option<&RowDatasetVersionMeta>,
+    predicate: impl Fn(u64) -> bool,
+) -> bool {
+    // Missing or column-spilled metadata cannot safely rule out a match.
+    let Some(RowDatasetVersionMeta::Inline(data)) = meta else {
+        return true;
+    };
+    let sequence = match read_dataset_versions(data) {
+        Ok(sequence) => sequence,
+        Err(error) => {
+            warn!(
+                fragment_id,
+                column,
+                metadata_bytes = data.len(),
+                error = %error,
+                "Cannot decode row-version metadata; skipping pruning for this column"
+            );
+            return true;
+        }
+    };
+    sequence.runs.is_empty() || sequence.runs.iter().any(|run| predicate(run.version))
 }
 
 /// A fragment's deletion vector at this version, empty where it has none.
@@ -969,10 +1049,24 @@ mod tests {
     use arrow_array::types::UInt64Type;
     use chrono::Duration;
     use futures::TryStreamExt;
-    use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
+    use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION, WILDCARD};
     use lance_datagen::{BatchCount, RowCount, array};
+    use lance_io::stream::RecordBatchStream;
+    use lance_table::feature_flags::FLAG_STABLE_ROW_IDS;
+    use lance_table::io::commit::write_manifest_file_to_path;
+    use lance_table::rowids::version::{
+        RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
+    };
     use mock_instant::thread_local::MockClock;
+    use rstest::rstest;
+    use std::cell::RefCell;
+    use std::collections::BTreeSet;
     use std::sync::Arc;
+    use tempfile::NamedTempFile;
+    use tracing::Level;
+
+    use super::{RowChange, pruned_fragments, version_meta_may_match};
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
 
     async fn create_test_dataset(
         rows: usize,
@@ -1057,8 +1151,363 @@ mod tests {
     async fn collect_stream(
         stream: crate::dataset::scanner::DatasetRecordBatchStream,
     ) -> arrow_array::RecordBatch {
+        let schema = stream.schema();
         let batches: Vec<_> = stream.try_collect().await.unwrap();
-        arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap()
+        arrow_select::concat::concat_batches(&schema, &batches).unwrap()
+    }
+
+    #[rstest]
+    #[case::empty(vec![], None)]
+    #[case::all_kept(vec![true, true, true], None)]
+    #[case::first_excluded(vec![false, true, true], Some(vec![1, 2]))]
+    #[case::middle_excluded(vec![true, false, true], Some(vec![0, 2]))]
+    #[case::last_excluded(vec![true, true, false], Some(vec![0, 1]))]
+    #[case::all_excluded(vec![false, false, false], Some(vec![]))]
+    fn test_pruned_fragments(#[case] matches: Vec<bool>, #[case] expected: Option<Vec<u64>>) {
+        let fragments: Vec<_> = (0..matches.len())
+            .map(|id| super::Fragment::new(id as u64))
+            .collect();
+        let visited = RefCell::new(Vec::new());
+        let actual = pruned_fragments(&fragments, |fragment| {
+            visited.borrow_mut().push(fragment.id);
+            matches[fragment.id as usize]
+        });
+        assert_eq!(
+            actual.map(|fragments| fragments.into_iter().map(|fragment| fragment.id).collect()),
+            expected
+        );
+        assert_eq!(
+            visited.into_inner(),
+            fragments
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[rstest]
+    #[case::before(vec![1], 2, 4, false)]
+    #[case::at_begin(vec![2], 2, 4, false)]
+    #[case::at_end(vec![4], 2, 4, true)]
+    #[case::after(vec![5], 2, 4, false)]
+    #[case::mixed(vec![5, 1, 3], 2, 4, true)]
+    #[case::gap(vec![1, 5], 2, 4, false)]
+    #[case::empty_range(vec![2], 2, 2, false)]
+    #[case::reversed_range(vec![2], 3, 1, false)]
+    #[case::max_version(vec![u64::MAX], u64::MAX - 1, u64::MAX, true)]
+    fn test_version_meta_pruning(
+        #[case] versions: Vec<u64>,
+        #[case] begin: u64,
+        #[case] end: u64,
+        #[case] expected: bool,
+    ) {
+        let sequence = RowDatasetVersionSequence {
+            runs: versions
+                .into_iter()
+                .enumerate()
+                .map(|(offset, version)| RowDatasetVersionRun {
+                    span: super::U64Segment::Range(offset as u64..offset as u64 + 1),
+                    version,
+                })
+                .collect(),
+        };
+        let meta = RowDatasetVersionMeta::from_sequence(&sequence).unwrap();
+        assert_eq!(
+            version_meta_may_match(42, ROW_CREATED_AT_VERSION, Some(&meta), |version| {
+                version > begin && version <= end
+            }),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[case::missing(None, false)]
+    #[case::undecodable(Some(RowDatasetVersionMeta::Inline(Arc::from([0xff]))), true)]
+    #[case::column(Some(RowDatasetVersionMeta::Column), false)]
+    #[case::empty(Some(RowDatasetVersionMeta::from_sequence(&RowDatasetVersionSequence::new()).unwrap()), false)]
+    fn test_version_meta_pruning_unknown(
+        #[case] meta: Option<RowDatasetVersionMeta>,
+        #[case] has_warning: bool,
+        #[values(ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION)] column: &str,
+    ) {
+        let log = NamedTempFile::new().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(log.reopen().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(version_meta_may_match(42, column, meta.as_ref(), |_| false));
+        });
+        let output = std::fs::read_to_string(log.path()).unwrap();
+        if has_warning {
+            assert!(output.contains("WARN"));
+            assert!(output.contains("fragment_id=42"));
+            assert!(output.contains(column));
+            assert!(output.contains("metadata_bytes=1"));
+            assert!(output.contains("Failed to decode RowDatasetVersionSequence"));
+            assert_eq!(
+                output
+                    .matches("Cannot decode row-version metadata; skipping pruning for this column")
+                    .count(),
+                1
+            );
+        } else {
+            assert!(output.is_empty(), "Unexpected warning: {output}");
+        }
+    }
+
+    #[rstest]
+    #[case::inserted(
+        RowChange::Inserted,
+        "_row_created_at_version > 1 AND _row_created_at_version <= 3",
+        vec![12, 13, 14, 15]
+    )]
+    #[case::updated(
+        RowChange::Updated,
+        "_row_created_at_version <= 1 AND _row_last_updated_at_version > 1 AND _row_last_updated_at_version <= 3",
+        vec![1]
+    )]
+    #[case::upserted(
+        RowChange::Upserted,
+        "(_row_created_at_version > 1 AND _row_created_at_version <= 3) OR (_row_created_at_version <= 1 AND _row_last_updated_at_version > 1 AND _row_last_updated_at_version <= 3)",
+        vec![1, 12, 13, 14, 15]
+    )]
+    #[tokio::test]
+    async fn test_delta_prunes_version_fragments(
+        #[case] change: RowChange,
+        #[case] filter: &str,
+        #[case] expected_keys: Vec<i32>,
+    ) {
+        let dir = lance_core::utils::tempfile::TempStrDir::default();
+        let data = lance_datagen::gen_batch()
+            .col("key", array::step::<Int32Type>())
+            .col("value", array::fill_utf8("initial".into()))
+            .into_reader_rows(RowCount::from(4), BatchCount::from(3));
+        let mut dataset = Dataset::write(
+            data,
+            dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+
+        dataset = write_dataset_temp(&dir, 12, 4, 1, "inserted", true, true).await;
+        let inserted_file = dataset.manifest.fragments.last().unwrap().files[0]
+            .path
+            .clone();
+        dataset = update_where(dataset, "key = 1", "updated").await;
+        let updated_file = dataset.manifest.fragments.last().unwrap().files[0]
+            .path
+            .clone();
+
+        let columns = &[
+            WILDCARD,
+            ROW_ID,
+            ROW_CREATED_AT_VERSION,
+            ROW_LAST_UPDATED_AT_VERSION,
+        ];
+        let collect_changes = async |dataset: &Dataset| {
+            let delta = dataset
+                .delta()
+                .with_begin_version(1)
+                .with_end_version(dataset.version().version)
+                .build()
+                .unwrap();
+            let stream = match change {
+                RowChange::Inserted => delta.get_inserted_rows().await,
+                RowChange::Updated => delta.get_updated_rows().await,
+                RowChange::Upserted => delta.get_upserted_rows().await,
+            }
+            .unwrap();
+            collect_stream(stream).await
+        };
+        let take_read_data_files = |dataset: &Dataset| -> BTreeSet<String> {
+            dataset
+                .object_store
+                .io_stats_incremental()
+                .requests
+                .iter()
+                .filter_map(|request| request.path.filename())
+                .filter(|filename| filename.ends_with(".lance"))
+                .map(str::to_owned)
+                .collect()
+        };
+        dataset.session().file_metadata_cache().clear().await;
+        dataset.object_store.io_stats_incremental();
+        let expected = scan_project_filter(&dataset, columns, Some(filter)).await;
+        let full_scan_files = take_read_data_files(&dataset);
+        assert_eq!(full_scan_files.len(), dataset.get_fragments().len());
+        // Tiny files can cache inline pages with their metadata, hiding file reads.
+        dataset.session().file_metadata_cache().clear().await;
+        let actual = collect_changes(&dataset).await;
+        assert_eq!(actual, expected);
+        let mut keys = actual["key"].as_primitive::<Int32Type>().values().to_vec();
+        keys.sort_unstable();
+        assert_eq!(keys, expected_keys);
+
+        let read_files = take_read_data_files(&dataset);
+        let expected_files = match change {
+            RowChange::Inserted => BTreeSet::from([inserted_file]),
+            RowChange::Updated => BTreeSet::from([updated_file]),
+            RowChange::Upserted => BTreeSet::from([inserted_file, updated_file]),
+        };
+        assert_eq!(read_files, expected_files);
+        assert!(read_files.len() < full_scan_files.len());
+
+        for column in [ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION] {
+            let mut unknown_dataset = dataset.clone();
+            let manifest = Arc::make_mut(&mut unknown_dataset.manifest);
+            for fragment in Arc::make_mut(&mut manifest.fragments) {
+                if column == ROW_CREATED_AT_VERSION {
+                    fragment.created_at_version_meta = None;
+                } else {
+                    fragment.last_updated_at_version_meta = None;
+                }
+            }
+            let expected = scan_project_filter(&unknown_dataset, columns, Some(filter)).await;
+            assert_eq!(
+                collect_changes(&unknown_dataset).await,
+                expected,
+                "Pruning changed results for {change:?} with missing {column} metadata"
+            );
+        }
+
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 100,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(metrics.fragments_removed > 0);
+        assert_eq!(dataset.get_fragments().len(), 1);
+        let sequence = dataset.manifest.fragments[0]
+            .created_at_version_meta
+            .as_ref()
+            .unwrap()
+            .load_sequence()
+            .unwrap();
+        assert!(sequence.runs.len() > 1);
+        let expected = scan_project_filter(&dataset, columns, Some(filter)).await;
+        assert_eq!(collect_changes(&dataset).await, expected);
+    }
+
+    #[rstest]
+    #[case::empty_snapshot(0, 0)]
+    #[case::same_version(1, 1)]
+    #[case::unchanged_range(2, 3)]
+    #[case::reversed_range(3, 1)]
+    #[tokio::test]
+    async fn test_delta_pruning_empty(#[case] begin: u64, #[case] end: u64) {
+        let mut dataset = create_test_dataset(4, 1, "value", true).await;
+        for _ in 0..2 {
+            dataset.delete("false").await.unwrap();
+        }
+        dataset.object_store.io_stats_incremental();
+        let delta = dataset
+            .delta()
+            .with_begin_version(begin)
+            .with_end_version(end)
+            .build()
+            .unwrap();
+        for stream in [
+            delta.get_inserted_rows().await.unwrap(),
+            delta.get_updated_rows().await.unwrap(),
+            delta.get_upserted_rows().await.unwrap(),
+        ] {
+            let batch = collect_stream(stream).await;
+            assert_eq!(batch.num_rows(), 0);
+            for column in [
+                "key",
+                "value",
+                ROW_ID,
+                ROW_CREATED_AT_VERSION,
+                ROW_LAST_UPDATED_AT_VERSION,
+            ] {
+                assert!(batch.column_by_name(column).is_some());
+            }
+        }
+        // Endpoint validation can read manifests, but pruning must avoid data files.
+        assert!(
+            dataset
+                .object_store
+                .io_stats_incremental()
+                .requests
+                .iter()
+                .all(|request| !request
+                    .path
+                    .filename()
+                    .is_some_and(|filename| filename.ends_with(".lance")))
+        );
+    }
+
+    #[rstest]
+    #[case::inserted(RowChange::Inserted)]
+    #[case::updated(RowChange::Updated)]
+    #[case::upserted(RowChange::Upserted)]
+    #[tokio::test]
+    async fn test_delta_rows_missing_end_version(#[case] change: RowChange) {
+        let dataset = create_test_dataset(4, 1, "value", true).await;
+        let delta = dataset
+            .delta()
+            .with_begin_version(4)
+            .with_end_version(5)
+            .build()
+            .unwrap();
+        let error = match change {
+            RowChange::Inserted => delta.get_inserted_rows().await,
+            RowChange::Updated => delta.get_updated_rows().await,
+            RowChange::Upserted => delta.get_upserted_rows().await,
+        }
+        .err()
+        .unwrap();
+        assert!(matches!(error, lance_core::Error::DatasetNotFound { .. }));
+        assert!(error.to_string().contains("_versions/5.manifest"));
+    }
+
+    #[tokio::test]
+    async fn test_delta_pruning_preserves_default_versions() {
+        let mut dataset = create_test_dataset(4, 1, "value", true).await;
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        for fragment in Arc::make_mut(&mut manifest.fragments) {
+            fragment.created_at_version_meta = None;
+            fragment.last_updated_at_version_meta = None;
+        }
+        let delta = dataset
+            .delta()
+            .with_begin_version(0)
+            .with_end_version(1)
+            .build()
+            .unwrap();
+        for stream in [
+            delta.get_inserted_rows().await.unwrap(),
+            delta.get_upserted_rows().await.unwrap(),
+        ] {
+            let batch = collect_stream(stream).await;
+            assert_eq!(batch.num_rows(), 4);
+            for column in [ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION] {
+                assert_eq!(
+                    batch[column].as_primitive::<UInt64Type>().values().as_ref(),
+                    &[1; 4]
+                );
+            }
+        }
+        assert_eq!(
+            collect_stream(delta.get_updated_rows().await.unwrap())
+                .await
+                .num_rows(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1138,7 +1587,7 @@ mod tests {
             Err(lance_core::Error::VersionNotFound { message }) => {
                 assert!(message.contains("Can not find version"));
             }
-            _ => panic!("Expected VersionNotFound error."),
+            other => panic!("Expected VersionNotFound error, got {other:?}"),
         }
     }
 
@@ -1798,6 +2247,76 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::inserted(RowChange::Inserted, vec![(4, "inserted", 2, 2, 4)])]
+    #[case::updated(RowChange::Updated, vec![(0, "updated", 1, 3, 0)])]
+    #[case::upserted(RowChange::Upserted, vec![(0, "updated", 1, 3, 0), (4, "inserted", 2, 2, 4)])]
+    #[tokio::test]
+    async fn test_delta_rows_at_end_version(
+        #[case] change: RowChange,
+        #[case] expected: Vec<(i32, &str, u64, u64, u64)>,
+        #[values(1, 3, 5)] handle_version: u64,
+    ) {
+        let dir = lance_core::utils::tempfile::TempStrDir::default();
+        MockClock::set_system_time(std::time::Duration::from_secs(10));
+        let dataset = write_dataset_temp(&dir, 0, 2, 2, "initial", true, false).await;
+        assert_eq!(dataset.version().version, 1);
+        MockClock::set_system_time(std::time::Duration::from_secs(20));
+        let dataset = write_dataset_temp(&dir, 4, 1, 1, "inserted", true, true).await;
+        assert_eq!(dataset.get_fragments().len(), 2);
+        MockClock::set_system_time(std::time::Duration::from_secs(30));
+        let dataset = update_where(dataset, "key = 0", "updated").await;
+        MockClock::set_system_time(std::time::Duration::from_secs(40));
+        let mut dataset = update_where(dataset, "key = 0", "later").await;
+        MockClock::set_system_time(std::time::Duration::from_secs(50));
+        dataset.delete("key = 4").await.unwrap();
+        assert_eq!(dataset.version().version, 5);
+        let dataset = dataset.checkout_version(handle_version).await.unwrap();
+
+        let mut builders = vec![
+            dataset.delta().with_begin_version(1).with_end_version(3),
+            dataset
+                .delta()
+                .with_begin_date(chrono::DateTime::from_timestamp(15, 0).unwrap())
+                .with_end_date(chrono::DateTime::from_timestamp(35, 0).unwrap()),
+        ];
+        if handle_version == 1 {
+            builders.push(dataset.delta().compared_against_version(3));
+        } else if handle_version == 3 {
+            builders.push(dataset.delta().compared_against_version(1));
+        }
+
+        for builder in builders {
+            let delta = builder.build().unwrap();
+            let stream = match change {
+                RowChange::Inserted => delta.get_inserted_rows().await,
+                RowChange::Updated => delta.get_updated_rows().await,
+                RowChange::Upserted => delta.get_upserted_rows().await,
+            }
+            .unwrap();
+            let batch = collect_stream(stream).await;
+            let keys = batch["key"].as_primitive::<Int32Type>();
+            let values = batch["value"].as_string::<i32>();
+            let created = batch[ROW_CREATED_AT_VERSION].as_primitive::<UInt64Type>();
+            let updated = batch[ROW_LAST_UPDATED_AT_VERSION].as_primitive::<UInt64Type>();
+            let ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+            let mut actual = (0..batch.num_rows())
+                .map(|i| {
+                    (
+                        keys.value(i),
+                        values.value(i),
+                        created.value(i),
+                        updated.value(i),
+                        ids.value(i),
+                    )
+                })
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "{change:?} on version {handle_version}");
+        }
+        assert_eq!(dataset.version().version, handle_version);
+    }
+
     #[tokio::test]
     async fn test_get_inserted_rows() {
         // Create initial dataset (version 1)
@@ -1981,20 +2500,99 @@ mod tests {
         }
     }
 
-    /// A range spanning the stable-id migration has a bare begin endpoint
-    /// and is rejected, naming the offending version.
+    #[rstest]
     #[tokio::test]
-    async fn test_mixed_stable_id_endpoints_are_rejected() {
+    async fn test_row_changes_require_stable_row_ids(
+        #[values(RowChange::Inserted, RowChange::Updated, RowChange::Upserted)] change: RowChange,
+        #[values(0, 1, 2)] begin_version: u64,
+    ) {
         let dir = lance_core::utils::tempfile::TempStrDir::default();
-        let mut dataset = write_dataset_temp(&dir, 0, 10, 1, "v1", false, false).await;
-        dataset.migrate_to_stable_row_ids().await.unwrap();
+        write_dataset_temp(&dir, 0, 1, 1, "v1", false, false).await;
+        let dataset = write_dataset_temp(&dir, 1, 1, 1, "v2", false, true).await;
+        assert_eq!(dataset.get_fragments().len(), 2);
+        let delta = dataset
+            .delta()
+            .with_begin_version(begin_version)
+            .with_end_version(2)
+            .build()
+            .unwrap();
 
-        let delta = dataset.delta().compared_against_version(1).build().unwrap();
-        let err = delta.get_deleted_row_ids().await.err().unwrap();
+        assert_eq!(
+            delta.list_transactions().await.unwrap().len() as u64,
+            2 - begin_version
+        );
+        let err = delta.scan_rows(change).await.err().unwrap();
+        assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
+        let unsupported_version = if begin_version == 0 { 2 } else { begin_version };
         assert!(
-            err.to_string().contains("stable row ids") && err.to_string().contains("version 1"),
+            err.to_string().contains("require stable row ids")
+                && err
+                    .to_string()
+                    .contains(&format!("version {unsupported_version} does not use them")),
             "{err}"
         );
+    }
+
+    /// Both endpoint manifests must advertise stable row ids.
+    #[rstest]
+    #[case::begin(false)]
+    #[case::end(true)]
+    #[tokio::test]
+    async fn test_mixed_stable_id_endpoints_are_rejected(
+        #[case] has_unsupported_end: bool,
+        #[values(false, true)] has_historical_handle: bool,
+    ) {
+        let dir = lance_core::utils::tempfile::TempStrDir::default();
+        let mut dataset = write_dataset_temp(&dir, 0, 2, 1, "v1", false, false).await;
+        dataset.migrate_to_stable_row_ids().await.unwrap();
+
+        let (begin_version, unsupported_version) = if has_unsupported_end {
+            let stable_version = dataset.manifest.version;
+            dataset.delete("false").await.unwrap();
+            // Current writers forbid disabling stable ids. Persist the test flag so
+            // endpoint checkouts also see it when the commit handler reloads the manifest.
+            let manifest = Arc::make_mut(&mut dataset.manifest);
+            manifest.reader_feature_flags &= !FLAG_STABLE_ROW_IDS;
+            write_manifest_file_to_path(
+                dataset.object_store.as_ref(),
+                manifest,
+                None,
+                &dataset.manifest_location.path,
+                None,
+            )
+            .await
+            .unwrap();
+            dataset = Dataset::open(&dir).await.unwrap();
+            (stable_version, dataset.manifest.version)
+        } else {
+            (1, 1)
+        };
+        let end_version = dataset.manifest.version;
+        if has_historical_handle {
+            dataset = dataset.checkout_version(1).await.unwrap();
+        }
+        let delta = dataset
+            .delta()
+            .with_begin_version(begin_version)
+            .with_end_version(end_version)
+            .build()
+            .unwrap();
+        for result in [
+            delta.get_deleted_row_ids().await,
+            delta.get_inserted_rows().await,
+            delta.get_updated_rows().await,
+            delta.get_upserted_rows().await,
+        ] {
+            let err = result.err().unwrap();
+            assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
+            assert!(
+                err.to_string().contains("require stable row ids")
+                    && err
+                        .to_string()
+                        .contains(&format!("version {unsupported_version} does not use them")),
+                "{err}"
+            );
+        }
     }
 
     /// One deletion per fragment across many fragments.
@@ -2268,6 +2866,7 @@ mod tests {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(1),
             base_id: None,
+            inline: None,
         };
         let dv_version = |f: &Fragment| f.deletion_file.as_ref().unwrap().read_version;
         let unchanged = Fragment::new(1);
@@ -2452,10 +3051,8 @@ mod tests {
         let stream = delta.get_updated_rows().await.unwrap();
         let result = collect_stream(stream).await;
 
-        // Should have 20 rows (keys 0-9 and 20-29)
-        // Note: keys 10-19 were updated in v2 but then updated again in v4,
-        // so they have _row_last_updated_at_version = 4, not 2
-        assert_eq!(result.num_rows(), 20);
+        // All 30 rows are returned as of version 2, including those updated again in version 4.
+        assert_eq!(result.num_rows(), 30);
         assert!(result.column_by_name(ROW_ID).is_some());
         assert!(result.column_by_name(ROW_CREATED_AT_VERSION).is_some());
         assert!(result.column_by_name(ROW_LAST_UPDATED_AT_VERSION).is_some());
@@ -2471,9 +3068,7 @@ mod tests {
         for i in 0..result.num_rows() {
             assert_eq!(created_at[i], 1); // Created at version 1
             assert_eq!(updated_at[i], 2); // Updated at version 2
-            // Keys should be in range [0, 30) but excluding [10, 20)
             assert!(keys[i] < 30);
-            assert!(keys[i] < 10 || keys[i] >= 20);
         }
 
         // Test 2: Get updated rows between version 2 and 3
@@ -2537,6 +3132,10 @@ mod tests {
         // Update some existing rows (version 3)
         let ds = update_where(ds, "key < 10", "updated_v3").await;
         assert_eq!(ds.version().version, 3);
+
+        // An insertion still belongs to the range if it was updated after the range.
+        let ds = update_where(ds, "key = 50", "updated_v4").await;
+        assert_eq!(ds.version().version, 4);
 
         // Get upserted rows between version 1 and 3
         let delta = ds
@@ -2604,6 +3203,23 @@ mod tests {
 
         let txs = delta.list_transactions().await.unwrap();
         assert_eq!(txs.len(), 1);
+
+        assert_eq!(
+            collect_stream(delta.get_inserted_rows().await.unwrap())
+                .await
+                .num_rows(),
+            0
+        );
+        for stream in [
+            delta.get_updated_rows().await.unwrap(),
+            delta.get_upserted_rows().await.unwrap(),
+        ] {
+            let batch = collect_stream(stream).await;
+            assert_eq!(batch.num_rows(), 10);
+            let mut keys = batch["key"].as_primitive::<Int32Type>().values().to_vec();
+            keys.sort_unstable();
+            assert_eq!(keys, (0..10).collect::<Vec<_>>());
+        }
     }
 
     #[tokio::test]
@@ -2646,10 +3262,15 @@ mod tests {
 
         let begin_ts = chrono::DateTime::<chrono::Utc>::from_timestamp(15, 0).unwrap();
 
+        let ds = ds.checkout_version(1).await.unwrap();
         let delta = ds.delta().with_begin_date(begin_ts).build().unwrap();
 
         let txs = delta.list_transactions().await.unwrap();
         // Should include transactions at v2 and v3
         assert_eq!(txs.len(), 2);
+        let batch = collect_stream(delta.get_updated_rows().await.unwrap()).await;
+        let mut keys = batch["key"].as_primitive::<Int32Type>().values().to_vec();
+        keys.sort_unstable();
+        assert_eq!(keys, (0..10).collect::<Vec<_>>());
     }
 }

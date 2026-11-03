@@ -215,7 +215,10 @@ public class MemWalTest {
 
       Optional<MemWalIndexDetails> details = dataset.memWalIndexDetails();
       assertTrue(details.isPresent());
+      // Naming no index is how "every index the table has" is expressed, so the
+      // flag is the only thing separating it from maintaining nothing.
       assertEquals(Collections.emptyList(), details.get().maintainedIndexes());
+      assertTrue(details.get().maintainAllIndexes());
     }
   }
 
@@ -391,6 +394,7 @@ public class MemWalTest {
 
         WriteStats stats = writer.stats();
         assertEquals(1, stats.putCount());
+        assertEquals(0, stats.memtableFlushFailures());
 
         MemTableStats memtableStats = writer.memtableStats();
         assertTrue(memtableStats.generation() >= 0);
@@ -452,7 +456,8 @@ public class MemWalTest {
       dataset.initializeMemWal(new InitializeMemWalParams());
 
       // SSTable overwrites id=2.
-      String genPath = basePath + "/_mem_wal/" + shardId + "/gen_1";
+      String dirId = dataset.memWalIndexDetails().orElseThrow().dirId();
+      String genPath = basePath + "/_" + dirId + "_mem_wal/" + shardId + "/gen_1";
       writeSsTable(allocator, genPath, new long[] {2}, "gen1");
 
       ShardSnapshot snapshot =
@@ -486,7 +491,8 @@ public class MemWalTest {
         Dataset dataset = writeLookupDataset(allocator, basePath, new long[] {1, 2, 3}, "base")) {
       dataset.initializeMemWal(new InitializeMemWalParams());
 
-      String genPath = basePath + "/_mem_wal/" + shardId + "/gen_1";
+      String dirId = dataset.memWalIndexDetails().orElseThrow().dirId();
+      String genPath = basePath + "/_" + dirId + "_mem_wal/" + shardId + "/gen_1";
       writeSsTable(allocator, genPath, new long[] {2}, "gen1");
 
       ShardSnapshot snapshot =
@@ -527,13 +533,30 @@ public class MemWalTest {
       Dataset dataset = writeLookupDataset(allocator, path, new long[] {1, 2, 3}, "base");
       try {
         dataset.initializeMemWal(new InitializeMemWalParams());
+        String dirId = dataset.memWalIndexDetails().orElseThrow().dirId();
+        assertFalse(dirId.isEmpty());
+
+        // A dirId other than the table's MemWAL is refused.
+        MergeInsertParams staleParams =
+            new MergeInsertParams(Collections.singletonList("id"))
+                .withMatchedUpdateAll()
+                .markSstablesAsCompacted(
+                    "stale", Collections.singletonList(new CompactedSsTable(shardId, 1)));
+        try (VectorSchemaRoot root = lookupRoot(allocator, new long[] {2}, "stale");
+            ArrowReader reader = toReader(allocator, root);
+            ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+          Data.exportArrayStream(allocator, reader, stream);
+          RuntimeException error =
+              assertThrows(RuntimeException.class, () -> dataset.mergeInsert(staleParams, stream));
+          assertTrue(error.getMessage().contains("Stale MemWAL"), error.getMessage());
+        }
 
         MergeInsertParams params =
             new MergeInsertParams(Collections.singletonList("id"))
                 .withMatchedUpdateAll()
                 .withNotMatched(MergeInsertParams.WhenNotMatched.InsertAll)
                 .markSstablesAsCompacted(
-                    Collections.singletonList(new CompactedSsTable(shardId, 1)));
+                    dirId, Collections.singletonList(new CompactedSsTable(shardId, 1)));
 
         try (VectorSchemaRoot root = lookupRoot(allocator, new long[] {2, 4}, "merged");
             ArrowReader reader = toReader(allocator, root);

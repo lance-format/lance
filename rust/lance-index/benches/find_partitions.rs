@@ -53,17 +53,44 @@ fn bench_partitions(c: &mut Criterion) {
     }
 }
 
+/// Partition search at common embedding widths, where the query-to-centroid
+/// distances rather than the top-k selection dominate.
+fn bench_partitions_by_dimension(c: &mut Criterion) {
+    const NUM_CENTROIDS: usize = 10240;
+    const NPROBES: usize = 20;
+    const SEED: [u8; 32] = [42; 32];
+
+    for dimension in [128, 768] {
+        let query: Float32Array = generate_random_array_with_seed::<Float32Type>(dimension, SEED);
+        let centroids =
+            generate_random_array_with_seed::<Float32Type>(NUM_CENTROIDS * dimension, SEED);
+        let fsl = FixedSizeListArray::try_new_from_values(centroids, dimension as i32).unwrap();
+
+        for distance_type in [DistanceType::L2, DistanceType::Dot] {
+            let ivf = IvfTransformer::new(fsl.clone(), distance_type, vec![]);
+            c.bench_function(
+                format!("IVF{NUM_CENTROIDS},dim={dimension},k={NPROBES},{distance_type}").as_str(),
+                |b| {
+                    b.iter(|| {
+                        let _ = ivf.find_partitions(&query, NPROBES);
+                    })
+                },
+            );
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets =bench_partitions);
+    targets = bench_partitions, bench_partitions_by_dimension);
 
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_partitions);
+    targets = bench_partitions, bench_partitions_by_dimension);
 
 criterion_main!(benches);

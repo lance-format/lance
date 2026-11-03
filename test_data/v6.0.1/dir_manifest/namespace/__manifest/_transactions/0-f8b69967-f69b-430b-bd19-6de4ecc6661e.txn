@@ -1,0 +1,4 @@
+$f8b69967-f69b-430b-bd19-6de4ecc6661e²×U	object_id ÿÿÿÿÿÿÿÿÿ*string8R1
+,lance-schema:unenforced-primary-key:position0`$object_type ÿÿÿÿÿÿÿÿÿ*string8#location ÿÿÿÿÿÿÿÿÿ*string08#metadata ÿÿÿÿÿÿÿÿÿ*string08%base_objects ÿÿÿÿÿÿÿÿÿ*list08	object_id *string08"!
+lance.auto_cleanup.interval20"'
+lance.auto_cleanup.older_than14days

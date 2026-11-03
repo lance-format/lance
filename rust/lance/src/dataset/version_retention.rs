@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use lance_table::io::commit::read_version_from_hint;
+use lance_table::io::commit::read_version_hint;
 
 use super::Dataset;
 use crate::Result;
@@ -59,7 +59,7 @@ impl ProtectedVersions {
             .map(|(_name, version)| version)
             .collect();
 
-        let hint_floor = read_version_from_hint(&dataset.object_store, &dataset.base).await;
+        let hint_floor = read_version_hint(&dataset.object_store, &dataset.base).await?;
 
         Ok(Self {
             latest: dataset.manifest.version,

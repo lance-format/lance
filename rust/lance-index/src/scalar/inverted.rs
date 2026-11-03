@@ -3,6 +3,7 @@
 
 pub mod builder;
 mod cache_codec;
+mod combined;
 mod compound;
 mod cross_column;
 mod documents;
@@ -11,31 +12,41 @@ mod impact;
 mod index;
 mod iter;
 pub mod json;
+/// Brute-force scoring reference for tests and benches. Never built normally; see
+/// the module docs for the gating.
+#[cfg(any(test, feature = "test-oracle"))]
+pub mod oracle;
 pub mod parser;
 pub mod query;
 mod scorer;
 pub mod tokenizer;
 mod wand;
 
+use lance_index_core::remapping::BatchRowIdRemapper;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 pub use builder::InvertedIndexBuilder;
+pub use combined::{
+    CombinedCorpusStats, CombinedFieldColumn, FlatFieldStats, build_combined_bm25_scorer,
+    combined_fields_search, flat_combined_fields_search_stream, validate_combined_tokenizers,
+};
 pub use compound::{
-    compound_search, compound_search_prepared_match,
-    compound_search_prepared_match_with_score_floor, compound_search_with_base_scorer,
-    compound_search_with_base_scorer_and_score_floor, exclusive_scaled_score_floor,
-    materialized_compound_top_k,
+    PreparedFtsGlobalStatistics, PreparedFtsQueryLeaf, compound_search,
+    compound_search_prepared_match, compound_search_prepared_match_with_score_floor,
+    compound_search_with_base_scorer, compound_search_with_base_scorer_and_score_floor,
+    exclusive_scaled_score_floor, materialized_compound_top_k, prepare_fts_global_statistics,
 };
 #[doc(hidden)]
 pub use cross_column::cross_column_compound_search;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion_execution::SendableRecordBatchStream;
+use documents::DocumentRemapping;
 pub use index::*;
 use lance_core::{Result, cache::LanceCache};
 pub use lance_tokenizer::Language;
-pub use scorer::{MemBM25Scorer, Scorer};
+pub use scorer::{CombinedFieldsBM25Scorer, MemBM25Scorer, Scorer};
 pub use tokenizer::*;
 
 use crate::scalar::inverted::query::{FtsSearchParams, Tokens, uses_fuzzy_expansion};
@@ -45,13 +56,13 @@ use crate::scalar::inverted::query::{FtsSearchParams, Tokens, uses_fuzzy_expansi
 /// Keeping these values together prevents a search path from expanding one
 /// vocabulary while scoring another. Positions on `tokens` identify fuzzy
 /// alternatives belonging to the same original query position.
-#[doc(hidden)]
 #[derive(Clone)]
 pub struct PreparedBm25Query {
     tokens: Arc<Tokens>,
     scorer: Arc<MemBM25Scorer>,
     has_all_query_positions: bool,
     can_reuse_scorer: bool,
+    term_ids: Option<Arc<PreparedTermIds>>,
 }
 
 impl std::fmt::Debug for PreparedBm25Query {
@@ -67,7 +78,41 @@ impl std::fmt::Debug for PreparedBm25Query {
 }
 
 impl PreparedBm25Query {
-    pub(crate) fn from_parts(
+    /// Reconstruct the canonical vocabulary and statistics selected by query
+    /// preparation. These must describe the same corpus and query.
+    ///
+    /// `has_all_query_positions` records whether every original query group
+    /// survived expansion. It cannot be inferred from the surviving tokens:
+    /// `false` makes AND and phrase searches return no matches.
+    ///
+    /// Dictionary term IDs and scorer-reuse eligibility are process-local
+    /// optimizations and are cleared. The destination resolves its own term IDs
+    /// without repeating vocabulary expansion or changing the supplied scorer.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_core::Result;
+    /// # use lance_index::scalar::inverted::{MemBM25Scorer, PreparedBm25Query};
+    /// # use lance_index::scalar::inverted::query::Tokens;
+    /// # fn rebuild(prepared: &PreparedBm25Query) -> Result<PreparedBm25Query> {
+    /// let tokens = prepared.tokens();
+    /// let decoded = Tokens::try_from_parts(
+    ///     (0..tokens.len()).map(|i| tokens.get_token(i).to_owned()).collect(),
+    ///     (0..tokens.len()).map(|i| tokens.position(i)).collect(),
+    ///     (0..tokens.len()).map(|i| tokens.term_group(i)).collect(),
+    ///     tokens.token_type().clone(),
+    /// )?;
+    /// let scorer = prepared.scorer();
+    /// Ok(PreparedBm25Query::from_parts(
+    ///     Arc::new(decoded),
+    ///     Arc::new(MemBM25Scorer::new(
+    ///         scorer.total_tokens, scorer.num_docs, scorer.token_docs.clone(),
+    ///     )),
+    ///     prepared.has_all_query_positions(),
+    /// ))
+    /// # }
+    /// ```
+    pub fn from_parts(
         tokens: Arc<Tokens>,
         scorer: Arc<MemBM25Scorer>,
         has_all_query_positions: bool,
@@ -77,15 +122,16 @@ impl PreparedBm25Query {
             scorer,
             has_all_query_positions,
             can_reuse_scorer: false,
+            term_ids: None,
         }
     }
 
-    #[doc(hidden)]
+    /// Canonical terms, phrase offsets and logical groups selected for the corpus.
     pub fn tokens(&self) -> &Arc<Tokens> {
         &self.tokens
     }
 
-    #[doc(hidden)]
+    /// Corpus statistics paired with the canonical vocabulary.
     pub fn scorer(&self) -> &Arc<MemBM25Scorer> {
         &self.scorer
     }
@@ -94,8 +140,14 @@ impl PreparedBm25Query {
         self.can_reuse_scorer.then_some(&self.scorer)
     }
 
-    pub(crate) fn has_all_query_positions(&self) -> bool {
+    /// Whether every original group survived vocabulary expansion. Preserve this
+    /// when reconstructing; see [`Self::from_parts`].
+    pub fn has_all_query_positions(&self) -> bool {
         self.has_all_query_positions
+    }
+
+    pub(in crate::scalar::inverted) fn term_ids(&self) -> Option<&PreparedTermIds> {
+        self.term_ids.as_deref()
     }
 }
 
@@ -111,15 +163,17 @@ pub(crate) fn final_query_tokens(
     let initial_capacity = query_tokens.len().min(params.max_expansions);
     let mut expanded_tokens = Vec::with_capacity(initial_capacity);
     let mut expanded_positions = Vec::with_capacity(initial_capacity);
+    let mut expanded_groups = Vec::with_capacity(initial_capacity);
     let mut seen = HashSet::new();
-    let mut source_terms_by_position = BTreeMap::<u32, Vec<&str>>::new();
+    let mut source_terms_by_group = BTreeMap::<u32, (u32, Vec<&str>)>::new();
     for token_idx in 0..query_tokens.len() {
-        source_terms_by_position
-            .entry(query_tokens.position(token_idx))
-            .or_default()
+        source_terms_by_group
+            .entry(query_tokens.position_for_query(token_idx, params.phrase_slop.is_some()))
+            .or_insert_with(|| (query_tokens.position(token_idx), Vec::new()))
+            .1
             .push(query_tokens.get_token(token_idx));
     }
-    for (position, source_terms) in source_terms_by_position {
+    for (group, (position, source_terms)) in source_terms_by_group {
         let remaining = params.max_expansions.saturating_sub(expanded_tokens.len());
         if remaining == 0 {
             break;
@@ -146,9 +200,10 @@ pub(crate) fn final_query_tokens(
             if expanded_tokens.len() >= params.max_expansions {
                 break;
             }
-            if seen.insert((candidate.clone(), position)) {
+            if seen.insert((candidate.clone(), group)) {
                 expanded_tokens.push(candidate);
                 expanded_positions.push(position);
+                expanded_groups.push(group);
             }
         }
     }
@@ -156,25 +211,38 @@ pub(crate) fn final_query_tokens(
         expanded_tokens,
         expanded_positions,
         query_tokens.token_type().clone(),
-    ))
+    )
+    .with_term_groups(expanded_groups))
 }
 
-fn unique_terms(tokens: &Tokens) -> Vec<String> {
+/// Deduplicated terms in first-occurrence order, plus each token's term
+/// ordinal.
+fn unique_terms(tokens: &Tokens) -> (Vec<String>, Box<[usize]>) {
     let mut terms = Vec::with_capacity(tokens.len());
-    let mut seen = HashSet::new();
-    for token in tokens {
-        if seen.insert(token.clone()) {
-            terms.push(token.clone());
-        }
-    }
-    terms
+    let mut term_ordinals = HashMap::with_capacity(tokens.len());
+    let term_by_token = tokens
+        .into_iter()
+        .map(|token| {
+            *term_ordinals.entry(token.as_str()).or_insert_with(|| {
+                terms.push(token.clone());
+                terms.len() - 1
+            })
+        })
+        .collect();
+    (terms, term_by_token)
 }
 
-pub(crate) fn has_all_query_positions(query_tokens: &Tokens, final_tokens: &Tokens) -> bool {
+pub(crate) fn has_all_query_positions(
+    query_tokens: &Tokens,
+    final_tokens: &Tokens,
+    is_phrase_query: bool,
+) -> bool {
     let surviving_positions = (0..final_tokens.len())
-        .map(|index| final_tokens.position(index))
+        .map(|index| final_tokens.position_for_query(index, is_phrase_query))
         .collect::<HashSet<_>>();
-    (0..query_tokens.len()).all(|index| surviving_positions.contains(&query_tokens.position(index)))
+    (0..query_tokens.len()).all(|index| {
+        surviving_positions.contains(&query_tokens.position_for_query(index, is_phrase_query))
+    })
 }
 
 const LANCE_FTS_SYNC_DF_ENV: &str = "LANCE_FTS_SYNC_DF";
@@ -190,13 +258,17 @@ static LANCE_FTS_SYNC_DF_ENABLED: LazyLock<bool> = LazyLock::new(|| {
     sync_df_enabled_from_value(std::env::var(LANCE_FTS_SYNC_DF_ENV).ok().as_deref())
 });
 
+/// A global scorer plus each segment's partition-major token ids for the
+/// scored terms, which the statistics had to resolve anyway.
+type LoadedScorer = (Arc<MemBM25Scorer>, Vec<Box<[Option<u32>]>>);
+
 /// Build the global scorer without futures when a completed full prewarm made
 /// every segment statistic and posting-length table synchronously available.
 /// Returning `None` leaves the existing asynchronous path entirely in charge.
 fn bm25_scorer_from_loaded_stats(
     indices: &[Arc<InvertedIndex>],
     terms: &[String],
-) -> Result<Option<Arc<MemBM25Scorer>>> {
+) -> Result<Option<LoadedScorer>> {
     bm25_scorer_from_loaded_stats_with_enabled(indices, terms, *LANCE_FTS_SYNC_DF_ENABLED)
 }
 
@@ -204,7 +276,7 @@ fn bm25_scorer_from_loaded_stats_with_enabled(
     indices: &[Arc<InvertedIndex>],
     terms: &[String],
     is_enabled: bool,
-) -> Result<Option<Arc<MemBM25Scorer>>> {
+) -> Result<Option<LoadedScorer>> {
     // Keep the kill switch first so an ablation does not even probe prewarm
     // state or resident metadata.
     if !is_enabled {
@@ -212,14 +284,16 @@ fn bm25_scorer_from_loaded_stats_with_enabled(
     }
 
     let mut loaded_stats = Vec::with_capacity(indices.len());
+    let mut token_ids = Vec::with_capacity(indices.len());
     for index in indices {
-        let Some(stats) = index.bm25_stats_for_terms_if_loaded(terms)? else {
+        let Some(loaded) = index.bm25_stats_for_terms_if_loaded(terms)? else {
             return Ok(None);
         };
-        loaded_stats.push(stats);
+        loaded_stats.push(loaded.stats);
+        token_ids.push(loaded.token_ids);
     }
 
-    merge_loaded_bm25_stats(terms, loaded_stats)
+    Ok(merge_loaded_bm25_stats(terms, loaded_stats)?.map(|scorer| (scorer, token_ids)))
 }
 
 fn merge_loaded_bm25_stats(
@@ -278,8 +352,9 @@ fn merge_loaded_bm25_stats(
 /// Expand and score one indexed query leaf exactly once across all segments.
 ///
 /// Expansion consumes one deterministic `max_expansions` budget in query
-/// position order, with terms ordered lexicographically across every physical
-/// segment and partition and deduplicated by `(term, position)`. The scorer's
+/// group order, with terms ordered lexicographically across every physical
+/// segment and partition and deduplicated by `(term, group)`. Match groups
+/// identify independent terms; phrase groups retain tokenizer offsets. The scorer's
 /// document frequencies are then merged for exactly those final terms.
 ///
 /// `base_scorer` is an API-compatibility hook for distributed/mixed callers
@@ -298,12 +373,14 @@ pub async fn prepare_bm25_query(
     })?;
     let (tokens, has_all_query_positions) = if uses_fuzzy_expansion(params.fuzziness) {
         let tokens = Arc::new(final_query_tokens(indices, &query_tokens, params)?);
-        let has_all_query_positions = has_all_query_positions(&query_tokens, tokens.as_ref());
+        let has_all_query_positions =
+            has_all_query_positions(&query_tokens, tokens.as_ref(), params.phrase_slop.is_some());
         (tokens, has_all_query_positions)
     } else {
         (Arc::new(query_tokens), true)
     };
-    let terms = unique_terms(tokens.as_ref());
+    let (terms, term_by_token) = unique_terms(tokens.as_ref());
+    let mut term_ids = None;
     let (scorer, can_reuse_scorer) = if let Some(scorer) = base_scorer {
         if let Some(missing) = terms
             .iter()
@@ -314,7 +391,14 @@ pub async fn prepare_bm25_query(
             )));
         }
         (scorer, false)
-    } else if let Some(scorer) = bm25_scorer_from_loaded_stats(indices, &terms)? {
+    } else if let Some((scorer, segment_token_ids)) =
+        bm25_scorer_from_loaded_stats(indices, &terms)?
+    {
+        let mut prepared_term_ids = PreparedTermIds::new(term_by_token, terms.len());
+        for (index, token_ids) in indices.iter().zip(segment_token_ids) {
+            prepared_term_ids.push_segment(index, token_ids)?;
+        }
+        term_ids = Some(Arc::new(prepared_term_ids));
         (scorer, true)
     } else {
         let (mut total_tokens, mut num_docs, first_token_docs) =
@@ -357,6 +441,7 @@ pub async fn prepare_bm25_query(
         scorer,
         has_all_query_positions,
         can_reuse_scorer,
+        term_ids,
     })
 }
 
@@ -396,8 +481,9 @@ use crate::scalar::{
     CreatedIndex, RowIdRemapper, ScalarIndex,
     expression::{FtsQueryParser, ScalarQueryParser},
     registry::{
-        BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-        TrainingRequest, single_flight_store_bound_open,
+        BasicTrainer, ScalarIndexCacheKey, ScalarIndexLoad, ScalarIndexPlugin,
+        StoreBoundScalarIndexCacheEntry, TrainingCriteria, TrainingOrdering, TrainingRequest,
+        single_flight_store_bound_open_with_snapshot,
     },
 };
 
@@ -538,6 +624,10 @@ impl BasicTrainer for InvertedIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for InvertedIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(true)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -564,10 +654,11 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         };
 
         if Self::can_accelerate_queries(&index_details) {
-            Some(Box::new(FtsQueryParser::new(
-                index_name,
-                self.name().to_string(),
-            )))
+            let mut parser = FtsQueryParser::new(index_name, self.name().to_string());
+            if let Ok(params) = InvertedIndexParams::try_from(&index_details) {
+                parser = parser.with_tokenizer_params(params);
+            }
+            Some(Box::new(parser))
         } else {
             None
         }
@@ -581,10 +672,36 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         &self,
         index_store: Arc<dyn IndexStore>,
         index_details: &prost_types::Any,
+        _index_version: u32,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let index = InvertedIndex::load(index_store, frag_reuse_index, cache).await?;
+        let details = index_details.to_msg::<pbold::InvertedIndexDetails>()?;
+        let expected_granularity = DocumentGranularity::try_from(details.document_granularity)?;
+        let physical_granularity = index.params().get_document_granularity();
+        if physical_granularity != expected_granularity {
+            return Err(Error::index(format!(
+                "FTS document granularity in index details is {expected_granularity:?}, but the physical document schema implies {physical_granularity:?}"
+            )));
+        }
+        Ok(index as Arc<dyn ScalarIndex>)
+    }
+
+    fn supports_batch_row_id_remapping(&self) -> bool {
+        true
+    }
+
+    async fn load_index_with_remapping(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        _index_version: u32,
+        frag_reuse_index: Option<Arc<dyn BatchRowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        let index =
+            InvertedIndex::load_with_remapping(index_store, frag_reuse_index, cache).await?;
         let details = index_details.to_msg::<pbold::InvertedIndexDetails>()?;
         let expected_granularity = DocumentGranularity::try_from(details.document_granularity)?;
         let physical_granularity = index.params().get_document_granularity();
@@ -604,16 +721,87 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         load: ScalarIndexLoad<'_>,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let rebind_store = index_store.clone();
-        single_flight_store_bound_open(index_store, cache, load, move |index| async move {
-            let index = index
-                .as_any()
-                .downcast_ref::<InvertedIndex>()
-                .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?;
-            index
-                .with_store(rebind_store, frag_reuse_index)
-                .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
-        })
+        single_flight_store_bound_open_with_snapshot(
+            index_store,
+            cache,
+            load,
+            move |index| async move {
+                let index = index
+                    .as_any()
+                    .downcast_ref::<InvertedIndex>()
+                    .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?;
+                index
+                    .with_store(rebind_store, frag_reuse_index.map(DocumentRemapping::Sync))
+                    .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
+            },
+            |index| self.cache_snapshot(index),
+        )
         .await
+    }
+
+    async fn put_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        cache: &LanceCache,
+        index: Arc<dyn ScalarIndex>,
+    ) -> Result<()> {
+        let snapshot = self.cache_snapshot(index.as_ref())?;
+        cache
+            .insert_unsized_with_key(
+                &ScalarIndexCacheKey,
+                Arc::new(StoreBoundScalarIndexCacheEntry::with_snapshot(
+                    index_store,
+                    index,
+                    snapshot,
+                )),
+            )
+            .await;
+        Ok(())
+    }
+
+    fn cache_snapshot(&self, index: &dyn ScalarIndex) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?
+            .cache_snapshot()
+            .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
+    }
+
+    fn rebind_with_remapping(
+        &self,
+        index: &dyn ScalarIndex,
+        index_store: Arc<dyn IndexStore>,
+        remapping: Option<Arc<dyn BatchRowIdRemapper>>,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        lance_index_core::remapping::check_batch_remapping_entry()?;
+        index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?
+            .with_store(index_store, remapping.map(DocumentRemapping::Batch))
+            .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
+    }
+
+    async fn get_from_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        let Some(entry) = cache.get_unsized_with_key(&ScalarIndexCacheKey).await else {
+            return Ok(None);
+        };
+        if let Some(index) = entry.index_for_store(&index_store) {
+            return Ok(Some(index));
+        }
+        let index = entry.index();
+        index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .ok_or_else(|| Error::internal("cached FTS index has an unexpected type"))?
+            .with_store(index_store, frag_reuse_index.map(DocumentRemapping::Sync))
+            .map(|index| index.map(|index| Arc::new(index) as Arc<dyn ScalarIndex>))
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {

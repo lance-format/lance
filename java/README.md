@@ -38,6 +38,35 @@ Introduce the Lance SDK Java Maven dependency(It is recommended to choose the la
 </dependency>
 ```
 
+### R2 Maven repository
+
+During the transition, new stable, beta, and RC releases are published to both
+Maven Central and `https://maven.lance.org`. Add this repository alongside Maven
+Central to use it:
+
+```xml
+<repositories>
+    <repository>
+        <id>lance</id>
+        <url>https://maven.lance.org</url>
+    </repository>
+</repositories>
+```
+
+For Gradle:
+
+```kotlin
+repositories {
+    mavenCentral()
+    maven { url = uri("https://maven.lance.org") }
+}
+```
+
+Use an explicit published version of `org.lance:lance-core`, including the full
+`-beta.N` or `-rc.N` suffix for preview releases. These are release versions, not
+Maven `SNAPSHOT` versions. Downloads require no credentials. The R2 repository
+does not publish `maven-metadata.xml` for version discovery or version ranges.
+
 ### Basic I/O
 
 * create empty dataset
@@ -211,6 +240,29 @@ JVM engine connectors can be built using the Lance Java SDK. Here are some conne
 * [Spark Lance connector](https://github.com/lancedb/lance-spark)
 * [Flink Lance connector](https://github.com/lancedb/lance-flink)
 * [Trino Lance connector](https://github.com/lancedb/lance-trino)
+
+## Publishing
+
+The `Build and publish Java packages` workflow publishes stable, beta, and RC
+releases to Maven Central, then extracts the same signed Central bundle and
+uploads it to R2 with the AWS CLI. Pull requests and manual `dry_run` runs do not
+publish to either repository.
+
+The R2 upload uses these GitHub Actions settings:
+
+| Type | Name | Value |
+| --- | --- | --- |
+| Secret | `R2_ACCESS_KEY_ID` | R2 S3 access key ID |
+| Secret | `R2_SECRET_ACCESS_KEY` | R2 S3 secret access key |
+| Variable | `R2_ENDPOINT` | R2 S3 endpoint for the bucket's account |
+| Variable | `R2_BUCKET` | `lance-maven` |
+
+Scope the credentials to Object Read & Write on `lance-maven` and keep its custom
+domain `maven.lance.org` enabled. Keep the existing Central and GPG credentials.
+
+An R2 upload failure fails the publish job after Central publication has already
+succeeded. Re-running that job also repeats Central publication; it is not an
+independent R2 retry.
 
 ## Contributing
 

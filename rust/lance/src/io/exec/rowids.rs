@@ -8,8 +8,12 @@ use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array, cast::AsArray, type
 use arrow_schema::{Schema, SchemaRef};
 use datafusion::common::ColumnStatistics;
 use datafusion::common::stats::Precision;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::ChildStats;
+use datafusion::physical_plan::StatisticsArgs;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
@@ -259,6 +263,13 @@ impl ExecutionPlan for AddRowAddrExec {
         vec![false]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -288,11 +299,16 @@ impl ExecutionPlan for AddRowAddrExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
-    fn partition_statistics(
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
         &self,
-        partition: Option<usize>,
-    ) -> Result<Arc<datafusion::physical_plan::Statistics>> {
-        let mut stats = Arc::unwrap_or_clone(self.input.partition_statistics(partition)?);
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        let mut stats = Statistics::clone(&input_stats[0]);
 
         let row_id_col_stats = stats.column_statistics.get(self.rowid_pos).ok_or_else(|| {
             DataFusionError::Internal("RowAddrExec: rowid column stats not found".into())
@@ -526,8 +542,22 @@ impl ExecutionPlan for AddRowOffsetExec {
         vec![false]
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        let mut stats = Statistics::clone(&input_stats[0]);
+        stats
+            .column_statistics
+            .push(ColumnStatistics::new_unknown());
+        // The input's byte count excludes the appended row-offset array.
+        stats.total_byte_size = Precision::Absent;
+        Ok(Arc::new(stats))
     }
 
     fn supports_limit_pushdown(&self) -> bool {
@@ -536,6 +566,13 @@ impl ExecutionPlan for AddRowOffsetExec {
 
     fn cardinality_effect(&self) -> CardinalityEffect {
         CardinalityEffect::Equal
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -585,12 +622,15 @@ impl ExecutionPlan for AddRowOffsetExec {
 
 #[cfg(test)]
 mod test {
-    use arrow_array::{Int32Array, RecordBatchIterator};
+    use arrow_array::{Int32Array, RecordBatchIterator, record_batch};
     use arrow_schema::{DataType, Field};
+    use datafusion::physical_plan::StatisticsArgs;
+    use datafusion::physical_plan::StatisticsContext;
     use datafusion::{datasource::memory::MemorySourceConfig, prelude::SessionContext};
     use futures::TryStreamExt;
     use lance_core::{ROW_ADDR, ROW_ID_FIELD};
     use lance_datafusion::exec::OneShotExec;
+    use rstest::rstest;
 
     use crate::dataset::WriteParams;
 
@@ -721,7 +761,9 @@ mod test {
         let memory_exec =
             MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], schema, None).unwrap();
         let exec = AddRowAddrExec::try_new(memory_exec, dataset.clone(), 0).unwrap();
-        let stats = exec.partition_statistics(None).unwrap();
+        let stats = StatisticsContext::new()
+            .compute(&exec, &StatisticsArgs::new())
+            .unwrap();
         let result = apply_to_batch(batch, dataset).await.unwrap();
 
         assert_eq!(stats.num_rows, Precision::Exact(3));
@@ -734,6 +776,60 @@ mod test {
             .iter()
             .fold(0, |acc, col| acc + col.get_array_memory_size());
         assert_eq!(stats.total_byte_size, Precision::Exact(actual_byte_size));
+    }
+
+    #[rstest]
+    #[case::global(None, false)]
+    #[case::first_partition(Some(0), false)]
+    #[case::second_partition(Some(1), false)]
+    #[case::unknown(None, true)]
+    fn test_row_offset_statistics(
+        #[case] partition: Option<usize>,
+        #[case] has_unknown_statistics: bool,
+    ) {
+        let batch = record_batch!(
+            ("payload", Utf8, [Some("a"), None]),
+            (ROW_ADDR, UInt64, [0, 1])
+        )
+        .unwrap();
+        let input: Arc<dyn ExecutionPlan> = if has_unknown_statistics {
+            Arc::new(OneShotExec::from_batch(batch))
+        } else {
+            MemorySourceConfig::try_new_exec(
+                &[vec![batch.clone()], vec![batch.slice(0, 1)]],
+                batch.schema(),
+                None,
+            )
+            .unwrap()
+        };
+        let args = StatisticsArgs::new().with_partition(partition);
+        let input_stats = StatisticsContext::new()
+            .compute(input.as_ref(), &args)
+            .unwrap();
+        let exec = AddRowOffsetExec::internal_new(input.clone(), Arc::new(HashMap::new())).unwrap();
+        let stats = StatisticsContext::new().compute(&exec, &args).unwrap();
+
+        assert_eq!(stats.column_statistics.len(), exec.schema().fields().len());
+        assert_eq!(stats.num_rows, input_stats.num_rows);
+        assert_eq!(
+            stats.column_statistics[..input_stats.column_statistics.len()],
+            input_stats.column_statistics
+        );
+        assert_eq!(
+            stats.column_statistics.last().unwrap(),
+            &ColumnStatistics::new_unknown()
+        );
+        // Even an exact input size excludes the newly allocated row-offset array.
+        assert_eq!(stats.total_byte_size, Precision::Absent);
+        if !has_unknown_statistics {
+            assert!(matches!(input_stats.total_byte_size, Precision::Exact(_)));
+        }
+        assert_eq!(
+            StatisticsContext::new()
+                .compute(input.as_ref(), &args)
+                .unwrap(),
+            input_stats
+        );
     }
 
     #[test]

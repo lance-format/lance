@@ -85,7 +85,16 @@ public class DataFile implements Serializable {
         && Objects.equals(path, that.path)
         && Arrays.equals(fields, that.fields)
         && Arrays.equals(columnIndices, that.columnIndices)
-        && Objects.equals(fileSizeBytes, that.fileSizeBytes);
+        && Objects.equals(fileSizeBytes, that.fileSizeBytes)
+        && Objects.equals(baseId, that.baseId);
+  }
+
+  @Override
+  public int hashCode() {
+    int result = Objects.hash(path, fileMajorVersion, fileMinorVersion, fileSizeBytes, baseId);
+    result = 31 * result + Arrays.hashCode(fields);
+    result = 31 * result + Arrays.hashCode(columnIndices);
+    return result;
   }
 
   @Override

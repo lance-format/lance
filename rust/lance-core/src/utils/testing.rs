@@ -219,6 +219,9 @@ impl ObjectStore for ProxyObjectStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        if let Err(error) = self.before_method("list", prefix.unwrap_or(&Path::default())) {
+            return futures::stream::once(future::ready(Err(error))).boxed();
+        }
         let target = self.target.clone();
         let policy = Arc::clone(&self.policy);
 
