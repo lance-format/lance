@@ -14,7 +14,7 @@ use std::num::NonZero;
 use std::ops::Range;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
@@ -732,32 +732,60 @@ async fn run_io_loop(tasks: Arc<IoQueue>) {
     }
 }
 
-/// Starts the stuck-queue watchdog's background thread.
+/// The stuck-queue watchdog's shared state: every standard-scheduler queue
+/// currently being monitored, each held as a [`Weak`] reference so a closed
+/// queue is dropped from the list (rather than kept alive) once every strong
+/// reference to it - the scheduler, its file schedulers, and the I/O loop
+/// task once it observes `done_scheduling` - is gone.
+struct Watchdog {
+    queues: Mutex<Vec<Weak<IoQueue>>>,
+}
+
+impl Watchdog {
+    /// Body of the watchdog's single background thread: wakes up every
+    /// `WATCHDOG_CHECK_INTERVAL`, checks every still-live registered queue,
+    /// and drops any that have been closed.
+    fn run(&self) {
+        loop {
+            std::thread::sleep(WATCHDOG_CHECK_INTERVAL);
+            self.queues.lock().unwrap().retain(|queue| {
+                let Some(queue) = queue.upgrade() else {
+                    return false;
+                };
+                let stuck = queue.state.lock().unwrap().check_watchdog();
+                if let Some((event, stuck_for)) = stuck {
+                    event.warn_stuck(stuck_for);
+                }
+                true
+            });
+        }
+    }
+}
+
+/// Registers `queue` with the stuck-queue watchdog, lazily starting its
+/// single background thread on first use.
 ///
-/// This runs on a plain OS thread (`std::thread::sleep`) rather than as a
-/// Tokio task, so it never depends on the I/O loop's own runtime having a
-/// time driver (`enable_time()`/`enable_all()`) - the queue keeps draining
+/// That thread runs on a plain OS thread (`std::thread::sleep`) rather than
+/// as a Tokio task, so it never depends on the I/O loop's own runtime having
+/// a time driver (`enable_time()`/`enable_all()`) - the queue keeps draining
 /// exactly the same either way, it just may or may not get a diagnostic
 /// warning if it stalls.
 ///
-/// Holds only a [`Weak`] reference: once every strong reference to `queue`
-/// is dropped (the scheduler, its file schedulers, and the I/O loop task
-/// once it observes `done_scheduling`), the next tick's `upgrade` fails and
-/// the thread exits - "fire and forget", same as `run_io_loop` itself.
+/// The thread is shared by every standard scheduler in the process, rather
+/// than spawned one per scheduler: workloads that open many short-lived
+/// schedulers (e.g. one per fragment) would otherwise be able to exhaust the
+/// process's OS thread budget purely from watchdog threads.
 fn spawn_watchdog(queue: &Arc<IoQueue>) {
-    let queue = Arc::downgrade(queue);
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(WATCHDOG_CHECK_INTERVAL);
-            let Some(queue) = queue.upgrade() else {
-                return;
-            };
-            let stuck = queue.state.lock().unwrap().check_watchdog();
-            if let Some((event, stuck_for)) = stuck {
-                event.warn_stuck(stuck_for);
-            }
-        }
+    static WATCHDOG: OnceLock<Arc<Watchdog>> = OnceLock::new();
+    let watchdog = WATCHDOG.get_or_init(|| {
+        let watchdog = Arc::new(Watchdog {
+            queues: Mutex::new(Vec::new()),
+        });
+        let watchdog_clone = watchdog.clone();
+        std::thread::spawn(move || watchdog_clone.run());
+        watchdog
     });
+    watchdog.queues.lock().unwrap().push(Arc::downgrade(queue));
 }
 
 #[derive(Debug)]
@@ -1988,6 +2016,41 @@ mod tests {
             state.last_watchdog_warn,
             Some(first_warn),
             "a repeat check inside the debounce window should not re-warn"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_watchdog_thread_is_shared_across_queues() {
+        // Regression test: `spawn_watchdog` must not spawn a dedicated OS
+        // thread per queue. It previously did, so a workload that opens many
+        // short-lived schedulers (e.g. one per fragment) could exhaust the
+        // process's thread budget purely from watchdog threads - this is
+        // what failed CI with "failed to spawn thread: Resource temporarily
+        // unavailable" when a test opened many schedulers in quick
+        // succession.
+        fn thread_count() -> usize {
+            std::fs::read_dir("/proc/self/task").unwrap().count()
+        }
+
+        let before = thread_count();
+        // Keep every queue alive for the duration of the loop: the
+        // assertion is about the number of watchdog *threads*, which must
+        // stay bounded regardless of how many queues are registered.
+        let queues: Vec<_> = (0..200)
+            .map(|_| {
+                let queue = Arc::new(IoQueue::new(1, 1024, IoStats::new()));
+                spawn_watchdog(&queue);
+                queue
+            })
+            .collect();
+        let after = thread_count();
+        drop(queues);
+
+        assert!(
+            after <= before + 4,
+            "spawn_watchdog must share a single background thread across queues, \
+             not spawn one per queue (before={before}, after={after})"
         );
     }
 
