@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod composition;
+
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;

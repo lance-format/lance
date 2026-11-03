@@ -459,8 +459,8 @@ impl HybridCompoundQueryExec {
     }
 
     /// The indexed segments this scorer reads. Paired with
-    /// [`Self::residual_input`] and [`Self::new`], this is what lets a caller
-    /// rebuild the node — the FTS top-k lives in [`Self::params`], not in a
+    /// [`Self::residual_input`], [`Self::indexed_input`] and [`Self::new`], this
+    /// lets a caller rebuild the node. The FTS top-k lives in [`Self::params`], not in a
     /// fetch node, so changing it means reconstruction.
     pub fn segments(&self) -> &[IndexMetadata] {
         &self.segments
@@ -514,6 +514,39 @@ impl HybridCompoundQueryExec {
         );
         result.indexed_input = Some((input, committed_scorer));
         Ok(result)
+    }
+
+    /// The externally computed indexed candidates and their committed-index
+    /// scorer, or `None` when this node searches its indexed segments locally.
+    ///
+    /// Preserve the pair together through [`Self::with_indexed_input`]. The
+    /// residual input remains separate, and its query-local index is rebuilt
+    /// during execution. A codec supplies decoded children; this example reuses
+    /// the existing children and reconstructs the scorer from its values.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance::io::exec::fts::HybridCompoundQueryExec;
+    /// # use lance_index::scalar::inverted::MemBM25Scorer;
+    /// # fn rebuild(exec: &HybridCompoundQueryExec)
+    /// #     -> datafusion::error::Result<HybridCompoundQueryExec> {
+    /// let rebuilt = HybridCompoundQueryExec::new(
+    ///     exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+    ///     exec.column().to_owned(), exec.segments().to_vec(),
+    ///     exec.residual_input().clone(),
+    /// );
+    /// match exec.indexed_input() {
+    ///     Some((input, scorer)) => rebuilt.with_indexed_input(
+    ///         input.clone(), Arc::new(MemBM25Scorer::new(
+    ///             scorer.total_tokens, scorer.num_docs, scorer.token_docs.clone(),
+    ///         )),
+    ///     ),
+    ///     None => Ok(rebuilt),
+    /// }
+    /// # }
+    /// ```
+    pub fn indexed_input(&self) -> Option<&(Arc<dyn ExecutionPlan>, Arc<MemBM25Scorer>)> {
+        self.indexed_input.as_ref()
     }
 
     /// The scan over the fragments no segment covers.
@@ -1348,7 +1381,7 @@ impl ExecutionPlan for CompoundQueryExec {
 #[derive(Debug, Clone)]
 struct CompoundColumnSelection {
     column: String,
-    segment_selection: FtsSegmentSelection,
+    segments: Arc<[IndexMetadata]>,
 }
 
 /// One DataFusion boundary around a cross-column posting-backed scorer tree.
@@ -1433,7 +1466,7 @@ impl CrossColumnCompoundQueryExec {
             .into_iter()
             .map(|(column, segments)| CompoundColumnSelection {
                 column,
-                segment_selection: FtsSegmentSelection::ExactResolved(Arc::from(segments)),
+                segments: Arc::from(segments),
             })
             .collect::<Vec<_>>();
         Ok(Self {
@@ -1474,6 +1507,39 @@ impl CrossColumnCompoundQueryExec {
 
     pub fn prefilter_source(&self) -> &PreFilterSource {
         &self.prefilter_source
+    }
+
+    /// The exact resolved segments for each column, preserving both column order
+    /// and each column's segment order. Segment ordinals across columns are not
+    /// aligned and must not be zipped together.
+    ///
+    /// These are the inputs accepted by [`Self::new_with_segments`]. Execution
+    /// still validates the selected segments' document granularity before search.
+    ///
+    /// ```
+    /// # use lance::{io::exec::fts::CrossColumnCompoundQueryExec, Result};
+    /// # fn rebuild(exec: &CrossColumnCompoundQueryExec)
+    /// #     -> Result<CrossColumnCompoundQueryExec> {
+    /// let columns = exec.column_segments()
+    ///     .map(|(column, segments)| (column.to_owned(), segments.to_vec()))
+    ///     .collect();
+    /// Ok(CrossColumnCompoundQueryExec::new_with_segments(
+    ///     exec.dataset().clone(), exec.query().clone(), exec.params().clone(),
+    ///     exec.prefilter_source().clone(), columns,
+    /// )?.with_external_mask(exec.external_mask().cloned()))
+    /// # }
+    /// ```
+    pub fn column_segments(&self) -> impl ExactSizeIterator<Item = (&str, &[IndexMetadata])> {
+        self.columns
+            .iter()
+            .map(|selection| (selection.column.as_str(), selection.segments.as_ref()))
+    }
+
+    /// Additional candidate restriction in the indices' row-id domain, or
+    /// `None` for no external mask. Corpus statistics remain independent of it.
+    /// See [`Self::column_segments`] for a reconstruction example.
+    pub fn external_mask(&self) -> Option<&Arc<RowAddrMask>> {
+        self.external_mask.as_ref()
     }
 
     /// Re-cut this scorer at `limit`, keeping its segment selection, prepared
@@ -1597,20 +1663,8 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
             let selected_segments = columns
                 .iter()
-                .flat_map(|selection| {
-                    selection
-                        .segment_selection
-                        .preset_segments()
-                        .into_iter()
-                        .flatten()
-                        .cloned()
-                })
+                .flat_map(|selection| selection.segments.iter().cloned())
                 .collect::<Vec<_>>();
-            if selected_segments.is_empty() {
-                return Err(DataFusionError::Internal(
-                    "cross-column compound FTS lost its exact segment selections".to_string(),
-                ));
-            }
             // DatasetPreFilter starts its deletion and filter prerequisites in
             // the background. Construct it before opening index segments so
             // both I/O paths can make progress concurrently.
@@ -1630,8 +1684,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                 let dataset = dataset.clone();
                 let metrics = metrics.clone();
                 async move {
-                    let segments = selection
-                        .segment_selection
+                    let segments = FtsSegmentSelection::ExactResolved(selection.segments)
                         .resolve(
                             &dataset,
                             &selection.column,
