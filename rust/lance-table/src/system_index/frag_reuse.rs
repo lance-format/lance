@@ -6,6 +6,7 @@ pub mod history;
 pub mod ledger;
 pub mod lineage;
 pub mod metadata;
+pub mod policy;
 
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 

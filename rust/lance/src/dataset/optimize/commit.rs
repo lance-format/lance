@@ -34,6 +34,7 @@ use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};
 use lance_core::{Error, Result};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
 use lance_table::format::Fragment;
+use lance_table::system_index::frag_reuse::policy::{FriPolicy, RecordForm};
 use roaring::{RoaringBitmap, RoaringTreemap};
 
 /// Returns the version the reservation committed at; `dataset` is not moved to it.
@@ -142,17 +143,8 @@ pub async fn commit_compaction(
     // compaction on a tagged table can only commit by appending transitions
     // (the deferred path below). Refuse the eager path up front, before any
     // remapping work runs into the commit gate.
-    let tagged_fri = load_all_indices(dataset)
-        .await?
-        .iter()
-        .any(lance_table::system_index::frag_reuse::metadata::is_tagged);
-    if tagged_fri && !options.defer_index_remap {
-        return Err(Error::not_supported(
-            "Compacting a table with a tagged fragment reuse history requires \
-             defer_index_remap; set defer_index_remap, or upgrade to a writer that \
-             remaps tagged histories eagerly",
-        ));
-    }
+    FriPolicy::new(&dataset.manifest, &load_all_indices(dataset).await?)
+        .require_rewrite_allowed(options.defer_index_remap)?;
 
     // Before anything is written or committed. The condition mirrors the
     // planner's: see `unremappable_index_coverage` for why this only applies
@@ -507,31 +499,13 @@ pub async fn commit_compaction(
         // flag nor tagged entry, and keeps creating the v0 entry byte
         // identically.
         let stored = load_all_indices(dataset).await?;
-        let tagged_at_commit = lance_table::system_index::frag_reuse::metadata::uses_tagged_fri(
-            &dataset.manifest,
-            stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME),
-        );
-        if tagged_at_commit {
-            // Materializing a data overlay breaks the reuse premise that a
-            // rewrite moves addresses, never values; on a tagged table the
-            // stale-index handling that v0 applies (dropping destination
-            // ids from swapped bitmaps) is a no-op because provenance never
-            // contains the destinations. Refuse rather than record a
-            // transition; see `build_frag_reuse_rewrite_entry` for the same
-            // rule on the stable-partition path.
-            if let Some(overlaid) = rewrite_groups
-                .iter()
-                .flat_map(|group| group.old_fragments.iter())
-                .find(|frag| !frag.overlays.is_empty())
-            {
-                return Err(Error::not_supported(format!(
-                    "source fragment {} carries data overlay files; deferred compaction on a \
-                     tagged fragment reuse table would materialize the overlaid values while \
-                     indices keep translated coverage over the old addresses. Compact the \
-                     overlays away or rebuild the covering indices eagerly first",
-                    overlaid.id
-                )));
-            }
+        let policy = FriPolicy::new(&dataset.manifest, &stored);
+        if policy.record_form() == RecordForm::Tagged {
+            policy.require_tagged_sources_supported(
+                rewrite_groups
+                    .iter()
+                    .flat_map(|group| group.old_fragments.iter()),
+            )?;
             use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
             let transitions = frag_reuse_groups
                 .into_iter()

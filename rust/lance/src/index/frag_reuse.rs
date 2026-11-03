@@ -31,6 +31,7 @@ use lance_table::format::{Fragment, IndexMetadata, Manifest};
 use lance_table::system_index::frag_reuse::gate::{BareRewriteRefusal, covered_bare_rewrite};
 use lance_table::system_index::frag_reuse::history::{FragReuseHistory, HistoryFormat, Record};
 use lance_table::system_index::frag_reuse::ledger::FragReuseLedger;
+use lance_table::system_index::frag_reuse::policy::FriPolicy;
 use lance_table::transaction::RewriteGroup;
 use object_store::path::Path;
 use prost::Message;
@@ -1100,12 +1101,8 @@ pub async fn frag_reuse_entry_appending(
     dataset: &Dataset,
     transitions: Vec<pb_fri::Transition>,
 ) -> lance_core::Result<IndexMetadata> {
-    if dataset.manifest.uses_stable_row_ids() {
-        return Err(Error::not_supported(
-            "Tagged fragment reuse histories are address-based and excluded on \
-             stable-row-id datasets; this rewrite cannot carry transition intent here",
-        ));
-    }
+    let stored = super::loading::load_all_indices(dataset).await?;
+    FriPolicy::new(&dataset.manifest, &stored).require_tagged_records_allowed()?;
     let (_, history) = current_frag_reuse_history(dataset, HistoryFormat::Tagged).await?;
     let history = history.into_tagged()?.append_transitions(&transitions)?;
     Ok(encode_inline_frag_reuse_entry(
@@ -1188,22 +1185,17 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
     transitions: &[pb_fri::Transition],
     groups: &[RewriteGroup],
 ) -> lance_core::Result<(IndexMetadata, Option<u64>)> {
+    let stored = super::loading::load_all_indices(dataset).await?;
+    let policy = FriPolicy::new(&dataset.manifest, &stored);
     // Deferred compaction records v0 entries on stable-row-id tables, so only a
     // hand-built tagged rewrite committed directly reaches this.
-    if dataset.manifest.uses_stable_row_ids() {
-        return Err(Error::not_supported(
-            "Tagged fragment reuse histories are address-based and excluded on \
-             stable-row-id datasets; this rewrite cannot carry transition intent here",
-        ));
-    }
+    policy.require_tagged_records_allowed()?;
 
     if transitions.is_empty() {
         return Err(Error::invalid_input(
             "a fragment-reuse rewrite carries no transitions",
         ));
     }
-
-    let stored = super::loading::load_all_indices(dataset).await?;
 
     // Bind the covered rewrite groups to the transitions, one to one and in
     // order. A group is covered when its old fragments appear among the
@@ -1290,6 +1282,7 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
             source_deltas.push(current - digest.num_deleted_rows);
         }
         let folding = source_deltas.iter().any(|&delta| delta > 0);
+        policy.require_tagged_sources_supported(group.old_fragments.iter())?;
 
         for (source_index, (frag, digest)) in group
             .old_fragments
@@ -1297,27 +1290,6 @@ pub(crate) async fn build_frag_reuse_rewrite_entry(
             .zip(transition.sources.iter())
             .enumerate()
         {
-            // Materializing a data overlay breaks the reuse premise that a
-            // rewrite moves addresses, never values: the destination holds
-            // the overlaid values physically (and carries no overlay for
-            // the runtime staleness guard to see), while an index built
-            // before the overlay keeps the source in its bitmap as
-            // provenance and would serve the destination through
-            // translation. v0 handles this by dropping the DESTINATION ids
-            // from stale bitmaps, which is a no-op here because tagged
-            // provenance never contains them. Until provenance-side
-            // invalidation exists, refuse to record a transition over
-            // overlaid sources.
-            if !frag.overlays.is_empty() {
-                return Err(Error::not_supported(format!(
-                    "source fragment {} carries data overlay files; a rewrite recording \
-                     fragment reuse transitions would materialize the overlaid values while \
-                     indices keep translated coverage over the old addresses. Compact the \
-                     overlays away or rebuild the covering indices eagerly before this \
-                     rewrite",
-                    frag.id
-                )));
-            }
             let physical_rows = frag.physical_rows.ok_or_else(|| {
                 Error::invalid_input(format!(
                     "source fragment {} has no physical row count",

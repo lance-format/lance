@@ -29,6 +29,7 @@ use lance_table::system_index::frag_reuse::FragReuseVersion;
 use lance_table::system_index::frag_reuse::history::{FragReuseHistory, HistoryFormat, Record};
 use lance_table::system_index::frag_reuse::lineage::TaggedLineage;
 use lance_table::system_index::frag_reuse::metadata::is_tagged;
+use lance_table::system_index::frag_reuse::policy::{FriPolicy, RecordForm};
 use lance_table::system_index::is_system_index;
 use lance_table::transaction::TaggedRewriteAssembly;
 use lance_table::{format::Fragment, io::deletion::write_deletion_file};
@@ -580,15 +581,11 @@ impl<'a> TransactionRebase<'a> {
         {
             return Ok(());
         }
-        let entry = indices
-            .iter()
-            .find(|index| index.name == FRAG_REUSE_INDEX_NAME);
-        if lance_table::system_index::frag_reuse::metadata::uses_tagged_fri(
-            &dataset.manifest,
-            entry,
-        ) {
+        let policy = FriPolicy::new(&dataset.manifest, indices);
+        if policy.record_form() == RecordForm::Tagged {
             return Ok(());
         }
+        let entry = policy.entry();
         let mut reuse = UntaggedReuse {
             groups: HashSet::new(),
             sources: HashMap::new(),
@@ -3192,12 +3189,7 @@ impl<'a> TransactionRebase<'a> {
             // before this point.
             if self.reuse.added_transitions.is_none() && proposed.index_version == 0 {
                 let stored = crate::index::loading::load_all_indices(dataset).await?;
-                let current_uses_tagged =
-                    lance_table::system_index::frag_reuse::metadata::uses_tagged_fri(
-                        &dataset.manifest,
-                        stored.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME),
-                    );
-                if current_uses_tagged {
+                if FriPolicy::new(&dataset.manifest, &stored).record_form() == RecordForm::Tagged {
                     let base = match self.reuse.read_entry.as_ref() {
                         Some(entry) => load_frag_reuse_history(dataset, entry).await?,
                         None => FragReuseHistory::empty(HistoryFormat::Legacy),
