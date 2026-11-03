@@ -23,7 +23,6 @@ pub mod tokenizer;
 mod wand;
 
 use futures::{StreamExt, TryStreamExt, stream};
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_index_core::remapping::BatchRowIdRemapper;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
@@ -317,10 +316,6 @@ fn merge_loaded_bm25_stats(
     ))))
 }
 
-/// Cap on concurrent index loads within one FTS query, shared with the
-/// cross-column scorer.
-const MAX_CONCURRENT_SOURCE_LOADS: usize = 32;
-
 /// Expand and score one indexed query leaf exactly once across all segments.
 ///
 /// Expansion consumes one deterministic `max_expansions` budget in query
@@ -376,10 +371,14 @@ pub async fn prepare_bm25_query(
         (scorer, true)
     } else {
         // Read the segments' statistics together rather than one segment
-        // after another, so uncached term statistics cost about one storage
-        // round trip per window of segments instead of one per segment.
-        let parallelism = get_num_compute_intensive_cpus()
-            .clamp(1, MAX_CONCURRENT_SOURCE_LOADS)
+        // after another, bounded by the store's IO parallelism, so uncached
+        // term statistics cost about one storage round trip per window of
+        // segments instead of one per segment.
+        let parallelism = indices
+            .iter()
+            .map(|index| index.store.io_parallelism())
+            .max()
+            .unwrap_or(1)
             .min(indices.len());
         // Collected first: holding a lazily mapped iterator across the await
         // makes rustc check `Send` for the closure over every lifetime

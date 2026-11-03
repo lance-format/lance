@@ -5,7 +5,6 @@ use super::*;
 use lance_core::cache::{
     CacheBackend, CacheCodec, CacheEntry, InternalCacheKey, QuickCacheBackend,
 };
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 /// IO accounting for the IO-counting stats test below: tracks bytes
@@ -307,9 +306,7 @@ async fn test_prepare_bm25_query_fetches_segment_stats_concurrently() {
     .await
     .unwrap();
 
-    let window = get_num_compute_intensive_cpus()
-        .clamp(1, crate::scalar::inverted::MAX_CONCURRENT_SOURCE_LOADS)
-        .min(indices.len());
+    let window = indices[0].store.io_parallelism().min(indices.len());
     assert!(
         counter.max_reads_in_flight() >= window.min(2),
         "at most {} statistics reads were in flight at once",

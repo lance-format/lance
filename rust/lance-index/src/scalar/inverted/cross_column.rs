@@ -19,7 +19,6 @@ use lance_core::{Error, Result};
 use lance_select::RowAddrMask;
 use roaring::{RoaringBitmap, RoaringTreemap};
 
-use super::MAX_CONCURRENT_SOURCE_LOADS;
 use super::compound::{
     BoxScorer, ComposableScorer, CompoundLeafPlanInput, CompoundPlanAnalysis, CompoundScorerPlan,
     EmptyScorer, LeafQuery, MaterializedScorer, RowAddressMergeScorer, RowAddressSource,
@@ -41,6 +40,8 @@ use super::{
 };
 use crate::metrics::MetricsCollector;
 use crate::prefilter::PreFilter;
+
+const MAX_CONCURRENT_SOURCE_LOADS: usize = 32;
 
 /// Stage optional/prohibited source I/O only when the positive generator is
 /// expected to match at most this percentage of its column corpus.

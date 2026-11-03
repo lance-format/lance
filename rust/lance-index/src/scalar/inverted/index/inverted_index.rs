@@ -22,7 +22,7 @@ impl InvertedPrewarmState {
 #[derive(Clone)]
 pub struct InvertedIndex {
     pub(super) params: InvertedIndexParams,
-    pub(super) store: Arc<dyn IndexStore>,
+    pub(in crate::scalar::inverted) store: Arc<dyn IndexStore>,
     pub(super) tokenizer: Box<dyn LanceTokenizer>,
     pub(super) token_set_format: TokenSetFormat,
     pub(super) format_version: InvertedListFormatVersion,
