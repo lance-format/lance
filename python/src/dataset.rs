@@ -117,6 +117,7 @@ pub(crate) mod delta;
 pub mod io_stats;
 pub(crate) mod merge_insert;
 pub mod optimize;
+mod replayable;
 pub(crate) mod sql;
 pub mod stats;
 pub(crate) mod write;

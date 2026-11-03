@@ -95,7 +95,7 @@ from .lance import (
 from .lance import __version__ as __version__
 from .lance import _Session as Session
 from .query import DocumentGranularity, FullTextQuery, MinHashQuery
-from .types import _coerce_reader
+from .types import _coerce_reader, _coerce_source, _WriteSource
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
 from .udf import batch_udf as batch_udf
@@ -5930,3 +5930,9 @@ def _merge_message_to_properties(
     if commit_message is not None:
         merged_properties[LANCE_COMMIT_MESSAGE_KEY] = commit_message
     return merged_properties
+
+
+@_coerce_source.register(LanceDataset)
+def _lance_dataset_source(data_obj: LanceDataset, schema=None) -> _WriteSource:
+    # Capture the native dataset version and all default scan options once.
+    return _coerce_source(data_obj.scanner(), schema)
