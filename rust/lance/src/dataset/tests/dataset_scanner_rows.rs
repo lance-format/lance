@@ -37,6 +37,8 @@ use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
 use rstest::rstest;
 
+mod mask_replay;
+
 use crate::Error;
 use crate::dataset::scanner::test_dataset::{TestVectorDataset, batch_row_ids};
 use crate::dataset::scanner::{
