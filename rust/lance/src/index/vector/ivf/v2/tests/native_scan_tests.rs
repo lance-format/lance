@@ -1148,9 +1148,11 @@ async fn test_rabit_scan_factory_rebinds_from_current_session(
         behavior: TestScanBehavior::Full,
         cache_layout,
     });
+    assert!(session().rabit_scan_factory().is_none());
+    let configured = session().with_rabit_scan_factory(original.clone());
     let installed = open_with_session(
         dir.as_str(),
-        session().with_rabit_scan_factory(original.clone()),
+        session().with_rabit_scan_factory(configured.rabit_scan_factory().unwrap()),
     )
     .await;
     let mut expected = None;

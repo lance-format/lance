@@ -304,6 +304,25 @@ impl Session {
         self
     }
 
+    /// The runtime RaBitQ strategy to rebind when opening an index.
+    ///
+    /// Callers rebuilding a session with isolated caches or object-store access
+    /// can retain its execution policy without sharing those resources. `None`
+    /// selects Lance's built-in full scan.
+    ///
+    /// ```
+    /// # use lance::session::Session;
+    /// fn retain_strategy(original: &Session, mut scoped: Session) -> Session {
+    ///     if let Some(factory) = original.rabit_scan_factory() {
+    ///         scoped = scoped.with_rabit_scan_factory(factory);
+    ///     }
+    ///     scoped
+    /// }
+    /// ```
+    pub fn rabit_scan_factory(&self) -> Option<Arc<dyn RabitScanFactory>> {
+        self.rabit_scan_factory.clone()
+    }
+
     /// Return a reference to the session's spill store.
     ///
     /// Callers use this to obtain reclaimable scratch space for intermediate
