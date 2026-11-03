@@ -851,6 +851,7 @@ async fn test_v11_0_0_fullzip_padded_control_words(#[case] rows: Option<Vec<u64>
             (0..8).collect(),
         ),
     };
+    assert_eq!(batch.num_rows(), rows.len());
     let binary = batch["binary"].as_fixed_size_list();
     let vector = batch["vector"].as_fixed_size_list();
     let binary_items = binary.values().as_struct().column_by_name("b").unwrap();
