@@ -561,7 +561,9 @@ pub struct RabitQuantizationStorage {
     ex_scale_factors: Option<Float32Array>,
     // Rows staged for code-to-code scoring, built on first use: only HNSW graph
     // construction compares stored codes with each other, queries never do.
-    staged_rows: OnceLock<(RQPairScorer, RecordBatch)>,
+    staged_rows: OnceLock<std::result::Result<(RQPairScorer, RecordBatch), Arc<Error>>>,
+    #[cfg(test)]
+    stage_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl DeepSizeOf for RabitQuantizationStorage {
@@ -585,20 +587,29 @@ impl RabitQuantizationStorage {
         // creation rejects up front.
         let (scorer, staged) = self
             .staged_rows()
+            .as_ref()
             .expect("RQ code-to-code distance requires an l2, current-format index");
         scorer
             .kernel(staged, staged)
             .expect("staged RQ rows always bind to their own scorer")
     }
 
-    /// Stage every row for code-to-code scoring on first use.
+    /// Rows staged for code-to-code scoring, staged on first use.
     ///
+    /// `get_or_init` blocks concurrent first callers until one has staged, so
+    /// HNSW's parallel insertion stages a partition once rather than once per
+    /// worker, each holding a dimension-sized copy of every row.
+    fn staged_rows(&self) -> &std::result::Result<(RQPairScorer, RecordBatch), Arc<Error>> {
+        self.staged_rows
+            .get_or_init(|| self.stage_rows().map_err(Arc::new))
+    }
+
     /// Only l2 is supported: the scorer needs the partition centroid for dot,
     /// and cosine indexes are stored as l2 over normalized vectors.
-    fn staged_rows(&self) -> Result<&(RQPairScorer, RecordBatch)> {
-        if let Some(staged) = self.staged_rows.get() {
-            return Ok(staged);
-        }
+    fn stage_rows(&self) -> Result<(RQPairScorer, RecordBatch)> {
+        #[cfg(test)]
+        self.stage_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.distance_type != DistanceType::L2 {
             return Err(Error::not_supported(format!(
                 "RQ code-to-code distance supports only l2 storage, got {}",
@@ -612,7 +623,7 @@ impl RabitQuantizationStorage {
                 .into_iter()
                 .map(|(field, column)| (field.name().clone(), column)),
         )?;
-        Ok(self.staged_rows.get_or_init(|| (scorer, staged)))
+        Ok((scorer, staged))
     }
 
     fn code_dim(&self) -> usize {
@@ -2942,6 +2953,8 @@ impl QuantizerStorage for RabitQuantizationStorage {
             ex_add_factors,
             ex_scale_factors,
             staged_rows: OnceLock::new(),
+            #[cfg(test)]
+            stage_count: Default::default(),
         };
 
         match build_frag_reuse_mapping(fri.as_deref(), &storage.row_ids) {
@@ -3047,6 +3060,8 @@ impl QuantizerStorage for RabitQuantizationStorage {
             ex_add_factors,
             ex_scale_factors,
             staged_rows: OnceLock::new(),
+            #[cfg(test)]
+            stage_count: Default::default(),
             row_ids: new_row_ids,
         })
     }
@@ -5548,6 +5563,41 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn test_concurrent_first_use_stages_rows_once() {
+        let (rows, code_dim, num_bits) = (64usize, 64usize, 5u8);
+        let sign_codes = make_test_codes(rows, code_dim as i32);
+        let ex_codes = make_test_ex_codes(rows, code_dim, num_bits);
+        let mut metadata = make_test_metadata(code_dim);
+        metadata.num_bits = num_bits;
+        let storage = RabitQuantizationStorage::try_from_batch(
+            make_test_batch_with_ex(sign_codes, ex_codes),
+            &metadata,
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
+
+        let workers = 8;
+        let barrier = std::sync::Barrier::new(workers);
+        std::thread::scope(|scope| {
+            for worker in 0..workers as u32 {
+                let (storage, barrier) = (&storage, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    storage.dist_calculator_from_id(worker).distance(worker + 1);
+                });
+            }
+        });
+
+        assert_eq!(
+            storage
+                .stage_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
     #[rstest]
     #[case::rq1(1)]
     #[case::rq2(2)]

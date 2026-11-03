@@ -238,6 +238,8 @@ impl RabitQuantizationStorage {
             ex_add_factors: None,
             ex_scale_factors: None,
             staged_rows: Default::default(),
+            #[cfg(test)]
+            stage_count: Default::default(),
         })
     }
 

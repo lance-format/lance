@@ -258,7 +258,11 @@ impl IndexType {
             | Self::IvfHnswSq
             | Self::IvfHnswPq
             | Self::IvfHnswFlat => 1,
-            Self::IvfRq | Self::IvfHnswRq => 2,
+            Self::IvfRq => 2,
+            // Released readers accept vector versions up to 2 and, unable to
+            // tell subtypes apart, would select this index and fail to open it.
+            // Version 3 makes them skip it and fall back to a flat scan.
+            Self::IvfHnswRq => 3,
         }
     }
 
