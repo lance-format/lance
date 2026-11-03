@@ -41,6 +41,7 @@ use dataset::base_path::DatasetBasePath;
 use dataset::blob::LanceBlobFile;
 use dataset::cleanup::{
     CleanupCandidateFile, CleanupExplanation, CleanupReferencedBranch, CleanupStats,
+    ExpireVersionsPlan, ExpireVersionsStats,
 };
 use dataset::io_stats::IoStats;
 use dataset::merge_insert::MergeInsertBuilder;
@@ -293,6 +294,8 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LanceBufferDescriptor>()?;
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;
+    m.add_class::<ExpireVersionsStats>()?;
+    m.add_class::<ExpireVersionsPlan>()?;
     m.add_class::<CleanupCandidateFile>()?;
     m.add_class::<CleanupReferencedBranch>()?;
     m.add_class::<CleanupExplanation>()?;

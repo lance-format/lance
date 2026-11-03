@@ -1957,3 +1957,120 @@ fn compaction_storage_version_config(
         assert!(error.to_string().contains(value));
     }
 }
+
+#[tokio::test]
+async fn byte_aware_consolidation_settles_after_rewrite() {
+    let dir = TempStrDir::default();
+    let reader = lance_datagen::gen_batch()
+        .col("id", lance_datagen::array::step::<Int32Type>())
+        .col(
+            "vec",
+            lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(64)),
+        )
+        .into_reader_rows(RowCount::from(128), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        reader,
+        dir.as_str(),
+        Some(WriteParams {
+            max_rows_per_file: 16,
+            max_rows_per_group: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+            false,
+        )
+        .await
+        .unwrap();
+    let fields = dataset.schema().field_ids().into_iter().collect();
+    let fragment = &dataset.fragments()[0];
+    assert!(consolidation::fragment_file_bytes(fragment, &fields).is_some());
+    let mut multi_file = fragment.clone();
+    multi_file.files.push(fragment.files[0].clone());
+    assert_eq!(
+        consolidation::fragment_file_bytes(&multi_file, &fields),
+        None
+    );
+    let mut obsolete = fragment.clone();
+    let mut obsolete_fields = obsolete.files[0].fields.to_vec();
+    obsolete_fields.push(i32::MAX);
+    obsolete.files[0].fields = obsolete_fields.into();
+    assert_eq!(consolidation::fragment_file_bytes(&obsolete, &fields), None);
+    let before = dataset.scan().try_into_batch().await.unwrap();
+    let options = CompactionOptions {
+        target_rows_per_fragment: 10_000,
+        max_bytes_per_file: Some(16 * 1024),
+        ..Default::default()
+    };
+    let planner = DefaultCompactionPlanner::new(options.clone())
+        .unwrap()
+        .with_byte_aware_consolidation();
+    assert!(planner.plan(&dataset).await.unwrap().num_tasks() > 0);
+    compact_files_with_planner(&mut dataset, None, &planner)
+        .await
+        .unwrap();
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), before);
+    assert_eq!(planner.plan(&dataset).await.unwrap().num_tasks(), 0);
+    // Opt-in changes planning, not the existing row-only API contract.
+    if dataset.fragments().len() > 1 {
+        assert!(
+            plan_compaction(&dataset, &options)
+                .await
+                .unwrap()
+                .num_tasks()
+                > 0
+        );
+    }
+    let mut scan = dataset.scan();
+    scan.filter("id >= 64").unwrap();
+    assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 64);
+    dataset.delete("id % 2 = 0").await.unwrap();
+    assert!(planner.plan(&dataset).await.unwrap().num_tasks() > 0);
+}
+
+#[tokio::test]
+async fn byte_full_fragment_preserves_small_runs_on_both_sides() {
+    let dir = TempStrDir::default();
+    let mut dataset = None;
+    for rows in [4, 4, 64, 4, 4] {
+        let reader = lance_datagen::gen_batch()
+            .col(
+                "vec",
+                lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(64)),
+            )
+            .into_reader_rows(RowCount::from(rows), BatchCount::from(1));
+        let params = Some(WriteParams {
+            max_rows_per_file: rows as usize,
+            ..Default::default()
+        });
+        if let Some(ds) = &mut dataset {
+            Dataset::append(ds, reader, params).await.unwrap();
+        } else {
+            dataset = Some(Dataset::write(reader, dir.as_str(), params).await.unwrap());
+        }
+    }
+    let dataset = dataset.unwrap();
+    let options = CompactionOptions {
+        target_rows_per_fragment: 10_000,
+        max_bytes_per_file: Some(8 * 1024),
+        ..Default::default()
+    };
+    let planner = DefaultCompactionPlanner::new(options)
+        .unwrap()
+        .with_byte_aware_consolidation();
+    let plan = planner.plan(&dataset).await.unwrap();
+    assert_eq!(plan.num_tasks(), 2);
+    let middle_id = dataset.fragments()[2].id;
+    assert!(
+        plan.compaction_tasks()
+            .all(|task| task.task.fragments.iter().all(|f| f.id != middle_id))
+    );
+}
