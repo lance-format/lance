@@ -2002,6 +2002,25 @@ impl Transaction {
             )
         };
 
+        // Every schema change lands here, including the Blob v2 promotion above.
+        // A table already holding such a field may still commit, e.g. to drop it.
+        let unsupported = |manifest: &Manifest, field: &lance_core::datatypes::Field| {
+            field.is_blob_v2()
+                || matches!(
+                    manifest.data_storage_format.lance_file_format(),
+                    ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+                )
+        };
+        manifest.schema.check_blob_nesting(|field| {
+            unsupported(&manifest, field)
+                && !current_manifest.is_some_and(|current| {
+                    current
+                        .schema
+                        .field_by_id(field.id)
+                        .is_some_and(|prior| unsupported(current, prior))
+                })
+        })?;
+
         if config.activate_non_reusable_field_ids {
             let already_active = current_manifest
                 .map(|manifest| manifest.uses_non_reusable_field_ids())

@@ -379,9 +379,11 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray, record_batch,
+        Array, ArrayRef, FixedSizeListArray, Int64Array, MapArray, RecordBatch,
+        RecordBatchIterator, RecordBatchReader, StringArray, StructArray, record_batch,
     };
-    use arrow_schema::{DataType, Field as ArrowField};
+    use arrow_buffer::OffsetBuffer;
+    use arrow_schema::{DataType, Field as ArrowField, Fields};
     use lance_arrow::SchemaExt;
     use lance_core::utils::tempfile::{TempDir, TempStrDir};
     use lance_table::format::BasePath;
@@ -567,60 +569,66 @@ mod tests {
         assert_eq!(blobs[3].as_ref().unwrap().size(), 0);
     }
 
-    /// Blob v2 nests only in Struct and List, so legacy blob input in a Map or
-    /// FixedSizeList, which 2.2 promotes to Blob v2, is rejected as unsupported
-    /// instead of failing on the unprepared array.
-    #[rstest]
-    #[case::map(true)]
-    #[case::fixed_size_list(false)]
-    #[tokio::test]
-    async fn test_legacy_blob_in_map_or_fixed_size_list_is_rejected_at_v2_2(#[case] map: bool) {
-        use arrow_array::{FixedSizeListArray, LargeBinaryArray, MapArray, StructArray};
-        use arrow_buffer::OffsetBuffer;
-
-        let blob = ArrowField::new("value", DataType::LargeBinary, true).with_metadata(
+    fn legacy_blob() -> (ArrowField, ArrayRef) {
+        let field = ArrowField::new("value", DataType::LargeBinary, true).with_metadata(
             std::collections::HashMap::from([(
                 lance_arrow::BLOB_META_KEY.to_string(),
                 "true".to_string(),
             )]),
         );
-        let blobs = Arc::new(LargeBinaryArray::from(vec![Some(b"v".as_slice())]));
-        let column: arrow_array::ArrayRef = if map {
-            let key = ArrowField::new("key", DataType::Utf8, false);
-            let fields: arrow_schema::Fields = vec![key, blob].into();
-            Arc::new(MapArray::new(
-                Arc::new(ArrowField::new(
-                    "entries",
-                    DataType::Struct(fields.clone()),
-                    false,
-                )),
-                OffsetBuffer::from_lengths([1]),
-                StructArray::new(
-                    fields,
-                    vec![Arc::new(StringArray::from(vec!["k"])), blobs],
-                    None,
-                ),
-                None,
-                false,
-            ))
-        } else {
-            let fields: arrow_schema::Fields = vec![blob].into();
-            Arc::new(FixedSizeListArray::new(
-                Arc::new(ArrowField::new(
-                    "item",
-                    DataType::Struct(fields.clone()),
-                    true,
-                )),
-                1,
-                Arc::new(StructArray::new(fields, vec![blobs], None)),
-                None,
-            ))
-        };
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "nested",
-            column.data_type().clone(),
-            true,
-        )]));
+        let values = arrow_array::LargeBinaryArray::from(vec![Some(b"v".as_slice())]);
+        (field, Arc::new(values))
+    }
+
+    fn prepared_blob() -> (ArrowField, ArrayRef) {
+        let mut builder = crate::blob::BlobDescriptorArrayBuilder::new("value");
+        builder.push_inline(b"v".as_slice()).unwrap();
+        builder.finish().unwrap().into_parts()
+    }
+
+    fn in_map((value, values): (ArrowField, ArrayRef)) -> (ArrowField, ArrayRef) {
+        let key = ArrowField::new("key", DataType::Utf8, false);
+        let fields = Fields::from(vec![key, value]);
+        let entries = ArrowField::new("entries", DataType::Struct(fields.clone()), false);
+        let keys = Arc::new(StringArray::from(vec!["k"]));
+        let map = MapArray::new(
+            Arc::new(entries),
+            OffsetBuffer::from_lengths([1]),
+            StructArray::new(fields, vec![keys, values], None),
+            None,
+            false,
+        );
+        (
+            ArrowField::new("nested", map.data_type().clone(), true),
+            Arc::new(map),
+        )
+    }
+
+    fn in_fixed_size_list((value, values): (ArrowField, ArrayRef)) -> (ArrowField, ArrayRef) {
+        let fields = Fields::from(vec![value]);
+        let item = ArrowField::new("item", DataType::Struct(fields.clone()), true);
+        let list = FixedSizeListArray::new(
+            Arc::new(item),
+            1,
+            Arc::new(StructArray::new(fields, vec![values], None)),
+            None,
+        );
+        (
+            ArrowField::new("nested", list.data_type().clone(), true),
+            Arc::new(list),
+        )
+    }
+
+    #[rstest]
+    #[case::legacy_blob_in_map(in_map(legacy_blob()))]
+    #[case::legacy_blob_in_fixed_size_list(in_fixed_size_list(legacy_blob()))]
+    #[case::prepared_blob_in_map(in_map(prepared_blob()))]
+    #[tokio::test]
+    async fn test_blob_in_map_or_fixed_size_list_is_rejected_at_v2_2(
+        #[case] column: (ArrowField, ArrayRef),
+    ) {
+        let (field, column) = column;
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
         let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
         let params = WriteParams {
             data_storage_version: Some(LanceFileVersion::V2_2),

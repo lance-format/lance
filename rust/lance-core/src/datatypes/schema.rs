@@ -423,6 +423,39 @@ impl Schema {
         Ok(())
     }
 
+    /// Reject the blob fields `rejects` selects inside a Map or FixedSizeList:
+    /// Blob v2 supports nesting only under Struct, List and LargeList.
+    pub fn check_blob_nesting(&self, rejects: impl Fn(&Field) -> bool) -> Result<()> {
+        fn check(
+            field: &Field,
+            path: &str,
+            container: Option<(&str, &str)>,
+            rejects: &dyn Fn(&Field) -> bool,
+        ) -> Result<()> {
+            if let Some((kind, container_path)) = container
+                && field.is_blob()
+                && rejects(field)
+            {
+                return Err(Error::not_supported(format!(
+                    "Blob v2 fields nested in {kind} field '{container_path}' are not supported; Blob v2 can be nested only in Struct, List and LargeList"
+                )));
+            }
+            let container = match field.data_type() {
+                DataType::Map(..) => Some(("Map", path)),
+                DataType::FixedSizeList(..) => Some(("FixedSizeList", path)),
+                _ => container,
+            };
+            for child in &field.children {
+                check(child, &format!("{path}.{}", child.name), container, rejects)?;
+            }
+            Ok(())
+        }
+        for field in &self.fields {
+            check(field, &field.name, None, &rejects)?;
+        }
+        Ok(())
+    }
+
     /// Validate a schema before storing it in a dataset manifest.
     ///
     /// System columns are virtual on reads, so [`Self::validate`] permits their
