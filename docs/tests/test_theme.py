@@ -19,6 +19,9 @@ class SidenavTests(unittest.TestCase):
             root = Path(tmp)
             for name in (
                 "index.md",
+                "guide/read_and_write.md",
+                "guide/spark/index.md",
+                "guide/spark/ddl/create.md",
                 "spark/index.md",
                 "spark/ddl/create.md",
                 "trino/ddl/create.md",
@@ -31,7 +34,18 @@ class SidenavTests(unittest.TestCase):
             config = load_config(
                 config_file=StringIO("""
 nav:
+  - User Guide:
+      - PyLance:
+          - Core Operations:
+              - Read and Write: guide/read_and_write.md
+      - LanceDB: https://docs.lancedb.com/
+      - Apache Spark:
+          - Welcome: guide/spark/index.md
+          - Operations:
+              - DDL:
+                  - CREATE NAMESPACE: guide/spark/ddl/create.md
   - Integrations:
+      - External Docs: https://docs.lancedb.com/
       - Overview: index.md
       - Apache Spark:
           - Welcome: spark/index.md
@@ -52,8 +66,18 @@ nav:
             )
             build(config)
             cls.sidebars = {}
-            for name in ("spark/ddl/create/index.html", "standalone/index.html"):
+            cls.topnavs = {}
+            for name in (
+                "guide/read_and_write/index.html",
+                "guide/spark/ddl/create/index.html",
+                "spark/ddl/create/index.html",
+                "standalone/index.html",
+            ):
                 html = (root / "site" / name).read_text(encoding="utf-8")
+                topnav = html.split('<nav class="ld-topnav"', 1)[1].split("</nav>", 1)[
+                    0
+                ]
+                cls.topnavs[name] = ElementTree.fromstring("<nav" + topnav + "</nav>")
                 sidebar = html.split('<aside class="ld-sidenav"', 1)[1].split(
                     "</aside>", 1
                 )[0]
@@ -66,23 +90,27 @@ nav:
         groups = sidebar.findall("./div[@class='ld-sidenav__group']")
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0].find("div").text, "Integrations")
-        spark, trino = groups[0].findall("./div[@class='ld-sidenav__group']")
-        self.assertEqual(spark.find("div").text, "Apache Spark")
-        self.assertEqual(trino.find("div").text, "Trino")
-        spark_ddl = spark.find("./div[@class='ld-sidenav__group']")
-        self.assertEqual(spark_ddl.find("div").text, "DDL")
-        self.assertEqual(spark_ddl.find("a").text, "CREATE NAMESPACE")
-        operations = trino.find("./div[@class='ld-sidenav__group']")
-        self.assertEqual(operations.find("div").text, "Operations")
-        trino_ddl = operations.find("./div[@class='ld-sidenav__group']")
-        self.assertEqual(trino_ddl.find("div").text, "DDL")
-        self.assertEqual(trino_ddl.find("a").text, "CREATE SCHEMA")
+        spark, trino = groups[0].findall("./details[@class='ld-sidenav__sub']")
+        self.assertEqual(spark.attrib.get("open"), "open")
+        self.assertIsNone(trino.attrib.get("open"))
+        self.assertEqual(spark.find("./summary/span").text, "Apache Spark")
+        self.assertEqual(trino.find("./summary/span").text, "Trino")
+        spark_ddl = spark.find("./div/details[@class='ld-sidenav__sub']")
+        self.assertEqual(spark_ddl.attrib.get("open"), "open")
+        self.assertEqual(spark_ddl.find("./summary/span").text, "DDL")
+        self.assertEqual(spark_ddl.find("./div/a").text, "CREATE NAMESPACE")
+        operations = trino.find("./div/details[@class='ld-sidenav__sub']")
+        self.assertIsNone(operations.attrib.get("open"))
+        self.assertEqual(operations.find("./summary/span").text, "Operations")
+        trino_ddl = operations.find("./div/details[@class='ld-sidenav__sub']")
+        self.assertEqual(trino_ddl.find("./summary/span").text, "DDL")
+        self.assertEqual(trino_ddl.find("./div/a").text, "CREATE SCHEMA")
 
     def test_links_keep_order_urls_and_active_state(self):
         sidebar = self.sidebars["spark/ddl/create/index.html"]
-        spark = sidebar.find("./div/div[@class='ld-sidenav__group']")
-        self.assertEqual([child.tag for child in spark], ["div", "a", "div", "a"])
-        welcome, project = spark.findall("a")
+        spark_items = sidebar.find("./div/details[@class='ld-sidenav__sub']/div")
+        self.assertEqual([child.tag for child in spark_items], ["a", "details", "a"])
+        welcome, project = spark_items.findall("a")
         self.assertEqual(welcome.attrib, {"href": "../../"})
         self.assertEqual(
             project.attrib,
@@ -103,3 +131,34 @@ nav:
         self.assertEqual(
             sidebar.find("./div/a").attrib, {"class": "active", "href": "./"}
         )
+        tabs = self.topnavs["standalone/index.html"].findall("a")
+        self.assertEqual(tabs[0].text, "User Guide")
+        self.assertEqual(tabs[0].get("href"), "../guide/read_and_write/")
+        self.assertEqual(tabs[1].text, "Integrations")
+        self.assertEqual(tabs[1].get("href"), "..")
+
+    def test_track_switcher_prioritizes_pylance_and_lancedb_and_scopes_tree(self):
+        pylance_sidebar = self.sidebars["guide/read_and_write/index.html"]
+        tracks = pylance_sidebar.findall("./div/div[@class='ld-sidenav__tracks']/a")
+        self.assertEqual(
+            [a.find("span").text for a in tracks],
+            ["PyLance", "LanceDB", "Apache Spark"],
+        )
+        self.assertIn("active", tracks[0].attrib.get("class", ""))
+        self.assertEqual(tracks[1].attrib.get("href"), "https://docs.lancedb.com/")
+        groups = pylance_sidebar.findall("./div[@class='ld-sidenav__group']")
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].find("div").text, "Core Operations")
+        self.assertEqual(groups[0].find("a").text, "Read and Write")
+
+        spark_sidebar = self.sidebars["guide/spark/ddl/create/index.html"]
+        spark_tracks = spark_sidebar.findall("./div/div[@class='ld-sidenav__tracks']/a")
+        self.assertIn("active", spark_tracks[2].attrib.get("class", ""))
+        spark_groups = spark_sidebar.findall("./div[@class='ld-sidenav__group']")
+        self.assertEqual(len(spark_groups), 2)
+        self.assertIsNone(spark_groups[0].find("./div[@class='ld-sidenav__label']"))
+        self.assertEqual(spark_groups[0].find("a").text, "Welcome")
+        self.assertEqual(spark_groups[1].find("div").text, "Operations")
+        ddl = spark_groups[1].find("./details[@class='ld-sidenav__sub']")
+        self.assertEqual(ddl.attrib.get("open"), "open")
+        self.assertEqual(ddl.find("./summary/span").text, "DDL")

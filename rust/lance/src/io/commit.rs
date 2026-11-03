@@ -2222,14 +2222,14 @@ pub(crate) async fn commit_transaction(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{collections::HashMap, sync::Mutex};
 
     use arrow_array::types::Int32Type;
     use arrow_array::{Int32Array, Int64Array, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::future::join_all;
     use lance_arrow::FixedSizeListArrayExt;
-    use lance_core::datatypes::{Field, Schema};
+    use lance_core::datatypes::{Field, LANCE_UNENFORCED_PRIMARY_KEY, Schema};
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_file::version::ConcreteFileVersion;
@@ -2251,8 +2251,8 @@ mod tests {
     use crate::dataset::cleanup::CleanupPolicyBuilder;
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::{
-        CommitBuilder, DeleteBuilder, MergeInsertBuilder, UpdateBuilder, WhenMatched, WriteMode,
-        WriteParams,
+        CommitBuilder, DeleteBuilder, MergeInsertBuilder, UpdateBuilder, WhenMatched,
+        WhenNotMatched, WriteMode, WriteParams,
     };
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
@@ -2473,6 +2473,166 @@ mod tests {
         assert_eq!(
             latest.count_rows(None).await.unwrap(),
             if is_compaction { 8 } else { 7 }
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::intact_history(&[])]
+    #[case::gap_read_retained(&[2])]
+    #[case::gap_read_removed(&[1, 2])]
+    #[tokio::test]
+    async fn test_insert_only_merge_insert_after_cleanup(
+        #[case] cleaned_versions: &[u64],
+        #[values(false, true)] is_staged: bool,
+        #[values("id", "value")] on: &str,
+    ) {
+        let initial =
+            arrow_array::record_batch!(("id", Int32, [0, 1, 2, 3]), ("value", Int32, [0, 1, 2, 3]))
+                .unwrap();
+        let mut fields = initial.schema().fields().to_vec();
+        fields[0] = Arc::new(
+            fields[0]
+                .as_ref()
+                .clone()
+                .with_nullable(false)
+                .with_metadata(HashMap::from([(
+                    LANCE_UNENFORCED_PRIMARY_KEY.to_string(),
+                    "true".to_string(),
+                )])),
+        );
+        let initial = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(fields)),
+            initial.columns().to_vec(),
+        )
+        .unwrap();
+        let stale = Arc::new(
+            crate::dataset::InsertBuilder::new("memory://")
+                .with_params(&WriteParams {
+                    max_rows_per_file: 2,
+                    ..Default::default()
+                })
+                .execute(vec![initial])
+                .await
+                .unwrap(),
+        );
+        assert_eq!(stale.get_fragments().len(), 2);
+        let upsert = |dataset| {
+            MergeInsertBuilder::try_new(dataset, vec![on.into()])
+                .unwrap()
+                .when_matched(WhenMatched::UpdateAll)
+                .when_not_matched(WhenNotMatched::InsertAll)
+                .try_build()
+                .unwrap()
+        };
+        let batch = if on == "id" {
+            arrow_array::record_batch!(("id", Int32, [100]), ("value", Int32, [101])).unwrap()
+        } else {
+            arrow_array::record_batch!(("id", Int32, [101]), ("value", Int32, [100])).unwrap()
+        };
+        // Stage before the concurrent insert and cleanup, as a separate writer would.
+        let staged = if is_staged {
+            let staged = upsert(stale.clone())
+                .execute_uncommitted_batches(vec![batch.clone()])
+                .await
+                .unwrap();
+            let Operation::Update {
+                updated_fragments,
+                removed_fragment_ids,
+                inserted_rows_filter,
+                ..
+            } = &staged.transaction.operation
+            else {
+                panic!("expected an Update transaction");
+            };
+            assert!(updated_fragments.is_empty());
+            assert!(removed_fragment_ids.is_empty());
+            assert_eq!(inserted_rows_filter.is_some(), on == "id");
+            Some(staged)
+        } else {
+            None
+        };
+        let concurrent =
+            arrow_array::record_batch!(("id", Int32, [100]), ("value", Int32, [100])).unwrap();
+        let (latest, _) = upsert(stale.clone())
+            .execute_batches(vec![concurrent])
+            .await
+            .unwrap();
+        let latest = CommitBuilder::new(latest)
+            .execute(Transaction::new(
+                2,
+                Operation::ReserveFragments { num_fragments: 1 },
+                None,
+            ))
+            .await
+            .unwrap();
+        if !cleaned_versions.is_empty() {
+            let stats = latest
+                .cleanup(
+                    CleanupPolicyBuilder::default()
+                        .versions(cleaned_versions.to_vec())
+                        .unwrap()
+                        .build(),
+                )
+                .execute()
+                .await
+                .unwrap();
+            assert_eq!(stats.old_versions, cleaned_versions.len() as u64);
+        }
+
+        let result = if let Some(staged) = staged {
+            let mut builder = CommitBuilder::new(stale);
+            if let Some(affected_rows) = staged.affected_rows {
+                builder = builder.with_affected_rows(affected_rows);
+            }
+            let result = builder.execute(staged.transaction).await;
+            if on == "id" {
+                let error = result.unwrap_err();
+                assert!(
+                    matches!(error, Error::RetryableCommitConflict { .. }),
+                    "{error}"
+                );
+                let message = if cleaned_versions.is_empty() {
+                    "preempted by concurrent transaction"
+                } else {
+                    "inserted keys"
+                };
+                assert!(error.to_string().contains(message), "{error}");
+                if !cleaned_versions.is_empty() {
+                    assert!(error.to_string().contains("versions [2]"), "{error}");
+                }
+                assert_eq!(latest.latest_version_id().await.unwrap(), 3);
+                assert_eq!(latest.count_rows(None).await.unwrap(), 5);
+                assert_eq!(latest.count_rows(Some("id = 100".into())).await.unwrap(), 1);
+                return;
+            }
+            result.unwrap()
+        } else {
+            let (result, stats) = upsert(stale).execute_batches(vec![batch]).await.unwrap();
+            assert_eq!(stats.num_attempts, if on == "id" { 2 } else { 1 });
+            result.as_ref().clone()
+        };
+        assert_eq!(result.version().version, 4);
+        assert_eq!(
+            result
+                .count_rows(Some(format!("{on} = 100")))
+                .await
+                .unwrap(),
+            if on == "id" { 1 } else { 2 }
+        );
+        assert_eq!(
+            result
+                .count_rows(Some(if on == "id" {
+                    "id = 100 AND value = 101".into()
+                } else {
+                    "id = 101 AND value = 100".into()
+                }))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            result.count_rows(None).await.unwrap(),
+            if on == "id" { 5 } else { 6 }
         );
     }
 
