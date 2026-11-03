@@ -141,6 +141,46 @@ jobs:
           name: pylance-debug-macosx_arm64
           path: python/target/wheels/*.whl
           retention-days: 90
+      - name: Verify macOS arm64 release wheel
+        if: github.event_name == 'workflow_dispatch' && inputs.debug == false
+        run: |
+          WHEEL=$(find python/target/wheels -maxdepth 1 -name 'pylance-*.whl' -print -quit)
+          if [[ -z "$WHEEL" ]]; then
+            echo "No macOS wheel was produced" >&2
+            exit 1
+          fi
+          WHEEL_NAME=$(basename "$WHEEL")
+          if [[ "$WHEEL_NAME" != *macosx_11_0_arm64* ]]; then
+            echo "Unexpected wheel platform: $WHEEL_NAME" >&2
+            exit 1
+          fi
+          python3 -m pip install "$WHEEL"
+          WHEEL_NAME="$WHEEL_NAME" python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+
+          import lance
+          import lance.lance
+
+          sections = set(
+              re.findall(
+                  r"^\s*sectname\s+(\S+)$",
+                  subprocess.check_output(
+                      ["otool", "-arch", "arm64", "-l", lance.lance.__file__],
+                      text=True,
+                  ),
+                  re.MULTILINE,
+              )
+          )
+          assert "__text" in sections
+          assert "__mod_init_func" in sections
+          assert "__text_startup" not in sections
+          print(
+              f"imported lance from {os.environ['WHEEL_NAME']}: "
+              f"{lance.lance.__file__}"
+          )
+          PY
       - uses: ./.github/workflows/upload_wheel
         if: github.event_name == 'release'
         with:
