@@ -8,18 +8,19 @@ use crate::{
         transaction::{Operation, TransactionBuilder},
     },
     index::{
-        DatasetIndexExt, DatasetIndexInternalExt, IntoIndexSegment,
-        build_index_metadata_from_segments,
+        DatasetIndexExt, IntoIndexSegment,
+        frag_reuse::OpenPurpose,
         frag_reuse_with_stable_row_ids::{
             ensure_index_allowed_with_frag_reuse, ensure_index_kind_allowed_with_frag_reuse,
         },
-        load_all_indices,
+        lifecycle::build_index_metadata_from_segments,
+        loading::{DatasetIndexInternalExt, load_all_indices, load_all_indices_by_name},
         scalar::{build_bitmap_index_segment, build_scalar_index},
+        vector::details::{vector_index_details, vector_index_details_default},
         vector::{
             LANCE_VECTOR_INDEX, StageParams, VectorIndexParams, build_distributed_vector_index,
             build_empty_vector_index, build_filtered_vector_index, build_vector_index,
         },
-        vector_index_details, vector_index_details_default,
     },
 };
 use futures::{FutureExt, future::BoxFuture};
@@ -735,13 +736,11 @@ impl<'a> CreateIndexBuilder<'a> {
             .apply_commit(transaction, &Default::default(), &Default::default())
             .await?;
 
-        // Fetch the committed index metadata from the dataset.
-        // This ensures we return the version that may have been modified by the commit.
-        let indices = self.dataset.load_indices().await?;
-        indices
-            .iter()
-            .find(|idx| idx.uuid == index_uuid)
-            .cloned()
+        // Rebasing may withdraw all query coverage while keeping the committed
+        // segment's definition for rebuilding. Include that stored metadata.
+        self.dataset
+            .load_index_with_purpose(&index_uuid, OpenPurpose::Maintenance)
+            .await?
             .ok_or_else(|| {
                 Error::internal(format!(
                     "Index with UUID {} not found after commit",
@@ -893,6 +892,12 @@ impl<'a> CreateIndexBuilder<'a> {
                 .await?;
 
             let indices = self.dataset.load_indices_by_name(&index_name).await?;
+            if let Some(index) = indices.into_iter().next() {
+                return Ok(index);
+            }
+            // A rebase can withdraw all query coverage and leave empty
+            // definitions, which tagged query listings omit.
+            let indices = load_all_indices_by_name(self.dataset, &index_name).await?;
             return indices.into_iter().next().ok_or_else(|| {
                 Error::internal(format!(
                     "FM-Index segments for '{}' not found after commit",
@@ -972,6 +977,12 @@ impl<'a> CreateIndexBuilder<'a> {
             .await?;
 
         let indices = self.dataset.load_indices_by_name(&index_name).await?;
+        if let Some(index) = indices.into_iter().next() {
+            return Ok(index);
+        }
+        // A rebase can withdraw all query coverage and leave empty
+        // definitions, which tagged query listings omit.
+        let indices = load_all_indices_by_name(self.dataset, &index_name).await?;
         indices.into_iter().next().ok_or_else(|| {
             Error::internal(format!(
                 "FM-Index segments for '{}' not found after commit",
@@ -2859,7 +2870,7 @@ mod tests {
                 .indices_dir()
                 .clone()
                 .join(segment.uuid.to_string())
-                .join(crate::index::INDEX_FILE_NAME);
+                .join(lance_index::INDEX_FILE_NAME);
             assert!(
                 dataset
                     .object_store

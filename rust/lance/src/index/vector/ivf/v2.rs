@@ -1087,10 +1087,10 @@ pub(crate) struct IvfOpenContext {
     /// sets one; `LANCE_RQ_RESIDENT_COLUMNS` set to `on` or `off` overrides
     /// it. See [`IVFIndex::resident_columns_at_open`].
     pub(crate) resident_columns: ResidentColumnsSetting,
-    /// The index's namespace of the index cache without a fragment reuse
-    /// segment, where an IVF_RQ index with resident small columns charges
-    /// their store (see [`ResidentColumns::in_index_cache`]), so
-    /// that a new fragment reuse index keeps the store. `None` keeps the
+    /// The cache pool for immutable index files, without dataset or fragment
+    /// reuse translation. Physical file keys scope raw entries and charge
+    /// resident stores (see [`ResidentColumns::in_index_cache`]), so snapshots
+    /// and shallow clones can share them. `None` keeps the
     /// store charged nowhere, shared with the file's other live indexes.
     pub(crate) file_cache: Option<LanceCache>,
     /// A strong reference acquired before opening the index can evict the
@@ -1160,6 +1160,8 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     distance_type: DistanceType,
 
     index_cache: WeakLanceCache,
+    /// Immutable planes and code-only entries, independent of FRI translation.
+    raw_cache: WeakLanceCache,
 
     io_parallelism: usize,
     /// Cumulative I/O performed while opening this index (file footers, IVF
@@ -1710,6 +1712,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .join(uuid_str.as_str())
             .join(INDEX_AUXILIARY_FILE_NAME);
         let index_file = aux_file_key(&object_store, &index_dir, &uuid);
+        let raw_cache = WeakLanceCache::from(
+            &context
+                .file_cache
+                .as_ref()
+                .unwrap_or(&index_cache)
+                .with_key_prefix(&object_store.store_prefix)
+                .with_key_prefix(aux_path.as_ref()),
+        );
+        let row_address_cache = WeakLanceCache::from(
+            &index_cache
+                .with_key_prefix(&object_store.store_prefix)
+                .with_key_prefix(aux_path.as_ref()),
+        );
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
         let scheduler = ScanScheduler::new(object_store, scheduler_config);
 
@@ -1801,6 +1816,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let resident_store =
             Self::resident_store_at_open(resident_columns, &index_file, context).await?;
         let storage = storage
+            .with_row_address_cache(row_address_cache)
             .with_origin_latency(origin_latency)
             .with_resident_columns(resident_store)
             .with_resident_columns_enabled(resident_columns)
@@ -1849,6 +1865,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             sub_index_metadata,
             distance_type,
             index_cache: WeakLanceCache::from(&index_cache),
+            raw_cache,
             io_parallelism,
             open_io_stats,
             prepared_partitions: Arc::default(),
@@ -1871,6 +1888,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         sub_index_metadata: Vec<String>,
         distance_type: DistanceType,
         index_cache: LanceCache,
+        raw_cache: WeakLanceCache,
         io_parallelism: usize,
         rq_search_cache: Option<Arc<RabitSearchCache>>,
         origin_latency: OriginLatencyClass,
@@ -1895,6 +1913,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             sub_index_metadata,
             distance_type,
             index_cache: WeakLanceCache::from(&index_cache),
+            raw_cache,
             io_parallelism,
             // Reconstruction from cached state re-opens readers on its own path;
             // the open-time I/O is not attributed here (it is a one-time cost,
@@ -2211,7 +2230,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .storage
             .load_partition_cached(
                 partition_id,
-                &self.index_cache,
+                &self.raw_cache,
                 write_cache,
                 attach,
                 io_stats.clone(),
@@ -2285,7 +2304,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let index = self.load_sub_index(partition_id, io_stats.clone()).await?;
         let storage = self
             .storage
-            .load_rabit_partition_planes(partition_id, &self.index_cache, io_stats)
+            .load_rabit_partition_planes(partition_id, &self.raw_cache, io_stats)
             .await?;
         Ok(PartitionEntry::new(index, storage))
     }
@@ -2536,7 +2555,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         while partition_id < partitions.end {
             let cached = |partition| async move {
                 let key = PartitionCodesKey { partition };
-                self.index_cache.get_with_key(&key).await.is_some()
+                self.raw_cache.get_with_key(&key).await.is_some()
             };
             if cached(partition_id).await {
                 partition_id += 1;
@@ -2569,7 +2588,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     !shares_resident_store(&codes.0),
                     "prewarmed codes of partition {partition} hold memory of a resident store"
                 );
-                self.index_cache
+                self.raw_cache
                     .get_or_insert_with_key(
                         PartitionCodesKey { partition },
                         || async move { Ok(codes) },
@@ -2692,7 +2711,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             self.uuid
         );
         if self.uses_rabit_plane_cache() {
-            self.storage.prewarm_planes(&self.index_cache).await?;
+            self.storage.prewarm_planes(&self.raw_cache).await?;
         } else {
             self.prewarm_partitions().await?;
         }
@@ -3154,28 +3173,58 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let prepare_parallelism = get_num_compute_intensive_cpus().max(1);
         let raw_query_context = self.prepare_rq_raw_query_context(&query.key)?;
 
-        if control.is_none() && S::supports_global_topk_heap() {
-            if let Some(strategy) = &self.rabit_scan {
-                let erased: Arc<dyn std::any::Any + Send + Sync> = self.clone();
-                if let Ok(index) = erased.downcast::<IVFIndex<FlatIndex, RabitQuantizer>>() {
-                    let context = Arc::new(RabitScanContext::new(
-                        index,
-                        raw_query_context.clone(),
-                        query.clone(),
-                        partitions.clone(),
-                        q_c_dists.clone(),
-                        start_idx..end_idx,
-                        pre_filter.clone(),
-                        metrics.clone(),
-                    ));
-                    if let Some(batch) = strategy.search(context).await? {
+        if S::supports_global_topk_heap()
+            && let Some(strategy) = &self.rabit_scan
+        {
+            let erased: Arc<dyn std::any::Any + Send + Sync> = self.clone();
+            if let Ok(index) = erased.downcast::<IVFIndex<FlatIndex, RabitQuantizer>>() {
+                let context = Arc::new(RabitScanContext::new(
+                    index,
+                    raw_query_context.clone(),
+                    query.clone(),
+                    partitions.clone(),
+                    q_c_dists.clone(),
+                    start_idx..end_idx,
+                    pre_filter.clone(),
+                    metrics.clone(),
+                ));
+                if let Some(control) = &control {
+                    if control.should_stop() {
                         return Ok(Box::pin(RecordBatchStreamAdapter::new(
                             VECTOR_RESULT_SCHEMA.clone(),
-                            stream::once(async move { Ok(batch) }),
+                            stream::empty(),
                         )));
                     }
+                    let factor = query.refine_factor.unwrap_or(1);
+                    if factor == 0 {
+                        return Err(Error::invalid_input(
+                            "refine_factor must be positive, got 0",
+                        ));
+                    }
+                    let candidate_limit =
+                        query.k.checked_mul(factor as usize).ok_or_else(|| {
+                            Error::invalid_input(format!(
+                                "RaBitQ candidate count overflow: k={}, refine_factor={factor}",
+                                query.k
+                            ))
+                        })?;
+                    if let Some(batches) = strategy.search_partition_stream(context)? {
+                        return rabit_scan::controlled_partition_stream(
+                            batches,
+                            end_idx - start_idx,
+                            candidate_limit,
+                            control.clone(),
+                        );
+                    }
+                } else if let Some(batch) = strategy.search(context).await? {
+                    return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                        VECTOR_RESULT_SCHEMA.clone(),
+                        stream::once(async move { Ok(batch) }),
+                    )));
                 }
             }
+        }
+        if control.is_none() && S::supports_global_topk_heap() {
             let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
             {
                 let _wait_timer = IndexTimer::new(metrics.as_ref(), IndexTiming::PrefilterWait);
@@ -3830,6 +3879,20 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     let dir: Path = parts.into_iter().collect();
     let aux_path = dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
     let index_file = IndexFileKey::new(&state.uuid, &object_store.store_prefix, aux_path.as_ref());
+    let raw_cache = WeakLanceCache::from(
+        &context
+            .file_cache
+            .as_ref()
+            .unwrap_or(&index_cache)
+            .with_key_prefix(&object_store.store_prefix)
+            .with_key_prefix(aux_path.as_ref()),
+    );
+
+    let row_address_cache = WeakLanceCache::from(
+        &index_cache
+            .with_key_prefix(&object_store.store_prefix)
+            .with_key_prefix(aux_path.as_ref()),
+    );
 
     // Readers carry a scheduler bound to an object store, so they cannot be
     // shared across dataset opens. Reuse only portable file metadata and bind
@@ -3888,6 +3951,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     let resident_columns =
         IVFIndex::<S, Q>::resident_store_at_open(resident, &index_file, context).await?;
     let storage = storage
+        .with_row_address_cache(row_address_cache)
         .with_resident_columns(resident_columns)
         .with_resident_columns_enabled(resident)
         .with_entry_columns(IVFIndex::<S, Q>::entry_columns_at_open()?);
@@ -3909,6 +3973,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         state.sub_index_metadata.clone(),
         state.distance_type,
         index_cache,
+        raw_cache,
         io_parallelism,
         rq_search_cache,
         origin_latency,
@@ -3918,4 +3983,4 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -563,12 +563,17 @@ mod tests {
     impl RestoreEnv {
         fn unset(key: &'static str) -> Self {
             let original = std::env::var_os(key);
+            // SAFETY: `#[serial]` only keeps the tests that use `RestoreEnv` from changing the
+            // environment at the same time. `set_var` and `remove_var` also require that no other
+            // thread reads or writes it outside `std::env` meanwhile, which nothing here
+            // guarantees when other tests share the process, as under `cargo test`.
             unsafe { std::env::remove_var(key) };
             Self { key, original }
         }
 
         fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
             let original = std::env::var_os(key);
+            // SAFETY: see `RestoreEnv::unset`.
             unsafe { std::env::set_var(key, value) };
             Self { key, original }
         }
@@ -576,6 +581,7 @@ mod tests {
 
     impl Drop for RestoreEnv {
         fn drop(&mut self) {
+            // SAFETY: see `RestoreEnv::unset`.
             unsafe {
                 match &self.original {
                     Some(value) => std::env::set_var(self.key, value),
