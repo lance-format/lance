@@ -19,6 +19,7 @@ use lance_table::format::IndexMetadata;
 use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
 use lance_table::io::manifest::read_manifest_indexes;
 use lance_table::system_index::frag_reuse::history::{FragReuseHistory, Record};
+use lance_table::system_index::frag_reuse::policy::{FriPolicy, RecordForm};
 use log::warn;
 use roaring::RoaringBitmap;
 
@@ -142,9 +143,10 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
         return cleanup_stable_row_id_history(dataset, frag_reuse_index_meta, &indices).await;
     }
 
-    // Hard fork by index_version: tagged histories trim per transition in
-    // fresh code below, while the v0 path stays exactly as it was.
-    if frag_reuse_index_meta.index_version != 0 {
+    // A tagged table trims per record, a v0 entry under the sticky flag
+    // included (it is lifted, as compaction lifts it); a v0 table keeps the
+    // v0 path exactly as it was.
+    if FriPolicy::new(&dataset.manifest, &indices).record_form() == RecordForm::Tagged {
         return cleanup_tagged_frag_reuse_index(dataset).await;
     }
 
@@ -854,13 +856,17 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
     else {
         return Ok(TaggedTrimOutcome::NothingToTrim);
     };
-    if entry.index_version == 0 {
-        // Reachable only through a rebase whose entry was concurrently
-        // replaced by a v0 one; nothing tagged remains to trim.
+    if FriPolicy::new(&dataset.manifest, &indices).record_form() == RecordForm::Legacy {
+        // Reachable only through a rebase whose table is no longer tagged;
+        // nothing tagged remains to trim.
         return Ok(TaggedTrimOutcome::NothingToTrim);
     }
 
-    let history = load_frag_reuse_history(dataset, &entry).await?;
+    // A v0 entry under the sticky flag is trimmed as the tagged history it
+    // is lifted to.
+    let history = load_frag_reuse_history(dataset, &entry)
+        .await?
+        .into_tagged()?;
     if !history.is_fully_interpretable() {
         return Err(Error::not_supported(
             "the tagged FRI history carries transitions this client cannot interpret; \
@@ -903,6 +909,65 @@ mod tests {
     use lance_index::IndexType;
     use lance_index::scalar::ScalarIndexParams;
     use std::collections::HashMap;
+
+    /// A v0 entry under the sticky tagged flag is trimmed as a tagged
+    /// history: once every index has caught up, the cleanup removes the entry
+    /// instead of publishing a v0 replacement onto a table that keeps the
+    /// tagged format.
+    #[tokio::test]
+    async fn cleanup_lifts_a_v0_entry_under_the_tagged_flag() {
+        let mut dataset = crate::index::frag_reuse_reader::tests::fixture().await;
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let indices = crate::index::load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        let entry = indices
+            .iter()
+            .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+            .unwrap();
+        assert_eq!(entry.index_version, 0);
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        manifest.reader_feature_flags |= lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+        manifest.writer_feature_flags |= lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+        crate::index::frag_reuse_reader::tests::persist_fixture(&mut dataset, indices).await;
+
+        remapping::remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+            .await
+            .unwrap();
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+
+        assert!(
+            dataset
+                .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+                .await
+                .unwrap()
+                .is_none(),
+            "the drained history is removed"
+        );
+        let flag = lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
+        assert_eq!(dataset.manifest.writer_feature_flags & flag, flag);
+        for value in 0..8 {
+            assert_eq!(
+                dataset
+                    .count_rows(Some(format!("i = {value}")))
+                    .await
+                    .unwrap(),
+                1,
+                "i = {value}"
+            );
+        }
+    }
 
     fn frag_digest(id: u64) -> lance_index::frag_reuse::FragDigest {
         lance_index::frag_reuse::FragDigest {
