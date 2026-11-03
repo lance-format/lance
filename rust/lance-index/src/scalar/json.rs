@@ -50,7 +50,7 @@ use crate::{
 
 /// A JSON segment whose target index stores row ids (or, for details written
 /// before `JsonIndexDetails::target_index_version` existed, whose target's domain
-/// is whatever a build from that time wrote; see [`legacy_target_index_version`]).
+/// is whatever a build from that time wrote; see `legacy_target_index_version`).
 pub const JSON_ROW_ID_DOMAIN_VERSION: u32 = 0;
 
 /// A JSON segment whose target index stores physical row addresses.

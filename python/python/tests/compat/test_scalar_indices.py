@@ -29,6 +29,20 @@ def _writer_supports_row_address_indices(compat_version):
     return Version(compat_version) >= Version("15.0.0")
 
 
+def _creator_rejects_json_wrapped_row_address_index(compat_version):
+    """Whether this release's writer outright rejects creating a JSON-wrapped
+    BTREE/BITMAP/LABEL_LIST index on a stable-row-id dataset.
+
+    The 14.x line added a safety guard rejecting that combination, because the
+    JSON wrapper could not yet carry its target's own domain through its own
+    metadata (see `build_scalar_index` in `rust/lance/src/index/scalar.rs`).
+    This guard is lifted starting with the release that ships
+    `JsonIndexDetails::target_index_version` (15.0.0), which is otherwise the
+    first release whose writer understands row-address-domain JSON indices.
+    """
+    return Version("14.0.0") <= Version(compat_version) < Version("15.0.0")
+
+
 def _assert_row_address_writes_fenced(dataset, data, compat_version):
     version = dataset.version
     original = dataset.to_table()
@@ -953,11 +967,20 @@ class JsonRowAddressDomainIndex(UpgradeDowngradeTest):
     - Updating it with the current build rebuilds it, keeping both old and
       new rows queryable.
     - An older build must then ignore the rebuilt index, but still answer
-      every query correctly via a full scan, and still write to the dataset.
+      every query correctly via a full scan. Stable writers without the
+      row-address capability must reject inserts and unsafe updates without
+      changing the dataset.
+
+    The upgrade/downgrade round trip (old build creates) is skipped for a
+    release whose writer rejected creating this combination outright -- see
+    `_creator_rejects_json_wrapped_row_address_index`.
     """
 
     def __init__(self, path: Path):
         self.path = path
+
+    def skip_upgrade_downgrade(self, version: str) -> bool:
+        return _creator_rejects_json_wrapped_row_address_index(version)
 
     def create(self):
         """Create a stable-row-id dataset with a JSON index over BTREE."""
@@ -1009,15 +1032,20 @@ class JsonRowAddressDomainIndex(UpgradeDowngradeTest):
         self._assert_queryable(expect_index_used=not self._running_in_old_venv)
 
     def check_write(self):
-        """Insert a row and update the index, then verify old and new rows
-        both stay correct."""
+        """Fence old writers; verify current writes and index maintenance."""
         ds = lance.dataset(self.path)
+        new_key = ds.count_rows()
         data = pa.table(
             {
-                "idx": pa.array([1000]),
-                "json": pa.array(['{"val": 1000}'], pa.json_()),
+                "idx": pa.array([new_key]),
+                "json": pa.array([f'{{"val": {new_key}}}'], pa.json_()),
             }
         )
+        if self._running_in_old_venv and not _writer_supports_row_address_indices(
+            self.compat_version
+        ):
+            _assert_row_address_writes_fenced(ds, data, self.compat_version)
+            return
         ds.insert(data)
         ds.optimize.optimize_indices()
         ds.optimize.compact_files()
@@ -1026,8 +1054,8 @@ class JsonRowAddressDomainIndex(UpgradeDowngradeTest):
         table = ds.to_table(filter="json_get_int(json, 'val') == 107")
         assert table.num_rows == 1
         # `check_write` runs more than once across the upgrade/downgrade round
-        # trip, each time inserting another `val == 1000` row.
-        table = ds.to_table(filter="json_get_int(json, 'val') == 1000")
+        # trip, each time inserting another new row.
+        table = ds.to_table(filter=f"json_get_int(json, 'val') == {new_key}")
         assert table.num_rows >= 1
 
 
