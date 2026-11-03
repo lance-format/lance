@@ -48,7 +48,7 @@ struct RemovalSummary {
     count: u64,
     bytes: u128,
     first: Option<(InternalCacheKey, u64, u64)>,
-    retained: [Option<QuickEntry>; 2],
+    retained: Vec<QuickEntry>,
 }
 
 impl RemovalSummary {
@@ -69,8 +69,9 @@ impl RemovalSummary {
         if self.count > 0 {
             metrics.size_removal(self.count, self.bytes.try_into().unwrap_or(u64::MAX));
         }
-        // `retained` is dropped here, after quick_cache has released the shard
-        // write lock for insert_with_lifecycle and returned this request state.
+        // All displaced values are dropped here, after quick_cache has released
+        // the shard write lock for insert_with_lifecycle and returned this
+        // request state.
     }
 }
 
@@ -88,11 +89,7 @@ impl quick_cache::Lifecycle<InternalCacheKey, QuickEntry> for EntryLifecycle {
         }
         state.count += 1;
         state.bytes += weight as u128;
-        if state.retained[0].is_none() {
-            state.retained[0] = Some(value);
-        } else if state.retained[1].is_none() {
-            state.retained[1] = Some(value);
-        }
+        state.retained.push(value);
     }
 
     fn end_request(&self, state: RemovalSummary) {
@@ -1273,22 +1270,24 @@ mod tests {
             CacheBackendKind::Quick,
             true,
         )));
-        let key = InternalCacheKey::from_bytes([1; 16]);
-        let value = QuickEntry {
-            entry: Arc::new(DropProbe(drops.clone())),
-            size_bytes: 8,
-            submission_id: 1,
-            type_name: None,
-        };
         let mut summary = quick_cache::Lifecycle::begin_request(&lifecycle);
-        quick_cache::Lifecycle::on_evict(&lifecycle, &mut summary, key, value);
+        for id in 0..3 {
+            let key = InternalCacheKey::from_bytes([id + 1; 16]);
+            let value = QuickEntry {
+                entry: Arc::new(DropProbe(drops.clone())),
+                size_bytes: 8,
+                submission_id: id as u64,
+                type_name: None,
+            };
+            quick_cache::Lifecycle::on_evict(&lifecycle, &mut summary, key, value);
+        }
         assert_eq!(
             drops.load(Ordering::SeqCst),
             0,
-            "the lifecycle callback must retain evicted values"
+            "the lifecycle callback must retain every evicted value"
         );
         summary.finish(&lifecycle.0, None);
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
     }
 
     #[rstest::rstest]
