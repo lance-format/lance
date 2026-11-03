@@ -47,7 +47,7 @@ Choose a **Query or Compute Engine** when you want to run distributed SQL, lakeh
 
 | Engine | Typical Workload | Get Started |
 |---|---|---|
-| **Apache Spark** | Distributed SQL, DDL/DML, and batch ETL with Spark SQL and PySpark | **[Spark Quickstart](spark.md)** · [Spark Guide](../guide/spark/index.md) |
+| **Apache Spark** | Distributed SQL, DDL/DML, and batch ETL with Spark SQL and PySpark | **[Spark Quickstart](spark.md)** · [Spark Connector Docs](../integrations/spark/index.md) |
 | **DuckDB / Trino / DataFusion** | Interactive SQL analytics and federated queries over Lance datasets | [DataFusion](../integrations/datafusion.md) · [All SQL Integrations](../integrations/index.md#query-engines-and-sql) |
 | **Ray / PyTorch / Flink** | Distributed data processing, streaming ingestion, and ML training loaders | [PyTorch](../integrations/pytorch.md) · [All ML & Stream Integrations](../integrations/index.md#machine-learning-and-ai) |
 

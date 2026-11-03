@@ -12,7 +12,7 @@
   {%- if item.is_section %}
     <details class="ld-sidenav__sub"{% if item.active %} open="open"{% endif %}>
       <summary class="ld-sidenav__sub-toggle">
-        <span>{{ item.title }}</span>
+        <span>{{ item.title | e }}</span>
         <svg class="ld-sidenav__chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
       </summary>
       <div class="ld-sidenav__sub-items">
@@ -22,16 +22,16 @@
       </div>
     </details>
   {%- elif item.is_link %}
-    <a href="{{ item.url }}" target="_blank" rel="noopener">{{ item.title }} <span class="ext">↗</span></a>
+    <a href="{{ item.url | e }}" target="_blank" rel="noopener">{{ item.title | e }} <span class="ext">↗</span></a>
   {%- else %}
-    <a{% if item == page %} class="active"{% endif %} href="{{ item.url | url }}">{{ item.title }}</a>
+    <a{% if item == page %} class="active"{% endif %} href="{{ item.url | url }}">{{ item.title | e }}</a>
   {%- endif %}
 {%- endmacro -%}
 
 {%- macro sidenav_group(children, label=none) -%}
   <div class="ld-sidenav__group">
     {%- if label %}
-    <div class="ld-sidenav__label">{{ label }}</div>
+    <div class="ld-sidenav__label">{{ label | e }}</div>
     {%- endif %}
     {%- for child in children %}
       {{ sidenav_item(child) }}
@@ -65,35 +65,44 @@
 
   <main class="ld-docs">
     <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
-      {{ active_section.item.title if active_section.item else "Menu" }}
+      {{ (active_section.item.title | e) if active_section.item else "Menu" }}
       <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
     </button>
     <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
       {%- if active_section.item and active_section.item.is_section %}
-        {%- set tracks = namespace(has_direct_page=false, count=0, active=none) -%}
+        {%- set tracks = namespace(has_direct_page=false, has_link_or_nested=false, count=0, active=none) -%}
         {%- for child in active_section.item.children -%}
           {%- if child.is_page -%}
             {%- set tracks.has_direct_page = true -%}
           {%- else -%}
             {%- set tracks.count = tracks.count + 1 -%}
+            {%- if child.is_link -%}
+              {%- set tracks.has_link_or_nested = true -%}
+            {%- elif child.is_section -%}
+              {%- for sub in child.children -%}
+                {%- if sub.is_section -%}
+                  {%- set tracks.has_link_or_nested = true -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endif -%}
             {%- if child.active -%}
               {%- set tracks.active = child -%}
             {%- endif -%}
           {%- endif -%}
         {%- endfor -%}
-        {%- if not tracks.has_direct_page and tracks.count >= 2 %}
+        {%- if not tracks.has_direct_page and tracks.count >= 2 and tracks.has_link_or_nested %}
           <div class="ld-sidenav__group ld-sidenav__group--tracks">
-            <div class="ld-sidenav__label ld-sidenav__label--root">{{ active_section.item.title }}</div>
-            <div class="ld-sidenav__tracks" role="navigation" aria-label="{{ active_section.item.title }} tracks">
+            <div class="ld-sidenav__label ld-sidenav__label--root">{{ active_section.item.title | e }}</div>
+            <div class="ld-sidenav__tracks" role="navigation" aria-label="{{ active_section.item.title | e }} tracks">
               {%- for track in active_section.item.children %}
               {%- if track.is_link %}
-              <a class="ld-sidenav__track" href="{{ track.url }}" target="_blank" rel="noopener">
-                <span>{{ track.title }}</span>
+              <a class="ld-sidenav__track" href="{{ track.url | e }}" target="_blank" rel="noopener">
+                <span>{{ track.title | e }}</span>
                 <span class="ext">↗</span>
               </a>
               {%- else %}
               <a class="ld-sidenav__track{% if track.active %} active{% endif %}" href="{{ track_first_url(track) | url }}">
-                <span>{{ track.title }}</span>
+                <span>{{ track.title | e }}</span>
               </a>
               {%- endif %}
               {%- endfor %}
@@ -107,8 +116,8 @@
         {%- endif %}
       {%- elif active_section.item %}
       <div class="ld-sidenav__group">
-        <div class="ld-sidenav__label ld-sidenav__label--root">{{ active_section.item.title }}</div>
-        <a class="active" href="{{ active_section.item.url | url }}">{{ active_section.item.title }}</a>
+        <div class="ld-sidenav__label ld-sidenav__label--root">{{ active_section.item.title | e }}</div>
+        <a class="active" href="{{ active_section.item.url | url }}">{{ active_section.item.title | e }}</a>
       </div>
       {%- endif %}
     </aside>
@@ -117,9 +126,9 @@
       <div class="ld-crumbs">
         <span>Docs</span>
         {%- for crumb in page.ancestors | reverse %}
-        <span>/</span><span>{{ crumb.title }}</span>
+        <span>/</span><span>{{ crumb.title | e }}</span>
         {%- endfor %}
-        <span>/</span><b>{{ page.title }}</b>
+        <span>/</span><b>{{ page.title | e }}</b>
       </div>
 
       <article class="ld-article">
