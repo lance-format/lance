@@ -1139,8 +1139,10 @@ class LanceFragment(pa.dataset.Fragment):
         Overwrite existing columns from data aligned with this fragment's rows.
 
         Unlike :meth:`update_columns`, there is no join and the current values
-        are never read, so memory is bounded by the size of the batches in
-        ``data_obj`` and by ``batch_size`` rather than by the fragment. The
+        are never read, so column payload memory is bounded by the size of the
+        batches in ``data_obj`` and by ``batch_size`` rather than by the
+        fragment. Alignment bookkeeping retains a bitmap of the live row
+        offsets, so total memory is not independent of fragment size. The
         data must supply every live row exactly once, in
         ascending ``_rowaddr`` order (what an in-order scan of this fragment,
         the default, returns), and must carry each row's ``_rowaddr``. Every

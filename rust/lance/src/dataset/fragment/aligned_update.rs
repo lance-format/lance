@@ -7,7 +7,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::compute::concat_batches;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, RecordBatch, UInt64Array};
@@ -60,8 +59,10 @@ impl FileFragment {
     /// logical layout (`data`, `uri`, and optionally `position` and `size`).
     ///
     /// Unlike [`Self::update_columns`], there is no join and the old values
-    /// are never read, so memory is bounded by the stream's batch size and
-    /// `batch_size` rather than by the fragment. Unlike
+    /// are never read, so column payload memory is bounded by the stream's
+    /// batch size and `batch_size` rather than by the fragment. Alignment
+    /// bookkeeping retains a bitmap of the live row offsets, so total memory
+    /// is not independent of fragment size. Unlike
     /// [`Self::write_columns`], deleted rows are not supplied. The legacy file
     /// format is not supported.
     ///
@@ -97,6 +98,7 @@ impl FileFragment {
     ///     fields_modified: update.fields_modified,
     ///     compacted_sstables: vec![],
     ///     fields_for_preserving_frag_bitmap: vec![],
+    ///     mem_wal_dir_id: None,
     ///     update_mode: Some(UpdateMode::RewriteColumns),
     ///     inserted_rows_filter: None,
     ///     updated_fragment_offsets: Some(UpdatedFragmentOffsets(offsets)),
@@ -138,14 +140,32 @@ impl FileFragment {
             while let Some(batch) = updater.next().await? {
                 let expected = batch[ROW_ADDR].as_primitive::<UInt64Type>().clone();
                 let values = if expected.is_empty() {
-                    columns.empty_values.clone()
+                    vec![columns.empty_values.clone()]
                 } else {
-                    let supplied = self
-                        .next_rows(&mut stream, &mut leftover, expected.len(), &columns)
-                        .await?;
-                    self.check_alignment(&expected, &supplied, &columns, rows_consumed)?;
-                    rows_consumed += supplied.num_rows();
-                    self.value_columns(&supplied, &columns)?
+                    let supplied = next_aligned_rows(
+                        self.id(),
+                        &columns.source_schema,
+                        &mut stream,
+                        &mut leftover,
+                        expected.len(),
+                    )
+                    .await?;
+                    let mut part_start = 0;
+                    for part in &supplied {
+                        self.check_alignment(
+                            &expected.slice(part_start, part.num_rows()),
+                            part,
+                            &columns,
+                            rows_consumed + part_start,
+                        )?;
+                        part_start += part.num_rows();
+                    }
+                    debug_assert_eq!(part_start, expected.len());
+                    rows_consumed += part_start;
+                    supplied
+                        .iter()
+                        .map(|part| self.value_columns(part, &columns))
+                        .collect::<Result<Vec<_>>>()?
                 };
                 matched_offsets.extend(
                     expected
@@ -153,7 +173,7 @@ impl FileFragment {
                         .iter()
                         .map(|addr| RowAddress::from(*addr).row_offset()),
                 );
-                updater.update(values).await?;
+                updater.update_batches(values).await?;
             }
             self.check_exhausted(&mut stream, leftover).await?;
             updater.finish().await
@@ -327,77 +347,6 @@ impl FileFragment {
         })
     }
 
-    /// Pull exactly `num_rows` rows from `stream`, carrying any surplus of the
-    /// last batch over in `leftover`.
-    async fn next_rows(
-        &self,
-        stream: &mut SendableRecordBatchStream,
-        leftover: &mut Option<RecordBatch>,
-        num_rows: usize,
-        columns: &AlignedColumns,
-    ) -> Result<RecordBatch> {
-        let mut parts = Vec::new();
-        let mut remaining = num_rows;
-        while remaining > 0 {
-            let batch = match leftover.take() {
-                Some(batch) => batch,
-                None => {
-                    let batch = stream.next().await.ok_or_else(|| {
-                        Error::invalid_input(format!(
-                            "the stream for fragment {} ended before supplying a row for every \
-                             live row",
-                            self.id()
-                        ))
-                    })??;
-                    self.check_batch_schema(&batch, columns)?;
-                    // An empty slice still holds its parent's buffers, so it is
-                    // dropped here instead of being kept in `parts`.
-                    if batch.num_rows() == 0 {
-                        continue;
-                    }
-                    batch
-                }
-            };
-            if batch.num_rows() > remaining {
-                parts.push(batch.slice(0, remaining));
-                *leftover = Some(batch.slice(remaining, batch.num_rows() - remaining));
-                remaining = 0;
-            } else {
-                remaining -= batch.num_rows();
-                parts.push(batch);
-            }
-        }
-        // Rebuilt against the declared schema even for a single part (which
-        // `concat_batches` does without copying): field metadata such as the
-        // JSON extension decides the physical conversion, and a batch may
-        // arrive without it.
-        Ok(concat_batches(&columns.source_schema, &parts)?)
-    }
-
-    /// Columns are taken by position, so a batch whose columns differ from the
-    /// declared schema would write each column's values under another's field.
-    fn check_batch_schema(&self, batch: &RecordBatch, columns: &AlignedColumns) -> Result<()> {
-        let declared = columns.source_schema.fields();
-        let actual = batch.schema_ref().fields();
-        let matches = declared.len() == actual.len()
-            && declared
-                .iter()
-                .zip(actual.iter())
-                .all(|(declared, actual)| {
-                    declared.name() == actual.name() && declared.data_type() == actual.data_type()
-                });
-        if matches {
-            return Ok(());
-        }
-        Err(Error::invalid_input(format!(
-            "a batch in the stream for fragment {} does not match the stream schema: expected \
-             {}, got {}",
-            self.id(),
-            ArrowSchema::new(declared.clone()),
-            ArrowSchema::new(actual.clone()),
-        )))
-    }
-
     /// `supplied` must name, row for row, the live rows in `expected`.
     /// `rows_consumed` is the stream position of its first row.
     fn check_alignment(
@@ -473,6 +422,81 @@ impl FileFragment {
     }
 }
 
+/// Pull exactly `num_rows` rows from `stream`, carrying any surplus of the last
+/// batch over in `leftover`. Source sub-batches are kept separate so they reach
+/// [`crate::dataset::updater::Updater::update_batches`] without a concatenation
+/// that could overflow a 32-bit variable-width offset.
+async fn next_aligned_rows(
+    fragment_id: usize,
+    source_schema: &SchemaRef,
+    stream: &mut SendableRecordBatchStream,
+    leftover: &mut Option<RecordBatch>,
+    num_rows: usize,
+) -> Result<Vec<RecordBatch>> {
+    let mut parts = Vec::new();
+    let mut remaining = num_rows;
+    while remaining > 0 {
+        let batch = match leftover.take() {
+            Some(batch) => batch,
+            None => {
+                let batch = stream.next().await.ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "the stream for fragment {fragment_id} ended before supplying a row for \
+                         every live row"
+                    ))
+                })??;
+                check_batch_schema(fragment_id, source_schema, &batch)?;
+                batch
+            }
+        };
+        // Rebuilt against the declared schema for every sub-batch, not just a
+        // concatenated one: field metadata such as the JSON extension decides
+        // the physical conversion, and a batch may arrive without it.
+        let batch = RecordBatch::try_new(source_schema.clone(), batch.columns().to_vec())?;
+        // An empty slice still holds its parent's buffers, so it is dropped
+        // here instead of being kept in `parts`.
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        if batch.num_rows() > remaining {
+            parts.push(batch.slice(0, remaining));
+            *leftover = Some(batch.slice(remaining, batch.num_rows() - remaining));
+            remaining = 0;
+        } else {
+            remaining -= batch.num_rows();
+            parts.push(batch);
+        }
+    }
+    Ok(parts)
+}
+
+/// Columns are taken by position, so a batch whose columns differ from the
+/// declared schema would write each column's values under another's field.
+fn check_batch_schema(
+    fragment_id: usize,
+    source_schema: &SchemaRef,
+    batch: &RecordBatch,
+) -> Result<()> {
+    let declared = source_schema.fields();
+    let actual = batch.schema_ref().fields();
+    let matches = declared.len() == actual.len()
+        && declared
+            .iter()
+            .zip(actual.iter())
+            .all(|(declared, actual)| {
+                declared.name() == actual.name() && declared.data_type() == actual.data_type()
+            });
+    if matches {
+        return Ok(());
+    }
+    Err(Error::invalid_input(format!(
+        "a batch in the stream for fragment {fragment_id} does not match the stream schema: \
+         expected {}, got {}",
+        ArrowSchema::new(declared.clone()),
+        ArrowSchema::new(actual.clone()),
+    )))
+}
+
 /// `target` with each blob v2 node, at any depth, given the logical layout
 /// the source supplies, so projecting onto it keeps `position` and `size`
 /// instead of cutting the struct down to the manifest's `data, uri`.
@@ -539,4 +563,62 @@ fn logical_blob_children(target: &ArrowField, source: &ArrowField) -> Result<Fie
         target.name(),
         source.data_type()
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use arrow_array::{Int32Array, UInt64Array};
+    use datafusion::error::DataFusionError;
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::stream;
+
+    use super::*;
+
+    /// One updater batch may be fed from several source batches. They must stay
+    /// separate on the way to the writer, and each must carry the declared
+    /// schema so per-batch conversion sees its field metadata.
+    #[tokio::test]
+    async fn test_next_aligned_rows_preserves_sub_batches_and_metadata() {
+        let metadata = HashMap::from([("test.metadata".to_string(), "declared".to_string())]);
+        let declared = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(ROW_ADDR, DataType::UInt64, true),
+            ArrowField::new("v", DataType::Int32, true).with_metadata(metadata),
+        ]));
+        let bare = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new(ROW_ADDR, DataType::UInt64, true),
+            ArrowField::new("v", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            bare,
+            vec![
+                Arc::new(UInt64Array::from(vec![0, 1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 11, 12, 13])),
+            ],
+        )
+        .unwrap();
+        let batches = vec![
+            Ok::<_, DataFusionError>(batch.slice(0, 2)),
+            Ok(batch.slice(2, 2)),
+        ];
+        let mut stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            declared.clone(),
+            stream::iter(batches),
+        ));
+        let mut leftover = None;
+
+        let parts = next_aligned_rows(0, &declared, &mut stream, &mut leftover, 3)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            parts.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert!(parts.iter().all(|part| part.schema_ref() == &declared));
+        let leftover = leftover.expect("the fourth row must be carried over");
+        assert_eq!(leftover.num_rows(), 1);
+        assert_eq!(leftover.schema_ref(), &declared);
+    }
 }

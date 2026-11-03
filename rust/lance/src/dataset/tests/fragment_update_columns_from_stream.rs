@@ -162,6 +162,7 @@ async fn commit_rewrite(dataset: &Dataset, result: FragmentUpdateColumnsResult) 
             fields_modified: result.fields_modified,
             compacted_sstables: vec![],
             fields_for_preserving_frag_bitmap: vec![],
+            mem_wal_dir_id: None,
             update_mode: Some(UpdateMode::RewriteColumns),
             inserted_rows_filter: None,
             updated_fragment_offsets: Some(UpdatedFragmentOffsets(offsets)),
@@ -986,6 +987,80 @@ async fn test_backfills_column_declared_all_null() {
         &Int32Array::from_iter_values(ids.iter().map(|id| id + 1000))
     );
     assert_eq!(batch["v"].as_ref(), &Int32Array::from(vec![-1; ids.len()]));
+}
+
+/// A fragment can hold several data files after `add_columns`. Rewriting `v`
+/// must tombstone `v` only in the file that stores it, leave the added
+/// column's file untouched, and still read both columns back after commit.
+#[tokio::test]
+async fn test_preserves_other_data_files() {
+    use crate::dataset::schema_evolution::NewColumnTransform;
+    use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
+
+    let test_uri = TempStrDir::default();
+    let mut dataset = base_dataset(&test_uri, LanceFileVersion::Stable, false, false).await;
+    let extra_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "extra",
+        DataType::Int32,
+        true,
+    )]));
+    let extra = RecordBatch::try_new(
+        extra_schema.clone(),
+        vec![Arc::new(Int32Array::from_iter_values(0..ROWS))],
+    )
+    .unwrap();
+    dataset
+        .add_columns(
+            NewColumnTransform::Reader(Box::new(reader_of(extra_schema, vec![extra]))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let fragment = only_fragment(&dataset);
+    assert_eq!(fragment.metadata().files.len(), 2);
+    let extra_id = dataset.schema().field("extra").unwrap().id;
+    let (addrs, ids) = live_rows(&fragment).await;
+    let addrs = addrs.into_iter().map(Some).collect::<Vec<_>>();
+    let result = fragment
+        .update_columns_from_stream(
+            reader_of(values_schema(), chunked(&new_values(&addrs, &ids))),
+            Some(BATCH_SIZE),
+        )
+        .await
+        .unwrap();
+
+    let layout: Vec<Vec<i32>> = result
+        .fragment
+        .files
+        .iter()
+        .map(|file| file.fields.as_ref().to_vec())
+        .collect();
+    let v_id = dataset.schema().field("v").unwrap().id;
+    let s_id = dataset.schema().field("s").unwrap().id;
+    assert_eq!(
+        layout,
+        vec![
+            vec![0, TOMBSTONE_FIELD_ID, TOMBSTONE_FIELD_ID],
+            vec![extra_id],
+            vec![v_id, s_id],
+        ]
+    );
+
+    let dataset = commit_rewrite(&dataset, result).await;
+    dataset.validate().await.unwrap();
+    only_fragment(&dataset).validate().await.unwrap();
+
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(
+        batch["v"].as_ref(),
+        &Int32Array::from_iter_values(ids.iter().map(|id| id * 10))
+    );
+    assert_eq!(
+        batch["extra"].as_ref(),
+        &Int32Array::from_iter_values(ids.iter().copied())
+    );
 }
 
 /// An index over a rewritten column still holds the old values, so the commit
