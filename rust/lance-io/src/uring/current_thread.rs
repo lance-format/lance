@@ -81,10 +81,10 @@ pub(super) fn push_request(request: Arc<IoRequest>) -> io::Result<()> {
 
         // Get buffer pointer, adjusting for any bytes already read (short read retry)
         let (buffer_ptr, read_offset, read_length) = {
-            let state = request.state.lock().unwrap();
+            let mut state = request.state.lock().unwrap();
             let br = state.bytes_read;
             (
-                unsafe { state.buffer.as_ptr().add(br) as *mut u8 },
+                state.buffer[br..].as_mut_ptr(),
                 request.offset + br as u64,
                 (request.length - br) as u32,
             )
@@ -107,6 +107,9 @@ pub(super) fn push_request(request: Arc<IoRequest>) -> io::Result<()> {
         }
 
         // Push to SQ
+        // SAFETY: the read writes into `request`'s buffer. `pending` keeps `request` alive until
+        // this read's completion is reaped, and nothing resizes or takes the buffer before then:
+        // the future takes it only after that reap sets `completed`.
         unsafe {
             sq.push(&read_op.build().user_data(user_data))
                 .map_err(|_| io::Error::other("Failed to push to SQ"))?;
@@ -190,10 +193,10 @@ pub(super) fn process_thread_local_completions() -> io::Result<usize> {
             let user_data = USER_DATA_COUNTER.fetch_add(1, Ordering::Relaxed);
 
             let (buffer_ptr, read_offset, read_length) = {
-                let state = request.state.lock().unwrap();
+                let mut state = request.state.lock().unwrap();
                 let br = state.bytes_read;
                 (
-                    unsafe { state.buffer.as_ptr().add(br) as *mut u8 },
+                    state.buffer[br..].as_mut_ptr(),
                     request.offset + br as u64,
                     (request.length - br) as u32,
                 )
@@ -212,6 +215,8 @@ pub(super) fn process_thread_local_completions() -> io::Result<usize> {
                 continue;
             }
 
+            // SAFETY: as in `push_request`: `pending` keeps `request` alive, and the buffer stays
+            // in place because the future takes it only after a reap sets `completed`.
             unsafe {
                 if sq.push(&read_op.build().user_data(user_data)).is_err() {
                     request.fail(io::Error::other("Failed to push short-read retry to SQ"));
@@ -335,6 +340,9 @@ impl UringCurrentThreadReader {
         length: usize,
     ) -> Pin<Box<dyn Future<Output = object_store::Result<Bytes>> + Send>> {
         let mut buffer = BytesMut::with_capacity(length);
+        // SAFETY: the capacity covers `length`. `set_len` also asks for initialized bytes, and
+        // these stay uninitialized until the kernel writes them, but nothing reads them before
+        // that: callers only ever get the first `bytes_read`, all written by the kernel.
         unsafe {
             buffer.set_len(length);
         }
