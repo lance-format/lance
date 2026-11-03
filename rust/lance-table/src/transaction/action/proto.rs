@@ -234,6 +234,7 @@ mod tests {
                     file_type: DeletionFileType::Bitmap,
                     num_deleted_rows: Some(4),
                     base_id: None,
+                    inline: None,
                 }),
                 data_change: true,
                 base: Some(Ref::Committed(2)),

@@ -128,6 +128,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(2),
             base_id: None,
+            inline: None,
         };
         let next = apply(
             &manifest,
@@ -178,6 +179,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(2),
             base_id,
+            inline: None,
         }
     }
 
