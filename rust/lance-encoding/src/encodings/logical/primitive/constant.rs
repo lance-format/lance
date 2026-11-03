@@ -305,7 +305,7 @@ impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantP
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ConstantPageDecoder {
     ranges: VecDeque<Range<u64>>,
     scalar: ArrayRef,
@@ -384,6 +384,31 @@ impl ConstantPageDecoder {
 }
 
 impl crate::encodings::logical::primitive::StructuralPageDecoder for ConstantPageDecoder {
+    fn decoded_bytes(&self, num_rows: u64) -> Result<u64> {
+        let mut planned = self.clone();
+        let mut visible_items = 0_u64;
+        for range in planned.drain_ranges(num_rows) {
+            planned.skip_to_row(range.start)?;
+            let start = planned.cursor_level;
+            planned.skip_to_row(range.end)?;
+            let end = planned.cursor_level;
+            let count = if let Some(def) = &planned.def {
+                def[start..end]
+                    .iter()
+                    .filter(|level| **level <= planned.max_visible_def)
+                    .count()
+            } else {
+                end - start
+            };
+            visible_items = visible_items
+                .checked_add(count as u64)
+                .ok_or_else(|| Error::not_supported("constant item count overflowed u64"))?;
+        }
+        visible_items
+            .checked_mul(self.scalar.get_buffer_memory_size() as u64)
+            .ok_or_else(|| Error::not_supported("constant decoded byte count overflowed u64"))
+    }
+
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn crate::decoder::DecodePageTask>> {
         let drained_ranges = self.drain_ranges(num_rows);
 

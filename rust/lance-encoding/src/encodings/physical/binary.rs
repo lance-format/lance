@@ -800,9 +800,25 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
         num_rows: u64,
     ) -> Option<u64> {
         let BinaryMiniBlockLayout::Legacy { bits_per_offset } = &self.layout else {
-            // Generic offsets are stored in a separate, possibly compressed buffer. Without
-            // decoding that buffer there is no reliable value-range bound.
-            return None;
+            let BinaryMiniBlockLayout::Generic {
+                bits_per_offset,
+                offsets_have_payload,
+                ..
+            } = &self.layout
+            else {
+                return None;
+            };
+            if chunk_buffers.len() != 1 + usize::from(*offsets_have_payload) {
+                return None;
+            }
+            // Generic offset buffers may be compressed. The whole value buffer
+            // still bounds any selected subrange without decoding those offsets.
+            let value_bytes = u64::try_from(chunk_buffers.last()?.len()).ok()?;
+            return value_bytes.checked_add(
+                num_rows
+                    .checked_add(1)?
+                    .checked_mul(u64::from(*bits_per_offset / 8))?,
+            );
         };
         let bits_per_offset = *bits_per_offset;
         if chunk_buffers.len() != 1 || !matches!(bits_per_offset, 32 | 64) {

@@ -3668,7 +3668,7 @@ pub async fn decode_batch(
 mod tests {
     use super::*;
     use arrow_array::{
-        Array, StringArray, StructArray,
+        Array, BinaryArray, StringArray, StructArray,
         builder::{BinaryBuilder, ListBuilder},
     };
     use std::collections::VecDeque;
@@ -4535,6 +4535,25 @@ mod tests {
                     || (offsets.last().unwrap() - offsets.first().unwrap()) as u64 <= budget
             );
         }
+        let actual = arrow_select::concat::concat_batches(&batch.schema(), &batches).unwrap();
+        assert_eq!(actual, batch);
+    }
+
+    #[rstest::rstest]
+    #[case::v21(TestEncoding::StructuralU16)]
+    #[case::v22(TestEncoding::StructuralU32)]
+    #[tokio::test]
+    async fn test_small_constant_binary_preserves_row_batches(#[case] version: TestEncoding) {
+        let values = BinaryArray::from_iter_values(std::iter::repeat_n(b"payload".as_slice(), 256));
+        let batch = RecordBatch::try_from_iter([("value", Arc::new(values) as ArrayRef)]).unwrap();
+        let batches = decode_batches_with_byte_limit(&batch, 128, None, version).await;
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            vec![128, 128]
+        );
         let actual = arrow_select::concat::concat_batches(&batch.schema(), &batches).unwrap();
         assert_eq!(actual, batch);
     }
