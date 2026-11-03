@@ -253,17 +253,12 @@ impl Transaction {
         // Row ids are a high-water mark like fragment ids: rewinding hands old ids to new rows.
         manifest.next_row_id = manifest.next_row_id.max(current_manifest.next_row_id);
         // So are clustering ids: rewinding would hand an old id to a new definition
-        // while objects on other versions still mean the old one by it. The
-        // definitions themselves are the target's: a restore brings back that
-        // snapshot's definitions, specs, fragments and index segments as they
-        // were, and the current definitions go with the current objects that
-        // referenced them. Only the allocation history is kept, so the next
-        // definition continues above every id this lineage has handed out; a
-        // mark above every present definition is the normal state after a
-        // restore and is never read as a selection.
-        manifest.max_clustering_id = manifest
-            .max_clustering_id
-            .max(current_manifest.max_clustering_id);
+        // while objects on other versions still mean the old one by it. Within one
+        // lineage the current counter already covers the target's, so it is the
+        // allocation mark to keep; the definitions themselves stay exactly the
+        // target snapshot's, and a mark above every present definition is the
+        // normal state after a restore and is never read as a selection.
+        manifest.max_clustering_id = current_manifest.max_clustering_id;
         // A restore republishes objects that already existed, so their labels
         // are not new writes: an old label may outlive its definition and must
         // not make the restore fail.
