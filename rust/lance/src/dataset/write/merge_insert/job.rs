@@ -730,6 +730,33 @@ impl MergeInsertJob {
     ///
     /// The dataset handle is scanned directly through [`LanceTableProvider`],
     /// including on conflict retries.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
+    /// # use std::sync::Arc;
+    /// # async fn example(source: Arc<Dataset>, target: Arc<Dataset>) -> Result<()> {
+    /// let (merged, _stats) =
+    ///     MergeInsertBuilder::try_new(target.clone(), vec!["id".to_string()])?
+    ///         .when_matched(WhenMatched::UpdateAll)
+    ///         .when_not_matched(WhenNotMatched::InsertAll)
+    ///         .try_build()?
+    ///         .execute_dataset(source.clone())
+    ///         .await?;
+    /// let _ = merged;
+    ///
+    /// let plan = MergeInsertBuilder::try_new(target, vec!["id".to_string()])?
+    ///     .when_matched(WhenMatched::UpdateAll)
+    ///     .when_not_matched(WhenNotMatched::InsertAll)
+    ///     .try_build()?
+    ///     .analyze_plan_dataset(source)
+    ///     .await?;
+    /// let _ = plan;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn execute_dataset(self, source: Arc<Dataset>) -> Result<(Arc<Dataset>, MergeStats)> {
         self.execute_provider(Self::dataset_source_provider(source))
             .await
@@ -763,6 +790,38 @@ impl MergeInsertJob {
     }
 
     /// Like [`Self::execute_uncommitted_batches`] for a native Lance dataset.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use datafusion::catalog::TableProvider;
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
+    /// # use std::sync::Arc;
+    /// # async fn example(
+    /// #     source: Arc<Dataset>,
+    /// #     provider: Arc<dyn TableProvider>,
+    /// #     target: Arc<Dataset>,
+    /// # ) -> Result<()> {
+    /// let dataset_result =
+    ///     MergeInsertBuilder::try_new(target.clone(), vec!["id".to_string()])?
+    ///         .when_matched(WhenMatched::UpdateAll)
+    ///         .when_not_matched(WhenNotMatched::InsertAll)
+    ///         .try_build()?
+    ///         .execute_uncommitted_dataset(source)
+    ///         .await?;
+    ///
+    /// let provider_result =
+    ///     MergeInsertBuilder::try_new(target, vec!["id".to_string()])?
+    ///         .when_matched(WhenMatched::UpdateAll)
+    ///         .when_not_matched(WhenNotMatched::InsertAll)
+    ///         .try_build()?
+    ///         .execute_uncommitted_provider(provider)
+    ///         .await?;
+    /// let _ = (dataset_result, provider_result);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn execute_uncommitted_dataset(
         self,
         source: Arc<Dataset>,
@@ -775,6 +834,8 @@ impl MergeInsertJob {
     }
 
     /// Like [`Self::execute_uncommitted_batches`] for a re-scannable provider.
+    ///
+    /// See [`Self::execute_uncommitted_dataset`] for a compiling example.
     pub async fn execute_uncommitted_provider(
         self,
         provider: Arc<dyn TableProvider>,
@@ -1943,6 +2004,8 @@ impl MergeInsertJob {
     }
 
     /// [`Self::analyze_plan_provider`] for a native Lance dataset.
+    ///
+    /// See [`Self::execute_dataset`] for a compiling example.
     pub async fn analyze_plan_dataset(&self, source: Arc<Dataset>) -> Result<String> {
         self.analyze_plan_provider(Self::dataset_source_provider(source))
             .await
