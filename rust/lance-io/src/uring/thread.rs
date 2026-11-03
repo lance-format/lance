@@ -386,10 +386,10 @@ pub(super) fn push_to_sq(
 
     // Get buffer pointer, adjusting for any bytes already read (short read retry)
     let (buffer_ptr, read_offset, read_length) = {
-        let state = request.state.lock().unwrap();
+        let mut state = request.state.lock().unwrap();
         let br = state.bytes_read;
         (
-            unsafe { state.buffer.as_ptr().add(br) as *mut u8 },
+            state.buffer[br..].as_mut_ptr(),
             request.offset + br as u64,
             (request.length - br) as u32,
         )
@@ -416,6 +416,9 @@ pub(super) fn push_to_sq(
     }
 
     // Push to SQ
+    // SAFETY: the read writes into `request`'s buffer. `pending` keeps `request` alive until
+    // this read's completion is reaped, and nothing resizes or takes the buffer before then:
+    // the future takes it only after that reap sets `completed`.
     unsafe {
         if sq.push(&read_op.build().user_data(user_data)).is_err() {
             drop(sq);
