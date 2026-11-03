@@ -1858,7 +1858,7 @@ fn serialized_round_trip(transaction: &Transaction) -> Transaction {
 /// way a build that predates the flag left a seeded index behind, and reopen.
 async fn reopen_with_seed_flags_cleared(dataset: &Dataset) -> Dataset {
     use crate::dataset::{ManifestWriteConfig, write_manifest_file};
-    use crate::index::load_all_indices;
+    use crate::index::loading::load_all_indices;
 
     let mut manifest = dataset.manifest.as_ref().clone();
     manifest.reader_feature_flags &= !FLAG_ZONE_WRITE_SEEDS;

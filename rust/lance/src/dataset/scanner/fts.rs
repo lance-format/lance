@@ -53,18 +53,20 @@ use uuid::Uuid;
 
 use crate::dataset::Dataset;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
+use crate::index::DatasetIndexExt;
+use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::scalar::fetch_index_details;
 use crate::index::scalar::inverted::{
     fts_index_fragment_bitmap, load_segment_details, load_segments, normalize_inverted_details,
     resolve_fts_field, resolve_query_document_granularity, validate_combined_fields_target_column,
 };
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use crate::io::exec::fts::segments::open_fts_segments_without_coverage;
 use crate::io::exec::fts::{
     BoolSlot, BooleanQueryExec, BoostQueryExec, CombinedFieldsQueryExec, CompoundQueryExec,
     CrossColumnCompoundQueryExec, FlatCombinedFieldsExec, FlatMatchFilterExec, FlatMatchQueryExec,
     FlatStatsCoverage, FlatStatsScope, FtsDocumentExec, HybridCompoundQueryExec, MatchQueryExec,
     PhraseQueryExec, SharedFtsScorer, SharedFtsScorerExec,
-    build_boolean_query_children_with_schema, open_fts_segments_without_coverage,
+    build_boolean_query_children_with_schema,
 };
 use crate::io::exec::{FilterPlan as ExprFilterPlan, PreFilterSource, RowAddrMaskFilterExec};
 use crate::{Error, Result};
@@ -2561,7 +2563,6 @@ impl Scanner {
             params.clone(),
             plan,
             scanned_fragments,
-            resolved_fields,
             stats_scope,
             emit_prefilter,
         )?;

@@ -38,7 +38,7 @@ async fn distributed_deferred_compaction_merges_with_a_disjoint_concurrent_rewri
         .await
         .unwrap();
     // Tag the table: the sticky flag decides the entry's form.
-    let indices: Vec<IndexMetadata> = crate::index::load_all_indices(&dataset)
+    let indices: Vec<IndexMetadata> = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -88,7 +88,9 @@ async fn distributed_deferred_compaction_merges_with_a_disjoint_concurrent_rewri
 
     let committed = fresh(uri).await.unwrap();
     assert_eq!(committed.fragments().len(), 2);
-    let stored = crate::index::load_all_indices(&committed).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&committed)
+        .await
+        .unwrap();
     let entry = stored
         .iter()
         .find(|idx| idx.name == lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME)
