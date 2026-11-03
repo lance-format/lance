@@ -17,7 +17,7 @@ from snippet_runner import run_sql
 QUICKSTART = Path(__file__).resolve().parent.parent / "quickstart"
 OUTPUTS = QUICKSTART / "outputs"
 RUNNER = Path(__file__).resolve().parent / "snippet_runner.py"
-INSTALL_SCRIPTS = ["lancedb-install.sh", "spark-install.sh"]
+INSTALL_SCRIPTS = ["lancedb-install.sh", "pylance-install.sh", "spark-install.sh"]
 
 
 def spark_env():
@@ -100,6 +100,21 @@ def test_install_commands_cover_tested_dependencies():
 
 def test_lancedb_quickstart(tmp_path, update_outputs):
     snippet = QUICKSTART / "lancedb_quickstart.py"
+    subprocess.run([sys.executable, RUNNER, snippet, tmp_path], check=True)
+    check_outputs(snippet, tmp_path, update_outputs)
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    [
+        "pylance_quickstart.py",
+        "versioning_quickstart.py",
+        "vector_search_quickstart.py",
+        "fts_quickstart.py",
+    ],
+)
+def test_pylance_quickstarts(script_name, tmp_path, update_outputs):
+    snippet = QUICKSTART / script_name
     subprocess.run([sys.executable, RUNNER, snippet, tmp_path], check=True)
     check_outputs(snippet, tmp_path, update_outputs)
 
