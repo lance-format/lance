@@ -4577,6 +4577,8 @@ dependencies = [
  "libc",
  "log",
  "lzma-sys",
+ "metrics",
+ "metrics-util",
  "mock_instant",
  "moka",
  "num-traits",

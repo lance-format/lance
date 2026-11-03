@@ -15,8 +15,6 @@ use lance_core::cache::{
     CacheKey, CacheKeySchema, CacheNamespace, KeyBuilder, LanceCache, WeakLanceCache,
 };
 
-mod cache_metrics;
-
 struct PageKey {
     column_index: u32,
     page_index: u64,
@@ -362,7 +360,6 @@ criterion_group!(
     benches,
     benchmark_key_preparation,
     benchmark_namespace_derivation,
-    benchmark_cache_operations,
-    cache_metrics::benchmark
+    benchmark_cache_operations
 );
 criterion_main!(benches);

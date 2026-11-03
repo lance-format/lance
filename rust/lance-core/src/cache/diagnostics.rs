@@ -206,107 +206,6 @@ pub struct CacheWarmActivity {
     pub errors: u64,
 }
 
-impl CacheWarmActivity {
-    fn saturating_add_assign(&mut self, other: &Self) {
-        self.attempts = self.attempts.saturating_add(other.attempts);
-        self.hits = self.hits.saturating_add(other.hits);
-        self.loads_started = self.loads_started.saturating_add(other.loads_started);
-        self.loads_succeeded = self.loads_succeeded.saturating_add(other.loads_succeeded);
-        self.loads_failed = self.loads_failed.saturating_add(other.loads_failed);
-        self.loads_cancelled = self.loads_cancelled.saturating_add(other.loads_cancelled);
-        self.load_bytes = self.load_bytes.saturating_add(other.load_bytes);
-        self.errors = self.errors.saturating_add(other.errors);
-    }
-
-    fn saturating_sub(&self, other: &Self) -> Self {
-        Self {
-            attempts: self.attempts.saturating_sub(other.attempts),
-            hits: self.hits.saturating_sub(other.hits),
-            loads_started: self.loads_started.saturating_sub(other.loads_started),
-            loads_succeeded: self.loads_succeeded.saturating_sub(other.loads_succeeded),
-            loads_failed: self.loads_failed.saturating_sub(other.loads_failed),
-            loads_cancelled: self.loads_cancelled.saturating_sub(other.loads_cancelled),
-            load_bytes: self.load_bytes.saturating_sub(other.load_bytes),
-            errors: self.errors.saturating_sub(other.errors),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.attempts == 0
-            && self.hits == 0
-            && self.loads_started == 0
-            && self.loads_succeeded == 0
-            && self.loads_failed == 0
-            && self.loads_cancelled == 0
-            && self.load_bytes == 0
-            && self.errors == 0
-    }
-}
-
-impl CacheActivity {
-    fn saturating_add_assign(&mut self, other: &Self) {
-        self.hits = self.hits.saturating_add(other.hits);
-        self.misses = self.misses.saturating_add(other.misses);
-        self.lookup_errors = self.lookup_errors.saturating_add(other.lookup_errors);
-        self.type_mismatches = self.type_mismatches.saturating_add(other.type_mismatches);
-        self.loads_started = self.loads_started.saturating_add(other.loads_started);
-        self.loads_succeeded = self.loads_succeeded.saturating_add(other.loads_succeeded);
-        self.loads_failed = self.loads_failed.saturating_add(other.loads_failed);
-        self.loads_cancelled = self.loads_cancelled.saturating_add(other.loads_cancelled);
-        self.loads_in_flight = self.loads_in_flight.saturating_add(other.loads_in_flight);
-        self.load_success_duration_ns = self
-            .load_success_duration_ns
-            .saturating_add(other.load_success_duration_ns);
-        self.load_error_duration_ns = self
-            .load_error_duration_ns
-            .saturating_add(other.load_error_duration_ns);
-        self.load_cancelled_duration_ns = self
-            .load_cancelled_duration_ns
-            .saturating_add(other.load_cancelled_duration_ns);
-        self.warm.saturating_add_assign(&other.warm);
-    }
-
-    fn saturating_sub(&self, other: &Self) -> Self {
-        Self {
-            hits: self.hits.saturating_sub(other.hits),
-            misses: self.misses.saturating_sub(other.misses),
-            lookup_errors: self.lookup_errors.saturating_sub(other.lookup_errors),
-            type_mismatches: self.type_mismatches.saturating_sub(other.type_mismatches),
-            loads_started: self.loads_started.saturating_sub(other.loads_started),
-            loads_succeeded: self.loads_succeeded.saturating_sub(other.loads_succeeded),
-            loads_failed: self.loads_failed.saturating_sub(other.loads_failed),
-            loads_cancelled: self.loads_cancelled.saturating_sub(other.loads_cancelled),
-            loads_in_flight: self.loads_in_flight.saturating_sub(other.loads_in_flight),
-            load_success_duration_ns: self
-                .load_success_duration_ns
-                .saturating_sub(other.load_success_duration_ns),
-            load_error_duration_ns: self
-                .load_error_duration_ns
-                .saturating_sub(other.load_error_duration_ns),
-            load_cancelled_duration_ns: self
-                .load_cancelled_duration_ns
-                .saturating_sub(other.load_cancelled_duration_ns),
-            warm: self.warm.saturating_sub(&other.warm),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.hits == 0
-            && self.misses == 0
-            && self.lookup_errors == 0
-            && self.type_mismatches == 0
-            && self.loads_started == 0
-            && self.loads_succeeded == 0
-            && self.loads_failed == 0
-            && self.loads_cancelled == 0
-            && self.loads_in_flight == 0
-            && self.load_success_duration_ns == 0
-            && self.load_error_duration_ns == 0
-            && self.load_cancelled_duration_ns == 0
-            && self.warm.is_empty()
-    }
-}
-
 /// Physical backend measurements. `None` means unavailable, never measured zero.
 ///
 /// Independently created wrappers over one backend share these values, but have
@@ -483,12 +382,6 @@ pub(super) struct TypeActivitySlot {
 #[derive(Clone, Copy)]
 pub(super) struct TypeActivityHandle(u8);
 
-impl TypeActivityHandle {
-    fn is_primary(self) -> bool {
-        self.0 == 0
-    }
-}
-
 impl TypeActivitySlot {
     fn new() -> Self {
         Self {
@@ -527,6 +420,8 @@ impl TypeActivitySlot {
 /// activity on an existing type uses bounded `OnceLock` reads and atomics.
 #[derive(Debug)]
 pub(super) struct TypeActivityRegistry {
+    // Published once, separately from counters that readers continuously write.
+    names: Box<[OnceLock<&'static str>]>,
     slots: Box<[TypeActivitySlot]>,
     other: TypeActivitySlot,
     registration: Mutex<()>,
@@ -536,10 +431,6 @@ pub(super) struct TypeActivityRegistry {
     cache_kind: CacheMetricsKind,
     #[cfg(feature = "metrics")]
     backend_kind: CacheBackendKind,
-    #[cfg(feature = "metrics")]
-    aggregate_lookup_metric_keys: super::telemetry::LookupMetricKeys,
-    #[cfg(feature = "metrics")]
-    aggregate_event_metric_keys: OnceLock<Box<super::telemetry::EventMetricKeys>>,
     #[cfg(all(test, feature = "metrics"))]
     registration_pause: Option<(Barrier, Barrier)>,
 }
@@ -578,6 +469,7 @@ impl TypeActivityRegistry {
             })
             .unwrap_or_else(|_| unreachable!());
         Self {
+            names: (0..capacity).map(|_| OnceLock::new()).collect(),
             slots: (0..capacity).map(|_| TypeActivitySlot::new()).collect(),
             other,
             registration: Mutex::new(()),
@@ -587,13 +479,6 @@ impl TypeActivityRegistry {
             cache_kind,
             #[cfg(feature = "metrics")]
             backend_kind,
-            #[cfg(feature = "metrics")]
-            aggregate_lookup_metric_keys: super::telemetry::LookupMetricKeys::aggregate(
-                cache_kind,
-                backend_kind,
-            ),
-            #[cfg(feature = "metrics")]
-            aggregate_event_metric_keys: OnceLock::new(),
             #[cfg(all(test, feature = "metrics"))]
             registration_pause: None,
         }
@@ -647,6 +532,9 @@ impl TypeActivityRegistry {
                 event_metric_keys: OnceLock::new(),
             })
             .unwrap_or_else(|_| unreachable!());
+        self.names[index]
+            .set(type_name)
+            .unwrap_or_else(|_| unreachable!());
         if index + 1 == self.slots.len() {
             self.full.store(true, Ordering::Release);
         }
@@ -659,22 +547,10 @@ impl TypeActivityRegistry {
     }
 
     #[inline]
-    #[allow(clippy::collapsible_if)]
     fn find(&self, type_name: &str) -> Option<TypeActivityHandle> {
-        if let Some(registration) = self.slots[0].registration.get() {
-            if Self::same_type(registration.diagnostic_name, type_name) {
-                return Some(TypeActivityHandle(0));
-            }
-        }
-        self.slots
-            .iter()
-            .enumerate()
-            .skip(1)
-            .find_map(|(index, slot)| {
-                let registration = slot.registration.get()?;
-                Self::same_type(registration.diagnostic_name, type_name)
-                    .then_some(TypeActivityHandle(index as u8))
-            })
+        self.names.iter().enumerate().find_map(|(index, name)| {
+            Self::same_type(name.get()?, type_name).then_some(TypeActivityHandle(index as u8))
+        })
     }
 
     #[inline]
@@ -698,17 +574,15 @@ impl TypeActivityRegistry {
     }
 
     #[cfg(feature = "metrics")]
-    pub(super) fn lookup_metric_keys(
+    pub(super) fn lookup_metric_key(
         &self,
         handle: TypeActivityHandle,
         is_hit: bool,
-    ) -> (&metrics::Key, &metrics::Key) {
-        let type_key = self
-            .slot(handle)
+    ) -> &metrics::Key {
+        self.slot(handle)
             .registration()
             .lookup_metric_keys
-            .get(is_hit);
-        (self.aggregate_lookup_metric_keys.get(is_hit), type_key)
+            .get(is_hit)
     }
 
     #[inline]
@@ -718,13 +592,6 @@ impl TypeActivityRegistry {
     ) -> super::telemetry::CacheMetricKeys<'_> {
         #[cfg(feature = "metrics")]
         {
-            let aggregate = self.aggregate_event_metric_keys.get_or_init(|| {
-                Box::new(super::telemetry::EventMetricKeys::new(
-                    self.cache_kind,
-                    self.backend_kind,
-                    None,
-                ))
-            });
             let registration = self.slot(handle).registration();
             let by_type = registration.event_metric_keys.get_or_init(|| {
                 Box::new(super::telemetry::EventMetricKeys::new(
@@ -733,7 +600,7 @@ impl TypeActivityRegistry {
                     Some(registration.export_name),
                 ))
             });
-            super::telemetry::CacheMetricKeys::new(aggregate, by_type)
+            super::telemetry::CacheMetricKeys::new(by_type)
         }
         #[cfg(not(feature = "metrics"))]
         {
@@ -757,66 +624,38 @@ impl TypeActivityRegistry {
     }
 
     pub(super) fn record_hit(&self, handle: TypeActivityHandle) {
-        if !handle.is_primary() {
-            self.slot(handle).hits.fetch_add(1, Ordering::Relaxed);
-        }
+        self.slot(handle).hits.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn record_miss(&self, handle: TypeActivityHandle) {
-        if !handle.is_primary() {
-            self.slot(handle).misses.fetch_add(1, Ordering::Relaxed);
-        }
+        self.slot(handle).misses.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn record_lookup_error(&self, handle: TypeActivityHandle) {
-        if !handle.is_primary() {
-            self.slot(handle)
-                .activity
-                .lookup_errors
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        self.slot(handle)
+            .activity
+            .lookup_errors
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn record_type_mismatch(&self, handle: TypeActivityHandle) {
-        if !handle.is_primary() {
-            self.slot(handle)
-                .activity
-                .type_mismatches
-                .fetch_add(1, Ordering::Relaxed);
-        }
+        self.slot(handle)
+            .activity
+            .type_mismatches
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn activity(&self, handle: TypeActivityHandle) -> Option<&ActivityCounters> {
-        (!handle.is_primary()).then_some(&self.slot(handle).activity)
+        Some(&self.slot(handle).activity)
     }
 
-    pub(super) fn snapshot(&self, aggregate: &CacheActivity) -> (Vec<CacheTypeActivity>, u64) {
-        let mut activity = Vec::new();
-        let mut secondary_total = CacheActivity::default();
-        for slot in self.slots.iter().skip(1) {
+    pub(super) fn snapshot(&self) -> (Vec<CacheTypeActivity>, u64) {
+        let mut activity = Vec::with_capacity(self.slots.len() + 1);
+        for slot in self.slots.iter().chain(std::iter::once(&self.other)) {
             if slot.registration.get().is_some() && slot.has_activity() {
-                let snapshot = slot.snapshot();
-                secondary_total.saturating_add_assign(&snapshot);
                 activity.push(CacheTypeActivity {
                     type_name: slot.diagnostic_name().to_string(),
-                    activity: snapshot,
-                });
-            }
-        }
-        if self.other.has_activity() {
-            let snapshot = self.other.snapshot();
-            secondary_total.saturating_add_assign(&snapshot);
-            activity.push(CacheTypeActivity {
-                type_name: self.other.diagnostic_name().to_string(),
-                activity: snapshot,
-            });
-        }
-        if let Some(registration) = self.slots[0].registration.get() {
-            let primary = aggregate.saturating_sub(&secondary_total);
-            if !primary.is_empty() {
-                activity.push(CacheTypeActivity {
-                    type_name: registration.diagnostic_name.to_string(),
-                    activity: primary,
+                    activity: slot.snapshot(),
                 });
             }
         }
@@ -1121,17 +960,15 @@ mod tests {
             CacheMetricsKind::Other,
             CacheBackendKind::Quick,
         );
-        let mut aggregate = CacheActivity::default();
         for index in 0..=capacity {
             let type_name = Box::leak(format!("test.Type{index}").into_boxed_str());
             let slot = registry.get(type_name);
             registry.record_hit(slot);
             #[cfg(feature = "metrics")]
             registry.note_event(slot, CacheMetricsKind::Other, CacheBackendKind::Quick);
-            aggregate.hits += 1;
         }
 
-        let (activity, overflow_events) = registry.snapshot(&aggregate);
+        let (activity, overflow_events) = registry.snapshot();
         assert_eq!(
             activity
                 .iter()
@@ -1164,7 +1001,6 @@ mod tests {
             CacheBackendKind::Quick,
         );
         let first = registry.get("test.First");
-        assert!(registry.aggregate_event_metric_keys.get().is_none());
         assert!(
             registry
                 .slot(first)
@@ -1175,7 +1011,6 @@ mod tests {
         );
 
         registry.event_metric_keys(first);
-        assert!(registry.aggregate_event_metric_keys.get().is_some());
         assert!(
             registry
                 .slot(first)
@@ -1205,9 +1040,8 @@ mod tests {
             let observed = std::panic::catch_unwind(|| {
                 let handle = registry.get("test.Concurrent");
                 for is_hit in [true, false] {
-                    let (aggregate, by_type) = registry.lookup_metric_keys(handle, is_hit);
-                    assert_eq!(aggregate.name(), super::super::telemetry::METRIC_LOOKUPS);
-                    assert_eq!(by_type.name(), super::super::telemetry::METRIC_LOOKUPS);
+                    let key = registry.lookup_metric_key(handle, is_hit);
+                    assert_eq!(key.name(), super::super::telemetry::METRIC_LOOKUPS);
                 }
                 assert_eq!(registry.slot(handle).diagnostic_name(), "test.Concurrent");
             });

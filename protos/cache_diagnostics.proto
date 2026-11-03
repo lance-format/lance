@@ -47,22 +47,44 @@ message CacheBackendDiagnostics {
   }
 
   Kind kind = 1;
+  // Opaque process-local pool identity; absent for uninstrumented custom backends.
   optional uint64 pool_id = 2;
+  // Configured weighted capacity; absent when unknown or unbounded.
   optional uint64 capacity_bytes = 3;
+  // Whether caching is enabled; absent when the backend cannot report it.
   optional bool enabled = 4;
+  // Accounted occupancy; absent when cheap accounting is unsupported.
   optional uint64 size_bytes = 5;
+  // Resident entry count; absent when cheap accounting is unsupported.
   optional uint64 num_entries = 6;
+  // Write submissions, including replacements and rejected candidates; absent if unsupported.
   optional uint64 write_attempts = 7;
+  // Submitted accounted bytes; absent when write accounting is unsupported.
   optional uint64 write_bytes = 8;
+  /*
+   * Size-removal notifications, including never-admitted candidates; absent when
+   * Moka's optional eviction listener is disabled or the backend cannot report them.
+   */
   optional uint64 size_removals = 9;
+  /*
+   * Accounted bytes in size-removal notifications, not freed heap bytes; absent
+   * when Moka's optional eviction listener is disabled or the backend cannot report them.
+   */
   optional uint64 size_removed_bytes = 10;
+  // Explicit writes to a disabled cache; absent when the backend cannot identify them.
   optional uint64 disabled_write_rejections = 11;
+  // Loads bypassing disabled caching; absent when the backend cannot identify them.
   optional uint64 disabled_bypasses = 12;
+  // Loader submissions with superseded Quick placeholders; absent if unsupported.
   optional uint64 lost_placeholder_rejections = 13;
+  // Sizes exceeding the backend's weight representation; absent if unsupported.
   optional uint64 weight_saturations = 14;
   bool write_rejections_complete = 15;
+  // Proven resident-capacity evictions; absent if indistinguishable from admission rejection.
   optional uint64 resident_evictions = 16;
+  // Proven policy admissions; absent when the backend cannot prove admission.
   optional uint64 admissions = 17;
+  // Exact shared-load observations; absent for both built-ins, which cannot always identify sharing.
   optional uint64 coalesced_loads = 18;
 }
 
@@ -93,6 +115,7 @@ message CacheByTypeDiagnostics {
 message CacheDiagnosticsSnapshot {
   CacheActivityDiagnostics activity = 1;
   CacheBackendDiagnostics backend = 2;
+  // Occupancy / capacity; absent for zero or unknown capacity, or unavailable occupancy.
   optional double utilization = 3;
   // Present only when the caller explicitly requests a per-type scan.
   CacheByTypeDiagnostics by_type = 4;

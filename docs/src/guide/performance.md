@@ -260,8 +260,8 @@ writes, loaders, and activity from other operations sharing the session.
 
 Metrics exporters also publish `lance_cache_warm_attempts_total`, `lance_cache_warm_hits_total`,
 `lance_cache_warm_loads_total` (labelled by outcome), `lance_cache_warm_load_bytes_total`, and
-`lance_cache_warm_errors_total`. Each has an aggregate series and bounded per-type series. The
-warm counters do not reset when a cache is cleared.
+`lance_cache_warm_errors_total`. Each carries a bounded `type` label; sum over it for aggregate
+activity. The warm counters do not reset when a cache is cleared.
 
 `size_bytes`, `capacity_bytes`, write bytes, and removal bytes are cache-policy weights. They include key
 accounting and can count a shared allocation for each entry that references it. They are different from

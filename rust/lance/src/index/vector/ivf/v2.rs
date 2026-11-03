@@ -2425,7 +2425,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         if self.caches_partition_codes() {
             return self.prewarm_partition_codes_window(partitions).await;
         }
-        let index_cache = self.raw_cache.with_load_origin(CacheLoadOrigin::Warm);
+        let index_cache = self.index_cache.with_load_origin(CacheLoadOrigin::Warm);
         let index_schema = Arc::new(match &self.read_projection {
             Some(projection) => projection.schema.as_ref().into(),
             None => self.reader.schema().as_ref().into(),
@@ -2550,16 +2550,16 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// holds nothing to warm, and the index loaded the resident store when
     /// it opened.
     async fn prewarm_partition_codes_window(&self, partitions: Range<usize>) -> Result<()> {
-        let index_cache = self.index_cache.with_load_origin(CacheLoadOrigin::Warm);
+        let raw_cache = self.raw_cache.with_load_origin(CacheLoadOrigin::Warm);
         let projection = self.storage.partition_codes_projection()?;
         let schema: arrow_schema::SchemaRef = Arc::new(projection.schema.as_ref().into());
         let mut partition_id = partitions.start;
         while partition_id < partitions.end {
             let cached = |partition| {
-                let index_cache = &index_cache;
+                let raw_cache = &raw_cache;
                 async move {
                     let key = PartitionCodesKey { partition };
-                    index_cache.get_with_key(&key).await.is_some()
+                    raw_cache.get_with_key(&key).await.is_some()
                 }
             };
             if cached(partition_id).await {
@@ -2593,7 +2593,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     !shares_resident_store(&codes.0),
                     "prewarmed codes of partition {partition} hold memory of a resident store"
                 );
-                index_cache
+                raw_cache
                     .get_or_insert_with_key(
                         PartitionCodesKey { partition },
                         || async move { Ok(codes) },

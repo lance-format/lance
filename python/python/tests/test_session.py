@@ -147,6 +147,52 @@ def test_cache_diagnostics_reports_both_cache_tiers(refresh: bool, by_type: bool
     assert session.index_cache_size_bytes() == 0
 
 
+@pytest.mark.parametrize("backend", ["quick", "moka"])
+def test_cache_diagnostics_after_indexed_reads(tmp_path: Path, backend: str):
+    data = pa.table({"a": range(32)})
+    dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=8)
+    dataset.create_scalar_index("a", "BTREE")
+    session = (
+        lance.Session()
+        if backend == "quick"
+        else lance.Session(index_cache_backend="moka://?capacity=1048576")
+    )
+    dataset = lance.dataset(tmp_path, session=session)
+    assert len(dataset.get_fragments()) == 4
+
+    assert dataset.to_table(filter="a = 7") == data.slice(7, 1)
+    first = session.cache_diagnostics(refresh=True)
+    assert dataset.to_table(filter="a = 7") == data.slice(7, 1)
+    second = session.cache_diagnostics(refresh=True, by_type=True)
+
+    for tier in ("metadata", "index"):
+        cache = second[tier]
+        activity = cache["activity"]
+        assert activity["hits"] > first[tier]["activity"]["hits"]
+        assert activity["misses"] > 0
+        assert activity["loads_started"] == activity["loads_succeeded"] > 0
+        assert activity["load_success_duration_ns"] > 0
+        for field in (
+            "lookup_errors",
+            "loads_failed",
+            "loads_cancelled",
+            "loads_in_flight",
+        ):
+            assert activity[field] == 0
+        rows = cache["by_type"]["activity"]
+        assert rows
+        for field in ("hits", "misses", "loads_started", "loads_succeeded"):
+            assert sum(row[field] for row in rows.values()) == activity[field]
+        occupancy = cache["by_type"]["occupancy"]
+        assert occupancy["types"]
+        assert sum(row["num_entries"] for row in occupancy["types"].values()) > 0
+        assert cache["backend"]["write_attempts"] > 0
+        assert cache["backend"]["size_bytes"] > 0
+    assert second["index"]["backend"]["kind"] == backend
+    assert second["metadata"]["backend"]["kind"] == "quick"
+    assert second["index"]["backend"]["size_bytes"] == session.index_cache_size_bytes()
+
+
 def test_cache_backend_rejects_size_and_backend():
     with pytest.raises(
         ValueError,

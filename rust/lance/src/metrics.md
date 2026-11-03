@@ -49,8 +49,8 @@ but not throttle/retryable counts.
 ## Cache metrics
 
 Cache activity metrics use bounded labels. `cache` is `index`, `metadata`, or
-`other`; `backend` is `quick`, `moka`, or `custom`. Each activity event updates
-the aggregate series and a second series with its stable cache-key `type`.
+`other`; `backend` is `quick`, `moka`, or `custom`. Activity series always carry
+a stable cache-key `type`; sum over this label for aggregate activity.
 Lance retains at most 64 exported type names process-wide; later names use
 `type="other"` and increment `lance_cache_type_overflow_total`. Physical backend
 metrics do not have a `cache` label because multiple logical cache wrappers can
@@ -58,17 +58,17 @@ share one physical pool.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `lance_cache_lookups_total` | counter | `cache`, `backend`, `outcome`, optional `type` | Lookups whose outcome is `hit` or `miss`. A caller that shares another caller's load is a hit because its loader was skipped. |
-| `lance_cache_lookup_errors_total` | counter | `cache`, `backend`, `reason`, optional `type` | Lookup failures. Known reasons are `load` and `type_mismatch`. |
-| `lance_cache_loads_total` | counter | `cache`, `backend`, `outcome`, optional `type` | Loaders that actually ran, with outcome `success`, `error`, or `cancelled`. Waiters sharing a load do not increment this counter. |
-| `lance_cache_loads_in_flight` | gauge | `cache`, `backend`, optional `type` | Loaders currently executing. |
-| `lance_cache_load_duration_seconds` | histogram | `cache`, `backend`, `outcome`, optional `type` | Time spent executing loaders. It excludes time in callers whose loaders were skipped. |
+| `lance_cache_lookups_total` | counter | `cache`, `backend`, `outcome`, `type` | Lookups whose outcome is `hit` or `miss`. A caller that shares another caller's load is a hit because its loader was skipped. |
+| `lance_cache_lookup_errors_total` | counter | `cache`, `backend`, `reason`, `type` | Lookup failures. Known reasons are `load` and `type_mismatch`. |
+| `lance_cache_loads_total` | counter | `cache`, `backend`, `outcome`, `type` | Loaders that actually ran, with outcome `success`, `error`, or `cancelled`. Waiters sharing a load do not increment this counter. |
+| `lance_cache_loads_in_flight` | gauge | `cache`, `backend`, `type` | Loaders currently executing. |
+| `lance_cache_load_duration_seconds` | histogram | `cache`, `backend`, `outcome`, `type` | Time spent executing loaders. It excludes time in callers whose loaders were skipped. |
 | `lance_cache_coalesced_loads_total` | counter | `backend` | Reserved for backends that can prove a caller received another loader's result. Neither built-in backend emits samples. |
-| `lance_cache_warm_attempts_total` | counter | `cache`, `backend`, optional `type` | Cache calls made through explicit prewarm-origin handles. |
-| `lance_cache_warm_hits_total` | counter | `cache`, `backend`, optional `type` | Prewarm calls served without new materialization. |
-| `lance_cache_warm_loads_total` | counter | `cache`, `backend`, `outcome`, optional `type` | Prewarm materializations, including direct insertions, by outcome. |
-| `lance_cache_warm_load_bytes_total` | counter | `cache`, `backend`, optional `type` | Accounted bytes successfully materialized by prewarming. |
-| `lance_cache_warm_errors_total` | counter | `cache`, `backend`, optional `type` | Failed explicit prewarm cache calls. |
+| `lance_cache_warm_attempts_total` | counter | `cache`, `backend`, `type` | Cache calls made through explicit prewarm-origin handles. |
+| `lance_cache_warm_hits_total` | counter | `cache`, `backend`, `type` | Prewarm calls served without new materialization. |
+| `lance_cache_warm_loads_total` | counter | `cache`, `backend`, `outcome`, `type` | Prewarm materializations, including direct insertions, by outcome. |
+| `lance_cache_warm_load_bytes_total` | counter | `cache`, `backend`, `type` | Accounted bytes successfully materialized by prewarming. |
+| `lance_cache_warm_errors_total` | counter | `cache`, `backend`, `type` | Failed explicit prewarm cache calls. |
 | `lance_cache_type_overflow_total` | counter | `cache`, `backend` | Activity events assigned to `type="other"` after the exported type-name bound is reached. |
 | `lance_cache_write_attempts_total` | counter | `backend` | Physical write submissions, including replacements and candidates that were not admitted. |
 | `lance_cache_write_bytes_total` | counter | `backend` | Accounted weight submitted by write attempts. |
@@ -95,8 +95,12 @@ these gauges.
 Event counters and histograms begin when a recorder is installed. Native cache
 diagnostics retain lifetime counts even when the recorder is installed later.
 The gauges report current state at refresh time, so they do not need event
-history. Do not sum the aggregate activity series with the corresponding
-type-labelled series; they are two views of the same events.
+history. Summing the `type` series yields aggregate activity.
+
+Resident-only reads, reads without promotion, and selected-row reads count as
+native diagnostics and exported lookups. Residency and tier probes (`peek_*`)
+do not record activity. The legacy `CacheStats` and `index_cache_hit_rate`
+remain limited to `get`, `get_unsized`, and `get_or_insert`.
 
 Cache byte metrics are policy weights. They include key accounting and can count
 shared allocations once per entry. They do not represent process RSS, heap bytes

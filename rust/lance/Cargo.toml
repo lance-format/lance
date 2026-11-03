@@ -108,6 +108,8 @@ pprof.workspace = true
 lzma-sys = { version = "0.1" }
 
 [dev-dependencies]
+metrics.workspace = true
+metrics-util.workspace = true
 lance-test-macros = { workspace = true }
 lance-datagen = { workspace = true }
 lance-datafusion = { workspace = true, features = ["datagen"] }

@@ -48,6 +48,7 @@ struct RemovalSummary {
     count: u64,
     bytes: u128,
     first: Option<(InternalCacheKey, u64, u64)>,
+    retained: [Option<QuickEntry>; 2],
 }
 
 impl RemovalSummary {
@@ -68,6 +69,8 @@ impl RemovalSummary {
         if self.count > 0 {
             metrics.size_removal(self.count, self.bytes.try_into().unwrap_or(u64::MAX));
         }
+        // `retained` is dropped here, after quick_cache has released the shard
+        // write lock for insert_with_lifecycle and returned this request state.
     }
 }
 
@@ -85,6 +88,11 @@ impl quick_cache::Lifecycle<InternalCacheKey, QuickEntry> for EntryLifecycle {
         }
         state.count += 1;
         state.bytes += weight as u128;
+        if state.retained[0].is_none() {
+            state.retained[0] = Some(value);
+        } else if state.retained[1].is_none() {
+            state.retained[1] = Some(value);
+        }
     }
 
     fn end_request(&self, state: RemovalSummary) {
@@ -93,6 +101,8 @@ impl quick_cache::Lifecycle<InternalCacheKey, QuickEntry> for EntryLifecycle {
 }
 
 pub struct QuickCacheBackend {
+    #[cfg(test)]
+    priority_snapshot_pause: Option<(std::sync::Barrier, std::sync::Barrier)>,
     cache: quick_cache::sync::Cache<
         InternalCacheKey,
         QuickEntry,
@@ -214,6 +224,8 @@ impl QuickCacheBackend {
             EntryLifecycle(metrics.clone()),
         );
         Self {
+            #[cfg(test)]
+            priority_snapshot_pause: None,
             cache,
             capacity,
             metrics,
@@ -241,8 +253,21 @@ impl QuickCacheBackend {
                 // Metadata and existing entries compete with signs, ahead of ex planes.
                 // Reserving the whole budget for planes would otherwise evict the IVF model.
                 let existing: Vec<_> = self.cache.iter().collect();
+                #[cfg(test)]
+                if let Some((snapshotted, resume)) = &self.priority_snapshot_pause {
+                    snapshotted.wait();
+                    resume.wait();
+                }
                 for (key, value) in existing {
-                    self.cache.remove(&key);
+                    // A concurrent eviction and reload may have replaced this
+                    // snapshot with a new value or single-flight placeholder.
+                    if self
+                        .cache
+                        .remove_if(&key, |current| current.submission_id == value.submission_id)
+                        .is_none()
+                    {
+                        continue;
+                    }
                     let size = key_footprint(&key).saturating_add(value.size_bytes);
                     dropped.extend(entries.insert(key, value, size, 3, self.capacity));
                 }
@@ -454,6 +479,15 @@ impl CacheBackend for QuickCacheBackend {
     }
 
     async fn get(&self, key: &InternalCacheKey, codec: Option<CacheCodec>) -> Option<CacheEntry> {
+        self.get_entry(key, codec)
+    }
+
+    async fn get_with_context(
+        &self,
+        key: &InternalCacheKey,
+        codec: Option<CacheCodec>,
+        _context: CacheOperationContext,
+    ) -> Option<CacheEntry> {
         self.get_entry(key, codec)
     }
 
@@ -1222,6 +1256,85 @@ mod tests {
                 .await
                 .is_some();
         assert!(hit, "recently inserted entries should be resident");
+    }
+
+    #[test]
+    fn evicted_quick_values_drop_after_the_request_ends() {
+        struct DropProbe(Arc<AtomicUsize>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let lifecycle = EntryLifecycle(Arc::new(BackendCounters::new(
+            CacheBackendKind::Quick,
+            true,
+        )));
+        let key = InternalCacheKey::from_bytes([1; 16]);
+        let value = QuickEntry {
+            entry: Arc::new(DropProbe(drops.clone())),
+            size_bytes: 8,
+            submission_id: 1,
+            type_name: None,
+        };
+        let mut summary = quick_cache::Lifecycle::begin_request(&lifecycle);
+        quick_cache::Lifecycle::on_evict(&lifecycle, &mut summary, key, value);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "the lifecycle callback must retain evicted values"
+        );
+        summary.finish(&lifecycle.0, None);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[rstest::rstest]
+    #[case::placeholder(true)]
+    #[case::replacement(false)]
+    #[test]
+    fn priority_transition_preserves_entries_reopened_after_snapshot(#[case] is_loading: bool) {
+        let mut backend = QuickCacheBackend::with_capacity(4096);
+        backend.priority_snapshot_pause =
+            Some((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        let key = InternalCacheKey::from_bytes([1; 16]);
+        let entry = |submission_id| QuickEntry {
+            entry: Arc::new(submission_id),
+            size_bytes: 8,
+            submission_id,
+            type_name: None,
+        };
+        backend.cache.insert(key, entry(1));
+
+        std::thread::scope(|scope| {
+            let transition = scope.spawn(|| {
+                backend.admit_priority(InternalCacheKey::from_bytes([2; 16]), entry(2), 3, 0);
+            });
+            let (snapshotted, resume) = backend.priority_snapshot_pause.as_ref().unwrap();
+            snapshotted.wait();
+            backend.cache.remove(&key);
+            let guard = if is_loading {
+                Some(
+                    futures::executor::block_on(backend.cache.get_value_or_guard_async(&key))
+                        .err()
+                        .unwrap(),
+                )
+            } else {
+                backend.cache.insert(key, entry(3));
+                None
+            };
+            resume.wait();
+            transition.join().unwrap();
+            assert!(!backend.priority.lock().unwrap().contains(&key));
+            if let Some(guard) = guard {
+                assert!(
+                    guard.insert(entry(3)).is_ok(),
+                    "priority transition removed a new loader's placeholder"
+                );
+            }
+        });
     }
 
     #[tokio::test]

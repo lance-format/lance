@@ -556,7 +556,11 @@ mod tests {
     use lance_core::cache::{CacheKey, UnsizedCacheKey};
     use lance_core::deepsize::Context;
     use lance_index::vector::VectorIndex;
+    #[cfg(feature = "metrics")]
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use std::borrow::Cow;
+    #[cfg(feature = "metrics")]
+    use std::process::Command;
     use tokio::io::AsyncWriteExt;
 
     struct TestKey(&'static str);
@@ -605,6 +609,74 @@ mod tests {
         assert_eq!(index_by_type.occupancy.unwrap().types[0].num_entries, 1);
         let legacy = session.index_cache_stats().await;
         assert_eq!((legacy.hits, legacy.misses, legacy.num_entries), (1, 2, 1));
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn test_session_cache_metric_labels_have_exact_cache_role() {
+        const NAME: &str = "session::tests::test_session_cache_metric_labels_have_exact_cache_role";
+        if std::env::var("LANCE_SESSION_METRICS_TEST").as_deref() != Ok(NAME) {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env("LANCE_SESSION_METRICS_TEST", NAME)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let session = Session::new(4096, 4096, Default::default());
+            runtime.block_on(async {
+                assert!(
+                    session
+                        .index_cache
+                        .0
+                        .get_with_key(&TestKey("metrics-index"))
+                        .await
+                        .is_none()
+                );
+                assert!(
+                    session
+                        .metadata_cache
+                        .0
+                        .get_with_key(&TestKey("metrics-metadata"))
+                        .await
+                        .is_none()
+                );
+            });
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        for cache in ["index", "metadata"] {
+            assert!(
+                snapshot.iter().any(|(key, _, _, value)| {
+                    let key = key.key();
+                    let labels = key
+                        .labels()
+                        .map(|label| (label.key(), label.value()))
+                        .collect::<Vec<_>>();
+                    key.name() == lance_core::cache::telemetry::METRIC_LOOKUPS
+                        && labels.len() == 4
+                        && labels.contains(&("cache", cache))
+                        && labels.contains(&("backend", "quick"))
+                        && labels.contains(&("type", "Test"))
+                        && labels.contains(&("outcome", "miss"))
+                        && matches!(value, DebugValue::Counter(1))
+                }),
+                "missing exact activity labels for {cache}"
+            );
+        }
     }
 
     struct TestUnsizedKey(&'static str);

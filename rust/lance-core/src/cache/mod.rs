@@ -239,6 +239,8 @@ struct CacheState {
     misses: AtomicU64,
     hits_at_clear: AtomicU64,
     misses_at_clear: AtomicU64,
+    native_hits: std::sync::atomic::AtomicU64,
+    native_misses: std::sync::atomic::AtomicU64,
     activity: diagnostics::ActivityCounters,
     type_activity: diagnostics::TypeActivityRegistry,
     entry_size_accessors: RwLock<HashMap<TypeId, CacheEntrySizeAccessor>>,
@@ -258,6 +260,8 @@ impl CacheState {
             misses: AtomicU64::new(0),
             hits_at_clear: AtomicU64::new(0),
             misses_at_clear: AtomicU64::new(0),
+            native_hits: std::sync::atomic::AtomicU64::new(0),
+            native_misses: std::sync::atomic::AtomicU64::new(0),
             activity: Default::default(),
             type_activity: diagnostics::TypeActivityRegistry::new(cache_kind, backend_kind),
             entry_size_accessors: RwLock::new(HashMap::new()),
@@ -267,26 +271,38 @@ impl CacheState {
     #[inline]
     fn record_hit(&self, by_type: diagnostics::TypeActivityHandle) {
         self.hits.fetch_add(1, Ordering::Relaxed);
+        self.record_native_hit(by_type);
+    }
+
+    #[inline]
+    fn record_native_hit(&self, by_type: diagnostics::TypeActivityHandle) {
+        self.native_hits.fetch_add(1, Ordering::Relaxed);
         self.type_activity.record_hit(by_type);
         #[cfg(feature = "metrics")]
         {
             self.type_activity
                 .note_event(by_type, self.cache_kind, self.backend_kind);
-            let (aggregate_key, type_key) = self.type_activity.lookup_metric_keys(by_type, true);
-            telemetry::lookup(aggregate_key, type_key);
+            let type_key = self.type_activity.lookup_metric_key(by_type, true);
+            telemetry::lookup(type_key);
         }
     }
 
     #[inline]
     fn record_miss(&self, by_type: diagnostics::TypeActivityHandle) {
         self.misses.fetch_add(1, Ordering::Relaxed);
+        self.record_native_miss(by_type);
+    }
+
+    #[inline]
+    fn record_native_miss(&self, by_type: diagnostics::TypeActivityHandle) {
+        self.native_misses.fetch_add(1, Ordering::Relaxed);
         self.type_activity.record_miss(by_type);
         #[cfg(feature = "metrics")]
         {
             self.type_activity
                 .note_event(by_type, self.cache_kind, self.backend_kind);
-            let (aggregate_key, type_key) = self.type_activity.lookup_metric_keys(by_type, false);
-            telemetry::lookup(aggregate_key, type_key);
+            let type_key = self.type_activity.lookup_metric_key(by_type, false);
+            telemetry::lookup(type_key);
         }
     }
 
@@ -614,7 +630,7 @@ impl LanceCache {
     pub async fn diagnostics_by_type(&self, mode: CacheSnapshotMode) -> CacheDiagnostics {
         let (backend, occupancy) = self.state.backend.diagnostics_with_types(mode).await;
         let aggregate = self.activity_snapshot();
-        let (activity, type_label_overflow_events) = self.state.type_activity.snapshot(&aggregate);
+        let (activity, type_label_overflow_events) = self.state.type_activity.snapshot();
         CacheDiagnostics::with_by_type(
             aggregate,
             backend,
@@ -628,8 +644,8 @@ impl LanceCache {
 
     fn activity_snapshot(&self) -> CacheActivity {
         self.state.activity.snapshot(
-            self.state.hits.load(Ordering::Relaxed),
-            self.state.misses.load(Ordering::Relaxed),
+            self.state.native_hits.load(Ordering::Relaxed),
+            self.state.native_misses.load(Ordering::Relaxed),
         )
     }
 
@@ -670,13 +686,11 @@ impl LanceCache {
         K: CacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
+        let by_type = self.state.type_activity.get(K::stable_type_id());
+        self.state.record_warm_attempt(by_type, self.origin);
         let key = self.sized_key(cache_key);
-        self.state
-            .backend
-            .get_resident(&key)
-            .await?
-            .downcast::<K::ValueType>()
-            .ok()
+        let entry = self.state.backend.get_resident(&key).await;
+        self.lookup_result(entry, by_type, K::stable_type_id(), false)
     }
 
     /// Report whether an entry is resident without counting as an access.
@@ -706,13 +720,15 @@ impl LanceCache {
         K: CacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
+        let by_type = self.state.type_activity.get(K::stable_type_id());
+        self.state.record_warm_attempt(by_type, self.origin);
         let key = self.sized_key(cache_key);
-        self.state
+        let entry = self
+            .state
             .backend
             .get_without_promotion(&key, cache_key.codec_for_key())
-            .await?
-            .downcast::<K::ValueType>()
-            .ok()
+            .await;
+        self.lookup_result(entry, by_type, K::stable_type_id(), false)
     }
 
     /// Read selected rows from a persistent entry without memory admission.
@@ -725,12 +741,14 @@ impl LanceCache {
         K: CacheKey,
         K::ValueType: DeepSizeOf + Send + Sync + 'static,
     {
-        self.state
+        let by_type = self.state.type_activity.get(K::stable_type_id());
+        self.state.record_warm_attempt(by_type, self.origin);
+        let entry = self
+            .state
             .backend
             .get_rows(&self.sized_key(cache_key), rows, cache_key.codec_for_key())
-            .await?
-            .downcast::<K::ValueType>()
-            .ok()
+            .await;
+        self.lookup_result(entry, by_type, K::stable_type_id(), false)
     }
 
     pub async fn get_with_key<K>(&self, cache_key: &K) -> Option<Arc<K::ValueType>>
@@ -741,18 +759,40 @@ impl LanceCache {
         let by_type = self.state.type_activity.get(K::stable_type_id());
         self.state.record_warm_attempt(by_type, self.origin);
         let key = self.sized_key(cache_key);
-        let Some(entry) = self
+        let entry = self
             .state
             .backend
-            .get(&key, cache_key.codec_for_key())
-            .await
-        else {
-            self.state.record_miss(by_type);
+            .get_with_context(
+                &key,
+                cache_key.codec_for_key(),
+                CacheOperationContext::new(K::stable_type_id(), self.origin),
+            )
+            .await;
+        self.lookup_result(entry, by_type, K::stable_type_id(), true)
+    }
+
+    fn lookup_result<T: Send + Sync + 'static>(
+        &self,
+        entry: Option<CacheEntry>,
+        by_type: diagnostics::TypeActivityHandle,
+        type_name: &'static str,
+        count_legacy: bool,
+    ) -> Option<Arc<T>> {
+        let Some(entry) = entry else {
+            if count_legacy {
+                self.state.record_miss(by_type);
+            } else {
+                self.state.record_native_miss(by_type);
+            }
             return None;
         };
-        match entry.downcast::<K::ValueType>() {
+        match entry.downcast::<T>() {
             Ok(value) => {
-                self.state.record_hit(by_type);
+                if count_legacy {
+                    self.state.record_hit(by_type);
+                } else {
+                    self.state.record_native_hit(by_type);
+                }
                 self.state.record_warm_hit(by_type, self.origin);
                 Some(value)
             }
@@ -762,9 +802,13 @@ impl LanceCache {
                 // intermediate state). Treat as a miss.
                 log::warn!(
                     "cache backend returned a value with the wrong concrete type for key type {:?}",
-                    K::stable_type_id()
+                    type_name
                 );
-                self.state.record_miss(by_type);
+                if count_legacy {
+                    self.state.record_miss(by_type);
+                } else {
+                    self.state.record_native_miss(by_type);
+                }
                 self.state.record_type_mismatch(by_type, self.origin);
                 None
             }
@@ -1019,7 +1063,16 @@ impl LanceCache {
         let by_type = self.state.type_activity.get(K::stable_type_id());
         self.state.record_warm_attempt(by_type, self.origin);
         let key = self.unsized_key(cache_key);
-        let Some(entry) = self.state.backend.get(&key, None).await else {
+        let Some(entry) = self
+            .state
+            .backend
+            .get_with_context(
+                &key,
+                None,
+                CacheOperationContext::new(K::stable_type_id(), self.origin),
+            )
+            .await
+        else {
             self.state.record_miss(by_type);
             return None;
         };
@@ -1621,10 +1674,21 @@ mod tests {
     #[derive(Debug, Default)]
     struct HashMapBackend {
         entries: tokio::sync::Mutex<HashMap<InternalCacheKey, (CacheEntry, usize)>>,
+        lookup_contexts: tokio::sync::Mutex<Vec<CacheOperationContext>>,
     }
 
     #[async_trait::async_trait]
     impl CacheBackend for HashMapBackend {
+        async fn get_with_context(
+            &self,
+            key: &InternalCacheKey,
+            codec: Option<CacheCodec>,
+            context: CacheOperationContext,
+        ) -> Option<CacheEntry> {
+            self.lookup_contexts.lock().await.push(context);
+            self.get(key, codec).await
+        }
+
         async fn get(
             &self,
             key: &InternalCacheKey,
@@ -2064,6 +2128,58 @@ mod tests {
     #[case::moka(TestBackendKind::Moka)]
     #[case::quick(TestBackendKind::Quick)]
     #[tokio::test]
+    async fn specialized_reads_extend_diagnostics_without_changing_legacy_stats(
+        #[case] kind: TestBackendKind,
+    ) {
+        let cache = kind.cache(4096);
+        let key = TestKey::new(1);
+        cache.insert_with_key(&key, Arc::new(vec![1])).await;
+        let legacy_before = cache.stats().await;
+        let native_before = cache.diagnostics().activity;
+
+        assert!(cache.get_resident_with_key(&key).await.is_some());
+        assert!(cache.get_without_promotion_with_key(&key).await.is_some());
+        assert!(cache.get_rows_with_key(&key, &[0]).await.is_none());
+
+        let legacy_after = cache.stats().await;
+        let native_after = cache.diagnostics().activity;
+        assert_eq!(
+            (legacy_after.hits, legacy_after.misses),
+            (legacy_before.hits, legacy_before.misses)
+        );
+        assert_eq!(
+            (native_after.hits, native_after.misses),
+            (native_before.hits + 2, native_before.misses + 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_lookups_forward_context_to_custom_backends() {
+        let backend = Arc::new(HashMapBackend::default());
+        let cache = LanceCache::with_backend(backend.clone());
+        let warm = cache.with_load_origin(CacheLoadOrigin::Warm);
+        assert!(cache.get_with_key(&TestKey::new(1)).await.is_none());
+        assert!(
+            warm.get_unsized_with_key(&LegacyUnsizedBridgeKey("missing"))
+                .await
+                .is_none()
+        );
+
+        let contexts = backend.lookup_contexts.lock().await;
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(contexts[0].type_name(), Some(TestKey::stable_type_id()));
+        assert_eq!(contexts[0].origin(), CacheLoadOrigin::Demand);
+        assert_eq!(
+            contexts[1].type_name(),
+            Some(LegacyUnsizedBridgeKey::stable_type_id())
+        );
+        assert_eq!(contexts[1].origin(), CacheLoadOrigin::Warm);
+    }
+
+    #[rstest::rstest]
+    #[case::moka(TestBackendKind::Moka)]
+    #[case::quick(TestBackendKind::Quick)]
+    #[tokio::test]
     async fn legacy_clear_watermarks_ignore_older_samples(#[case] kind: TestBackendKind) {
         let cache = kind.cache(4096);
         for _ in 0..2 {
@@ -2387,6 +2503,17 @@ mod tests {
         assert_eq!(warm_activity.errors, 1);
         assert!(warm_activity.load_bytes > 0);
         let by_type = snapshot.by_type.unwrap();
+        let second = &by_type
+            .activity
+            .iter()
+            .find(|row| row.type_name == "test.SecondVecU32")
+            .unwrap()
+            .activity
+            .warm;
+        assert_eq!(second.attempts, 1);
+        assert_eq!(second.loads_started, 1);
+        assert_eq!(second.loads_succeeded, 1);
+        assert_eq!(second.load_bytes, cache_entry_size(&vec![3_u32]) as u64);
         assert_eq!(
             by_type
                 .activity

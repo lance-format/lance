@@ -204,17 +204,17 @@ public final class CacheDiagnostics {
       this.proto = proto;
     }
 
-    /** Returns successful cache lookups. */
+    /** Returns successful lookups whose loader was skipped, including shared loads. */
     public long getHits() {
       return proto.getHits();
     }
 
-    /** Returns cache lookups that did not find a value. */
+    /** Returns absent entries, executed successful loads, and type mismatches. */
     public long getMisses() {
       return proto.getMisses();
     }
 
-    /** Returns cache lookups that failed before loading a value. */
+    /** Returns failed backend calls and type mismatches, including propagated loader errors. */
     public long getLookupErrors() {
       return proto.getLookupErrors();
     }
@@ -313,7 +313,7 @@ public final class CacheDiagnostics {
       return proto.getLoadBytes();
     }
 
-    /** Returns failed warm cache calls, including loader failures. */
+    /** Returns failed warm cache calls, including loader failures and type mismatches. */
     public long getErrors() {
       return proto.getErrors();
     }
@@ -386,12 +386,20 @@ public final class CacheDiagnostics {
       return optionalLong(proto.hasWriteBytes(), proto.getWriteBytes());
     }
 
-    /** Returns cumulative removals caused by weighted capacity, when available. */
+    /**
+     * Returns size-removal notifications, including never-admitted candidates.
+     *
+     * <p>Empty when Moka's optional eviction listener is disabled or the backend cannot report it.
+     */
     public OptionalLong getSizeRemovals() {
       return optionalLong(proto.hasSizeRemovals(), proto.getSizeRemovals());
     }
 
-    /** Returns cumulative weight removed because of capacity, when available. */
+    /**
+     * Returns accounted bytes in size-removal notifications, not freed heap bytes.
+     *
+     * <p>Empty when Moka's optional eviction listener is disabled or the backend cannot report it.
+     */
     public OptionalLong getSizeRemovedBytes() {
       return optionalLong(proto.hasSizeRemovedBytes(), proto.getSizeRemovedBytes());
     }

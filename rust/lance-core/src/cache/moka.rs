@@ -303,6 +303,15 @@ impl CacheBackend for MokaCacheBackend {
         self.cache.get(key).await.map(|r| r.entry)
     }
 
+    async fn get_with_context(
+        &self,
+        key: &InternalCacheKey,
+        _codec: Option<CacheCodec>,
+        _context: CacheOperationContext,
+    ) -> Option<CacheEntry> {
+        self.cache.get(key).await.map(|r| r.entry)
+    }
+
     async fn insert(
         &self,
         key: &InternalCacheKey,

@@ -32,19 +32,21 @@ impl PostingListReader {
         for token_id in 0..self.len() as u32 {
             if let Some((start, end)) = self.group_range_for_token(token_id) {
                 if seen_groups.insert((start, end))
-                    && self
+                    && !self
                         .index_cache
-                        .get_with_key(&posting_list_group_cache_key(start, end, self.has_impacts))
+                        .peek_resident_with_key(&posting_list_group_cache_key(
+                            start,
+                            end,
+                            self.has_impacts,
+                        ))
                         .await
-                        .is_none()
                 {
                     return false;
                 }
-            } else if self
+            } else if !self
                 .index_cache
-                .get_with_key(&posting_list_cache_key(token_id, self.has_impacts))
+                .peek_resident_with_key(&posting_list_cache_key(token_id, self.has_impacts))
                 .await
-                .is_none()
             {
                 return false;
             }
@@ -54,11 +56,10 @@ impl PostingListReader {
 
     async fn positions_resident_now(&self) -> bool {
         for token_id in 0..self.len() as u32 {
-            if self
+            if !self
                 .index_cache
-                .get_with_key(&PositionKey { token_id })
+                .peek_resident_with_key(&PositionKey { token_id })
                 .await
-                .is_none()
             {
                 return false;
             }
