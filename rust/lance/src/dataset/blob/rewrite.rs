@@ -346,6 +346,7 @@ enum BlobV2FieldRewritePlan {
         output_field: Arc<ArrowField>,
     },
     Blob {
+        sidecars: Option<Arc<super::SidecarCopy>>,
         field_id: u32,
         field_name: String,
         output_field: Arc<ArrowField>,
@@ -428,6 +429,7 @@ impl BlobV2FieldRewritePlan {
                 }
             };
             return Ok(Self::Blob {
+                sidecars: None,
                 field_id,
                 field_name: field.name.clone(),
                 output_field,
@@ -524,6 +526,7 @@ impl BlobV2FieldRewritePlan {
             match self {
                 Self::Passthrough { .. } => Ok(array),
                 Self::Blob {
+                    sidecars,
                     field_id,
                     field_name,
                     output_field,
@@ -533,6 +536,9 @@ impl BlobV2FieldRewritePlan {
                         Some(BlobV2Layout::Logical) => Ok(array),
                         Some(BlobV2Layout::Descriptor) => {
                             if matches!(output_field.data_type(), ArrowDataType::Struct(fields) if BlobV2Layout::classify(fields) == Some(BlobV2Layout::Prepared)) {
+                                if let Some(sidecars) = sidecars {
+                                    return sidecars.prepare(dataset, *field_id, struct_arr, &row_addrs, output_field).await;
+                                }
                                 return preserve_managed_descriptors(dataset, *field_id, struct_arr, &row_addrs, output_field, None).await;
                             }
                             let descriptor =
@@ -738,6 +744,32 @@ impl BlobV2BatchRewritePlan {
                 input_schema.metadata().clone(),
             )),
         })
+    }
+
+    /// Build the prepared rewrite used by ordinary sidecar compaction.
+    pub(in crate::dataset) fn with_sidecar_copy(
+        mut self,
+        sidecars: Arc<super::SidecarCopy>,
+    ) -> Self {
+        fn configure(plan: &mut BlobV2FieldRewritePlan, sidecars: &Arc<super::SidecarCopy>) {
+            match plan {
+                BlobV2FieldRewritePlan::Blob {
+                    sidecars: context, ..
+                } => *context = Some(sidecars.clone()),
+                BlobV2FieldRewritePlan::Struct { children, .. } => {
+                    for child in children {
+                        configure(child, sidecars);
+                    }
+                }
+                BlobV2FieldRewritePlan::List { child, .. }
+                | BlobV2FieldRewritePlan::LargeList { child, .. } => configure(child, sidecars),
+                BlobV2FieldRewritePlan::Passthrough { .. } => {}
+            }
+        }
+        for (_, column) in &mut self.columns {
+            configure(column, &sidecars);
+        }
+        self
     }
 
     pub(crate) fn output_schema(&self) -> &SchemaRef {

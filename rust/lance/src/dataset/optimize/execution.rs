@@ -16,7 +16,7 @@ use super::planning::{
     CompactionMode, CompactionOptions, CompactionPlan, TaskData, has_eager_remappable_index,
 };
 use crate::Dataset;
-use crate::dataset::blob::BlobV2BatchRewritePlan;
+use crate::dataset::blob::{BlobV2BatchRewritePlan, SidecarCopy};
 use crate::dataset::index::load_indices_for_remapping;
 use crate::dataset::rowids::{
     RowLineage, RowLineagePlan, RowLineageSpill, RowVersionKind, inline_row_lineage_max_bytes,
@@ -578,6 +578,7 @@ pub(super) async fn rewrite_files(
     let mut row_ids_rx: Option<std::sync::mpsc::Receiver<CapturedRowIds>> = None;
     let mut reader: Option<SendableRecordBatchStream> = None;
 
+    let sidecars = Arc::new(SidecarCopy::default());
     if !can_binary_copy {
         let (prepared_reader, rx_initial, has_blob_v2_columns) = prepare_reader(
             dataset.as_ref(),
@@ -604,16 +605,20 @@ pub(super) async fn rewrite_files(
 
         if has_blob_v2_columns {
             let dataset_arc = Arc::new(dataset.as_ref().clone());
-            let rewrite_plan = Arc::new(BlobV2BatchRewritePlan::try_new(
+            let supports_prepared = matches!(
+                write_version,
+                ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
+            );
+            let mut rewrite_plan = BlobV2BatchRewritePlan::try_new(
                 dataset.schema(),
                 schema.as_ref(),
                 false,
-                managed_blobs_enabled(dataset.schema())?
-                    && matches!(
-                        write_version,
-                        ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3
-                    ),
-            )?);
+                supports_prepared,
+            )?;
+            if supports_prepared && !managed_blobs_enabled(dataset.schema())? {
+                rewrite_plan = rewrite_plan.with_sidecar_copy(sidecars.clone());
+            }
+            let rewrite_plan = Arc::new(rewrite_plan);
             let transformed_schema = rewrite_plan.output_schema().clone();
             let transformed = reader_with_progress.then(move |batch_result| {
                 let dataset = dataset_arc.clone();
@@ -808,6 +813,9 @@ pub(super) async fn rewrite_files(
     // Wrap in an async block so `?` returns into `row_addrs_result` and we can
     // run cleanup before propagating the error.
     let row_addrs_result: Result<Option<Vec<u8>>> = async {
+        // A rewrite result must not escape until every descriptor's destination
+        // object exists. Failed copies use the same orphan cleanup as failed remaps.
+        sidecars.copy_to_fragments(&dataset, &new_fragments).await?;
         if uses_stable_row_ids {
             log::info!("Compaction task {}: rechunking stable row ids", task_id);
             match lineage_plan {
