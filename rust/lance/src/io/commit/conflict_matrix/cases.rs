@@ -50,8 +50,8 @@ update_rewrite_rows       | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L  R* R
 update_rewrite_columns    | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L  R* R* R*
 data_overlay              | L  L  R  R  L  L  L  R  R  R  R  L  R  X  X  L  R* R* R*
 data_replacement          | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L  R* R* R*
-project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  R  R* R* R*
-project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  R  R  R* R
+project                   | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  R  R* R  R
+project_alter_nullability | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  R  R  R  R
 merge                     | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R
 merge_alter_nullability   | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R
 create_index              | L  L  L  L  L  L  L  L  L  L  L  R  R  X  X  L  R* R* R*
@@ -59,9 +59,9 @@ rewrite                   | L  R  R  R  R  R  R  L  L  R  R  R  R  X  X  L  R* R
 overwrite                 | L  L  L  L  L  L  L  L  L  L  L  L  L  R  L  L  R* R* R*
 restore                   | L  L  L  L  L  L  L  L  L  L  L  L  L  L  L  X  R* R  R
 update_config             | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  X  R* R  R
-action_append             | R* R* R* R* R* R* R* R* R  R* R  R* R* R  R  R* L  L  L
-action_update_config      | R* R* R* R* R* R* R* R* R* R  R  R* R* R  R  R  L  R  R
-action_append_and_config  | R* R* R* R* R* R* R* R* R  R  R  R* R* R  R  R  L  R  R
+action_append             | R* R* R* R* R* R* R* R* R  R  R  R* R* R  R  R* L  L  L
+action_update_config      | R* R* R* R* R* R* R* R  R  R  R  R* R* R  R  R  L  R  R
+action_append_and_config  | R* R* R* R* R* R* R* R  R  R  R  R* R* R  R  R  L  R  R
 ";
 
 /// The level [`MATRIX`] was observed under.
