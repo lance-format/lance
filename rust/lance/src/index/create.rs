@@ -1150,6 +1150,7 @@ mod tests {
     use lance_core::utils::{address::RowAddress, tempfile::TempStrDir};
     use lance_datagen::{self, gen_batch};
     use lance_index::optimize::OptimizeOptions;
+    use lance_index::pb::VectorIndexDetails;
     use lance_index::progress::IndexBuildProgress;
     use lance_index::scalar::{
         AnyQuery, BloomFilterQuery, FullTextSearchQuery, LabelListQuery, SargableQuery,
@@ -3161,9 +3162,22 @@ mod tests {
             .iter()
             .flat_map(|segment| segment.fragment_bitmap.as_ref().unwrap().iter())
             .collect::<RoaringBitmap>();
-        let expected_merged_details = compatible_tail.last().unwrap().index_details.clone();
+        let expected_merged_details = compatible_tail
+            .last()
+            .unwrap()
+            .index_details
+            .as_ref()
+            .unwrap()
+            .to_msg::<VectorIndexDetails>()
+            .unwrap();
         assert_ne!(
-            independent_segment.index_details, expected_merged_details,
+            independent_segment
+                .index_details
+                .as_ref()
+                .unwrap()
+                .to_msg::<VectorIndexDetails>()
+                .unwrap(),
+            expected_merged_details,
             "test setup must distinguish base and suffix metadata"
         );
         let mut segments = vec![independent_segment];
@@ -3200,8 +3214,15 @@ mod tests {
             merged.fragment_bitmap.as_ref().unwrap(),
             &expected_merged_fragments
         );
+        // Protobuf map ordering can change when the fingerprint is rewritten.
         assert_eq!(
-            merged.index_details, expected_merged_details,
+            merged
+                .index_details
+                .as_ref()
+                .unwrap()
+                .to_msg::<VectorIndexDetails>()
+                .unwrap(),
+            expected_merged_details,
             "merged metadata must come from the selected suffix, not an incompatible base segment"
         );
     }

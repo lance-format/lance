@@ -8,7 +8,6 @@ use lance_index::pb::VectorIndexDetails;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
-use sha2::{Digest, Sha256};
 
 use crate::{Error, Result};
 
@@ -29,13 +28,13 @@ impl CoarseQuantizerFingerprint {
             return None;
         }
 
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
         hasher.update(b"lance.coarse_quantizer.v1");
-        hasher.update([metric_tag(metric)]);
-        hasher.update((centroids.len() as u64).to_le_bytes());
-        hasher.update((centroids.value_length() as u64).to_le_bytes());
+        hasher.update(&[metric_tag(metric)]);
+        hasher.update(&(centroids.len() as u64).to_le_bytes());
+        hasher.update(&(centroids.value_length() as u64).to_le_bytes());
         hash_centroids(&mut hasher, centroids)?;
-        Some(Self(hasher.finalize().into()))
+        Some(Self(*hasher.finalize().as_bytes()))
     }
 
     /// Decode a validated identity from persisted index metadata.
@@ -91,35 +90,35 @@ fn metric_tag(metric: DistanceType) -> u8 {
     }
 }
 
-fn hash_centroids(hasher: &mut Sha256, centroids: &FixedSizeListArray) -> Option<()> {
+fn hash_centroids(hasher: &mut blake3::Hasher, centroids: &FixedSizeListArray) -> Option<()> {
     let values = centroids.values();
     match values.data_type() {
         arrow_schema::DataType::Float16 => {
-            hasher.update([1]);
+            hasher.update(&[1]);
             for value in values.as_primitive::<Float16Type>().values() {
-                hasher.update(value.to_bits().to_le_bytes());
+                hasher.update(&value.to_bits().to_le_bytes());
             }
         }
         arrow_schema::DataType::Float32 => {
-            hasher.update([2]);
+            hasher.update(&[2]);
             for value in values.as_primitive::<Float32Type>().values() {
-                hasher.update(value.to_bits().to_le_bytes());
+                hasher.update(&value.to_bits().to_le_bytes());
             }
         }
         arrow_schema::DataType::Float64 => {
-            hasher.update([3]);
+            hasher.update(&[3]);
             for value in values.as_primitive::<Float64Type>().values() {
-                hasher.update(value.to_bits().to_le_bytes());
+                hasher.update(&value.to_bits().to_le_bytes());
             }
         }
         arrow_schema::DataType::UInt8 => {
-            hasher.update([4]);
+            hasher.update(&[4]);
             hasher.update(values.as_primitive::<UInt8Type>().values().as_ref());
         }
         arrow_schema::DataType::Int8 => {
-            hasher.update([5]);
+            hasher.update(&[5]);
             for value in values.as_primitive::<Int8Type>().values() {
-                hasher.update(value.to_le_bytes());
+                hasher.update(&value.to_le_bytes());
             }
         }
         _ => return None,
