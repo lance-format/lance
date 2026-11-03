@@ -85,10 +85,23 @@ pub(super) enum StoredBlob<'a> {
 impl<'a> StoredBlob<'a> {
     /// Parse row `row` of a blob v2 descriptor array, returning `None` for a
     /// null blob.
+    ///
+    /// Rejects a non-null descriptor with a null child, a Dedicated
+    /// descriptor with a nonzero position, and a `position + size` that
+    /// overflows `u64`.
     pub(super) fn parse(descriptions: &'a StructArray, row: usize) -> Result<Option<Self>> {
         let kinds = descriptions.column(0).as_primitive::<UInt8Type>();
         if descriptions.is_null(row) || kinds.is_null(row) {
             return Ok(None);
+        }
+        if let Some(child) =
+            (1..descriptions.num_columns()).find(|&child| descriptions.column(child).is_null(row))
+        {
+            return Err(Error::invalid_input(format!(
+                "Blob v2 descriptor row {row} has kind {} but null {}",
+                kinds.value(row),
+                descriptions.fields()[child].name(),
+            )));
         }
         let position = descriptions
             .column(1)
@@ -104,6 +117,16 @@ impl<'a> StoredBlob<'a> {
             .value(row);
         let uri = descriptions.column(4).as_string::<i32>().value(row);
         let kind = BlobKind::try_from(kinds.value(row))?;
+        if kind == BlobKind::Dedicated && position != 0 {
+            return Err(Error::invalid_input(format!(
+                "Blob v2 Dedicated descriptor row {row} has nonzero position {position}"
+            )));
+        }
+        if position.checked_add(size).is_none() {
+            return Err(Error::invalid_input(format!(
+                "Blob v2 {kind:?} descriptor row {row} range overflows u64: position={position}, size={size}"
+            )));
+        }
         Ok(Some(match kind {
             // Writers store empty payloads as an inline (0, 0) range.
             BlobKind::Inline if position == 0 && size == 0 => Self::Empty,
@@ -468,7 +491,9 @@ mod tests {
 
     use crate::dataset::blob::test_util::{BlobTestFixture, create_multi_base_blob_v2_fixture};
     use crate::dataset::blob::write::INLINE_MAX;
-    use arrow_array::{ArrayRef, StringArray, StructArray, UInt8Array, UInt32Array, UInt64Array};
+    use arrow_array::{
+        ArrayRef, StringArray, StructArray, UInt8Array, UInt32Array, UInt64Array, new_null_array,
+    };
     use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType, Field};
     use lance_core::Error;
@@ -584,17 +609,47 @@ mod tests {
         assert_eq!(StoredBlob::parse(&descriptions, 0).unwrap(), expected);
     }
 
+    fn with_null_child(descriptions: StructArray, child: usize) -> StructArray {
+        let (fields, mut columns, nulls) = descriptions.into_parts();
+        columns[child] = new_null_array(fields[child].data_type(), columns[child].len());
+        StructArray::try_new(fields, columns, nulls).unwrap()
+    }
+
     #[rstest]
-    #[case::non_canonical_uri("_blobs/../a.blob", 0, 1)]
-    #[case::range_overflow("_blobs/a.blob", u64::MAX, 1)]
-    fn test_stored_blob_parse_rejects_invalid_managed(
-        #[case] uri: &str,
+    #[case::managed_non_canonical_uri(BlobKind::Managed, 0, 1, 0, "_blobs/../a.blob", None, "")]
+    #[case::managed_range_overflow(BlobKind::Managed, u64::MAX, 1, 0, "_blobs/a.blob", None, "")]
+    #[case::inline_range_overflow(BlobKind::Inline, u64::MAX, 1, 0, "", None, "overflows")]
+    #[case::packed_range_overflow(BlobKind::Packed, u64::MAX, 1, 3, "", None, "overflows")]
+    #[case::external_range_overflow(
+        BlobKind::External,
+        u64::MAX,
+        1,
+        0,
+        "s3://bucket/a.bin",
+        None,
+        "overflows"
+    )]
+    #[case::dedicated_nonzero_position(BlobKind::Dedicated, 4, 8, 3, "", None, "position 4")]
+    #[case::null_position(BlobKind::Inline, 4, 8, 0, "", Some(1), "null position")]
+    #[case::null_size(BlobKind::Inline, 4, 8, 0, "", Some(2), "null size")]
+    #[case::null_blob_id(BlobKind::Packed, 4, 8, 3, "", Some(3), "null blob_id")]
+    #[case::null_blob_uri(BlobKind::External, 4, 8, 0, "a.bin", Some(4), "null blob_uri")]
+    fn test_stored_blob_parse_rejects_invalid(
+        #[case] kind: BlobKind,
         #[case] position: u64,
         #[case] size: u64,
+        #[case] blob_id: u32,
+        #[case] uri: &str,
+        #[case] null_child: Option<usize>,
+        #[case] message: &str,
     ) {
-        let descriptions = descriptor(Some(BlobKind::Managed), position, size, 0, uri, true);
+        let mut descriptions = descriptor(Some(kind), position, size, blob_id, uri, true);
+        if let Some(child) = null_child {
+            descriptions = with_null_child(descriptions, child);
+        }
         let error = StoredBlob::parse(&descriptions, 0).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains(message), "{error}");
     }
 
     #[tokio::test]
