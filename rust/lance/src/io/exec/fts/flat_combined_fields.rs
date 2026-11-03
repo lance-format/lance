@@ -16,6 +16,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning, PhysicalExpr};
 use futures::stream::{self};
 use futures::{StreamExt, TryStreamExt};
+use lance_arrow::json::JsonEncoding;
 use lance_core::{Error, ROW_ID, Result, utils::tracing::StreamTracingExt};
 use lance_select::RowAddrMask;
 
@@ -146,7 +147,7 @@ impl FlatCombinedFieldsExec {
     /// the corpus input may be narrowed to the emission prefilter.
     ///
     /// Paths crossing lists read the complete list root; other paths require a
-    /// string column aliased to the query path. The input also needs UInt64
+    /// string or JSON column aliased to the query path. The input also needs UInt64
     /// `_rowid`. See [`Self`] for a reconstruction example.
     pub fn try_new(
         dataset: Arc<Dataset>,
@@ -205,7 +206,7 @@ impl FlatCombinedFieldsExec {
                 matches!(
                     field.data_type(),
                     DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
-                )
+                ) || JsonEncoding::of_field(field).is_some()
             };
             if !is_valid {
                 return Err(Error::invalid_input(format!(
