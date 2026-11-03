@@ -20,7 +20,7 @@ The FTS index consists of multiple files storing the token dictionary, document 
 
 An FTS index may contain multiple partitions. Each partition has its own set of token, document, and posting list files, prefixed with the partition ID (e.g. `part_0_tokens.lance`, `part_0_docs.lance`, `part_0_invert.lance`). The `metadata.lance` file lists all partition IDs in the index. At query time, every partition must be searched and the results combined to produce the final ranked output. Fewer partitions generally means better query performance, since each partition requires its own token dictionary lookup and posting list scan. The number of partitions is controlled by the training configuration -- specifically `LANCE_FTS_TARGET_SIZE` determines how large each merged partition can grow (see [Training Process](#training-process) for details).
 
-From format version 4 onward, a segment stores a physical row address (`fragment_id << 32 | offset`) in `docs.lance._rowid` instead of the dataset's logical row id. A segment persisted before version 4 stores a row id there instead.
+From format version 4 onward, a segment stores a physical row address (`fragment_id << 32 | offset`) in `docs.lance._rowid` instead of the dataset's logical row id. A segment persisted before version 4 stores a row id there instead. The current implementation supports format versions 1 through 3; format version 4 is specified here but is not yet implemented.
 
 ### Token Dictionary File Schema
 
@@ -74,7 +74,7 @@ The metadata file contains JSON-serialized configuration and partition informati
 | `base_tokenizer`     | String         | "simple"           | Lexical tokenizer type (see Tokenizers section)                |
 | `language`           | String         | "English"          | Language for stemming and stop words                           |
 | `with_position`      | Boolean        | false              | Store term positions for phrase queries (increases index size) |
-| `max_token_length`   | UInt32?        | 40                 | Remove tokens longer than this. Null disables the limit.       |
+| `max_token_length`   | UInt32?        | 40                 | Remove tokens whose UTF-8 byte length is greater than or equal to this value. Null disables the limit. |
 | `lower_case`         | Boolean        | true               | Convert tokens to lowercase                                    |
 | `stem`               | Boolean        | true (code: false) | Apply language-specific stemming                               |
 | `remove_stop_words`  | Boolean        | true (code: false) | Remove common stop words for the specified language            |
@@ -91,7 +91,7 @@ The metadata file contains JSON-serialized configuration and partition informati
 
 The defaults above are for the text analyzer profile (`base_tokenizer = "simple"`); entries marked `(code: ...)` show the `code` profile's values. The `ngram` tokenizer disables stemming and stop word removal unless they are set explicitly. The `analyzer` key (`"text"` or `"code"`) is an input-only preset that is expanded into `base_tokenizer` and the flags above before params are persisted.
 
-The `document_granularity` field is persisted in the index details, not in this params object. Three creation-time fields are accepted for builds but are not persisted with the index: `memory_limit` (build memory cap in MiB), `num_workers` (build worker count), and `format_version` (on-disk posting-list format). Creation resolves `format_version` as: explicit value, then the `LANCE_FTS_FORMAT_VERSION` environment variable, then the configuration default -- code analysis writes format version 3; text analysis writes version 2 with block size 128 and version 3 with block size 256. Code analysis always requires format version 3. Existing indexes keep their format version when they are updated or optimized.
+The `document_granularity` field is persisted in the index details, not in this params object. `memory_limit` (build memory cap in MiB), `num_workers` (build worker count), and the input `format_version` are creation-time fields accepted for builds but omitted from the params object. Creation resolves `format_version` as: explicit value, then the `LANCE_FTS_FORMAT_VERSION` environment variable, then the configuration default -- code analysis writes format version 3; text analysis writes version 2 with block size 128 and version 3 with block size 256. The resolved value is persisted in `metadata.lance` schema metadata and in `InvertedIndexDetails.posting_format_version`. Code analysis always requires format version 3. Existing indexes keep their format version when they are updated or optimized.
 
 ## Tokenizers
 
@@ -174,7 +174,7 @@ Token filters are applied in sequence after the base tokenizer:
 | Filter           | Description                                 | Configuration                   |
 |------------------|---------------------------------------------|---------------------------------|
 | **WordDelimiter** | Splits identifier tokens into subwords at case, digit, and delimiter boundaries (`code` tokenizer only; applied before the filters below) | `split_identifiers`, `split_on_numerics`, `preserve_original` |
-| **RemoveLong**   | Removes tokens exceeding max_token_length   | `max_token_length`              |
+| **RemoveLong**   | Removes tokens whose UTF-8 byte length is greater than or equal to `max_token_length` | `max_token_length`              |
 | **LowerCase**    | Converts tokens to lowercase                | `lower_case` (default: true)    |
 | **Stemmer**      | Reduces words to their root form            | `stem`, `language`              |
 | **StopWords**    | Removes common words like "the", "is", "at" | `remove_stop_words`, `language` |
