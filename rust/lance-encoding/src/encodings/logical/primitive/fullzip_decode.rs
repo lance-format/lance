@@ -64,7 +64,7 @@ struct FullZipDecodeDetails {
 }
 
 impl FullZipDecodeDetails {
-    /// Bytes before each value: the control word plus the padding byte, if any.
+    /// Bytes taken by each item's control word, including the padding byte when `is_padded`.
     fn bytes_per_word(&self) -> usize {
         self.ctrl_word_parser.bytes_per_word() + usize::from(self.is_padded)
     }
@@ -895,10 +895,10 @@ impl VariableFullZipDecoder {
                 out_bits_per_offset,
             );
         }
-        // Writers before #9018 could put one zero byte before each value of a NIL page (see
-        // `FullZipDecodeDetails::is_padded`). When the NIL walk fails, retry it with that padding and
-        // use the result only if every value then lines up. A padded page whose NIL walk
-        // happens to succeed is still read as NIL.
+        // Writers before #9018 could put one zero byte before each value of a NIL page
+        // (see `FullZipDecodeDetails::is_padded`). When the NIL walk fails, retry it with
+        // that padding and use the result only if every value then lines up. A padded page
+        // whose NIL walk happens to succeed is still read as NIL.
         Self::try_new(
             details.clone(),
             decompressor.clone(),
