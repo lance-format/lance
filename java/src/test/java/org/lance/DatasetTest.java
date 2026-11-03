@@ -1636,6 +1636,46 @@ public class DatasetTest {
   }
 
   @Test
+  void testGetRowAddresses(@TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("stable").toString());
+      dataset =
+          testDataset.createDatasetWithWriteParams(
+              new WriteParams.Builder().withEnableStableRowIds(true).build());
+      testDataset.write(1, 5).close();
+      try (Dataset ds = testDataset.write(2, 5)) {
+        // Row ids 0-4 live in the first fragment and 5-9 in the second.
+        long second = ds.getFragments().get(1).getId();
+        assertEquals(
+            Arrays.asList(second << 32 | 2, null), ds.getRowAddresses(Arrays.asList(7L, 99L)));
+
+        // Compaction moves every row into one new fragment but keeps its id; deleted rows
+        // (ids 2 and 7 hold id = 2) no longer resolve.
+        ds.compact();
+        ds.delete("id = 2");
+        assertEquals(1, ds.getFragments().size());
+        long compacted = ds.getFragments().get(0).getId();
+        assertEquals(
+            Arrays.asList(compacted << 32 | 8, null, compacted << 32 | 1, compacted << 32 | 8),
+            ds.getRowAddresses(Arrays.asList(8L, 7L, 1L, 8L)));
+        assertEquals(Collections.emptyList(), ds.getRowAddresses(Collections.emptyList()));
+      }
+    }
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("plain").toString());
+      testDataset.createEmptyDataset().close();
+      try (Dataset ds = testDataset.write(1, 5)) {
+        // Without stable row ids a row id is its address, so ids pass through unchanged.
+        List<Long> ids = Arrays.asList(3L, 1L << 32 | 9);
+        assertEquals(ids, ds.getRowAddresses(ids));
+      }
+    }
+  }
+
+  @Test
   void testCompact(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
