@@ -50,7 +50,22 @@ use crate::index::frag_reuse_reader::tests::persist_fixture;
 use crate::index::vector::VectorIndexParams;
 use crate::index::{CreateIndexBuilder, DatasetIndexExt, loading::DatasetIndexInternalExt};
 use crate::io::exec::filtered_read::FilteredReadExec;
+#[cfg(feature = "substrait")]
+use crate::io::exec::filtered_read_proto::{
+    filtered_read_exec_from_proto, filtered_read_exec_to_proto,
+};
 use crate::io::exec::fts::FlatMatchQueryExec;
+#[cfg(feature = "substrait")]
+use datafusion::execution::{SessionState, TaskContext};
+#[cfg(feature = "substrait")]
+use datafusion::physical_plan::{
+    ChildrenPropertiesMode, ExecutionPlan, ReplaceChildrenOptions, collect,
+    stream::RecordBatchStreamAdapter,
+};
+#[cfg(feature = "substrait")]
+use lance_datafusion::exec::OneShotExec;
+#[cfg(feature = "substrait")]
+use prost::Message;
 
 /// Two-fragment Int32 dataset: `id` (field 0) = 0..12 and `age` (field 1) = id * 10,
 /// six rows per file (fragments 0 and 1). In-memory store so overlay files can be written
@@ -782,9 +797,10 @@ async fn test_btree_overlay_row_level_precision(#[values(false, true)] stable_ro
 /// still apply: the drop-stale block and the stale-Take re-eval both run regardless of
 /// `fast_search` on the scalar path. A regression that gated overlay masking behind
 /// `!fast_search` would leak id=1's stale age=10 hit here.
+#[rstest]
 #[tokio::test]
-async fn test_btree_overlay_masked_under_fast_search() {
-    let mut dataset = create_base_dataset().await;
+async fn test_btree_overlay_masked_under_fast_search(#[values(false, true)] stable_row_ids: bool) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
     build_age_index(&mut dataset).await;
 
     // Fragment 0, offset 1 is id=1, age=10. Overlay (committed after the index) → age=999.
@@ -810,6 +826,188 @@ async fn test_btree_overlay_masked_under_fast_search() {
     );
     // An untouched indexed value on the same fragment is unaffected.
     assert_eq!(ids_matching_opts(&dataset, "age = 20", true).await, vec![2]);
+
+    // COUNT(*) must preserve both stale-hit exclusion and current-value replay.
+    // The ordinary scanner currently keeps the union rather than pushing the
+    // count into the raw scalar mask.
+    for (predicate, expected) in [("age = 10", 0), ("age = 999", 1), ("age >= 0", 12)] {
+        assert_eq!(
+            dataset
+                .count_rows(Some(predicate.to_string()))
+                .await
+                .unwrap(),
+            expected
+        );
+        let mut scanner = dataset.scan();
+        scanner.fast_search().filter(predicate).unwrap();
+        assert_eq!(scanner.count_rows().await.unwrap(), expected as u64);
+        let mut reference = dataset.scan();
+        reference.use_scalar_index(false).filter(predicate).unwrap();
+        assert_eq!(
+            reference.try_into_batch().await.unwrap().num_rows(),
+            expected
+        );
+    }
+    let mut scanner = dataset.scan();
+    scanner.filter("age = 999").unwrap();
+    scanner
+        .aggregate(
+            crate::dataset::scanner::AggregateExpr::builder()
+                .count_star()
+                .build(),
+        )
+        .unwrap();
+    let plan = scanner.create_plan().await.unwrap();
+    let display = datafusion::physical_plan::displayable(plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert!(display.contains("UnionExec"), "{display}");
+    assert!(!display.contains("CountFromMask"), "{display}");
+}
+
+// The caller's codec owns the surrounding DataFusion nodes and the index child.
+// Transport the child's evaluated mask as Arrow IPC, and round-trip every read
+// (including current-value replay) through the library's wire conversion.
+#[cfg(feature = "substrait")]
+#[async_recursion::async_recursion]
+async fn roundtrip_visibility_reads(
+    plan: Arc<dyn ExecutionPlan>,
+    dataset: Arc<Dataset>,
+    state: &SessionState,
+    is_planned: bool,
+) -> Arc<dyn ExecutionPlan> {
+    if let Some(read) = plan.downcast_ref::<FilteredReadExec>() {
+        let index_input = if let Some(input) = read.index_input() {
+            let batches = collect(input.clone(), Arc::new(TaskContext::default()))
+                .await
+                .unwrap();
+            assert_eq!(batches.len(), 1);
+            let mut bytes = Vec::new();
+            let mut writer =
+                arrow_ipc::writer::FileWriter::try_new(&mut bytes, &batches[0].schema()).unwrap();
+            writer.write(&batches[0]).unwrap();
+            writer.finish().unwrap();
+            drop(writer);
+            let mut reader =
+                arrow_ipc::reader::FileReader::try_new(std::io::Cursor::new(bytes), None).unwrap();
+            let schema = reader.schema();
+            let batch = reader.next().unwrap().unwrap();
+            Some(
+                Arc::new(OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    futures::stream::once(async { Ok(batch) }),
+                )))) as Arc<dyn ExecutionPlan>,
+            )
+        } else {
+            None
+        };
+        if is_planned {
+            read.get_or_create_plan(Arc::new(TaskContext::default()))
+                .await
+                .unwrap();
+        }
+        let proto = filtered_read_exec_to_proto(read, state).await.unwrap();
+        assert_eq!(proto.plan.is_some(), is_planned);
+        let proto =
+            lance_datafusion::pb::FilteredReadExecProto::decode(proto.encode_to_vec().as_slice())
+                .unwrap();
+        let back = filtered_read_exec_from_proto(proto, Some(dataset), index_input, state)
+            .await
+            .unwrap();
+        assert_eq!(
+            back.options().only_indexed_fragments,
+            read.options().only_indexed_fragments
+        );
+        assert_eq!(
+            back.options()
+                .overlay_block
+                .as_ref()
+                .and_then(RowAddrMask::block_list),
+            read.options()
+                .overlay_block
+                .as_ref()
+                .and_then(RowAddrMask::block_list),
+        );
+        return Arc::new(back) as Arc<dyn ExecutionPlan>;
+    }
+    let mut children = Vec::new();
+    for child in plan.children() {
+        children.push(
+            roundtrip_visibility_reads(child.clone(), dataset.clone(), state, is_planned).await,
+        );
+    }
+    if children.is_empty() {
+        plan
+    } else {
+        plan.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+        .unwrap()
+    }
+}
+
+#[cfg(feature = "substrait")]
+#[rstest]
+#[tokio::test]
+async fn test_distributed_scalar_overlay_visibility(
+    #[values(false, true)] stable_row_ids: bool,
+    #[values(false, true)] is_planned: bool,
+    #[values(false, true)] fast_search: bool,
+) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
+    build_age_index(&mut dataset).await;
+    append_age_fragment(&mut dataset, 12..14).await;
+    dataset.delete("id = 6").await.unwrap();
+    let dataset = Arc::new(
+        commit_overlay(
+            dataset,
+            "distributed_age",
+            1,
+            &[1],
+            OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+            vec![i32_array([Some(999)])],
+        )
+        .await,
+    );
+    let state = datafusion::prelude::SessionContext::new().state();
+    for (predicate, changed_ids) in [
+        ("age = 70 OR age IN (120, 130)", vec![]),
+        ("age = 999 OR age IN (120, 130)", vec![7]),
+    ] {
+        let mut scanner = dataset.scan();
+        scanner.filter(predicate).unwrap().project(&["id"]).unwrap();
+        scanner.with_fragments(dataset.fragments()[1..].to_vec());
+        if fast_search {
+            scanner.fast_search();
+        }
+        let plan = roundtrip_visibility_reads(
+            scanner.create_plan().await.unwrap(),
+            dataset.clone(),
+            &state,
+            is_planned,
+        )
+        .await;
+        let batches = collect(plan, Arc::new(TaskContext::default()))
+            .await
+            .unwrap();
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch["id"]
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        ids.sort_unstable();
+        let mut expected = changed_ids;
+        if !fast_search {
+            expected.extend([12, 13]);
+        }
+        assert_eq!(ids, expected, "{predicate}");
+    }
 }
 
 /// An overlay touching only a non-indexed field excludes nothing from the index on `age`.

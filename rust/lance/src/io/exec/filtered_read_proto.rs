@@ -25,7 +25,7 @@ use lance_datafusion::pb;
 use lance_datafusion::substrait::{
     encode_substrait, parse_substrait, prune_schema_for_substrait, validate_substrait_expr,
 };
-use lance_select::RowAddrTreeMap;
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::Fragment;
 
 use crate::Dataset;
@@ -42,9 +42,9 @@ use super::table_identifier::{resolve_dataset, table_identifier_from_dataset};
 
 /// Convert a [`FilteredReadExec`] to proto for serialization.
 ///
-/// Sliced plans require coordinated planner/executor upgrades. Older executors
-/// can ignore the physical allowlist and read outside the requested slices;
-/// this wire protocol does not negotiate capabilities.
+/// Physical selections, overlay exclusions, and index-only scans require
+/// coordinated planner/executor upgrades. Older executors can ignore these
+/// restrictions; this wire protocol does not negotiate capabilities.
 ///
 /// Uses `table_identifier_from_dataset` by default (no manifest bytes).
 /// The caller can replace the `table` field with
@@ -80,6 +80,7 @@ pub async fn filtered_read_exec_to_proto(
 /// the identifier (or the storage options) can encode synchronously, for
 /// example from a DataFusion `PhysicalExtensionCodec`, whose `try_encode` is
 /// not async.
+/// See [`filtered_read_exec_to_proto`] for planner/executor upgrade requirements.
 pub fn filtered_read_exec_to_proto_with_table(
     exec: &FilteredReadExec,
     state: &SessionState,
@@ -105,15 +106,28 @@ pub fn filtered_read_exec_to_proto_with_table(
 
 /// Reconstruct a [`FilteredReadExec`] from proto.
 ///
-/// A supplied dataset must be the snapshot used to plan the scan. Sliced plans
-/// require the planner and all executors to support physical row selections;
-/// mixed-version execution with older executors is unsupported.
+/// A supplied dataset must be the snapshot used to plan the scan. Physical
+/// selections, overlay exclusions, and index-only scans require coordinated
+/// planner/executor upgrades; mixed-version execution with older executors is
+/// unsupported. The caller transports the index child and any replay branches
+/// through its plan codec.
 pub async fn filtered_read_exec_from_proto(
     proto: pb::FilteredReadExecProto,
     dataset: Option<Arc<Dataset>>,
     index_input: Option<Arc<dyn ExecutionPlan>>,
     state: &SessionState,
 ) -> Result<FilteredReadExec> {
+    if let (Some(dataset), Some(table)) = (&dataset, &proto.table)
+        && (dataset.uri() != table.uri || dataset.manifest.version != table.version)
+    {
+        return Err(Error::invalid_input(format!(
+            "FilteredReadExec requires dataset '{}' version {}, supplied '{}' version {}",
+            table.uri,
+            table.version,
+            dataset.uri(),
+            dataset.manifest.version
+        )));
+    }
     let dataset = resolve_dataset(dataset, proto.table.as_ref()).await?;
 
     let options_proto = proto.options.ok_or_else(|| {
@@ -179,6 +193,21 @@ fn fr_options_to_proto(
         })
         .transpose()?;
 
+    let overlay_block = options
+        .overlay_block
+        .as_ref()
+        .map(|mask| {
+            let mut rows = mask
+                .block_list()
+                .cloned()
+                .ok_or_else(|| Error::invalid_input("overlay_block must contain a block list"))?;
+            rows.optimize();
+            let mut bytes = Vec::with_capacity(rows.serialized_size());
+            rows.serialize_into(&mut bytes)?;
+            Ok::<Vec<u8>, Error>(bytes)
+        })
+        .transpose()?;
+
     Ok(pb::FilteredReadOptionsProto {
         scan_range_before_filter: options
             .scan_range_before_filter
@@ -205,6 +234,8 @@ fn fr_options_to_proto(
             .as_ref()
             .and_then(|o| o.batch_size_bytes),
         physical_row_addr_allowlist,
+        only_indexed_fragments: options.only_indexed_fragments,
+        overlay_block,
     })
 }
 
@@ -218,6 +249,9 @@ async fn fr_options_from_proto(
         dataset.clone() as Arc<dyn lance_core::datatypes::Projectable>,
     )?;
     let mut options = FilteredReadOptions::new(projection);
+    options.only_indexed_fragments = proto.only_indexed_fragments;
+    options.overlay_block =
+        RowAddrMask::from_serialized_parts(None, proto.overlay_block.as_deref())?;
 
     // Fragments
     if !proto.fragment_ids.is_empty() {
@@ -748,11 +782,93 @@ mod tests {
         assert!(effective.decoder_config.validate_on_decode);
         assert_eq!(options.threading_mode, back.threading_mode);
         assert_eq!(options.with_deleted_rows, back.with_deleted_rows);
+        assert!(!back.only_indexed_fragments);
+        assert!(back.overlay_block.is_none());
         assert_eq!(options.projection.field_ids, back.projection.field_ids);
         assert_eq!(options.projection.with_row_id, back.projection.with_row_id);
         assert_eq!(
             options.projection.with_row_addr,
             back.projection.with_row_addr
+        );
+    }
+
+    #[rstest]
+    #[case::no_block(None)]
+    #[case::empty_block(Some(RowAddrTreeMap::new()))]
+    #[case::sparse_block(Some(RowAddrTreeMap::from_iter([7, 9])))]
+    #[tokio::test]
+    async fn test_visibility_options_roundtrip(#[case] rows: Option<RowAddrTreeMap>) {
+        let dataset = make_test_dataset().await;
+        let state = SessionContext::new().state();
+        let schema = Arc::new(prune_schema_for_substrait(&dataset.schema().into()));
+        let mut options =
+            FilteredReadOptions::basic_full_read(&dataset).with_only_indexed_fragments();
+        options.overlay_block = rows.clone().map(RowAddrMask::from_block);
+        let proto = fr_options_to_proto(&options, &schema, &state).unwrap();
+        let back = fr_options_from_proto(proto, &dataset, &state)
+            .await
+            .unwrap();
+        assert!(back.only_indexed_fragments);
+        assert_eq!(
+            back.overlay_block
+                .as_ref()
+                .and_then(RowAddrMask::block_list),
+            rows.as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_visibility_options_reject_invalid_block() {
+        let dataset = make_test_dataset().await;
+        let state = SessionContext::new().state();
+        let schema = Arc::new(prune_schema_for_substrait(&dataset.schema().into()));
+        let mut options = FilteredReadOptions::basic_full_read(&dataset);
+        let mut proto = fr_options_to_proto(&options, &schema, &state).unwrap();
+        proto.overlay_block = Some(b"invalid block".to_vec());
+        let error = fr_options_from_proto(proto, &dataset, &state)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("blocklist"));
+
+        options.overlay_block = Some(RowAddrMask::from_allowed(RowAddrTreeMap::new()));
+        let error = fr_options_to_proto(&options, &schema, &state).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("overlay_block must contain a block list")
+        );
+    }
+
+    #[rstest]
+    #[case::version(false)]
+    #[case::uri(true)]
+    #[tokio::test]
+    async fn test_exec_rejects_different_snapshot(#[case] has_wrong_uri: bool) {
+        let dataset = make_test_dataset().await;
+        let state = SessionContext::new().state();
+        let exec = FilteredReadExec::try_new(
+            dataset.clone(),
+            FilteredReadOptions::basic_full_read(&dataset),
+            None,
+        )
+        .unwrap();
+        let mut proto = filtered_read_exec_to_proto(&exec, &state).await.unwrap();
+        let table = proto.table.as_mut().unwrap();
+        if has_wrong_uri {
+            table.uri.push_str("/other");
+        } else {
+            table.version += 1;
+        }
+        let error = filtered_read_exec_from_proto(proto, Some(dataset), None, &state)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("FilteredReadExec requires dataset")
         );
     }
 

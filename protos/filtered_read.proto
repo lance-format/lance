@@ -84,6 +84,19 @@ message FilteredReadOptionsProto {
    * refer to the exact dataset snapshot used to plan the scan.
    */
   optional bytes physical_row_addr_allowlist = 15;
+  /* If true, omit fragments outside the scalar index result's coverage.
+   * False preserves the normal fallback scan of unindexed fragments.
+   */
+  bool only_indexed_fragments = 16;
+  /* If present, a serialized RowAddrTreeMap of stale index entries to exclude.
+   * Entries use the index result's identifier domain: stable row IDs on stable-ID
+   * datasets, physical addresses otherwise. This is not a physical allowlist.
+   * If absent, no overlay exclusion is applied. Current-value replay is a
+   * separate plan branch and must also be transported by the caller's codec.
+   * This field and only_indexed_fragments require coordinated planner/executor
+   * upgrades; executors predating them may silently ignore the restrictions.
+   */
+  optional bytes overlay_block = 17;
 }
 
 /* Serializable form of FilteredReadPlan (planned/distributed mode).
