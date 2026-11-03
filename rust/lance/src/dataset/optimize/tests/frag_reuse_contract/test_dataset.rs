@@ -1,22 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! A table paired with a model of its live rows.
+//! A table paired with a model of its live rows and of which of them the
+//! index serves.
 //!
 //! Every mutation that changes row contents applies the same change to the
 //! model, deriving the table's change from the model where it can so the two
 //! cannot diverge by construction. Rewrites and index maintenance leave the
-//! model alone: that they leave every answer unchanged is the property under
-//! test.
+//! rows alone: that they leave every answer unchanged is the property under
+//! test. A deferred rewrite also leaves coverage alone, since translating the
+//! index's addresses through the history is what fragment reuse is for.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow_array::RecordBatchIterator;
 use arrow_array::cast::AsArray;
-use arrow_array::types::Int32Type;
-use lance_core::Error;
+use arrow_array::types::{Int32Type, UInt64Type};
 use lance_core::utils::tempfile::TempStrDir;
+use lance_core::{Error, ROW_ADDR};
 use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::optimize::OptimizeOptions;
 use lance_table::format::Fragment;
@@ -32,9 +34,9 @@ use crate::dataset::write::CommitBuilder;
 use crate::dataset::{
     MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched, WriteParams,
 };
-use crate::index::DatasetIndexExt;
 use crate::index::frag_reuse::frag_reuse_entry_appending;
 use crate::index::frag_reuse_reader::tests::prepare_partition;
+use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use crate::session::Session;
 
 pub(super) const ROWS_PER_FRAGMENT: i32 = 8;
@@ -59,6 +61,15 @@ pub(super) struct TestDataset {
     form: HistoryForm,
     /// The live rows by `i`: the oracle every check compares against.
     model: BTreeMap<i32, Row>,
+    /// The live rows by `i` the index is not expected to serve, so a query
+    /// scans their fragments instead. Without this, a history that silently
+    /// dropped coverage would still pass every row check through the scan.
+    uncovered: BTreeSet<i32>,
+    /// Rows the index reaches only through one stable-partition transition.
+    /// The index's bitmap names the transition's sources, not its
+    /// destinations, so an in-place update of any of these rows withdraws
+    /// the whole transition and uncovers all of them.
+    translated_together: Vec<BTreeSet<i32>>,
     /// The `i` the next appended row takes, so appended rows never reuse a
     /// deleted row's identity.
     next_i: i32,
@@ -86,6 +97,8 @@ impl TestDataset {
             kind,
             form,
             model,
+            uncovered: (0..next_i).collect(),
+            translated_together: Vec::new(),
             next_i,
             _dir: dir,
         };
@@ -111,6 +124,8 @@ impl TestDataset {
             )
             .await
             .unwrap();
+        self.uncovered.clear();
+        self.translated_together.clear();
     }
 
     pub(super) async fn delete_where(&mut self, predicate: fn(&Row) -> bool) {
@@ -137,6 +152,7 @@ impl TestDataset {
     async fn delete_ids(&mut self, ids: &[i32]) {
         for i in ids {
             assert!(self.model.remove(i).is_some(), "row {i} is not live");
+            self.uncovered.remove(i);
         }
         let ids: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
         self.dataset
@@ -159,6 +175,7 @@ impl TestDataset {
             )
             .await
             .unwrap();
+        self.uncovered.extend(rows.iter().map(|row| row.i));
         self.model.extend(rows.into_iter().map(|row| (row.i, row)));
     }
 
@@ -187,8 +204,19 @@ impl TestDataset {
         for row in updated {
             if let Some(live) = self.model.get_mut(&row.i) {
                 *live = row;
+                self.uncovered.insert(live.i);
             }
         }
+        let updated_ids: BTreeSet<i32> = ids.iter().copied().collect();
+        for rows in &self.translated_together {
+            if !rows.is_disjoint(&updated_ids) {
+                self.uncovered
+                    .extend(rows.iter().filter(|i| self.model.contains_key(i)));
+            }
+        }
+        // The update withdraws its fragments from the index's coverage, not
+        // just the rows it rewrote.
+        self.widen_uncovered_to_fragments().await;
     }
 
     /// Rewrites every live fragment in the record form of `self.form`.
@@ -225,6 +253,7 @@ impl TestDataset {
         compact_files(&mut self.dataset, options, None)
             .await
             .unwrap();
+        self.widen_uncovered_to_fragments().await;
     }
 
     /// Partitions every live fragment into two destinations through the
@@ -244,6 +273,15 @@ impl TestDataset {
         let source_ids: Vec<u64> = old_fragments.iter().map(|fragment| fragment.id).collect();
         let (transition, new_fragments) =
             prepare_partition(&self.dataset, &source_ids, dest_base_id).await;
+        // The partition rewrites every live fragment, so this transition
+        // subsumes any earlier one.
+        self.translated_together = vec![
+            self.model
+                .keys()
+                .filter(|i| !self.uncovered.contains(i))
+                .copied()
+                .collect(),
+        ];
         let read_version = self.dataset.manifest.version;
         let frag_reuse_index = Some(
             frag_reuse_entry_appending(&self.dataset, vec![transition])
@@ -265,6 +303,7 @@ impl TestDataset {
             ))
             .await
             .unwrap();
+        self.widen_uncovered_to_fragments().await;
     }
 
     /// Stages a merge of the index's segments, lets a concurrent writer
@@ -291,6 +330,10 @@ impl TestDataset {
             .optimize_indices(&OptimizeOptions::append())
             .await
             .unwrap();
+        self.uncovered.clear();
+        // The retry below prunes the deleted fragment from the staged
+        // segment's coverage and leaves the appended segment in place, so
+        // every live row stays covered.
 
         let conflict = stale
             .commit_existing_index_segments(INDEX_NAME, kind.column(), vec![staged.clone()])
@@ -317,7 +360,10 @@ impl TestDataset {
             ..Default::default()
         };
         match compact_files(&mut self.dataset, options, None).await {
-            Ok(_) | Err(Error::InvalidInput { .. } | Error::NotSupported { .. }) => {}
+            Ok(_) => self.widen_uncovered_to_fragments().await,
+            // A refused compaction leaves the table, and the appended rows
+            // unindexed, as they were.
+            Err(Error::InvalidInput { .. } | Error::NotSupported { .. }) => {}
             Err(error) => panic!("{:?}: eager compaction failed: {error}", self.kind),
         }
     }
@@ -327,6 +373,7 @@ impl TestDataset {
             .optimize_indices(&OptimizeOptions::default())
             .await
             .unwrap();
+        self.uncovered.clear();
     }
 
     pub(super) async fn remap(&mut self) {
@@ -337,16 +384,47 @@ impl TestDataset {
         )
         .await
         .unwrap();
+        self.translated_together.clear();
     }
 
     pub(super) async fn trim(&mut self) {
         cleanup_frag_reuse_index(&mut self.dataset).await.unwrap();
     }
 
-    /// Asserts that a full scan returns the model and that every query of
-    /// the index kind returns the model's answer, through this handle and
-    /// through a cold handle with a fresh session, so a cache keyed without
-    /// the history's identity cannot hide behind a warm entry.
+    /// The fragment holding each live row, by `i`.
+    async fn fragment_ids(dataset: &Dataset) -> BTreeMap<i32, u64> {
+        let mut scan = dataset.scan();
+        scan.project(&["i", ROW_ADDR]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let ids = batch["i"].as_primitive::<Int32Type>().values();
+        let addresses = batch[ROW_ADDR].as_primitive::<UInt64Type>().values();
+        ids.iter()
+            .zip(addresses.iter())
+            .map(|(&i, &address)| (i, address >> 32))
+            .collect()
+    }
+
+    /// Uncovers every row sharing a fragment with an uncovered row. Coverage
+    /// is a set of whole fragments, so a rewrite that merges covered and
+    /// uncovered rows into one fragment cannot keep the covered ones served
+    /// by the index without the index missing the others.
+    async fn widen_uncovered_to_fragments(&mut self) {
+        let fragment_ids = Self::fragment_ids(&self.dataset).await;
+        let uncovered_fragments: BTreeSet<u64> =
+            self.uncovered.iter().map(|i| fragment_ids[i]).collect();
+        self.uncovered = fragment_ids
+            .into_iter()
+            .filter(|(_, fragment_id)| uncovered_fragments.contains(fragment_id))
+            .map(|(i, _)| i)
+            .collect();
+    }
+
+    /// Asserts that a full scan returns the model, that every query of the
+    /// index kind returns the model's answer, and that the index leaves out
+    /// exactly the fragments holding rows the model expects it not to serve,
+    /// through this handle and through a cold handle with a fresh session, so
+    /// a cache keyed without the history's identity cannot hide behind a warm
+    /// entry.
     pub(super) async fn check(&self, step: &str) {
         let Self { kind, form, .. } = self;
         let cold = DatasetBuilder::from_uri(self.dataset.uri())
@@ -377,6 +455,24 @@ impl TestDataset {
                     .unwrap_or_else(|error| panic!("{context}: {error}"));
                 assert_eq!(actual, expected, "{context}");
             }
+        }
+        let fragment_ids = Self::fragment_ids(&self.dataset).await;
+        let expected_unindexed: BTreeSet<u64> =
+            self.uncovered.iter().map(|i| fragment_ids[i]).collect();
+        for (handle, which) in handles {
+            let unindexed: BTreeSet<u64> = handle
+                .unindexed_fragments(INDEX_NAME)
+                .await
+                .unwrap()
+                .iter()
+                .map(|fragment| fragment.id)
+                .collect();
+            assert_eq!(
+                unindexed, expected_unindexed,
+                "{kind:?} under {form:?} after {step}: fragments not covered by {INDEX_NAME} \
+                 through the {which} handle (expected left out of the index: \
+                 {expected_unindexed:?}, actually left out: {unindexed:?})"
+            );
         }
     }
 }
