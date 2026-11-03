@@ -2571,40 +2571,56 @@ mod tests {
         assert!(!store.exists(&path).await.unwrap());
     }
 
+    #[rstest]
+    #[case::zero_clamps_to_one("0", 1)]
+    #[case::positive_passes_through("3", 3)]
     #[tokio::test]
-    async fn test_io_parallelism_clamped_to_nonzero() {
+    async fn test_io_parallelism_clamped_to_nonzero(
+        #[case] io_threads: &str,
+        #[case] expected: usize,
+    ) {
+        // Other tests read the process-wide `LANCE_IO_THREADS`, so instead of setting it here the
+        // test re-runs itself in a child process that starts with it. libtest names the thread
+        // after the running test, so the child's filter cannot drift from this test's name.
+        const CHILD_ENV: &str = "LANCE_TEST_IO_PARALLELISM_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .env("LANCE_IO_THREADS", io_threads)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child test failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
         // `io_parallelism()` feeds `buffered`/`buffer_unordered` windows; a value of 0 makes those
         // streams never poll, hanging callers (e.g. a metadata-only `count_rows`). It must clamp.
         let store = ObjectStore::local();
+        assert_eq!(
+            store.io_parallelism(),
+            expected,
+            "LANCE_IO_THREADS={io_threads} must give {expected}"
+        );
+
         // Readers opened by the store must advertise the store's normalized
         // effective parallelism, not the hardcoded cloud default.
         let mem_store = ObjectStore::memory();
         let path = Path::from("/io_parallelism_probe");
         mem_store.put(&path, b"x").await.unwrap();
-
-        // SAFETY: process-global env var, set and restored within this test. `io_parallelism()`
-        // only reads it, and a concurrent reader observes a valid clamped value, never 0.
-        unsafe { std::env::set_var("LANCE_IO_THREADS", "0") };
-        assert_eq!(
-            store.io_parallelism(),
-            1,
-            "LANCE_IO_THREADS=0 must clamp to 1"
-        );
         assert_eq!(
             mem_store.open(&path).await.unwrap().io_parallelism(),
-            1,
-            "an opened reader must report the store's clamped parallelism"
-        );
-
-        unsafe { std::env::set_var("LANCE_IO_THREADS", "8") };
-        assert_eq!(
-            store.io_parallelism(),
-            8,
-            "a positive override must pass through unchanged"
-        );
-        assert_eq!(
-            mem_store.open(&path).await.unwrap().io_parallelism(),
-            8,
+            expected,
             "an opened reader must honor the configured request limit"
         );
         assert_eq!(
@@ -2613,14 +2629,8 @@ mod tests {
                 .await
                 .unwrap()
                 .io_parallelism(),
-            8,
+            expected,
             "a sized reader must honor the configured request limit"
-        );
-
-        unsafe { std::env::remove_var("LANCE_IO_THREADS") };
-        assert!(
-            store.io_parallelism() >= 1,
-            "the configured default parallelism must be at least 1"
         );
     }
 

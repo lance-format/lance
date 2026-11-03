@@ -70,7 +70,7 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::dataset::Dataset;
-use crate::index::DatasetIndexInternalExt;
+use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader, mask_selects_nothing};
 use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
 use crate::session::index_caches::SegmentOwnershipMaskKey;
@@ -84,6 +84,9 @@ use super::utils::{
 };
 
 mod adaptive_probe;
+mod refine;
+
+pub use refine::BatchRefineExec;
 
 use adaptive_probe::AutoProbePolicy;
 

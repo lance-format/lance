@@ -33,19 +33,16 @@ import pyarrow as pa
 from lance_namespace import LanceNamespace
 
 from .._arrow.bf16 import BFloat16Array
-from ..commit import CommitLock
-from ..dataset import (
+from .._dataset.index import Index
+from .._dataset.refs import Branch, Tag, Version, VersionRef
+from .._dataset.transaction import (
     AlterColumn,
-    Branch,
     ExecuteResult,
-    Index,
     LanceOperation,
-    Tag,
     Transaction,
     UpdateResult,
-    Version,
-    VersionRef,
 )
+from ..commit import CommitLock
 from ..fragment import (
     DataFile,
     FragmentMetadata,
@@ -150,6 +147,17 @@ class CleanupStats:
     index_files_removed: int
     deletion_files_removed: int
     failed_deletes: int
+
+class ExpireVersionsStats:
+    versions_removed: int
+    versions_retained: int
+    bytes_removed: int
+    failed_deletes: int
+
+class ExpireVersionsPlan:
+    versions: List[int]
+    stats: ExpireVersionsStats
+    tagged_but_kept: List[int]
 
 class CleanupCandidateFile:
     path: str
@@ -544,6 +552,7 @@ class _Dataset:
         data_storage_version: Optional[str] = None,
     ) -> UpdateResult: ...
     def count_deleted_rows(self) -> int: ...
+    def column_layout_stats(self) -> List[Dict[str, Any]]: ...
     def versions(self) -> List[Version]: ...
     def version_refs(self) -> List[VersionRef]: ...
     def version(self) -> int: ...
@@ -766,8 +775,19 @@ class _MergeInsertBuilder:
     def target_all_bases(self, include_primary: bool = True) -> Self: ...
     def execute(self, new_data: pa.RecordBatchReader) -> ExecuteResult: ...
     def execute_batches(self, new_data: pa.RecordBatchReader) -> ExecuteResult: ...
+    def execute_dataset(self, source: _Dataset) -> ExecuteResult: ...
+    def analyze_plan_dataset(self, source: _Dataset) -> str: ...
+    def execute_replayable(
+        self, schema: pa.Schema, factory: Callable[[], pa.RecordBatchReader]
+    ) -> ExecuteResult: ...
+    def analyze_plan_replayable(
+        self, schema: pa.Schema, factory: Callable[[], pa.RecordBatchReader]
+    ) -> str: ...
     def execute_uncommitted(
         self, new_data: pa.RecordBatchReader
+    ) -> tuple[Transaction, ExecuteResult]: ...
+    def execute_uncommitted_dataset(
+        self, source: _Dataset
     ) -> tuple[Transaction, ExecuteResult]: ...
     def execute_uncommitted_batches(
         self, new_data: pa.RecordBatchReader
@@ -848,6 +868,7 @@ class _Fragment:
         read_columns: Optional[List[str]] = None,
         batch_size: Optional[int] = None,
     ) -> Tuple[FragmentMetadata, LanceSchema, FragmentAddColumnsCleanup]: ...
+    def write_overlay(self, columns: List[str]) -> _OverlayWriter: ...
     def delete(self, predicate: str) -> Optional[_Fragment]: ...
     def delete_rows(self, offsets: List[int]) -> Optional[_Fragment]: ...
     def schema(self) -> pa.Schema: ...
@@ -858,6 +879,11 @@ class _Fragment:
     @property
     def num_deletions(self) -> int: ...
     def validate(self) -> None: ...
+
+class _OverlayWriter:
+    def write_batch(self, batch: pa.RecordBatch) -> None: ...
+    def finish(self) -> Optional[LanceOperation.DataOverlayGroup]: ...
+    def abort(self) -> None: ...
 
 def iops_counter() -> int: ...
 def bytes_read_counter() -> int: ...

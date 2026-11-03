@@ -43,7 +43,7 @@
         <div class="ld-feature__body">
           <h3>Expressive hybrid search</h3>
           <p>Combine vector similarity, full-text search (BM25), and SQL analytics on the same dataset. All query types are accelerated by secondary indexes that are part of the Lance specification.</p>
-          <a class="ld-more" href="{{ 'quickstart/vector-search/' | url }}">Learn more →</a>
+          <a class="ld-more" href="{{ 'guide/vector_search/' | url }}">Learn more →</a>
         </div>
         <div class="ld-feature__code">
           <div class="ld-win" aria-hidden="true"><i></i><i></i><i></i></div>
@@ -134,13 +134,47 @@ dataset.add_columns(add_embeddings)</code></pre>
       <div class="ld-feature">
         <div class="ld-feature__num">05</div>
         <div class="ld-feature__body">
-          <h3>Rich ecosystem integrations</h3>
-          <p>Works with Pandas, Polars, Ray, and PyTorch for processing and ML. Connects to Apache DataFusion, DuckDB, Apache Spark, Trino, and Apache Flink for SQL analytics and distributed processing.</p>
-          <a class="ld-more" href="{{ 'integrations/' | url }}">View integrations →</a>
+          <h3>One format across a three-layer stack</h3>
+          <p>Every layer reads and writes the same Lance tables on object storage without copying data — start with LanceDB as your AI database, embed the Python, Rust, or Java SDKs directly, or connect SQL and ML compute engines across your lakehouse.</p>
+          <a class="ld-more" href="{{ 'integrations/' | url }}">View all integrations →</a>
         </div>
-        <div class="ld-feature__img">
-          <img src="{{ 'assets/images/ecosystem-integrations.png' | url }}" alt="Lance ecosystem integrations" loading="lazy">
-        </div>
+        <nav class="ld-stack" aria-label="Lance three-layer ecosystem stack">
+          <div class="ld-stack__layer">
+            <div class="ld-stack__meta">01 · Database</div>
+            <div class="ld-stack__chips">
+              <a class="ld-stack__chip ld-stack__chip--primary" href="{{ 'quickstart/lancedb/' | url }}">LanceDB</a>
+              <a class="ld-stack__chip" href="https://docs.lancedb.com/" target="_blank" rel="noopener">LanceDB Docs ↗</a>
+            </div>
+          </div>
+          <div class="ld-stack__layer">
+            <div class="ld-stack__meta">02 · Language SDKs</div>
+            <div class="ld-stack__chips">
+              <a class="ld-stack__chip" href="{{ 'quickstart/pylance/' | url }}">Python (PyLance)</a>
+              <a class="ld-stack__chip" href="{{ 'quickstart/rust/' | url }}">Rust</a>
+              <a class="ld-stack__chip" href="{{ 'quickstart/java/' | url }}">Java</a>
+            </div>
+          </div>
+          <div class="ld-stack__layer">
+            <div class="ld-stack__meta">03 · Query &amp; Compute Engines</div>
+            <div class="ld-stack__chips">
+              <a class="ld-stack__chip" href="{{ 'integrations/spark/' | url }}">Apache Spark</a>
+              <a class="ld-stack__chip" href="{{ 'integrations/duckdb/' | url }}">DuckDB</a>
+              <a class="ld-stack__chip" href="{{ 'integrations/trino/' | url }}">Trino</a>
+              <a class="ld-stack__chip" href="{{ 'integrations/datafusion/' | url }}">DataFusion</a>
+              <a class="ld-stack__chip" href="{{ 'integrations/ray/' | url }}">Ray</a>
+              <a class="ld-stack__chip" href="{{ 'integrations/pytorch/' | url }}">PyTorch</a>
+              <a class="ld-stack__chip" href="{{ 'integrations/huggingface/' | url }}">Hugging Face</a>
+            </div>
+          </div>
+          <div class="ld-stack__base">
+            <span>Shared Foundation</span>
+            <div class="ld-stack__base-links">
+              <a href="{{ 'format/' | url }}">Format Spec</a>
+              <span aria-hidden="true">·</span>
+              <a href="{{ 'format/namespace/' | url }}">Namespace &amp; Catalogs</a>
+            </div>
+          </div>
+        </nav>
       </div>
     </section>
   </main>

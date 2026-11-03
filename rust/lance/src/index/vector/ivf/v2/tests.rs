@@ -35,7 +35,7 @@ use lance_index::vector::v3::subindex::IvfSubIndex;
 
 use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
-use crate::index::DatasetIndexInternalExt;
+use crate::index::loading::DatasetIndexInternalExt;
 use crate::index::prefilter::DatasetPreFilter;
 use crate::index::vector::details::target_partition_size_from_details;
 use crate::index::vector::ivf::v2::{
@@ -84,7 +84,7 @@ use lance_index::{
     metrics::{LocalMetricsCollector, NoOpMetricsCollector},
 };
 use lance_io::{
-    object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor},
+    object_store::{ObjectStore, ObjectStoreParams},
     scheduler::{ScanScheduler, SchedulerConfig},
     utils::CachedFileSize,
 };
@@ -98,7 +98,7 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use rstest::rstest;
 use uuid::Uuid;
 
-const NUM_ROWS: usize = 512;
+pub const NUM_ROWS: usize = 512;
 const DIM: usize = 32;
 // 8-bit PQ needs at least 256 training vectors; 320 leaves a stable margin
 // while 20 neighbors provide a useful recall oracle.
@@ -630,7 +630,7 @@ fn test_rabit_query_scratch_capacity_does_not_preallocate_u32() {
     assert_eq!(capacity.u32, 0);
 }
 
-async fn generate_test_dataset<T: ArrowPrimitiveType>(
+pub async fn generate_test_dataset<T: ArrowPrimitiveType>(
     test_uri: &str,
     range: Range<T::Native>,
 ) -> (Dataset, Arc<FixedSizeListArray>)
@@ -696,7 +696,7 @@ where
     (dataset, Arc::new(vectors.as_list::<i32>().clone()))
 }
 
-async fn append_dataset<T: ArrowPrimitiveType>(
+pub async fn append_dataset<T: ArrowPrimitiveType>(
     dataset: &mut Dataset,
     num_rows: usize,
     range: Range<T::Native>,
@@ -1833,7 +1833,7 @@ async fn compact_after_deletions(dataset: &mut Dataset) {
     .unwrap();
 }
 
-async fn ground_truth(
+pub async fn ground_truth(
     dataset: &Dataset,
     column: &str,
     query: &dyn Array,
@@ -2381,7 +2381,7 @@ async fn test_distributed_vector_build_commits_multiple_segments_and_preserves_q
             .indices_dir()
             .clone()
             .join(segment.uuid.to_string())
-            .join(crate::index::INDEX_FILE_NAME);
+            .join(lance_index::INDEX_FILE_NAME);
         assert!(
             ds_split
                 .object_store
@@ -5554,8 +5554,8 @@ async fn rewrite_pq_storage(dataset: &mut Dataset, old_meta: &IndexMetadata) -> 
     // Copy the main index file to the new directory unchanged.
     obj_store
         .copy(
-            &old_dir.clone().join(super::INDEX_FILE_NAME),
-            &new_dir.clone().join(super::INDEX_FILE_NAME),
+            &old_dir.clone().join(lance_index::INDEX_FILE_NAME),
+            &new_dir.clone().join(lance_index::INDEX_FILE_NAME),
         )
         .await?;
 
@@ -6740,7 +6740,7 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
 /// [`InternalCacheKey`] set to bypass once the index identity is known
 /// (see [`ivf_partition_cache_keys`]).
 #[derive(Debug)]
-struct PartitionBypassCacheBackend {
+pub struct PartitionBypassCacheBackend {
     inner: lance_core::cache::MokaCacheBackend,
     partition_keys: std::sync::Mutex<HashSet<lance_core::cache::InternalCacheKey>>,
     bypass_partitions: AtomicBool,
@@ -6748,7 +6748,7 @@ struct PartitionBypassCacheBackend {
 }
 
 impl PartitionBypassCacheBackend {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             inner: lance_core::cache::MokaCacheBackend::with_capacity(256 * 1024 * 1024),
             partition_keys: std::sync::Mutex::new(HashSet::new()),
@@ -6757,7 +6757,7 @@ impl PartitionBypassCacheBackend {
         }
     }
 
-    fn set_partition_keys(&self, partition_keys: HashSet<lance_core::cache::InternalCacheKey>) {
+    pub fn set_partition_keys(&self, partition_keys: HashSet<lance_core::cache::InternalCacheKey>) {
         *self.partition_keys.lock().unwrap() = partition_keys;
     }
 
@@ -6765,7 +6765,7 @@ impl PartitionBypassCacheBackend {
         self.partition_keys.lock().unwrap().contains(key)
     }
 
-    fn set_bypass_partitions(&self, bypass_partitions: bool) {
+    pub fn set_bypass_partitions(&self, bypass_partitions: bool) {
         self.bypass_partitions
             .store(bypass_partitions, Ordering::Relaxed);
     }
@@ -6775,11 +6775,11 @@ impl PartitionBypassCacheBackend {
     }
 
     /// Whether the backend currently holds an entry for `key`.
-    async fn contains(&self, key: &lance_core::cache::InternalCacheKey) -> bool {
+    pub async fn contains(&self, key: &lance_core::cache::InternalCacheKey) -> bool {
         self.inner.get(key, None).await.is_some()
     }
 
-    fn partition_hits(&self) -> usize {
+    pub fn partition_hits(&self) -> usize {
         self.partition_hits.load(Ordering::Relaxed)
     }
 }
@@ -6789,7 +6789,7 @@ impl PartitionBypassCacheBackend {
 /// `dataset URI -> index UUID -> frag-reuse UUID` used when opening the
 /// index. V3 partitions use [`IVFPartitionKey`]; legacy (v0.1/v0.2)
 /// indices use `LegacyIVFPartitionKey`.
-fn ivf_partition_cache_keys(
+pub fn ivf_partition_cache_keys(
     dataset_uri: &str,
     uuid: &uuid::Uuid,
     fri_uuid: Option<&uuid::Uuid>,
@@ -7077,280 +7077,6 @@ async fn test_prewarm_and_query_with_serializing_backend(
         read_iops,
         0,
         "warmed IVF query should not perform IO after backend restart"
-    );
-}
-
-#[rstest]
-#[case::v3(IndexFileVersion::V3)]
-#[case::legacy(IndexFileVersion::Legacy)]
-#[tokio::test]
-async fn test_vector_cache_uses_current_object_store(#[case] index_version: IndexFileVersion) {
-    let test_dir = TempStrDir::default();
-    let test_uri = test_dir.as_str();
-    let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
-    append_dataset::<Float32Type>(&mut dataset, NUM_ROWS, 0.0..1.0).await;
-    assert_eq!(dataset.get_fragments().len(), 2);
-
-    let params = VectorIndexParams::with_ivf_pq_params(
-        DistanceType::L2,
-        IvfBuildParams::new(4),
-        PQBuildParams::default(),
-    )
-    .version(index_version.clone())
-    .clone();
-    dataset
-        .create_index(
-            &["vector"],
-            IndexType::Vector,
-            Some("credential_rotation_idx".to_owned()),
-            &params,
-            true,
-        )
-        .await
-        .unwrap();
-    let index_meta = dataset
-        .load_indices_by_name("credential_rotation_idx")
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    let query = vectors.value(0);
-    let ground_truth = ground_truth(&dataset, "vector", &query, 20, DistanceType::L2).await;
-
-    let cache_backend = Arc::new(PartitionBypassCacheBackend::new());
-    let session = Arc::new(crate::session::Session::with_index_cache_backend(
-        cache_backend.clone(),
-        128 * 1024 * 1024,
-        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
-    ));
-    let dataset = crate::DatasetBuilder::from_uri(test_uri)
-        .with_session(session)
-        .load()
-        .await
-        .unwrap();
-
-    let store_params_a = ObjectStoreParams {
-        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
-            HashMap::from([(
-                "credential_generation".to_owned(),
-                "secret-generation-a".to_owned(),
-            )]),
-        ))),
-        ..Default::default()
-    };
-    let (store_a, _) = ObjectStore::from_uri_and_params(
-        dataset.session().store_registry(),
-        dataset.uri(),
-        &store_params_a,
-    )
-    .await
-    .unwrap();
-    let dataset_a = dataset.with_object_store(store_a.clone(), Some(store_params_a));
-
-    let store_params_b = ObjectStoreParams {
-        storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
-            HashMap::from([(
-                "credential_generation".to_owned(),
-                "secret-generation-b".to_owned(),
-            )]),
-        ))),
-        ..Default::default()
-    };
-    let (store_b, _) = ObjectStore::from_uri_and_params(
-        dataset.session().store_registry(),
-        dataset.uri(),
-        &store_params_b,
-    )
-    .await
-    .unwrap();
-    assert!(!Arc::ptr_eq(&store_a, &store_b));
-    let dataset_b = dataset.with_object_store(store_b.clone(), Some(store_params_b));
-
-    let _ = store_a.io_stats_incremental();
-    let _ = store_b.io_stats_incremental();
-
-    dataset_a
-        .scan()
-        .nearest("vector", &query, 20)
-        .unwrap()
-        .minimum_nprobes(4)
-        .with_row_id()
-        .try_into_batch()
-        .await
-        .unwrap();
-
-    let frag_reuse_uuid = dataset_a.frag_reuse_index_uuid().await;
-    let state_cache_key =
-        crate::index::IvfIndexStateCacheKey::new(&index_meta.uuid, frag_reuse_uuid.as_ref());
-    let cached_state = if matches!(index_version, IndexFileVersion::V3) {
-        Some(
-            dataset_a
-                .index_cache
-                .get_with_key(&state_cache_key)
-                .await
-                .expect("V3 IVF state should be cached"),
-        )
-    } else {
-        None
-    };
-    let index_path_fragment = format!("_indices/{}", index_meta.uuid);
-    let first_store_stats = store_a.io_stats_incremental();
-    assert!(
-        first_store_stats
-            .requests
-            .iter()
-            .any(|request| request.path.as_ref().contains(&index_path_fragment)),
-        "the first query should read the index through the first object store: {first_store_stats:#?}"
-    );
-    let partition_keys = ivf_partition_cache_keys(
-        dataset.uri(),
-        &index_meta.uuid,
-        frag_reuse_uuid.as_ref(),
-        4,
-        &index_version,
-    );
-    cache_backend.set_partition_keys(partition_keys.clone());
-    for partition_key in &partition_keys {
-        assert!(
-            cache_backend.contains(partition_key).await,
-            "the first query should populate portable partition entries"
-        );
-    }
-    let index_entries_after_a = dataset.session().index_cache_stats().await.num_entries;
-    let metadata_entries_after_a = dataset.session().metadata_cache_stats().await.num_entries;
-    let _ = store_b.io_stats_incremental();
-
-    cache_backend.set_bypass_partitions(true);
-    let results = dataset_b
-        .scan()
-        .nearest("vector", &query, 20)
-        .unwrap()
-        .minimum_nprobes(4)
-        .with_row_id()
-        .try_into_batch()
-        .await
-        .unwrap();
-    let row_ids = results[ROW_ID]
-        .as_primitive::<UInt64Type>()
-        .values()
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>();
-    let recall = row_ids.intersection(&ground_truth).count() as f32 / 20.0;
-    assert_ge!(recall, 0.5);
-
-    let old_store_stats = store_a.io_stats_incremental();
-    let old_store_index_reads = old_store_stats
-        .requests
-        .iter()
-        .filter(|request| request.path.as_ref().contains(&index_path_fragment))
-        .count();
-    let new_store_stats = store_b.io_stats_incremental();
-    let new_store_index_reads = new_store_stats
-        .requests
-        .iter()
-        .filter(|request| request.path.as_ref().contains(&index_path_fragment))
-        .count();
-    if matches!(index_version, IndexFileVersion::V3) {
-        assert_eq!(
-            old_store_index_reads, 0,
-            "the new dataset query must not use readers bound to the old object store: {old_store_stats:#?}"
-        );
-        assert!(
-            new_store_index_reads > 0,
-            "the new dataset query should read the index through the new object store: {new_store_stats:#?}"
-        );
-    } else {
-        // Legacy live indices are shared across dataset opens: their
-        // readers stay bound to the object store that first populated the
-        // cache, so the second dataset keeps reading through the old store.
-        assert!(
-            old_store_index_reads > 0,
-            "the cached legacy index should keep reading through the original object store: {old_store_stats:#?}"
-        );
-        assert_eq!(
-            new_store_index_reads, 0,
-            "the cached legacy index must not reopen through the new object store: {new_store_stats:#?}"
-        );
-    }
-    if let Some(cached_state) = cached_state {
-        let state_after_rotation = dataset_b
-            .index_cache
-            .get_with_key(&state_cache_key)
-            .await
-            .expect("V3 IVF state should remain cached after rotation");
-        assert!(
-            Arc::ptr_eq(&cached_state, &state_after_rotation),
-            "store-free IVF state should be reused across object-store generations"
-        );
-    }
-
-    // Re-query through the first dataset: V3 portable state is rebound to
-    // the store supplied by each reconstruction, while the cached legacy
-    // index keeps reading through its original store. Either way the second
-    // store must not be touched.
-    let _ = store_a.io_stats_incremental();
-    let _ = store_b.io_stats_incremental();
-    dataset_a
-        .scan()
-        .nearest("vector", &query, 20)
-        .unwrap()
-        .minimum_nprobes(4)
-        .with_row_id()
-        .try_into_batch()
-        .await
-        .unwrap();
-    let store_a_stats = store_a.io_stats_incremental();
-    let store_a_index_reads = store_a_stats
-        .requests
-        .iter()
-        .filter(|request| request.path.as_ref().contains(&index_path_fragment))
-        .count();
-    let store_b_stats = store_b.io_stats_incremental();
-    let store_b_index_reads = store_b_stats
-        .requests
-        .iter()
-        .filter(|request| request.path.as_ref().contains(&index_path_fragment))
-        .count();
-    assert!(
-        store_a_index_reads > 0,
-        "re-querying the first dataset should read the index through its object store: {store_a_stats:#?}"
-    );
-    assert_eq!(
-        store_b_index_reads, 0,
-        "re-querying the first dataset must not use the second object store: {store_b_stats:#?}"
-    );
-
-    // Cache keys are opaque digests, so they cannot embed credential
-    // material by construction. What rotation must not do is mint new
-    // entries: the same portable state, partitions, and file metadata
-    // serve both object-store generations.
-    let index_entries_after_rotation = dataset.session().index_cache_stats().await.num_entries;
-    let metadata_entries_after_rotation =
-        dataset.session().metadata_cache_stats().await.num_entries;
-    assert_eq!(
-        index_entries_after_rotation, index_entries_after_a,
-        "credential rotation must not create new index cache entries"
-    );
-    assert_eq!(
-        metadata_entries_after_rotation, metadata_entries_after_a,
-        "credential rotation must not create new metadata cache entries"
-    );
-
-    cache_backend.set_bypass_partitions(false);
-    let partition_hits_before = cache_backend.partition_hits();
-    dataset_b
-        .scan()
-        .nearest("vector", &query, 20)
-        .unwrap()
-        .minimum_nprobes(4)
-        .with_row_id()
-        .try_into_batch()
-        .await
-        .unwrap();
-    assert!(
-        cache_backend.partition_hits() > partition_hits_before,
-        "the second store should reuse portable partitions populated by the first"
     );
 }
 

@@ -18,6 +18,9 @@ import org.lance.cleanup.CleanupPolicy;
 import org.lance.cleanup.RemovalStats;
 import org.lance.compaction.CompactionOptions;
 import org.lance.delta.DatasetDelta;
+import org.lance.expire.ExpireVersionsPlan;
+import org.lance.expire.ExpireVersionsPolicy;
+import org.lance.expire.ExpireVersionsStats;
 import org.lance.file.FileWriteOptions;
 import org.lance.index.Index;
 import org.lance.index.IndexBuildProgress;
@@ -1645,6 +1648,24 @@ public class Dataset implements Closeable {
   private native FragmentStatistics nativeGetFragmentStatistics();
 
   /**
+   * Get per-fragment column-layout statistics for this dataset version: how many data files hold a
+   * column of the schema, each file's size and schema field count, the share of dead field slots,
+   * and how many overlay files each fragment carries. Only manifest metadata is read.
+   *
+   * <p>This is an experimental API. It may change at any time.
+   *
+   * @return column-layout statistics as parallel arrays, in manifest order
+   */
+  public ColumnLayoutStatistics getColumnLayoutStatistics() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetColumnLayoutStatistics();
+    }
+  }
+
+  private native ColumnLayoutStatistics nativeGetColumnLayoutStatistics();
+
+  /**
    * Gets the arrow schema of the dataset.
    *
    * @return the arrow schema
@@ -1885,10 +1906,12 @@ public class Dataset implements Closeable {
   /**
    * Check whether the dataset uses stable row IDs.
    *
-   * <p>Stable row IDs remain constant when rows are moved during compaction. This reads the
-   * manifest feature flag directly rather than the user-facing config map.
+   * <p>Stable row IDs remain constant when a row is relocated or rewritten, whether by compaction,
+   * an update, or a merge insert. This reads the manifest feature flag directly rather than the
+   * user-facing config map.
    *
-   * @return true if the dataset was created with stable row IDs enabled
+   * @return true if the dataset uses stable row IDs, whether enabled at creation or by a later
+   *     migration
    */
   public boolean hasStableRowIds() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -2803,6 +2826,49 @@ public class Dataset implements Closeable {
       Optional<Long> deleteConcurrency,
       Optional<Long> deleteRateLimit,
       Optional<String> retentionPolicyJson);
+
+  /**
+   * Remove version history without deleting any data files.
+   *
+   * <p>Unlike {@link #cleanupWithPolicy}, this does not compute the set of live data files, so it
+   * does not read the manifests it expires. Data files that only an expired version referenced are
+   * left behind as unreferenced; the next cleanup reclaims them, and is cheaper for having fewer
+   * manifests to read. The intended order is expire, then clean up.
+   *
+   * <p>The newest version, tags on the current branch, and versions a branch is rooted at are never
+   * removed.
+   *
+   * @param policy expiry policy
+   * @return expiry stats; a non-zero {@code failedDeletes} means the run completed without removing
+   *     everything it selected
+   */
+  public ExpireVersionsStats expireVersions(ExpireVersionsPolicy policy) {
+    Preconditions.checkNotNull(policy, "policy cannot be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeExpireVersions(policy);
+    }
+  }
+
+  private native ExpireVersionsStats nativeExpireVersions(ExpireVersionsPolicy policy);
+
+  /**
+   * Report what {@link #expireVersions} would remove, without removing it.
+   *
+   * <p>A dry run: no manifest is deleted to produce this.
+   *
+   * @param policy expiry policy, the same one you would pass to {@link #expireVersions}
+   * @return the versions that would be removed and the stats that would result
+   */
+  public ExpireVersionsPlan explainExpireVersions(ExpireVersionsPolicy policy) {
+    Preconditions.checkNotNull(policy, "policy cannot be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeExplainExpireVersions(policy);
+    }
+  }
+
+  private native ExpireVersionsPlan nativeExplainExpireVersions(ExpireVersionsPolicy policy);
 
   CleanupExplanation explainCleanup(
       CleanupPolicy policy,

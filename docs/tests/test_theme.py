@@ -19,6 +19,11 @@ class SidenavTests(unittest.TestCase):
             root = Path(tmp)
             for name in (
                 "index.md",
+                "flat_guide/read.md",
+                "flat_guide/search.md",
+                "guide/read_and_write.md",
+                "guide/spark/index.md",
+                "guide/spark/ddl/create.md",
                 "spark/index.md",
                 "spark/ddl/create.md",
                 "trino/ddl/create.md",
@@ -31,7 +36,23 @@ class SidenavTests(unittest.TestCase):
             config = load_config(
                 config_file=StringIO("""
 nav:
+  - User Guide:
+      - Core Operations:
+          - Read & Write: flat_guide/read.md
+      - Indexing & Search:
+          - Overview: flat_guide/search.md
+  - Track Guide:
+      - PyLance:
+          - Core Operations:
+              - Read and Write: guide/read_and_write.md
+      - LanceDB: https://docs.lancedb.com/
+      - Apache Spark:
+          - Welcome: guide/spark/index.md
+          - Operations:
+              - DDL:
+                  - CREATE NAMESPACE: guide/spark/ddl/create.md
   - Integrations:
+      - External Docs: https://docs.lancedb.com/
       - Overview: index.md
       - Apache Spark:
           - Welcome: spark/index.md
@@ -52,8 +73,19 @@ nav:
             )
             build(config)
             cls.sidebars = {}
-            for name in ("spark/ddl/create/index.html", "standalone/index.html"):
+            cls.topnavs = {}
+            for name in (
+                "flat_guide/read/index.html",
+                "guide/read_and_write/index.html",
+                "guide/spark/ddl/create/index.html",
+                "spark/ddl/create/index.html",
+                "standalone/index.html",
+            ):
                 html = (root / "site" / name).read_text(encoding="utf-8")
+                topnav = html.split('<nav class="ld-topnav"', 1)[1].split("</nav>", 1)[
+                    0
+                ]
+                cls.topnavs[name] = ElementTree.fromstring("<nav" + topnav + "</nav>")
                 sidebar = html.split('<aside class="ld-sidenav"', 1)[1].split(
                     "</aside>", 1
                 )[0]
@@ -64,24 +96,26 @@ nav:
     def test_nested_sections_keep_their_parents(self):
         sidebar = self.sidebars["spark/ddl/create/index.html"]
         groups = sidebar.findall("./div[@class='ld-sidenav__group']")
-        self.assertEqual(len(groups), 1)
-        self.assertEqual(groups[0].find("div").text, "Integrations")
-        spark, trino = groups[0].findall("./div[@class='ld-sidenav__group']")
+        self.assertEqual(len(groups), 3)
+        root_group, spark, trino = groups
+        self.assertEqual(root_group.find("div").text, "Integrations")
         self.assertEqual(spark.find("div").text, "Apache Spark")
         self.assertEqual(trino.find("div").text, "Trino")
-        spark_ddl = spark.find("./div[@class='ld-sidenav__group']")
-        self.assertEqual(spark_ddl.find("div").text, "DDL")
-        self.assertEqual(spark_ddl.find("a").text, "CREATE NAMESPACE")
-        operations = trino.find("./div[@class='ld-sidenav__group']")
-        self.assertEqual(operations.find("div").text, "Operations")
-        trino_ddl = operations.find("./div[@class='ld-sidenav__group']")
-        self.assertEqual(trino_ddl.find("div").text, "DDL")
-        self.assertEqual(trino_ddl.find("a").text, "CREATE SCHEMA")
+        spark_ddl = spark.find("./details[@class='ld-sidenav__sub']")
+        self.assertEqual(spark_ddl.attrib.get("open"), "open")
+        self.assertEqual(spark_ddl.find("./summary/span").text, "DDL")
+        self.assertEqual(spark_ddl.find("./div/a").text, "CREATE NAMESPACE")
+        operations = trino.find("./details[@class='ld-sidenav__sub']")
+        self.assertIsNone(operations.attrib.get("open"))
+        self.assertEqual(operations.find("./summary/span").text, "Operations")
+        trino_ddl = operations.find("./div/details[@class='ld-sidenav__sub']")
+        self.assertEqual(trino_ddl.find("./summary/span").text, "DDL")
+        self.assertEqual(trino_ddl.find("./div/a").text, "CREATE SCHEMA")
 
     def test_links_keep_order_urls_and_active_state(self):
         sidebar = self.sidebars["spark/ddl/create/index.html"]
-        spark = sidebar.find("./div/div[@class='ld-sidenav__group']")
-        self.assertEqual([child.tag for child in spark], ["div", "a", "div", "a"])
+        spark = sidebar.findall("./div[@class='ld-sidenav__group']")[1]
+        self.assertEqual([child.tag for child in spark], ["div", "a", "details", "a"])
         welcome, project = spark.findall("a")
         self.assertEqual(welcome.attrib, {"href": "../../"})
         self.assertEqual(
@@ -103,3 +137,118 @@ nav:
         self.assertEqual(
             sidebar.find("./div/a").attrib, {"class": "active", "href": "./"}
         )
+        tabs = self.topnavs["standalone/index.html"].findall("a")
+        self.assertEqual(tabs[0].text, "User Guide")
+        self.assertEqual(tabs[0].get("href"), "../flat_guide/read/")
+        self.assertEqual(tabs[1].text, "Track Guide")
+        self.assertEqual(tabs[1].get("href"), "../guide/read_and_write/")
+        self.assertEqual(tabs[2].text, "Integrations")
+        self.assertEqual(tabs[2].get("href"), "..")
+
+    def test_two_level_guide_renders_flat_groups_without_switcher(self):
+        sidebar = self.sidebars["flat_guide/read/index.html"]
+        self.assertIsNone(sidebar.find(".//div[@class='ld-sidenav__tracks']"))
+        groups = sidebar.findall("./div[@class='ld-sidenav__group']")
+        self.assertEqual(
+            [group.find("div").text for group in groups],
+            ["Core Operations", "Indexing & Search"],
+        )
+        self.assertEqual(groups[0].find("a").attrib.get("class"), "active")
+        self.assertEqual(groups[0].find("a").text, "Read & Write")
+
+    def test_track_switcher_prioritizes_pylance_and_lancedb_and_scopes_tree(self):
+        pylance_sidebar = self.sidebars["guide/read_and_write/index.html"]
+        tracks = pylance_sidebar.findall("./div/div[@class='ld-sidenav__tracks']/a")
+        self.assertEqual(
+            [a.find("span").text for a in tracks],
+            ["PyLance", "LanceDB", "Apache Spark"],
+        )
+        self.assertIn("active", tracks[0].attrib.get("class", ""))
+        self.assertEqual(tracks[1].attrib.get("href"), "https://docs.lancedb.com/")
+        groups = pylance_sidebar.findall("./div[@class='ld-sidenav__group']")
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].find("div").text, "Core Operations")
+        self.assertEqual(groups[0].find("a").text, "Read and Write")
+
+        spark_sidebar = self.sidebars["guide/spark/ddl/create/index.html"]
+        spark_tracks = spark_sidebar.findall("./div/div[@class='ld-sidenav__tracks']/a")
+        self.assertIn("active", spark_tracks[2].attrib.get("class", ""))
+        spark_groups = spark_sidebar.findall("./div[@class='ld-sidenav__group']")
+        self.assertEqual(len(spark_groups), 2)
+        self.assertIsNone(spark_groups[0].find("./div[@class='ld-sidenav__label']"))
+        self.assertEqual(spark_groups[0].find("a").text, "Welcome")
+        self.assertEqual(spark_groups[1].find("div").text, "Operations")
+        ddl = spark_groups[1].find("./details[@class='ld-sidenav__sub']")
+        self.assertEqual(ddl.attrib.get("open"), "open")
+        self.assertEqual(ddl.find("./summary/span").text, "DDL")
+
+    def test_alternate_style_language_tabs_render_radio_inputs_and_labels(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            page = root / "src" / "index.md"
+            page.parent.mkdir(parents=True, exist_ok=True)
+            page.write_text(
+                "# Guide\n\n"
+                '=== "Python"\n\n'
+                "    ```python\n"
+                "    ds = lance.dataset('a.lance')\n"
+                "    ```\n\n"
+                '=== "Rust"\n\n'
+                "    ```rust\n"
+                '    let ds = Dataset::open("a.lance").await?;\n'
+                "    ```\n\n"
+                '=== "Java"\n\n'
+                "    ```java\n"
+                '    Dataset ds = Dataset.open("a.lance", allocator);\n'
+                "    ```\n",
+                encoding="utf-8",
+            )
+            config = load_config(
+                config_file=StringIO(
+                    "markdown_extensions:\n"
+                    "  - pymdownx.superfences\n"
+                    "  - pymdownx.tabbed:\n"
+                    "      alternate_style: true\n"
+                ),
+                site_name="Tab test",
+                docs_dir=str(root / "src"),
+                site_dir=str(root / "site"),
+                theme={"name": None, "custom_dir": str(DOCS_DIR / "theme")},
+                plugins=[],
+            )
+            build(config)
+            html = (root / "site" / "index.html").read_text(encoding="utf-8")
+            self.assertIn("tabbed-set tabbed-alternate", html)
+            self.assertIn(">Python</label>", html)
+            self.assertIn(">Rust</label>", html)
+            self.assertIn(">Java</label>", html)
+
+    def test_homepage_renders_three_layer_stack_links(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "src" / "index.md"
+            home.parent.mkdir(parents=True, exist_ok=True)
+            home.write_text("---\ntemplate: home.html\n---\n", encoding="utf-8")
+            config = load_config(
+                config_file=StringIO("nav:\n  - Home: index.md\n"),
+                site_name="Home test",
+                docs_dir=str(root / "src"),
+                site_dir=str(root / "site"),
+                theme={"name": None, "custom_dir": str(DOCS_DIR / "theme")},
+                plugins=[],
+            )
+            build(config)
+            html = (root / "site" / "index.html").read_text(encoding="utf-8")
+            self.assertIn("01 · Database", html)
+            self.assertIn("02 · Language SDKs", html)
+            self.assertIn("03 · Query &amp; Compute Engines", html)
+            for expected_href in (
+                'href="quickstart/lancedb/"',
+                'href="quickstart/pylance/"',
+                'href="quickstart/rust/"',
+                'href="quickstart/java/"',
+                'href="integrations/spark/"',
+                'href="format/"',
+                'href="format/namespace/"',
+            ):
+                self.assertIn(expected_href, html)
