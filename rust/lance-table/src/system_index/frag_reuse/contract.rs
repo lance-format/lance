@@ -18,6 +18,7 @@ use super::history::tests::{
 use super::history::{
     FragReuseHistory, HistoryFormat, LEGACY_VERSION_FIELD, RawHistory, Record, length_delimited,
 };
+use super::plan::{ReadContext, ReadPlan, RowDomain, SegmentSummary, TranslationSupport};
 
 /// Record one rewrite as the record kind `history`'s format writes.
 fn record_natively(
@@ -207,5 +208,208 @@ fn whole_history_edits_refuse_records_they_cannot_interpret(
     assert_refused(history.remap_stable_partition_bases(&Ok));
     if format == HistoryFormat::Tagged {
         assert_refused(history.append_transitions(&[ordered(&[whole(1, 1)], &[(2, 1)])]));
+    }
+}
+
+/// How a history is read: each format, and the legacy format on a table
+/// with stable row IDs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Reading {
+    Legacy,
+    LegacyStableRowIds,
+    Tagged,
+}
+
+/// The version the rewrite in [`rewritten`] is recorded at, and the FRI
+/// entry's version.
+const REWRITE_VERSION: u64 = 5;
+
+/// One rewrite at [`REWRITE_VERSION`]: fragments 0 and 3 (one row each)
+/// into fragment 1. Fragment 2 is untouched; 1 and 2 are live.
+fn rewritten(reading: Reading) -> (FragReuseHistory, RoaringBitmap) {
+    let format = match reading {
+        Reading::Legacy | Reading::LegacyStableRowIds => HistoryFormat::Legacy,
+        Reading::Tagged => HistoryFormat::Tagged,
+    };
+    let history = record_natively(
+        FragReuseHistory::empty(format),
+        REWRITE_VERSION,
+        &[whole(0, 1), whole(3, 1)],
+        &[(1, 2)],
+    );
+    let history = match reading {
+        Reading::LegacyStableRowIds => history.on_stable_row_ids().unwrap(),
+        _ => history,
+    };
+    (history, RoaringBitmap::from_iter([1, 2]))
+}
+
+fn segment(
+    covered: &[u32],
+    dataset_version: u64,
+    translation: TranslationSupport,
+) -> SegmentSummary {
+    SegmentSummary {
+        uuid: uuid::Uuid::new_v4(),
+        fragment_bitmap: Some(covered.iter().copied().collect()),
+        dataset_version,
+        domain: RowDomain::Address,
+        translation,
+    }
+}
+
+fn plan_one(reading: Reading, segment: SegmentSummary) -> ReadPlan {
+    let (history, live) = rewritten(reading);
+    let context = ReadContext {
+        entry_version: REWRITE_VERSION,
+        live_fragments: &live,
+    };
+    history
+        .plan(&context, std::slice::from_ref(&segment))
+        .remove(0)
+}
+
+/// A segment built after the rewrite, or covering none of its fragments,
+/// is caught up and read directly. The comparison is strict: a segment built
+/// at the rewrite's version read its sources.
+#[rstest]
+#[case::legacy(Reading::Legacy)]
+#[case::legacy_stable_row_ids(Reading::LegacyStableRowIds)]
+#[case::tagged(Reading::Tagged)]
+fn caught_up_segment_is_direct(#[case] reading: Reading) {
+    let (history, _) = rewritten(reading);
+    let supported = TranslationSupport::Supported;
+    for (covered, dataset_version, is_caught_up) in [
+        (&[1, 2][..], REWRITE_VERSION + 1, true),
+        (&[2][..], 1, true),
+        // A fragment that is no longer live needs no translation either.
+        (&[2, 7][..], 1, true),
+        (&[1, 2][..], REWRITE_VERSION, false),
+        (&[0, 3][..], 1, false),
+    ] {
+        let summary = segment(covered, dataset_version, supported);
+        assert_eq!(
+            history.is_caught_up(REWRITE_VERSION, &summary),
+            is_caught_up,
+            "{covered:?} at version {dataset_version}"
+        );
+        let plan = plan_one(reading, summary);
+        assert_eq!(
+            plan == ReadPlan::Direct,
+            is_caught_up,
+            "{covered:?} at version {dataset_version}: {plan:?}"
+        );
+    }
+}
+
+/// Every fragment a segment answers for is live, and either one it covers
+/// itself or one a transition produced from fragments its index covers. An
+/// excluded segment answers for nothing.
+#[rstest]
+#[case::legacy(Reading::Legacy)]
+#[case::legacy_stable_row_ids(Reading::LegacyStableRowIds)]
+#[case::tagged(Reading::Tagged)]
+fn effective_coverage_never_claims_an_untranslatable_fragment(#[case] reading: Reading) {
+    let (history, live) = rewritten(reading);
+    let context = ReadContext {
+        entry_version: REWRITE_VERSION,
+        live_fragments: &live,
+    };
+    let supported = TranslationSupport::Supported;
+    let unsupported = TranslationSupport::Unsupported;
+    let groups = [
+        vec![segment(&[0, 3], 1, supported)],
+        vec![segment(&[0], 1, supported), segment(&[3], 1, supported)],
+        vec![segment(&[0], 1, supported)],
+        vec![
+            segment(&[0, 3], 1, unsupported),
+            segment(&[2], 1, supported),
+        ],
+        vec![segment(&[0, 3], 1, supported), segment(&[1], 6, supported)],
+    ];
+    for group in groups {
+        let provenance: RoaringBitmap = group
+            .iter()
+            .flat_map(|segment| segment.fragment_bitmap.iter().flatten())
+            .collect();
+        let plans = history.plan(&context, &group);
+        let coverage = history.effective_coverage(&context, &group);
+        for ((segment, plan), coverage) in group.iter().zip(plans).zip(coverage) {
+            let own = segment.fragment_bitmap.as_ref().unwrap();
+            if plan == ReadPlan::Excluded {
+                assert!(coverage.is_empty(), "{group:?}");
+            }
+            for fragment in &coverage {
+                assert!(live.contains(fragment), "{group:?}: {fragment} is not live");
+                let is_translated = history.ledger().producer(fragment).is_some_and(|producer| {
+                    history.ledger().transitions()[producer]
+                        .sources()
+                        .iter()
+                        .all(|source| provenance.contains(source.id as u32))
+                });
+                assert!(
+                    own.contains(fragment) || is_translated,
+                    "{group:?}: {fragment} cannot be translated to"
+                );
+            }
+        }
+    }
+}
+
+/// A segment is excluded only when it needs translation its kind cannot
+/// provide. Legacy trusts every kind (fail-closed plugins come with the
+/// `Remapper`); on a table with stable row IDs the legacy reader applies the
+/// history to every segment it opens, so a kind that cannot apply it, or one
+/// storing stable row IDs, is excluded even when caught up.
+#[rstest]
+#[case::legacy(Reading::Legacy, [false, false, false])]
+#[case::legacy_stable_row_ids(Reading::LegacyStableRowIds, [true, true, true])]
+#[case::tagged(Reading::Tagged, [true, false, false])]
+fn excluded_only_when_translation_is_needed_and_unsupported(
+    #[case] reading: Reading,
+    #[case] is_excluded: [bool; 3],
+) {
+    let unsupported = TranslationSupport::Unsupported;
+    let stale = segment(&[0, 3], 1, unsupported);
+    let caught_up = segment(&[1], REWRITE_VERSION + 1, unsupported);
+    let mut row_ids = segment(&[1], REWRITE_VERSION + 1, TranslationSupport::Supported);
+    row_ids.domain = RowDomain::StableRowId;
+    for (segment, is_excluded) in [stale, caught_up, row_ids].into_iter().zip(is_excluded) {
+        let plan = plan_one(reading, segment.clone());
+        assert_eq!(
+            plan == ReadPlan::Excluded,
+            is_excluded,
+            "{segment:?}: {plan:?}"
+        );
+    }
+    for covered in [&[0, 3][..], &[1], &[2], &[]] {
+        let plan = plan_one(reading, segment(covered, 1, TranslationSupport::Supported));
+        assert_ne!(plan, ReadPlan::Excluded, "{covered:?}");
+    }
+}
+
+/// A segment with no remaining coverage is still translated, not excluded,
+/// so readers that need the index itself (full text search takes its
+/// tokenizer from it) still find it: one whose coverage was withdrawn, and,
+/// where coverage is derived from the lineage, one covering only part of a
+/// transition's sources.
+#[rstest]
+#[case::legacy(Reading::Legacy)]
+#[case::legacy_stable_row_ids(Reading::LegacyStableRowIds)]
+#[case::tagged(Reading::Tagged)]
+fn empty_remaining_coverage_still_translates(#[case] reading: Reading) {
+    let mut cases = vec![segment(
+        &[],
+        REWRITE_VERSION + 1,
+        TranslationSupport::Supported,
+    )];
+    if reading == Reading::Tagged {
+        cases.push(segment(&[0], 1, TranslationSupport::Supported));
+    }
+    for segment in cases {
+        match plan_one(reading, segment.clone()) {
+            ReadPlan::Translate(plan) => assert!(plan.coverage().is_empty(), "{segment:?}"),
+            other => panic!("{segment:?}: {other:?}"),
+        }
     }
 }

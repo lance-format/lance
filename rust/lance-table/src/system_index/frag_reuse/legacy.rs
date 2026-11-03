@@ -416,4 +416,105 @@ mod tests {
             Some(address(8, 1))
         );
     }
+
+    fn reuse_version(dataset_version: u64, old: &[u64], new: &[u64]) -> FragReuseVersion {
+        let digest = |id| super::super::FragDigest {
+            id,
+            physical_rows: 100,
+            num_deleted_rows: 0,
+        };
+        FragReuseVersion {
+            dataset_version,
+            groups: vec![super::super::FragReuseGroup {
+                changed_row_addrs: Vec::new(),
+                old_frags: old.iter().copied().map(digest).collect(),
+                new_frags: new.iter().copied().map(digest).collect(),
+            }],
+        }
+    }
+
+    fn index_covering(dataset_version: u64, covered: &[u32]) -> IndexMetadata {
+        IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            fields: vec![0],
+            covering_fields: vec![],
+            name: "test_idx".into(),
+            dataset_version,
+            fragment_bitmap: Some(RoaringBitmap::from_iter(covered.iter().copied())),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            clustering_id: None,
+            metadata: Default::default(),
+        }
+    }
+
+    /// The catch-up determination must not pin the FRI on an index that is
+    /// simply unrelated to the compaction, while still retaining versions that a
+    /// covering-but-not-yet-remapped index needs.
+    #[test]
+    fn caught_up_uses_fragment_coverage_not_only_version() {
+        // A reuse version at dataset_version 10 rewrote fragments [4, 5] -> [6].
+        let version = reuse_version(10, &[4, 5], &[6]);
+        let chain = reuse_chain_frag_bitmap(std::slice::from_ref(&version));
+        let caught_up = |dataset_version, covered: &[u32]| {
+            is_index_remap_caught_up(&version, &index_covering(dataset_version, covered), &chain)
+                .unwrap()
+        };
+
+        // Non-covering, stale version: touches none of the rewritten frags, so
+        // caught up despite version 5 < 10.
+        assert!(caught_up(5, &[1, 2, 3]));
+        // Still holds an old fragment: not caught up.
+        assert!(!caught_up(5, &[1, 4, 5]));
+        // Bitmap advanced onto the new fragment but data not yet remapped: not
+        // caught up (why the chain must include new frags).
+        assert!(!caught_up(5, &[1, 6]));
+        // Built at version 10 itself: still pre-rewrite data, not caught up.
+        assert!(!caught_up(10, &[1, 6]));
+        // Built or remapped after version 10: caught up.
+        assert!(caught_up(11, &[1, 6]));
+        // Partly covering a rewrite group only a corrupted version records.
+        let error =
+            is_index_remap_caught_up(&version, &index_covering(11, &[4]), &chain).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    }
+
+    /// The chain spans every reuse version, not just the one being checked: a
+    /// stale index touching only a *later* version's fragment must still fall to
+    /// the version gate (a per-version chain would wrongly clear it).
+    #[test]
+    fn caught_up_uses_whole_reuse_chain() {
+        let v1 = reuse_version(10, &[4, 5], &[6]);
+        let v2 = reuse_version(11, &[6], &[7]);
+        let chain = reuse_chain_frag_bitmap(&[v1.clone(), v2]);
+        assert!(!is_index_remap_caught_up(&v1, &index_covering(5, &[1, 7]), &chain).unwrap());
+    }
+
+    /// Whole-fragment removal (every row deleted, no replacement): an index
+    /// emptied by the deletion has an empty bitmap and must count as caught up --
+    /// it holds only dead rows -- else its stale version pins the removed-fragment
+    /// version forever.
+    #[test]
+    fn caught_up_handles_fragment_removal() {
+        let version = reuse_version(20, &[7], &[]);
+        let chain = reuse_chain_frag_bitmap(std::slice::from_ref(&version));
+        assert!(is_index_remap_caught_up(&version, &index_covering(5, &[]), &chain).unwrap());
+        assert!(!is_index_remap_caught_up(&version, &index_covering(5, &[7]), &chain).unwrap());
+    }
+
+    /// Released writers did not always record a bitmap; such an index is
+    /// taken as caught up once built after the version, as they took it.
+    #[test]
+    fn caught_up_without_a_bitmap_after_the_version() {
+        let version = reuse_version(10, &[4], &[6]);
+        let chain = reuse_chain_frag_bitmap(std::slice::from_ref(&version));
+        let mut index = index_covering(11, &[]);
+        index.fragment_bitmap = None;
+        assert!(is_index_remap_caught_up(&version, &index, &chain).unwrap());
+        index.dataset_version = 10;
+        assert!(!is_index_remap_caught_up(&version, &index, &chain).unwrap());
+    }
 }
