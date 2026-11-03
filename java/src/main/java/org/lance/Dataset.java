@@ -1777,6 +1777,13 @@ public class Dataset implements Closeable {
    *
    * <p>UUIDs must be nonempty, unique, non-null, and belong to {@code indexName}. System indices
    * are unsupported.
+   *
+   * <pre>{@code
+   * List<IndexSegmentStatistics> segments =
+   *     dataset.getIndexSegmentStatistics("vector_idx", segmentUuids);
+   * Map<String, Object> statistics =
+   *     dataset.getIndexStatisticsFromSegments("vector_idx", segments);
+   * }</pre>
    */
   public List<IndexSegmentStatistics> getIndexSegmentStatistics(
       String indexName, List<UUID> indexUuids) {
@@ -1801,6 +1808,8 @@ public class Dataset implements Closeable {
    *
    * <p>Input order is ignored; output follows manifest order. Coverage comes from dataset metadata.
    * Statistics are not recomputed. Outdated fragment metadata is rejected instead of migrated.
+   *
+   * <p>See {@link #getIndexSegmentStatistics} for a collection example.
    */
   public Map<String, Object> getIndexStatisticsFromSegments(
       String indexName, List<IndexSegmentStatistics> segmentStatistics) {
