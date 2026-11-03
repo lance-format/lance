@@ -3502,8 +3502,9 @@ pub trait StructuralPageDecoder: std::fmt::Debug + Send {
 
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>>;
     fn num_rows(&self) -> u64;
-    /// Returns the exact decoded byte count for the next `num_rows` rows
-    /// from this decoder's current position, without consuming any rows.
+    /// Returns an exact count or conservative upper bound on the decoded byte count
+    /// for the next `num_rows` rows from this decoder's current position, without
+    /// consuming any rows.
     fn decoded_bytes(&self, _num_rows: u64) -> Result<u64> {
         Err(Error::not_supported(
             "decoded_bytes is not implemented for this page decoder".to_string(),

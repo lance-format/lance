@@ -59,7 +59,7 @@ use lance_index::vector::{
     pq::PQBuildParams,
     sq::{ScalarQuantizer, builder::SQBuildParams},
 };
-use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, IndexType};
+use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, IndexType, pb};
 use lance_io::object_reader::LazyReader;
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Reader;
@@ -70,10 +70,12 @@ use tracing::instrument;
 use utils::get_vector_type;
 use uuid::Uuid;
 
-use super::{DatasetIndexExt, DatasetIndexInternalExt, IndexParams, pb};
+use super::{DatasetIndexExt, IndexParams, loading::DatasetIndexInternalExt};
 use crate::dataset::index::dataset_format_version;
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::{Error, Result, dataset::Dataset, index::pb::vector_index_stage::Stage};
+use crate::{Error, Result, dataset::Dataset};
+
+use lance_index::pb::vector_index_stage::Stage;
 
 pub const LANCE_VECTOR_INDEX: &str = "__lance_vector_index";
 
@@ -1957,7 +1959,7 @@ pub(crate) async fn open_vector_index(
 
     let mut last_stage: Option<Arc<dyn VectorIndex>> = None;
 
-    let frag_reuse_uuid = crate::index::frag_reuse_cache_scope(&dataset).await;
+    let frag_reuse_uuid = crate::index::loading::frag_reuse_cache_scope(&dataset).await;
 
     for stg in vec_idx.stages.iter().rev() {
         match stg.stage.as_ref() {
@@ -2087,7 +2089,7 @@ pub(crate) async fn open_vector_index_v2(
     let index_metadata: lance_index::IndexMetadata = serde_json::from_str(index_metadata)?;
     let distance_type = DistanceType::try_from(index_metadata.distance_type.as_str())?;
 
-    let frag_reuse_uuid = crate::index::frag_reuse_cache_scope(&dataset).await;
+    let frag_reuse_uuid = crate::index::loading::frag_reuse_cache_scope(&dataset).await;
     // Load the index metadata to get the correct index directory
     let index_meta = dataset
         .load_index(uuid)

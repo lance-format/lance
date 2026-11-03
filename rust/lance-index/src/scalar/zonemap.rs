@@ -712,6 +712,12 @@ impl ZoneMapIndex {
                     return Ok(true);
                 }
 
+                // A zone without extrema, such as one over a dictionary column,
+                // cannot be compared with the prefix.
+                if Self::zone_has_missing_extrema(zone) {
+                    return Ok(Self::zone_has_comparable_values(zone));
+                }
+
                 // Check zone.max >= prefix
                 let max_check = &zone.max >= prefix;
                 if !max_check {

@@ -162,7 +162,7 @@ impl FragReuseBase {
 }
 
 async fn stored_frag_reuse_entry(dataset: &Dataset) -> Result<Option<IndexMetadata>> {
-    Ok(crate::index::load_all_indices(dataset)
+    Ok(crate::index::loading::load_all_indices(dataset)
         .await?
         .iter()
         .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
@@ -570,7 +570,7 @@ impl<'a> TransactionRebase<'a> {
         if !matches!(self.transaction.operation, Operation::CreateIndex { .. }) {
             return Ok(());
         }
-        let indices = crate::index::load_all_indices(dataset).await?;
+        let indices = crate::index::loading::load_all_indices(dataset).await?;
         let Some(entry) = indices
             .iter()
             .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))
@@ -635,27 +635,56 @@ impl<'a> TransactionRebase<'a> {
         Ok(())
     }
 
-    /// Whether a version cleaned up from this attempt's window could hide a
-    /// change this CreateIndex must account for: it covers the source fragments
-    /// of a recorded deferred compaction, whose values must stay unchanged from
-    /// the build until that compaction read them, and its output's after.
-    /// Compactions before the build do not count: the index covers their
-    /// output under its own id.
-    pub(crate) fn needs_versions(&self, missing: &[u64]) -> bool {
+    /// Refuse gaps in the transaction history required to safely rebase.
+    pub(crate) fn check_missing_versions(
+        &self,
+        missing: &[u64],
+        latest_version: u64,
+    ) -> Result<()> {
+        if missing.is_empty() {
+            return Ok(());
+        }
+        // A missing transaction may have changed or removed any source fragment.
+        // Publishing a staged fragment without checking it can undo that write.
+        if !self.modified_fragment_ids.is_empty() {
+            return Err(Error::retryable_commit_conflict_source(
+                latest_version,
+                format!(
+                    "versions {missing:?} between transaction read version {} and latest \
+                     version {latest_version} were cleaned up, so {} cannot safely modify \
+                     existing fragments; retry the operation on the latest version",
+                    self.transaction.read_version, self.transaction.operation
+                )
+                .into(),
+            ));
+        }
+
+        // Gaps can hide changes to the source fragments an index covers, or to
+        // their outputs after a deferred compaction. Compactions before the build
+        // do not count: the index covers their output under its own id.
         let (Some(reuse), Operation::CreateIndex { new_indices, .. }) =
             (&self.untagged_reuse, &self.transaction.operation)
         else {
-            return false;
+            return Ok(());
         };
-        !missing.is_empty()
-            && reuse.groups.iter().any(|sources| {
-                new_indices.iter().any(|index| {
-                    index
-                        .fragment_bitmap
-                        .as_ref()
-                        .is_none_or(|bitmap| sources.iter().any(|id| bitmap.contains(*id as u32)))
-                })
+        if reuse.groups.iter().any(|sources| {
+            new_indices.iter().any(|index| {
+                index
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_none_or(|bitmap| sources.iter().any(|id| bitmap.contains(*id as u32)))
             })
+        }) {
+            return Err(Error::retryable_commit_conflict_source(
+                latest_version,
+                format!(
+                    "versions {missing:?} were cleaned up, so this index cannot be carried \
+                     through the deferred compaction it covers; rebuild it"
+                )
+                .into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
@@ -3151,7 +3180,7 @@ impl<'a> TransactionRebase<'a> {
             // tagged support are fenced off by the writer feature flag
             // before this point.
             if self.reuse.added_transitions.is_none() && proposed.index_version == 0 {
-                let stored = crate::index::load_all_indices(dataset).await?;
+                let stored = crate::index::loading::load_all_indices(dataset).await?;
                 let current_uses_tagged =
                     lance_table::system_index::frag_reuse::metadata::uses_tagged_fri(
                         &dataset.manifest,
@@ -3330,7 +3359,7 @@ async fn rewrite_reuse_state(
     } else {
         Cow::Borrowed(dataset)
     };
-    let read_entry = crate::index::load_all_indices(&read_version)
+    let read_entry = crate::index::loading::load_all_indices(&read_version)
         .await?
         .iter()
         .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
@@ -8026,7 +8055,9 @@ mod tests {
         }
 
         async fn fri_ledger(dataset: &Dataset) -> (IndexMetadata, FragReuseLedger) {
-            let stored = crate::index::load_all_indices(dataset).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(dataset)
+                .await
+                .unwrap();
             let entry = stored
                 .iter()
                 .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
@@ -8597,7 +8628,9 @@ mod tests {
 
             // Writer A trims the oldest legacy version, as v0 cleanup does.
             let mut writer_a = dataset.clone();
-            let stored = crate::index::load_all_indices(&writer_a).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&writer_a)
+                .await
+                .unwrap();
             let old_entry = stored
                 .iter()
                 .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
@@ -8680,7 +8713,9 @@ mod tests {
             .await
             .unwrap();
 
-            let stored = crate::index::load_all_indices(&committed).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&committed)
+                .await
+                .unwrap();
             let scalar = stored.iter().find(|idx| idx.name == "i_idx").unwrap();
             assert_eq!(
                 scalar.fragment_bitmap.as_ref().unwrap(),
@@ -9084,7 +9119,9 @@ mod tests {
             assert_eq!(filtered("i = 1").await, vec![1]);
             assert_eq!(filtered("i = 9").await, vec![9]);
             assert_eq!(filtered("i >= 14").await, vec![14, 15]);
-            let stored = crate::index::load_all_indices(&verify).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&verify)
+                .await
+                .unwrap();
             let scalar = stored.iter().find(|idx| idx.name == "i_idx").unwrap();
             assert_eq!(
                 scalar.fragment_bitmap.as_ref().unwrap(),
@@ -9205,7 +9242,9 @@ mod tests {
             )
             .await
             .unwrap();
-            let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&dataset)
+                .await
+                .unwrap();
             let entry = stored
                 .iter()
                 .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
@@ -9222,7 +9261,9 @@ mod tests {
         /// `i_idx` is as it was and still agrees with the scan.
         async fn assert_mixed_rewrite_refused(mut dataset: Dataset) {
             let version = dataset.manifest.version;
-            let stored_before = crate::index::load_all_indices(&dataset).await.unwrap();
+            let stored_before = crate::index::loading::load_all_indices(&dataset)
+                .await
+                .unwrap();
             assert_eq!(
                 i_idx(&stored_before).fragment_bitmap.as_ref().unwrap(),
                 &RoaringBitmap::from_iter([0u32, 1, 2, 3])
@@ -9239,7 +9280,9 @@ mod tests {
                 dataset.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
                 vec![0, 1, 2, 3]
             );
-            let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&dataset)
+                .await
+                .unwrap();
             assert_eq!(stored.len(), stored_before.len());
             assert_eq!(i_idx(&stored).uuid, i_idx(&stored_before).uuid);
             assert_eq!(
@@ -9258,7 +9301,9 @@ mod tests {
         /// destinations are scanned.
         async fn assert_mixed_rewrite_lands(dataset: Dataset) {
             let version = dataset.manifest.version;
-            let stored_before = crate::index::load_all_indices(&dataset).await.unwrap();
+            let stored_before = crate::index::loading::load_all_indices(&dataset)
+                .await
+                .unwrap();
             assert_eq!(
                 i_idx(&stored_before).fragment_bitmap.as_ref().unwrap(),
                 &RoaringBitmap::from_iter([0u32, 1])
@@ -9276,7 +9321,9 @@ mod tests {
             );
             let (_, ledger) = fri_ledger(&committed).await;
             assert_eq!(ledger.transitions().len(), 1);
-            let stored = crate::index::load_all_indices(&committed).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&committed)
+                .await
+                .unwrap();
             assert_eq!(stored.len(), stored_before.len() + 1, "the entry was added");
             assert_eq!(i_idx(&stored).uuid, i_idx(&stored_before).uuid);
             assert_eq!(
@@ -9360,7 +9407,9 @@ mod tests {
             let version = writer_a.manifest.version;
             let operation = mixed_rewrite(&writer_a).await;
             let writer_b = concurrent_index(&writer_a, vec![2, 3]).await;
-            let stored_b = crate::index::load_all_indices(&writer_b).await.unwrap();
+            let stored_b = crate::index::loading::load_all_indices(&writer_b)
+                .await
+                .unwrap();
             assert_eq!(
                 late_idx(&stored_b).fragment_bitmap.as_ref().unwrap(),
                 &RoaringBitmap::from_iter([2u32, 3])
@@ -9384,7 +9433,9 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![0, 1, 2, 3]
             );
-            let stored = crate::index::load_all_indices(&writer_a).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&writer_a)
+                .await
+                .unwrap();
             assert_eq!(stored.len(), stored_b.len());
             assert_eq!(late_idx(&stored).uuid, late_idx(&stored_b).uuid);
             assert_eq!(
@@ -9412,7 +9463,9 @@ mod tests {
             let version = writer_a.manifest.version;
             let operation = mixed_rewrite(&writer_a).await;
             let writer_b = concurrent_index(&writer_a, vec![0, 1]).await;
-            let stored_b = crate::index::load_all_indices(&writer_b).await.unwrap();
+            let stored_b = crate::index::loading::load_all_indices(&writer_b)
+                .await
+                .unwrap();
 
             let committed = commit_sp(&writer_a, version, operation).await.unwrap();
             assert_eq!(committed.manifest.version, writer_b.manifest.version + 1);
@@ -9426,7 +9479,9 @@ mod tests {
             );
             let (_, ledger) = fri_ledger(&committed).await;
             assert_eq!(ledger.transitions().len(), 1);
-            let stored = crate::index::load_all_indices(&committed).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&committed)
+                .await
+                .unwrap();
             assert_eq!(stored.len(), stored_b.len() + 1, "the entry was added");
             for (name, pick) in [
                 (
@@ -9745,7 +9800,9 @@ mod tests {
                 unreachable!()
             };
             mapping.map_id = Uuid::new_v4().to_string();
-            let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&dataset)
+                .await
+                .unwrap();
             let indices: Vec<IndexMetadata> = stored
                 .iter()
                 .map(|idx| {

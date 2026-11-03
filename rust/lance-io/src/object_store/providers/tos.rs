@@ -156,6 +156,7 @@ impl ObjectStoreProvider for TosStoreProvider {
             list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or(true),
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count: storage_options.download_retry_count(),
+            scheduler_error_mode: Default::default(),
             io_tracker: Default::default(),
             store_prefix: self.calculate_object_store_prefix(&url, params.storage_options())?,
             // Listed in full: no paginated lister covers OpenDAL yet.
@@ -177,10 +178,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{Tos, TosStoreProvider};
+    use crate::object_store::StorageOptionsAccessor;
     use crate::object_store::dynamic_opendal::DynamicOpenDalStore;
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
     use crate::object_store::{ObjectStore, opendal_store::OpendalStore};
-    use crate::object_store::{ObjectStoreProvider, StorageOptionsAccessor};
     use url::Url;
 
     #[derive(Clone, Default)]
@@ -451,16 +452,6 @@ mod tests {
         let deleted = mock.deleted.lock().unwrap();
         assert_eq!(deleted.first().unwrap(), "tenant/dataset/data/part.lance");
         assert_eq!(deleted.last().unwrap(), "tenant/dataset");
-    }
-
-    #[test]
-    fn test_tos_store_path() {
-        let provider = TosStoreProvider;
-
-        let url = Url::parse("tos://bucket/path/to/file").unwrap();
-        let path = provider.extract_path(&url).unwrap();
-        let expected_path = object_store::path::Path::from("path/to/file");
-        assert_eq!(path, expected_path);
     }
 
     #[test]

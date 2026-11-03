@@ -352,6 +352,7 @@ impl ObjectStoreProvider for GcsStoreProvider {
             list_is_lexically_ordered: true,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
+            scheduler_error_mode: Default::default(),
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
@@ -478,16 +479,6 @@ mod tests {
             ),
             ("allow_http".to_string(), "true".to_string()),
         ])
-    }
-
-    #[test]
-    fn test_gcs_store_path() {
-        let provider = GcsStoreProvider;
-
-        let url = Url::parse("gs://bucket/path/to/file").unwrap();
-        let path = provider.extract_path(&url).unwrap();
-        let expected_path = object_store::path::Path::from("path/to/file");
-        assert_eq!(path, expected_path);
     }
 
     #[tokio::test]

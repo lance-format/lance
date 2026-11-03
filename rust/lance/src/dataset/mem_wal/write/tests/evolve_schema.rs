@@ -4,9 +4,26 @@
 //! Moving a live writer onto a schema change, and the replay that has to
 //! rebuild the same generation boundaries afterwards.
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use arrow_array::{
+    ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, StringArray,
+};
+use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use lance_arrow::FixedSizeListArrayExt;
+use lance_io::object_store::ObjectStore;
+use object_store::path::Path;
+use uuid::Uuid;
+
+use super::super::test_support::*;
+use super::super::{ShardWriter, ShardWriterConfig};
+use crate::dataset::Dataset;
+use crate::dataset::mem_wal::manifest::ShardManifestStore;
+
 /// Replay starts each memtable where the WAL entry it reads says to.
 mod replay {
-    use super::super::*;
+    use super::*;
 
     /// Replay starts a new memtable where the recorded generation changes, even
     /// when no size limit or Blob v2 target would.
@@ -223,10 +240,10 @@ mod replay {
 
 /// A live writer moved onto a new schema keeps writing and reading.
 mod evolve {
-    use super::super::*;
+    use super::*;
     use crate::dataset::WriteParams;
     use crate::dataset::mem_wal::DatasetMemWalExt;
-    use crate::dataset::mem_wal::write::shard_writer_tests::{
+    use crate::dataset::mem_wal::write::tests::integration::{
         create_test_batch, create_test_schema,
     };
     use crate::index::DatasetIndexExt;

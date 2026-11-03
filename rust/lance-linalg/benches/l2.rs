@@ -127,12 +127,16 @@ fn l2_distance_uint_scalar_auto_vectorized(key: &[u8], target: &[u8]) -> f32 {
 
 fn bench_uint_distance(c: &mut Criterion) {
     let mut rng = rand::rng();
-    let key = repeat_with(|| rng.random::<u8>())
-        .take(DIMENSION)
+    // Slice 64-byte-aligned views out of padded buffers: zmm loads split cache
+    // lines on misaligned inputs, so results depended on heap placement.
+    let key_buf = repeat_with(|| rng.random::<u8>())
+        .take(DIMENSION + 63)
         .collect::<Vec<_>>();
-    let target = repeat_with(|| rng.random::<u8>())
-        .take(TOTAL * DIMENSION)
+    let key = &key_buf[key_buf.as_ptr().align_offset(64)..][..DIMENSION];
+    let target_buf = repeat_with(|| rng.random::<u8>())
+        .take(TOTAL * DIMENSION + 63)
         .collect::<Vec<_>>();
+    let target = &target_buf[target_buf.as_ptr().align_offset(64)..][..TOTAL * DIMENSION];
 
     c.bench_function("L2(uint8, scalar)", |b| {
         b.iter(|| {
@@ -141,7 +145,7 @@ fn bench_uint_distance(c: &mut Criterion) {
                     .as_chunks::<DIMENSION>()
                     .0
                     .iter()
-                    .map(|tgt| l2_distance_uint_scalar(&key, tgt))
+                    .map(|tgt| l2_distance_uint_scalar(key, tgt))
                     .fold(0.0, |acc, v| acc + v),
             );
         });
@@ -154,7 +158,7 @@ fn bench_uint_distance(c: &mut Criterion) {
                     .as_chunks::<DIMENSION>()
                     .0
                     .iter()
-                    .map(|tgt| l2_distance_uint_scalar_auto_vectorized(&key, tgt))
+                    .map(|tgt| l2_distance_uint_scalar_auto_vectorized(key, tgt))
                     .fold(0.0, |acc, v| acc + v),
             );
         });
@@ -167,7 +171,7 @@ fn bench_uint_distance(c: &mut Criterion) {
                     .as_chunks::<DIMENSION>()
                     .0
                     .iter()
-                    .map(|tgt| l2_u8(&key, tgt) as f32)
+                    .map(|tgt| l2_u8(key, tgt) as f32)
                     .fold(0.0, |acc, v| acc + v),
             );
         });

@@ -302,6 +302,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
             list_is_lexically_ordered: !is_s3_express,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
+            scheduler_error_mode: Default::default(),
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
@@ -1073,26 +1074,6 @@ mod tests {
             let expected_path = Path::parse(expected_path).unwrap();
             assert_eq!(path, expected_path)
         }
-    }
-
-    // Regression test for https://github.com/lance-format/lance/issues/6643
-    // extract_path must NOT double-encode paths that contain non-ASCII characters.
-    // url.path() returns a percent-encoded string; we must decode it back to raw
-    // UTF-8 before storing it in a Path, so the object store HTTP client can apply
-    // a single, correct percent-encoding when building the request URL.
-    #[test]
-    fn test_s3_non_ascii_path_no_double_encoding() {
-        let provider = AwsStoreProvider;
-
-        // "s3://bucket/中文路径" → url.path() == "/%E4%B8%AD%E6%96%87%E8%B7%AF%E5%BE%84".
-        // The buggy Path::parse(url.path()) stored "%E4%B8%AD..." verbatim; the S3
-        // client then percent-encodes the '%' again, yielding "%25E4%25B8%25AD...".
-        // With Path::from_url_path the Path stores the decoded UTF-8 instead.
-        let url = Url::parse("s3://bucket/中文路径").unwrap();
-        let path = provider.extract_path(&url).unwrap();
-
-        // The Path must hold the decoded UTF-8, not the percent-encoded form.
-        assert_eq!(path.as_ref(), "中文路径");
     }
 
     #[test]

@@ -5,13 +5,15 @@ description: Get started with Lance using LanceDB - create a table, query it, an
 
 # Getting Started with LanceDB
 
-Lance is an open table format. You can work with Lance tables from many engines, and this quickstart covers three of them:
+Lance is an open columnar table format for multimodal AI. Depending on your workload, you can work with Lance tables through a high-level retrieval database, a distributed compute engine, or the format SDKs directly:
 
-- **LanceDB** (this page) is a retrieval database built on Lance. It runs embedded in your application or as a distributed service.
-- **[Apache Spark](spark.md)** runs SQL and distributed data processing on Lance tables.
-- **[PyLance](pylance.md)** is the Python SDK for the Lance format itself, for low-level control over datasets.
+| Path | When to use | Entry point |
+|---|---|---|
+| **LanceDB** (this page) | You want an embedded or distributed retrieval database with built-in table management, vector search, full-text search, and hybrid reranking. | Continue below |
+| **[PyLance](pylance.md) / [Rust & Java SDKs](../sdk_docs.md)** | You want direct, low-level control over Lance datasets, fragments, custom Arrow schemas, blob columns, or distributed write transactions. | [PyLance Quickstart](pylance.md) · [User Guide](../guide/read_and_write.md) |
+| **[Apache Spark](spark.md) & Query Engines** | You want to run distributed SQL, ETL, or analytics over Lance tables alongside existing lakehouse pipelines. | [Spark Quickstart](spark.md) · [Integrations](../integrations/index.md) |
 
-All three engines read and write the same format, so a table you create with one of them can be opened with the others.
+All of these tools read and write the same underlying Lance format, so a table created with one can be opened by the others.
 
 In this guide, you'll create a small product catalog with LanceDB, filter it, search it by vector similarity and by keyword, modify it, and look back at earlier versions.
 

@@ -382,7 +382,20 @@ async fn commit_and_reopen_external_segment(#[case] empty_coverage: bool) {
         .unwrap();
     let reopened = Dataset::open(dataset.uri()).await.unwrap();
     assert_eq!(reopened.load_indices().await.unwrap()[0].uuid, uuid);
-    assert_external_index(&reopened, 4, coverage).await;
+    assert_external_index(&reopened, 4, coverage.clone()).await;
+    let descriptions = reopened.describe_indices(None).await.unwrap();
+    assert_eq!(descriptions.len(), 1);
+    if empty_coverage {
+        assert!(
+            descriptions[0].fragment_coverage().is_none(),
+            "an externally maintained empty bitmap does not establish coverage"
+        );
+    } else {
+        assert!(
+            descriptions[0].fragment_coverage().is_some(),
+            "a populated external bitmap remains authoritative coverage"
+        );
+    }
 }
 
 #[tokio::test]
