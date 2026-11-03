@@ -90,7 +90,9 @@ import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -217,6 +219,47 @@ public class DirectoryNamespaceTest {
     assertTrue(
         versionRejectingNamespace.getDescribeTableCallCount() > 0,
         "Expected describeTable to be called when opening through namespace");
+  }
+
+  @Test
+  void testReadsProceedWhileStorageOptionsRefreshIsInFlight() throws Exception {
+    // Vended storage options expire 1 ms after they are issued, so every
+    // getLatestStorageOptions() call refreshes them through describeTable.
+    DirectoryNamespace vendingNamespace = new DirectoryNamespace();
+    Map<String, String> config = new HashMap<>();
+    config.put("root", tempDir.resolve("vending").toString());
+    config.put("storage.refresh_offset_millis", "1000");
+    config.put("vend_input_storage_options", "true");
+    config.put("vend_input_storage_options_refresh_interval_millis", "1");
+    vendingNamespace.initialize(config, allocator);
+    BlockingDescribeNamespace blockingNamespace = new BlockingDescribeNamespace(vendingNamespace);
+    List<String> tableId = Arrays.asList("refresh_in_flight");
+    blockingNamespace.createTable(new CreateTableRequest().id(tableId), createTestTableData());
+
+    ExecutorService executor = Executors.newFixedThreadPool(2);
+    try (Dataset dataset =
+        Dataset.open()
+            .allocator(allocator)
+            .namespaceClient(blockingNamespace)
+            .tableId(tableId)
+            .build()) {
+      blockingNamespace.blockNextDescribe();
+      Future<Map<String, String>> refresh = executor.submit(dataset::getLatestStorageOptions);
+      try {
+        assertTrue(
+            blockingNamespace.awaitBlocked(10, TimeUnit.SECONDS),
+            "Expected the storage options refresh to call describeTable");
+        // The refresh is parked inside native code. A second read on the same Dataset
+        // must not wait for it.
+        Future<Long> count = executor.submit(() -> dataset.countRows());
+        assertEquals(3, count.get(5, TimeUnit.SECONDS));
+      } finally {
+        blockingNamespace.release();
+      }
+      refresh.get(10, TimeUnit.SECONDS);
+    } finally {
+      executor.shutdownNow();
+    }
   }
 
   @Test
@@ -1536,6 +1579,43 @@ public class DirectoryNamespaceTest {
         writer.writeBatch();
       }
       return out.toByteArray();
+    }
+  }
+
+  /** Holds one describeTable call until released, keeping a storage options refresh in flight. */
+  private static class BlockingDescribeNamespace extends CustomNamespace {
+    private final AtomicBoolean blockNext = new AtomicBoolean();
+    private final CountDownLatch blocked = new CountDownLatch(1);
+    private final CountDownLatch released = new CountDownLatch(1);
+
+    BlockingDescribeNamespace(DirectoryNamespace inner) {
+      super(inner);
+    }
+
+    void blockNextDescribe() {
+      blockNext.set(true);
+    }
+
+    boolean awaitBlocked(long timeout, TimeUnit unit) throws InterruptedException {
+      return blocked.await(timeout, unit);
+    }
+
+    void release() {
+      released.countDown();
+    }
+
+    @Override
+    public DescribeTableResponse describeTable(DescribeTableRequest request) {
+      if (blockNext.compareAndSet(true, false)) {
+        blocked.countDown();
+        try {
+          released.await();
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new IllegalStateException("Interrupted while blocking describeTable", e);
+        }
+      }
+      return super.describeTable(request);
     }
   }
 
