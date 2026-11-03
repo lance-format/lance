@@ -123,7 +123,12 @@ impl ComputeStat for FixedSizeListBlock {
         // There is a potential opportunity here to do better.  For example, if we have a FSL of
         // 4 32-bit integers then we should probably treat them as a single 128-bit integer or maybe
         // even 4 columns of 32-bit integers.  This might yield better compression.
-        self.child.compute_stat();
+        //
+        // The child's stats are already computed: `from_arrays` runs `compute_stat`
+        // on every block it builds, including this FSL's child. Re-running the
+        // child here computed every fixed-width statistic twice (every vector
+        // column) and panicked for a variable-width child, whose `compute_stat`
+        // rejects a second call.
     }
 }
 
@@ -581,16 +586,27 @@ impl ComputeStat for StructDataBlock {
         let data_size = self.data_size();
         let data_size_array = Arc::new(UInt64Array::from(vec![data_size]));
 
+        // A child without `MaxLength` (all-null or dictionary-encoded) makes the
+        // packed width unknown, not zero, so the statistic is left out.
         let max_len = self
             .children
             .iter()
-            .map(|child| child.expect_single_stat::<UInt64Type>(Stat::MaxLength))
-            .sum::<u64>();
-        let max_len_array = Arc::new(UInt64Array::from(vec![max_len]));
+            .map(|child| {
+                let stat = child.get_stat(Stat::MaxLength)?;
+                let stat = stat.as_primitive_opt::<UInt64Type>()?;
+                if stat.len() == 1 {
+                    Some(stat.value(0))
+                } else {
+                    None
+                }
+            })
+            .sum::<Option<u64>>();
 
         let mut info = self.block_info.0.write().unwrap();
         info.insert(Stat::DataSize, data_size_array);
-        info.insert(Stat::MaxLength, max_len_array);
+        if let Some(max_len) = max_len {
+            info.insert(Stat::MaxLength, Arc::new(UInt64Array::from(vec![max_len])));
+        }
     }
 }
 
@@ -599,17 +615,19 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
-        UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+        ArrayRef, FixedSizeListArray, Float32Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     };
     use arrow_schema::{DataType, Field};
     use lance_arrow::DataTypeExt;
     use lance_datagen::{ArrayGeneratorExt, DEFAULT_SEED, RowCount, array};
     use rand::SeedableRng;
+    use rstest::rstest;
 
+    use crate::data::FixedSizeListBlock;
     use crate::statistics::{GetStat, Stat};
 
-    use super::DataBlock;
+    use super::{ComputeStat, DataBlock};
 
     use arrow_array::{
         Array,
@@ -617,6 +635,110 @@ mod tests {
         types::{Int32Type, UInt64Type},
     };
     use arrow_select::concat::concat;
+
+    #[rstest]
+    #[case::vector(1)]
+    #[case::nested_vector(2)]
+    fn test_fixed_size_list_reuses_child_statistics(#[case] depth: u32) {
+        let mut block = DataBlock::from_array(Float32Array::from(vec![1.0, 2.0, 2.0, 4.0]));
+        let stats = [
+            Stat::DataSize,
+            Stat::BitWidth,
+            Stat::RunCount,
+            Stat::BytePositionEntropy,
+        ]
+        .map(|stat| (stat, block.expect_stat(stat)));
+
+        for _ in 0..depth {
+            block = DataBlock::FixedSizeList(FixedSizeListBlock {
+                child: Box::new(block),
+                dimension: 2,
+            });
+        }
+        block.compute_stat();
+
+        for (stat, child_stat) in stats {
+            assert!(Arc::ptr_eq(&child_stat, &block.expect_stat(stat)), "{stat}");
+        }
+        assert_eq!(
+            block.expect_single_stat::<UInt64Type>(Stat::MaxLength),
+            4 * 2_u64.pow(depth)
+        );
+    }
+
+    #[rstest]
+    #[case::utf8(DataType::Utf8)]
+    #[case::large_utf8(DataType::LargeUtf8)]
+    #[case::utf8_view(DataType::Utf8View)]
+    #[case::binary(DataType::Binary)]
+    #[case::large_binary(DataType::LargeBinary)]
+    #[case::binary_view(DataType::BinaryView)]
+    fn test_fixed_size_list_variable_width_statistics(
+        #[case] child_type: DataType,
+        #[values(1, 2)] depth: u32,
+        #[values(false, true)] is_nullable: bool,
+    ) {
+        let strings = StringArray::from(vec![
+            Some("a"),
+            if is_nullable { None } else { Some("bb") },
+            Some("ccc"),
+            Some("dddd"),
+        ]);
+        let mut array = arrow_cast::cast(&strings, &child_type).unwrap();
+        let child_block = DataBlock::from_array(array.clone());
+        let child_size = child_block.expect_single_stat::<UInt64Type>(Stat::DataSize);
+
+        for _ in 0..depth {
+            let field = Arc::new(Field::new("item", array.data_type().clone(), true));
+            array = Arc::new(FixedSizeListArray::new(field, 2, array, None));
+        }
+
+        let block = DataBlock::from_arrays(&[array.clone()], array.len() as u64);
+        assert_eq!(
+            block.expect_single_stat::<UInt64Type>(Stat::DataSize),
+            child_size
+        );
+        assert_eq!(
+            block.expect_single_stat::<UInt64Type>(Stat::MaxLength),
+            4 * 2_u64.pow(depth)
+        );
+    }
+
+    #[test]
+    fn test_struct_stat_without_child_max_length() {
+        use crate::compression::try_fixed_packed_struct_miniblock;
+        use arrow_array::{StructArray, new_null_array};
+        use arrow_schema::Fields;
+
+        let fields = Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]);
+        let array = Arc::new(StructArray::new(
+            fields,
+            vec![
+                new_null_array(&DataType::Int32, 3),
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            ],
+            None,
+        )) as ArrayRef;
+
+        let block = DataBlock::from_arrays(&[array], 3);
+        assert!(matches!(block, DataBlock::Struct(_)));
+        assert!(block.get_stat(Stat::DataSize).is_some());
+        assert!(
+            block.get_stat(Stat::MaxLength).is_none(),
+            "an all-null child contributes no width, so the sum is unknown"
+        );
+
+        let err = try_fixed_packed_struct_miniblock(&block)
+            .expect_err("a packed struct with an all-null child must be rejected");
+        assert!(
+            err.to_string().contains("fixed-width children"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn test_data_size_stat() {
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);

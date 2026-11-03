@@ -29,8 +29,8 @@ use crate::{
         miniblock::{MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor},
     },
     format::{
-        ProtobufUtils21,
-        pb21::{CompressiveEncoding, PackedStruct, compressive_encoding::Compression},
+        EncodingUtils,
+        metadata::{CompressiveEncoding, PackedStruct, compressive_encoding::Compression},
     },
     statistics::{GetStat, Stat},
 };
@@ -91,7 +91,7 @@ impl MiniBlockCompressor for PackedStructFixedWidthMiniBlockEncoder {
 
                 Ok((
                     value_miniblock_compressed,
-                    ProtobufUtils21::packed_struct(value_array_encoding, bits_per_values),
+                    EncodingUtils::packed_struct(value_array_encoding, bits_per_values),
                 ))
             }
             _ => Err(Error::invalid_input_source(format!(
@@ -379,7 +379,7 @@ impl PerValueCompressor for PackedStructVariablePerValueEncoder {
             let (compressed, encoding) = compressor.compress(child_block)?;
             match compressed {
                 PerValueDataBlock::Fixed(block) => {
-                    field_metadata.push(ProtobufUtils21::packed_struct_field_fixed(
+                    field_metadata.push(EncodingUtils::packed_struct_field_fixed(
                         encoding,
                         block.bits_per_value,
                     ));
@@ -388,7 +388,7 @@ impl PerValueCompressor for PackedStructVariablePerValueEncoder {
                 }
                 PerValueDataBlock::Variable(block) => {
                     let bits_per_length = block.bits_per_offset as u64;
-                    field_metadata.push(ProtobufUtils21::packed_struct_field_variable(
+                    field_metadata.push(EncodingUtils::packed_struct_field_variable(
                         encoding,
                         bits_per_length,
                     ));
@@ -442,7 +442,7 @@ impl PerValueCompressor for PackedStructVariablePerValueEncoder {
 
         Ok((
             PerValueDataBlock::Variable(data_block),
-            ProtobufUtils21::packed_struct_variable(field_metadata),
+            EncodingUtils::packed_struct_variable(field_metadata),
         ))
     }
 }
@@ -516,8 +516,8 @@ impl PerValueCompressor for PackedStructFixedPerValueEncoder {
 
         Ok((
             PerValueDataBlock::Fixed(data_block),
-            ProtobufUtils21::packed_struct(
-                ProtobufUtils21::flat(bits_per_row, None),
+            EncodingUtils::packed_struct(
+                EncodingUtils::flat(bits_per_row, None),
                 field_bits_per_value,
             ),
         ))
@@ -930,7 +930,7 @@ impl PackedStructFixedPerValueDecompressor {
             .bits_per_value
             .iter()
             .map(|&bits_per_value| {
-                let flat = crate::format::pb21::Flat {
+                let flat = crate::format::metadata::Flat {
                     bits_per_value,
                     data: None,
                 };
@@ -1409,13 +1409,13 @@ mod tests {
         let fixed_decompressor = Arc::from(
             crate::compression::DecompressionStrategy::create_fixed_per_value_decompressor(
                 &strategy,
-                &ProtobufUtils21::flat(32, None),
+                &EncodingUtils::flat(32, None),
             )?,
         );
         let variable_decompressor = Arc::from(
             crate::compression::DecompressionStrategy::create_variable_per_value_decompressor(
                 &strategy,
-                &ProtobufUtils21::variable(ProtobufUtils21::flat(32, None), None),
+                &EncodingUtils::variable(EncodingUtils::flat(32, None), None),
             )?,
         );
 

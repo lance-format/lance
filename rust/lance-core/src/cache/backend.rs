@@ -162,6 +162,14 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
         codec: Option<CacheCodec>,
     ) -> Result<(CacheEntry, bool)>;
 
+    /// Largest entry size the backend admits to RAM, in bytes. Defaults to
+    /// the total capacity; sharded backends may report a smaller limit.
+    /// `None` means the backend does not expose an admission limit.
+    /// Admission never guarantees that an entry will remain cached.
+    fn max_entry_bytes(&self) -> Option<u64> {
+        self.capacity_bytes().map(|bytes| bytes as u64)
+    }
+
     /// Remove all entries.
     async fn clear(&self);
 

@@ -33,6 +33,7 @@ use super::sstable_cache::{DatasetCache, SsTableWarmer};
 use super::vector_search::ProbeBounds;
 use crate::dataset::Dataset;
 use crate::dataset::mem_wal::util::derived_store_params;
+use crate::dataset::utils::SchemaAdapter;
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
@@ -205,6 +206,8 @@ pub struct LsmScanner {
     /// In-memory memtables by shard (active + frozen-awaiting-flush), so
     /// the scanner path carries frozen-undrained generations too.
     in_memory_memtables: HashMap<Uuid, InMemoryMemTables>,
+    /// The MemWAL's `dir_id`, handed to the collector.
+    mem_wal_dir_id: String,
 
     // Query configuration
     projection: Option<Vec<String>>,
@@ -272,6 +275,7 @@ impl LsmScanner {
             schema: Arc::new(arrow_schema),
             shard_snapshots,
             in_memory_memtables: HashMap::new(),
+            mem_wal_dir_id: String::new(),
             projection: None,
             filter: None,
             limit: None,
@@ -294,7 +298,7 @@ impl LsmScanner {
     /// SSTables) without including a base Lance table.
     ///
     /// This is useful when the caller owns the base read path separately and
-    /// only needs the WAL's contribution: active memtable ∪ L0 SSTables.
+    /// only needs the WAL's contribution: active memtable ∪ SSTables.
     /// Deduplication semantics are unchanged — newer generations
     /// still win on PK conflicts.
     ///
@@ -319,6 +323,7 @@ impl LsmScanner {
             schema,
             shard_snapshots,
             in_memory_memtables: HashMap::new(),
+            mem_wal_dir_id: String::new(),
             projection: None,
             filter: None,
             limit: None,
@@ -353,7 +358,7 @@ impl LsmScanner {
         self
     }
 
-    /// Supply [`Self::schema`] with each field's id, so a sealed generation's
+    /// Supply [`Self::schema`] with each field's id, so a flushed generation's
     /// columns resolve to the table's by id rather than by name. A rename keeps
     /// the id and moves the name, so without this a renamed column reads as
     /// absent. Built with
@@ -375,6 +380,13 @@ impl LsmScanner {
         memtables: InMemoryMemTables,
     ) -> Self {
         self.in_memory_memtables.insert(shard_id, memtables);
+        self
+    }
+
+    /// Set the MemWAL `dir_id` the snapshots' SSTables live under. See
+    /// [`LsmDataSourceCollector::with_mem_wal_dir_id`].
+    pub fn with_mem_wal_dir_id(mut self, dir_id: impl Into<String>) -> Self {
+        self.mem_wal_dir_id = dir_id.into();
         self
     }
 
@@ -827,7 +839,16 @@ impl LsmScanner {
     }
 
     /// Execute the scan and return a stream of record batches.
+    ///
+    /// Lance JSON columns are returned as Arrow JSON, as
+    /// [`crate::dataset::scanner::Scanner::try_into_stream`] does.
     pub async fn try_into_stream(&self) -> Result<SendableRecordBatchStream> {
+        let stream = self.execute_plan().await?;
+        Ok(SchemaAdapter::new(stream.schema()).to_logical_stream(stream))
+    }
+
+    /// Execute the scan without converting Lance JSON columns to Arrow JSON.
+    async fn execute_plan(&self) -> Result<SendableRecordBatchStream> {
         let plan = self.create_plan().await?;
         let ctx = SessionContext::new();
         let task_ctx = ctx.task_ctx();
@@ -855,7 +876,8 @@ impl LsmScanner {
 
     /// Count the number of rows that match the query.
     pub async fn count_rows(&self) -> Result<u64> {
-        let stream = self.try_into_stream().await?;
+        // Counting needs no JSON conversion, so skip decoding the values.
+        let stream = self.execute_plan().await?;
         let batches: Vec<RecordBatch> = stream
             .try_collect()
             .await
@@ -942,7 +964,8 @@ impl LsmScanner {
                 path.clone(),
                 self.shard_snapshots.clone(),
             ),
-        };
+        }
+        .with_mem_wal_dir_id(self.mem_wal_dir_id.clone());
 
         for (shard_id, mems) in &self.in_memory_memtables {
             collector = collector.with_in_memory_memtables(*shard_id, mems.clone());
@@ -985,7 +1008,8 @@ mod tests {
     use arrow_schema::{Field, Fields};
     use lance_index::scalar::inverted::{DOC_INDEX_COL, DocumentGranularity, InvertedIndexParams};
 
-    use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+    use crate::dataset::mem_wal::index::IndexStore;
+    use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 
     #[test]
     fn test_lsm_scanner_builder() {
@@ -1036,7 +1060,8 @@ mod tests {
 
     #[test]
     fn test_in_memory_memtable_ref() {
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 
         let batch_store = Arc::new(BatchStore::with_capacity(100));
         let index_store = Arc::new(IndexStore::new());
@@ -1067,7 +1092,8 @@ mod tests {
     /// An active/frozen memtable holding `ids` at `generation`, with a single
     /// batch and a maintained primary-key index on `id`.
     fn mk_pk_memtable(ids: &[i32], generation: u64) -> InMemoryMemTableRef {
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         let store = BatchStore::with_capacity(8);
         let mut index = IndexStore::new();
         index.enable_pk_index(&[("id".to_string(), 0)]);
@@ -1364,7 +1390,8 @@ mod tests {
     /// `vector_dim`) and surface the in-memory match.
     #[tokio::test]
     async fn nearest_dispatches_through_facade() {
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::{Dataset, WriteParams};
         use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
         use arrow_array::{Float32Array, Int32Array, RecordBatchIterator};
@@ -1877,7 +1904,8 @@ mod tests {
     /// FTS planner and surface a memtable-only match.
     #[tokio::test]
     async fn full_text_search_dispatches_through_facade() {
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::{Dataset, WriteParams};
         use crate::index::DatasetIndexExt;
         use arrow_array::{Int32Array, RecordBatchIterator, StringArray};
@@ -1965,7 +1993,8 @@ mod tests {
     /// expands to the multi-match the cross-column planner decomposes.
     #[tokio::test]
     async fn full_text_search_spans_every_named_column() {
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use arrow_array::{Int32Array, StringArray};
         use arrow_schema::{DataType, Field, Schema};
 
@@ -2181,12 +2210,13 @@ mod tests {
 
     /// One active memtable with a maintained BTree on `id`, all rows visible.
     fn mk_indexed_memtable(schema: &SchemaRef, ids: &[i32], names: &[&str]) -> InMemoryMemTableRef {
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use arrow_array::{Int32Array, StringArray};
 
         let store = BatchStore::with_capacity(8);
         let index = IndexStore::from_specs(
-            &[crate::dataset::mem_wal::write::MemIndexSpec::btree(
+            &[crate::dataset::mem_wal::index::MemIndexSpec::btree(
                 "id_idx", 0, "id",
             )],
             &lance_core::datatypes::Schema::try_from(schema.as_ref()).unwrap(),

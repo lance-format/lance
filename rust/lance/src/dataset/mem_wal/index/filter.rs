@@ -230,8 +230,8 @@ mod tests {
         (result.at_most.into(), exact)
     }
 
-    /// A label-list parser claims a list comparison even though field ids make
-    /// the planner cast the column.
+    /// A label-list parser claims a list comparison even when the column is cast
+    /// to a type that differs only in its nested field metadata.
     #[test]
     fn an_index_sees_through_a_cast_that_only_relabels_nested_fields() {
         let item = Field::new("item", DataType::Utf8, true).with_metadata(HashMap::from([(
@@ -252,6 +252,19 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
+        // DataFusion 55 no longer casts the column when only nested field
+        // metadata differs, so add the relabelling cast that older planners
+        // produced.
+        let relabelled = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let filter = filter
+            .transform_up(|expr| match expr {
+                Expr::Column(column) if column.name == "tags" => Ok(Transformed::yes(
+                    datafusion::logical_expr::cast(Expr::Column(column), relabelled.clone()),
+                )),
+                expr => Ok(Transformed::no(expr)),
+            })
+            .unwrap()
+            .data;
         assert!(
             filter.to_string().contains("CAST(tags"),
             "the comparison must cast the column for this test to mean anything: {filter}"

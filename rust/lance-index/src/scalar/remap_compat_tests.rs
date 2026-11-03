@@ -94,7 +94,7 @@ impl ScalarIndex for LegacyOnlyIndex {
     }
     async fn update(
         &self,
-        _: datafusion::execution::SendableRecordBatchStream,
+        _: datafusion_execution::SendableRecordBatchStream,
         _: &dyn IndexStore,
         _: Option<crate::scalar::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {

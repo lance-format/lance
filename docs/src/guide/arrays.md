@@ -180,3 +180,28 @@ tensor_images.to_encoded()
 # [...
 # b'\x89PNG\r\n\x1a...'
 ```
+
+## Compressing integer tensors (Lance 2.3)
+
+Integer tensors with similar neighboring values, such as images or sensor arrays,
+can benefit from lossless compression. With the unstable 2.3 writer, set the field
+metadata `lance-encoding:compression` to `lz4` or `zstd`. Lance automatically samples
+supported integer tensors and chooses raw storage, direct compression, or AxisDelta
+followed by compression. AxisDelta stores differences along a tensor axis; when
+sampling finds no worthwhile compression, Lance keeps raw storage.
+
+Compression can save space at the cost of additional write and decode work.
+Random reads still fetch individual tensors, but must decode each selected tensor
+in full. Smaller files do not guarantee faster reads. Leave general compression
+unset to avoid both compression and sampling.
+
+The default requires no AxisDelta configuration. To override it, set field metadata
+`lance-encoding:axis-delta` to:
+
+- `auto:<axis>` to sample a specific axis instead of choosing one automatically.
+- `on:<axis>` to force differential coding on that axis.
+- `off` to disable differential coding and sampling, **keeping the configured codec**.
+
+Axes are zero-based and exclude the dataset row dimension. For HWC images,
+`auto:1` tests horizontal differences within each channel. Floating-point vectors
+and stable 2.1/2.2 writers keep their existing behavior.

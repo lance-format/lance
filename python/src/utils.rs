@@ -32,6 +32,7 @@ use lance_index::vector::kmeans::{
 };
 use lance_index::vector::v3::subindex::IvfSubIndex;
 use lance_linalg::distance::DistanceType;
+use lance_linalg::kernels::normalize_fsl_owned;
 use lance_table::io::manifest::ManifestDescribing;
 use pyo3::intern;
 use pyo3::types::PyNone;
@@ -72,6 +73,27 @@ pub struct KMeans {
     trained_kmeans: Option<LanceKMeans>,
 }
 
+/// Cosine is trained and assigned as L2 over unit-length vectors, the way the
+/// index build path does it. The float kmeans dispatch itself does not take
+/// cosine, so the vectors have to be normalized on the way in.
+fn kmeans_metric(metric_type: DistanceType) -> DistanceType {
+    match metric_type {
+        DistanceType::Cosine => DistanceType::L2,
+        other => other,
+    }
+}
+
+fn normalize_for_cosine(
+    metric_type: DistanceType,
+    vectors: FixedSizeListArray,
+) -> PyResult<FixedSizeListArray> {
+    if metric_type != DistanceType::Cosine {
+        return Ok(vectors);
+    }
+    normalize_fsl_owned(vectors)
+        .map_err(|e| PyValueError::new_err(format!("Error normalizing cosine input: {}", e)))
+}
+
 #[pymethods]
 impl KMeans {
     #[new]
@@ -82,14 +104,21 @@ impl KMeans {
         max_iters: u32,
         centroids_arr: Option<&Bound<PyAny>>,
     ) -> PyResult<Self> {
+        let metric_type: DistanceType = metric_type
+            .try_into()
+            .map_err(|e| PyValueError::new_err(format!("Invalid metric_type: {}", e)))?;
         let trained_kmeans = if let Some(arr) = centroids_arr {
             let data = ArrayData::from_pyarrow_bound(arr)?;
             if !matches!(data.data_type(), DataType::FixedSizeList(_, _)) {
                 return Err(PyValueError::new_err("Must be a FixedSizeList"));
             }
+            // Not normalized: these are centroids, which is model state, not
+            // input data. A cosine fit leaves its centroids as means of unit
+            // vectors, so normalizing them here would move every prediction
+            // away from the model they were taken from.
             let fixed_size_arr = FixedSizeListArray::from(data);
             let params = KMeansParams {
-                distance_type: metric_type.try_into().unwrap(),
+                distance_type: kmeans_metric(metric_type),
                 max_iters,
                 ..Default::default()
             };
@@ -106,7 +135,7 @@ impl KMeans {
         };
         Ok(Self {
             k,
-            metric_type: metric_type.try_into().unwrap(),
+            metric_type,
             max_iters,
             trained_kmeans,
         })
@@ -118,9 +147,10 @@ impl KMeans {
         if !matches!(data.data_type(), DataType::FixedSizeList(_, _)) {
             return Err(PyValueError::new_err("Must be a FixedSizeList"));
         }
-        let fixed_size_arr = FixedSizeListArray::from(data);
+        let fixed_size_arr =
+            normalize_for_cosine(self.metric_type, FixedSizeListArray::from(data))?;
         let params = KMeansParams {
-            distance_type: self.metric_type,
+            distance_type: kmeans_metric(self.metric_type),
             max_iters: self.max_iters,
             ..Default::default()
         };
@@ -153,6 +183,9 @@ impl KMeans {
         if !matches!(fixed_size_arr.value_type(), DataType::Float32) {
             return Err(PyValueError::new_err("Must be a FixedSizeList of Float32"));
         };
+        // The model was trained over unit-length vectors for cosine, so the
+        // query has to be normalized the same way before it is assigned.
+        let fixed_size_arr = normalize_for_cosine(self.metric_type, fixed_size_arr)?;
         let values = fixed_size_arr.values().as_primitive();
         let centroids = kmeans.centroids.as_primitive();
         let cluster_ids = UInt32Array::from(

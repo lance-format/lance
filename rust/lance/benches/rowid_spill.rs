@@ -43,7 +43,11 @@
 //!    resolve an id -- the read cost the design adds. The `take` that follows
 //!    once the index and the fragment's sequence are cached is a control: it
 //!    should cost the same in both arms
-//! 5. compaction wall time and the bytes it wrote -- the write cost it adds
+//! 5. cold scans of both user columns, with and without row ids -- whether a
+//!    scan pays for lineage it does not need. Each sample starts with a fresh
+//!    default session, preserving normal caching within the query. The OS page
+//!    cache is not flushed, and dataset open is not timed
+//! 6. compaction wall time and the bytes it wrote -- the write cost it adds
 //!
 //! Timings are reported as the median and the minimum of their samples.
 //!
@@ -258,6 +262,8 @@ struct ArmResult {
     commit: Vec<Duration>,
     load_sequence: Vec<Duration>,
     index_build: Vec<Duration>,
+    scan: Vec<Duration>,
+    scan_with_row_ids: Vec<Duration>,
     take: Vec<Duration>,
     spilled_fragments: SpilledFragments,
     total_fragments: usize,
@@ -708,6 +714,37 @@ async fn run_arm(dir: &str, config: Config, scenario: Scenario, spill: bool) -> 
         index_build.push(started.elapsed());
     }
 
+    // The same user columns and batches in both cases. Fresh default sessions
+    // start each query cold while preserving normal within-query cache reuse.
+    let mut scan = Vec::with_capacity(READ_SAMPLES);
+    let mut scan_with_row_ids = Vec::with_capacity(READ_SAMPLES);
+    for _ in 0..READ_SAMPLES {
+        for (with_row_ids, samples) in [(false, &mut scan), (true, &mut scan_with_row_ids)] {
+            let cold = lance::dataset::builder::DatasetBuilder::from_uri(&uri)
+                .with_session(Arc::new(Session::default()))
+                .load()
+                .await
+                .unwrap();
+            let mut scanner = cold.scan();
+            scanner.project(&["id", "value"]).unwrap();
+            if with_row_ids {
+                scanner.with_row_id();
+            }
+            let started = Instant::now();
+            let scanned = scanner
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_fold(0_u64, |count, batch| async move {
+                    Ok(count + batch.num_rows() as u64)
+                })
+                .await
+                .unwrap();
+            samples.push(started.elapsed());
+            assert_eq!(scanned, rows);
+        }
+    }
+
     // The take itself, once everything it depends on is cached, which makes
     // this row a control. It needs a session that actually caches --
     // `open_cold` gives the caches zero capacity, so on that dataset
@@ -819,6 +856,8 @@ async fn run_arm(dir: &str, config: Config, scenario: Scenario, spill: bool) -> 
         commit,
         load_sequence,
         index_build,
+        scan,
+        scan_with_row_ids,
         take,
         spilled_fragments,
         total_fragments,
@@ -940,6 +979,26 @@ fn report(scenario: Scenario, config: Config, inline: &ArmResult, spilled: &ArmR
         &inline.index_build,
         &spilled.index_build,
     );
+    for (name, inline_samples, spilled_samples) in [
+        ("scan user columns (cold)", &inline.scan, &spilled.scan),
+        (
+            "scan with row ids (cold)",
+            &inline.scan_with_row_ids,
+            &spilled.scan_with_row_ids,
+        ),
+    ] {
+        timing(name, inline_samples, spilled_samples);
+        // Keep the samples alongside the summary so comparisons can inspect
+        // variance instead of relying on the median alone.
+        println!(
+            "{name} inline samples (ms): {:?}",
+            inline_samples.iter().copied().map(ms).collect::<Vec<_>>()
+        );
+        println!(
+            "{name} spilled samples (ms): {:?}",
+            spilled_samples.iter().copied().map(ms).collect::<Vec<_>>()
+        );
+    }
     timing("take by row id (control)", &inline.take, &spilled.take);
     row(
         "compaction",

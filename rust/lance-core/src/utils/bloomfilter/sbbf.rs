@@ -351,9 +351,10 @@ impl Sbbf {
         self.blocks.capacity() * std::mem::size_of::<Block>()
     }
 
-    /// Check if this filter might intersect with another filter.
-    /// Returns true if there's at least one bit position where both filters have a 1.
-    /// This is a fast check that may return false positives but never false negatives.
+    /// Check if this filter might intersect with another filter: true if some
+    /// block has a bit set in both filters in every one of its eight words. A
+    /// value sets one bit in each word of its block, so a shared value always
+    /// leaves that pattern (no false negatives).
     ///
     /// Returns an error if the filters have different sizes, as bloom filters with
     /// different configurations cannot be reliably compared.
@@ -368,14 +369,11 @@ impl Sbbf {
                 ),
             });
         }
-        for i in 0..self.blocks.len() {
-            for j in 0..8 {
-                if (self.blocks[i][j] & other.blocks[i][j]) != 0 {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
+        Ok(self
+            .blocks
+            .iter()
+            .zip(&other.blocks)
+            .any(|(a, b)| (0..8).all(|j| a[j] & b[j] != 0)))
     }
 
     /// Check if this filter might intersect with a raw bitmap.
@@ -388,7 +386,8 @@ impl Sbbf {
     }
 
     /// Check if two raw bloom filter bitmaps might intersect.
-    /// Returns true if there's at least one bit position where both filters have a 1.
+    /// Same rule as [`Self::might_intersect`], over the layout `to_bytes()`
+    /// produces: 32-byte blocks of eight little-endian 32-bit words.
     ///
     /// This is a fast probabilistic check: if it returns false, the filters definitely
     /// have no common elements. If it returns true, they might have common elements
@@ -407,12 +406,23 @@ impl Sbbf {
                 ),
             });
         }
-        for i in 0..a.len() {
-            if (a[i] & b[i]) != 0 {
-                return Ok(true);
-            }
+        if !a.len().is_multiple_of(32) {
+            return Err(SbbfError::InvalidData {
+                message: format!(
+                    "Bloom filter bitmap of {} bytes is not a whole number of 32-byte blocks",
+                    a.len()
+                ),
+            });
         }
-        Ok(false)
+        // A word's bits are tested only for being nonzero, so its byte order
+        // does not matter.
+        let (a, b) = (a.as_chunks::<32>().0, b.as_chunks::<32>().0);
+        Ok(a.iter().zip(b).any(|(a, b)| {
+            let (a, b) = (a.as_chunks::<4>().0, b.as_chunks::<4>().0);
+            a.iter()
+                .zip(b)
+                .all(|(a, b)| u32::from_ne_bytes(*a) & u32::from_ne_bytes(*b) != 0)
+        }))
     }
 }
 
@@ -618,5 +628,61 @@ mod tests {
             assert!(sbbf2.check(&i));
         }
         assert!(!sbbf2.check(&999));
+    }
+
+    /// Filters at the merge-insert conflict-detection size (8192 items @
+    /// 0.00057), as `KeyExistenceFilterBuilder` builds them.
+    fn conflict_filter() -> Sbbf {
+        SbbfBuilder::new()
+            .expected_items(8192)
+            .false_positive_probability(0.00057)
+            .build()
+            .unwrap()
+    }
+
+    /// Disjoint key sets of a realistic size must not look like they share a
+    /// key. Each insert sets one bit in each of the 8 words of a block, so two
+    /// filters of a few hundred keys share *some* set bit almost surely; that
+    /// alone says nothing about a shared key.
+    #[test]
+    fn test_disjoint_sets_do_not_intersect() {
+        for n in [100u64, 500, 1000] {
+            let mut a = conflict_filter();
+            let mut b = conflict_filter();
+            for i in 0..n {
+                a.insert(&i);
+                b.insert(&(i + 1_000_000));
+            }
+            assert!(
+                !a.might_intersect(&b).unwrap(),
+                "{n} disjoint keys per filter reported as intersecting"
+            );
+            assert!(
+                !Sbbf::bytes_might_intersect(&a.to_bytes(), &b.to_bytes()).unwrap(),
+                "{n} disjoint keys per filter reported as intersecting (bytes)"
+            );
+        }
+    }
+
+    /// Never a false negative: one shared key among many is always reported.
+    #[test]
+    fn test_one_shared_key_always_intersects() {
+        for shared in [0u64, 17, 999] {
+            let mut a = conflict_filter();
+            let mut b = conflict_filter();
+            for i in 0..1000u64 {
+                a.insert(&i);
+                b.insert(&(i + 1_000_000));
+            }
+            b.insert(&shared);
+            assert!(a.might_intersect(&b).unwrap());
+            assert!(b.might_intersect(&a).unwrap());
+            assert!(Sbbf::bytes_might_intersect(&a.to_bytes(), &b.to_bytes()).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_bytes_intersect_rejects_partial_blocks() {
+        assert!(Sbbf::bytes_might_intersect(&[0xff; 33], &[0xff; 33]).is_err());
     }
 }

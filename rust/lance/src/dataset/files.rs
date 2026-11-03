@@ -107,7 +107,11 @@ fn manifest_file_rows<'a>(
         // drifts.
         files += fragment.referenced_lance_files().count();
 
-        if fragment.deletion_file.is_some() {
+        if fragment
+            .deletion_file
+            .as_ref()
+            .is_some_and(|file| !file.is_inline())
+        {
             files += 1;
         }
     }
@@ -130,7 +134,8 @@ fn manifest_file_rows<'a>(
     });
 
     let deletion_files = manifest.fragments.iter().filter_map(|fragment| {
-        fragment.deletion_file.as_ref().map(|del_file| FileRow {
+        let del_file = fragment.deletion_file.as_ref().filter(|f| !f.is_inline())?;
+        Some(FileRow {
             version: manifest.version,
             base_uri: Cow::Borrowed(resolve_file_base(manifest, del_file.base_id, base_uri).uri),
             path: Cow::Owned(relative_deletion_file_path(fragment.id, del_file)),
@@ -903,6 +908,7 @@ mod tests {
             file_major_version: 2,
             file_minor_version: 0,
             file_size_bytes: CachedFileSize::unknown(),
+            file_metadata_size_bytes: None,
             base_id,
         };
 
@@ -929,11 +935,14 @@ mod tests {
                 file_type: DeletionFileType::Bitmap,
                 num_deleted_rows: Some(1),
                 base_id: Some(2),
+                inline: None,
             }),
             row_id_meta: None,
             physical_rows: Some(3),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let mut base_paths = HashMap::new();
@@ -972,6 +981,66 @@ mod tests {
             .expect("deletion file row");
         assert_eq!(deletion.path.as_ref(), "_deletions/0-1-7.bin");
         assert_eq!(deletion.base_uri.as_ref(), "s3://bucket-b/root");
+    }
+
+    #[test]
+    fn test_manifest_file_rows_excludes_inline_deletions_from_exact_size() {
+        use lance_core::datatypes::{Field as LanceField, Schema as LanceSchema};
+        use lance_io::utils::CachedFileSize;
+        use lance_table::format::{
+            DataFile, DataStorageFormat, DeletionFile, DeletionFileType, Fragment, Manifest,
+        };
+
+        let schema = LanceSchema {
+            fields: vec![LanceField::try_from(&Field::new("id", DataType::Int32, false)).unwrap()],
+            metadata: Default::default(),
+        };
+        let fragment = Fragment {
+            id: 0,
+            files: vec![DataFile {
+                path: "data.lance".to_string(),
+                fields: Arc::from(vec![0]),
+                column_indices: Arc::from(Vec::<i32>::new()),
+                file_major_version: 2,
+                file_minor_version: 0,
+                file_size_bytes: CachedFileSize::unknown(),
+                file_metadata_size_bytes: None,
+                base_id: None,
+            }],
+            deletion_file: Some(DeletionFile {
+                read_version: 1,
+                id: 7,
+                file_type: DeletionFileType::Bitmap,
+                num_deleted_rows: Some(1),
+                base_id: None,
+                inline: Some(bytes::Bytes::from_static(&[0])),
+            }),
+            physical_rows: Some(3),
+            ..Fragment::new(0)
+        };
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(vec![fragment]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+
+        let mut rows = manifest_file_rows(&manifest, "memory://main", "_versions/1.manifest");
+        let expected = rows.len();
+        let row_types = rows.by_ref().map(|row| row.file_type).collect::<Vec<_>>();
+        assert_eq!(expected, row_types.len());
+        assert!(
+            !row_types
+                .iter()
+                .any(|file_type| matches!(file_type, FileType::DeletionFile))
+        );
+        assert_eq!(
+            row_types
+                .iter()
+                .filter(|file_type| matches!(file_type, FileType::DataFile))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
