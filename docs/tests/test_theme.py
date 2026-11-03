@@ -88,18 +88,16 @@ nav:
     def test_nested_sections_keep_their_parents(self):
         sidebar = self.sidebars["spark/ddl/create/index.html"]
         groups = sidebar.findall("./div[@class='ld-sidenav__group']")
-        self.assertEqual(len(groups), 1)
-        self.assertEqual(groups[0].find("div").text, "Integrations")
-        spark, trino = groups[0].findall("./details[@class='ld-sidenav__sub']")
-        self.assertEqual(spark.attrib.get("open"), "open")
-        self.assertIsNone(trino.attrib.get("open"))
-        self.assertEqual(spark.find("./summary/span").text, "Apache Spark")
-        self.assertEqual(trino.find("./summary/span").text, "Trino")
-        spark_ddl = spark.find("./div/details[@class='ld-sidenav__sub']")
+        self.assertEqual(len(groups), 3)
+        root_group, spark, trino = groups
+        self.assertEqual(root_group.find("div").text, "Integrations")
+        self.assertEqual(spark.find("div").text, "Apache Spark")
+        self.assertEqual(trino.find("div").text, "Trino")
+        spark_ddl = spark.find("./details[@class='ld-sidenav__sub']")
         self.assertEqual(spark_ddl.attrib.get("open"), "open")
         self.assertEqual(spark_ddl.find("./summary/span").text, "DDL")
         self.assertEqual(spark_ddl.find("./div/a").text, "CREATE NAMESPACE")
-        operations = trino.find("./div/details[@class='ld-sidenav__sub']")
+        operations = trino.find("./details[@class='ld-sidenav__sub']")
         self.assertIsNone(operations.attrib.get("open"))
         self.assertEqual(operations.find("./summary/span").text, "Operations")
         trino_ddl = operations.find("./div/details[@class='ld-sidenav__sub']")
@@ -108,9 +106,9 @@ nav:
 
     def test_links_keep_order_urls_and_active_state(self):
         sidebar = self.sidebars["spark/ddl/create/index.html"]
-        spark_items = sidebar.find("./div/details[@class='ld-sidenav__sub']/div")
-        self.assertEqual([child.tag for child in spark_items], ["a", "details", "a"])
-        welcome, project = spark_items.findall("a")
+        spark = sidebar.findall("./div[@class='ld-sidenav__group']")[1]
+        self.assertEqual([child.tag for child in spark], ["div", "a", "details", "a"])
+        welcome, project = spark.findall("a")
         self.assertEqual(welcome.attrib, {"href": "../../"})
         self.assertEqual(
             project.attrib,
