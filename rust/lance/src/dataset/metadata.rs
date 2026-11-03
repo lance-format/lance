@@ -232,23 +232,20 @@ mod tests {
     };
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
 
-    struct RestoreBeforeCommit {
+    struct AppendBeforeCommit {
         inner: Arc<dyn CommitHandler>,
-        restore: Mutex<Option<Dataset>>,
-        expected_latest_version: u64,
+        append: Mutex<Option<Dataset>>,
         triggered: AtomicBool,
     }
 
-    impl std::fmt::Debug for RestoreBeforeCommit {
+    impl std::fmt::Debug for AppendBeforeCommit {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("RestoreBeforeCommit")
-                .field("expected_latest_version", &self.expected_latest_version)
-                .finish_non_exhaustive()
+            f.debug_struct("AppendBeforeCommit").finish_non_exhaustive()
         }
     }
 
     #[async_trait]
-    impl CommitHandler for RestoreBeforeCommit {
+    impl CommitHandler for AppendBeforeCommit {
         async fn commit(
             &self,
             manifest: &mut Manifest,
@@ -260,14 +257,17 @@ mod tests {
             transaction: Option<ManifestTransaction>,
         ) -> std::result::Result<ManifestLocation, CommitError> {
             if !self.triggered.swap(true, Ordering::SeqCst) {
-                let mut restore = self
-                    .restore
+                let mut append = self
+                    .append
                     .lock()
                     .unwrap()
                     .take()
-                    .expect("restore fixture is available once");
-                restore
-                    .restore_from(self.expected_latest_version)
+                    .expect("append fixture is available once");
+                let data = gen_batch()
+                    .col("i", array::step::<Int32Type>())
+                    .into_reader_rows(RowCount::from(4), BatchCount::from(1));
+                append
+                    .append(data, None)
                     .await
                     .map_err(CommitError::OtherError)?;
             }
@@ -410,69 +410,6 @@ mod tests {
         );
     }
 
-    /// Appends are otherwise compatible with metadata updates, so this test
-    /// distinguishes the opt-in version fence from the baseline Restore rules.
-    #[rstest]
-    #[case::default_rebases_append(false)]
-    #[case::expected_version_rejects_append(true)]
-    #[tokio::test]
-    async fn field_metadata_append_race_respects_expected_version(#[case] fenced: bool) {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let data = gen_batch()
-            .col("i", array::step::<Int32Type>())
-            .into_reader_rows(RowCount::from(4), BatchCount::from(1));
-        let mut latest = Dataset::write(data, uri, None).await.unwrap();
-        let expected_latest_version = latest.version_id();
-        let mut stale = latest.clone();
-
-        let appended = gen_batch()
-            .col("i", array::step::<Int32Type>())
-            .into_reader_rows(RowCount::from(4), BatchCount::from(1));
-        latest.append(appended, None).await.unwrap();
-        assert_eq!(latest.version_id(), expected_latest_version + 1);
-        assert_eq!(latest.count_rows(None).await.unwrap(), 8);
-
-        let update = stale
-            .update_field_metadata()
-            .update("i", [("fixture.freshness", "committed")])
-            .unwrap();
-        if fenced {
-            let error = update
-                .with_expected_latest_version(expected_latest_version)
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(error, Error::RetryableCommitConflict { .. }),
-                "{error}"
-            );
-            assert!(
-                error
-                    .to_string()
-                    .contains("latest version advanced from the expected"),
-                "{error}"
-            );
-        } else {
-            update.await.unwrap();
-        }
-
-        stale.checkout_latest().await.unwrap();
-        assert_eq!(
-            stale.version_id(),
-            expected_latest_version + if fenced { 1 } else { 2 }
-        );
-        assert_eq!(stale.count_rows(None).await.unwrap(), 8);
-        assert_eq!(
-            stale
-                .schema()
-                .field("i")
-                .unwrap()
-                .metadata
-                .contains_key("fixture.freshness"),
-            !fenced
-        );
-    }
-
     #[tokio::test]
     async fn field_metadata_expected_latest_version_rejects_restore_race() {
         let data = gen_batch()
@@ -512,24 +449,24 @@ mod tests {
         );
     }
 
+    /// The append lands from the commit handler after the version precheck.
+    /// The default path retries and rebases; the version fence must not retry.
+    #[rstest]
+    #[case::default_retries_compatible_append(false)]
+    #[case::expected_version_rejects_after_cas(true)]
     #[tokio::test]
-    async fn field_metadata_expected_version_catches_restore_before_cas() {
+    async fn field_metadata_append_before_commit_respects_expected_version(#[case] fenced: bool) {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let data = gen_batch()
             .col("i", array::step::<Int32Type>())
-            .into_reader_rows(RowCount::from(8), BatchCount::from(1));
-        let mut dataset = Dataset::write(data, uri, None).await.unwrap();
-        dataset
-            .update_config([("fixture.version", "2")])
-            .await
-            .unwrap();
+            .into_reader_rows(RowCount::from(4), BatchCount::from(1));
+        let dataset = Dataset::write(data, uri, None).await.unwrap();
         let expected_latest_version = dataset.version_id();
 
-        let handler = Arc::new(RestoreBeforeCommit {
+        let handler = Arc::new(AppendBeforeCommit {
             inner: Arc::new(RenameCommitHandler),
-            restore: Mutex::new(None),
-            expected_latest_version,
+            append: Mutex::new(Some(dataset)),
             triggered: AtomicBool::new(false),
         });
         let mut guarded = DatasetBuilder::from_uri(uri)
@@ -537,31 +474,38 @@ mod tests {
             .load()
             .await
             .unwrap();
-        let restore = guarded.checkout_version(1).await.unwrap();
-        *handler.restore.lock().unwrap() = Some(restore);
-
-        let error = guarded
+        let update = guarded
             .update_field_metadata()
-            .update("i", [("fixture.freshness", "must-not-land")])
-            .unwrap()
-            .with_expected_latest_version(expected_latest_version)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                Error::CommitConflict { .. } | Error::RetryableCommitConflict { .. }
-            ),
-            "{error}"
-        );
+            .update("i", [("fixture.freshness", "committed")])
+            .unwrap();
+        if fenced {
+            let error = update
+                .with_expected_latest_version(expected_latest_version)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "{error}"
+            );
+        } else {
+            update.await.unwrap();
+        }
+
+        assert!(handler.triggered.load(Ordering::SeqCst));
         guarded.checkout_latest().await.unwrap();
-        assert!(
-            !guarded
+        assert_eq!(
+            guarded.version_id(),
+            expected_latest_version + if fenced { 1 } else { 2 }
+        );
+        assert_eq!(guarded.count_rows(None).await.unwrap(), 8);
+        assert_eq!(
+            guarded
                 .schema()
                 .field("i")
                 .unwrap()
                 .metadata
-                .contains_key("fixture.freshness")
+                .contains_key("fixture.freshness"),
+            !fenced
         );
     }
 
