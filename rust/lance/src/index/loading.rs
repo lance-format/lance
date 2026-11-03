@@ -318,6 +318,12 @@ pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
                 idx.index_version,
                 max_supported_version,
             );
+        } else if !index_is_usable(idx) {
+            log::warn!(
+                "Index {} has unsupported field dependencies {:?}, ignoring it",
+                idx.name,
+                idx.dependency_fields(),
+            );
         }
     }
 }
