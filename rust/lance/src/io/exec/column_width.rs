@@ -76,8 +76,9 @@ impl CacheKey for MeasuredWidthKey<'_> {
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!(
-            "column-width/{}/{}/{}/{:?}",
-            self.version, self.generation, self.column, self.layout
+            "column-width/{}/{:?}",
+            self.version,
+            (self.generation, self.column, self.layout)
         ))
     }
 
@@ -377,6 +378,30 @@ mod tests {
                 .get(&field),
             None,
             "a recreated dataset version must not inherit the old width"
+        );
+
+        // Generation tokens are opaque and column names can contain slashes.
+        // Treating the fields as raw path segments would let these two keys
+        // alias each other.
+        let layout = DataType::Utf8;
+        let slashed_generation = MeasuredWidthKey {
+            generation: "a/b",
+            version: 1,
+            column: "c",
+            layout: &layout,
+        };
+        let slashed_column = MeasuredWidthKey {
+            generation: "a",
+            version: 1,
+            column: "b/c",
+            layout: &layout,
+        };
+        cache
+            .insert_with_key(&slashed_generation, Arc::new(MeasuredWidth(7.0)))
+            .await;
+        assert!(
+            cache.get_with_key(&slashed_column).await.is_none(),
+            "slash-containing generation and column pairs must not share a cache entry"
         );
 
         read(None).await.unwrap();
