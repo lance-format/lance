@@ -4,8 +4,8 @@
 """Generate the fixtures written by Lance 11.0.0.
 
 `blob_sidecars` holds the released Packed/Dedicated blobs used by Managed adoption tests.
-`fullzip_padded_control_words.lance` holds full-zip pages with a zero control-word byte
-before each value.
+`fullzip_padded_control_words.lance` holds a second file whose full-zip pages have a zero
+control-word byte before each value.
 """
 
 import shutil

@@ -2660,7 +2660,7 @@ mod tests {
     #[case::no_value_bytes(ControlWordParser::NIL, 0, 4, 4, false)]
     #[case::no_rows(ControlWordParser::NIL, 32, 0, 0, false)]
     #[case::sub_byte_values(ControlWordParser::NIL, 4, 8, 8, false)]
-    #[case::overflow(ControlWordParser::NIL, 32, u64::MAX, 0, false)]
+    #[case::overflow(ControlWordParser::NIL, 8, 1_u64 << 63, 0, false)]
     fn test_has_padded_fixed_control_words(
         #[case] ctrl_word_parser: ControlWordParser,
         #[case] bits_per_value: u64,
