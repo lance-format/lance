@@ -1072,13 +1072,12 @@ async fn rtree_queries_translate_partition_addresses() {
     );
 }
 
-// Under a v0 history a segment's cache key covers only the versions on its
-// path. Compacting fragments a segment never covered, and the trim after the
-// covering segment is remapped, both give the history a new identity; the
-// untouched scalar and vector segments must stay warm through both, while the
-// covering segment reloads.
+// Under a v0 history a segment's cache key covers only the versions it was
+// not built after. A compaction keys every segment built before it, touched or
+// not (its coverage could have been withdrawn); once the covering segment is
+// remapped, the trim that drops the compaction leaves that segment warm.
 #[tokio::test]
-async fn v0_history_keeps_untouched_segments_warm() {
+async fn v0_history_keeps_remapped_segments_warm_through_trim() {
     fn rows(values: std::ops::Range<i32>) -> RecordBatch {
         let vectors = arrow_array::FixedSizeListArray::from_iter_primitive::<
             arrow_array::types::Float32Type,
@@ -1213,13 +1212,13 @@ async fn v0_history_keeps_untouched_segments_warm() {
     .await
     .unwrap();
     assert!(assert_legacy_metadata(&dataset).await.is_some());
-    assert_eq!(index_loads(&dataset, "i", "i_idx").await, 0);
-    assert_eq!(index_loads(&dataset, "vector", "vector_idx").await, 0);
-    assert_eq!(
-        index_loads(&dataset, "j", "j_idx").await,
-        1,
-        "the compaction rewrote fragments j_idx covers"
-    );
+    for (column, name) in segments {
+        assert_eq!(
+            index_loads(&dataset, column, name).await,
+            1,
+            "{name} predates the compaction"
+        );
+    }
     assert_queries(&dataset).await;
 
     let compacted = history(&dataset).await;
@@ -1230,6 +1229,7 @@ async fn v0_history_keeps_untouched_segments_warm() {
     )
     .await
     .unwrap();
+    assert_eq!(index_loads(&dataset, "j", "j_idx").await, 1);
     crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
         .await
         .unwrap();
@@ -1238,8 +1238,11 @@ async fn v0_history_keeps_untouched_segments_warm() {
         compacted,
         "the trim changes the history"
     );
-    assert_eq!(index_loads(&dataset, "i", "i_idx").await, 0);
-    assert_eq!(index_loads(&dataset, "vector", "vector_idx").await, 0);
+    assert_eq!(
+        index_loads(&dataset, "j", "j_idx").await,
+        0,
+        "the remapped segment postdates the trimmed version"
+    );
     assert_queries(&dataset).await;
 }
 

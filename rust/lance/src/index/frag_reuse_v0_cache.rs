@@ -12,27 +12,22 @@ use lance_index::frag_reuse::{
 };
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::IndexMetadata;
-use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use crate::Dataset;
-use crate::dataset::index::frag_reuse::{is_index_remap_caught_up, reuse_chain_frag_bitmap};
+use crate::dataset::index::frag_reuse::index_postdates_rewrite;
 use crate::index::frag_reuse::{OpenPurpose, fri_cache_id, open_row_id_remapping_with_plan};
 
 /// What [`v0_segment_cache_id`] needs from a v0 history, computed once per
-/// history: every fragment the history touches, and a content digest of each
-/// version in history order.
+/// history: a content digest of each version in history order.
 pub(super) struct V0HistoryDigests {
-    chain: RoaringBitmap,
     versions: Vec<[u8; 32]>,
 }
 
 impl V0HistoryDigests {
     pub(super) fn new(details: &FragReuseIndexDetails) -> Self {
-        let versions = details.versions.iter().map(version_digest).collect();
         Self {
-            chain: reuse_chain_frag_bitmap(&details.versions),
-            versions,
+            versions: details.versions.iter().map(version_digest).collect(),
         }
     }
 }
@@ -76,7 +71,7 @@ fn version_digest(version: &FragReuseVersion) -> [u8; 32] {
 
 impl DeepSizeOf for V0HistoryDigests {
     fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
-        self.chain.serialized_size() + self.versions.len() * 32
+        self.versions.len() * 32
     }
 }
 
@@ -107,37 +102,32 @@ impl CacheKey for V0HistoryDigestsKey<'_> {
 /// The part of a v0 history that can change one segment's decoded rows, as a
 /// cache identity, or `None` when no part can.
 ///
-/// A v0 remapper is applied while the segment is decoded, but a version the
-/// segment has caught up on moves none of its rows: that is the condition
-/// under which the trim may drop the version (`is_index_remap_caught_up`), so
-/// decoding with or without it gives the same rows. Keying on the contents of
-/// the remaining versions keeps a segment whose fragments the history never
-/// touched in the plain namespace through compactions and trims. A segment
-/// the history does touch is keyed by every version it has not caught up on,
-/// which the gate decides against the fragments of the whole history, so a
-/// later version changes its key until it is remapped. A segment with no
-/// fragment bitmap cannot be classified and keeps the whole history's
-/// identity.
+/// A v0 remapper rewrites every stored row while the segment is decoded, but a
+/// version the segment was built after (and covers none of the sources of)
+/// moves none of its rows, so decoding with or without it gives the same rows.
+/// The segment is keyed by the contents of every other version: one built or
+/// remapped after the whole history stays in the plain namespace, and
+/// trimming versions older than the segment leaves its key unchanged.
+///
+/// Disjoint coverage is not enough (unlike the trim gate): coverage can be
+/// withdrawn while the index data still holds the withdrawn fragments' rows,
+/// which the remapper still translates. A segment with no fragment bitmap
+/// cannot be classified and keeps the whole history's identity.
 pub(super) fn v0_segment_cache_id(
     history: Uuid,
     details: &FragReuseIndexDetails,
     digests: &V0HistoryDigests,
     segment: &IndexMetadata,
 ) -> Option<Uuid> {
-    let Some(covered) = &segment.fragment_bitmap else {
+    if segment.fragment_bitmap.is_none() {
         return Some(history);
-    };
-    // Caught up on every version; skips the per-version gate below.
-    if covered.is_disjoint(&digests.chain) {
-        return None;
     }
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"lance.frag_reuse.v0_segment_cache_id");
     let mut on_path = false;
     for (version, digest) in details.versions.iter().zip(&digests.versions) {
-        // A version the gate cannot classify is treated as on the path.
-        let caught_up = is_index_remap_caught_up(version, segment, &digests.chain).unwrap_or(false);
-        if !caught_up {
+        // A version that cannot be classified is treated as on the path.
+        if !index_postdates_rewrite(version, segment).unwrap_or(false) {
             on_path = true;
             hasher.update(digest);
         }
@@ -171,6 +161,7 @@ pub(super) async fn segment_cache_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roaring::RoaringBitmap;
 
     // Every field reaches the digest, and the length prefixes keep content
     // from shifting across a field or group boundary unnoticed.
@@ -261,27 +252,34 @@ mod tests {
         let unrelated = version(12, &[1], &[7]);
         let stale = segment(5, Some(&[6]));
 
-        assert_eq!(id(vec![rewrite.clone()], &segment(5, Some(&[0]))), None);
+        // Built or remapped after the whole history: plain namespace.
         assert_eq!(id(vec![rewrite.clone()], &segment(11, Some(&[6]))), None);
-        let on_path = id(vec![rewrite.clone()], &stale);
-        assert!(on_path.is_some());
-        assert_eq!(id(vec![rewrite.clone()], &stale), on_path);
-        // An untouched segment stays in the plain namespace as the history
-        // grows.
         assert_eq!(
             id(
                 vec![rewrite.clone(), unrelated.clone()],
-                &segment(5, Some(&[0]))
+                &segment(13, Some(&[0]))
             ),
             None
         );
-        assert_eq!(id(vec![unrelated.clone()], &stale), None);
-        // A touched segment that has not been remapped counts every later
-        // version: the gate checks it against the whole history's fragments.
+        let on_path = id(vec![rewrite.clone()], &stale);
+        assert!(on_path.is_some());
+        assert_eq!(id(vec![rewrite.clone()], &stale), on_path);
+        // Disjoint coverage does not exempt a segment built before the
+        // rewrite: the coverage may have been withdrawn while the index data
+        // still holds the rewritten rows.
+        assert!(id(vec![rewrite.clone()], &segment(5, Some(&[0]))).is_some());
+        // Trimming a version older than the segment leaves its key unchanged.
+        let after_rewrite = segment(11, Some(&[0]));
+        assert!(id(vec![unrelated.clone()], &after_rewrite).is_some());
+        assert_eq!(
+            id(vec![rewrite.clone(), unrelated.clone()], &after_rewrite),
+            id(vec![unrelated.clone()], &after_rewrite)
+        );
+        // A stale segment counts every later version.
         assert_ne!(id(vec![rewrite.clone(), unrelated], &stale), on_path);
         assert_eq!(id(vec![rewrite.clone()], &segment(5, None)), Some(history));
-        // A rewrite group only half inside the segment is rejected by the
-        // gate and counts as on the path.
+        // A rewrite group only half inside the segment cannot be classified
+        // and counts as on the path.
         assert!(id(vec![rewrite], &segment(11, Some(&[4]))).is_some());
     }
 }

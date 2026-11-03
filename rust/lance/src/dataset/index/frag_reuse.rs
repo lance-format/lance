@@ -281,6 +281,18 @@ pub(crate) fn is_index_remap_caught_up(
         return Ok(true);
     }
 
+    index_postdates_rewrite(frag_reuse_version, index_meta)
+}
+
+/// Whether `index_meta` was built after `frag_reuse_version`'s rewrite and
+/// covers none of its source fragments, so its stored rows hold no address the
+/// version remaps. Unlike [`is_index_remap_caught_up`] this does not accept
+/// disjoint coverage: coverage can be withdrawn while the index data still
+/// holds rows of the withdrawn fragments.
+pub(crate) fn index_postdates_rewrite(
+    frag_reuse_version: &FragReuseVersion,
+    index_meta: &IndexMetadata,
+) -> lance_core::Result<bool> {
     // Inclusive: an index built at dataset_version predates the rewrite.
     if index_meta.dataset_version <= frag_reuse_version.dataset_version {
         return Ok(false);
