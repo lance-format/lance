@@ -1,34 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Copy ordinary sidecars without materializing their payloads. IDs are unique
-//! within a rewrite task; output files copy only the objects their rows use.
+//! Resolve ordinary sidecars without materializing their payloads. Task-local
+//! IDs let destination writers stream live ranges and copy dedicated objects.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use arrow_array::{Array, ArrayRef, StructArray, cast::AsArray};
+use arrow_array::{Array, ArrayRef, StructArray};
 use arrow_schema::Field;
-use futures::TryStreamExt;
-use lance_arrow::{list::ListArrayExt, r#struct::StructArrayExt};
-use lance_core::datatypes::{BlobKind, Field as LanceField};
+use lance_core::datatypes::BlobKind;
 use lance_core::utils::blob::blob_path;
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
-use lance_table::format::Fragment;
 use object_store::path::Path;
 
-use super::locate::{
-    BlobV2DescriptorColumns, BlobV2ReadContext, data_file_key_from_path, resolve_managed_base_id,
-};
+use super::locate::{BlobV2DescriptorColumns, BlobV2ReadContext, resolve_managed_base_id};
 use crate::Dataset;
 use crate::blob::{BlobDescriptor, BlobDescriptorArrayBuilder, BlobRange};
-use crate::dataset::fragment::FileFragment;
 
 #[derive(Clone)]
-struct Source {
-    store: Arc<ObjectStore>,
-    path: Path,
+pub(super) struct Source {
+    pub(super) store: Arc<ObjectStore>,
+    pub(super) path: Path,
 }
 
 #[derive(Default)]
@@ -38,9 +32,9 @@ struct Sources {
 }
 
 #[derive(Default)]
-pub(in crate::dataset) struct SidecarCopy(Mutex<Sources>);
+pub(in crate::dataset) struct SidecarRewrite(Mutex<Sources>);
 
-impl SidecarCopy {
+impl SidecarRewrite {
     fn register(&self, base: Option<u32>, source: Source) -> Result<u32> {
         let mut sources = self
             .0
@@ -154,126 +148,20 @@ impl SidecarCopy {
         Ok(builder.finish()?.into_parts().1)
     }
 
-    pub(in crate::dataset) async fn copy_to_fragments(
-        &self,
-        dataset: &Dataset,
-        fragments: &[Fragment],
-    ) -> Result<()> {
-        let sources = self
-            .0
+    pub(super) fn source(&self, id: u32) -> Result<Source> {
+        self.0
             .lock()
             .map_err(|_| Error::internal("Poisoned sidecar copy map"))?
             .objects
-            .clone();
-        if sources.is_empty() {
-            return Ok(());
-        }
-        let fields = dataset
-            .schema()
-            .fields
-            .iter()
-            .filter(|f| super::field_contains_blob(f))
-            .collect::<Vec<_>>();
-        let names = fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>();
-        let dataset = Arc::new(dataset.clone());
-        for fragment in fragments {
-            let file_fragment = FileFragment::new(dataset.clone(), fragment.clone());
-            let mut scan = file_fragment.scan();
-            scan.project(&names)?;
-            let mut stream = scan.try_into_stream().await?;
-            let mut copied = HashSet::new();
-            while let Some(batch) = stream.try_next().await? {
-                for field in &fields {
-                    let array = batch
-                        .column_by_name(&field.name)
-                        .ok_or_else(|| Error::internal("Missing compacted Blob column"))?;
-                    let mut ids = HashSet::new();
-                    collect_ids(field, array.as_ref(), &mut ids)?;
-                    for (field_id, id) in ids {
-                        let file = file_fragment
-                            .data_file_for_field(field_id)
-                            .ok_or_else(|| Error::internal("Missing compacted Blob data file"))?;
-                        if !copied.insert((file.path.clone(), id)) {
-                            continue;
-                        }
-                        let source = sources.get(&id).ok_or_else(|| {
-                            Error::internal(format!("Missing source for compacted sidecar {id}"))
-                        })?;
-                        let destination = blob_path(
-                            &dataset.data_file_dir(file)?,
-                            data_file_key_from_path(&file.path),
-                            id,
-                        );
-                        let store = dataset.object_store(file.base_id).await?;
-                        if Arc::ptr_eq(&source.store, &store) {
-                            store.copy(&source.path, &destination).await?;
-                        } else {
-                            source
-                                .store
-                                .copy_bulk(&source.path, store.as_ref(), &destination)
-                                .await?;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| Error::internal(format!("Missing source for compacted sidecar {id}")))
     }
-}
-
-fn collect_ids(field: &LanceField, array: &dyn Array, ids: &mut HashSet<(u32, u32)>) -> Result<()> {
-    if field.is_blob_v2() {
-        let values = array.as_struct();
-        let columns = BlobV2DescriptorColumns::new(values);
-        for row in 0..values.len() {
-            if !columns.is_null_blob(row)
-                && matches!(
-                    BlobKind::try_from(columns.kinds.value(row))?,
-                    BlobKind::Packed | BlobKind::Dedicated
-                )
-            {
-                ids.insert((field.id as u32, columns.blob_ids.value(row)));
-            }
-        }
-    } else {
-        match array.data_type() {
-            arrow_schema::DataType::Struct(_) => {
-                let values = array.as_struct().normalize_slicing()?.pushdown_nulls()?;
-                for child in &field.children {
-                    if super::field_contains_blob(child) {
-                        let values = values
-                            .column_by_name(&child.name)
-                            .ok_or_else(|| Error::internal("Missing Blob child"))?;
-                        collect_ids(child, values.as_ref(), ids)?;
-                    }
-                }
-            }
-            arrow_schema::DataType::List(_) => collect_ids(
-                &field.children[0],
-                array
-                    .as_list::<i32>()
-                    .filter_garbage_nulls()
-                    .trimmed_values()
-                    .as_ref(),
-                ids,
-            )?,
-            arrow_schema::DataType::LargeList(_) => collect_ids(
-                &field.children[0],
-                array
-                    .as_list::<i64>()
-                    .filter_garbage_nulls()
-                    .trimmed_values()
-                    .as_ref(),
-                ids,
-            )?,
-            _ => {}
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::locate::data_file_key_from_path;
     use super::*;
     use crate::BlobArrayBuilder;
     use crate::dataset::blob::{BlobV2BatchRewritePlan, prepared_blob_ids};
@@ -283,11 +171,13 @@ mod tests {
     };
     use arrow_array::{RecordBatch, RecordBatchIterator};
     use arrow_schema::Schema;
+    use futures::TryStreamExt;
     use lance_arrow::{
         BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, BLOB_INLINE_SIZE_THRESHOLD_META_KEY,
     };
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
+    use std::collections::HashSet;
 
     async fn fixture() -> (TempStrDir, Dataset) {
         let dir = TempStrDir::default();
@@ -443,6 +333,114 @@ mod tests {
         assert_eq!(data_paths(&before), data_paths(&after));
     }
 
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn sidecar_compaction_reclaims_deleted_packed_bytes(
+        #[values(LanceFileVersion::V2_2, LanceFileVersion::V2_3)] version: LanceFileVersion,
+        #[values(1, 128)] batch_size: usize,
+        #[values(1, 4)] live_rows: u64,
+    ) {
+        let dir = TempStrDir::default();
+        let field = crate::blob_field("blob", true).with_metadata(HashMap::from([
+            ("ARROW:extension:name".into(), "lance.blob.v2".into()),
+            (BLOB_INLINE_SIZE_THRESHOLD_META_KEY.into(), "8".into()),
+            (BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.into(), "24".into()),
+        ]));
+        let schema = Arc::new(Schema::new(vec![field]));
+        let mut blobs = BlobArrayBuilder::new(1000);
+        for row in 0..1000 {
+            blobs.push_bytes(vec![row as u8; 16]).unwrap();
+        }
+        let batch = RecordBatch::try_new(schema.clone(), vec![blobs.finish().unwrap()]).unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &dir,
+            Some(WriteParams {
+                data_storage_version: Some(version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // Retain a range in the middle of the source pack: compaction must
+        // update its offset as well as dropping the unreferenced payloads.
+        dataset
+            .delete(&format!("_rowid < 500 OR _rowid >= {}", 500 + live_rows))
+            .await
+            .unwrap();
+        let options = CompactionOptions {
+            target_rows_per_fragment: 2,
+            batch_size: Some(batch_size),
+            ..Default::default()
+        };
+        let task = crate::dataset::optimize::CompactionTask {
+            task: crate::dataset::optimize::TaskData {
+                fragments: dataset.manifest.fragments.as_ref().clone(),
+                output_clustering_id: None,
+                output_metadata: HashMap::new(),
+            },
+            read_version: dataset.manifest.version,
+            options: options.clone(),
+        };
+        let result = task.execute(&dataset).await.unwrap();
+        crate::dataset::optimize::commit_compaction(
+            &mut dataset,
+            vec![result],
+            Arc::new(crate::dataset::index::DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), live_rows as usize);
+        assert_eq!(
+            dataset.manifest.fragments.len(),
+            if live_rows == 1 { 1 } else { 2 }
+        );
+        crate::dataset::cleanup::cleanup_old_versions(
+            &dataset,
+            crate::dataset::cleanup::CleanupPolicy {
+                before_timestamp: Some(chrono::Utc::now() + chrono::TimeDelta::seconds(1)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for fragment in dataset.get_fragments() {
+            let file = &fragment.metadata().files[0];
+            let sidecar_dir = dataset
+                .data_file_dir(file)
+                .unwrap()
+                .join(data_file_key_from_path(&file.path));
+            let retained = dataset
+                .object_store
+                .read_dir_all(&sidecar_dir, None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let retained_blob_bytes: u64 = retained
+                .iter()
+                .filter(|o| o.location.extension() == Some("blob"))
+                .map(|o| o.size)
+                .sum();
+            assert_eq!(
+                retained_blob_bytes,
+                fragment.metadata().physical_rows.unwrap() as u64 * 16,
+                "a replacement pack must contain only its own live values"
+            );
+        }
+        let reopened = Arc::new(Dataset::open(dataset.uri()).await.unwrap());
+        let values = reopened
+            .take_blobs_by_indices(&(0..live_rows).collect::<Vec<_>>(), "blob")
+            .await
+            .unwrap();
+        for (row, blob) in values.iter().enumerate() {
+            assert_eq!(
+                blob.as_ref().unwrap().read().await.unwrap().as_ref(),
+                &[(500 + row) as u8; 16]
+            );
+        }
+    }
+
     #[tokio::test]
     async fn sidecar_compaction_prepares_descriptors_without_payload_reads() {
         let (_dir, dataset) = fixture().await;
@@ -464,7 +462,7 @@ mod tests {
         let plan =
             BlobV2BatchRewritePlan::try_new(dataset.schema(), batch.schema().as_ref(), false, true)
                 .unwrap()
-                .with_sidecar_copy(Arc::new(SidecarCopy::default()));
+                .with_sidecar_rewrite(Arc::new(SidecarRewrite::default()));
         let prepared = plan
             .transform_batch(&Arc::new(dataset), batch)
             .await

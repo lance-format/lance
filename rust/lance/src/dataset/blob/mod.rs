@@ -15,7 +15,7 @@ mod rewrite;
 pub mod test_util;
 mod write;
 
-pub(super) use compaction::SidecarCopy;
+pub(super) use compaction::SidecarRewrite;
 pub(super) use external::{
     ExternalBaseCandidate, ExternalBaseResolver, validate_external_blob_references,
 };

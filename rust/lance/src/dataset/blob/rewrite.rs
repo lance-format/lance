@@ -346,7 +346,7 @@ enum BlobV2FieldRewritePlan {
         output_field: Arc<ArrowField>,
     },
     Blob {
-        sidecars: Option<Arc<super::SidecarCopy>>,
+        sidecars: Option<Arc<super::SidecarRewrite>>,
         field_id: u32,
         field_name: String,
         output_field: Arc<ArrowField>,
@@ -747,11 +747,11 @@ impl BlobV2BatchRewritePlan {
     }
 
     /// Build the prepared rewrite used by ordinary sidecar compaction.
-    pub(in crate::dataset) fn with_sidecar_copy(
+    pub(in crate::dataset) fn with_sidecar_rewrite(
         mut self,
-        sidecars: Arc<super::SidecarCopy>,
+        sidecars: Arc<super::SidecarRewrite>,
     ) -> Self {
-        fn configure(plan: &mut BlobV2FieldRewritePlan, sidecars: &Arc<super::SidecarCopy>) {
+        fn configure(plan: &mut BlobV2FieldRewritePlan, sidecars: &Arc<super::SidecarRewrite>) {
             match plan {
                 BlobV2FieldRewritePlan::Blob {
                     sidecars: context, ..
