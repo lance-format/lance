@@ -6,13 +6,13 @@ use std::sync::Arc;
 
 use crate::Dataset;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
-use crate::index::DatasetIndexInternalExt;
 use crate::index::frag_reuse::{
     build_frag_reuse_index_metadata, build_tagged_frag_reuse_entry,
     decode_frag_reuse_ledger_from_content, load_frag_reuse_index_details,
     load_raw_frag_reuse_content,
 };
 use crate::index::frag_reuse_with_stable_row_ids::history::trimmable_versions;
+use crate::index::loading::DatasetIndexInternalExt;
 use lance_core::{Error, Result};
 use lance_index::frag_reuse::{
     CompactFragReuseIndex, FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails, FragReuseVersion,
@@ -485,7 +485,7 @@ pub(crate) async fn derive_superseded_segments(
             // version) is opaque: its translated coverage is invisible, so it
             // is never pruned, and it must not mask anyone -- the reader will
             // not answer queries from it, so its bitmap covers nothing.
-            if !crate::index::index_is_usable(segment) {
+            if !crate::index::segment::index_is_usable(segment) {
                 kept_any = true;
                 continue;
             }
@@ -767,7 +767,7 @@ fn compute_tagged_retention(elements: &[TrimElement], indices: &[IndexMetadata])
         match &index.fragment_bitmap {
             Some(bitmap) => {
                 group.provenance |= bitmap;
-                if crate::index::index_is_usable(index) {
+                if crate::index::segment::index_is_usable(index) {
                     group.direct |= bitmap;
                 }
             }
@@ -1589,7 +1589,7 @@ mod tests {
         }
 
         async fn fri_entry(dataset: &Dataset) -> Option<IndexMetadata> {
-            crate::index::load_all_indices(dataset)
+            crate::index::loading::load_all_indices(dataset)
                 .await
                 .unwrap()
                 .iter()
@@ -2574,7 +2574,7 @@ mod tests {
             assert_eq!(records.legacy_versions.len(), 1);
             assert!(records.transitions.is_empty());
             let legacy_version = records.legacy_versions[0].dataset_version;
-            let listed = crate::index::load_all_indices(&dataset)
+            let listed = crate::index::loading::load_all_indices(&dataset)
                 .await
                 .unwrap()
                 .iter()

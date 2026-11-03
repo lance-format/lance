@@ -26,7 +26,7 @@ use std::sync::{Arc, LazyLock};
 use uuid::Uuid;
 
 use crate::index::DatasetIndexExt;
-use crate::index::DatasetIndexInternalExt;
+use crate::index::loading::DatasetIndexInternalExt;
 use crate::session::index_caches::ProstAny;
 use crate::{
     Dataset,
@@ -1219,7 +1219,7 @@ mod tests {
         name: &str,
         field_id: i32,
         index_type: Option<IndexType>,
-    ) -> crate::index::IndexMetadata {
+    ) -> lance_table::format::IndexMetadata {
         let index_details = index_type
             .map(|index_type| match index_type {
                 IndexType::BTree => {
@@ -1239,7 +1239,7 @@ mod tests {
                 }
             })
             .map(Arc::new);
-        crate::index::IndexMetadata {
+        lance_table::format::IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
             name: name.to_string(),
             fields: vec![field_id],

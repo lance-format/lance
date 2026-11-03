@@ -354,6 +354,15 @@ rabit_scan_counters! {
         /// Time those builds took: the attach of the resident rows and the
         /// storage's construction, without a fallback load of the store.
         code_only_partition_build_ns,
+        /// Candidate address lookups served without running a translation
+        /// loader, including coalesced loads.
+        row_address_cache_hits,
+        /// Candidate address lookups that ran a translation loader.
+        row_address_cache_misses,
+        /// Physical address slots translated by candidate-view loaders.
+        row_address_translation_rows,
+        /// Elapsed time in those loaders, including mapping reads.
+        row_address_translation_ns,
         /// Bytes of packed row columns that reads of plane-row IVF_RQ files
         /// unpacked into the column layout's fields.
         plane_rows_unpack_bytes,

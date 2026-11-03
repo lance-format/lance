@@ -8,6 +8,7 @@ docs_src="$script_dir/src"
 rm -rf "$docs_src/format/catalog"
 rm -rf "$docs_src/format/namespace"
 rm -f "$docs_src/format/layout.png"
+rm -rf "$docs_src/guide/spark"
 rm -rf "$docs_src/integrations/huggingface"
 rm -rf "$docs_src/integrations/duckdb"
 rm -rf "$docs_src/integrations/spark"
@@ -38,10 +39,23 @@ EOF
 cat > "$docs_src/integrations/.pages" <<'EOF'
 nav:
   - Overview: index.md
-  - Apache DataFusion: datafusion.md
-  - PostgreSQL: https://github.com/lance-format/pglance
-  - PyTorch: pytorch.md
-  - TensorFlow: tensorflow.md
+  - Database:
+    - LanceDB: https://docs.lancedb.com/
+  - Language SDKs:
+    - Python (PyLance): https://lance-format.github.io/lance-python-doc
+    - Rust (docs.rs): https://docs.rs/lance/latest/lance
+    - Java (Javadoc): https://www.javadoc.io/doc/org.lance/lance-core/latest/index.html
+  - Query & Compute Engines:
+    - Apache Spark: spark
+    - DuckDB: duckdb
+    - Trino: trino
+    - Apache DataFusion: datafusion.md
+    - Ray: ray
+    - PostgreSQL: https://github.com/lance-format/pglance
+  - ML & AI Ecosystem:
+    - PyTorch: pytorch.md
+    - Hugging Face: huggingface
+    - TensorFlow: tensorflow.md
 EOF
 
 mkdir -p "$docs_src/format/catalog/dir"
@@ -185,6 +199,10 @@ mkdir -p "$docs_src/integrations/duckdb"
 mkdir -p "$docs_src/integrations/ray"
 mkdir -p "$docs_src/integrations/trino"
 mkdir -p "$docs_src/integrations/huggingface"
+
+cat > "$docs_src/integrations/spark/operations/dql/.pages" <<'EOF'
+title: DQL
+EOF
 
 cat > "$docs_src/integrations/spark/index.md" <<'EOF'
 # Apache Spark Integration

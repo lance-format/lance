@@ -1,0 +1,2 @@
+   id                                                                       text category  _score
+0   2  This ramen recipe simmers the broth for three hours with dried mushrooms.     food  0.8855
