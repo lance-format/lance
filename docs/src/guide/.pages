@@ -1,6 +1,4 @@
 nav:
-  - LanceDB: https://docs.lancedb.com/
-  - Apache Spark: spark
   - PyLance:
     - Core Operations:
       - Read and Write: read_and_write.md
@@ -26,3 +24,5 @@ nav:
       - Distributed Indexing: distributed_indexing.md
       - Extension Arrays: arrays.md
       - Migration Guide: migration.md
+  - LanceDB: https://docs.lancedb.com/
+  - Apache Spark: spark
