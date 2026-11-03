@@ -42,7 +42,7 @@ pub(super) async fn load_indices(
     let mut groups: HashMap<&str, Vec<(usize, &IndexMetadata)>> = HashMap::new();
     let mut result = vec![None; indices.len()];
     for (position, index) in indices.iter().enumerate() {
-        if !super::index_is_usable(index) {
+        if !super::segment::index_is_usable(index) {
             continue;
         }
         // System indices are table-level metadata; the user-index coverage
@@ -133,7 +133,7 @@ pub(super) async fn segment_supports_batch_remapping(
     let Some(details) = index.index_details.as_ref() else {
         return Ok(None);
     };
-    if super::segment_has_vector_details(index) {
+    if super::segment::segment_has_vector_details(index) {
         return Ok(Some(
             super::frag_reuse_remapping::vector_supports_batch_remapping(dataset, index).await?,
         ));
@@ -494,7 +494,7 @@ async fn load_ledger(dataset: &Dataset, index: &IndexMetadata) -> Result<FragReu
 pub mod tests {
     use super::*;
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
-    use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+    use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
     use crate::session::index_caches::IndexMetadataKey;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::types::Int32Type;
@@ -827,7 +827,7 @@ pub mod tests {
         .encode_to_vec();
         let mut fri = install(&mut dataset, content, destinations, false).await;
         fri.index_version = 2;
-        let indices = crate::index::load_all_indices(&dataset)
+        let indices = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .iter()
@@ -867,7 +867,7 @@ pub mod tests {
         }
         .encode_to_vec();
         let fri = install(&mut dataset, content, destinations, false).await;
-        let indices = crate::index::load_all_indices(&dataset)
+        let indices = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .as_ref()
@@ -897,7 +897,9 @@ pub mod tests {
             "{error}"
         );
         assert_eq!(dataset.manifest.version, version);
-        let indices = crate::index::load_all_indices(&dataset).await.unwrap();
+        let indices = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
         assert_eq!(
             indices.iter().find(|index| index.uuid == fri.uuid),
             Some(&fri)
@@ -923,7 +925,7 @@ pub mod tests {
         }
         .encode_to_vec();
         let fri = install(&mut dataset, content, destinations, external).await;
-        let indices = crate::index::load_all_indices(&dataset)
+        let indices = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .as_ref()
@@ -997,7 +999,7 @@ pub mod tests {
         }
         .encode_to_vec();
         install(&mut dataset, content, destinations, false).await;
-        let indices = crate::index::load_all_indices(&dataset)
+        let indices = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .as_ref()
@@ -1119,7 +1121,9 @@ pub mod tests {
                 )
                 .await
                 .unwrap();
-                let indices = crate::index::load_all_indices(&dataset).await.unwrap();
+                let indices = crate::index::loading::load_all_indices(&dataset)
+                    .await
+                    .unwrap();
                 let fri = indices
                     .iter()
                     .find(|i| i.name == FRAG_REUSE_INDEX_NAME)
@@ -1157,7 +1161,7 @@ pub mod tests {
         }
         .encode_to_vec();
         let fri = install(&mut dataset, content, destinations, false).await;
-        let indices = crate::index::load_all_indices(&dataset)
+        let indices = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .as_ref()
@@ -1270,7 +1274,7 @@ pub mod tests {
             type_url: "/lance.table.FragmentReuseIndexDetails".into(),
             value: field(1, &content),
         }));
-        let mut indices = crate::index::load_all_indices(&dataset)
+        let mut indices = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .as_ref()

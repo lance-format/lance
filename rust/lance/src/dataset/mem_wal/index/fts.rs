@@ -62,8 +62,8 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_index::scalar::IndexStore as _;
 use lance_index::scalar::InvertedIndexParams;
-use lance_index::scalar::inverted::query::{FtsQuery, Operator, Tokens};
-use lance_index::scalar::inverted::tokenizer::document_tokenizer::{DocType, LanceTokenizer};
+use lance_index::scalar::inverted::query::{FtsQuery, Operator, Tokens, collect_query_tokens};
+use lance_index::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 use lance_index::scalar::inverted::{DocSet, MemBM25Scorer, Scorer, TokenSet};
 use lance_table::format::IndexMetadata;
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer, TokenStream};
@@ -711,9 +711,9 @@ fn query_tokens_to_vec(tokens: &Tokens) -> Vec<String> {
         .collect()
 }
 
-fn has_grouped_positions(tokens: &Tokens) -> bool {
+fn has_grouped_terms(tokens: &Tokens) -> bool {
     let mut seen = HashSet::new();
-    (0..tokens.len()).any(|idx| !seen.insert(tokens.position(idx)))
+    (0..tokens.len()).any(|idx| !seen.insert(tokens.term_group(idx)))
 }
 
 struct QueryPositionGroup {
@@ -721,11 +721,15 @@ struct QueryPositionGroup {
     tokens: Vec<String>,
 }
 
-fn query_position_groups(tokens: &Tokens) -> Vec<QueryPositionGroup> {
+fn query_position_groups(tokens: &Tokens, is_phrase_query: bool) -> Vec<QueryPositionGroup> {
     let mut groups = Vec::with_capacity(tokens.len());
     let mut current_position = None;
     for idx in 0..tokens.len() {
-        let position = tokens.position(idx);
+        let position = if is_phrase_query {
+            tokens.position(idx)
+        } else {
+            tokens.term_group(idx)
+        };
         if current_position != Some(position) {
             current_position = Some(position);
             groups.push(QueryPositionGroup {
@@ -1124,8 +1128,8 @@ impl<'a> PooledTokenizer<'a> {
         }
     }
 
-    fn get_mut(&mut self) -> &mut dyn LanceTokenizer {
-        self.inner.as_mut().expect("tokenizer in scope").as_mut()
+    fn get_mut(&mut self) -> &mut Box<dyn LanceTokenizer> {
+        self.inner.as_mut().expect("tokenizer in scope")
     }
 }
 
@@ -2292,7 +2296,7 @@ impl FtsMemIndex {
         include_tail: bool,
         tail_skip: bool,
     ) -> Vec<FtsEntry> {
-        if operator == Operator::And && has_grouped_positions(query_tokens) {
+        if operator == Operator::And && has_grouped_terms(query_tokens) {
             return self.search_grouped_and(st, query_tokens, limit, include_tail, tail_skip);
         }
         let tokens = query_tokens_to_vec(query_tokens);
@@ -2377,9 +2381,9 @@ impl FtsMemIndex {
         operator: Operator,
         scorer: &MemBM25Scorer,
     ) -> Vec<FtsEntry> {
-        if operator == Operator::And && has_grouped_positions(query_tokens) {
+        if operator == Operator::And && has_grouped_terms(query_tokens) {
             let mut result_map: Option<HashMap<DocumentKey, f32>> = None;
-            for group in query_position_groups(query_tokens) {
+            for group in query_position_groups(query_tokens, false) {
                 let group_results =
                     self.search_match_strings_with_scorer(st, &group.tokens, Operator::Or, scorer);
                 let group_map = group_results
@@ -2440,7 +2444,7 @@ impl FtsMemIndex {
         results
     }
 
-    /// Conjunction over the query's position groups; see [`Self::search_groups_and`].
+    /// Conjunction over the query's logical term groups; see [`Self::search_groups_and`].
     fn search_grouped_and(
         &self,
         st: &IndexState,
@@ -2451,7 +2455,7 @@ impl FtsMemIndex {
     ) -> Vec<FtsEntry> {
         self.search_groups_and(
             st,
-            query_position_groups(query_tokens)
+            query_position_groups(query_tokens, false)
                 .into_iter()
                 .map(|group| group.tokens)
                 .collect(),
@@ -2526,7 +2530,7 @@ impl FtsMemIndex {
         if query_tokens.is_empty() {
             return Vec::new();
         }
-        let groups = query_position_groups(query_tokens);
+        let groups = query_position_groups(query_tokens, true);
         if groups.is_empty() {
             return Vec::new();
         }
@@ -2596,7 +2600,7 @@ impl FtsMemIndex {
         if query_tokens.is_empty() || scorer.num_docs() == 0 {
             return Vec::new();
         }
-        let groups = query_position_groups(query_tokens);
+        let groups = query_position_groups(query_tokens, true);
         if groups.is_empty() {
             return Vec::new();
         }
@@ -2920,15 +2924,8 @@ impl FtsMemIndex {
     }
 
     fn analyze_for_search(&self, text: &str) -> Tokens {
-        let mut tok = PooledTokenizer::new(&self.tokenizer_pool);
-        let mut stream = tok.get_mut().token_stream_for_search(text);
-        let mut tokens = Vec::new();
-        let mut positions = Vec::new();
-        while let Some(t) = stream.next() {
-            tokens.push(t.text.clone());
-            positions.push(t.position as u32);
-        }
-        Tokens::with_positions(tokens, positions, DocType::Text)
+        let mut tokenizer = PooledTokenizer::new(&self.tokenizer_pool);
+        collect_query_tokens(text, tokenizer.get_mut())
     }
 
     // ------------------------------------------------------------------
@@ -5925,6 +5922,96 @@ mod tests {
             .collect::<Vec<_>>();
         rows.sort_unstable();
         assert_eq!(rows, vec![0, 1]);
+    }
+
+    #[rstest]
+    #[case::bigrams((2, 2), "abcd", &[0, 5], &[0, 1, 2, 3, 5, 6])]
+    #[case::mixed_lengths((1, 3), "abcd", &[0], &[0, 1, 2, 3, 5, 6])]
+    #[case::missing_gram((2, 2), "abcde", &[], &[0, 1, 2, 3, 5, 6])]
+    #[case::repeated_gram((2, 2), "abab", &[6], &[0, 1, 5, 6])]
+    fn test_ngram_match_groups_preserve_phrase_behavior(
+        #[case] ngram_lengths: (u32, u32),
+        #[case] query: &str,
+        #[case] expected_and: &[u64],
+        #[case] expected_or: &[u64],
+        #[values(false, true)] with_position: bool,
+    ) {
+        let index = FtsMemIndex::with_params(
+            1,
+            "description".to_string(),
+            InvertedIndexParams::default()
+                .base_tokenizer("ngram".into())
+                .ngram_min_length(ngram_lengths.0)
+                .ngram_max_length(ngram_lengths.1)
+                .with_position(with_position),
+        );
+        let batch = arrow_array::record_batch!((
+            "description",
+            Utf8,
+            vec![
+                Some("abcd"),
+                Some("ab"),
+                Some("bc"),
+                Some("cd"),
+                Some("zz"),
+                Some("ab bc cd"),
+                Some("abab"),
+                None,
+                Some("")
+            ]
+        ))
+        .unwrap();
+        let batch_size = batch.num_rows() as u64;
+
+        // Exercise the tail, frozen partitions, and a partition with a new tail.
+        for copy in 0..2 {
+            index.insert(&batch, copy * batch_size).unwrap();
+            for is_flushed in [false, true] {
+                if is_flushed {
+                    index.flush();
+                }
+                let state = index.state.load_full();
+                let tokens = index.analyze_for_search(query);
+                let terms = query_tokens_to_vec(&tokens);
+                let scorer = build_scorer(&state, &state.tail.snapshot(), &terms, true);
+                for (operator, expected) in
+                    [(Operator::And, expected_and), (Operator::Or, expected_or)]
+                {
+                    let expected = (0..=copy)
+                        .flat_map(|copy| expected.iter().map(move |row| row + copy * batch_size))
+                        .collect::<Vec<_>>();
+                    let query = FtsQueryExpr::match_query_with_operator(query, operator);
+                    for entries in [
+                        index.search_query(&query),
+                        index.search_with_options(&query, SearchOptions::new().with_limit(20)),
+                        index.search_match_with_scorer(&state, &tokens, operator, &scorer),
+                    ] {
+                        assert_eq!(
+                            rows(entries),
+                            expected,
+                            "{operator:?}, copy={copy}, is_flushed={is_flushed}"
+                        );
+                    }
+                }
+
+                // Ngram phrase offsets remain zero, preserving their existing
+                // same-position alternatives independently of Match coverage.
+                let expected_phrase = (0..=copy)
+                    .flat_map(|copy| expected_or.iter().map(move |row| row + copy * batch_size))
+                    .collect::<Vec<_>>();
+                for entries in [
+                    index.search_phrase(query, 0),
+                    index.search_query(&FtsQueryExpr::phrase(query)),
+                    index.search_phrase_with_scorer(&state, &tokens, 0, &scorer),
+                ] {
+                    assert_eq!(
+                        rows(entries),
+                        expected_phrase,
+                        "phrase, copy={copy}, is_flushed={is_flushed}"
+                    );
+                }
+            }
+        }
     }
 
     #[rstest]

@@ -40,7 +40,7 @@ use super::vector::ivf::{
     optimize_vector_indices, select_steady_state_rebalance, vector_segment_compatibility,
 };
 use super::vector::{LogicalVectorIndex, VectorIndexParams, details, fresh_vector_segment_params};
-use super::{CreateIndexBuilder, DatasetIndexExt, DatasetIndexInternalExt};
+use super::{CreateIndexBuilder, DatasetIndexExt, loading::DatasetIndexInternalExt};
 use crate::dataset::Dataset;
 use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
@@ -49,7 +49,7 @@ use crate::index::scalar::{
     IndexDetails, TrainingRows, fetch_index_details, load_fts_training_data, load_training_data,
     scan_training_data,
 };
-use crate::index::vector_index_details_default;
+use crate::index::vector::details::vector_index_details_default;
 
 #[derive(Debug, Clone)]
 pub struct IndexMergeResults<'a> {
@@ -240,7 +240,7 @@ pub async fn tagged_segment_coverage(
 ) -> Result<Option<HashMap<Uuid, RoaringBitmap>>> {
     use crate::index::frag_reuse::SegmentRemappingPlan;
 
-    let stored = crate::index::load_all_indices(dataset).await?;
+    let stored = crate::index::loading::load_all_indices(dataset).await?;
     if !stored
         .iter()
         .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
@@ -982,12 +982,26 @@ async fn merge_scalar_indices<'a>(
         None => split_segment_coverage(dataset.as_ref(), selected_old_indices.iter().copied()),
     };
 
+    // Keep honoring the deprecated instance-level check for external plugins
+    // that predate ScalarIndexPlugin::can_remap. Short-circuit so their `false`
+    // never reaches the metadata check or a remap attempt.
+    #[allow(deprecated)]
+    let is_remappable = if reference_index.can_remap() {
+        let reference_details =
+            fetch_index_details(dataset.as_ref(), field_path, reference_idx).await?;
+        IndexDetails(reference_details.clone())
+            .get_plugin()?
+            .can_remap(reference_details.as_ref())?
+    } else {
+        false
+    };
+
     // A remapping merge is stamped with the manifest it read (below): its sources were
     // translated through the fragment-reuse index, so the trim may retire the versions they
     // predate, and overlay masking will trust it for every overlay up to that manifest.
     // Entries carried over from a source never incorporate overlays committed after it was
     // built, so those rows are dropped from the carried-over data and re-read instead.
-    let (stale_rows, scan_selection) = if reference_index.can_remap() {
+    let (stale_rows, scan_selection) = if is_remappable {
         overlay_rescan(
             dataset.as_ref(),
             &selected_old_indices,
@@ -1269,7 +1283,7 @@ async fn merge_scalar_indices<'a>(
                 }
             }
         };
-        let new_dataset_version = if reference_index.can_remap() {
+        let new_dataset_version = if is_remappable {
             dataset.manifest.version
         } else {
             selected_old_indices
@@ -1294,7 +1308,7 @@ async fn metadata_is_vector_index(dataset: &Dataset, index: &IndexMetadata) -> R
     // Declared type first: an index awaiting training declares itself a vector
     // index and has no file to find it by.
     if index.index_details.is_some() {
-        return Ok(crate::index::segment_has_vector_details(index));
+        return Ok(crate::index::segment::segment_has_vector_details(index));
     }
 
     if let Some(files) = &index.files {
@@ -2246,7 +2260,7 @@ mod tests {
     use super::*;
 
     use crate::index::DatasetIndexExt;
-    use crate::index::DatasetIndexInternalExt;
+    use crate::index::loading::DatasetIndexInternalExt;
     use crate::index::optimize::{
         OptimizeIndicesPlan, commit_optimize_indices, plan_optimize_indices,
     };

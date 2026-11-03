@@ -13,7 +13,7 @@ use lance_arrow::interleave_batches;
 /// Measure logical data rather than backing buffers, which may belong to a
 /// much larger sliced array. Counting at least one byte per child value also
 /// bounds List<Null> offsets, even though those children have no value buffer.
-fn array_size(array: &dyn Array) -> Result<usize, ArrowError> {
+pub fn array_size(array: &dyn Array) -> Result<usize, ArrowError> {
     let (child, start, len, offset_bytes) = match array.data_type() {
         DataType::Utf8View | DataType::BinaryView => return Ok(array.get_array_memory_size()),
         DataType::List(_) | DataType::Map(_, _) => {

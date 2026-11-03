@@ -182,8 +182,8 @@ public class CommitBuilder {
   }
 
   /**
-   * Whether to use stable row ids. This makes the {@code _rowid} column stable after compaction,
-   * but not updates.
+   * Whether to use stable row ids. A row then keeps the same {@code _rowid} for its lifetime, even
+   * when compaction, an update or a merge insert rewrites it.
    *
    * <p>This is only used for new datasets. Existing datasets will use their existing setting.
    * Default is false.

@@ -1,4 +1,4 @@
-# Runnable source for docs/src/quickstart/index.md. The sections between the
+# Runnable source for docs/src/quickstart/lancedb.md. The sections between the
 # `--8<--` markers are embedded in the page, and CI checks what each one
 # displays against outputs/ (see tests/snippet_runner.py).
 # Sections import what they use and end with an expression to display, like

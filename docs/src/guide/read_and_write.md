@@ -376,6 +376,12 @@ and timestamp_col = timestamp '2021-01-01 00:00:00'
 and decimal_col = decimal(8,3) '1.000'
 ```
 
+A plain number in a comparison, `BETWEEN` or `IN` with a decimal column, such as
+`decimal_col < 0.055`, is compared exactly with the digits as written; it is not
+rounded to the column's scale or converted to a float. A number whose digits as
+written do not fit a 256-bit decimal, such as `1e-80` or `1e200`, is not
+supported.
+
 For timestamp columns, the precision can be specified as a number in the type
 parameter. Microsecond precision (6) is the default.
 
@@ -431,7 +437,7 @@ To address this, Lance provides methods for optimizing dataset layout.
 ### Compact data files
 
 Data files can be rewritten so there are fewer files. When passing a
-`target_rows_per_fragment` to `lance.dataset.DatasetOptimizer.compact_files`,
+`target_rows_per_fragment` to `dataset.optimize.compact_files(...)`,
 Lance will skip any fragments that are already above that row count, and rewrite
 others. Fragments will be merged according to their fragment ids, so the inherent
 ordering of the data will be preserved.
@@ -452,11 +458,11 @@ During compaction, Lance can also remove deleted rows. Rewritten fragments will
 not have deletion files. This can improve scan performance since the soft deleted
 rows don't have to be skipped during the scan.
 
-When files are rewritten, the original row addresses are invalidated. This means the
-affected files are no longer part of any ANN index if they were before. Because
-of this, it's recommended to rewrite files before re-building indices.
-
-<!-- TODO: remove this last comment once stable row ids are default. -->
+When files are rewritten, the physical row addresses (`_rowaddr`) of the compacted rows change.
+Run `compact_files()` before `optimize_indices()` or index rebuilds so Lance can remap or update
+secondary indices against the compacted fragments (see [Compaction and Rebuilding](indexing.md#compaction-and-rebuilding)).
+If your application needs logical row identifiers that remain constant across updates and compaction,
+enable [Stable Row IDs](row_ids.md).
 
 ### Cleanup old versions
 
@@ -488,7 +494,7 @@ dataset = lance.dataset("./my_dataset.lance")
 dataset.cleanup_old_versions()
 ```
 
-By default, versions older than 7 days are removed. You can override this with
+By default, versions older than two weeks are removed. You can override this with
 the `older_than` parameter (a `timedelta`):
 
 ```python
@@ -496,6 +502,93 @@ from datetime import timedelta
 
 dataset.cleanup_old_versions(older_than=timedelta(days=1))
 ```
+
+For multiple retention windows, pass a `CleanupPolicy` containing ordered `CleanupRule` entries. This example keeps
+full recent history, hourly samples between two and seven days, daily samples
+between seven and thirty days, and expires everything older than thirty days:
+
+```python
+from lance import CleanupPolicy, KeepOne, RemoveAll
+
+dataset.cleanup_old_versions(
+    policy=CleanupPolicy(rules=[
+        KeepOne(per_interval=timedelta(hours=1), older_than=timedelta(days=2)),
+        KeepOne(per_interval=timedelta(days=1), older_than=timedelta(days=7)),
+        RemoveAll(older_than=timedelta(days=30)),
+    ])
+)
+```
+
+`KeepOne` and `RemoveAll` implement `CleanupRule`. A `CleanupPolicy` contains
+the ordered rules; `CleanupPolicy()` defaults to a single
+`RemoveAll(older_than=timedelta(days=14))`, matching existing cleanup behavior.
+Ages must strictly increase. Each version uses the oldest matching `KeepOne`
+rule, with separate buckets for each band. `RemoveAll` is optional and must be
+last; without it, sampled history has no expiration limit. Empty policies,
+duplicate thresholds and unsupported rules are rejected. Comparisons are strictly
+older-than: a version exactly at a threshold stays in the younger band.
+
+`KeepOne.older_than` must be at least two days. Sampling ages are relative to the
+hinted commit timestamp, falling back to this dataset's commit when no hint
+exists. The hinted version and every later version are protected from thinning,
+even with backwards clocks or `LANCE_USE_VERSION_HINT=0` in the cleaner.
+`RemoveAll.older_than` is a wall-clock expiration age and expires sampled versions
+too. Each sampling interval aligns to the UTC Unix epoch and selects the newest
+eligible commit timestamp, breaking ties by version number.
+
+Tags, current versions and branch dependencies remain protected. `versions` and
+`retain_versions` limit which versions either operation can remove. Cleanup also
+preserves the data, indices and blobs needed by retained snapshots. The same
+`policy` is accepted by `explain_cleanup_old_versions` for a read-only preview.
+
+Retention rules work with both values of `delete_unverified`. By default, cleanup
+preserves recent files that no manifest references. With `delete_unverified=True`,
+it can remove those files immediately; files needed by retained snapshots remain
+protected in either mode.
+
+The existing top-level `older_than` keeps its wall-clock expiration meaning.
+Existing cleanup calls and defaults continue to work. The single-window shorthand
+`older_than=timedelta(days=7), keep_one=KeepOne(timedelta(days=1), timedelta(days=2))`
+is also supported. Do not combine `policy` with `older_than` or `keep_one`.
+
+Rust uses `cleanup::retention::CleanupPolicy::new(Vec<CleanupRule>)` through
+`.with_retention_policy(...)`; the legacy `cleanup::CleanupPolicy` remains
+available for version and file-cleanup filters. Java accepts
+`dataset.cleanup(new CleanupPolicy(rules))`, using
+`CleanupRule.keepOne(perInterval, olderThan)` and
+`CleanupRule.removeAll(olderThan)`. Existing native policy filters still apply.
+
+For automatic cleanup, use the same rules with duration strings:
+
+```python
+import json
+
+dataset.update_config({
+    "lance.auto_cleanup.interval": None,
+    "lance.auto_cleanup.older_than": None,
+    "lance.auto_cleanup.policy_interval": "100",
+    "lance.auto_cleanup.policy": json.dumps({"rules": [
+        {"type": "keep_one", "per_interval": "1h", "older_than": "2days"},
+        {"type": "keep_one", "per_interval": "1day", "older_than": "7days"},
+        {"type": "remove_all", "older_than": "30days"},
+    ]}),
+})
+```
+
+The policy interval is a version count. Older clients ignore this activation key
+and leave automatic retention cleanup disabled. The legacy interval must be
+removed atomically when activating either policy form; unsafe combinations are
+rejected before publication. Do not combine this policy with
+`lance.auto_cleanup.older_than` or the
+single-window `lance.auto_cleanup.keep_one.*` settings.
+
+Thinning also supports local filesystems and S3 Express. The hint-relative
+two-day minimum provides a retention buffer for delayed hint writes; it does not
+make hint updates monotonic. On stores using hints, unreadable or malformed hints
+fail cleanup instead of using the wall clock. If explicit expiration has removed
+an older hinted manifest, cleanup falls back to the dataset snapshot, as latest
+version discovery does when a hint target is missing. A missing current manifest
+still fails cleanup.
 
 !!! note
 
@@ -560,7 +653,7 @@ Auto cleanup can be enabled when creating a new dataset:
 ```python
 import lance
 import pyarrow as pa
-from lance.dataset import AutoCleanupConfig
+from lance import AutoCleanupConfig
 
 table = pa.table({"id": range(100)})
 ds = lance.write_dataset(

@@ -42,10 +42,11 @@ use lance_namespace::models::{
     ListTableBranchesResponse, ListTableIndicesRequest, ListTableIndicesResponse,
     ListTableTagsRequest, ListTableTagsResponse, ListTableVersionsRequest,
     ListTableVersionsResponse, ListTablesRequest, ListTablesResponse, MergeInsertIntoTableRequest,
-    MergeInsertIntoTableResponse, NamespaceExistsRequest, QueryTableRequest, RestoreTableRequest,
-    RestoreTableResponse, TableExistsRequest, TagContents as ModelTagContents, UpdateTableRequest,
-    UpdateTableResponse, UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse,
-    UpdateTableTagRequest, UpdateTableTagResponse,
+    MergeInsertIntoTableResponse, NamespaceExistsRequest, QueryTableRequest, RenameTableRequest,
+    RenameTableResponse, RestoreTableRequest, RestoreTableResponse, TableExistsRequest,
+    TagContents as ModelTagContents, UpdateTableRequest, UpdateTableResponse,
+    UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse, UpdateTableTagRequest,
+    UpdateTableTagResponse,
 };
 use lance_table::io::commit::ManifestNamingScheme;
 use object_store::path::Path;
@@ -349,6 +350,51 @@ impl LanceNamespace for DirectoryNamespace {
         })
     }
 
+    async fn rename_table(&self, request: RenameTableRequest) -> Result<RenameTableResponse> {
+        self.record_op("rename_table");
+
+        let table_id = request.id.as_ref().ok_or_else(|| {
+            lance_core::Error::from(NamespaceError::InvalidInput {
+                message: "Table ID is required".to_string(),
+            })
+        })?;
+        if table_id.is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "Table ID cannot be empty".to_string(),
+            }
+            .into());
+        }
+        if request.new_table_name.trim().is_empty() {
+            return Err(NamespaceError::InvalidInput {
+                message: "new_table_name cannot be empty".to_string(),
+            }
+            .into());
+        }
+
+        let source_is_child = table_id.len() > 1;
+        let destination_is_child = request
+            .new_namespace_id
+            .as_ref()
+            .is_none_or(|namespace| !namespace.is_empty());
+        let manifest_is_authoritative =
+            !self.dir_listing_enabled || (source_is_child && destination_is_child);
+
+        if !self.manifest_enabled || !manifest_is_authoritative {
+            return Err(NamespaceError::Unsupported {
+                message: "rename_table requires manifest-authoritative source and destination resolution; directory-only and directory-listing root tables are not supported".to_string(),
+            }
+            .into());
+        }
+
+        let Some(manifest_ns) = self.manifest_ns_for_write().await? else {
+            return Err(NamespaceError::Unsupported {
+                message: "rename_table is only supported when manifest mode is enabled".to_string(),
+            }
+            .into());
+        };
+        LanceNamespace::rename_table(manifest_ns.as_ref(), request).await
+    }
+
     async fn create_table(
         &self,
         request: CreateTableRequest,
@@ -377,6 +423,7 @@ impl LanceNamespace for DirectoryNamespace {
         let write_result = self
             .write_reader_to_table(
                 &table_uri,
+                None,
                 reader,
                 WriteMode::Create,
                 request.storage_options.clone(),
@@ -575,6 +622,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: AlterTableAddColumnsRequest,
     ) -> Result<AlterTableAddColumnsResponse> {
+        Self::ensure_main_branch(request.branch.as_deref(), "alter_table_add_columns")?;
         if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return manifest_ns.alter_table_add_columns(request).await;
         }
@@ -633,6 +681,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: AlterTableAlterColumnsRequest,
     ) -> Result<AlterTableAlterColumnsResponse> {
+        Self::ensure_main_branch(request.branch.as_deref(), "alter_table_alter_columns")?;
         if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return manifest_ns.alter_table_alter_columns(request).await;
         }
@@ -683,6 +732,7 @@ impl LanceNamespace for DirectoryNamespace {
         &self,
         request: AlterTableDropColumnsRequest,
     ) -> Result<AlterTableDropColumnsResponse> {
+        Self::ensure_main_branch(request.branch.as_deref(), "alter_table_drop_columns")?;
         if let Some(manifest_ns) = self.manifest_ns_for_write().await? {
             return manifest_ns.alter_table_drop_columns(request).await;
         }
@@ -1005,8 +1055,9 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<CreateTableIndexResponse> {
         self.record_op("create_table_index");
         let table_uri = self.resolve_table_location(&request.id).await?;
+        let branch = request.branch.as_deref();
         let mut dataset = self
-            .load_dataset(&table_uri, None, "create_table_index")
+            .load_branch_dataset(&table_uri, branch, None, "create_table_index")
             .await?;
         let index_request = Self::build_index_params(&request)?;
 
@@ -1077,8 +1128,9 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<ListTableIndicesResponse> {
         self.record_op("list_table_indices");
         let table_uri = self.resolve_table_location(&request.id).await?;
+        let branch = request.branch.as_deref();
         let dataset = self
-            .load_dataset(&table_uri, request.version, "list_table_indices")
+            .load_branch_dataset(&table_uri, branch, request.version, "list_table_indices")
             .await?;
         let total_rows = dataset.count_rows(None).await.map_err(|e| {
             lance_core::Error::from(NamespaceError::Internal {
@@ -1173,8 +1225,14 @@ impl LanceNamespace for DirectoryNamespace {
     ) -> Result<DescribeTableIndexStatsResponse> {
         self.record_op("describe_table_index_stats");
         let table_uri = self.resolve_table_location(&request.id).await?;
+        let branch = request.branch.as_deref();
         let dataset = self
-            .load_dataset(&table_uri, request.version, "describe_table_index_stats")
+            .load_branch_dataset(
+                &table_uri,
+                branch,
+                request.version,
+                "describe_table_index_stats",
+            )
             .await?;
         let index_name = request.index_name.as_deref().ok_or_else(|| {
             lance_core::Error::from(NamespaceError::InvalidInput {
@@ -1493,8 +1551,9 @@ impl LanceNamespace for DirectoryNamespace {
                 message: "Index name is required for drop_table_index".to_string(),
             })
         })?;
+        let branch = request.branch.as_deref();
         let mut dataset = self
-            .load_dataset(&table_uri, None, "drop_table_index")
+            .load_branch_dataset(&table_uri, branch, None, "drop_table_index")
             .await?;
         let metadatas = dataset
             .load_indices_by_name(index_name)
@@ -1623,8 +1682,9 @@ impl LanceNamespace for DirectoryNamespace {
         request: UpdateTableSchemaMetadataRequest,
     ) -> Result<UpdateTableSchemaMetadataResponse> {
         let table_uri = self.resolve_table_location(&request.id).await?;
+        let branch = request.branch.as_deref();
         let mut dataset = self
-            .load_dataset(&table_uri, None, "update_table_schema_metadata")
+            .load_branch_dataset(&table_uri, branch, None, "update_table_schema_metadata")
             .await?;
 
         let new_metadata = request.metadata.unwrap_or_default();
@@ -1748,9 +1808,27 @@ impl LanceNamespace for DirectoryNamespace {
         request: ExplainTableQueryPlanRequest,
     ) -> Result<String> {
         let table_uri = self.resolve_table_location(&request.id).await?;
+        // The request can name the branch itself or in its query; both must agree.
+        let request_branch = Self::normalized_branch(request.branch.as_deref())?;
+        let query_branch = Self::normalized_branch(request.query.branch.as_deref())?;
+        if request.branch.is_some()
+            && request.query.branch.is_some()
+            && request_branch != query_branch
+        {
+            return Err(NamespaceError::InvalidInput {
+                message: format!(
+                    "explain_table_query_plan names branch '{}' but its query names branch '{}'",
+                    request_branch.unwrap_or("main"),
+                    query_branch.unwrap_or("main")
+                ),
+            }
+            .into());
+        }
+        let branch = request_branch.or(query_branch);
         let dataset = self
-            .load_dataset(
+            .load_branch_dataset(
                 &table_uri,
+                branch,
                 request.query.version,
                 "explain_table_query_plan",
             )
@@ -1797,8 +1875,14 @@ impl LanceNamespace for DirectoryNamespace {
         request: AnalyzeTableQueryPlanRequest,
     ) -> Result<String> {
         let table_uri = self.resolve_table_location(&request.id).await?;
+        let branch = request.branch.as_deref();
         let dataset = self
-            .load_dataset(&table_uri, request.version, "analyze_table_query_plan")
+            .load_branch_dataset(
+                &table_uri,
+                branch,
+                request.version,
+                "analyze_table_query_plan",
+            )
             .await?;
 
         let mut scanner = dataset.scan();
@@ -1880,13 +1964,16 @@ impl LanceNamespace for DirectoryNamespace {
             }
         };
 
-        let dataset = if !self.table_uri_has_actual_manifests(&table_uri).await? {
-            self.write_reader_to_table(&table_uri, reader, WriteMode::Create, None)
-                .await?
-        } else {
-            self.write_reader_to_table(&table_uri, reader, mode, None)
-                .await?
-        };
+        let branch = Self::normalized_branch(request.branch.as_deref())?;
+        // A branch forks from an existing version, so only an insert on main creates the table.
+        let dataset =
+            if branch.is_none() && !self.table_uri_has_actual_manifests(&table_uri).await? {
+                self.write_reader_to_table(&table_uri, None, reader, WriteMode::Create, None)
+                    .await?
+            } else {
+                self.write_reader_to_table(&table_uri, branch, reader, mode, None)
+                    .await?
+            };
 
         Ok(InsertIntoTableResponse {
             transaction_id: None,
@@ -1904,14 +1991,16 @@ impl LanceNamespace for DirectoryNamespace {
         self.record_op("merge_insert_into_table");
         let table_uri = self.resolve_table_location(&request.id).await?;
         let on = merge_insert_on_columns(request.on.as_deref(), "merge_insert_into_table")?;
+        let branch = Self::normalized_branch(request.branch.as_deref())?;
 
         let table_has_manifests = self.table_uri_has_actual_manifests(&table_uri).await?;
         let (reader, num_rows) =
             Self::ipc_reader_from_request_data(&request_data, "merge_insert_into_table")?;
 
-        if !table_has_manifests {
+        // A branch forks from an existing version, so only a merge on main creates the table.
+        if branch.is_none() && !table_has_manifests {
             let dataset = self
-                .write_reader_to_table(&table_uri, reader, WriteMode::Create, None)
+                .write_reader_to_table(&table_uri, None, reader, WriteMode::Create, None)
                 .await?;
             let version = dataset.version().version as i64;
             return Ok(MergeInsertIntoTableResponse {
@@ -1925,7 +2014,7 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         let dataset = Arc::new(
-            self.load_dataset(&table_uri, None, "merge_insert_into_table")
+            self.load_branch_dataset(&table_uri, branch, None, "merge_insert_into_table")
                 .await?,
         );
 
@@ -2038,7 +2127,11 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         let table_uri = self.resolve_table_location(&request.id).await?;
-        let dataset = Arc::new(self.load_dataset(&table_uri, None, "update_table").await?);
+        let branch = request.branch.as_deref();
+        let dataset = Arc::new(
+            self.load_branch_dataset(&table_uri, branch, None, "update_table")
+                .await?,
+        );
 
         let mut builder = UpdateBuilder::new(dataset);
         for pair in &request.updates {
@@ -2094,8 +2187,9 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         let table_uri = self.resolve_table_location(&request.id).await?;
+        let branch = request.branch.as_deref();
         let mut dataset = self
-            .load_dataset(&table_uri, None, "delete_from_table")
+            .load_branch_dataset(&table_uri, branch, None, "delete_from_table")
             .await?;
 
         let result = dataset
@@ -2115,8 +2209,9 @@ impl LanceNamespace for DirectoryNamespace {
 
         self.record_op("query_table");
         let table_uri = self.resolve_table_location(&request.id).await?;
+        let branch = request.branch.as_deref();
         let dataset = self
-            .load_dataset(&table_uri, request.version, "query_table")
+            .load_branch_dataset(&table_uri, branch, request.version, "query_table")
             .await?;
 
         // Build scanner
@@ -2414,8 +2509,10 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         let table_uri = self.resolve_table_location(&request.id).await?;
+        // A bare version resolves on the branch the dataset is opened on.
+        let branch = request.branch.as_deref();
         let dataset = self
-            .load_dataset(&table_uri, None, "create_table_tag")
+            .load_branch_dataset(&table_uri, branch, None, "create_table_tag")
             .await?;
 
         dataset
@@ -2481,8 +2578,9 @@ impl LanceNamespace for DirectoryNamespace {
         }
 
         let table_uri = self.resolve_table_location(&request.id).await?;
+        let branch = request.branch.as_deref();
         let dataset = self
-            .load_dataset(&table_uri, None, "update_table_tag")
+            .load_branch_dataset(&table_uri, branch, None, "update_table_tag")
             .await?;
 
         dataset
@@ -2527,17 +2625,6 @@ impl LanceNamespace for DirectoryNamespace {
             .load_dataset(&table_uri, None, "create_table_branch")
             .await?;
 
-        // Best-effort pre-check: a duplicate returns a clean TableBranchAlreadyExists conflict
-        // instead of the opaque Internal error create_branch raises on a pre-existing branch. A
-        // concurrent create can still race past this window. Remove once lance-core create_branch
-        // returns RefConflict up front.
-        if dataset.branches().get(&request.name).await.is_ok() {
-            return Err(NamespaceError::TableBranchAlreadyExists {
-                message: format!("branch '{}' for table at '{}'", request.name, table_uri),
-            }
-            .into());
-        }
-
         dataset
             .create_branch(
                 &request.name,
@@ -2546,9 +2633,13 @@ impl LanceNamespace for DirectoryNamespace {
             )
             .await
             .map_err(|e| {
-                // After load_dataset + the dup pre-check, a DatasetNotFound from create_branch
-                // means the requested fork source (from_branch/from_version) doesn't exist.
-                if matches!(e, lance_core::Error::DatasetNotFound { .. }) {
+                // Missing sources can be detected while reserving the branch name or cloning.
+                // Both phases must preserve the create API's InvalidInput response.
+                if matches!(
+                    e,
+                    lance_core::Error::DatasetNotFound { .. }
+                        | lance_core::Error::VersionNotFound { .. }
+                ) {
                     NamespaceError::InvalidInput {
                         message: format!(
                             "from_branch/from_version for branch '{}' refers to a source that does not exist: {}",

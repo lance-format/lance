@@ -186,6 +186,9 @@ impl UringReader {
         length: usize,
     ) -> Pin<Box<dyn Future<Output = object_store::Result<Bytes>> + Send>> {
         let mut buffer = BytesMut::with_capacity(length);
+        // SAFETY: the capacity covers `length`. `set_len` also asks for initialized bytes, and
+        // these stay uninitialized until the kernel writes them, but nothing reads them before
+        // that: callers only ever get the first `bytes_read`, all written by the kernel.
         unsafe {
             buffer.set_len(length);
         }
