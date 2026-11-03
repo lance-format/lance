@@ -33,19 +33,16 @@ import pyarrow as pa
 from lance_namespace import LanceNamespace
 
 from .._arrow.bf16 import BFloat16Array
-from ..commit import CommitLock
-from ..dataset import (
+from .._dataset.index import Index
+from .._dataset.refs import Branch, Tag, Version, VersionRef
+from .._dataset.transaction import (
     AlterColumn,
-    Branch,
     ExecuteResult,
-    Index,
     LanceOperation,
-    Tag,
     Transaction,
     UpdateResult,
-    Version,
-    VersionRef,
 )
+from ..commit import CommitLock
 from ..fragment import (
     DataFile,
     FragmentMetadata,
@@ -444,6 +441,7 @@ class _Dataset:
         late_materialization: Optional[bool | List[str]] = None,
         blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[List[str]] = None,
         include_deleted_rows: Optional[bool] = None,
         scan_stats_callback: Optional[Callable[[Any], None]] = None,
         strict_batch_size: Optional[bool] = None,
@@ -554,6 +552,8 @@ class _Dataset:
         delete_rate_limit: Optional[int] = None,
         versions: Optional[List[int]] = None,
         delete_concurrency: Optional[int] = None,
+        keep_one_micros: Optional[Tuple[int, int]] = None,
+        policy_json: Optional[str] = None,
     ) -> CleanupStats: ...
     def explain_cleanup_old_versions(
         self,
@@ -565,6 +565,8 @@ class _Dataset:
         versions: Optional[List[int]] = None,
         include_files: bool = False,
         max_files: int = 1000,
+        keep_one_micros: Optional[Tuple[int, int]] = None,
+        policy_json: Optional[str] = None,
     ) -> CleanupExplanation: ...
     def get_version(self, tag: str) -> int: ...
     # Tag operations
@@ -798,12 +800,14 @@ class _Fragment:
         blob_handling: Optional[str] = None,
         order_by: Optional[List[Any]] = None,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[List[str]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         include_deleted_rows: Optional[bool] = None,
         batch_size_bytes: Optional[int] = None,
         strict_batch_size: Optional[bool] = None,
         substrait_filter: Optional[bytes] = None,
+        scan_stats_callback: Optional[Callable[[Any], None]] = None,
     ) -> _Scanner: ...
     def add_columns_from_reader(
         self,

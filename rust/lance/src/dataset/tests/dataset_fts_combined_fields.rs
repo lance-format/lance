@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod reconstruction;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::vec;
@@ -2041,8 +2043,11 @@ async fn assert_combined_fields_flat_list_column<
 /// A target column reached through a list (`List<Struct<Utf8>>`) is a shape a Lance
 /// projection cannot address by its public path, so the flat side scans the list
 /// root and walks down to the leaf itself.
+#[rstest]
 #[tokio::test]
-async fn test_fts_combined_fields_column_under_a_list() {
+async fn test_fts_combined_fields_column_under_a_list(
+    #[values(false, true)] is_reconstructed: bool,
+) {
     let params = combined_fields_test_params();
     // Rows 0-1 are indexed and match "aa" nowhere, so every "aa" hit comes from
     // the flat side and its score is the exact blended BM25F. Row 2 spreads the
@@ -2126,17 +2131,26 @@ async fn test_fts_combined_fields_column_under_a_list() {
                 !brute_force_ids(&expected).is_empty(),
                 "the reference must match something"
             );
-            let actual = fts_result_id_scores(
-                &dataset,
-                combined_query_over(
-                    &["docs.content", "title"],
-                    terms,
-                    Operator::Or,
-                    Some(weights.to_vec()),
-                ),
-                None,
-            )
-            .await;
+            let query = combined_query_over(
+                &["docs.content", "title"],
+                terms,
+                Operator::Or,
+                Some(weights.to_vec()),
+            );
+            let actual = if is_reconstructed {
+                let mut scanner = dataset.scan();
+                scanner
+                    .project(&["id"])
+                    .unwrap()
+                    .full_text_search(FullTextSearchQuery::new_query(query))
+                    .unwrap();
+                reconstruction::id_scores(reconstruction::reconstruct_plan(
+                    scanner.create_plan().await.unwrap(),
+                ))
+                .await
+            } else {
+                fts_result_id_scores(&dataset, query, None).await
+            };
             assert_matches_brute_force(
                 &actual,
                 &expected,

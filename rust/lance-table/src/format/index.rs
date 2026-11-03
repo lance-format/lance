@@ -129,6 +129,18 @@ pub struct IndexMetadata {
 }
 
 impl IndexMetadata {
+    /// Returns the run-optimized serialized size of this fragment bitmap.
+    ///
+    /// Fragment bitmaps are run-optimized before they are persisted. This method
+    /// applies the same optimization without serializing or exporting the
+    /// bitmap itself. The bitmap can be a query-time derived view, so this size
+    /// need not match the original manifest bytes.
+    pub fn fragment_bitmap_serialized_size(&self) -> Option<usize> {
+        let mut bitmap = self.fragment_bitmap.clone()?;
+        bitmap.optimize();
+        Some(bitmap.serialized_size())
+    }
+
     pub fn effective_fragment_bitmap(
         &self,
         existing_fragments: &RoaringBitmap,
@@ -262,13 +274,9 @@ impl IndexMetadata {
     /// fragments, rather than just losing coverage of them until rebuilt.
     ///
     /// Of the address-domain types, BTree, Bitmap and LabelList's indexes support
-    /// this today (`ScalarIndex::can_remap`); ZoneMap, BloomFilter and FM always
-    /// report `RemapResult::Drop`, so remapping is never worth attempting for them.
-    /// `can_remap()` lives on the opened index and can vary per instance in
-    /// principle, but every implementation today is a type-level constant, so
-    /// this metadata-only check -- answering whether a remap is worth
-    /// attempting, not whether one will succeed opening the index -- is exact
-    /// in practice, not just a cheap approximation.
+    /// this today (`ScalarIndexPlugin::can_remap`); ZoneMap, BloomFilter and FM
+    /// cannot remap. This gate recognizes the supported built-in address-domain
+    /// formats without opening index files.
     pub fn supports_eager_remap(&self) -> bool {
         self.index_details.as_ref().is_some_and(|details| {
             Self::is_btree_addr_domain(details, self.index_version)
@@ -881,6 +889,10 @@ mod tests {
         };
 
         let proto = pb::IndexMetadata::from(&metadata);
+        assert_eq!(
+            metadata.fragment_bitmap_serialized_size(),
+            Some(proto.fragment_bitmap.len())
+        );
         assert!(
             proto.fragment_bitmap.len() < unoptimized_size / 100,
             "expected run-optimized bitmap ({} bytes) to be <1% of the \
@@ -1367,7 +1379,7 @@ mod tests {
         assert!(!metadata.can_follow_stable_row_ids());
         assert!(
             metadata.supports_eager_remap(),
-            "BitmapIndex and LabelListIndex both support can_remap(), same as BTree"
+            "BitmapIndex and LabelListIndex both support remapping, same as BTree"
         );
     }
 

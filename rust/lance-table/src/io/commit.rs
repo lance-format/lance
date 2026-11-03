@@ -384,15 +384,36 @@ pub async fn write_version_hint(object_store: &ObjectStore, base: &Path, version
 /// Read the latest version from the hint file, or `None` if it does not exist
 /// or cannot be parsed.
 async fn read_version_from_hint(object_store: &ObjectStore, base: &Path) -> Option<u64> {
-    let bytes = object_store
-        .inner
-        .get(&version_hint_path(base))
-        .await
-        .ok()?
-        .bytes()
-        .await
-        .ok()?;
-    Some(serde_json::from_slice::<VersionHint>(&bytes).ok()?.version)
+    read_version_hint(object_store, base).await.ok().flatten()
+}
+
+/// Read the version hint for retention planning, distinguishing absence from
+/// storage and decoding failures. A missing hint returns `Ok(None)`.
+///
+/// ```
+/// # use lance_core::Result;
+/// # use lance_io::object_store::ObjectStore;
+/// # use lance_table::io::commit::read_version_hint;
+/// # use object_store::path::Path;
+/// # async fn example(store: &ObjectStore, base: &Path) -> Result<()> {
+/// let version = read_version_hint(store, base).await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn read_version_hint(object_store: &ObjectStore, base: &Path) -> Result<Option<u64>> {
+    let result = match object_store.inner.get(&version_hint_path(base)).await {
+        Ok(result) => result,
+        Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let bytes = result.bytes().await?;
+    let hint = serde_json::from_slice::<VersionHint>(&bytes).map_err(|error| {
+        Error::invalid_input(format!(
+            "Invalid version hint at {}: {error}",
+            version_hint_path(base)
+        ))
+    })?;
+    Ok(Some(hint.version))
 }
 
 /// Read the version hint and probe upward to find the true latest manifest.
@@ -1292,7 +1313,15 @@ pub async fn commit_handler_from_url(
                 .await?,
             }))
         }
-        _ => Ok(Arc::new(UnsafeCommitHandler)),
+        // Default for unrecognized schemes: prefer the conflict-safe
+        // put-if-not-exists handler over `UnsafeCommitHandler`. Most object
+        // stores (including out-of-tree providers registered at runtime) back
+        // onto storage that supports atomic create-if-not-exists, so this makes
+        // concurrent commits fail loudly with a conflict instead of silently
+        // clobbering each other's manifests. A store that genuinely lacks
+        // conditional-put support can still opt back into `UnsafeCommitHandler`
+        // explicitly (e.g. via a caller-supplied commit handler).
+        _ => Ok(Arc::new(ConditionalPutCommitHandler)),
     }
 }
 
@@ -2469,11 +2498,13 @@ mod tests {
     #[case::oss("oss://bucket-a/ds")]
     #[case::tos("tos://bucket-a/ds")]
     #[case::goosefs("goosefs://bucket-a/ds")]
+    #[case::custom_scheme("my-custom-scheme://bucket-a/ds")]
     async fn test_commit_handler_from_url_conditional_put_schemes(#[case] url: &str) {
         // Every scheme whose store supports atomic put-if-not-exists must
         // route to ConditionalPutCommitHandler — otherwise concurrent writers
         // fall through to UnsafeCommitHandler and silently clobber each
-        // other's manifests.
+        // other's manifests. Unrecognized schemes (e.g. runtime-registered
+        // out-of-tree providers) default to the same conflict-safe handler.
         let handler = commit_handler_from_url(url, &None).await.unwrap();
         assert_eq!(
             format!("{:?}", handler),

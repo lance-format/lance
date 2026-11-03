@@ -162,7 +162,7 @@ impl FragReuseBase {
 }
 
 async fn stored_frag_reuse_entry(dataset: &Dataset) -> Result<Option<IndexMetadata>> {
-    Ok(crate::index::load_all_indices(dataset)
+    Ok(crate::index::loading::load_all_indices(dataset)
         .await?
         .iter()
         .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
@@ -220,9 +220,9 @@ fn supplies_values(operation: &Operation) -> bool {
     )
 }
 
-/// Whether an operation changes schema-level or per-field metadata. A merge
-/// carries the complete schema from its read version, so rebasing either
-/// operation over the other can discard one side's metadata changes.
+/// Whether an operation changes schema-level or per-field metadata. A merge or
+/// projection carries the complete schema from its read version, so rebasing
+/// either operation over the other can discard one side's metadata changes.
 fn updates_schema_or_field_metadata(operation: &Operation) -> bool {
     let Operation::UpdateConfig {
         schema_metadata_updates,
@@ -546,7 +546,7 @@ impl<'a> TransactionRebase<'a> {
         if !matches!(self.transaction.operation, Operation::CreateIndex { .. }) {
             return Ok(());
         }
-        let indices = crate::index::load_all_indices(dataset).await?;
+        let indices = crate::index::loading::load_all_indices(dataset).await?;
         let Some(entry) = indices
             .iter()
             .find(|index| lance_table::system_index::frag_reuse::metadata::is_tagged(index))
@@ -611,27 +611,56 @@ impl<'a> TransactionRebase<'a> {
         Ok(())
     }
 
-    /// Whether a version cleaned up from this attempt's window could hide a
-    /// change this CreateIndex must account for: it covers the source fragments
-    /// of a recorded deferred compaction, whose values must stay unchanged from
-    /// the build until that compaction read them, and its output's after.
-    /// Compactions before the build do not count: the index covers their
-    /// output under its own id.
-    pub(crate) fn needs_versions(&self, missing: &[u64]) -> bool {
+    /// Refuse gaps in the transaction history required to safely rebase.
+    pub(crate) fn check_missing_versions(
+        &self,
+        missing: &[u64],
+        latest_version: u64,
+    ) -> Result<()> {
+        if missing.is_empty() {
+            return Ok(());
+        }
+        // A missing transaction may have changed or removed any source fragment.
+        // Publishing a staged fragment without checking it can undo that write.
+        if !self.modified_fragment_ids.is_empty() {
+            return Err(Error::retryable_commit_conflict_source(
+                latest_version,
+                format!(
+                    "versions {missing:?} between transaction read version {} and latest \
+                     version {latest_version} were cleaned up, so {} cannot safely modify \
+                     existing fragments; retry the operation on the latest version",
+                    self.transaction.read_version, self.transaction.operation
+                )
+                .into(),
+            ));
+        }
+
+        // Gaps can hide changes to the source fragments an index covers, or to
+        // their outputs after a deferred compaction. Compactions before the build
+        // do not count: the index covers their output under its own id.
         let (Some(reuse), Operation::CreateIndex { new_indices, .. }) =
             (&self.untagged_reuse, &self.transaction.operation)
         else {
-            return false;
+            return Ok(());
         };
-        !missing.is_empty()
-            && reuse.groups.iter().any(|sources| {
-                new_indices.iter().any(|index| {
-                    index
-                        .fragment_bitmap
-                        .as_ref()
-                        .is_none_or(|bitmap| sources.iter().any(|id| bitmap.contains(*id as u32)))
-                })
+        if reuse.groups.iter().any(|sources| {
+            new_indices.iter().any(|index| {
+                index
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_none_or(|bitmap| sources.iter().any(|id| bitmap.contains(*id as u32)))
             })
+        }) {
+            return Err(Error::retryable_commit_conflict_source(
+                latest_version,
+                format!(
+                    "versions {missing:?} were cleaned up, so this index cannot be carried \
+                     through the deferred compaction it covers; rebuild it"
+                )
+                .into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn check_txn(&mut self, other_transaction: &Transaction, other_version: u64) -> Result<()> {
@@ -643,11 +672,13 @@ impl<'a> TransactionRebase<'a> {
         {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
-        // Merge carries a complete schema from its read version. In either
-        // commit order, rebasing it with a metadata update can keep one side's
-        // schema while discarding metadata from the other side.
-        if (matches!(ours, Operation::Merge { .. }) && updates_schema_or_field_metadata(theirs))
-            || (updates_schema_or_field_metadata(ours) && matches!(theirs, Operation::Merge { .. }))
+        // Merge and Project carry complete schemas from their read versions.
+        // In either commit order, rebasing them with a metadata update can keep
+        // one side's schema while discarding metadata from the other side.
+        if (matches!(ours, Operation::Merge { .. } | Operation::Project { .. })
+            && updates_schema_or_field_metadata(theirs))
+            || (updates_schema_or_field_metadata(ours)
+                && matches!(theirs, Operation::Merge { .. } | Operation::Project { .. }))
         {
             return Err(self.retryable_conflict_err(other_transaction, other_version));
         }
@@ -1250,9 +1281,8 @@ impl<'a> TransactionRebase<'a> {
                     }
                     Ok(())
                 }
-                // Merge, reserve, and project don't change row ids. The MemWAL
-                // index is the exception: its install validates schema-dependent
-                // state, which a concurrent schema change invalidates.
+                // Merge preserves row ids. The MemWAL index's install validates
+                // schema-dependent state, which a concurrent schema change invalidates.
                 Operation::Merge {
                     fragments, schema, ..
                 } => {
@@ -1262,11 +1292,9 @@ impl<'a> TransactionRebase<'a> {
                     // A merge that removed or retyped a field our index keys
                     // on or carries (an `alter_columns` cast rewrites the
                     // column under a new field id) leaves the index describing
-                    // a column that no longer exists on a tagged table's
-                    // destinations; the build is redone against the new field.
-                    if self.current_lineage.is_some()
-                        && let Some(read_schema) = self.read_schema.as_ref()
-                    {
+                    // a column that no longer exists; the build is redone
+                    // against the new field, regardless of fragment reuse history.
+                    if let Some(read_schema) = self.read_schema.as_ref() {
                         let gone: HashSet<i32> = read_schema
                             .fields_pre_order()
                             .filter(|field| {
@@ -1336,7 +1364,21 @@ impl<'a> TransactionRebase<'a> {
                     Ok(())
                 }
                 Operation::ReserveFragments { .. } => Ok(()),
-                Operation::Project { .. } => Ok(()),
+                // A projection removes existing indices on dropped fields.
+                // An index built before it must not reintroduce those dependencies.
+                Operation::Project { schema, .. } => {
+                    if new_indices.iter().any(|index| {
+                        !is_system_index(index)
+                            && index
+                                .dependency_fields()
+                                .iter()
+                                .any(|field| schema.field_by_id(*field).is_none())
+                    }) {
+                        Err(self.retryable_conflict_err(other_transaction, other_version))
+                    } else {
+                        Ok(())
+                    }
+                }
                 // Should be compatible with rewrite if it didn't move the rows
                 // we indexed. If it did, we could retry.
                 // TODO: this will change with stable row ids.
@@ -1924,6 +1966,9 @@ impl<'a> TransactionRebase<'a> {
         other_transaction: &Transaction,
         other_version: u64,
     ) -> Result<()> {
+        let Operation::Append { fragments } = &self.transaction.operation else {
+            return Err(wrong_operation_err(&self.transaction.operation));
+        };
         match &other_transaction.operation {
             // Append is not compatible with any operation that completely
             // overwrites the schema.
@@ -1931,6 +1976,21 @@ impl<'a> TransactionRebase<'a> {
             | Operation::Restore { .. }
             | Operation::UpdateMemWalState { .. } => {
                 Err(self.incompatible_conflict_err(other_transaction, other_version))
+            }
+            Operation::Merge { schema, .. } => {
+                // Casts and dropped-and-readded columns replace field ids. Files
+                // staged with the old ids would silently read back as null.
+                // Negative ids are tombstones or internal fields outside the schema.
+                if fragments
+                    .iter()
+                    .flat_map(|fragment| &fragment.files)
+                    .flat_map(|file| file.fields.iter())
+                    .any(|field| *field >= 0 && schema.field_by_id(*field).is_none())
+                {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                } else {
+                    Ok(())
+                }
             }
             Operation::Append { .. }
             | Operation::Rewrite { .. }
@@ -1940,7 +2000,6 @@ impl<'a> TransactionRebase<'a> {
             | Operation::ReserveFragments { .. }
             | Operation::Project { .. }
             | Operation::UpdateBases { .. }
-            | Operation::Merge { .. }
             | Operation::UpdateConfig { .. }
             | Operation::Clone { .. }
             | Operation::DataReplacement { .. }
@@ -2764,6 +2823,7 @@ impl<'a> TransactionRebase<'a> {
                         dataset.manifest.version,
                         &dv,
                         dataset.object_store.as_ref(),
+                        dataset.inline_deletions_max_bytes()?,
                     )
                     .await?;
 
@@ -3084,7 +3144,7 @@ impl<'a> TransactionRebase<'a> {
             // tagged support are fenced off by the writer feature flag
             // before this point.
             if self.reuse.added_transitions.is_none() && proposed.index_version == 0 {
-                let stored = crate::index::load_all_indices(dataset).await?;
+                let stored = crate::index::loading::load_all_indices(dataset).await?;
                 let current_uses_tagged =
                     lance_table::system_index::frag_reuse::metadata::uses_tagged_fri(
                         &dataset.manifest,
@@ -3263,7 +3323,7 @@ async fn rewrite_reuse_state(
     } else {
         Cow::Borrowed(dataset)
     };
-    let read_entry = crate::index::load_all_indices(&read_version)
+    let read_entry = crate::index::loading::load_all_indices(&read_version)
         .await?
         .iter()
         .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
@@ -3702,29 +3762,42 @@ mod tests {
     #[case::config(false)]
     #[case::table_metadata(true)]
     #[tokio::test]
-    async fn test_merge_preserves_unrelated_update_config_compatibility(
+    async fn test_schema_change_preserves_unrelated_update_config_compatibility(
         #[case] update_table_metadata: bool,
-        #[values(true, false)] merge_commits_first: bool,
+        #[values("merge", "drop", "rename")] schema_change: &str,
+        #[values(true, false)] schema_change_commits_first: bool,
     ) {
-        let dataset = Arc::new(test_dataset(5, 1).await);
+        let dataset = Arc::new(test_dataset(4, 2).await);
         let read_version = dataset.manifest.version;
 
-        let mut merged_schema = dataset.schema().clone();
-        merged_schema
+        let mut schema = dataset.schema().clone();
+        schema
             .metadata
-            .insert("merge.schema".to_string(), "preserved".to_string());
-        let field_id = merged_schema.fields[0].id;
-        merged_schema.fields[0]
+            .insert("schema.key".to_string(), "preserved".to_string());
+        let field_id = schema.fields[0].id;
+        schema.fields[0]
             .metadata
-            .insert("merge.field".to_string(), "preserved".to_string());
-        let merge = Transaction::new_from_version(
-            read_version,
-            Operation::Merge {
+            .insert("field.key".to_string(), "preserved".to_string());
+        let operation = match schema_change {
+            "merge" => Operation::Merge {
                 fragments: dataset.manifest.fragments.as_ref().clone(),
-                schema: merged_schema,
+                schema,
                 preserves_nullability: true,
             },
-        );
+            "drop" | "rename" => {
+                if schema_change == "drop" {
+                    schema.fields.truncate(1);
+                } else {
+                    schema.fields[1].name = "renamed_b".to_string();
+                }
+                Operation::Project {
+                    schema,
+                    preserves_nullability: true,
+                }
+            }
+            _ => unreachable!(),
+        };
+        let schema_transaction = Transaction::new_from_version(read_version, operation);
 
         let replacement = UpdateMap {
             update_entries: vec![("key", Some("value")).into()],
@@ -3740,10 +3813,10 @@ mod tests {
             },
         );
 
-        let (first, stale) = if merge_commits_first {
-            (merge, update_config)
+        let (first, stale) = if schema_change_commits_first {
+            (schema_transaction, update_config)
         } else {
-            (update_config, merge)
+            (update_config, schema_transaction)
         };
         CommitBuilder::new(dataset.clone())
             .execute(first)
@@ -3755,7 +3828,7 @@ mod tests {
             latest_dataset
                 .schema()
                 .metadata
-                .get("merge.schema")
+                .get("schema.key")
                 .map(String::as_str),
             Some("preserved")
         );
@@ -3765,7 +3838,7 @@ mod tests {
                 .field_by_id(field_id)
                 .unwrap()
                 .metadata
-                .get("merge.field")
+                .get("field.key")
                 .map(String::as_str),
             Some("preserved")
         );
@@ -3781,30 +3854,43 @@ mod tests {
     #[case::schema_metadata(true)]
     #[case::field_metadata(false)]
     #[tokio::test]
-    async fn test_concurrent_merge_and_metadata_update_conflict(
+    async fn test_concurrent_schema_change_and_metadata_update_conflict(
         #[case] replace_schema_metadata: bool,
+        #[values("merge", "drop", "rename")] schema_change: &str,
         #[values(true, false)] replace: bool,
-        #[values(true, false)] merge_commits_first: bool,
+        #[values(true, false)] schema_change_commits_first: bool,
     ) {
-        let dataset = Arc::new(test_dataset(5, 1).await);
+        let dataset = Arc::new(test_dataset(4, 2).await);
         let read_version = dataset.manifest.version;
 
-        let mut merged_schema = dataset.schema().clone();
-        merged_schema
+        let mut schema = dataset.schema().clone();
+        schema
             .metadata
-            .insert("merge.schema".to_string(), "coordinated".to_string());
-        let field_id = merged_schema.fields[0].id;
-        merged_schema.fields[0]
+            .insert("schema.key".to_string(), "coordinated".to_string());
+        let field_id = schema.fields[0].id;
+        schema.fields[0]
             .metadata
-            .insert("merge.field".to_string(), "coordinated".to_string());
-        let merge = Transaction::new_from_version(
-            read_version,
-            Operation::Merge {
+            .insert("field.key".to_string(), "coordinated".to_string());
+        let operation = match schema_change {
+            "merge" => Operation::Merge {
                 fragments: dataset.manifest.fragments.as_ref().clone(),
-                schema: merged_schema,
+                schema,
                 preserves_nullability: true,
             },
-        );
+            "drop" | "rename" => {
+                if schema_change == "drop" {
+                    schema.fields.truncate(1);
+                } else {
+                    schema.fields[1].name = "renamed_b".to_string();
+                }
+                Operation::Project {
+                    schema,
+                    preserves_nullability: true,
+                }
+            }
+            _ => unreachable!(),
+        };
+        let schema_transaction = Transaction::new_from_version(read_version, operation);
 
         let metadata_update = UpdateMap {
             update_entries: vec![("replacement", Some("coordinated")).into()],
@@ -3824,10 +3910,10 @@ mod tests {
             },
         );
 
-        let (first, stale) = if merge_commits_first {
-            (merge, update_config)
+        let (first, stale) = if schema_change_commits_first {
+            (schema_transaction, update_config)
         } else {
-            (update_config, merge)
+            (update_config, schema_transaction)
         };
         CommitBuilder::new(dataset.clone())
             .execute(first)
@@ -3839,6 +3925,7 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, Error::RetryableCommitConflict { .. }));
+        assert!(error.to_string().contains("Please retry"), "{error}");
     }
 
     #[tokio::test]
@@ -4017,6 +4104,7 @@ mod tests {
             dataset.manifest.version,
             &current_deletions,
             dataset.object_store.as_ref(),
+            0,
         )
         .await
         .unwrap();
@@ -5289,22 +5377,49 @@ mod tests {
         }
     }
 
-    /// An append is the one value-write that rebases across a committed merge,
-    /// so a merge introducing a required field must claim: the append's
-    /// fragments omit the new column and its rows would read as null. A merge
-    /// without the claim keeps the long-standing behavior of appends passing
-    /// over nullable column adds. The reverse order conflicts regardless of
-    /// the claim, because a rebasing merge rewrites the whole fragment list.
-    #[test]
-    fn test_merge_claim_blocks_stale_append() {
+    /// Appends can cross merges only if their written fields survive and no
+    /// nullability claim is invalidated. A projection can drop written fields,
+    /// since it writes no replacement data. A merge in the reverse order always
+    /// conflicts because it replaces the fragment list.
+    #[rstest::rstest]
+    #[case::surviving_fields(vec![0, 1, 2], false)]
+    #[case::removed_field(vec![0, 3], true)]
+    #[case::removed_nested_field(vec![0, 1, 3], true)]
+    #[case::unwritten_field(vec![0], false)]
+    #[case::reserved_ids(vec![0, -2, -3, -4, -5], false)]
+    fn test_schema_change_blocks_stale_append(
+        #[case] written_fields: Vec<i32>,
+        #[case] field_removed: bool,
+        #[values(false, true)] project: bool,
+    ) {
         for claims in [true, false] {
-            let merge = Operation::Merge {
-                fragments: vec![Fragment::new(0)],
-                schema: lance_core::datatypes::Schema::default(),
-                preserves_nullability: !claims,
+            let schema = (&Schema::new(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new_struct("s", vec![Field::new("x", DataType::Int64, true)], true),
+            ]))
+                .try_into()
+                .unwrap();
+            let schema_change = if project {
+                Operation::Project {
+                    schema,
+                    preserves_nullability: !claims,
+                }
+            } else {
+                Operation::Merge {
+                    fragments: vec![Fragment::new(0)],
+                    schema,
+                    preserves_nullability: !claims,
+                }
             };
             let append = Operation::Append {
-                fragments: vec![Fragment::new(1)],
+                fragments: vec![Fragment {
+                    files: vec![DataFile::new_legacy_from_fields(
+                        "append.lance",
+                        written_fields.clone(),
+                        None,
+                    )],
+                    ..Fragment::new(1)
+                }],
             };
 
             let mut append_rebase = TransactionRebase {
@@ -5323,15 +5438,16 @@ mod tests {
                 reuse: Default::default(),
                 staged_replay: false,
             };
-            let result = append_rebase.check_txn(&Transaction::new(0, merge.clone(), None), 1);
+            let result =
+                append_rebase.check_txn(&Transaction::new(0, schema_change.clone(), None), 1);
             assert_eq!(
                 matches!(result, Err(Error::RetryableCommitConflict { .. })),
-                claims,
-                "append rebasing over merge/claims={claims}: got {result:?}"
+                claims || (!project && field_removed),
+                "append rebasing over {schema_change}/claims={claims}: got {result:?}"
             );
 
-            let mut merge_rebase = TransactionRebase {
-                transaction: Transaction::new(0, merge, None),
+            let mut schema_rebase = TransactionRebase {
+                transaction: Transaction::new(0, schema_change.clone(), None),
                 initial_fragments: HashMap::new(),
                 modified_fragment_ids: HashSet::from_iter([0]),
                 affected_rows: None,
@@ -5346,10 +5462,11 @@ mod tests {
                 reuse: Default::default(),
                 staged_replay: false,
             };
-            let result = merge_rebase.check_txn(&Transaction::new(0, append, None), 1);
-            assert!(
+            let result = schema_rebase.check_txn(&Transaction::new(0, append, None), 1);
+            assert_eq!(
                 matches!(result, Err(Error::RetryableCommitConflict { .. })),
-                "merge rebasing over append/claims={claims}: got {result:?}"
+                claims || !project,
+                "{schema_change} rebasing over append/claims={claims}: got {result:?}"
             );
         }
     }
@@ -5703,6 +5820,8 @@ mod tests {
     enum CoveringConflictSite {
         /// The index, on a tagged table, over an `alter_columns` cast.
         IndexOverCast,
+        IndexOverUntaggedCast,
+        IndexOverProjection,
         IndexOverDataReplacement,
         DataReplacementOverIndex,
         IndexOverFoldedOverlay,
@@ -5745,7 +5864,7 @@ mod tests {
                 )],
             };
             let (mut rebase, theirs) = match self {
-                Self::IndexOverCast => {
+                Self::IndexOverCast | Self::IndexOverUntaggedCast | Self::IndexOverProjection => {
                     let mut rebase = rebase_of(create_index);
                     let history = IndexMetadata {
                         uuid: Uuid::new_v4(),
@@ -5762,19 +5881,29 @@ mod tests {
                         clustering_id: None,
                         metadata: Default::default(),
                     };
-                    rebase.current_lineage = Some(TaggedLineage::new(&history, None));
+                    if matches!(self, Self::IndexOverCast) {
+                        rebase.current_lineage = Some(TaggedLineage::new(&history, None));
+                    }
                     rebase.read_schema = Some(schema.clone());
                     let kept: Vec<i32> = [KEYED, CARRIED, UNRELATED]
                         .into_iter()
                         .filter(|field| *field != changed)
                         .collect();
-                    // A cast moves the column to a new field id.
-                    let cast = Operation::Merge {
-                        fragments: vec![],
-                        schema: schema.project_by_ids(&kept, true),
-                        preserves_nullability: true,
+                    // A cast moves the column to a new field id; a projection drops it.
+                    let schema = schema.project_by_ids(&kept, true);
+                    let change = if matches!(self, Self::IndexOverProjection) {
+                        Operation::Project {
+                            schema,
+                            preserves_nullability: true,
+                        }
+                    } else {
+                        Operation::Merge {
+                            fragments: vec![],
+                            schema,
+                            preserves_nullability: true,
+                        }
                     };
-                    (rebase, cast)
+                    (rebase, change)
                 }
                 Self::IndexOverDataReplacement => (rebase_of(create_index), replacement),
                 Self::DataReplacementOverIndex => (rebase_of(replacement), create_index),
@@ -5829,6 +5958,8 @@ mod tests {
     /// repeats the carried column; a change to another column does not.
     #[rstest::rstest]
     #[case::index_over_cast(CoveringConflictSite::IndexOverCast)]
+    #[case::index_over_untagged_cast(CoveringConflictSite::IndexOverUntaggedCast)]
+    #[case::index_over_projection(CoveringConflictSite::IndexOverProjection)]
     #[case::index_over_data_replacement(CoveringConflictSite::IndexOverDataReplacement)]
     #[case::data_replacement_over_index(CoveringConflictSite::DataReplacementOverIndex)]
     #[case::index_over_folded_overlay(CoveringConflictSite::IndexOverFoldedOverlay)]
@@ -7712,7 +7843,9 @@ mod tests {
         }
 
         async fn fri_ledger(dataset: &Dataset) -> (IndexMetadata, FragReuseLedger) {
-            let stored = crate::index::load_all_indices(dataset).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(dataset)
+                .await
+                .unwrap();
             let entry = stored
                 .iter()
                 .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
@@ -8283,7 +8416,9 @@ mod tests {
 
             // Writer A trims the oldest legacy version, as v0 cleanup does.
             let mut writer_a = dataset.clone();
-            let stored = crate::index::load_all_indices(&writer_a).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&writer_a)
+                .await
+                .unwrap();
             let old_entry = stored
                 .iter()
                 .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
@@ -8366,7 +8501,9 @@ mod tests {
             .await
             .unwrap();
 
-            let stored = crate::index::load_all_indices(&committed).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&committed)
+                .await
+                .unwrap();
             let scalar = stored.iter().find(|idx| idx.name == "i_idx").unwrap();
             assert_eq!(
                 scalar.fragment_bitmap.as_ref().unwrap(),
@@ -8770,7 +8907,9 @@ mod tests {
             assert_eq!(filtered("i = 1").await, vec![1]);
             assert_eq!(filtered("i = 9").await, vec![9]);
             assert_eq!(filtered("i >= 14").await, vec![14, 15]);
-            let stored = crate::index::load_all_indices(&verify).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&verify)
+                .await
+                .unwrap();
             let scalar = stored.iter().find(|idx| idx.name == "i_idx").unwrap();
             assert_eq!(
                 scalar.fragment_bitmap.as_ref().unwrap(),
@@ -8891,7 +9030,9 @@ mod tests {
             )
             .await
             .unwrap();
-            let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&dataset)
+                .await
+                .unwrap();
             let entry = stored
                 .iter()
                 .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
@@ -8908,7 +9049,9 @@ mod tests {
         /// `i_idx` is as it was and still agrees with the scan.
         async fn assert_mixed_rewrite_refused(mut dataset: Dataset) {
             let version = dataset.manifest.version;
-            let stored_before = crate::index::load_all_indices(&dataset).await.unwrap();
+            let stored_before = crate::index::loading::load_all_indices(&dataset)
+                .await
+                .unwrap();
             assert_eq!(
                 i_idx(&stored_before).fragment_bitmap.as_ref().unwrap(),
                 &RoaringBitmap::from_iter([0u32, 1, 2, 3])
@@ -8925,7 +9068,9 @@ mod tests {
                 dataset.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
                 vec![0, 1, 2, 3]
             );
-            let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&dataset)
+                .await
+                .unwrap();
             assert_eq!(stored.len(), stored_before.len());
             assert_eq!(i_idx(&stored).uuid, i_idx(&stored_before).uuid);
             assert_eq!(
@@ -8944,7 +9089,9 @@ mod tests {
         /// destinations are scanned.
         async fn assert_mixed_rewrite_lands(dataset: Dataset) {
             let version = dataset.manifest.version;
-            let stored_before = crate::index::load_all_indices(&dataset).await.unwrap();
+            let stored_before = crate::index::loading::load_all_indices(&dataset)
+                .await
+                .unwrap();
             assert_eq!(
                 i_idx(&stored_before).fragment_bitmap.as_ref().unwrap(),
                 &RoaringBitmap::from_iter([0u32, 1])
@@ -8962,7 +9109,9 @@ mod tests {
             );
             let (_, ledger) = fri_ledger(&committed).await;
             assert_eq!(ledger.transitions().len(), 1);
-            let stored = crate::index::load_all_indices(&committed).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&committed)
+                .await
+                .unwrap();
             assert_eq!(stored.len(), stored_before.len() + 1, "the entry was added");
             assert_eq!(i_idx(&stored).uuid, i_idx(&stored_before).uuid);
             assert_eq!(
@@ -9046,7 +9195,9 @@ mod tests {
             let version = writer_a.manifest.version;
             let operation = mixed_rewrite(&writer_a).await;
             let writer_b = concurrent_index(&writer_a, vec![2, 3]).await;
-            let stored_b = crate::index::load_all_indices(&writer_b).await.unwrap();
+            let stored_b = crate::index::loading::load_all_indices(&writer_b)
+                .await
+                .unwrap();
             assert_eq!(
                 late_idx(&stored_b).fragment_bitmap.as_ref().unwrap(),
                 &RoaringBitmap::from_iter([2u32, 3])
@@ -9070,7 +9221,9 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![0, 1, 2, 3]
             );
-            let stored = crate::index::load_all_indices(&writer_a).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&writer_a)
+                .await
+                .unwrap();
             assert_eq!(stored.len(), stored_b.len());
             assert_eq!(late_idx(&stored).uuid, late_idx(&stored_b).uuid);
             assert_eq!(
@@ -9098,7 +9251,9 @@ mod tests {
             let version = writer_a.manifest.version;
             let operation = mixed_rewrite(&writer_a).await;
             let writer_b = concurrent_index(&writer_a, vec![0, 1]).await;
-            let stored_b = crate::index::load_all_indices(&writer_b).await.unwrap();
+            let stored_b = crate::index::loading::load_all_indices(&writer_b)
+                .await
+                .unwrap();
 
             let committed = commit_sp(&writer_a, version, operation).await.unwrap();
             assert_eq!(committed.manifest.version, writer_b.manifest.version + 1);
@@ -9112,7 +9267,9 @@ mod tests {
             );
             let (_, ledger) = fri_ledger(&committed).await;
             assert_eq!(ledger.transitions().len(), 1);
-            let stored = crate::index::load_all_indices(&committed).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&committed)
+                .await
+                .unwrap();
             assert_eq!(stored.len(), stored_b.len() + 1, "the entry was added");
             for (name, pick) in [
                 (
@@ -9431,7 +9588,9 @@ mod tests {
                 unreachable!()
             };
             mapping.map_id = Uuid::new_v4().to_string();
-            let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+            let stored = crate::index::loading::load_all_indices(&dataset)
+                .await
+                .unwrap();
             let indices: Vec<IndexMetadata> = stored
                 .iter()
                 .map(|idx| {

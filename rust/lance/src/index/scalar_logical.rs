@@ -29,7 +29,7 @@ use serde_json::json;
 use crate::dataset::Dataset;
 use crate::index::scalar::fetch_index_details;
 use crate::index::segment_coverage::{SegmentCoverage, SegmentRowDomain};
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
 
 /// Query-time view that exposes several physical scalar index segments as a single [`ScalarIndex`].
 ///

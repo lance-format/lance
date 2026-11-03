@@ -179,7 +179,7 @@ async fn has_usable_vector_index(
     let column_id = dataset.schema().field_id(column)?;
     Ok(dataset.load_indices().await?.iter().any(|index| {
         index.fields.first() == Some(&column_id)
-            && crate::index::index_type_is_known(index)
+            && crate::index::segment::index_type_is_known(index)
             && crate::index::vector::details::metric_type_from_index_metadata(index)
                 .is_none_or(|metric| metric == distance_type)
     }))
@@ -1174,8 +1174,9 @@ mod tests {
     /// whatever the caller asked for.
     #[tokio::test]
     async fn with_ef_reaches_the_memtable_arm() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
         let schema = create_vector_schema();
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1273,8 +1274,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_vector_search_base_plus_active_returns_distance() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
 
@@ -1390,8 +1392,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_vector_search_active_tombstone_masks_base_hit() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use crate::index::DatasetIndexExt;
         use crate::index::vector::VectorIndexParams;
         use datafusion::prelude::SessionContext;
@@ -1469,8 +1472,9 @@ mod tests {
     /// brute-force arm, which masks rows before the top-k cut.
     #[tokio::test]
     async fn test_vector_search_prefilter_restricts_to_matching_rows() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::{SessionContext, col, lit};
         use futures::TryStreamExt;
 
@@ -1577,8 +1581,9 @@ mod tests {
     /// that routing guard.
     #[tokio::test]
     async fn test_vector_search_distance_range_bounds_the_search() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
 
@@ -1676,8 +1681,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_vector_search_filtered_active_without_pk_keeps_all_matching_rows() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::{SessionContext, col, lit};
         use futures::TryStreamExt;
 
@@ -1911,8 +1917,9 @@ mod tests {
     /// is evaluated against the newest version of each PK.
     #[tokio::test]
     async fn test_vector_search_prefilter_excludes_pk_whose_newest_version_fails() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use arrow_array::StringArray;
         use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
         use arrow_schema::{DataType, Field};
@@ -2038,8 +2045,9 @@ mod tests {
     /// newer active copy is `archived`; pk=5 must be absent from the result.
     #[tokio::test]
     async fn test_vector_search_prefilter_blocks_base_when_active_newest_fails() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use crate::index::DatasetIndexExt;
         use crate::index::vector::VectorIndexParams;
         use arrow_array::StringArray;
@@ -2177,8 +2185,9 @@ mod tests {
         // delete/update phantom: the cluster constantly freezes memtables
         // (flush_interval ~250ms), so an insert and its later delete/update split
         // across in-memory generations.
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
 
@@ -2291,8 +2300,9 @@ mod tests {
         // Regression for: active arm previously did NOT call `build_projection_for_knn`,
         // so when the caller passed `projection=Some([...])`, the active arm's output
         // dropped the PK column (and the staleness/dedup pipeline lost its hash input).
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
 
@@ -2371,8 +2381,9 @@ mod tests {
         // Regression: `_distance` / `_rowid` in projection must not break
         // the plan. `_distance` honored at requested position (no
         // duplication); `_rowid` honored as nullable.
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
 
@@ -2485,8 +2496,9 @@ mod tests {
         // (2) Active-memtable rows must reach the output — the UnionExec puts
         //     them in non-zero partitions, and any downstream node that only
         //     reads partition 0 would silently drop them.
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
 
@@ -2618,9 +2630,10 @@ mod tests {
         // under {base_uri}/_mem_wal/{shard}/gen_1 and pointing the
         // collector at it. Real flush would reverse-write, but for this
         // test we only have one row in the SSTable gen so order is moot.
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
 
@@ -2721,9 +2734,10 @@ mod tests {
         //   2. SSTable arm runs without erroring
         //   3. `_rowaddr` symmetry with `_rowid` (same code path, both are
         //      surfaced when requested and NULL'd outside the base arm)
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use crate::index::DatasetIndexExt;
         use crate::index::vector::VectorIndexParams;
         use datafusion::prelude::SessionContext;
@@ -3014,8 +3028,9 @@ mod tests {
         // Regression: same PK inserted twice into one active memtable with
         // *different* vectors. The exact active search must consider only the
         // newest version of each PK before top-k. The newer insert must win.
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
 
@@ -3131,8 +3146,9 @@ mod tests {
         // (distance ~0), then updated to a FAR vector. Exact brute force must
         // compute newest-per-PK over the whole memtable before top-k, so the
         // stale near row is dropped even though the fresh row is far away.
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
 
@@ -3242,8 +3258,9 @@ mod tests {
         //     to the query than fresh pk=1. With k=1 the active arm surfaces
         //     pk=2 and drops fresh pk=1, so without the block-list the stale
         //     base copy of pk=1 wins top-1.
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use crate::index::DatasetIndexExt;
         use crate::index::vector::VectorIndexParams;
         use datafusion::prelude::SessionContext;
@@ -3450,8 +3467,9 @@ mod tests {
     async fn test_vector_search_overfetch_backfills_when_top_k_all_stale() {
         // A source whose entire top-k is stale must still yield k live results
         // from its next-nearest rows: the over-fetch backfills the dropped rows.
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use crate::index::DatasetIndexExt;
         use crate::index::vector::VectorIndexParams;
         use datafusion::prelude::SessionContext;
@@ -3553,9 +3571,10 @@ mod tests {
     /// reports it exactly; both must land on the requested scale.
     #[tokio::test]
     async fn test_vector_search_cosine_arms_share_one_scale() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
         use lance_linalg::distance::DistanceType;
@@ -3961,8 +3980,9 @@ mod tests {
     async fn test_vector_search_stale_read_with_composite_pk() {
         // The block-list must key on the full composite PK: a base row updated in
         // the active memtable (matched on (id1,id2)) must be suppressed.
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use crate::index::DatasetIndexExt;
         use crate::index::vector::VectorIndexParams;
         use datafusion::prelude::SessionContext;
@@ -4074,8 +4094,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_vector_search_prefilter_excludes_composite_pk_newest_version() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use arrow_array::StringArray;
         use arrow_array::builder::Float32Builder;
         use datafusion::prelude::{SessionContext, col, lit};
@@ -4205,8 +4226,9 @@ mod tests {
         // the newer far copy and exclude the stale near one — unlike
         // `test_vector_search_dedup_within_active_memtable`, which keeps the newer
         // copy only because it is also the closer one (a weaker check).
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use datafusion::prelude::SessionContext;
         use futures::TryStreamExt;
 
@@ -4303,10 +4325,11 @@ mod tests {
     /// being planned must not be returned alongside the older copy it replaces.
     #[tokio::test]
     async fn test_vector_search_write_during_planning_returns_key_once() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
         use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
         use crate::dataset::mem_wal::scanner::sstable_cache::RunOnOpen;
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use crate::index::DatasetIndexExt;
         use crate::index::vector::VectorIndexParams;
         use datafusion::prelude::SessionContext;
