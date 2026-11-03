@@ -217,10 +217,11 @@ impl LegacyHistory {
             .as_ref()
             .map(|bitmap| bitmap & context.live_fragments)
             .unwrap_or_default();
-        let is_direct =
-            segment.fragment_bitmap.as_ref().is_some_and(|bitmap| {
-                !bitmap.is_empty() && bitmap.is_subset(context.live_fragments)
-            }) && self.is_caught_up(context.entry_version, segment);
+        let is_direct = segment
+            .fragment_bitmap
+            .as_ref()
+            .is_some_and(|bitmap| !bitmap.is_empty())
+            && self.is_caught_up(context.entry_version, segment);
         if is_direct {
             ReadPlan::Direct
         } else {

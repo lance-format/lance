@@ -37,17 +37,11 @@ impl TaggedHistory {
 }
 
 impl TaggedHistory {
-    /// Whether the segment's stored addresses are usable as they are: every
-    /// fragment it covers is live and it is caught up with the history.
-    /// Dead fragments may belong to an omitted unknown mapping; those must
-    /// not get an identity read merely because they are absent from the
-    /// graph.
+    /// Whether the segment's stored addresses are usable as they are. A
+    /// fragment the segment covers that is no longer live needs no
+    /// translation either: the reader serves only its live coverage.
     fn is_direct(&self, context: &ReadContext, segment: &SegmentSummary) -> bool {
-        segment
-            .fragment_bitmap
-            .as_ref()
-            .is_some_and(|bitmap| bitmap.is_subset(context.live_fragments))
-            && self.is_caught_up(context.entry_version, segment)
+        self.is_caught_up(context.entry_version, segment)
     }
 }
 
@@ -148,18 +142,39 @@ impl FriImpl for TaggedHistory {
         ))
     }
 
-    /// A projected bitmap can name only destinations while the files still
-    /// hold source addresses, so a segment is caught up only when it covers
-    /// no fragment of the lineage. A dropped unknown transition leaves no
-    /// record of which fragments it touched, so no segment can be proven
-    /// untouched by it.
-    fn is_caught_up(&self, _entry_version: u64, segment: &SegmentSummary) -> bool {
+    /// The legacy rule, per transition: a segment is caught up with a
+    /// transition it covers no fragment of, or one it was built after
+    /// without covering any of its sources.
+    ///
+    /// Covering only destinations does not prove the segment was built after
+    /// the rewrite: a bitmap a legacy reader projected onto the destinations
+    /// still describes files holding source addresses. Its stamp does: such
+    /// a segment was built before the rewrite committed, and a transition is
+    /// stamped no earlier than the version the rewrite committed on top of
+    /// (its legacy version once lifted, otherwise the entry's version, which
+    /// every later write of the entry only raises). The comparison is strict:
+    /// a segment stamped at that version still read the sources.
+    ///
+    /// A dropped unknown transition leaves no record of which fragments it
+    /// touched, so no segment can be proven caught up with it.
+    fn is_caught_up(&self, entry_version: u64, segment: &SegmentSummary) -> bool {
         let ledger = &self.0.ledger;
+        let Some(bitmap) = &segment.fragment_bitmap else {
+            return false;
+        };
+        let covers = |digests: &[pb::FragmentDigest]| {
+            digests
+                .iter()
+                .any(|digest| bitmap.contains(digest.id as u32))
+        };
         !ledger.has_unsupported_transitions()
-            && segment.fragment_bitmap.as_ref().is_some_and(|bitmap| {
-                bitmap
-                    .iter()
-                    .all(|fragment| !ledger.contains_fragment(fragment))
+            && ledger.transitions().iter().all(|transition| {
+                let covers_sources = covers(transition.sources());
+                if !covers_sources && !covers(transition.destinations()) {
+                    return true;
+                }
+                let recorded_at = transition.legacy_dataset_version().unwrap_or(entry_version);
+                !covers_sources && segment.dataset_version > recorded_at
             })
     }
 
