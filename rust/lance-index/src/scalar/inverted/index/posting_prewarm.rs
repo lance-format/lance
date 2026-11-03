@@ -3,6 +3,11 @@
 
 use super::*;
 
+struct PackedPostingChunk {
+    groups: Vec<(u32, u32, PostingListGroup)>,
+    positions: Vec<(u32, Positions)>,
+}
+
 impl PostingListReader {
     pub(super) async fn prewarm_residency_status(
         &self,
@@ -149,6 +154,99 @@ impl PostingListReader {
         Ok(())
     }
 
+    async fn prewarm_byte_groups(
+        &self,
+        max_bytes: usize,
+        with_position: bool,
+        chunk_tokens_override: Option<usize>,
+        chunk_concurrency: usize,
+    ) -> Result<usize> {
+        let token_count = self.len();
+        let chunk_tokens = chunk_tokens_override
+            .unwrap_or_else(|| {
+                posting_read_chunk_tokens(token_count, self.posting_data_size_bytes())
+            })
+            .max(1);
+        let ranges = prewarm_chunk_ranges(&PostingGrouping::None, token_count, chunk_tokens);
+        let chunk_count = ranges.len();
+        let concurrency = chunk_concurrency.max(1);
+        let planner = Arc::new(std::sync::Mutex::new(ByteGroupPlanner::new(max_bytes)));
+        let reads = stream::iter(ranges)
+            .map(|(start, end)| async move {
+                self.read_chunk_batch(start, end, with_position)
+                    .await
+                    .map(|batch| (batch, end == token_count))
+            })
+            .buffered(concurrency);
+        // Planning is ordered, but packing runs concurrently. The unfinished
+        // tail owns compact buffers rather than pinning the previous read chunk.
+        let prepared = reads.then(move |result| {
+            let planner = planner.clone();
+            async move {
+                let (batch, last) = result?;
+                // A tail can include large positions. The sequential `then`
+                // transfers the planner between blocking workers without
+                // copying those buffers on the async executor.
+                spawn_blocking(move || {
+                    let mut planner = planner.lock().map_err(|error| {
+                        Error::internal(format!("posting group planner lock poisoned: {error}"))
+                    })?;
+                    planner.push(batch, last)
+                })
+                .await
+                .map_err(|error| {
+                    Error::internal(format!(
+                        "failed to plan byte-bounded posting groups: {error}"
+                    ))
+                })?
+            }
+        });
+        let published = prepared
+            .map(|result| async move {
+                let chunk = self.build_packed_groups(result?, with_position).await?;
+                // Keep publication inside the buffered future: a spill waiting for
+                // backpressure must not stop polling other chunks' reads and builds.
+                for (token_id, positions) in chunk.positions {
+                    self.index_cache
+                        .insert_with_key(&PositionKey { token_id }, Arc::new(positions))
+                        .await;
+                }
+                let mut ends = Vec::with_capacity(chunk.groups.len());
+                for (start, end, group) in chunk.groups {
+                    self.index_cache
+                        .insert_with_key(
+                            &posting_list_group_cache_key(start, end, self.has_impacts),
+                            Arc::new(group),
+                        )
+                        .await;
+                    ends.push(end);
+                }
+                Result::Ok(ends)
+            })
+            .buffered(concurrency);
+        futures::pin_mut!(published);
+        let mut ends = Vec::new();
+        while let Some(chunk_ends) = published.try_next().await? {
+            ends.extend(chunk_ends);
+        }
+        if !ends.is_empty() {
+            let bounds = Arc::new(PostingGroupBoundaries { ends });
+            // Publish only a complete directory. A missing/evicted group is a
+            // normal cache miss; a missing directory retains the cold-read policy.
+            self.index_cache
+                .insert_with_key(
+                    &PostingGroupBoundariesKey {
+                        max_bytes,
+                        token_count,
+                    },
+                    bounds.clone(),
+                )
+                .await;
+            self.grouping.publish(bounds);
+        }
+        Ok(chunk_count)
+    }
+
     /// Stream the partition's posting lists into the cache in bounded token-row chunks
     /// (read -> build -> insert -> drop), so peak resident set is ~one chunk. Returns
     /// the chunk count (tests assert it split). `chunk_tokens_override` is test-only.
@@ -167,12 +265,24 @@ impl PostingListReader {
         // Make max_scores/lengths available for query-local packed views. The
         // materialized fallback also clones them into its blocking build task.
         self.ensure_metadata_loaded().await?;
+        if let PostingGrouping::Bytes { max_bytes, .. } = self.grouping {
+            return self
+                .prewarm_byte_groups(
+                    max_bytes,
+                    with_position,
+                    chunk_tokens_override,
+                    chunk_concurrency,
+                )
+                .await;
+        }
 
         // With grouping the cache stores one entry per group, so a group's
         // posting lists must all be resident at once: align chunk boundaries to
         // whole groups. Without grouping, chunks are plain token ranges.
         let grouping = self.grouping.clone();
-        let use_packed_groups = grouping.is_grouped() && !with_position;
+        let use_packed_groups = grouping.is_grouped()
+            && (!with_position
+                || matches!(self.positions_layout, PositionsLayout::SharedStream(_)));
         // Packed groups reuse the reader's bulk metadata at query time, so they
         // do not need the temporary full-partition metadata clones used by the
         // materialized fallback.
@@ -193,10 +303,23 @@ impl PostingListReader {
                 let grouping = &grouping;
                 async move {
                     if use_packed_groups {
-                        let groups = self
-                            .build_packed_chunk_groups(tok_start, tok_end, token_count, grouping)
+                        let chunk = self
+                            .build_packed_chunk(
+                                tok_start,
+                                tok_end,
+                                token_count,
+                                grouping,
+                                with_position,
+                            )
                             .await?;
-                        for (start, end, group) in groups {
+                        // Keep per-term keys so persisted positions remain independently
+                        // readable after their posting group leaves memory.
+                        for (token_id, positions) in chunk.positions {
+                            self.index_cache
+                                .insert_with_key(&PositionKey { token_id }, Arc::new(positions))
+                                .await;
+                        }
+                        for (start, end, group) in chunk.groups {
                             self.index_cache
                                 .insert_with_key(
                                     &posting_list_group_cache_key(start, end, self.has_impacts),
@@ -353,46 +476,96 @@ impl PostingListReader {
     /// Build compact v2 groups directly from one posting-row chunk. Each group
     /// slice is deep-copied once, so it owns only its Arrow buffers without
     /// materializing a `Vec<PostingList>` or retaining the full chunk.
-    async fn build_packed_chunk_groups(
+    async fn build_packed_chunk(
         &self,
         tok_start: usize,
         tok_end: usize,
         token_count: usize,
         grouping: &PostingGrouping,
-    ) -> Result<Vec<(u32, u32, PostingListGroup)>> {
+        with_position: bool,
+    ) -> Result<PackedPostingChunk> {
         debug_assert!(grouping.is_grouped());
         debug_assert!(!self.is_legacy_layout());
 
-        let chunk_batch = self.read_chunk_batch(tok_start, tok_end, false).await?;
-        let ranges = grouping.ranges_for_chunk(tok_start, tok_end, token_count);
+        let chunk_batch = self
+            .read_chunk_batch(tok_start, tok_end, with_position)
+            .await?;
+        let groups = grouping
+            .ranges_for_chunk(tok_start, tok_end, token_count)
+            .into_iter()
+            .map(|(start, end)| {
+                (
+                    start,
+                    end,
+                    chunk_batch.slice(start as usize - tok_start, (end - start) as usize),
+                )
+            })
+            .collect();
+        self.build_packed_groups(groups, with_position).await
+    }
+
+    async fn build_packed_groups(
+        &self,
+        batches: Vec<PostingGroupBatch>,
+        with_position: bool,
+    ) -> Result<PackedPostingChunk> {
+        let position_codec = match (with_position, self.positions_layout) {
+            (true, PositionsLayout::SharedStream(codec)) => Some(codec),
+            _ => None,
+        };
         let posting_tail_codec = self.posting_tail_codec;
         let block_size = self.block_size;
         let num_docs = self.modern_num_docs;
-        let (chunk_max_scores, chunk_lengths) = match &self.metadata {
-            PostingMetadata::V2 { metadata } => {
-                let loaded = metadata.get().ok_or_else(|| {
-                    Error::internal("packed prewarm requires loaded posting metadata".to_owned())
-                })?;
-                (
-                    loaded.max_scores[tok_start..tok_end].to_vec(),
-                    loaded.lengths[tok_start..tok_end].to_vec(),
-                )
-            }
-            PostingMetadata::LegacyV1 { .. } => {
-                return Err(Error::internal(
-                    "packed prewarm is not supported for legacy posting metadata".to_owned(),
-                ));
-            }
+        let PostingMetadata::V2 { metadata } = &self.metadata else {
+            return Err(Error::internal(
+                "packed prewarm requires modern posting metadata",
+            ));
         };
-
-        let groups = spawn_blocking(move || {
-            let mut groups = Vec::with_capacity(ranges.len());
-            for (start, end) in ranges {
-                let start_usize = start as usize;
-                let end_usize = end as usize;
-                let local_start = start_usize - tok_start;
-                let group_len = end_usize - start_usize;
-                let group_batch = chunk_batch.slice(local_start, group_len).shrink_to_fit()?;
+        let metadata = metadata.clone();
+        let chunk = spawn_blocking(move || {
+            let loaded = metadata.get().ok_or_else(|| Error::internal(
+                "packed prewarm requires loaded posting metadata"
+            ))?;
+            let mut groups = Vec::with_capacity(batches.len());
+            let mut positions = Vec::new();
+            for (start, end, batch) in batches {
+                let group_len = (end - start) as usize;
+                let mut group_batch = batch.shrink_to_fit()?;
+                if position_codec.is_some() {
+                    // Position prewarm keeps metadata inline for hits after reopen.
+                    group_batch = group_batch.try_with_column(
+                        Field::new(MAX_SCORE_COL, DataType::Float32, false),
+                        Arc::new(Float32Array::from(loaded.max_scores[start as usize..end as usize].to_vec())),
+                    )?.try_with_column(
+                        Field::new(LENGTH_COL, DataType::UInt32, false),
+                        Arc::new(UInt32Array::from(loaded.lengths[start as usize..end as usize].to_vec())),
+                    )?;
+                }
+                let group_batch = if let Some(codec) = position_codec {
+                    let payload = group_batch.column_by_name(COMPRESSED_POSITION_COL)
+                        .and_then(|column| column.as_binary_opt::<i64>())
+                        .ok_or_else(|| Error::index("compressed position column must be LargeBinary"))?;
+                    let offsets = group_batch.column_by_name(POSITION_BLOCK_OFFSET_COL)
+                        .and_then(|column| column.as_list_opt::<i32>())
+                        .ok_or_else(|| Error::index("position block offsets must be List<UInt32>"))?;
+                    let values = offsets.values().as_primitive_opt::<UInt32Type>()
+                        .ok_or_else(|| Error::index("position block offsets must contain UInt32 values"))?;
+                    for slot in 0..group_len {
+                        let start_offset = offsets.value_offsets()[slot] as usize;
+                        let end_offset = offsets.value_offsets()[slot + 1] as usize;
+                        positions.push((start + slot as u32, Positions(
+                            CompressedPositionStorage::SharedStream(SharedPositionStream::new(
+                                codec,
+                                values.values()[start_offset..end_offset].to_vec(),
+                                bytes::Bytes::copy_from_slice(payload.value(slot)),
+                            )),
+                        )));
+                    }
+                    let schema = group_batch.schema_ref();
+                    let position_columns = [schema.index_of(COMPRESSED_POSITION_COL)?, schema.index_of(POSITION_BLOCK_OFFSET_COL)?];
+                    let posting_columns = (0..group_batch.num_columns()).filter(|column| !position_columns.contains(column)).collect::<Vec<_>>();
+                    group_batch.project(&posting_columns)?
+                } else { group_batch };
                 let group = PostingListGroup::new_packed_with_block_size(
                     group_batch,
                     posting_tail_codec,
@@ -400,12 +573,11 @@ impl PostingListReader {
                 )?;
                 if let Some(num_docs) = num_docs {
                     for token_id in start..end {
-                        let chunk_slot = token_id as usize - tok_start;
                         let posting = group
                             .posting_list(
                                 (token_id - start) as usize,
-                                Some(chunk_max_scores[chunk_slot]),
-                                Some(chunk_lengths[chunk_slot]),
+                                Some(loaded.max_scores[token_id as usize]),
+                                Some(loaded.lengths[token_id as usize]),
                             )?
                             .ok_or_else(|| {
                                 Error::index(format!(
@@ -417,7 +589,7 @@ impl PostingListReader {
                 }
                 groups.push((start, end, group));
             }
-            Result::Ok(groups)
+            Result::Ok(PackedPostingChunk { groups, positions })
         })
         .await
         .map_err(|err| {
@@ -425,12 +597,12 @@ impl PostingListReader {
                 "Failed to build packed prewarm posting groups in blocking task: {err}"
             ))
         })??;
-        for (start, end, _) in &groups {
+        for (start, end, _) in &chunk.groups {
             for token_id in *start..*end {
                 self.publish_modern_posting_validated(token_id).await?;
             }
         }
-        Ok(groups)
+        Ok(chunk)
     }
 
     /// Strip positions into their own per-token cache entries (the posting cache
@@ -459,7 +631,7 @@ impl PostingListReader {
                         .await;
                 }
             }
-            PostingGrouping::SyntheticFixed { .. } => {
+            PostingGrouping::SyntheticFixed { .. } | PostingGrouping::Bytes { .. } => {
                 let mut chunk_postings = Vec::with_capacity(posting_lists.len());
                 for (token_id, mut posting_list) in posting_lists {
                     self.cache_positions(&mut posting_list, token_id, with_position)

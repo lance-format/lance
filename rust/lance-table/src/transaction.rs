@@ -52,7 +52,11 @@ pub use row_version::has_writer_placed_lineage;
 pub use update_map::{
     UpdateMap, UpdateMapEntry, translate_config_updates, translate_schema_metadata_updates,
 };
-pub use validate::validate_operation;
+pub use validate::{
+    canonicalize_non_reusable_field_ids, resolve_arrow_field_ids,
+    validate_detached_non_reusable_field_ids, validate_non_reusable_field_id_transition,
+    validate_operation,
+};
 
 use crate::format::{IndexMetadata, Manifest};
 use roaring::RoaringBitmap;

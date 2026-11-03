@@ -39,6 +39,9 @@ serde = { workspace = true, features = ["derive"] }
 stop-words = { version = "0.10.0", default-features = false, features = ["iso", "nltk"] }
 unicode-normalization = "0.1.25"
 
+[dev-dependencies]
+rstest.workspace = true
+
 [features]
 jieba-rs = ["dep:jieba-rs"]
 lindera = ["dep:lindera"]

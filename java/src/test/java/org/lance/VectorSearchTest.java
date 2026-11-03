@@ -13,6 +13,10 @@
  */
 package org.lance;
 
+import org.lance.index.DistanceType;
+import org.lance.index.IndexParams;
+import org.lance.index.IndexType;
+import org.lance.index.vector.VectorIndexParams;
 import org.lance.ipc.Query;
 import org.lance.ipc.ScanOptions;
 
@@ -33,6 +37,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -159,6 +164,103 @@ public class VectorSearchTest {
 
             assertFalse(reader.loadNextBatch(), "Expected only one batch");
           }
+        }
+      }
+    }
+  }
+
+  @Test
+  void test_quantized_refine_rejects_non_rq_index() throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("test_quantized_refine_rejects_non_rq_index"))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        testVectorDataset.createIndex(dataset);
+        ScanOptions options =
+            new ScanOptions.Builder()
+                .nearest(
+                    new Query.Builder()
+                        .setColumn(TestVectorDataset.vectorColumnName)
+                        .setKey(new float[32])
+                        .setK(5)
+                        .setQuantizedRefineFactor(2)
+                        .build())
+                .build();
+
+        IOException error =
+            assertThrows(
+                IOException.class,
+                () -> {
+                  try (Scanner scanner = dataset.newScan(options);
+                      ArrowReader reader = scanner.scanBatches()) {
+                    reader.loadNextBatch();
+                  }
+                });
+        assertTrue(
+            error.getMessage().contains("requires an IVF_RQ flat index"), error.getMessage());
+      }
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void test_knn_with_distance_range(boolean createVectorIndex) throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("test_knn_with_distance_range"))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        if (createVectorIndex) {
+          IndexParams params =
+              IndexParams.builder()
+                  .setVectorIndexParams(VectorIndexParams.ivfFlat(2, DistanceType.L2))
+                  .build();
+          dataset.createIndex(
+              Arrays.asList(TestVectorDataset.vectorColumnName),
+              IndexType.VECTOR,
+              Optional.of(TestVectorDataset.indexName),
+              params,
+              true);
+        }
+
+        float[] key = new float[32];
+        for (int i = 0; i < 32; i++) {
+          key[i] = i;
+        }
+
+        ScanOptions options =
+            new ScanOptions.Builder()
+                .nearest(
+                    new Query.Builder()
+                        .setColumn(TestVectorDataset.vectorColumnName)
+                        .setKey(key)
+                        .setK(400)
+                        .setLowerBound(32768.0f)
+                        .setUpperBound(131072.0f)
+                        .setNprobes(2)
+                        .setUseIndex(createVectorIndex)
+                        .build())
+                .build();
+
+        try (Scanner scanner = dataset.newScan(options);
+            ArrowReader reader = scanner.scanBatches()) {
+          VectorSchemaRoot root = reader.getVectorSchemaRoot();
+          assertTrue(reader.loadNextBatch(), "Expected distance-range matches");
+
+          IntVector iVector = (IntVector) root.getVector("i");
+          Set<Integer> actualI = new HashSet<>();
+          for (int i = 0; i < iVector.getValueCount(); i++) {
+            actualI.add(iVector.get(i));
+          }
+          assertEquals(
+              new HashSet<>(Arrays.asList(1, 81, 161, 241, 321)),
+              actualI,
+              "Distance range should include its lower bound and exclude its upper bound");
+
+          Float4Vector distanceVector = (Float4Vector) root.getVector("_distance");
+          for (int i = 0; i < distanceVector.getValueCount(); i++) {
+            float distance = distanceVector.get(i);
+            assertTrue(distance >= 32768.0f);
+            assertTrue(distance < 131072.0f);
+          }
+          assertFalse(reader.loadNextBatch(), "Expected only one batch");
         }
       }
     }

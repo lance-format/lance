@@ -2,14 +2,15 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_array::{
-    Float32Array,
+    FixedSizeListArray, Float32Array,
     types::{Float16Type, Float32Type, Float64Type},
 };
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use lance_arrow::{ArrowFloatType, FloatArray, bfloat16::BFloat16Type};
-use lance_linalg::distance::cosine::{Cosine, cosine_distance_batch};
+use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, bfloat16::BFloat16Type};
+use lance_linalg::distance::DistanceType;
+use lance_linalg::distance::cosine::{Cosine, cosine_distance_batch_into};
 use lance_linalg::distance::cosine_u8::{cosine_u8, cosine_u8_scalar};
 use num_traits::Float;
 
@@ -55,11 +56,15 @@ where
     c.bench_function(
         format!("Cosine({}, auto-vectorized)", type_name).as_str(),
         |b| {
+            let mut distances = vec![0.0; TOTAL];
             b.iter(|| {
-                black_box(
-                    cosine_distance_batch(key.as_slice(), target.as_slice(), DIMENSION)
-                        .collect::<Vec<_>>(),
+                cosine_distance_batch_into(
+                    key.as_slice(),
+                    target.as_slice(),
+                    DIMENSION,
+                    &mut distances,
                 );
+                black_box(&mut distances);
             })
         },
     );
@@ -75,9 +80,16 @@ fn bench_distance(c: &mut Criterion) {
     let target = generate_random_array_with_seed::<Float32Type>(1024 * 1024 * 8, [42; 32]);
 
     c.bench_function("Cosine(simd,f32x8) rng seed", |b| {
+        let mut distances = vec![0.0; target.len() / 8];
         b.iter(|| {
-            black_box(cosine_distance_batch(key.values(), target.values(), 8).collect::<Vec<_>>())
+            cosine_distance_batch_into(key.values(), target.values(), 8, &mut distances);
+            black_box(&mut distances);
         })
+    });
+
+    let target = FixedSizeListArray::try_new_from_values(target, 8).unwrap();
+    c.bench_function("Cosine(f32x8, arrow) rng seed", |b| {
+        b.iter(|| black_box(DistanceType::Cosine.batch(&key, &target).unwrap()))
     });
 
     // u8 cosine benchmarks
@@ -88,10 +100,14 @@ fn bench_distance(c: &mut Criterion) {
         const DIMENSION: usize = 1024;
         const TOTAL: usize = 1024 * 1024;
         let mut rng = rand::rng();
-        let key_u8: Vec<u8> = repeat_with(|| rng.random()).take(DIMENSION).collect();
-        let target_u8: Vec<u8> = repeat_with(|| rng.random())
-            .take(TOTAL * DIMENSION)
+        // Slice 64-byte-aligned views out of padded buffers: zmm loads split cache
+        // lines on misaligned inputs, so results depended on heap placement.
+        let key_buf: Vec<u8> = repeat_with(|| rng.random()).take(DIMENSION + 63).collect();
+        let key_u8 = &key_buf[key_buf.as_ptr().align_offset(64)..][..DIMENSION];
+        let target_buf: Vec<u8> = repeat_with(|| rng.random())
+            .take(TOTAL * DIMENSION + 63)
             .collect();
+        let target_u8 = &target_buf[target_buf.as_ptr().align_offset(64)..][..TOTAL * DIMENSION];
 
         c.bench_function("Cosine(u8, scalar)", |b| {
             b.iter(|| {
@@ -100,7 +116,7 @@ fn bench_distance(c: &mut Criterion) {
                         .as_chunks::<DIMENSION>()
                         .0
                         .iter()
-                        .map(|tgt| cosine_u8_scalar(&key_u8, tgt))
+                        .map(|tgt| cosine_u8_scalar(key_u8, tgt))
                         .fold(0.0, |acc: f32, v| acc + v),
                 );
             });
@@ -113,7 +129,7 @@ fn bench_distance(c: &mut Criterion) {
                         .as_chunks::<DIMENSION>()
                         .0
                         .iter()
-                        .map(|tgt| cosine_u8(&key_u8, tgt))
+                        .map(|tgt| cosine_u8(key_u8, tgt))
                         .fold(0.0, |acc: f32, v| acc + v),
                 );
             });

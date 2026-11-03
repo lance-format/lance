@@ -58,6 +58,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -366,6 +367,7 @@ public class TransactionTest {
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         dataset.initializeMemWal(new InitializeMemWalParams().withUnsharded());
+        String dirId = dataset.memWalIndexDetails().orElseThrow().dirId();
         CompactedSsTable sstable = new CompactedSsTable(UUID.randomUUID().toString(), 7);
         try (Transaction transaction =
                 new Transaction.Builder()
@@ -373,6 +375,7 @@ public class TransactionTest {
                     .operation(
                         UpdateMemWalState.builder()
                             .compactedSstables(Collections.singletonList(sstable))
+                            .dirId(dirId)
                             .build())
                     .build();
             Dataset committed = new CommitBuilder(dataset).execute(transaction);
@@ -381,6 +384,7 @@ public class TransactionTest {
           assertEquals(
               UpdateMemWalState.builder()
                   .compactedSstables(Collections.singletonList(sstable))
+                  .dirId(dirId)
                   .build(),
               operation);
           assertEquals(1, operation.getCompactedSstables().size());
@@ -515,6 +519,7 @@ public class TransactionTest {
         assertEquals(expectedBasePath.isDatasetRoot(), readBasePath.isDatasetRoot());
 
         dataset.initializeMemWal(new InitializeMemWalParams().withUnsharded());
+        String dirId = dataset.memWalIndexDetails().orElseThrow().dirId();
         KeyExistenceFilter filter = KeyExistenceFilter.exact(new int[] {0}, new long[] {42});
         CompactedSsTable compacted = new CompactedSsTable(UUID.randomUUID().toString(), 8);
         try (Transaction update =
@@ -523,6 +528,7 @@ public class TransactionTest {
                     .operation(
                         Update.builder()
                             .compactedSstables(Collections.singletonList(compacted))
+                            .memWalDirId(dirId)
                             .insertedRowsFilter(filter)
                             .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
                             .build())
@@ -537,6 +543,7 @@ public class TransactionTest {
           CompactedSsTable readCompacted = updateOperation.getCompactedSstables().get(0);
           assertEquals(compacted.getShardId(), readCompacted.getShardId());
           assertEquals(compacted.getGeneration(), readCompacted.getGeneration());
+          assertEquals(Optional.of(dirId), updateOperation.memWalDirId());
         }
       }
     }
@@ -720,6 +727,241 @@ public class TransactionTest {
               assertThrows(
                   IllegalArgumentException.class, () -> indexMetadata("too-large", null, files));
           assertTrue(error.getMessage().contains("cannot be represented"));
+        }
+      }
+    }
+  }
+
+  private static Map<String, String> clusteringMetadata() {
+    Map<String, String> metadata = new HashMap<>();
+    metadata.put("org.example.cluster.bucket", "3");
+    metadata.put("org.example.unknown", "  opaque value: 東京  ");
+    metadata.put("org.example.empty", "");
+    return metadata;
+  }
+
+  private static FragmentMetadata withClusteringMetadata(
+      FragmentMetadata fragment, Long clusteringId, Map<String, String> metadata) {
+    return new FragmentMetadata(
+        fragment.getId(),
+        fragment.getFiles(),
+        fragment.getPhysicalRows(),
+        fragment.getDeletionFile(),
+        fragment.getRowIdMeta(),
+        fragment.getCreatedAtVersionMeta(),
+        fragment.getLastUpdatedAtVersionMeta(),
+        fragment.getReferencedLanceFiles(),
+        clusteringId,
+        metadata);
+  }
+
+  @Test
+  public void testFragmentClusteringMetadataTransportRoundTrip(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("fragment_clustering_metadata").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        FragmentMetadata written = testDataset.createNewFragment(10);
+        // Old-style construction leaves both fields unset.
+        assertNull(written.getClusteringId());
+        assertTrue(written.getMetadata().isEmpty());
+
+        Map<String, String> metadata = clusteringMetadata();
+        // Java -> Rust: a populated map crosses the binding into the commit.
+        try (Transaction append =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
+                .operation(
+                    Append.builder()
+                        .fragments(
+                            Collections.singletonList(
+                                withClusteringMetadata(written, null, metadata)))
+                        .build())
+                .build()) {
+          try (Dataset committed = new CommitBuilder(dataset).execute(append)) {
+            // Rust -> Java: the manifest's fragment comes back with the map.
+            FragmentMetadata stored = committed.getFragments().get(0).metadata();
+            assertEquals(metadata, stored.getMetadata());
+            assertNull(stored.getClusteringId());
+            try (Transaction read = committed.readTransaction().orElseThrow()) {
+              Append operation = assertInstanceOf(Append.class, read.operation());
+              assertEquals(metadata, operation.fragments().get(0).getMetadata());
+            }
+
+            // Rust -> Java -> Rust on the SAME fragment: an update post-image
+            // built from the exported object keeps every entry.
+            try (Transaction update =
+                new Transaction.Builder()
+                    .readVersion(committed.version())
+                    .operation(
+                        Update.builder()
+                            .updatedFragments(Collections.singletonList(stored))
+                            .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
+                            .build())
+                    .build()) {
+              try (Dataset updated = new CommitBuilder(committed).execute(update)) {
+                FragmentMetadata kept = updated.getFragments().get(0).metadata();
+                assertEquals(stored.getId(), kept.getId());
+                assertEquals(metadata, kept.getMetadata());
+                assertNull(kept.getClusteringId());
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testFragmentClusteringIdCrossesBindingWithFullRange(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("fragment_clustering_id").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        FragmentMetadata written = testDataset.createNewFragment(10);
+
+        // No definition exists in this manifest, so validation names the id it
+        // received: the proof that the top of the u32 range crossed intact.
+        long maxU32 = 0xFFFFFFFFL;
+        try (Transaction undefined =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
+                .operation(
+                    Append.builder()
+                        .fragments(
+                            Collections.singletonList(
+                                withClusteringMetadata(written, maxU32, Collections.emptyMap())))
+                        .build())
+                .build()) {
+          IllegalArgumentException error =
+              assertThrows(
+                  IllegalArgumentException.class,
+                  () -> new CommitBuilder(dataset).execute(undefined));
+          assertTrue(
+              error.getMessage().contains("references clustering definition 4294967295"),
+              error.getMessage());
+        }
+
+        // Beyond the format's id range the binding refuses before any commit.
+        try (Transaction tooLarge =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
+                .operation(
+                    Append.builder()
+                        .fragments(
+                            Collections.singletonList(
+                                withClusteringMetadata(written, 1L << 32, Collections.emptyMap())))
+                        .build())
+                .build()) {
+          IllegalArgumentException error =
+              assertThrows(
+                  IllegalArgumentException.class,
+                  () -> new CommitBuilder(dataset).execute(tooLarge));
+          assertTrue(
+              error.getMessage().contains("outside the unsigned 32-bit range"), error.getMessage());
+        }
+      }
+    }
+  }
+
+  private static Index withClusteringMetadata(
+      Index index, Long clusteringId, Map<String, String> metadata) {
+    return Index.builder()
+        .uuid(index.uuid())
+        .fields(index.fields())
+        .coveringFields(index.coveringFields())
+        .name(index.name())
+        .datasetVersion(index.datasetVersion())
+        .fragments(index.fragments().orElse(null))
+        .indexDetails(index.indexDetails().orElse(null))
+        .indexVersion(index.indexVersion())
+        .createdAt(index.createdAt().orElse(null))
+        .baseId(index.baseId().orElse(null))
+        .sizeBytes(index.getSizeBytes().orElse(null))
+        .files(index.getFiles().orElse(null))
+        .indexType(index.indexType())
+        .clusteringId(clusteringId)
+        .metadata(metadata)
+        .build();
+  }
+
+  @Test
+  public void testIndexClusteringMetadataTransportRoundTrip(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("index_clustering_metadata").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset ignored = testDataset.createEmptyDataset();
+          Dataset dataset = testDataset.write(1, 10)) {
+        IndexParams indexParams =
+            IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("btree")).build();
+        dataset.createIndex(
+            Collections.singletonList("id"),
+            IndexType.BTREE,
+            Optional.of("id_idx"),
+            indexParams,
+            true);
+        // Builder defaults leave both fields unset.
+        assertTrue(indexMetadata("plain", null, null).clusteringId().isEmpty());
+        assertTrue(indexMetadata("plain", null, null).metadata().isEmpty());
+
+        // Rust -> Java: the segment the index build committed.
+        Index original;
+        try (Transaction read = dataset.readTransaction().orElseThrow()) {
+          CreateIndex created = assertInstanceOf(CreateIndex.class, read.operation());
+          original = created.getNewIndices().get(0);
+        }
+        assertTrue(original.metadata().isEmpty());
+
+        Map<String, String> metadata = clusteringMetadata();
+        // Java -> Rust: replace the same segment, now carrying a map.
+        try (Transaction stamp =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
+                .operation(
+                    CreateIndex.builder()
+                        .withNewIndices(
+                            Collections.singletonList(
+                                withClusteringMetadata(original, null, metadata)))
+                        .withRemovedIndices(Collections.singletonList(original))
+                        .build())
+                .build()) {
+          try (Dataset stamped = new CommitBuilder(dataset).execute(stamp)) {
+            // Rust -> Java through the transaction file ...
+            try (Transaction read = stamped.readTransaction().orElseThrow()) {
+              CreateIndex op = assertInstanceOf(CreateIndex.class, read.operation());
+              assertEquals(metadata, op.getNewIndices().get(0).metadata());
+              assertTrue(op.getNewIndices().get(0).clusteringId().isEmpty());
+            }
+            // ... and through the manifest's index section.
+            Index described = stamped.describeIndices().get(0).getMetadata().get(0);
+            assertEquals(original.uuid(), described.uuid());
+            assertEquals(metadata, described.metadata());
+
+            // A reference to a definition the manifest lacks is rejected with the
+            // id the binding delivered, at the top of the u32 range.
+            try (Transaction undefined =
+                new Transaction.Builder()
+                    .readVersion(stamped.version())
+                    .operation(
+                        CreateIndex.builder()
+                            .withNewIndices(
+                                Collections.singletonList(
+                                    withClusteringMetadata(described, 0xFFFFFFFFL, metadata)))
+                            .withRemovedIndices(Collections.singletonList(described))
+                            .build())
+                    .build()) {
+              IllegalArgumentException error =
+                  assertThrows(
+                      IllegalArgumentException.class,
+                      () -> new CommitBuilder(stamped).execute(undefined));
+              assertTrue(
+                  error.getMessage().contains("references clustering definition 4294967295"),
+                  error.getMessage());
+            }
+          }
         }
       }
     }
