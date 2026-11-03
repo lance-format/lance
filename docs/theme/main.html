@@ -39,6 +39,26 @@
   </div>
 {%- endmacro -%}
 
+{%- macro render_section_groups(children, root_label=none) -%}
+  {%- set direct = namespace(items=[], used_root=false) -%}
+  {%- for item in children %}
+    {%- if item.is_section %}
+      {%- if direct.items %}
+        {{ sidenav_group(direct.items, root_label if not direct.used_root else none) }}
+        {%- set direct.items = [] -%}
+        {%- set direct.used_root = true -%}
+      {%- endif %}
+      {{ sidenav_group(item.children, item.title) }}
+      {%- set direct.used_root = true -%}
+    {%- else %}
+      {%- set direct.items = direct.items + [item] -%}
+    {%- endif %}
+  {%- endfor %}
+  {%- if direct.items %}
+    {{ sidenav_group(direct.items, root_label if not direct.used_root else none) }}
+  {%- endif %}
+{%- endmacro -%}
+
 {% block container %}
   {%- set active_section = namespace(item=none) -%}
   {%- for item in nav %}{% if item.active %}{% set active_section.item = item %}{% endif %}{% endfor %}
@@ -80,24 +100,10 @@
             </div>
           </div>
           {%- if tracks.active and tracks.active.children %}
-            {%- set direct = namespace(items=[]) -%}
-            {%- for item in tracks.active.children %}
-              {%- if item.is_section %}
-                {%- if direct.items %}
-                  {{ sidenav_group(direct.items) }}
-                  {%- set direct.items = [] -%}
-                {%- endif %}
-                {{ sidenav_group(item.children, item.title) }}
-              {%- else %}
-                {%- set direct.items = direct.items + [item] -%}
-              {%- endif %}
-            {%- endfor %}
-            {%- if direct.items %}
-              {{ sidenav_group(direct.items) }}
-            {%- endif %}
+            {{ render_section_groups(tracks.active.children) }}
           {%- endif %}
         {%- else %}
-          {{ sidenav_group(active_section.item.children, active_section.item.title) }}
+          {{ render_section_groups(active_section.item.children, active_section.item.title) }}
         {%- endif %}
       {%- elif active_section.item %}
       <div class="ld-sidenav__group">
