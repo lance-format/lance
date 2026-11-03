@@ -461,8 +461,8 @@ async fn test_queued_read_keeps_its_file_open() -> Result<()> {
     HANDLE_CACHE.invalidate(&cache_key).await;
     HANDLE_CACHE.run_pending_tasks().await;
     assert!(
-        cached_file.strong_count() <= 1,
-        "the reader and the handle cache must have released the file"
+        cached_file.strong_count() == 1,
+        "only the queued request must keep the file open"
     );
     // Had the file been closed, this would likely take over its descriptor number.
     let (_other_file, _) = create_test_file(4096)?;
