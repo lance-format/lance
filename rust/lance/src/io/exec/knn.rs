@@ -2667,7 +2667,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             ds.open_vector_index(&column, &index_uuid, &metrics.index_metrics).await?
                         };
                         query = normalize_query_for_index(raw_index.as_ref(), query)?;
-                        let (search_index, query) = raw_index
+                        let (search_index, mut query) = raw_index
                             .clone()
                             .prepare_partition_query(&query)
                             .map_err(|err| {
