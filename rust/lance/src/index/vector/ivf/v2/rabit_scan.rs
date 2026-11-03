@@ -301,10 +301,11 @@ impl RabitScanContext {
 
     /// Prepare whole ex codes with the same address view as candidate gathers.
     ///
-    /// Current native Full/Accurate storage keeps encoded rows in file order;
-    /// FRI only translates the sign view's addresses. Other encodings and Fast
-    /// mode retain their ordinary partition reader. Wait for the query filter
-    /// before preparing either representation.
+    /// With the plane cache layout, current native Full/Accurate storage keeps
+    /// encoded rows in file order; FRI only translates the sign view's addresses.
+    /// Partition cache layouts, other encodings and Fast mode retain their
+    /// ordinary partition reader so preparation uses the same entries as prewarm.
+    /// Wait for the query filter before preparing either representation.
     ///
     /// ```
     /// # use std::collections::BinaryHeap;
@@ -322,7 +323,8 @@ impl RabitScanContext {
         partition_id: usize,
         dist_q_c: f32,
     ) -> Result<RabitPreparedPartition> {
-        if self.storage().supports_candidate_reads()
+        if self.index.uses_rabit_plane_cache()
+            && self.storage().supports_candidate_reads()
             && self.has_raw_query_bounds()
             && self.query.approx_mode != ApproxMode::Fast
         {

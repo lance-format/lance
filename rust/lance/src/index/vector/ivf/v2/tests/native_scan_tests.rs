@@ -669,7 +669,7 @@ async fn test_rabit_raw_cache_survives_fragment_reuse(
 async fn test_native_strategy_scoring_through_fragment_reuse(
     #[case] tagged: bool,
     #[values(
-        NativeScanFactory::Whole,
+        NativeScanFactory::Whole(RabitCacheLayout::Planes),
         NativeScanFactory::Survivors(ExIndex::Identity),
         NativeScanFactory::Survivors(ExIndex::Compact)
     )]
@@ -773,6 +773,9 @@ async fn test_native_strategy_scoring_through_fragment_reuse(
         .await
         .unwrap();
     for k in [8, 256] {
+        if k == 256 {
+            lazy.prewarm().await.unwrap();
+        }
         let mut query = lazy_test_query(key.clone(), k, 4);
         query.approx_mode = mode;
         let expected = search_global(&ordinary, &query, filter.clone())
@@ -816,7 +819,7 @@ async fn test_native_strategy_scoring_through_fragment_reuse(
 
 #[derive(Debug, Clone, Copy)]
 enum NativeScanFactory {
-    Whole,
+    Whole(RabitCacheLayout),
     Survivors(ExIndex),
 }
 
@@ -832,6 +835,13 @@ impl super::super::rabit_scan::RabitScanFactory for NativeScanFactory {
 
 #[async_trait]
 impl super::super::rabit_scan::RabitScan for NativeScanFactory {
+    fn cache_layout(&self) -> RabitCacheLayout {
+        match self {
+            Self::Whole(layout) => *layout,
+            Self::Survivors(_) => RabitCacheLayout::Planes,
+        }
+    }
+
     async fn search(
         &self,
         context: Arc<super::super::rabit_scan::RabitScanContext>,
@@ -842,7 +852,7 @@ impl super::super::rabit_scan::RabitScan for NativeScanFactory {
         for probe in context.probes.clone() {
             let partition = context.partitions.value(probe) as usize;
             match self {
-                Self::Whole => {
+                Self::Whole(_) => {
                     let prepared = context
                         .prepare_partition(partition, context.centroid_distances.value(probe))
                         .await?;
@@ -917,6 +927,94 @@ impl super::super::rabit_scan::RabitScan for NativeScanFactory {
 }
 
 #[rstest]
+#[case::partition(RabitCacheLayout::Partition)]
+#[case::planes(RabitCacheLayout::Planes)]
+#[tokio::test]
+async fn test_whole_scoring_reuses_selected_prewarm(#[case] layout: RabitCacheLayout) {
+    struct IoMetrics(lance_io::scheduler::IoStats);
+    impl lance_index::metrics::MetricsCollector for IoMetrics {
+        fn record_parts_loaded(&self, _: usize) {}
+        fn record_index_loads(&self, _: usize) {}
+        fn record_comparisons(&self, _: usize) {}
+        fn io_stats(&self) -> Option<lance_io::scheduler::IoStats> {
+            Some(self.0.clone())
+        }
+    }
+    let dir = TempStrDir::default();
+    let (dataset, batch) = native_fixture(dir.as_str()).await;
+    let uuid = dataset.load_indices().await.unwrap()[0].uuid;
+    let query = lazy_test_query(batch["vector"].as_fixed_size_list().value(0), 8, 4);
+    let ordinary = dataset
+        .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let expected = search_global(&ordinary, &query, Arc::new(NoFilter))
+        .await
+        .unwrap();
+    let truth =
+        super::ground_truth(&dataset, "vector", query.key.as_ref(), 8, DistanceType::L2).await;
+    let configured = open_with_session(
+        dir.as_str(),
+        Session::default().with_rabit_scan_factory(Arc::new(NativeScanFactory::Whole(layout))),
+    )
+    .await;
+    let index = configured
+        .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(
+        lazy_index(&index).uses_rabit_plane_cache(),
+        layout == RabitCacheLayout::Planes
+    );
+    index.prewarm().await.unwrap();
+    let (partitions, distances) = index.find_partitions(&query).unwrap();
+    let io = lance_io::scheduler::IoStats::new();
+    for &partition in partitions.values() {
+        lazy_index(&index)
+            .load_query_partition(partition as usize, &IoMetrics(io.clone()))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        io.snapshot().bytes_read,
+        0,
+        "ordinary reader consumes prewarmed cache"
+    );
+    let actual = index
+        .search_partitions(
+            query,
+            Arc::new(partitions),
+            Arc::new(distances),
+            0,
+            4,
+            Arc::new(NoFilter),
+            None,
+            Arc::new(IoMetrics(io.clone())),
+        )
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(
+        io.snapshot().bytes_read,
+        0,
+        "whole scoring consumes prewarmed cache"
+    );
+    assert_eq!(actual.len(), 1);
+    assert_eq!(result_bits(&actual[0]), result_bits(&expected));
+    assert!(
+        result_bits(&actual[0])
+            .0
+            .iter()
+            .filter(|id| truth.contains(id))
+            .count()
+            >= 4,
+        "recall must be >= 0.5"
+    );
+}
+
+#[rstest]
 #[case::unrefined(None, 8)]
 #[case::unit_refinement(Some(1), 8)]
 #[case::oversampled(Some(3), 24)]
@@ -925,7 +1023,7 @@ async fn test_native_strategy_scoring_preserves_refinement_candidates(
     #[case] refine_factor: Option<u32>,
     #[case] candidate_count: usize,
     #[values(
-        NativeScanFactory::Whole,
+        NativeScanFactory::Whole(RabitCacheLayout::Planes),
         NativeScanFactory::Survivors(ExIndex::Identity),
         NativeScanFactory::Survivors(ExIndex::Compact)
     )]
