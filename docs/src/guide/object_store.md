@@ -7,8 +7,8 @@ will use Azure, and `gs://bucket/path` will use GCS.
 
 These object stores take additional configuration objects. There are two ways to
 specify these configurations: by setting environment variables or by passing them
-to the `storage_options` parameter of `lance.dataset` and
-`lance.write_dataset`. So for example, to globally set a higher timeout,
+as storage options when opening or writing a dataset in Python, Rust, or Java.
+So for example, to globally set a higher timeout,
 you would run in your shell:
 
 ```bash
@@ -18,10 +18,42 @@ export TIMEOUT=60s
 If you only want to set the timeout for a single dataset, you can pass it as a
 storage option:
 
-```python
-import lance
-ds = lance.dataset("s3://path", storage_options={"timeout": "60s"})
-```
+=== "Python"
+
+    ```python
+    import lance
+
+    ds = lance.dataset("s3://path", storage_options={"timeout": "60s"})
+    ```
+
+=== "Rust"
+
+    ```rust
+    use std::collections::HashMap;
+    use lance::dataset::builder::DatasetBuilder;
+
+    let storage_options = HashMap::from([("timeout".to_string(), "60s".to_string())]);
+    let ds = DatasetBuilder::from_uri("s3://path")
+        .with_storage_options(storage_options)
+        .load()
+        .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.lance.Dataset;
+    import org.lance.ReadOptions;
+    import java.util.Map;
+
+    ReadOptions options =
+        new ReadOptions.Builder()
+            .setStorageOptions(Map.of("timeout", "60s"))
+            .build();
+    try (Dataset ds = Dataset.open("s3://path", options)) {
+      // read from ds
+    }
+    ```
 
 ## General Configuration
 
@@ -68,16 +100,60 @@ spark-sql --conf "spark.sql.catalog.lance.storage.scheduler_error_mode=fail_fast
 Set `local_fsync` to `"true"` for local datasets when writes must be durable
 before they return:
 
-```python
-import lance
-import pyarrow as pa
+=== "Python"
 
-lance.write_dataset(
-    pa.table({"id": [1]}),
-    "/path/to/data.lance",
-    storage_options={"local_fsync": "true"},
-)
-```
+    ```python
+    import lance
+    import pyarrow as pa
+
+    lance.write_dataset(
+        pa.table({"id": [1]}),
+        "/path/to/data.lance",
+        storage_options={"local_fsync": "true"},
+    )
+    ```
+
+=== "Rust"
+
+    ```rust
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use lance::dataset::{WriteMode, WriteParams};
+    use lance::io::{ObjectStoreParams, StorageOptionsAccessor};
+    use lance::Dataset;
+
+    let storage_options = HashMap::from([("local_fsync".to_string(), "true".to_string())]);
+    let write_params = WriteParams {
+        mode: WriteMode::Overwrite,
+        store_params: Some(ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(
+                StorageOptionsAccessor::with_static_options(storage_options),
+            )),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let ds = Dataset::write(reader, "/path/to/data.lance", Some(write_params)).await?;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.lance.Dataset;
+    import org.lance.WriteParams;
+    import java.util.Map;
+
+    try (Dataset ds =
+        Dataset.write()
+            .allocator(allocator)
+            .reader(reader)
+            .uri("/path/to/data.lance")
+            .mode(WriteParams.WriteMode.OVERWRITE)
+            .storageOptions(Map.of("local_fsync", "true"))
+            .execute()) {
+      // durable write committed
+    }
+    ```
 
 The default is `"false"`. When enabled, Lance syncs local data, transaction,
 and manifest files before reporting successful writes, including copied files
@@ -148,17 +224,57 @@ AWS credentials can be set in the environment variables `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`. Alternatively, they can be
 passed as parameters to the `storage_options` parameter:
 
-```python
-import lance
-ds = lance.dataset(
-    "s3://bucket/path",
-    storage_options={
-        "access_key_id": "my-access-key",
-        "secret_access_key": "my-secret-key",
-        "session_token": "my-session-token",
+=== "Python"
+
+    ```python
+    import lance
+
+    ds = lance.dataset(
+        "s3://bucket/path",
+        storage_options={
+            "access_key_id": "my-access-key",
+            "secret_access_key": "my-secret-key",
+            "session_token": "my-session-token",
+        },
+    )
+    ```
+
+=== "Rust"
+
+    ```rust
+    use std::collections::HashMap;
+    use lance::dataset::builder::DatasetBuilder;
+
+    let storage_options = HashMap::from([
+        ("access_key_id".to_string(), "my-access-key".to_string()),
+        ("secret_access_key".to_string(), "my-secret-key".to_string()),
+        ("session_token".to_string(), "my-session-token".to_string()),
+    ]);
+    let ds = DatasetBuilder::from_uri("s3://bucket/path")
+        .with_storage_options(storage_options)
+        .load()
+        .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.lance.Dataset;
+    import org.lance.ReadOptions;
+    import java.util.Map;
+
+    ReadOptions options =
+        new ReadOptions.Builder()
+            .setStorageOptions(
+                Map.of(
+                    "access_key_id", "my-access-key",
+                    "secret_access_key", "my-secret-key",
+                    "session_token", "my-session-token"))
+            .build();
+    try (Dataset ds = Dataset.open("s3://bucket/path", options)) {
+      // read from ds
     }
-)
-```
+    ```
 
 If you are using AWS SSO, you can specify the `AWS_PROFILE` environment variable.
 It cannot be specified in the `storage_options` parameter.
@@ -216,16 +332,54 @@ ds_b = lance.dataset(
 Lance can also connect to S3-compatible stores, such as MinIO. To do so, you must
 specify both region and endpoint:
 
-```python
-import lance
-ds = lance.dataset(
-    "s3://bucket/path",
-    storage_options={
-        "region": "us-east-1",
-        "endpoint": "http://minio:9000",
+=== "Python"
+
+    ```python
+    import lance
+
+    ds = lance.dataset(
+        "s3://bucket/path",
+        storage_options={
+            "region": "us-east-1",
+            "endpoint": "http://minio:9000",
+        },
+    )
+    ```
+
+=== "Rust"
+
+    ```rust
+    use std::collections::HashMap;
+    use lance::dataset::builder::DatasetBuilder;
+
+    let storage_options = HashMap::from([
+        ("region".to_string(), "us-east-1".to_string()),
+        ("endpoint".to_string(), "http://minio:9000".to_string()),
+    ]);
+    let ds = DatasetBuilder::from_uri("s3://bucket/path")
+        .with_storage_options(storage_options)
+        .load()
+        .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    import org.lance.Dataset;
+    import org.lance.ReadOptions;
+    import java.util.Map;
+
+    ReadOptions options =
+        new ReadOptions.Builder()
+            .setStorageOptions(
+                Map.of(
+                    "region", "us-east-1",
+                    "endpoint", "http://minio:9000"))
+            .build();
+    try (Dataset ds = Dataset.open("s3://bucket/path", options)) {
+      // read from ds
     }
-)
-```
+    ```
 
 This can also be done with the `AWS_ENDPOINT` and `AWS_DEFAULT_REGION` environment variables.
 
