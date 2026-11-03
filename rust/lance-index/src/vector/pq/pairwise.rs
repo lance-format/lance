@@ -56,7 +56,9 @@ impl CodewordTable {
         match backend {
             #[cfg(target_arch = "x86_64")]
             LookupBackend::Avx512Vbmi => Self::BytePlanes(
-                rows.chunks_exact(256)
+                rows.as_chunks::<256>()
+                    .0
+                    .iter()
                     .flat_map(|row| {
                         (0..4).flat_map(move |k| row.iter().map(move |v| v.to_le_bytes()[k]))
                     })
@@ -621,7 +623,7 @@ mod x86 {
             // L2, so fetch the next row while this one is applied.
             if byte + 1 < code_bytes {
                 let next = row_start(byte + 1);
-                for line in planes[next..next + 1024].chunks_exact(64) {
+                for line in planes[next..next + 1024].as_chunks::<64>().0 {
                     // `_mm_prefetch` is safe in newer toolchains but unsafe at
                     // the 1.91 MSRV, so allow both.
                     // SAFETY: prefetching an in-bounds address has no side effects.
@@ -641,7 +643,12 @@ mod x86 {
                 // SAFETY: the slice holds exactly 64 bytes.
                 let block = unsafe { _mm512_loadu_si512(codes[c..c + BLOCK].as_ptr().cast()) };
                 let entries = lookup64(&row, block, order);
-                for (out, entry) in out[c..c + BLOCK].chunks_exact_mut(LANES).zip(entries) {
+                for (out, entry) in out[c..c + BLOCK]
+                    .as_chunks_mut::<LANES>()
+                    .0
+                    .iter_mut()
+                    .zip(entries)
+                {
                     // SAFETY: `out` holds exactly 16 floats.
                     unsafe {
                         let sum = _mm512_add_ps(_mm512_loadu_ps(out.as_ptr()), entry);
@@ -657,7 +664,9 @@ mod x86 {
                 let block = unsafe { _mm512_loadu_si512(block.as_ptr().cast()) };
                 let mut entries = [0.0f32; BLOCK];
                 for (values, entry) in entries
-                    .chunks_exact_mut(LANES)
+                    .as_chunks_mut::<LANES>()
+                    .0
+                    .iter_mut()
                     .zip(lookup64(&row, block, order))
                 {
                     // SAFETY: `values` holds exactly 16 floats.
@@ -809,7 +818,9 @@ mod tests {
             .flat_map(|codes| {
                 if num_bits == 4 {
                     codes
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|c| (c[0] | (c[1] << 4)) as u8)
                         .collect::<Vec<_>>()
                 } else {

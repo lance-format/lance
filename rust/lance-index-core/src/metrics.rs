@@ -2,6 +2,86 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+/// Coarse ANN stage timings. Durations are cumulative wall times, including waits.
+/// Nested stages and concurrent partitions overlap; these are not additive query latency.
+#[derive(Clone, Copy, Debug)]
+#[repr(usize)]
+pub enum IndexTiming {
+    /// Cache lookup, cache-fill wait, and loading/decoding a partition on a miss.
+    PartitionLoad,
+    /// Partition loading and per-partition filter preparation, including overlapping waits.
+    PartitionPrepare,
+    /// Time waiting until the shared filter is ready; not filter construction CPU time.
+    PrefilterWait,
+    /// Delay between submitting a search task and starting its CPU closure.
+    CpuQueueWait,
+    /// CPU search of a prepared partition, including query preparation and result construction.
+    Search,
+    /// Distance calculator and lookup-table construction for a partition query.
+    QueryPrepare,
+    /// Fused candidate filtering, distance evaluation, and TopK heap updates.
+    DistanceTopK,
+    /// Conversion of a result heap into Arrow arrays and a record batch.
+    ResultMaterialize,
+    /// Opening an index handle, including cache lookup and metadata reads.
+    IndexOpen,
+}
+
+impl IndexTiming {
+    /// All stages in discriminant order, for fixed-size metric storage.
+    pub const ALL: [Self; 9] = [
+        Self::PartitionLoad,
+        Self::PartitionPrepare,
+        Self::PrefilterWait,
+        Self::CpuQueueWait,
+        Self::Search,
+        Self::QueryPrepare,
+        Self::DistanceTopK,
+        Self::ResultMaterialize,
+        Self::IndexOpen,
+    ];
+
+    /// Key used in execution summaries and language-binding statistics.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::PartitionLoad => "index_partition_load_time",
+            Self::PartitionPrepare => "index_partition_prepare_time",
+            Self::PrefilterWait => "index_prefilter_wait_time",
+            Self::CpuQueueWait => "index_cpu_queue_wait_time",
+            Self::Search => "index_search_time",
+            Self::QueryPrepare => "index_query_prepare_time",
+            Self::DistanceTopK => "index_distance_topk_time",
+            Self::ResultMaterialize => "index_result_materialize_time",
+            Self::IndexOpen => "index_open_time",
+        }
+    }
+}
+
+/// Records one partition/batch stage, never one candidate or distance evaluation.
+pub struct IndexTimer<'a> {
+    metrics: &'a dyn MetricsCollector,
+    stage: IndexTiming,
+    start: Instant,
+}
+
+impl<'a> IndexTimer<'a> {
+    /// Start a scope timer; dropping it also records early-return and cancellation paths.
+    pub fn new(metrics: &'a dyn MetricsCollector, stage: IndexTiming) -> Self {
+        Self {
+            metrics,
+            stage,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for IndexTimer<'_> {
+    fn drop(&mut self) {
+        self.metrics.record_timing(self.stage, self.start.elapsed());
+    }
+}
 
 /// A trait used by the index to report metrics
 ///
@@ -10,6 +90,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// window events here. Benchmark-only instrumentation belongs in test- or
 /// benchmark-local hooks.
 pub trait MetricsCollector: Send + Sync {
+    /// Record a coarse stage duration; existing collectors may ignore timings.
+    fn record_timing(&self, _stage: IndexTiming, _duration: Duration) {}
+
     /// Record partition loads
     ///
     /// Many indices consist of partitions that may need to be loaded
@@ -128,6 +211,7 @@ impl MetricsCollector for NoOpMetricsCollector {
 
 #[derive(Default)]
 pub struct LocalMetricsCollector {
+    timings: [AtomicUsize; IndexTiming::ALL.len()],
     pub parts_loaded: AtomicUsize,
     pub index_loads: AtomicUsize,
     pub comparisons: AtomicUsize,
@@ -144,6 +228,12 @@ pub struct LocalMetricsCollector {
 
 impl LocalMetricsCollector {
     pub fn dump_into(self, other: &dyn MetricsCollector) {
+        for stage in IndexTiming::ALL {
+            other.record_timing(
+                stage,
+                Duration::from_nanos(self.timings[stage as usize].load(Ordering::Relaxed) as u64),
+            );
+        }
         other.record_parts_loaded(self.parts_loaded.load(Ordering::Relaxed));
         other.record_index_loads(self.index_loads.load(Ordering::Relaxed));
         other.record_comparisons(self.comparisons.load(Ordering::Relaxed));
@@ -175,6 +265,10 @@ impl LocalMetricsCollector {
 }
 
 impl MetricsCollector for LocalMetricsCollector {
+    fn record_timing(&self, stage: IndexTiming, duration: Duration) {
+        self.timings[stage as usize].fetch_add(duration.as_nanos() as usize, Ordering::Relaxed);
+    }
+
     fn record_parts_loaded(&self, num_parts: usize) {
         self.parts_loaded.fetch_add(num_parts, Ordering::Relaxed);
     }
@@ -279,6 +373,20 @@ mod tests {
         assert_eq!(sink.misses.load(Ordering::Relaxed), 3);
         assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 3);
         assert_eq!(sink.single_page_reads.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn local_metrics_collector_forwards_timings() {
+        let local = LocalMetricsCollector::default();
+        let sink = LocalMetricsCollector::default();
+        for stage in IndexTiming::ALL {
+            local.record_timing(stage, Duration::from_nanos(7));
+            local.record_timing(stage, Duration::from_nanos(11));
+        }
+        local.dump_into(&sink);
+        for stage in IndexTiming::ALL {
+            assert_eq!(sink.timings[stage as usize].load(Ordering::Relaxed), 18);
+        }
     }
 
     #[test]

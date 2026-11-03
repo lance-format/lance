@@ -105,6 +105,16 @@ impl MokaCacheBackend {
 
 #[async_trait]
 impl CacheBackend for MokaCacheBackend {
+    async fn get_resident(&self, key: &InternalCacheKey) -> Option<CacheEntry> {
+        self.cache.get(key).await.map(|r| r.entry)
+    }
+
+    /// Moka does not count `contains_key` as a read: the entry's popularity
+    /// estimate and recency order stay unchanged.
+    async fn peek_resident(&self, key: &InternalCacheKey) -> bool {
+        self.cache.contains_key(key)
+    }
+
     async fn get(&self, key: &InternalCacheKey, _codec: Option<CacheCodec>) -> Option<CacheEntry> {
         self.cache.get(key).await.map(|r| r.entry)
     }
@@ -119,6 +129,10 @@ impl CacheBackend for MokaCacheBackend {
         self.cache
             .insert(*key, MokaCacheEntry { entry, size_bytes })
             .await;
+    }
+
+    fn uses_entry_sizes(&self) -> bool {
+        self.capacity > 0
     }
 
     async fn get_or_insert<'a>(
@@ -141,7 +155,7 @@ impl CacheBackend for MokaCacheBackend {
             loader
                 .await
                 .map(|(entry, size_bytes)| MokaCacheEntry { entry, size_bytes })
-                .map_err(CloneableError)
+                .map_err(CloneableError::new)
         };
 
         let owned_key = *key;
@@ -150,7 +164,7 @@ impl CacheBackend for MokaCacheBackend {
                 let was_cached = !was_miss.load(Ordering::Relaxed);
                 Ok((record.entry, was_cached))
             }
-            Err(error) => Err(Arc::unwrap_or_clone(error).0),
+            Err(error) => Err(Arc::unwrap_or_clone(error).into_inner()),
         }
     }
 

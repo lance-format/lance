@@ -1,24 +1,19 @@
 {% extends "base.html" %}
 
-{#- Render one nav section as sidenav groups: its direct pages/links under the
-    section's own label, then each child section as a further group. -#}
+{#- Keep child sections inside their parent group so the hierarchy remains visible. -#}
 {%- macro sidenav_section(sec, label) -%}
-  {%- set direct = sec.children | selectattr("is_section", "ne", true) | list -%}
-  {%- if direct -%}
   <div class="ld-sidenav__group">
     <div class="ld-sidenav__label">{{ label }}</div>
-    {%- for child in direct %}
-    {%- if child.is_link %}
+    {%- for child in sec.children %}
+    {%- if child.is_section %}
+      {{ sidenav_section(child, child.title) }}
+    {%- elif child.is_link %}
     <a href="{{ child.url }}" target="_blank" rel="noopener">{{ child.title }} <span class="ext">↗</span></a>
     {%- else %}
     <a{% if child == page %} class="active"{% endif %} href="{{ child.url | url }}">{{ child.title }}</a>
     {%- endif %}
     {%- endfor %}
   </div>
-  {%- endif -%}
-  {%- for child in sec.children if child.is_section -%}
-    {{ sidenav_section(child, child.title) }}
-  {%- endfor -%}
 {%- endmacro -%}
 
 {% block container %}

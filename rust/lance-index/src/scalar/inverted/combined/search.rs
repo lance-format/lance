@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use lance_core::Result;
 use lance_core::utils::tokio::spawn_cpu;
+use lance_select::RowAddrMask;
 
 use super::super::documents::AddressKeyedDocuments;
 use super::super::query::{FtsSearchParams, Operator, Tokens};
@@ -84,10 +85,11 @@ pub async fn combined_fields_search(
     // same order so `dl'` sums in the exact scan's order too (float addition is
     // order-sensitive; matching the order keeps every score bit-identical).
     let mut loaded: Vec<Vec<LoadedSource>> = (0..terms.len()).map(|_| Vec::new()).collect();
-    let mut length_sources: Vec<(f32, AddressKeyedDocuments)> = Vec::new();
+    let mut length_sources: Vec<(f32, AddressKeyedDocuments, Arc<RowAddrMask>)> = Vec::new();
     for column in columns {
         let weight = column.weight;
         for index in &column.indices {
+            let mask = index.restrict_mask(mask.clone());
             for partition in &index.partitions {
                 let docs = partition.docs.address_keyed().await?;
                 let is_legacy = partition.is_legacy();
@@ -104,9 +106,10 @@ pub async fn combined_fields_search(
                         docs: docs.clone(),
                         is_legacy,
                         posting,
+                        mask: mask.clone(),
                     });
                 }
-                length_sources.push((weight, docs));
+                length_sources.push((weight, docs, mask.clone()));
             }
         }
     }
@@ -120,16 +123,18 @@ pub async fn combined_fields_search(
     // of per-term statistics) and moves everything else in.
     let scorer = Arc::new(scorer.clone());
     let top = spawn_cpu(move || {
+        // A segment that may not report `row_id` can still hold a stale length for it.
         let dl_prime = |row_id: u64| -> f32 {
             length_sources
                 .iter()
-                .map(|(weight, docs)| weight * docs.doc_length_at(row_id) as f32)
+                .filter(|(_, _, mask)| mask.selected(row_id))
+                .map(|(weight, docs, _)| weight * docs.doc_length_at(row_id) as f32)
                 .sum()
         };
         let terms: Vec<CombinedTermPostings> = terms
             .iter()
             .zip(loaded)
-            .map(|(term, sources)| build_term_postings(term, sources, &mask, scorer.as_ref()))
+            .map(|(term, sources)| build_term_postings(term, sources, scorer.as_ref()))
             .collect();
 
         // Score every candidate: the union of the terms' postings for `Or`, and the
@@ -183,7 +188,7 @@ mod tests {
     use super::super::super::index::InvertedListFormatVersion;
     use super::super::super::scorer::idf;
     use super::super::super::tokenizer::document_tokenizer::DocType;
-    use super::super::stats::build_combined_bm25_scorer;
+    use super::super::stats::{CombinedCorpusStats, build_combined_bm25_scorer};
     use super::super::testing::{
         ElementRows, as_row_documents, combined_columns, combined_top_k, element_document_index,
     };
@@ -242,7 +247,7 @@ mod tests {
         );
         assert_eq!(
             title_index
-                .bm25_row_stats_for_terms(&terms, None)
+                .bm25_row_stats_for_terms(&terms, None, None)
                 .await
                 .unwrap(),
             (19, 10, vec![1, 1]),
@@ -389,11 +394,17 @@ mod tests {
             "the fixture must still be element-per-document",
         );
         assert_eq!(
-            legacy.bm25_row_stats_for_terms(&terms, None).await.unwrap(),
+            legacy
+                .bm25_row_stats_for_terms(&terms, None, None)
+                .await
+                .unwrap(),
             (9, 4, vec![1, 3]),
         );
         assert_eq!(
-            modern.bm25_row_stats_for_terms(&terms, None).await.unwrap(),
+            modern
+                .bm25_row_stats_for_terms(&terms, None, None)
+                .await
+                .unwrap(),
             modern.bm25_stats_for_terms(&terms, None).await.unwrap(),
             "a row-per-document index must be untouched",
         );
@@ -404,6 +415,7 @@ mod tests {
         let scorer = build_combined_bm25_scorer(
             &columns,
             &Tokens::new(vec!["alpha".to_owned(), "beta".to_owned()], DocType::Text),
+            CombinedCorpusStats::IndexOnly,
             None,
         )
         .await

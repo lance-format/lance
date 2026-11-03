@@ -4,7 +4,7 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::{
     cell::{OnceCell, RefCell, UnsafeCell},
     collections::{BinaryHeap, VecDeque},
@@ -56,7 +56,24 @@ const TERMINATED_DOC_ID: u64 = u64::MAX;
 /// tuple instead of a `Vec`.
 type TopKHeap = BinaryHeap<Reverse<(ScoredDoc, u32, u64, u32)>>;
 
-type NormKCache<'a> = (&'a [u8], Box<[f32; 256]>);
+type NormKCache<'a> = (&'a [u8], Arc<[f32; 256]>);
+
+/// Norm-code BM25 denominator addends (Lucene's norm cache) computed once for
+/// every partition a query searches with the same scorer. Each partition
+/// otherwise rebuilds the same 256 entries for its first scored window.
+///
+/// Every [`Wand`] given one instance must use a scorer with identical
+/// [`Scorer::doc_norm`] results; the first search to need the table fills it.
+#[derive(Clone, Default)]
+pub struct SharedNormAddends(Arc<OnceLock<Option<Arc<[f32; 256]>>>>);
+
+fn norm_addends<S: Scorer + ?Sized>(scorer: &S) -> Option<Arc<[f32; 256]>> {
+    let mut addends = [0f32; 256];
+    for (code, slot) in addends.iter_mut().enumerate() {
+        *slot = scorer.doc_norm(dequantize_doc_length(code as u8))?;
+    }
+    Some(Arc::new(addends))
+}
 
 /// Reusable (term, freq) storage for live heap candidates. Replacing the k-th
 /// result reuses its slot and retained `Vec` capacity, so memory stays bounded
@@ -482,7 +499,10 @@ struct CompressedState {
     frequency_blocks_decoded: usize,
     #[cfg(test)]
     impact_bound_computations: usize,
-    buffer: Box<[u32; MAX_POSTING_BLOCK_SIZE]>,
+    // Scratch for full bitpacked blocks and packed position groups. Most
+    // cursors of short posting lists only ever decode a varint tail block or
+    // never read positions, so both are allocated on first use.
+    buffer: Option<Box<[u32; MAX_POSTING_BLOCK_SIZE]>>,
     position_block_idx: Option<usize>,
     position_values: Vec<u32>,
     position_offsets: Vec<usize>,
@@ -492,7 +512,7 @@ struct CompressedState {
     // check decode just the candidate doc's positions instead of the whole
     // 256-doc position block.
     position_group_offsets: Vec<usize>,
-    position_unpacked_group: Box<[u32; BLOCK_SIZE]>,
+    position_unpacked_group: Option<Box<[u32; BLOCK_SIZE]>>,
     position_unpacked_group_idx: Option<usize>,
     position_tail: Vec<u32>,
     position_total_deltas: usize,
@@ -516,12 +536,12 @@ impl CompressedState {
             frequency_blocks_decoded: 0,
             #[cfg(test)]
             impact_bound_computations: 0,
-            buffer: Box::new([0; MAX_POSTING_BLOCK_SIZE]),
+            buffer: None,
             position_block_idx: None,
             position_values: Vec::new(),
             position_offsets: Vec::new(),
             position_group_offsets: Vec::new(),
-            position_unpacked_group: Box::new([0; BLOCK_SIZE]),
+            position_unpacked_group: None,
             position_unpacked_group_idx: None,
             position_tail: Vec::new(),
             position_total_deltas: 0,
@@ -557,7 +577,9 @@ impl CompressedState {
         } else {
             decompress_posting_block_doc_ids(
                 block,
-                &mut self.buffer[..],
+                &mut self
+                    .buffer
+                    .get_or_insert_with(|| Box::new([0; MAX_POSTING_BLOCK_SIZE]))[..],
                 &mut self.doc_ids,
                 block_size,
             )
@@ -596,7 +618,9 @@ impl CompressedState {
             decompress_posting_block_frequencies(
                 block,
                 self.frequency_offset,
-                &mut self.buffer[..],
+                &mut self
+                    .buffer
+                    .get_or_insert_with(|| Box::new([0; MAX_POSTING_BLOCK_SIZE]))[..],
                 &mut self.freqs,
                 block_size,
             );
@@ -613,8 +637,6 @@ impl CompressedState {
 struct BlockMaxWindow {
     // Sliding block range used for Lucene-style getMaxScore(upTo). The deque is
     // monotonic by score and covers blocks in [start_block_idx, next_block_idx).
-    // Only used for compressed lists without impact skip data; impact lists
-    // answer window max scores from the anchored level caches instead.
     start_block_idx: usize,
     next_block_idx: usize,
     max_scores: VecDeque<(usize, f32)>,
@@ -1277,7 +1299,9 @@ impl PostingIterator {
                                 compressed.position_total_deltas,
                                 delta_start..delta_end,
                                 &mut compressed.position_group_offsets,
-                                &mut compressed.position_unpacked_group,
+                                compressed
+                                    .position_unpacked_group
+                                    .get_or_insert_with(|| Box::new([0; BLOCK_SIZE])),
                                 &mut compressed.position_unpacked_group_idx,
                                 &mut compressed.position_tail,
                                 &mut position_values,
@@ -1609,9 +1633,11 @@ impl PostingIterator {
 
     fn window_max_score<S: Scorer + ?Sized>(&self, up_to: Option<u64>, scorer: &S) -> f32 {
         if let Some(up_to) = up_to
-            && let PostingList::Compressed(ref list) = self.list
-            && list.impacts.is_some()
+            && let PostingList::Compressed(_) = self.list
         {
+            // The window end can come from other postings' block ends, so it can
+            // cover several of this posting's blocks; bound all of them,
+            // impacts or not.
             return self.block_max_score_up_to_with_stats(up_to, scorer).score;
         }
         self.block_max_score(scorer)
@@ -2418,6 +2444,9 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // `None` means the window has not been initialized yet and the next
     // candidate must refresh block-max state before making pruning decisions.
     up_to: Option<u64>,
+    // First unchecked disjunction doc. Head postings may jump beyond this
+    // while a clause stays parked in tail under a window-local bound.
+    or_next_target: u64,
     // For conjunctions, this is the maximum attainable score for the current
     // block-max window `[target, up_to]`.
     and_max_score: f32,
@@ -2472,6 +2501,7 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // k-th score (`atomic_store_max_f32`) and prunes against the running value
     // -- a lower bound on the global k-th, so it never drops a real top-k doc.
     shared_threshold: Option<Arc<AtomicU32>>,
+    shared_norm_addends: Option<SharedNormAddends>,
 }
 
 /// Monotonically raise an f32 stored in an `AtomicU32` to `val`. CAS loop (not a
@@ -2553,6 +2583,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             tail: BinaryHeap::new(),
             tail_max_score: 0.0,
             up_to: None,
+            or_next_target: 0,
             and_max_score: f32::INFINITY,
             and_last_doc: None,
             and_candidate_score: None,
@@ -2583,6 +2614,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             documents,
             scorer,
             shared_threshold: None,
+            shared_norm_addends: None,
         }
     }
 
@@ -2612,19 +2644,30 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         self
     }
 
+    /// Share one norm addend table across a query's partitions. The caller
+    /// must pass the same table only to searches whose scorers agree on
+    /// [`Scorer::doc_norm`].
+    pub(crate) fn with_shared_norm_addends(mut self, shared: SharedNormAddends) -> Self {
+        self.shared_norm_addends = Some(shared);
+        self
+    }
+
     /// Per-search norm→BM25-denominator cache (Lucene's norm cache): the doc
     /// byte-norm slab plus the 256 possible denominator addends. Available
     /// when the DocSet scores quantized (256-document-block partitions) and the scorer
     /// factors `doc_weight` as `(K1+1)*freq/(freq + addend)`. Scoring through
     /// the cache is bit-identical to `scorer.doc_weight`, because both
     /// evaluate the same expressions on the same quantized lengths.
-    fn norm_k_cache(&self) -> Option<(&'a [u8], Box<[f32; 256]>)> {
+    fn norm_k_cache(&self) -> Option<NormKCache<'a>> {
         let norms = self.documents.scoring_norms()?;
-        let mut cache = Box::new([0f32; 256]);
-        for (code, slot) in cache.iter_mut().enumerate() {
-            *slot = self.scorer.doc_norm(dequantize_doc_length(code as u8))?;
-        }
-        Some((norms, cache))
+        let addends = match &self.shared_norm_addends {
+            Some(shared) => shared
+                .0
+                .get_or_init(|| norm_addends(&self.scorer))
+                .clone()?,
+            None => norm_addends(&self.scorer)?,
+        };
+        Some((norms, addends))
     }
 
     /// Set the pruning threshold from this partition's k-th best, raised to the
@@ -3851,7 +3894,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             };
 
             if self.up_to.is_none_or(|up_to| target > up_to) {
-                self.update_max_scores(target);
+                // The tail's bounds expire at the old window end. Refresh from
+                // the first unchecked doc, before the next head posting, and
+                // re-read the head since a competitive tail may now precede it.
+                let refresh_target = self.up_to.map_or(self.or_next_target, |up_to| {
+                    self.or_next_target.max(up_to + 1)
+                });
+                self.update_max_scores(refresh_target);
+                continue;
             }
             self.move_head_doc_to_lead(target);
             if self.lead.is_empty() {
@@ -5492,11 +5542,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // A low-scoring tail can be the only iterator left in the current
         // window. Move to the next window so a later high-scoring block is still
         // reachable instead of ending the disjunction early.
-        self.update_max_scores(up_to + 1);
+        self.update_max_scores(self.or_next_target.max(up_to + 1));
         true
     }
 
     fn push_back_leads(&mut self, target: u64) {
+        self.or_next_target = target;
         // After finishing a candidate doc, convert the aligned iterators back
         // into lagging iterators. Entries that do not stay in `tail` are
         // advanced to `target` and returned to `head`.
@@ -6259,6 +6310,7 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
             return;
         }
 
+        self.or_next_target = target;
         let mut postings = std::mem::take(&mut self.head)
             .into_vec()
             .into_iter()
@@ -7999,6 +8051,38 @@ mod tests {
         let wand = Wand::new(Operator::Or, std::iter::empty(), &docs, PartialNormScorer);
 
         assert!(wand.norm_k_cache().is_none());
+
+        let shared = SharedNormAddends::default();
+        for _ in 0..2 {
+            let wand = Wand::new(Operator::Or, std::iter::empty(), &docs, PartialNormScorer)
+                .with_shared_norm_addends(shared.clone());
+            assert!(wand.norm_k_cache().is_none());
+        }
+    }
+
+    #[test]
+    fn test_shared_norm_addends_are_built_once_and_match_local_table() {
+        let mut docs = DocSet::default();
+        docs.append(0, 7);
+        docs.set_quantized_scoring(true);
+        let scorer = Arc::new(MemBM25Scorer::new(70, 10, std::collections::HashMap::new()));
+        let shared = SharedNormAddends::default();
+        let norm_addends = |shared: Option<SharedNormAddends>| {
+            let mut wand = Wand::new(Operator::Or, std::iter::empty(), &docs, scorer.clone());
+            if let Some(shared) = shared {
+                wand = wand.with_shared_norm_addends(shared);
+            }
+            wand.norm_k_cache().unwrap().1
+        };
+
+        let first = norm_addends(Some(shared.clone()));
+        let second = norm_addends(Some(shared));
+        let local = norm_addends(None);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "partitions of one query must share one table"
+        );
+        assert_eq!((*first).map(f32::to_bits), (*local).map(f32::to_bits));
     }
 
     #[test]
@@ -8974,6 +9058,83 @@ mod tests {
         assert_eq!(candidate.0.doc_id(), BLOCK_SIZE as u64);
     }
 
+    #[rstest]
+    #[case::head_jump(false)]
+    #[case::window_skip(true)]
+    fn or_window_refresh_recovers_competitive_tail_documents(
+        #[case] is_window_skip: bool,
+        #[values(CompetitiveFloorMode::Exclusive, CompetitiveFloorMode::Inclusive)]
+        floor_mode: CompetitiveFloorMode,
+    ) {
+        let block_size = MAX_POSTING_BLOCK_SIZE as u32;
+        let hot_doc = block_size;
+        let next_head_doc = 4 * block_size;
+        let mut docs = DocSet::default();
+        for doc_id in 0..=next_head_doc {
+            docs.append(u64::from(doc_id), 1);
+        }
+
+        let parked_docs = (0..block_size).chain([hot_doc]).collect::<Vec<_>>();
+        let mut parked_freqs = vec![1; parked_docs.len()];
+        *parked_freqs.last_mut().unwrap() = 10;
+        let driving_docs = if is_window_skip {
+            (0..block_size).chain([next_head_doc]).collect::<Vec<_>>()
+        } else {
+            vec![0, next_head_doc]
+        };
+        let mut driving_freqs = vec![1; driving_docs.len()];
+        driving_freqs[0] = 6;
+        *driving_freqs.last_mut().unwrap() = 8;
+        let postings = [(parked_docs, parked_freqs), (driving_docs, driving_freqs)]
+            .into_iter()
+            .enumerate()
+            .map(|(term, (doc_ids, freqs))| {
+                let doc_lengths = vec![1; doc_ids.len()];
+                PostingIterator::with_query_weight(
+                    format!("term{term}"),
+                    term as u32,
+                    term as u32,
+                    1.0,
+                    generate_impact_posting_list_with_freqs_and_block_size(
+                        doc_ids,
+                        freqs,
+                        doc_lengths,
+                        MAX_POSTING_BLOCK_SIZE,
+                    ),
+                    docs.len(),
+                )
+            });
+        let mut wand =
+            Wand::new(Operator::Or, postings, &docs, UnitScorer).with_floor_mode(floor_mode);
+
+        let (first_doc, _) = wand.next().unwrap().unwrap();
+        assert_eq!(first_doc.doc_id(), 0);
+        wand.advance_all_tail(0, None, None);
+        assert_eq!(wand.score_in_query_order(1), 7.0);
+        wand.threshold = 6.5;
+        wand.push_back_leads(1);
+        assert_eq!(wand.tail.len(), 1);
+        assert_eq!(wand.up_to, Some(u64::from(hot_doc - 1)));
+
+        if is_window_skip {
+            // A shared collector may raise the floor between candidates. The
+            // old window is now dead, but the parked clause's next block wins.
+            wand.threshold = 7.5;
+            assert!(wand.or_block_window_max() < wand.threshold);
+        }
+
+        let mut competitive_docs = Vec::with_capacity(2);
+        while let Some((doc, _)) = wand.next().unwrap() {
+            wand.advance_all_tail(doc.doc_id(), None, None);
+            competitive_docs.push((doc.doc_id(), wand.score_in_query_order(1)));
+            wand.push_back_leads(doc.doc_id() + 1);
+        }
+        assert_eq!(
+            competitive_docs,
+            vec![(u64::from(hot_doc), 10.0), (u64::from(next_head_doc), 8.0)],
+        );
+    }
+
     #[test]
     fn test_non_positive_threshold_advances_without_impact_bound_scoring() {
         let mut docs = DocSet::default();
@@ -9502,6 +9663,115 @@ mod tests {
             scored.load(Ordering::Relaxed) <= total_entries + 8,
             "bounds should be baked once instead of recomputed per window; scored={}",
             scored.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn or_search_finds_parked_union_hit_in_a_later_block_of_the_window() {
+        // A query-time fuzzy union (grouped, 128-doc blocks, no impacts) parks
+        // in the tail while the sparse clause's wide block sets the window end.
+        // The union's best document sits in a later block of that window, so a
+        // bound taken from its current block alone skips it and the top-1 is wrong.
+        let block = crate::scalar::inverted::LEGACY_BLOCK_SIZE;
+        let codec = crate::scalar::inverted::PostingTailCodec::VarintDelta;
+        let non_impact_list = |doc_ids: &[u32], freqs: &[u32]| {
+            let block_maxes = freqs
+                .chunks(block)
+                .map(|chunk| chunk.iter().copied().max().unwrap() as f32)
+                .collect::<Vec<_>>();
+            let max_score = block_maxes.iter().copied().fold(0.0, f32::max);
+            let blocks = compress_posting_list_with_tail_codec_and_block_size(
+                doc_ids.len(),
+                doc_ids.iter(),
+                freqs.iter(),
+                block_maxes.into_iter(),
+                codec,
+                block,
+            )
+            .unwrap();
+            PostingList::Compressed(CompressedPostingList::new(
+                blocks,
+                max_score,
+                doc_ids.len() as u32,
+                codec,
+                block,
+                None,
+                None,
+            ))
+        };
+
+        let block_docs = block as u32;
+        let num_docs = 6 * block_docs;
+        // Dense union over six blocks; every block max is 1 except block 2.
+        let hot_doc = 2 * block_docs + 44;
+        let union_docs = (0..num_docs).collect::<Vec<_>>();
+        let union_freqs = union_docs
+            .iter()
+            .map(|&doc| if doc == hot_doc { 12 } else { 1 })
+            .collect::<Vec<_>>();
+        // Sparse clause: a dense first block whose doc 0 sets the floor, then
+        // a stride-4 block spanning union blocks 1..=4, then a short tail. It
+        // carries no scorer-bound flag so its block maxes stay finite under
+        // `UnitScorer`.
+        let sparse_docs = (0..block_docs)
+            .chain((0..block_docs).map(|i| block_docs + 4 * i))
+            .chain([5 * block_docs, 5 * block_docs + 4])
+            .collect::<Vec<_>>();
+        let sparse_freqs = sparse_docs
+            .iter()
+            .map(|&doc| if doc == 0 { 9 } else { 1 })
+            .collect::<Vec<_>>();
+
+        let mut docs = DocSet::default();
+        let mut exhaustive = vec![0_u32; num_docs as usize];
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 1);
+        }
+        for (doc_ids, freqs) in [(&union_docs, &union_freqs), (&sparse_docs, &sparse_freqs)] {
+            for (&doc_id, &freq) in doc_ids.iter().zip(freqs.iter()) {
+                exhaustive[doc_id as usize] += freq;
+            }
+        }
+        let limit = 1;
+        let mut expected = (0..num_docs).map(u64::from).collect::<Vec<_>>();
+        expected.sort_by_key(|&doc| (std::cmp::Reverse(exhaustive[doc as usize]), doc));
+        expected.truncate(limit);
+        assert_eq!(expected, vec![u64::from(hot_doc)]);
+
+        let union_list = non_impact_list(&union_docs, &union_freqs);
+        let grouped_terms =
+            Arc::<[GroupedTermScorer]>::from([GroupedTermScorer::new(1.0, &union_list)]);
+        let union = PostingIterator::with_query_weight(
+            String::from("union"),
+            0,
+            0,
+            1.0,
+            union_list,
+            docs.len(),
+        )
+        .with_grouped_terms(grouped_terms);
+        let sparse = PostingIterator::with_query_weight(
+            String::from("sparse"),
+            1,
+            1,
+            1.0,
+            non_impact_list(&sparse_docs, &sparse_freqs),
+            docs.len(),
+        );
+        let mut wand = Wand::new(Operator::Or, [union, sparse].into_iter(), &docs, UnitScorer);
+        let hits = wand
+            .search(
+                &FtsSearchParams::default().with_limit(Some(limit)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        let found = hits
+            .iter()
+            .map(|hit| hit.posting_doc_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            found, expected,
+            "WAND OR top-{limit} must match exhaustive scoring"
         );
     }
 
