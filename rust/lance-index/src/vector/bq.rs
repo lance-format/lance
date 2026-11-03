@@ -20,9 +20,16 @@ use crate::vector::quantizer::QuantizerBuildParams;
 pub mod builder;
 pub(crate) mod dist_table_quant;
 pub mod ex_dot;
+pub mod layered;
 pub(crate) mod pairwise;
+pub mod partition_codes;
+mod plane_cache;
+pub mod planes;
 pub mod prune;
+pub mod raw_body;
+pub(crate) mod resident;
 pub mod rotation;
+pub mod scan_stats;
 pub mod storage;
 pub mod transform;
 
@@ -284,3 +291,6 @@ mod tests {
         assert_eq!(rabit_ex_code_bytes(129, 3).unwrap(), 49);
     }
 }
+
+#[cfg(test)]
+mod scan_tests;

@@ -6,13 +6,13 @@ use std::sync::{Arc, LazyLock};
 
 use arrow::array::AsArray;
 use arrow::datatypes::{Float16Type, Float32Type, Float64Type, UInt32Type};
-#[cfg(test)]
-use arrow_array::UInt32Array;
-use arrow_array::{Array, ArrowNativeTypeOp, FixedSizeListArray, Float32Array, RecordBatch};
+use arrow_array::{
+    Array, ArrowNativeTypeOp, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array,
+};
 use arrow_schema::DataType;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
-use lance_linalg::distance::{DistanceType, norm_squared_fsl};
+use lance_linalg::distance::{DistanceType, try_norm_squared_fsl};
 use rayon::prelude::*;
 use tracing::instrument;
 
@@ -162,7 +162,8 @@ impl RQTransformer {
     ) -> Result<Self> {
         // for dot product, the add factor is `1 - v*c + |c|^2`, so we need to compute |c|^2
         let centroids_norm_square = (distance_type == DistanceType::Dot)
-            .then(|| Float32Array::from(norm_squared_fsl(&centroids)));
+            .then(|| try_norm_squared_fsl(&centroids).map(Float32Array::from))
+            .transpose()?;
         let rotated_centroids = (rq.metadata_ref().query_estimator
             == RabitQueryEstimator::RawQuery)
             .then(|| rq.rotate_fsl_to_f32(&centroids))
@@ -178,13 +179,13 @@ impl RQTransformer {
     }
 }
 
-#[cfg(test)]
-struct RabitRawQueryFactors {
-    add_factors: Float32Array,
-    scale_factors: Float32Array,
-    error_factors: Float32Array,
-    ex_add_factors: Option<Float32Array>,
-    ex_scale_factors: Option<Float32Array>,
+#[doc(hidden)]
+pub struct RabitRawQueryFactors {
+    pub add_factors: Float32Array,
+    pub scale_factors: Float32Array,
+    pub error_factors: Float32Array,
+    pub ex_add_factors: Option<Float32Array>,
+    pub ex_scale_factors: Option<Float32Array>,
 }
 
 pub(crate) struct RabitRowFactors<'c, 'o> {
@@ -264,7 +265,6 @@ fn factor_ratio(numerator: f32, denominator: f32) -> f32 {
     }
 }
 
-#[cfg(test)]
 #[inline]
 fn binary_factor_value(rotated_residual: f32) -> f32 {
     if rotated_residual.is_sign_positive() {
@@ -296,9 +296,9 @@ fn error_factor_value(
     }
 }
 
-#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-fn compute_raw_query_factors(
+#[doc(hidden)]
+pub fn compute_raw_query_factors(
     distance_type: DistanceType,
     res_norm_square: &Float32Array,
     rotated_residuals: &[f32],
@@ -477,7 +477,7 @@ impl Transformer for RQTransformer {
         let res_norm_square = match self.distance_type {
             // for L2, |v-c|^2 is just the distance to the centroid
             DistanceType::L2 => dist_v_c.clone(),
-            DistanceType::Dot => Float32Array::from(norm_squared_fsl(residual_vectors)),
+            DistanceType::Dot => Float32Array::from(try_norm_squared_fsl(residual_vectors)?),
             _ => {
                 return Err(Error::index(format!(
                     "RQ Transform: distance type {} not supported",
@@ -664,7 +664,8 @@ mod tests {
         let residuals = FixedSizeListArray::try_new_from_values(values, dim as i32)
             .unwrap()
             .slice(1, num_rows);
-        let norm = Float32Array::from(lance_linalg::distance::norm_squared_fsl(&residuals));
+        let norm =
+            Float32Array::from(lance_linalg::distance::try_norm_squared_fsl(&residuals).unwrap());
         let parts = UInt32Array::from((0..num_rows).map(|i| (i % 3) as u32).collect::<Vec<_>>());
         let batch = RecordBatch::try_from_iter(vec![
             ("vector", Arc::new(residuals.clone()) as ArrayRef),

@@ -41,6 +41,8 @@ pub(super) struct LoadedSource {
     pub(super) docs: AddressKeyedDocuments,
     pub(super) is_legacy: bool,
     pub(super) posting: PostingList,
+    /// The query mask restricted to the rows the segment may report.
+    pub(super) mask: Arc<RowAddrMask>,
 }
 
 /// Merge every source's postings for `term` into the shared row-id space,
@@ -48,13 +50,12 @@ pub(super) struct LoadedSource {
 pub(super) fn build_term_postings(
     term: &str,
     sources: Vec<LoadedSource>,
-    mask: &Arc<RowAddrMask>,
     scorer: &CombinedFieldsBM25Scorer,
 ) -> CombinedTermPostings {
     let mut acc: HashMap<u64, f32> = HashMap::new();
     for source in &sources {
         for (row_id, freq) in live_posting_rows(&source.posting, &source.docs, source.is_legacy) {
-            if !mask.selected(row_id) {
+            if !source.mask.selected(row_id) {
                 continue;
             }
             *acc.entry(row_id).or_insert(0.0) += source.weight * freq as f32;
@@ -94,6 +95,7 @@ mod tests {
         // projection (the only representation a compressed posting is loaded
         // alongside) to row 20; row 42 is blocked by the mask below.
         let compressed = PostingList::Compressed(compressed_list(&[(20, 5), (42, 7)]));
+        let mask = Arc::new(RowAddrMask::all_rows().also_block(RowAddrTreeMap::from_iter([42u64])));
         let docs = modern_identity_docs(&vec![1u32; 64], &[]).await;
         let sources = vec![
             LoadedSource {
@@ -101,16 +103,17 @@ mod tests {
                 docs: docs.clone(),
                 is_legacy: true,
                 posting: legacy,
+                mask: mask.clone(),
             },
             LoadedSource {
                 weight: 1.0,
                 docs,
                 is_legacy: false,
                 posting: compressed,
+                mask: mask.clone(),
             },
         ];
-        let mask = Arc::new(RowAddrMask::all_rows().also_block(RowAddrTreeMap::from_iter([42u64])));
-        let term = build_term_postings("t", sources, &mask, &scorer);
+        let term = build_term_postings("t", sources, &scorer);
 
         // row 10: 2*1 = 2; row 20: 2*2 + 2*3 + 1*5 = 15; row 30: 2*1 = 2.
         // Row 42 is masked out entirely.
@@ -142,8 +145,9 @@ mod tests {
                 (DEAD_ROW as u32, 7),
                 (30, 3),
             ])),
+            mask: Arc::new(RowAddrMask::default()),
         }];
-        let term = build_term_postings("t", sources, &Arc::new(RowAddrMask::default()), &scorer);
+        let term = build_term_postings("t", sources, &scorer);
         assert_eq!(
             term.postings,
             vec![(10, 2.0), (30, 6.0)],

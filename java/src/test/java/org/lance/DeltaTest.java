@@ -14,6 +14,7 @@
 package org.lance;
 
 import org.lance.delta.DatasetDelta;
+import org.lance.delta.DatasetDeltaBuilder;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
@@ -234,6 +235,52 @@ public class DeltaTest {
             total += outRoot.getRowCount();
           }
           Assertions.assertEquals(1, total, "exactly one row was deleted");
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testBuilderRejectsInvalidVersionSelection(@TempDir Path tempDir) throws IOException {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      String uri = tempDir.resolve("delta_conflicting_selection").toString();
+      Schema schema =
+          new Schema(
+              Arrays.asList(
+                  Field.notNullable(
+                      "id", new org.apache.arrow.vector.types.pojo.ArrowType.Int(32, true)),
+                  Field.nullable(
+                      "val", org.apache.arrow.vector.types.pojo.ArrowType.Utf8.INSTANCE)));
+      byte[] batch = writeBatch(allocator, schema, new int[] {1, 2}, new String[] {"a", "b"});
+      try (ArrowStreamReader reader =
+              new ArrowStreamReader(new ByteArrayReadableSeekableByteChannel(batch), allocator);
+          ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+        Data.exportArrayStream(allocator, reader, stream);
+        try (Dataset ds =
+            Dataset.write().stream(stream).uri(uri).mode(WriteParams.WriteMode.CREATE).execute()) {
+          // A range set together with comparedAgainstVersion must be rejected, not
+          // silently dropped in favour of the comparison.
+          IllegalArgumentException conflicting =
+              Assertions.assertThrows(
+                  IllegalArgumentException.class,
+                  () ->
+                      new DatasetDeltaBuilder(ds)
+                          .comparedAgainstVersion(1L)
+                          .withBeginVersion(1L)
+                          .withEndVersion(1L)
+                          .build());
+          Assertions.assertTrue(
+              conflicting.getMessage().contains("Cannot combine compared_against_version"),
+              conflicting.getMessage());
+          IllegalArgumentException halfRange =
+              Assertions.assertThrows(
+                  IllegalArgumentException.class,
+                  () -> new DatasetDeltaBuilder(ds).withBeginVersion(1L).build());
+          Assertions.assertTrue(
+              halfRange
+                  .getMessage()
+                  .contains("Must specify both with_begin_version and with_end_version"),
+              halfRange.getMessage());
         }
       }
     }

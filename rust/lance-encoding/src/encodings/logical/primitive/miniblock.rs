@@ -12,7 +12,7 @@
 //!
 //! Any form of compression can be used since we are compressing and decompressing
 //! entire chunks.
-use crate::{buffer::LanceBuffer, data::DataBlock, format::pb21::CompressiveEncoding};
+use crate::{buffer::LanceBuffer, data::DataBlock, format::metadata::CompressiveEncoding};
 
 use lance_core::Result;
 

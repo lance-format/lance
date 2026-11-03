@@ -405,7 +405,7 @@ impl PostingListBuilder {
             let tail_position_block = std::mem::take(&mut overflow.tail_positions).finish();
             full_blocks
                 .encoded_position_blocks
-                .push_encoded_block(tail_position_block.as_slice());
+                .push_encoded_block(tail_position_block)?;
         }
         self.tail.clear();
         self.tail_len = 0;
@@ -448,35 +448,18 @@ impl PostingListBuilder {
         }
     }
 
-    fn build_position_columns(
-        positions: Option<CompressedPositionStorage>,
-    ) -> Result<Vec<ArrayRef>> {
+    fn build_position_columns(positions: Option<PostingListPositions>) -> Result<Vec<ArrayRef>> {
         let Some(positions) = positions else {
             return Ok(Vec::new());
         };
         match positions {
-            CompressedPositionStorage::LegacyPerDoc(positions) => {
-                Ok(vec![Arc::new(ListArray::try_new(
-                    Arc::new(Field::new("item", positions.data_type().clone(), true)),
-                    OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, positions.len() as i32])),
-                    Arc::new(positions) as ArrayRef,
-                    None,
-                )?) as ArrayRef])
-            }
-            CompressedPositionStorage::SharedStream(positions) => {
-                let mut columns = Vec::with_capacity(2);
-                columns.push(
-                    Arc::new(LargeBinaryArray::from(vec![Some(positions.bytes())])) as ArrayRef,
-                );
-
-                let mut offsets_builder = ListBuilder::new(UInt32Builder::new());
-                for &offset in positions.block_offsets() {
-                    offsets_builder.values().append_value(offset);
-                }
-                offsets_builder.append(true);
-                columns.push(Arc::new(offsets_builder.finish()) as ArrayRef);
-                Ok(columns)
-            }
+            PostingListPositions::Legacy(positions) => Ok(vec![Arc::new(ListArray::try_new(
+                Arc::new(Field::new("item", positions.data_type().clone(), true)),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, positions.len() as i32])),
+                Arc::new(positions) as ArrayRef,
+                None,
+            )?) as ArrayRef]),
+            PostingListPositions::Shared(positions) => positions.into_columns(),
         }
     }
 
@@ -486,7 +469,7 @@ impl PostingListBuilder {
         impacts: Option<ImpactSkipData>,
         max_score: f32,
         schema: SchemaRef,
-        positions: Option<CompressedPositionStorage>,
+        positions: Option<PostingListPositions>,
     ) -> Result<RecordBatch> {
         let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, compressed.len() as i32]));
         let mut columns = vec![
@@ -561,16 +544,10 @@ impl PostingListBuilder {
         let (compressed, shared_positions, max_score, impacts) =
             Self::build_compressed_with_scores_from_parts(parts, docs)?;
         let positions = match legacy_positions {
-            Some(positions) => Some(CompressedPositionStorage::LegacyPerDoc(positions)),
-            None => shared_positions.map(CompressedPositionStorage::SharedStream),
+            Some(positions) => Some(PostingListPositions::Legacy(positions)),
+            None => shared_positions.map(PostingListPositions::Shared),
         };
-        batch_builder.append(
-            compressed,
-            Some(&impacts),
-            max_score,
-            length,
-            positions.as_ref(),
-        )
+        batch_builder.append(compressed, Some(&impacts), max_score, length, positions)
     }
 
     fn build_compressed_with_scores_from_parts(
@@ -578,7 +555,7 @@ impl PostingListBuilder {
         docs: &DocSet,
     ) -> Result<(
         LargeBinaryArray,
-        Option<SharedPositionStream>,
+        Option<EncodedPositionBlocks>,
         f32,
         ImpactSkipData,
     )> {
@@ -645,16 +622,15 @@ impl PostingListBuilder {
             if with_positions {
                 encoded_position_blocks.push_encoded_block(
                     tail_position_block
-                        .as_deref()
                         .expect("tail position block must exist for postings with positions"),
-                );
+                )?;
             }
         }
 
         let impacts = impact_builder.finish()?;
         Ok((
             encoded_blocks.into_array(),
-            with_positions.then(|| encoded_position_blocks.into_stream()),
+            with_positions.then_some(encoded_position_blocks),
             max_score,
             impacts,
         ))
@@ -663,7 +639,7 @@ impl PostingListBuilder {
     fn build_compressed_with_block_scores_from_parts(
         parts: PostingListParts,
         mut block_max_scores: impl Iterator<Item = f32>,
-    ) -> Result<(LargeBinaryArray, Option<SharedPositionStream>, f32)> {
+    ) -> Result<(LargeBinaryArray, Option<EncodedPositionBlocks>, f32)> {
         let PostingListParts {
             with_positions,
             posting_tail_codec,
@@ -706,15 +682,14 @@ impl PostingListBuilder {
             if with_positions {
                 encoded_position_blocks.push_encoded_block(
                     tail_position_block
-                        .as_deref()
                         .expect("tail position block must exist for postings with positions"),
-                );
+                )?;
             }
         }
 
         Ok((
             encoded_blocks.into_array(),
-            with_positions.then(|| encoded_position_blocks.into_stream()),
+            with_positions.then_some(encoded_position_blocks),
             max_score,
         ))
     }
@@ -744,8 +719,8 @@ impl PostingListBuilder {
                 block_max_scores.into_iter(),
             )?;
         let positions = match legacy_positions {
-            Some(positions) => Some(CompressedPositionStorage::LegacyPerDoc(positions)),
-            None => shared_positions.map(CompressedPositionStorage::SharedStream),
+            Some(positions) => Some(PostingListPositions::Legacy(positions)),
+            None => shared_positions.map(PostingListPositions::Shared),
         };
         Self::build_batch(length, compressed, None, max_score, schema, positions)
     }
@@ -763,8 +738,8 @@ impl PostingListBuilder {
         let (compressed, shared_positions, max_score, impacts) =
             Self::build_compressed_with_scores_from_parts(parts, docs)?;
         let positions = match legacy_positions {
-            Some(positions) => Some(CompressedPositionStorage::LegacyPerDoc(positions)),
-            None => shared_positions.map(CompressedPositionStorage::SharedStream),
+            Some(positions) => Some(PostingListPositions::Legacy(positions)),
+            None => shared_positions.map(PostingListPositions::Shared),
         };
         Self::build_batch(
             length,

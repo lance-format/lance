@@ -164,7 +164,7 @@ being limited to `struct` only.
 
 To actually remove the data from disk, the files must be rewritten to remove the
 columns and then the old files must be deleted. This can be done using
-`lance.dataset.DatasetOptimizer.compact_files()` followed by
+`dataset.optimize.compact_files(...)` followed by
 `lance.LanceDataset.cleanup_old_versions()`.
 
 !!! warning

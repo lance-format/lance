@@ -32,7 +32,7 @@ use arrow_array::types::*;
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::ScalarValue;
-use lance_core::{Error, ROW_ID, Result};
+use lance_core::{Error, Result};
 use lance_index::IndexType;
 use lance_index::scalar::btree::OrderableScalarValue;
 use lance_index::scalar::expression::{SargableQueryParser, ScalarQueryParser};
@@ -42,8 +42,8 @@ use lance_index::scalar::{SargableQuery, compute_next_prefix};
 use super::RowPosition;
 use super::arena_skiplist::{SkipListReader, SkipListWriter, new_skiplist};
 use super::plugin::{
-    FlushContext, FlushOutcome, MemIndex, MemIndexBuildContext, MemIndexPlugin, MemIndexSpec,
-    PrimaryKeyIndex,
+    FlushContext, FlushOutcome, MemIndex, MemIndexBuildContext, MemIndexParams, MemIndexPlugin,
+    MemIndexSpec, PrimaryKeyIndex,
 };
 use super::query::{MemMatches, MemQuery, MemSearchResult, PositionSet, SearchContext};
 
@@ -723,10 +723,40 @@ impl BytesBackend {
     }
 }
 
+/// Heap a stored `ScalarValue` key owns outside the arena node it sits in.
+///
+/// Only the string and binary variants own their bytes; numeric, boolean,
+/// decimal and temporal values live inline in the node. A dictionary value
+/// boxes its key type and its decoded value, which may itself own a string.
+/// Nested values (lists, structs, maps) hold an Arrow array sliced from the
+/// inserted batch, sharing buffers the batch store already charges; only a
+/// small per-row header and offsets array is theirs, and that is not counted.
+/// `ScalarValue::size` is no substitute: it reports the whole shared buffer
+/// for every row.
+fn owned_heap_bytes(value: &ScalarValue) -> usize {
+    match value {
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => s.capacity(),
+        ScalarValue::Binary(Some(b))
+        | ScalarValue::LargeBinary(Some(b))
+        | ScalarValue::BinaryView(Some(b))
+        | ScalarValue::FixedSizeBinary(_, Some(b)) => b.capacity(),
+        ScalarValue::Dictionary(_, inner) => {
+            std::mem::size_of::<DataType>().next_multiple_of(16)
+                + std::mem::size_of::<ScalarValue>().next_multiple_of(16)
+                + owned_heap_bytes(inner)
+        }
+        _ => 0,
+    }
+}
+
 /// Fallback backend for arbitrary scalar types, keyed by `OrderableScalarValue`.
 struct ScalarBackend {
     reader: SkipListReader<IndexKey>,
     writer: Mutex<SkipListWriter<IndexKey>>,
+    /// Heap the stored keys own outside the arena (see [`owned_heap_bytes`]).
+    key_heap_bytes: AtomicUsize,
 }
 
 impl ScalarBackend {
@@ -735,10 +765,17 @@ impl ScalarBackend {
         Self {
             reader,
             writer: Mutex::new(writer),
+            key_heap_bytes: AtomicUsize::new(0),
         }
     }
 
     fn add(&self, value: OrderableScalarValue, row_position: RowPosition) -> bool {
+        // Charged before the key is published, so a concurrent memory read
+        // never sees a key without its heap.
+        let heap = owned_heap_bytes(&value.0);
+        if heap > 0 {
+            self.key_heap_bytes.fetch_add(heap, Ordering::Relaxed);
+        }
         let probe = value.clone();
         self.writer.lock().unwrap().insert_and_check_neighbors(
             IndexKey {
@@ -990,7 +1027,7 @@ impl Backend {
                     + b.null_bytes.load(Ordering::Relaxed)
                     + b.key_heap_bytes.load(Ordering::Relaxed)
             }
-            Self::Scalar(b) => b.reader.resident_bytes(),
+            Self::Scalar(b) => b.reader.resident_bytes() + b.key_heap_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -1189,6 +1226,8 @@ impl BTreeMemIndex {
 
     /// Export the index data as sorted RecordBatches for BTree index training.
     pub fn to_training_batches(&self, batch_size: usize) -> Result<Vec<RecordBatch>> {
+        use lance_core::ROW_ADDR;
+
         let snapshot = self.snapshot();
         if snapshot.is_empty() {
             return Ok(vec![]);
@@ -1197,7 +1236,7 @@ impl BTreeMemIndex {
         let data_type = snapshot[0].0.0.data_type();
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, data_type, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
 
         let mut batches = Vec::new();
@@ -1447,13 +1486,13 @@ impl MemIndexPlugin for BTreeMemIndexPlugin {
     }
 
     fn training_criteria(&self) -> TrainingCriteria {
-        TrainingCriteria::new(TrainingOrdering::Values).with_row_id()
+        TrainingCriteria::new(TrainingOrdering::Values).with_row_addr()
     }
 
     fn query_parser(
         &self,
         index_name: String,
-        _index_details: Option<&prost_types::Any>,
+        _params: &dyn MemIndexParams,
     ) -> Option<Box<dyn ScalarQueryParser>> {
         // The on-disk B-tree's parser, so both claim the same expressions.
         Some(Box::new(SargableQueryParser::new(
@@ -1489,6 +1528,35 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use rstest::rstest;
     use std::sync::Arc;
+
+    /// Keys the fallback backend copies into owned strings are charged for
+    /// those bytes; values stored inline in the node add nothing.
+    #[test]
+    fn test_scalar_backend_charges_owned_key_bytes() {
+        let rows = 100;
+        let long = "x".repeat(1024);
+        let key_heap = |array: ArrayRef| {
+            let backend = Backend::for_type(array.data_type());
+            let Backend::Scalar(scalar) = &backend else {
+                panic!("{} should use the fallback backend", array.data_type());
+            };
+            backend.insert_array_and_report_existing(&array, 0).unwrap();
+            assert_eq!(
+                backend.resident_bytes(),
+                scalar.reader.resident_bytes() + scalar.key_heap_bytes.load(Ordering::Relaxed)
+            );
+            scalar.key_heap_bytes.load(Ordering::Relaxed)
+        };
+
+        let strings = arrow_array::StringViewArray::from(vec![long.as_str(); rows]);
+        assert!(key_heap(Arc::new(strings)) >= rows * long.len());
+        // A dictionary of strings decodes each value into an owned string too.
+        let dictionary: arrow_array::DictionaryArray<arrow_array::types::Int32Type> =
+            vec![long.as_str(); rows].into_iter().collect();
+        assert!(key_heap(Arc::new(dictionary)) >= rows * long.len());
+        let floats = arrow_array::Float64Array::from(vec![1.5; rows]);
+        assert_eq!(key_heap(Arc::new(floats)), 0);
+    }
 
     fn create_test_schema() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
@@ -1877,7 +1945,7 @@ mod tests {
 
     #[test]
     fn test_btree_index_to_training_batches() {
-        use lance_core::ROW_ID;
+        use lance_core::ROW_ADDR;
         use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 
         let schema = create_test_schema();
@@ -1890,7 +1958,7 @@ mod tests {
         let batch = &batches[0];
         assert_eq!(batch.num_rows(), 6);
         assert_eq!(batch.schema().field(0).name(), VALUE_COLUMN_NAME);
-        assert_eq!(batch.schema().field(1).name(), ROW_ID);
+        assert_eq!(batch.schema().field(1).name(), ROW_ADDR);
 
         let values = batch
             .column_by_name(VALUE_COLUMN_NAME)
@@ -1903,7 +1971,7 @@ mod tests {
             vec![0, 1, 2, 10, 11, 12]
         );
         let row_ids = batch
-            .column_by_name(ROW_ID)
+            .column_by_name(ROW_ADDR)
             .unwrap()
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
@@ -1921,7 +1989,7 @@ mod tests {
     /// page for every later probe.
     #[test]
     fn test_btree_index_to_training_batches_dedups_repeated_positions() {
-        use lance_core::ROW_ID;
+        use lance_core::ROW_ADDR;
         use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 
         // Int and bytes backends both dedup; check each.
@@ -1935,7 +2003,7 @@ mod tests {
         let batches = index.to_training_batches(100).unwrap();
         assert_eq!(batches.len(), 1);
         let row_ids = batches[0]
-            .column_by_name(ROW_ID)
+            .column_by_name(ROW_ADDR)
             .unwrap()
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()
@@ -1966,7 +2034,7 @@ mod tests {
         index.insert(&batch, 0).unwrap();
         let batches = index.to_training_batches(100).unwrap();
         let row_ids = batches[0]
-            .column_by_name(ROW_ID)
+            .column_by_name(ROW_ADDR)
             .unwrap()
             .as_any()
             .downcast_ref::<arrow_array::UInt64Array>()

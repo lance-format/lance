@@ -3,7 +3,7 @@
 
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream};
+use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
 use futures::Stream;
 use lance_arrow::json::{JsonEncoding, JsonValues};
 use lance_core::{Error, Result};
@@ -92,8 +92,8 @@ mod tests {
     use arrow_array::cast::AsArray;
     use arrow_array::{ArrayRef, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::execution::RecordBatchStream;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion_execution::RecordBatchStream;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{TryStreamExt, stream};
     use lance_arrow::ARROW_EXT_NAME_KEY;
     use lance_arrow::json::{ARROW_JSON_EXT_NAME, JsonArray, json_field};

@@ -578,6 +578,7 @@ mod tests {
     use lance_datagen::{array, gen_batch};
     use lance_io::spill::LocalSpillStore;
     use rstest::rstest;
+    use std::time::Duration;
 
     fn flat_batch() -> RecordBatch {
         let quantizer = FlatQuantizer::new(2, DistanceType::L2);
@@ -614,6 +615,14 @@ mod tests {
         let mut aborted = PairwiseSpillWriter::new(&store).await.unwrap();
         aborted.write(batch.clone()).await.unwrap();
         drop(aborted);
+        // Accepted writes retain the backing until their blocking I/O finishes.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while std::fs::read_dir(&spill_dir).unwrap().count() != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("cancelled preparation must eventually remove temporary files");
         assert_eq!(
             std::fs::read_dir(spill_dir).unwrap().count(),
             0,
@@ -636,6 +645,84 @@ mod tests {
         let mut replacement = PairwiseSpillWriter::new(&capped).await.unwrap();
         replacement.write(batch).await.unwrap();
         drop(replacement.finish().await.unwrap());
+    }
+
+    #[test]
+    fn test_pairwise_spill_cancelled_write_retains_disk_budget() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let batch = flat_batch();
+            let store = LocalSpillStore::default();
+            let mut writer = PairwiseSpillWriter::new(&store).await.unwrap();
+            writer.write(batch.clone()).await.unwrap();
+            let encoded = writer.finish().await.unwrap();
+            let bytes = encoded.reader.size().await.unwrap();
+            drop(encoded);
+
+            let capped = LocalSpillStore::with_cap(bytes as u64).unwrap();
+            let mut writer = PairwiseSpillWriter::new(&capped).await.unwrap();
+            writer.write(batch.clone()).await.unwrap();
+            let encoded = writer.finish().await.unwrap();
+            let spill_path =
+                std::path::PathBuf::from(lance_io::local::to_local_path(encoded.reader.path()));
+            let spill_dir = spill_path.parent().unwrap().to_owned();
+            drop(encoded);
+            let mut aborted = PairwiseSpillWriter::new(&capped).await.unwrap();
+            // Open the quota probe before occupying the only blocking worker.
+            let mut replacement = PairwiseSpillWriter::new(&capped).await.unwrap();
+            let (release, wait) = tokio::sync::oneshot::channel::<()>();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                // Dropping the sender also releases the worker on assertion failure.
+                let _ = wait.blocking_recv();
+            });
+            ready.await.unwrap();
+
+            aborted.write(batch.clone()).await.unwrap();
+            drop(aborted);
+            assert_eq!(
+                std::fs::read_dir(&spill_dir).unwrap().count(),
+                2,
+                "queued write and quota probe must retain their backing"
+            );
+            let err = replacement.write(batch.clone()).await.unwrap_err();
+            assert!(matches!(err, Error::DiskCapExceeded { .. }), "{err}");
+            assert!(err.to_string().contains("cap"));
+
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while std::fs::read_dir(&spill_dir).unwrap().count() != 1 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("cancelled preparation must clean up after queued I/O finishes");
+            assert_eq!(std::fs::read_dir(&spill_dir).unwrap().count(), 1);
+            // Deletion precedes quota release; wait for the full cleanup to finish.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    match replacement.write(batch.clone()).await {
+                        Ok(()) => break,
+                        Err(Error::DiskCapExceeded { .. }) => {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        Err(err) => panic!("replacement preparation failed: {err}"),
+                    }
+                }
+            })
+            .await
+            .expect("cancelled preparation must release its disk reservation");
+            let encoded = replacement.finish().await.unwrap();
+            assert_eq!(encoded.read_batch(0).await.unwrap(), batch);
+            drop(encoded);
+            assert_eq!(std::fs::read_dir(&spill_dir).unwrap().count(), 0);
+        });
     }
 
     #[tokio::test]

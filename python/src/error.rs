@@ -89,16 +89,6 @@ fn namespace_error_to_pyerr(py: Python<'_>, ns_err: &NamespaceError) -> PyErr {
 pub trait PythonErrorExt<T> {
     /// Convert to a python error based on the Lance error type
     fn infer_error(self) -> PyResult<T>;
-    /// Convert to RuntimeError
-    fn runtime_error(self) -> PyResult<T>;
-    /// Convert to ValueError
-    fn value_error(self) -> PyResult<T>;
-    /// Convert to PyNotImplementedError
-    fn not_implemented(self) -> PyResult<T>;
-    /// Convert to PyIoError
-    fn io_error(self) -> PyResult<T>;
-    /// Convert to PyTimeoutError
-    fn timeout_error(self) -> PyResult<T>;
     /// Convert to PyTimeoutError for `Error::Timeout`, otherwise PyIoError.
     ///
     /// Used by call sites that historically mapped every `lance::Error` to
@@ -113,86 +103,71 @@ pub trait PythonErrorExt<T> {
 
 impl<T> PythonErrorExt<T> for std::result::Result<T, LanceError> {
     fn infer_error(self) -> PyResult<T> {
-        match &self {
-            Ok(_) => Ok(self.unwrap()),
-            Err(err) => match err {
-                LanceError::InvalidInput { .. } => self.value_error(),
-                LanceError::NotSupported { .. } => self.not_implemented(),
-                LanceError::IO { .. } => self.io_error(),
-                LanceError::Timeout { .. } => self.timeout_error(),
-                LanceError::NotFound { .. } => self.value_error(),
-                LanceError::RefNotFound { .. } => self.value_error(),
-                LanceError::VersionNotFound { .. } => self.value_error(),
-                LanceError::RetryableCommitConflict { .. }
-                | LanceError::CommitConflict { .. }
-                | LanceError::IncompatibleTransaction { .. } => {
-                    let retryable = commit_conflict_retryable(err);
-                    Python::attach(|py| Err(commit_conflict_error(py, err, retryable)))
+        let Err(err) = &self else {
+            return Ok(self.unwrap());
+        };
+        // Classify by the root error so a coalesced `Error::Shared(..)` from a
+        // shared cache/IO future maps to the same Python exception as the error
+        // it wraps, rather than falling through to a generic RuntimeError.
+        match err.find_root() {
+            LanceError::InvalidInput { .. }
+            | LanceError::NotFound { .. }
+            | LanceError::RefNotFound { .. }
+            | LanceError::VersionNotFound { .. } => Err(PyValueError::new_err(err.to_string())),
+            LanceError::NotSupported { .. } => Err(PyNotImplementedError::new_err(err.to_string())),
+            LanceError::IO { .. } => Err(PyIOError::new_err(err.to_string())),
+            LanceError::Timeout { .. } => Err(PyTimeoutError::new_err(err.to_string())),
+            root @ (LanceError::RetryableCommitConflict { .. }
+            | LanceError::CommitConflict { .. }
+            | LanceError::IncompatibleTransaction { .. }) => {
+                let retryable = commit_conflict_retryable(root);
+                Python::attach(|py| Err(commit_conflict_error(py, root, retryable)))
+            }
+            LanceError::Namespace { source, .. } => {
+                // Try to downcast to NamespaceError and convert to proper Python exception
+                if let Some(ns_err) = source.downcast_ref::<NamespaceError>() {
+                    Python::attach(|py| Err(namespace_error_to_pyerr(py, ns_err)))
+                } else {
+                    log::warn!(
+                        "Failed to downcast NamespaceError source, falling back to runtime error. \
+                         This may indicate a version mismatch. Source type: {:?}",
+                        source
+                    );
+                    Err(PyRuntimeError::new_err(err.to_string()))
                 }
-                LanceError::Namespace { source, .. } => {
-                    // Try to downcast to NamespaceError and convert to proper Python exception
-                    if let Some(ns_err) = source.downcast_ref::<NamespaceError>() {
-                        Python::attach(|py| Err(namespace_error_to_pyerr(py, ns_err)))
-                    } else {
-                        log::warn!(
-                            "Failed to downcast NamespaceError source, falling back to runtime error. \
-                             This may indicate a version mismatch. Source type: {:?}",
-                            source
-                        );
-                        self.runtime_error()
-                    }
-                }
-                _ => self.runtime_error(),
-            },
+            }
+            _ => Err(PyRuntimeError::new_err(err.to_string())),
         }
     }
 
-    fn runtime_error(self) -> PyResult<T> {
-        self.map_err(|err| PyRuntimeError::new_err(err.to_string()))
-    }
-
-    fn value_error(self) -> PyResult<T> {
-        self.map_err(|err| PyValueError::new_err(err.to_string()))
-    }
-
-    fn not_implemented(self) -> PyResult<T> {
-        self.map_err(|err| PyNotImplementedError::new_err(err.to_string()))
-    }
-
-    fn io_error(self) -> PyResult<T> {
-        self.map_err(|err| PyIOError::new_err(err.to_string()))
-    }
-
-    fn timeout_error(self) -> PyResult<T> {
-        self.map_err(|err| PyTimeoutError::new_err(err.to_string()))
-    }
-
     fn io_or_timeout_error(self) -> PyResult<T> {
-        match &self {
-            Err(LanceError::Timeout { .. }) => self.timeout_error(),
-            Err(
-                err @ (LanceError::RetryableCommitConflict { .. }
-                | LanceError::CommitConflict { .. }
-                | LanceError::IncompatibleTransaction { .. }),
-            ) => {
-                let retryable = commit_conflict_retryable(err);
-                Python::attach(|py| Err(commit_conflict_error(py, err, retryable)))
+        let Err(err) = &self else {
+            return Ok(self.unwrap());
+        };
+        match err.find_root() {
+            LanceError::Timeout { .. } => Err(PyTimeoutError::new_err(err.to_string())),
+            root @ (LanceError::RetryableCommitConflict { .. }
+            | LanceError::CommitConflict { .. }
+            | LanceError::IncompatibleTransaction { .. }) => {
+                let retryable = commit_conflict_retryable(root);
+                Python::attach(|py| Err(commit_conflict_error(py, root, retryable)))
             }
-            _ => self.io_error(),
+            _ => Err(PyIOError::new_err(err.to_string())),
         }
     }
 
     fn io_or_commit_conflict_error(self) -> PyResult<T> {
-        match &self {
-            Err(
-                err @ (LanceError::RetryableCommitConflict { .. }
-                | LanceError::CommitConflict { .. }
-                | LanceError::IncompatibleTransaction { .. }),
-            ) => {
-                let retryable = commit_conflict_retryable(err);
-                Python::attach(|py| Err(commit_conflict_error(py, err, retryable)))
+        let Err(err) = &self else {
+            return Ok(self.unwrap());
+        };
+        match err.find_root() {
+            root @ (LanceError::RetryableCommitConflict { .. }
+            | LanceError::CommitConflict { .. }
+            | LanceError::IncompatibleTransaction { .. }) => {
+                let retryable = commit_conflict_retryable(root);
+                Python::attach(|py| Err(commit_conflict_error(py, root, retryable)))
             }
-            _ => self.io_error(),
+            _ => Err(PyIOError::new_err(err.to_string())),
         }
     }
 }

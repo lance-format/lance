@@ -338,7 +338,14 @@ impl object_store::ObjectStore for MeteredObjectStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> OSResult<Box<dyn MultipartUpload>> {
-        let upload = self.target.put_multipart_opts(location, opts).await?;
+        // Creating the upload is a request of its own, and the only one in
+        // this store that went unrecorded: its parts, completion and abort
+        // are all metered already.
+        let _in_flight = InFlightGuard::new(&self.base, "create_multipart");
+        let start = Instant::now();
+        let result = self.target.put_multipart_opts(location, opts).await;
+        record_request(&self.base, "create_multipart", start, 0, &result);
+        let upload = result?;
         Ok(Box::new(MeteredMultipartUpload {
             target: upload,
             base: self.base.clone(),
@@ -1304,6 +1311,16 @@ mod tests {
             histogram_count(&recorded, METRIC_DURATION, &complete_labels),
             1
         );
+
+        // So is creating it, which is what a dashboard compares the
+        // completions against.
+        let create_labels = [("operation", "create_multipart"), ("base", "memory")];
+        assert_eq!(counter_value(&recorded, METRIC_REQUESTS, &create_labels), 1);
+        assert_eq!(
+            histogram_count(&recorded, METRIC_DURATION, &create_labels),
+            1
+        );
+        assert_eq!(counter_value(&recorded, METRIC_ERRORS, &create_labels), 0);
     }
 
     #[test]

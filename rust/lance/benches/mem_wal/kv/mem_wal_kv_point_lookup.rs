@@ -773,7 +773,7 @@ async fn run_lance(
 
     // No-flush config: every *memtable*-flush threshold is set above the
     // dataset so the single active MemTable holds all rows (no generation is
-    // sealed to disk). Read visibility is gated on the WAL durability
+    // frozen to disk). Read visibility is gated on the WAL durability
     // watermark (`max_visible_batch_position`), which only advances on a WAL
     // flush — so we use `durable_write=true`: each put flushes its batch to
     // the WAL and awaits, which both populates the maintained BTree and
@@ -800,7 +800,7 @@ async fn run_lance(
     let writer = dataset.mem_wal_writer(shard_id, config).await?;
 
     // --- write phase ---
-    // LSM: split rows into `generations+1` parts; seal+flush after each of the
+    // LSM: split rows into `generations+1` parts; freeze+flush after each of the
     // first `generations` parts (each becomes an on-disk generation) and leave
     // the last part in the active MemTable.
     let gens = args.generations;
@@ -826,7 +826,7 @@ async fn run_lance(
             lo = hi;
         }
         if g < gens {
-            writer.force_seal_active().await?;
+            writer.force_freeze_active().await?;
             for _ in 0..600 {
                 let n = writer
                     .manifest()

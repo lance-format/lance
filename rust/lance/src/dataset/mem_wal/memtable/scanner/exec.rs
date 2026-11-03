@@ -27,13 +27,15 @@ mod scan;
 mod vector;
 
 use crate::dataset::blob::prepared_blob_batch_to_descriptors;
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
-use crate::dataset::mem_wal::write::BatchStore;
 
 pub use brute_force_vector::MemTableBruteForceVectorExec;
 pub use dedup_scan::MemTableDedupScanExec;
 pub use fts::{FtsIndexExec, SCORE_COLUMN};
 pub use scalar_index::ScalarMemIndexExec;
+#[cfg(test)]
+pub use scalar_index::{FALLBACK_READS_METRIC, NEWEST_CHECKS_METRIC};
 pub use scan::{MemTableScanExec, ROW_ADDRESS_COLUMN};
 pub use vector::VectorIndexExec;
 
