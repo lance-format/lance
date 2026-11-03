@@ -27,6 +27,10 @@ import java.util.Objects;
  * divisible by 8; numBits must be between 1 and 9 inclusive. Restored models using the
  * residual-query estimator require numBits to be 1.
  *
+ * <p>The serialized representation is a transient transfer format between producers and workers
+ * using the same Lance SDK version. It is not a persistent compatibility contract; rebuild the
+ * model after upgrading the SDK instead of storing it for use across versions.
+ *
  * <pre>{@code
  * RQModel model = RQModel.build(128, (byte) 5);
  * byte[] transferred = model.toBytes();

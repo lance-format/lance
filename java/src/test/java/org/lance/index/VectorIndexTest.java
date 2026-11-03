@@ -628,6 +628,33 @@ public class VectorIndexTest {
     }
   }
 
+  @Test
+  public void testIvfRqModelSettingsMismatch(@TempDir Path tempDir) throws Exception {
+    try (TestVectorDataset fixture =
+            new TestVectorDataset(tempDir.resolve("ivf_rq_wrong_settings"));
+        Dataset dataset = fixture.create()) {
+      IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(2).build();
+      RQModel model = RQModel.build(32, (byte) 3);
+
+      assertCreateIvfRqIndexFails(
+          dataset,
+          ivf,
+          new RQBuildParams.Builder().setNumBits((byte) 1).setModel(model).build(),
+          "num_bits=3",
+          "requested num_bits=1");
+      assertCreateIvfRqIndexFails(
+          dataset,
+          ivf,
+          new RQBuildParams.Builder()
+              .setNumBits((byte) 3)
+              .setRotationType(RQRotationType.MATRIX)
+              .setModel(model)
+              .build(),
+          "rotation_type=Fast",
+          "requested rotation_type=Matrix");
+    }
+  }
+
   /**
    * Regression test for the metric_type passthrough in the JNI VectorTrainer.
    *
@@ -718,5 +745,26 @@ public class VectorIndexTest {
       }
     }
     return false;
+  }
+
+  private static void assertCreateIvfRqIndexFails(
+      Dataset dataset, IvfBuildParams ivf, RQBuildParams rq, String... expectedCauseMessages) {
+    IndexParams params =
+        IndexParams.builder()
+            .setVectorIndexParams(VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, rq))
+            .build();
+    RuntimeException error =
+        assertThrows(
+            RuntimeException.class,
+            () ->
+                dataset.createIndex(
+                    IndexOptions.builder(
+                            List.of(TestVectorDataset.vectorColumnName), IndexType.IVF_RQ, params)
+                        .build()));
+    for (String expected : expectedCauseMessages) {
+      assertTrue(
+          causeChainContains(error, expected),
+          "Expected cause containing '" + expected + "', got: " + error);
+    }
   }
 }

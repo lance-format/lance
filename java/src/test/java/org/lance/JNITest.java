@@ -38,7 +38,6 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class JNITest {
   @Test
@@ -183,39 +182,6 @@ public class JNITest {
     assertThrows(IllegalArgumentException.class, () -> RQModel.build(31, (byte) 3));
     assertThrows(IllegalArgumentException.class, () -> RQModel.build(32, (byte) 0));
     assertThrows(IllegalArgumentException.class, () -> RQModel.fromBytes(new byte[] {1, 2, 3}));
-
-    IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(2).build();
-    RQBuildParams wrongBits =
-        new RQBuildParams.Builder().setNumBits((byte) 1).setModel(restored).build();
-    IllegalArgumentException bitsError =
-        assertThrows(
-            IllegalArgumentException.class,
-            () ->
-                JniTestHelper.parseIndexParams(
-                    IndexParams.builder()
-                        .setVectorIndexParams(
-                            VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, wrongBits))
-                        .build()));
-    assertTrue(bitsError.getMessage().contains("num_bits=3"));
-    assertTrue(bitsError.getMessage().contains("requested num_bits=1"));
-
-    RQBuildParams wrongRotation =
-        new RQBuildParams.Builder()
-            .setNumBits((byte) 3)
-            .setRotationType(RQRotationType.MATRIX)
-            .setModel(restored)
-            .build();
-    IllegalArgumentException rotationError =
-        assertThrows(
-            IllegalArgumentException.class,
-            () ->
-                JniTestHelper.parseIndexParams(
-                    IndexParams.builder()
-                        .setVectorIndexParams(
-                            VectorIndexParams.withIvfRqParams(DistanceType.L2, ivf, wrongRotation))
-                        .build()));
-    assertTrue(rotationError.getMessage().contains("rotation_type=Fast"));
-    assertTrue(rotationError.getMessage().contains("requested rotation_type=Matrix"));
   }
 
   @Test
