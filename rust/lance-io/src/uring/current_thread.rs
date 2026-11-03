@@ -11,7 +11,6 @@ use super::requests::{IoRequest, PendingRequests, RequestState};
 use super::{DEFAULT_URING_BLOCK_SIZE, DEFAULT_URING_IO_PARALLELISM, URING_BLOCK_SIZE};
 use crate::local::to_local_path;
 use crate::traits::Reader;
-use crate::uring::DEFAULT_URING_QUEUE_DEPTH;
 use crate::utils::tracking_store::IOTracker;
 use bytes::{Bytes, BytesMut};
 use futures::FutureExt;
@@ -44,7 +43,7 @@ static USER_DATA_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub(super) const DEFAULT_THREAD_LOCAL_QUEUE_DEPTH: usize = 2;
 
 #[cfg(not(test))]
-const DEFAULT_THREAD_LOCAL_QUEUE_DEPTH: usize = DEFAULT_URING_QUEUE_DEPTH;
+const DEFAULT_THREAD_LOCAL_QUEUE_DEPTH: usize = super::DEFAULT_URING_QUEUE_DEPTH;
 
 /// Thread-local io_uring instance with pending requests
 struct ThreadLocalUring {
