@@ -700,6 +700,9 @@ pub struct WriteParams {
     /// The strategy used when writing external blob URIs.
     pub external_blob_mode: ExternalBlobMode,
 
+    /// Runtime application admission for incoming blob values. Never serialized.
+    pub blob_write_policy: Option<Arc<dyn super::blob::BlobWritePolicy>>,
+
     /// Maximum size in bytes for blob v2 pack (.blob) sidecar files.
     /// When a pack file reaches this size, a new one is started.
     /// If not set, defaults to 1 GiB.
@@ -740,6 +743,7 @@ impl Default for WriteParams {
             target_all_bases: None,
             allow_external_blob_outside_bases: false,
             external_blob_mode: ExternalBlobMode::Reference,
+            blob_write_policy: None,
             blob_pack_file_size_threshold: None,
             file_writer_options: None,
         }

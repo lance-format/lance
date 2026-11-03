@@ -694,6 +694,14 @@ impl MergeInsertJob {
         self,
         source: SendableRecordBatchStream,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
+        let source = crate::dataset::blob::guard_blob_write_stream(
+            source,
+            self.write_params
+                .blob_write_policy
+                .clone()
+                .or_else(|| self.dataset.session().blob_write_policy()),
+            crate::dataset::blob::BlobWriteContext::for_dataset(Some(&self.dataset)),
+        )?;
         let (provider, source_mode) = self.stream_source_to_provider(source).await?;
         self.execute_inner(provider, source_mode).await
     }
@@ -713,6 +721,14 @@ impl MergeInsertJob {
         self,
         provider: Arc<dyn TableProvider>,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
+        if self.write_params.blob_write_policy.is_some()
+            || self.dataset.session().blob_write_policy().is_some()
+        {
+            let context = SessionContext::new();
+            let plan = provider.scan(&context.state(), None, &[], None).await?;
+            let stream = datafusion::physical_plan::execute_stream(plan, context.task_ctx())?;
+            return self.execute(stream).await;
+        }
         // TableProvider supports repeated scans, but does not guarantee that
         // separate scans observe the same rows.
         self.execute_inner(provider, SourceProviderMode::Rescannable)
@@ -729,7 +745,29 @@ impl MergeInsertJob {
         self,
         batches: Vec<RecordBatch>,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
-        let provider = self.batches_to_provider(batches)?;
+        let mut validated = Vec::with_capacity(batches.len());
+        for batch in batches {
+            validated.push(
+                if let Some(policy) = self
+                    .write_params
+                    .blob_write_policy
+                    .clone()
+                    .or_else(|| self.dataset.session().blob_write_policy())
+                {
+                    policy
+                        .apply(
+                            batch,
+                            &crate::dataset::blob::BlobWriteContext::for_dataset(Some(
+                                &self.dataset,
+                            )),
+                        )
+                        .await?
+                } else {
+                    batch
+                },
+            );
+        }
+        let provider = self.batches_to_provider(validated)?;
         self.execute_inner(provider, SourceProviderMode::StableSnapshot)
             .await
     }
@@ -741,7 +779,29 @@ impl MergeInsertJob {
         self,
         batches: Vec<RecordBatch>,
     ) -> Result<UncommittedMergeInsert> {
-        let provider = self.batches_to_provider(batches)?;
+        let mut validated = Vec::with_capacity(batches.len());
+        for batch in batches {
+            validated.push(
+                if let Some(policy) = self
+                    .write_params
+                    .blob_write_policy
+                    .clone()
+                    .or_else(|| self.dataset.session().blob_write_policy())
+                {
+                    policy
+                        .apply(
+                            batch,
+                            &crate::dataset::blob::BlobWriteContext::for_dataset(Some(
+                                &self.dataset,
+                            )),
+                        )
+                        .await?
+                } else {
+                    batch
+                },
+            );
+        }
+        let provider = self.batches_to_provider(validated)?;
         self.execute_uncommitted_impl(provider, SourceProviderMode::StableSnapshot)
             .await
     }
@@ -841,7 +901,14 @@ impl MergeInsertJob {
         self,
         source: impl StreamingWriteSource,
     ) -> Result<UncommittedMergeInsert> {
-        let stream = source.into_stream();
+        let stream = crate::dataset::blob::guard_blob_write_stream(
+            source.into_stream(),
+            self.write_params
+                .blob_write_policy
+                .clone()
+                .or_else(|| self.dataset.session().blob_write_policy()),
+            crate::dataset::blob::BlobWriteContext::for_dataset(Some(&self.dataset)),
+        )?;
         self.execute_uncommitted_impl(one_shot_provider(stream)?, SourceProviderMode::OneShot)
             .await
     }

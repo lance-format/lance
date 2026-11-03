@@ -66,7 +66,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
-pub(crate) mod blob;
+pub mod blob;
 pub(crate) mod branch_location;
 pub mod builder;
 pub mod cleanup;
@@ -2906,6 +2906,13 @@ impl Dataset {
             }
             None => Ok(self.base.clone().join(INDICES_DIR)),
         }
+    }
+
+    /// Clone this snapshot with request-local admission state. Cached snapshots are unchanged.
+    pub fn with_blob_write_policy(&self, policy: Arc<dyn blob::BlobWritePolicy>) -> Self {
+        let mut dataset = self.clone();
+        dataset.session = Arc::new(self.session.as_ref().clone().with_blob_write_policy(policy));
+        dataset
     }
 
     pub fn session(&self) -> Arc<Session> {

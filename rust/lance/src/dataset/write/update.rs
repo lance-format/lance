@@ -540,6 +540,9 @@ impl UpdateJob {
             .await?
         };
 
+        let blob_write_policy = self.dataset.session().blob_write_policy();
+        let blob_write_context =
+            crate::dataset::blob::BlobWriteContext::for_dataset(Some(&self.dataset));
         let updates_ref = plan.updates.clone();
         let blob_columns = plan.blob_columns.clone();
         let output_schema = schema.clone();
@@ -561,9 +564,34 @@ impl UpdateJob {
             .then(move |batch_result| {
                 let external_base_resolver = external_base_resolver.clone();
                 let updated_blob_column_indices = updated_blob_column_indices.clone();
+                let policy = blob_write_policy.clone();
+                let context = blob_write_context.clone();
                 async move {
-                    let batch = batch_result?;
-                    if let Some(resolver) = external_base_resolver.as_deref() {
+                    let mut batch = batch_result?;
+                    let has_policy = policy.is_some();
+                    if let Some(policy) = policy {
+                        let values = batch.project(&updated_blob_column_indices)?;
+                        let values = policy
+                            .apply(values, &context)
+                            .await
+                            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+                        let mut fields = batch.schema().fields().to_vec();
+                        let mut columns = batch.columns().to_vec();
+                        for (index, original) in updated_blob_column_indices.iter().enumerate() {
+                            fields[*original] = values.schema().field(index).clone().into();
+                            columns[*original] = values.column(index).clone();
+                        }
+                        batch = RecordBatch::try_new(
+                            Arc::new(ArrowSchema::new_with_metadata(
+                                fields,
+                                batch.schema().metadata().clone(),
+                            )),
+                            columns,
+                        )?;
+                    }
+                    if let Some(resolver) =
+                        external_base_resolver.as_deref().filter(|_| !has_policy)
+                    {
                         let updated_blob_batch = batch.project(&updated_blob_column_indices)?;
                         let selected_rows = vec![true; batch.num_rows()];
                         crate::dataset::blob::validate_external_blob_references(

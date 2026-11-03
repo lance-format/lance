@@ -13,6 +13,9 @@ mod rewrite;
 #[cfg(test)]
 pub mod test_util;
 mod write;
+mod write_policy;
+
+pub use write_policy::{BlobWriteContext, BlobWritePolicy, guard_blob_write_stream};
 
 pub(super) use external::{
     ExternalBaseCandidate, ExternalBaseResolver, validate_external_blob_references,

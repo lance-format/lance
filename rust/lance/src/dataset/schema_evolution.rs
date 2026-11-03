@@ -386,6 +386,15 @@ pub(super) async fn add_columns_to_fragments(
         }
     }?;
 
+    let output_schema = if let Some(policy) = dataset.session().blob_write_policy() {
+        Arc::new(policy.schema(
+            output_schema.as_ref(),
+            &super::blob::BlobWriteContext::for_dataset(Some(dataset)),
+        )?)
+    } else {
+        output_schema
+    };
+
     let mut schema = match dataset.schema().merge(output_schema.as_ref()) {
         Ok(schema) => schema,
         Err(e) => {

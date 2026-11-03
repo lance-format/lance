@@ -77,6 +77,8 @@ pub struct Session {
 
     store_registry: Arc<ObjectStoreRegistry>,
 
+    blob_write_policy: Option<Arc<dyn crate::dataset::blob::BlobWritePolicy>>,
+
     spill_store: Arc<dyn SpillStore>,
 
     /// The origin latency class the process declares for the IVF_RQ indexes
@@ -156,6 +158,7 @@ impl Session {
             )),
             index_extensions: HashMap::new(),
             store_registry,
+            blob_write_policy: None,
             spill_store: Arc::new(LocalSpillStore::default()),
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
@@ -180,11 +183,26 @@ impl Session {
             )),
             index_extensions: HashMap::new(),
             store_registry,
+            blob_write_policy: None,
             spill_store: Arc::new(LocalSpillStore::default()),
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
             rabit_scan_factory: None,
         }
+    }
+
+    /// Attach admission state to a request-local clone while sharing storage and caches.
+    pub fn with_blob_write_policy(
+        mut self,
+        policy: Arc<dyn crate::dataset::blob::BlobWritePolicy>,
+    ) -> Self {
+        self.blob_write_policy = Some(policy);
+        self
+    }
+
+    /// The runtime admission policy, never loaded from persisted metadata.
+    pub fn blob_write_policy(&self) -> Option<Arc<dyn crate::dataset::blob::BlobWritePolicy>> {
+        self.blob_write_policy.clone()
     }
 
     /// Replace the spill store used by this session.
@@ -339,6 +357,7 @@ impl Session {
             metadata_cache: GlobalMetadataCache(metadata_cache),
             index_extensions: HashMap::new(),
             store_registry,
+            blob_write_policy: None,
             spill_store: Arc::new(LocalSpillStore::default()),
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,

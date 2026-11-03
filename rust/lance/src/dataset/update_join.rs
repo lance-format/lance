@@ -41,7 +41,7 @@ use lance_datafusion::exec::{
     OneShotExec, collect_execution_metrics, new_session_context,
 };
 use lance_datafusion::spill::{materialize_replayable_stream, materialize_stream};
-use lance_datafusion::utils::reader_to_stream;
+use lance_datafusion::utils::{StreamingWriteSource, reader_to_stream};
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
 
@@ -332,10 +332,8 @@ fn canonical_blob_array(
     }
 }
 
-fn canonicalize_blob_reader(
-    reader: Box<dyn RecordBatchReader + Send>,
-) -> Result<Box<dyn RecordBatchReader + Send>> {
-    let source_schema = reader.schema();
+fn canonicalize_blob_stream(input: SendableRecordBatchStream) -> Result<SendableRecordBatchStream> {
+    let source_schema = input.schema();
     let target_fields = source_schema
         .fields()
         .iter()
@@ -346,11 +344,10 @@ fn canonicalize_blob_reader(
         source_schema.metadata().clone(),
     ));
     if source_schema.fields() == target_schema.fields() {
-        return Ok(reader);
+        return Ok(input);
     }
-
     let output_schema = target_schema.clone();
-    let converted = reader.map(move |batch| {
+    let converted = input.map(move |batch| {
         let batch = batch?;
         let columns = batch
             .schema()
@@ -362,9 +359,12 @@ fn canonicalize_blob_reader(
                 canonical_blob_array(source_field, target_field, column.clone())
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        RecordBatch::try_new(output_schema.clone(), columns)
+        Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
     });
-    Ok(Box::new(RecordBatchIterator::new(converted, target_schema)))
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        target_schema,
+        converted,
+    )))
 }
 
 struct BlobUpdateContext {
@@ -440,7 +440,11 @@ impl BlobUpdateContext {
     }
 
     async fn validate_updates(&self, batch: &RecordBatch, matched_rows: &[bool]) -> Result<()> {
-        if let Some(resolver) = self.external_base_resolver.as_deref() {
+        if let Some(resolver) = self
+            .external_base_resolver
+            .as_deref()
+            .filter(|_| self.dataset.session().blob_write_policy().is_none())
+        {
             blob::validate_external_blob_references(resolver, batch, matched_rows).await?;
         }
         Ok(())
@@ -448,16 +452,16 @@ impl BlobUpdateContext {
 }
 
 async fn prepare_rhs(
-    reader: Box<dyn RecordBatchReader + Send>,
+    source: impl StreamingWriteSource,
     right_on: &str,
     options: &UpdateColumnsOptions,
 ) -> Result<PreparedRhs> {
-    let schema = reader.schema();
+    let mut unread = source.into_stream();
+    let schema = unread.schema();
     let key_index = schema.index_of(right_on)?;
     let resolved_pool_size = options.execution_options.mem_pool_size();
     let hash_byte_budget = options.max_hash_bytes;
 
-    let mut unread = reader_to_stream(reader);
     let mut prefetched = Vec::new();
     let mut all_buffers = MemoryAccumulator::default();
     let mut key_buffers = MemoryAccumulator::default();
@@ -575,7 +579,12 @@ pub(super) async fn update_columns_with_options(
         )));
     }
 
-    let original_right_schema = right_reader.schema();
+    let right_stream = blob::guard_blob_write_stream(
+        reader_to_stream(right_reader),
+        fragment.dataset().session().blob_write_policy(),
+        blob::BlobWriteContext::for_dataset(Some(fragment.dataset())),
+    )?;
+    let original_right_schema = right_stream.schema();
     if original_right_schema.field_with_name(right_on).is_err() {
         return Err(Error::invalid_input(format!(
             "Column {} does not exist in the right side fragment",
@@ -605,12 +614,12 @@ pub(super) async fn update_columns_with_options(
 
     // Match the physical representation returned by fragment scans (for example,
     // JSONB and offset-based string/binary arrays).
-    let right_reader = SchemaAdapter::new(original_right_schema).to_physical_reader(right_reader);
-    let right_reader = canonicalize_blob_reader(right_reader)?;
-    let right_schema = right_reader.schema();
+    let right_stream = SchemaAdapter::new(original_right_schema).to_physical_stream(right_stream);
+    let right_stream = canonicalize_blob_stream(right_stream)?;
+    let right_schema = right_stream.schema();
     validate_key_types(fragment, left_on, &right_schema, right_on)?;
 
-    match prepare_rhs(right_reader, right_on, &options).await? {
+    match prepare_rhs(right_stream, right_on, &options).await? {
         PreparedRhs::Empty(stats) => {
             report_strategy_selection(
                 options.execution_options.execution_stats_callback.as_ref(),
@@ -730,7 +739,7 @@ async fn run_hash_update(
             blob_context.blob_handling.clone(),
         )
         .await?;
-    if blob_context.has_blob_v2 {
+    if blob_context.has_blob_v2 || fragment.dataset().session().blob_write_policy().is_some() {
         updater.allow_external_blob_outside_bases();
     }
     let fragment_id = fragment_id(fragment)?;
@@ -971,7 +980,7 @@ async fn run_external_update(
             blob_context.blob_handling.clone(),
         )
         .await?;
-    if blob_context.has_blob_v2 {
+    if blob_context.has_blob_v2 || fragment.dataset().session().blob_write_policy().is_some() {
         updater.allow_external_blob_outside_bases();
     }
     let mut matched_offsets = RoaringBitmap::new();
@@ -2109,6 +2118,106 @@ mod tests {
         assert_eq!(payload.value(0), b"one");
         assert_eq!(payload.value(1), b"NEW");
         assert!(payload.is_null(2));
+    }
+
+    #[derive(Debug)]
+    struct IncomingValuePolicy;
+
+    #[async_trait::async_trait]
+    impl blob::BlobWritePolicy for IncomingValuePolicy {
+        fn schema(
+            &self,
+            input: &ArrowSchema,
+            context: &blob::BlobWriteContext,
+        ) -> Result<ArrowSchema> {
+            assert!(context.target_schema.is_some());
+            let fields = input
+                .fields()
+                .iter()
+                .map(|field| {
+                    if field.name() == "incoming" {
+                        Arc::new(field.as_ref().clone().with_name("value"))
+                    } else {
+                        field.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            Ok(ArrowSchema::new_with_metadata(
+                fields,
+                input.metadata().clone(),
+            ))
+        }
+
+        async fn apply(
+            &self,
+            batch: RecordBatch,
+            context: &blob::BlobWriteContext,
+        ) -> Result<RecordBatch> {
+            // The policy must see the RHS before joining with existing values.
+            let values = batch["incoming"]
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            assert!(
+                values
+                    .values()
+                    .iter()
+                    .all(|value| *value > 0 && *value < 100)
+            );
+            let mut columns = batch.columns().to_vec();
+            columns[batch.schema().index_of("incoming")?] = Arc::new(Int32Array::from(
+                values
+                    .values()
+                    .iter()
+                    .map(|value| value * 10)
+                    .collect::<Vec<_>>(),
+            ));
+            Ok(RecordBatch::try_new(
+                Arc::new(self.schema(batch.schema().as_ref(), context)?),
+                columns,
+            )?)
+        }
+    }
+
+    #[rstest]
+    #[case::hash(false)]
+    #[case::external(true)]
+    #[tokio::test]
+    async fn test_update_policy_admits_rhs_before_join(#[case] is_external: bool) {
+        let input = record_batch!(("key", Int32, [1, 2]), ("value", Int32, [-1, -1])).unwrap();
+        let dataset = Dataset::write(
+            reader(input.schema(), vec![Ok(input.clone()), Ok(input)]),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let dataset = dataset.with_blob_write_policy(Arc::new(IncomingValuePolicy));
+        assert_eq!(dataset.get_fragments().len(), 2);
+        for mut fragment in dataset.get_fragments() {
+            let updates =
+                record_batch!(("rhs_key", Int32, [2]), ("incoming", Int32, [10])).unwrap();
+            let result = update_columns_with_options(
+                &mut fragment,
+                reader(updates.schema(), vec![Ok(updates)]),
+                "key",
+                "rhs_key",
+                if is_external {
+                    options(0, usize::MAX)
+                } else {
+                    options(usize::MAX, usize::MAX)
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.matched_offsets, RoaringBitmap::from_iter([1]));
+            let fragment = FileFragment::new(Arc::new(dataset.clone()), result.fragment);
+            let batch = fragment.scan().try_into_batch().await.unwrap();
+            assert_eq!(batch["value"].as_ref(), &Int32Array::from(vec![-1, 100]));
+        }
     }
 
     #[rstest]

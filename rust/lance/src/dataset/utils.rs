@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::Result;
-use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt64Array};
+use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::{
     DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
@@ -330,24 +330,23 @@ impl SchemaAdapter {
         ))
     }
 
-    /// Wrap a synchronous [`RecordBatchReader`] so each batch is converted from
-    /// its logical form to the physical form Lance stores on disk (Arrow JSON →
-    /// Lance JSON, view types → offset types). Returns the reader unchanged when
-    /// no field needs conversion.
-    pub fn to_physical_reader(
+    /// Convert a logical stream into the physical form Lance stores on disk
+    /// (Arrow JSON → Lance JSON, view types → offset types). Returns the stream
+    /// unchanged when no field needs conversion.
+    pub fn to_physical_stream(
         &self,
-        reader: Box<dyn RecordBatchReader + Send>,
-    ) -> Box<dyn RecordBatchReader + Send> {
+        stream: SendableRecordBatchStream,
+    ) -> SendableRecordBatchStream {
         if !self.requires_physical_conversion() {
-            return reader;
+            return stream;
         }
-        let schema = Self::physical_schema(&reader.schema());
-        let converted = reader.map(|batch| {
+        let schema = Self::physical_schema(&stream.schema());
+        let converted = stream.map(|batch| {
             let batch = batch?;
             let batch = convert_json_columns(&batch)?;
-            downcast_view_columns(&batch)
+            Ok(downcast_view_columns(&batch)?)
         });
-        Box::new(RecordBatchIterator::new(converted, schema))
+        Box::pin(RecordBatchStreamAdapter::new(schema, converted))
     }
 
     /// Convert a physical stream into a logical stream.

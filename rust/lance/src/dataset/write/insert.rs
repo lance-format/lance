@@ -231,6 +231,24 @@ impl<'a> InsertBuilder<'a> {
     ) -> Result<(Transaction, WriteContext<'_>)> {
         let mut context = self.resolve_context().await?;
 
+        let policy = context.params.blob_write_policy.clone().or_else(|| {
+            context
+                .dest
+                .dataset()
+                .and_then(|dataset| dataset.session().blob_write_policy())
+        });
+        let (stream, schema) = if policy.is_some() {
+            let stream = super::super::blob::guard_blob_write_stream(
+                stream,
+                policy,
+                super::super::blob::BlobWriteContext::for_dataset(context.dest.dataset()),
+            )?;
+            let schema = Schema::try_from(stream.schema().as_ref())?;
+            (stream, schema)
+        } else {
+            (stream, schema)
+        };
+
         info!(
             target: TRACE_DATASET_EVENTS,
             event=DATASET_WRITING_EVENT,
@@ -238,6 +256,14 @@ impl<'a> InsertBuilder<'a> {
             mode=?context.params.mode
         );
 
+        if context.params.blob_write_policy.is_some()
+            || context
+                .dest
+                .dataset()
+                .is_some_and(|dataset| dataset.session().blob_write_policy().is_some())
+        {
+            context.params.allow_external_blob_outside_bases = true;
+        }
         self.validate_write(&mut context, &schema)?;
 
         let existing_base_paths = context.dest.dataset().map(|ds| &ds.manifest.base_paths);

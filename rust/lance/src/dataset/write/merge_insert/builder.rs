@@ -385,12 +385,18 @@ impl MergeInsertBuilder {
         // operation-scoped so any execution error discards that accounting and
         // cannot reduce the quota of a later merge job.
         let spill_session_context = new_session_context(&spill_execution_options);
+        let mut write_params = self.write_params.as_ref().clone();
+        if write_params.blob_write_policy.is_some()
+            || self.dataset.session().blob_write_policy().is_some()
+        {
+            write_params.allow_external_blob_outside_bases = true;
+        }
         Ok(MergeInsertJob {
             dataset: self.dataset.clone(),
             params,
             spill_session_context,
             spill_execution_options,
-            write_params: self.write_params.clone(),
+            write_params: Arc::new(write_params),
         })
     }
 }

@@ -694,7 +694,10 @@ impl FullSchemaMergeInsertExec {
                 let result: lance_core::Result<Vec<Fragment>> = async {
                     // Existing target references can be outside the current
                     // bases. Validate only source-provided blob columns.
-                    let stream = if source_blob_columns.is_empty() {
+                    let stream = if source_blob_columns.is_empty()
+                        || dataset.session().blob_write_policy().is_some()
+                        || write_params.blob_write_policy.is_some()
+                    {
                         stream
                     } else {
                         let resolver = blob_v2_external_base_resolver(

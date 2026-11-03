@@ -245,7 +245,8 @@ impl Updater {
             self.write_version,
             self.dataset(),
             &schema,
-            self.allow_external_blob_outside_bases,
+            self.allow_external_blob_outside_bases
+                || self.dataset().session().blob_write_policy().is_some(),
         )
         .await
     }
@@ -312,6 +313,20 @@ impl Updater {
     ///
     /// Errors leave the updater in the same unspecified state as [`Self::update`].
     pub async fn update_batches(&mut self, batches: Vec<RecordBatch>) -> Result<()> {
+        let batches = if !self.allow_external_blob_outside_bases {
+            if let Some(policy) = self.dataset().session().blob_write_policy() {
+                let context = super::blob::BlobWriteContext::for_dataset(Some(self.dataset()));
+                let mut validated = Vec::with_capacity(batches.len());
+                for batch in batches {
+                    validated.push(policy.apply(batch, &context).await?);
+                }
+                validated
+            } else {
+                batches
+            }
+        } else {
+            batches
+        };
         let Some(last) = self.last_input.as_ref() else {
             return Err(Error::invalid_input(
                 "Fragment Updater: no input data is available before update".to_string(),
@@ -867,7 +882,11 @@ impl DeletionRestorer {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
+    use std::{
+        collections::HashMap,
+        num::NonZeroU32,
+        sync::{Arc, Mutex},
+    };
 
     use arrow::{array::AsArray, datatypes::Int32Type};
     use arrow_array::{
@@ -2462,6 +2481,71 @@ mod tests {
             Field::new(name, DataType::Int32, false),
             Arc::new(Int32Array::from_iter_values(values)),
         )
+    }
+
+    #[derive(Debug, Default)]
+    struct IncrementPolicy {
+        batch_sizes: Mutex<Vec<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::dataset::blob::BlobWritePolicy for IncrementPolicy {
+        fn schema(
+            &self,
+            input: &Schema,
+            _context: &crate::dataset::blob::BlobWriteContext,
+        ) -> crate::Result<Schema> {
+            Ok(input.clone())
+        }
+
+        async fn apply(
+            &self,
+            batch: RecordBatch,
+            _context: &crate::dataset::blob::BlobWriteContext,
+        ) -> crate::Result<RecordBatch> {
+            self.batch_sizes.lock().unwrap().push(batch.num_rows());
+            let values = batch["o"].as_primitive::<Int32Type>();
+            Ok(int_output(
+                "o",
+                values.values().iter().map(|value| value + 10),
+            ))
+        }
+    }
+
+    #[rstest]
+    #[case::single_batch(false)]
+    #[case::split_batches(true)]
+    #[tokio::test]
+    async fn test_update_batches_applies_blob_write_policy(#[case] is_split: bool) {
+        let policy = Arc::new(IncrementPolicy::default());
+        let mut dataset = int_dataset("memory://", 4, LanceFileVersion::V2_2, 1024)
+            .await
+            .with_blob_write_policy(policy.clone());
+        let fragment = dataset.get_fragment(0).unwrap();
+        let mut updater = fragment
+            .updater::<String>(None, None, None, None)
+            .await
+            .unwrap();
+        updater.next().await.unwrap().unwrap();
+        let output = int_output("o", 0..4);
+        if is_split {
+            updater
+                .update_batches(vec![output.slice(0, 2), output.slice(2, 2)])
+                .await
+                .unwrap();
+        } else {
+            updater.update(output).await.unwrap();
+        }
+        assert!(updater.next().await.unwrap().is_none());
+        let metadata = updater.finish().await.unwrap();
+        Arc::make_mut(&mut dataset.manifest).schema = updater.schema().unwrap().clone();
+        let updated = crate::dataset::fragment::FileFragment::new(Arc::new(dataset), metadata);
+        let batch = updated.scan().try_into_batch().await.unwrap();
+        assert_eq!(batch["o"].as_ref(), &Int32Array::from(vec![10, 11, 12, 13]));
+        assert_eq!(
+            *policy.batch_sizes.lock().unwrap(),
+            if is_split { vec![2, 2] } else { vec![4] }
+        );
     }
 
     #[tokio::test]

@@ -14,6 +14,51 @@ use lance_core::datatypes::Schema;
 /// Execute a metadata update operation on a dataset.
 /// This is moved from Dataset::update_op to keep metadata logic in this module.
 pub async fn execute_metadata_update(dataset: &mut Dataset, operation: Operation) -> Result<()> {
+    if dataset.session().blob_write_policy().is_some()
+        && let Operation::UpdateConfig {
+            field_metadata_updates,
+            ..
+        } = &operation
+    {
+        // A metadata edit must not reinterpret previously unvalidated values
+        // as storage references, or remove their authoritative blob identity.
+        for (id, update) in field_metadata_updates {
+            let field = dataset
+                .schema()
+                .field_by_id(*id)
+                .ok_or_else(|| crate::Error::invalid_input("Unknown field ID"))?;
+            let mut metadata = if update.replace {
+                HashMap::new()
+            } else {
+                field.metadata.clone()
+            };
+            for entry in &update.update_entries {
+                match &entry.value {
+                    Some(value) => {
+                        metadata.insert(entry.key.clone(), value.clone());
+                    }
+                    None => {
+                        metadata.remove(&entry.key);
+                    }
+                }
+            }
+            for key in ["ARROW:extension:name", "lance-encoding:blob"] {
+                let is_blob_identity = key == "lance-encoding:blob"
+                    || metadata
+                        .get(key)
+                        .is_some_and(|value| value == "lance.blob.v2")
+                    || field
+                        .metadata
+                        .get(key)
+                        .is_some_and(|value| value == "lance.blob.v2");
+                if is_blob_identity && metadata.get(key) != field.metadata.get(key) {
+                    return Err(crate::Error::invalid_input(
+                        "Blob identity cannot be changed through field metadata updates",
+                    ));
+                }
+            }
+        }
+    }
     let transaction = Transaction::new(dataset.manifest.version, operation, None);
     dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
