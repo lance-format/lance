@@ -969,6 +969,7 @@ mod tests {
     use rstest::rstest;
 
     use crate::dataset::WriteParams;
+    use crate::dataset::builder::DatasetBuilder;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, NoContextTestFixture};
 
     use super::*;
@@ -1316,14 +1317,19 @@ mod tests {
         use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
         let tmp = TempStrDir::default();
+        let written = gen_batch()
+            .col("name", array::cycle_utf8_literals(&["alpha", "bb", "c"]))
+            .into_dataset(
+                tmp.as_str(),
+                FragmentCount::from(1),
+                FragmentRowCount::from(100),
+            )
+            .await
+            .unwrap();
         let dataset = Arc::new(
-            gen_batch()
-                .col("name", array::cycle_utf8_literals(&["alpha", "bb", "c"]))
-                .into_dataset(
-                    tmp.as_str(),
-                    FragmentCount::from(1),
-                    FragmentRowCount::from(100),
-                )
+            DatasetBuilder::from_uri(written.uri())
+                .with_session(written.session())
+                .load()
                 .await
                 .unwrap(),
         );
@@ -1379,14 +1385,19 @@ mod tests {
         use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
         let tmp = TempStrDir::default();
+        let written = gen_batch()
+            .col("name", array::cycle_utf8_literals(&["alpha", "bb", "c"]))
+            .into_dataset(
+                tmp.as_str(),
+                FragmentCount::from(2),
+                FragmentRowCount::from(10),
+            )
+            .await
+            .unwrap();
         let dataset = Arc::new(
-            gen_batch()
-                .col("name", array::cycle_utf8_literals(&["alpha", "bb", "c"]))
-                .into_dataset(
-                    tmp.as_str(),
-                    FragmentCount::from(2),
-                    FragmentRowCount::from(10),
-                )
+            DatasetBuilder::from_uri(written.uri())
+                .with_session(written.session())
+                .load()
                 .await
                 .unwrap(),
         );
@@ -1454,14 +1465,19 @@ mod tests {
         use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
         let tmp = TempStrDir::default();
+        let written = gen_batch()
+            .col("name", array::cycle_utf8_literals(&["alpha", "bb", "c"]))
+            .into_dataset(
+                tmp.as_str(),
+                FragmentCount::from(1),
+                FragmentRowCount::from(100),
+            )
+            .await
+            .unwrap();
         let dataset = Arc::new(
-            gen_batch()
-                .col("name", array::cycle_utf8_literals(&["alpha", "bb", "c"]))
-                .into_dataset(
-                    tmp.as_str(),
-                    FragmentCount::from(1),
-                    FragmentRowCount::from(100),
-                )
+            DatasetBuilder::from_uri(written.uri())
+                .with_session(written.session())
+                .load()
                 .await
                 .unwrap(),
         );

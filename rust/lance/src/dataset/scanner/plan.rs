@@ -1195,6 +1195,7 @@ mod tests {
     use lance_file::version::LanceFileVersion;
 
     use crate::dataset::Dataset;
+    use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::scanner::test_dataset::{
         TestVectorDataset, assert_scan_slice_matches, batch_knn_two_queries, find_filtered_read,
     };
@@ -1465,13 +1466,18 @@ mod tests {
         use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
         let tmp = TempStrDir::default();
-        let dataset = lance_datagen::gen_batch()
+        let written = lance_datagen::gen_batch()
             .col("name", array::cycle_utf8_literals(&["alpha", "bb", "c"]))
             .into_dataset(
                 tmp.as_str(),
                 FragmentCount::from(1),
                 FragmentRowCount::from(256),
             )
+            .await
+            .unwrap();
+        let dataset = DatasetBuilder::from_uri(written.uri())
+            .with_session(written.session())
+            .load()
             .await
             .unwrap();
 
@@ -1565,7 +1571,7 @@ mod tests {
         .unwrap();
         let actual = batch.get_array_memory_size();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        let dataset = Dataset::write(
+        let written = Dataset::write(
             reader,
             tmp.as_str(),
             Some(crate::dataset::WriteParams {
@@ -1576,6 +1582,11 @@ mod tests {
         )
         .await
         .unwrap();
+        let dataset = DatasetBuilder::from_uri(written.uri())
+            .with_session(written.session())
+            .load()
+            .await
+            .unwrap();
 
         let full_plan_size = async || {
             let plan = dataset.scan().create_plan().await.unwrap();
@@ -1611,13 +1622,18 @@ mod tests {
         use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
         let tmp = TempStrDir::default();
-        let dataset = lance_datagen::gen_batch()
+        let written = lance_datagen::gen_batch()
             .col("name", array::cycle_utf8_literals(&["alpha", "bb", "c"]))
             .into_dataset(
                 tmp.as_str(),
                 FragmentCount::from(1),
                 FragmentRowCount::from(256),
             )
+            .await
+            .unwrap();
+        let dataset = DatasetBuilder::from_uri(written.uri())
+            .with_session(written.session())
+            .load()
             .await
             .unwrap();
 

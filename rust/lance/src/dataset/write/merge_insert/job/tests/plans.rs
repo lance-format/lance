@@ -196,6 +196,8 @@ async fn test_plan_join_build_side_follows_source_statistics() {
 /// materialized source and the collection threshold.
 #[tokio::test]
 async fn test_plan_join_build_side_uses_measured_widths() {
+    use crate::dataset::builder::DatasetBuilder;
+
     fn find_hash_join(plan: &dyn ExecutionPlan) -> Option<&HashJoinExec> {
         if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
             return Some(join);
@@ -226,7 +228,14 @@ async fn test_plan_join_build_side_uses_measured_widths() {
         .col("value", array::step::<UInt32Type>())
         .col("payload", array::cycle_utf8_literals(&[wide]))
         .into_reader_rows(RowCount::from(1_024), BatchCount::from(1));
-    let ds = Arc::new(Dataset::write(target, tmp.as_str(), None).await.unwrap());
+    let written = Dataset::write(target, tmp.as_str(), None).await.unwrap();
+    let ds = Arc::new(
+        DatasetBuilder::from_uri(written.uri())
+            .with_session(written.session())
+            .load()
+            .await
+            .unwrap(),
+    );
 
     // Larger than the target's cold seed estimate (1,024 rows x ~72 B) but
     // smaller than its measured payload (1,024 x 4 KB).
