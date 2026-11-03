@@ -3889,6 +3889,9 @@ pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
 /// reservation, replace and removal selection, explicit drop - answers that
 /// second question too: a name it cannot see is a name it will hand out twice.
 pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexMetadata>>> {
+    if let Some(snapshot) = &dataset.staged_snapshot {
+        return Ok(snapshot.indices.clone());
+    }
     let metadata_key = IndexMetadataKey {
         version: dataset.manifest.version,
         store_identity: &dataset.object_store.store_prefix,

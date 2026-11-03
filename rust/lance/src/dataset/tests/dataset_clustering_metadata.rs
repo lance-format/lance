@@ -117,6 +117,7 @@ async fn commit_edited_manifest(
             activate_non_reusable_field_ids: false,
             tagged_frag_reuse_trim: false,
             clustering_definitions: None,
+            required_base_version: None,
         },
         dataset.manifest_location.naming_scheme,
         None,

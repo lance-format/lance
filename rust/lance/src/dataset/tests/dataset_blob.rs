@@ -45,7 +45,9 @@ use lance_core::{
 };
 use lance_datagen::{BatchCount, RowCount, array};
 use lance_file::{version::LanceFileVersion, writer::FileWriterOptions};
+use lance_io::object_store::ObjectStoreParams;
 use lance_io::stream::RecordBatchStream;
+use lance_io::utils::tracking_store::IOTracker;
 use lance_table::feature_flags::{FLAG_MANAGED_BLOBS, MANAGED_BLOBS_META_KEY};
 use lance_table::format::BasePath;
 use rstest::rstest;
@@ -3666,4 +3668,214 @@ async fn scan_blobs_as_logical_keeps_escaped_external_names() {
         read_blob_bytes(&target, |rows| rows["blob"].clone()).await,
         expected
     );
+}
+
+#[rstest]
+#[case::inline(6, BlobKind::Inline)]
+#[case::packed(16, BlobKind::Packed)]
+#[case::dedicated(32, BlobKind::Dedicated)]
+#[tokio::test]
+async fn staged_blob_append_preserves_payload_and_abort_reader(
+    #[case] size: usize,
+    #[case] kind: BlobKind,
+    #[values(false, true)] managed: bool,
+) {
+    let dir = crate::utils::test::copy_test_data_to_tmp("v11.0.0/blob_sidecars").unwrap();
+    let mut dataset = Dataset::open(&dir.path_str()).await.unwrap();
+    if managed {
+        dataset
+            .update_schema_metadata([(MANAGED_BLOBS_META_KEY, "true")])
+            .await
+            .unwrap();
+    }
+    let original_rows = dataset.count_rows(None).await.unwrap();
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![
+            blob_field("blob", true)
+                .with_metadata(dataset.schema().field("blob").unwrap().metadata.clone()),
+        ],
+        dataset.schema().metadata.clone(),
+    ));
+    let payload = vec![b'z'; size];
+    let mut blobs = BlobArrayBuilder::new(1);
+    blobs.push_bytes(&payload).unwrap();
+    let batch = RecordBatch::try_new(schema, vec![blobs.finish().unwrap()]).unwrap();
+    let mut tx = dataset.begin_transaction().await.unwrap();
+    tx.append(vec![batch.clone()]).await.unwrap();
+    let mut reader = tx.scan().unwrap();
+    reader.blob_handling(BlobHandling::AllBinary);
+    tx.abort();
+    let read = reader.try_into_batch().await.unwrap();
+    assert_eq!(
+        read["blob"].as_binary::<i64>().value(original_rows),
+        payload
+    );
+    assert_eq!(
+        Dataset::open(&dir.path_str())
+            .await
+            .unwrap()
+            .count_rows(None)
+            .await
+            .unwrap(),
+        original_rows
+    );
+    let mut tx = dataset.begin_transaction().await.unwrap();
+    tx.append(vec![batch]).await.unwrap();
+    tx.commit().await.unwrap();
+    let reopened = Arc::new(Dataset::open(&dir.path_str()).await.unwrap());
+    let values = reopened
+        .take_blobs_by_indices(&[original_rows as u64], "blob")
+        .await
+        .unwrap();
+    let value = values[0].as_ref().unwrap();
+    assert_eq!(
+        value.kind(),
+        if managed && size > 8 {
+            BlobKind::Managed
+        } else {
+            kind
+        }
+    );
+    assert_eq!(value.read().await.unwrap().as_ref(), payload);
+}
+
+#[tokio::test]
+async fn staged_append_ingests_external_blob_with_source_store_params() {
+    let dir = crate::utils::test::copy_test_data_to_tmp("v11.0.0/blob_sidecars").unwrap();
+    let dataset = Dataset::open(&dir.path_str()).await.unwrap();
+    let original_rows = dataset.count_rows(None).await.unwrap();
+    let source_dir = TempDir::default();
+    let source_path = source_dir.std_path().join("source.bin");
+    let payload = b"ingested payload";
+    std::fs::write(&source_path, payload).unwrap();
+    let source_uri = format!("file-object-store://{}", source_path.display());
+    let mut blobs = BlobArrayBuilder::new(1);
+    blobs.push_uri(source_uri).unwrap();
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![
+            blob_field("blob", true)
+                .with_metadata(dataset.schema().field("blob").unwrap().metadata.clone()),
+        ],
+        dataset.schema().metadata.clone(),
+    ));
+    let batch = RecordBatch::try_new(schema, vec![blobs.finish().unwrap()]).unwrap();
+    let source_io = Arc::new(IOTracker::default());
+    let mut tx = dataset.begin_transaction().await.unwrap();
+    tx.append_with_params(
+        vec![batch],
+        &WriteParams {
+            mode: WriteMode::Append,
+            enable_stable_row_ids: dataset.manifest.uses_stable_row_ids(),
+            external_blob_mode: ExternalBlobMode::Ingest,
+            store_params: Some(ObjectStoreParams {
+                object_store_wrapper: Some(source_io.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(source_io.stats().read_bytes >= payload.len() as u64);
+    assert_eq!(source_io.stats().written_bytes, 0);
+    std::fs::remove_file(source_path).unwrap();
+    let mut reader = tx.scan().unwrap();
+    reader.blob_handling(BlobHandling::AllBinary);
+    let rows = reader.try_into_batch().await.unwrap();
+    assert_eq!(
+        rows["blob"].as_binary::<i64>().value(original_rows),
+        payload
+    );
+    tx.commit().await.unwrap();
+    let reopened = Arc::new(Dataset::open(&dir.path_str()).await.unwrap());
+    let values = reopened
+        .take_blobs_by_indices(&[original_rows as u64], "blob")
+        .await
+        .unwrap();
+    let value = values[0].as_ref().unwrap();
+    assert_eq!(value.kind(), BlobKind::Packed);
+    assert_eq!(value.read().await.unwrap().as_ref(), payload);
+}
+
+#[rstest]
+#[tokio::test]
+async fn staged_managed_reference_is_borrowed_across_abort_and_commit(
+    #[values(false, true)] registered: bool,
+    #[values(false, true)] unknown: bool,
+) {
+    let dir = TempStrDir::default();
+    let handler = Arc::new(crate::utils::test::AmbiguousCommitHandler::default());
+    let objects = TempStrDir::default();
+    let root = if registered {
+        objects.as_str()
+    } else {
+        dir.as_str()
+    };
+    std::fs::create_dir_all(std::path::Path::new(root).join("_blobs")).unwrap();
+    let path = std::path::Path::new(root).join("_blobs/borrowed.blob");
+    std::fs::write(&path, b"payload").unwrap();
+    let mut values = BlobDescriptorArrayBuilder::new("blob");
+    values
+        .push(BlobDescriptor::Managed {
+            base_id: registered.then_some(7),
+            uri: "_blobs/borrowed.blob".into(),
+            offset: 0,
+            size: 7,
+        })
+        .unwrap();
+    let (field, values) = values.finish().unwrap().into_parts();
+    let schema = Arc::new(managed_blob_schema(vec![field]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], schema),
+        &dir,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            commit_handler: Some(handler.clone()),
+            initial_bases: registered
+                .then(|| vec![BasePath::new(7, objects.as_str().to_owned(), None, true)]),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let mut tx = dataset.begin_transaction().await.unwrap();
+    tx.append(vec![batch.clone()]).await.unwrap();
+    let mut reader = tx.scan().unwrap();
+    reader.blob_handling(BlobHandling::AllBinary);
+    tx.abort();
+    assert_eq!(std::fs::read(&path).unwrap(), b"payload");
+    let read = reader.try_into_batch().await.unwrap();
+    assert_eq!(read.num_rows(), 2);
+    assert_eq!(read["blob"].as_binary::<i64>().value(1), b"payload");
+    let mut tx = dataset.begin_transaction().await.unwrap();
+    tx.append(vec![batch]).await.unwrap();
+    if unknown {
+        handler.fail_next(crate::utils::test::AmbiguousFailure::LandAndError);
+        handler
+            .fail_resolve
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = tx.commit().await.unwrap_err();
+        assert!(error.is_commit_status_unknown());
+        assert!(
+            error
+                .to_string()
+                .contains("simulated ambiguous commit failure")
+        );
+        handler
+            .fail_resolve
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        tx.commit().await.unwrap();
+    }
+    let reopened = Arc::new(Dataset::open(dir.as_str()).await.unwrap());
+    let values = reopened
+        .take_blobs_by_indices(&[0, 1], "blob")
+        .await
+        .unwrap();
+    for value in values {
+        let value = value.unwrap();
+        assert_eq!(value.kind(), BlobKind::Managed);
+        assert_eq!(value.read().await.unwrap().as_ref(), b"payload");
+    }
 }

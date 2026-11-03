@@ -1310,6 +1310,7 @@ pub(crate) async fn do_commit_detached_transaction(
     commit_config: &CommitConfig,
     retry_timeout: Duration,
 ) -> Result<(Manifest, ManifestLocation)> {
+    dataset.ensure_published()?;
     ensure_can_write_manifest(&dataset.manifest)?;
     // Definitions are allocated against the version chain: a detached
     // manifest's ids and field-identity activation would be invisible to it.
@@ -1764,6 +1765,7 @@ pub(crate) async fn commit_transaction(
     manifest_naming_scheme: ManifestNamingScheme,
     affected_rows: Option<&RowAddrTreeMap>,
 ) -> Result<(Manifest, ManifestLocation)> {
+    dataset.ensure_published()?;
     // Note: object_store has been configured with WriteParams, but dataset.object_store.as_ref()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let read_version = transaction.read_version;
@@ -1841,6 +1843,18 @@ pub(crate) async fn commit_transaction(
         if !strict_overwrite {
             let checked_since = dataset.manifest.version;
             (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
+            if let Some(required) = write_config.required_base_version
+                && dataset.manifest.version != required
+            {
+                return Err(Error::retryable_commit_conflict_source(
+                    dataset.manifest.version,
+                    format!(
+                        "Staged reads require base version {required}, but current version is {}",
+                        dataset.manifest.version
+                    )
+                    .into(),
+                ));
+            }
 
             ensure_can_write_manifest(&dataset.manifest)?;
 

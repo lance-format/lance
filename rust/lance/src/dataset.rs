@@ -112,6 +112,8 @@ pub mod transaction {
         translate_schema_metadata_updates, validate_operation,
     };
 }
+mod staged;
+pub use staged::StagedTransaction;
 pub mod udtf;
 pub mod updater;
 mod utils;
@@ -236,6 +238,8 @@ pub const DEFAULT_METADATA_CACHE_SIZE: usize = 1024 * 1024 * 1024;
 /// Lance Dataset
 #[derive(Clone)]
 pub struct Dataset {
+    /// Unpublished state; `None` for a committed snapshot.
+    pub(crate) staged_snapshot: Option<Arc<staged::StagedSnapshotState>>,
     /// The primary dataset object store. Use [`Self::object_store`] when
     /// resolving files that may carry a base id.
     pub(crate) object_store: Arc<ObjectStore>,
@@ -998,6 +1002,7 @@ impl Dataset {
             store_params: store_params.map(Box::new),
             base_store_params,
             base_object_stores: Default::default(),
+            staged_snapshot: None,
         })
     }
 
@@ -4426,6 +4431,7 @@ impl DatasetTakeRows for Dataset {
 
 #[derive(Debug)]
 pub(crate) struct ManifestWriteConfig {
+    pub(crate) required_base_version: Option<u64>,
     auto_set_feature_flags: bool,              // default true
     timestamp: Option<SystemTime>,             // default None
     use_stable_row_ids: bool,                  // default false
@@ -4450,6 +4456,7 @@ pub(crate) struct ManifestWriteConfig {
 impl Default for ManifestWriteConfig {
     fn default() -> Self {
         Self {
+            required_base_version: None,
             auto_set_feature_flags: true,
             timestamp: None,
             use_stable_row_ids: false,

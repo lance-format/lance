@@ -37,6 +37,7 @@ use tracing::info;
 /// Transactions can be created using a write method like [`super::InsertBuilder::execute_uncommitted`].
 #[derive(Debug, Clone)]
 pub struct CommitBuilder<'a> {
+    required_base_version: Option<u64>,
     dest: WriteDestination<'a>,
     use_stable_row_ids: Option<bool>,
     enable_v2_manifest_paths: bool,
@@ -70,9 +71,15 @@ pub struct CommitBuilder<'a> {
 pub const DEFAULT_COMMIT_TIMEOUT: Duration = Duration::from_secs(1800);
 
 impl<'a> CommitBuilder<'a> {
+    pub(crate) fn with_required_base_version(mut self, version: u64) -> Self {
+        self.required_base_version = Some(version);
+        self
+    }
+
     pub fn new(dest: impl Into<WriteDestination<'a>>) -> Self {
         Self {
             dest: dest.into(),
+            required_base_version: None,
             use_stable_row_ids: None,
             enable_v2_manifest_paths: true,
             storage_format: None,
@@ -567,6 +574,7 @@ impl<'a> CommitBuilder<'a> {
         };
 
         let manifest_config = ManifestWriteConfig {
+            required_base_version: self.required_base_version,
             use_stable_row_ids,
             storage_format: self.storage_format.map(DataStorageFormat::new),
             migration_next_row_id: self.migration_next_row_id,
@@ -683,6 +691,7 @@ impl<'a> CommitBuilder<'a> {
                     store_params: self.store_params.clone().map(Box::new),
                     base_store_params: None,
                     base_object_stores: Default::default(),
+                    staged_snapshot: None,
                 })
             }
         }
