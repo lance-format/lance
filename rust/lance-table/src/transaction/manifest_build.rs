@@ -256,11 +256,10 @@ impl Transaction {
         // while objects on other versions still mean the old one by it. The
         // definitions themselves are the target's: a restore brings back that
         // snapshot's definitions, specs, fragments and index segments as they
-        // were, and the current definitions go with the current objects that
-        // referenced them. Only the allocation history is kept, so the next
-        // definition continues above every id this lineage has handed out; a
-        // mark above every present definition is the normal state after a
-        // restore and is never read as a selection.
+        // were. A detached restore can use a handle older than the target,
+        // so neither counter alone necessarily covers the other's history.
+        // Keep their maximum; a mark above every present definition is the
+        // normal state after a restore and is never read as a selection.
         manifest.max_clustering_id = manifest
             .max_clustering_id
             .max(current_manifest.max_clustering_id);

@@ -2653,6 +2653,126 @@ async fn ambiguous_success_is_recognized_by_transaction_identity() {
 }
 
 #[tokio::test]
+async fn detached_restore_through_an_old_handle_keeps_the_target_allocation_mark() {
+    let dir = TempStrDir::default();
+    let before_allocation = write_dataset(&dir).await;
+    let allocated = commit(
+        &before_allocation,
+        submission(
+            before_allocation.manifest().version,
+            vec![definition(1), definition(2)],
+            vec![],
+        ),
+    )
+    .await
+    .unwrap();
+    let target = commit(
+        &allocated,
+        submission(allocated.manifest().version, vec![], vec![]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(before_allocation.manifest().max_clustering_id, 0);
+    assert_eq!(target.manifest().max_clustering_id, 2);
+    assert!(target.manifest().clustering.is_empty());
+
+    let detached = CommitBuilder::new(Arc::new(before_allocation.clone()))
+        .with_detached(true)
+        .execute(Transaction::new(
+            before_allocation.manifest().version,
+            Operation::Restore {
+                version: target.manifest().version,
+            },
+            None,
+        ))
+        .await
+        .unwrap();
+    let reopened = target
+        .checkout_version(detached.manifest().version)
+        .await
+        .unwrap();
+    assert_eq!(reopened.manifest().max_clustering_id, 2);
+    assert_eq!(reopened.manifest().clustering, target.manifest().clustering);
+    assert_eq!(
+        reopened.manifest().table_metadata,
+        target.manifest().table_metadata
+    );
+}
+
+#[rstest]
+#[case::upsert(false)]
+#[case::replace(true)]
+#[tokio::test]
+async fn provider_metadata_cannot_rebase_over_restore(#[case] replace: bool) {
+    let dir = TempStrDir::default();
+    let dataset = write_dataset(&dir).await;
+    let target = commit(
+        &dataset,
+        submission(
+            dataset.manifest().version,
+            vec![definition(1)],
+            vec![(ACTIVE_KEY.to_string(), Some("1".to_string()))],
+        ),
+    )
+    .await
+    .unwrap();
+    let before_restore = commit(
+        &target,
+        submission(
+            target.manifest().version,
+            vec![definition(1), definition(2)],
+            vec![(ACTIVE_KEY.to_string(), Some("2".to_string()))],
+        ),
+    )
+    .await
+    .unwrap();
+    // No definitions list accompanies this provider-only update, so checking
+    // clustering allocation alone cannot detect its stale selector.
+    let metadata_update = |read_version, active: &str| {
+        Transaction::new(
+            read_version,
+            Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: Some(UpdateMap {
+                    update_entries: vec![(ACTIVE_KEY, Some(active)).into()],
+                    replace,
+                }),
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            None,
+        )
+    };
+    let stale = metadata_update(before_restore.manifest().version, "2");
+    let mut restored = target.clone();
+    restored.restore().await.unwrap();
+    let restored_version = restored.manifest().version;
+    let error = CommitBuilder::new(Arc::new(before_restore))
+        .execute(stale)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::IncompatibleTransaction { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("Restore"), "{error}");
+
+    let reopened = Dataset::open(&dir).await.unwrap();
+    assert_eq!(reopened.manifest().version, restored_version);
+    assert_eq!(ids(&reopened), vec![1]);
+    assert_eq!(reopened.manifest().max_clustering_id, 2);
+    assert_eq!(reopened.manifest().table_metadata[ACTIVE_KEY], "1");
+    // A provider can re-read the restored snapshot and compute a valid update.
+    let refreshed = CommitBuilder::new(Arc::new(reopened))
+        .execute(metadata_update(restored_version, "1"))
+        .await
+        .unwrap();
+    assert_eq!(refreshed.manifest().table_metadata[ACTIVE_KEY], "1");
+    assert_eq!(ids(&refreshed), vec![1]);
+    assert_eq!(refreshed.count_rows(None).await.unwrap(), 100);
+}
+
+#[tokio::test]
 async fn restored_manifest_keeps_the_mark_for_later_submissions() {
     let dir = TempStrDir::default();
     let dataset = write_dataset(&dir).await;
