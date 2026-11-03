@@ -2027,12 +2027,13 @@ impl FtsMemIndex {
     ///
     /// Each batch's documents are split into runs of roughly
     /// `min_run_bytes`..(text / 4·threads) bytes; runs from every batch of a
-    /// window are tokenized concurrently on rayon, each with a pooled
-    /// tokenizer and run-local document positions. The writer then, batch by
-    /// batch, shifts each run to its tail document position, concatenates the
-    /// runs in document order (so postings stay sorted) and publishes the
-    /// batch through the same single `append_batch` + freeze check as the
-    /// serial path. The result is identical to inserting the batches one at a
+    /// window are tokenized concurrently as rayon tasks, each with a pooled
+    /// tokenizer and run-local document positions. Meanwhile the calling
+    /// thread, batch by batch as each batch's runs finish, shifts each run to
+    /// its tail document position, concatenates the runs in document order
+    /// (so postings stay sorted) and publishes the batch through the same
+    /// single `append_batch` + freeze check as the serial path, so publication
+    /// overlaps the tokenizing of later batches. The result is identical to inserting the batches one at a
     /// time with [`Self::insert_batch_with_keys`]; on error, every batch before
     /// the failing one is published, as in the serial loop.
     fn insert_rows(&self, batches: &[(&RecordBatch, u64)], min_run_bytes: usize) -> Result<()> {
@@ -2060,7 +2061,7 @@ impl FtsMemIndex {
             return Ok(());
         };
         let resolved = self.resolve_field(first)?;
-        let mut extracted: Vec<Result<Vec<FtsDocument>>> = if batches.len() == 1 {
+        let extracted: Vec<Result<Vec<FtsDocument>>> = if batches.len() == 1 {
             vec![resolved.documents_from_batch(first)]
         } else {
             batches
@@ -2068,20 +2069,27 @@ impl FtsMemIndex {
                 .map(|(batch, _)| resolved.documents_from_batch(batch))
                 .collect()
         };
+        // The serial loop never reaches the batches after one that fails to
+        // extract: process those before it, then report its error.
+        let mut documents: Vec<Vec<FtsDocument>> = Vec::with_capacity(extracted.len());
+        let mut extract_error = None;
+        for docs in extracted {
+            match docs {
+                Ok(docs) => documents.push(docs),
+                Err(err) => {
+                    extract_error = Some(err);
+                    break;
+                }
+            }
+        }
 
-        let total_bytes: usize = extracted
-            .iter()
-            .filter_map(|docs| docs.as_ref().ok())
-            .flatten()
-            .map(|doc| doc.text.len())
-            .sum();
+        let total_bytes: usize = documents.iter().flatten().map(|doc| doc.text.len()).sum();
         let threads = rayon::current_num_threads().max(1);
         let run_bytes = min_run_bytes.max(total_bytes.div_ceil(threads * 4)).max(1);
 
         // Split every batch's documents into runs of consecutive documents.
         let mut runs: Vec<(usize, u64, &mut [FtsDocument])> = Vec::new();
-        for (batch_idx, docs) in extracted.iter_mut().enumerate() {
-            let Ok(docs) = docs else { continue };
+        for (batch_idx, docs) in documents.iter_mut().enumerate() {
             let row_offset = batches[batch_idx].1;
             let mut rest: &mut [FtsDocument] = docs.as_mut_slice();
             while !rest.is_empty() {
@@ -2096,49 +2104,81 @@ impl FtsMemIndex {
                 rest = tail;
             }
         }
-
+        let run_batches: Vec<usize> = runs.iter().map(|(batch_idx, _, _)| *batch_idx).collect();
         let preserve_zero_token_documents =
             self.params.get_document_granularity().is_list_element();
-        let tokenized: Vec<(usize, Result<TokenizedRun>)> = if runs.len() <= 1 || threads == 1 {
-            let mut tok_guard = self
-                .writer_tokenizer
-                .lock()
-                .expect("writer tokenizer poisoned — single-writer invariant violated");
-            runs.into_iter()
-                .map(|(batch_idx, row_offset, docs)| {
-                    let run = tokenize_run(
-                        docs,
-                        row_offset,
-                        tok_guard.as_mut(),
-                        preserve_zero_token_documents,
-                    );
-                    (batch_idx, run)
-                })
-                .collect()
-        } else {
-            runs.into_par_iter()
-                .map_init(
-                    || PooledTokenizer::new(&self.tokenizer_pool),
-                    |tokenizer, (batch_idx, row_offset, docs)| {
+
+        // Blocking on results is only safe off the rayon pool, and only worth
+        // it with more than one run and more than one worker.
+        let parallel = runs.len() > 1 && threads > 1 && rayon::current_thread_index().is_none();
+        let published = if parallel {
+            // Tokenize every run as its own pool task (injected FIFO, so runs
+            // finish roughly in order) while this thread publishes finished
+            // batches in order — publication overlaps later tokenization.
+            let pool = self.tokenizer_pool.as_ref();
+            let (tx, rx) = std::sync::mpsc::channel();
+            rayon::in_place_scope(|scope| {
+                for (run_idx, (_, row_offset, docs)) in runs.into_iter().enumerate() {
+                    let tx = tx.clone();
+                    scope.spawn(move |_| {
+                        let mut tokenizer = PooledTokenizer::new(pool);
                         let run = tokenize_run(
                             docs,
                             row_offset,
                             tokenizer.get_mut(),
                             preserve_zero_token_documents,
                         );
-                        (batch_idx, run)
-                    },
+                        let _ = tx.send((run_idx, run));
+                    });
+                }
+                drop(tx);
+                let mut pending: Vec<Option<Result<TokenizedRun>>> =
+                    (0..run_batches.len()).map(|_| None).collect();
+                self.publish_in_order(&run_batches, |run_idx| {
+                    while pending[run_idx].is_none() {
+                        let (idx, run) = rx.recv().map_err(|_| {
+                            Error::internal("MemWAL FTS tokenizer task vanished".to_string())
+                        })?;
+                        pending[idx] = Some(run);
+                    }
+                    pending[run_idx].take().expect("received above")
+                })
+            })
+        } else {
+            let mut tok_guard = self
+                .writer_tokenizer
+                .lock()
+                .expect("writer tokenizer poisoned — single-writer invariant violated");
+            let mut runs = runs.into_iter();
+            self.publish_in_order(&run_batches, |_| {
+                let (_, row_offset, docs) = runs.next().expect("one run per index");
+                tokenize_run(
+                    docs,
+                    row_offset,
+                    tok_guard.as_mut(),
+                    preserve_zero_token_documents,
                 )
-                .collect()
+            })
         };
+        published?;
+        extract_error.map_or(Ok(()), Err)
+    }
 
-        // Publish batch by batch, in order, on this (the writer) thread.
-        let mut tokenized = tokenized.into_iter().peekable();
-        for (batch_idx, docs) in extracted.into_iter().enumerate() {
-            docs?;
+    /// Publish runs `0..run_batches.len()` (fetched in order through
+    /// `next_run`), one batch at a time; `run_batches[i]` is run `i`'s batch.
+    /// Stops at the first failing run, leaving earlier batches published.
+    fn publish_in_order(
+        &self,
+        run_batches: &[usize],
+        mut next_run: impl FnMut(usize) -> Result<TokenizedRun>,
+    ) -> Result<()> {
+        let mut run_idx = 0;
+        while run_idx < run_batches.len() {
+            let batch_idx = run_batches[run_idx];
             let mut batch_runs = Vec::new();
-            while let Some((_, run)) = tokenized.next_if(|(idx, _)| *idx == batch_idx) {
-                batch_runs.push(run?);
+            while run_idx < run_batches.len() && run_batches[run_idx] == batch_idx {
+                batch_runs.push(next_run(run_idx)?);
+                run_idx += 1;
             }
             self.publish_runs(batch_runs)?;
         }
@@ -9011,6 +9051,15 @@ mod parallel_insert_tests {
             .unwrap_err();
         assert_eq!(dump(&serial), dump(&parallel));
         assert_eq!(parallel.doc_count(), serial.doc_count());
+
+        // A failure while tokenizing (row position overflow) behaves the same.
+        let near_max = u64::MAX - 10;
+        serial.insert_batch(&good, 200).unwrap();
+        serial.insert_batch(&good, near_max).unwrap_err();
+        parallel
+            .insert_rows(&[(&good, 200), (&good, near_max), (&good, 300)], 1)
+            .unwrap_err();
+        assert_eq!(dump(&serial), dump(&parallel));
     }
 
     /// Ingest throughput, serial vs parallel, over ~200 MB of synthetic
