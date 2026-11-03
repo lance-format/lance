@@ -33,8 +33,9 @@ import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import pytest
 from helper import ProgressForTest
+from lance._dataset.optimize import AutoCleanupConfig
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
-from lance.dataset import LANCE_COMMIT_MESSAGE_KEY, AutoCleanupConfig
+from lance.dataset import LANCE_COMMIT_MESSAGE_KEY
 from lance.debug import format_fragment
 from lance.file import LanceFileWriter, stable_version
 from lance.schema import LanceSchema
@@ -1900,6 +1901,129 @@ def test_explain_cleanup_old_versions(tmp_path):
     assert stats.old_versions == explanation.stats.old_versions
 
 
+def test_expire_versions(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+    for _ in range(3):
+        lance.write_dataset(table, base_dir, mode="overwrite")
+
+    dataset = lance.dataset(base_dir)
+    latest = dataset.version
+    data_files_before = len(list((base_dir / "data").iterdir()))
+
+    # No condition expires nothing, rather than everything.
+    stats = dataset.expire_versions()
+    assert stats.versions_removed == 0
+
+    # A dry run must not delete.
+    plan = dataset.explain_expire_versions(before_version=latest)
+    assert plan.versions == [1, 2, 3]
+    assert plan.stats.versions_removed == 3
+    assert lance.dataset(base_dir).version == latest
+    assert len(lance.dataset(base_dir).versions()) == 4
+
+    stats = dataset.expire_versions(before_version=latest)
+    assert stats.versions_removed == 3
+    assert stats.failed_deletes == 0
+    assert stats.bytes_removed > 0
+
+    # The latest version survives and the table still reads.
+    reopened = lance.dataset(base_dir)
+    assert reopened.version == latest
+    assert reopened.count_rows() == 100
+    assert len(reopened.versions()) == 1
+
+    # Data files are untouched: reclaiming them is cleanup_old_versions' job.
+    assert len(list((base_dir / "data").iterdir())) == data_files_before
+
+
+def test_expire_versions_keeps_tagged(tmp_path):
+    table = pa.Table.from_pydict({"a": range(10)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+    for _ in range(3):
+        lance.write_dataset(table, base_dir, mode="overwrite")
+
+    dataset = lance.dataset(base_dir)
+    dataset.tags.create("keepme", 2)
+
+    # A tagged version inside the expiry range is an error by default.
+    with pytest.raises(OSError, match="tagged"):
+        dataset.expire_versions(before_version=dataset.version)
+
+    stats = dataset.expire_versions(
+        before_version=dataset.version, error_if_tagged_old_versions=False
+    )
+    assert stats.versions_removed == 2
+    assert lance.dataset(base_dir, version=2).count_rows() == 10
+
+
+def test_expire_versions_zero_before_is_a_cutoff(tmp_path):
+    table = pa.Table.from_pydict({"a": range(10)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+    for _ in range(2):
+        lance.write_dataset(table, base_dir, mode="overwrite")
+
+    dataset = lance.dataset(base_dir)
+    # timedelta(0) is falsy, but it is still an explicit cutoff at the current time.
+    plan = dataset.explain_expire_versions(before=timedelta(0))
+    assert plan.versions == [1, 2]
+
+    stats = dataset.expire_versions(before=timedelta(0))
+    assert stats.versions_removed == 2
+    assert len(lance.dataset(base_dir).versions()) == 1
+
+
+def test_expire_versions_keep_one_per(tmp_path):
+    table = pa.Table.from_pydict({"a": range(10)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+    for _ in range(5):
+        lance.write_dataset(table, base_dir, mode="overwrite")
+
+    dataset = lance.dataset(base_dir)
+    latest = dataset.version
+
+    # All six versions land inside one hour, so thinning keeps exactly one of the
+    # five expirable ones alongside the latest.
+    stats = dataset.expire_versions(
+        before_version=latest, keep_one_per=timedelta(hours=1)
+    )
+    assert stats.versions_removed == 4
+    remaining = sorted(v["version"] for v in lance.dataset(base_dir).versions())
+    assert len(remaining) == 2, remaining
+    assert remaining[-1] == latest
+
+
+def test_expire_versions_keep_one_per_minimum(tmp_path):
+    table = pa.Table.from_pydict({"a": range(10)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+    for _ in range(3):
+        lance.write_dataset(table, base_dir, mode="overwrite")
+
+    dataset = lance.dataset(base_dir)
+    latest = dataset.version
+    manifests_before = len(dataset.versions())
+
+    # Thinning competes with the version hint, whose protective floor is read once and
+    # can be lowered afterwards by a slow committer. Widths finer than an hour put
+    # deletions next to that window, so they are refused. timedelta(0) is falsy, so this
+    # also pins that it is not silently treated as "not supplied".
+    for too_fine in (timedelta(0), timedelta(microseconds=1), timedelta(minutes=59)):
+        with pytest.raises(OSError, match="at least"):
+            dataset.expire_versions(before_version=latest, keep_one_per=too_fine)
+    assert len(lance.dataset(base_dir).versions()) == manifests_before
+
+    # Exactly one hour is accepted.
+    plan = dataset.explain_expire_versions(
+        before_version=latest, keep_one_per=timedelta(hours=1)
+    )
+    assert plan.stats.versions_removed >= 0
+
+
 def test_cleanup_error_when_tagged_old_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -2526,7 +2650,7 @@ def test_nonzero_clustering_reference_reaches_rust_validation(tmp_path: Path):
     """
     import dataclasses
 
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     table = pa.Table.from_pydict({"a": range(10)})
     base_dir = tmp_path / "clustering_reference"
