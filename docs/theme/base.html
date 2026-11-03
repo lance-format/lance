@@ -56,7 +56,7 @@
     </a>
     <nav class="ld-topnav" aria-label="Sections">
       {%- for item in nav %}
-      <a class="ld-toptab{% if item.active %} active{% endif %}" href="{{ first_url(item) | url }}">{{ item.title }}</a>
+      <a class="ld-toptab{% if item.active %} active{% endif %}" href="{{ first_url(item) | url }}">{{ item.title | e }}</a>
       {%- endfor %}
     </nav>
     <div class="ld-header__actions">

@@ -19,6 +19,8 @@ class SidenavTests(unittest.TestCase):
             root = Path(tmp)
             for name in (
                 "index.md",
+                "flat_guide/read.md",
+                "flat_guide/search.md",
                 "guide/read_and_write.md",
                 "guide/spark/index.md",
                 "guide/spark/ddl/create.md",
@@ -35,6 +37,11 @@ class SidenavTests(unittest.TestCase):
                 config_file=StringIO("""
 nav:
   - User Guide:
+      - Core Operations:
+          - Read & Write: flat_guide/read.md
+      - Indexing & Search:
+          - Overview: flat_guide/search.md
+  - Track Guide:
       - PyLance:
           - Core Operations:
               - Read and Write: guide/read_and_write.md
@@ -68,6 +75,7 @@ nav:
             cls.sidebars = {}
             cls.topnavs = {}
             for name in (
+                "flat_guide/read/index.html",
                 "guide/read_and_write/index.html",
                 "guide/spark/ddl/create/index.html",
                 "spark/ddl/create/index.html",
@@ -131,9 +139,22 @@ nav:
         )
         tabs = self.topnavs["standalone/index.html"].findall("a")
         self.assertEqual(tabs[0].text, "User Guide")
-        self.assertEqual(tabs[0].get("href"), "../guide/read_and_write/")
-        self.assertEqual(tabs[1].text, "Integrations")
-        self.assertEqual(tabs[1].get("href"), "..")
+        self.assertEqual(tabs[0].get("href"), "../flat_guide/read/")
+        self.assertEqual(tabs[1].text, "Track Guide")
+        self.assertEqual(tabs[1].get("href"), "../guide/read_and_write/")
+        self.assertEqual(tabs[2].text, "Integrations")
+        self.assertEqual(tabs[2].get("href"), "..")
+
+    def test_two_level_guide_renders_flat_groups_without_switcher(self):
+        sidebar = self.sidebars["flat_guide/read/index.html"]
+        self.assertIsNone(sidebar.find(".//div[@class='ld-sidenav__tracks']"))
+        groups = sidebar.findall("./div[@class='ld-sidenav__group']")
+        self.assertEqual(
+            [group.find("div").text for group in groups],
+            ["Core Operations", "Indexing & Search"],
+        )
+        self.assertEqual(groups[0].find("a").attrib.get("class"), "active")
+        self.assertEqual(groups[0].find("a").text, "Read & Write")
 
     def test_track_switcher_prioritizes_pylance_and_lancedb_and_scopes_tree(self):
         pylance_sidebar = self.sidebars["guide/read_and_write/index.html"]
