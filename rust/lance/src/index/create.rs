@@ -14,7 +14,7 @@ use crate::{
             ensure_index_allowed_with_frag_reuse, ensure_index_kind_allowed_with_frag_reuse,
         },
         lifecycle::build_index_metadata_from_segments,
-        loading::{DatasetIndexInternalExt, load_all_indices},
+        loading::{DatasetIndexInternalExt, load_all_indices, load_all_indices_by_name},
         scalar::{build_bitmap_index_segment, build_scalar_index},
         vector::details::{vector_index_details, vector_index_details_default},
         vector::{
@@ -892,6 +892,12 @@ impl<'a> CreateIndexBuilder<'a> {
                 .await?;
 
             let indices = self.dataset.load_indices_by_name(&index_name).await?;
+            if let Some(index) = indices.into_iter().next() {
+                return Ok(index);
+            }
+            // A rebase can withdraw all query coverage and leave empty
+            // definitions, which tagged query listings omit.
+            let indices = load_all_indices_by_name(self.dataset, &index_name).await?;
             return indices.into_iter().next().ok_or_else(|| {
                 Error::internal(format!(
                     "FM-Index segments for '{}' not found after commit",
@@ -971,6 +977,12 @@ impl<'a> CreateIndexBuilder<'a> {
             .await?;
 
         let indices = self.dataset.load_indices_by_name(&index_name).await?;
+        if let Some(index) = indices.into_iter().next() {
+            return Ok(index);
+        }
+        // A rebase can withdraw all query coverage and leave empty
+        // definitions, which tagged query listings omit.
+        let indices = load_all_indices_by_name(self.dataset, &index_name).await?;
         indices.into_iter().next().ok_or_else(|| {
             Error::internal(format!(
                 "FM-Index segments for '{}' not found after commit",

@@ -310,6 +310,101 @@ async fn index_build_after_cleanup_withdraws_rewritten_retired_provenance(
 
 #[tokio::test]
 #[serial_test::serial(frag_reuse_maintenance)]
+async fn multi_segment_fmindex_after_cleanup_returns_empty_definition_and_scans() {
+    let dir = TempStrDir::default();
+    let mut stale = fixture(dir.as_str()).await;
+    let source =
+        arrow_array::record_batch!(("i", Int32, [0]), ("text", Utf8, ["patched"])).unwrap();
+    let (latest, _) = MergeInsertBuilder::try_new(Arc::new(stale.clone()), vec!["i".into()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .write_mode(MergeInsertWriteMode::RewriteColumns)
+        .try_build()
+        .unwrap()
+        .execute_batches(vec![source])
+        .await
+        .unwrap();
+    let latest = make_tagged(latest.as_ref().clone()).await;
+    let partition_version = latest.version().version;
+    let latest = crate::dataset::CommitBuilder::new(Arc::new(latest))
+        .execute(Transaction::new(
+            partition_version,
+            Operation::ReserveFragments { num_fragments: 1 },
+            None,
+        ))
+        .await
+        .unwrap();
+    let stats = latest
+        .cleanup(
+            CleanupPolicyBuilder::default()
+                .versions((1..=partition_version).collect())
+                .unwrap()
+                .build(),
+        )
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(stats.old_versions, partition_version);
+
+    let commit_version = latest.version().version + 1;
+    let params = ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::Fm)
+        .with_params(&serde_json::json!({ "num_segments": 2 }));
+    let committed = stale
+        .create_index(&["text"], IndexType::Fm, Some("idx".into()), &params, false)
+        .await
+        .unwrap();
+
+    assert_eq!(stale.version().version, commit_version);
+    assert_eq!(committed.name, "idx");
+    assert!(
+        committed
+            .fragment_bitmap
+            .as_ref()
+            .is_some_and(RoaringBitmap::is_empty),
+        "all retired coverage must be withdrawn"
+    );
+    assert!(
+        stale.load_indices_by_name("idx").await.unwrap().is_empty(),
+        "the empty definition is not query-visible"
+    );
+    let stored = crate::index::loading::load_all_indices(&stale)
+        .await
+        .unwrap();
+    let definitions = stored
+        .iter()
+        .filter(|index| index.name == "idx")
+        .collect::<Vec<_>>();
+    assert_eq!(definitions.len(), 2);
+    assert!(definitions.iter().all(|index| {
+        index
+            .fragment_bitmap
+            .as_ref()
+            .is_some_and(RoaringBitmap::is_empty)
+    }));
+    assert!(definitions.iter().any(|index| index.uuid == committed.uuid));
+
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(dataset.version().version, commit_version);
+    assert_eq!(
+        i_values(&dataset, Some("contains(text, 'patched')"), false).await,
+        vec![0]
+    );
+    assert_eq!(
+        i_values(&dataset, Some("contains(text, 'document')"), false).await,
+        vec![1, 2, 3, 4, 5, 6, 7]
+    );
+    for predicate in ["contains(text, 'patched')", "contains(text, 'document')"] {
+        assert_eq!(
+            i_values(&dataset, Some(predicate), true).await,
+            i_values(&dataset, Some(predicate), false).await,
+            "{predicate}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
 async fn index_built_before_a_stable_partition_lands_translating() {
     let dir = TempStrDir::default();
     let dataset = fixture(dir.as_str()).await;
