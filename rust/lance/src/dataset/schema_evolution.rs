@@ -14,7 +14,7 @@ use super::{
     write::cleanup_data_fragments,
 };
 use crate::dataset::mem_wal::DatasetMemWalExt;
-use crate::index::load_all_indices;
+use crate::index::loading::load_all_indices;
 use crate::{Error, Result, io::exec::Planner};
 use arrow::compute::CastOptions;
 use arrow::compute::can_cast_types;
@@ -1138,8 +1138,8 @@ pub(super) async fn alter_columns(
                     .skip(original_file_count)
                     .flat_map(|file| file.fields.iter().copied())
                     .collect::<HashSet<_>>();
-                // V1 files record struct ancestor ids, so a child rewrite also
-                // supersedes those ancestor entries in the original file.
+                // A child rewrite also supersedes recorded struct ancestor IDs.
+                // V2.0 readers still use their physical headers from the file schema.
                 for file in frag.files.iter_mut().take(original_file_count) {
                     file.fields = file
                         .fields
@@ -1731,6 +1731,7 @@ mod test {
         }
     }
 
+    use crate::dataset::optimize::compact_files;
     use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use arrow_array::builder::BinaryBuilder;
     use arrow_array::cast::AsArray;
@@ -5772,7 +5773,12 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_cast_nested_column(
-        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        #[values(
+            LanceFileVersion::Legacy,
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::Stable
+        )]
         data_storage_version: LanceFileVersion,
     ) -> Result<()> {
         use arrow_array::{Int64Array, cast::AsArray};
@@ -5826,6 +5832,61 @@ mod test {
             &Int64Array::from(vec![1, 2, 3])
         );
 
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::v2_0(LanceFileVersion::V2_0)]
+    #[case::v2_1(LanceFileVersion::V2_1)]
+    #[case::stable(LanceFileVersion::Stable)]
+    #[tokio::test]
+    async fn test_cast_nested_column_with_siblings(
+        #[case] data_storage_version: LanceFileVersion,
+    ) -> Result<()> {
+        let children = record_batch!(
+            ("c", Int32, [Some(1), None, Some(3)]),
+            ("d", Int32, [10, 20, 30])
+        )?;
+        let batch = RecordBatch::try_from_iter(vec![
+            ("b", Arc::new(StructArray::from(children)) as ArrayRef),
+            (
+                "created_at",
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            ),
+        ])?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(data_storage_version),
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await?;
+        assert_eq!(dataset.fragments().len(), 2);
+        dataset
+            .alter_columns(&[ColumnAlteration::new("b.c".into()).cast_to(DataType::Int64)])
+            .await?;
+
+        let children = record_batch!(
+            ("c", Int64, [Some(1), None, Some(3)]),
+            ("d", Int32, [10, 20, 30])
+        )?;
+        let expected = RecordBatch::try_from_iter(vec![
+            ("b", Arc::new(StructArray::from(children)) as ArrayRef),
+            ("created_at", batch["created_at"].clone()),
+        ])?;
+        let mut dataset = Dataset::open(&test_dir).await?;
+        assert_eq!(dataset.scan().try_into_batch().await?, expected);
+        dataset.validate().await?;
+
+        let metrics = compact_files(&mut dataset, Default::default(), None).await?;
+        assert_eq!(metrics.fragments_removed, 2);
+        assert_eq!(metrics.fragments_added, 1);
+        assert_eq!(dataset.scan().try_into_batch().await?, expected);
+        dataset.validate().await?;
         Ok(())
     }
 

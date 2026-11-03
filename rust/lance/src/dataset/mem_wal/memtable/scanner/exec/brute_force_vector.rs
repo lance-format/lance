@@ -41,10 +41,11 @@ use lance_linalg::distance::DistanceType;
 use super::super::builder::VectorQuery;
 use super::newest_pk_positions;
 use super::vector::DISTANCE_COLUMN;
+use crate::dataset::mem_wal::index::IndexStore;
 use crate::dataset::mem_wal::index::{SearchContext, evaluate_index_filter};
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
 use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Distance metric used when [`VectorQuery::distance_type`] is `None`. The
 /// indexed path defers to the index's own metric, but with no index there is

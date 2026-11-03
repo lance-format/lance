@@ -15,14 +15,16 @@ use crate::vector::bq::transform::ERROR_FACTORS_COLUMN;
 use crate::vector::quantizer::QuantizerStorage;
 use arrow::compute::concat_batches;
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array, cast::AsArray,
-    types::UInt8Type,
+    Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array,
+    cast::AsArray,
+    types::{UInt8Type, UInt64Type},
 };
 use arrow_schema::SchemaRef;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::cache::{CacheTier, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID, Result};
 use lance_encoding::decoder::FilterExpression;
@@ -2086,9 +2088,11 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         )
     }
 
-    /// Remappers can remove physical rows, so candidate offsets require an identity mapping.
+    /// Whether this file exposes native sign/ex planes for candidate reads.
+    /// Sign preparation translates row addresses without compacting deleted
+    /// slots, so candidate offsets still address the original ex planes.
     pub fn supports_candidate_reads(&self) -> bool {
-        self.frag_reuse_index.is_none() && self.batch_remapper.is_none()
+        self.supports_rabit_planes()
     }
 
     /// Load one whole plane entry of a RaBitQ partition, which holds the
@@ -2311,6 +2315,9 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
 
     /// Stage-1 storage of the lazy full-precision scan: the partition's sign
     /// plane alone, loaded (and admitted) like the eager load's sign plane.
+    /// Addresses are translated in a private view without changing physical
+    /// row positions or cached columns. Deleted rows retain their slots with
+    /// [`RowAddress::TOMBSTONE_ROW`]; the scan must exclude them before scoring.
     pub async fn load_sign_stage(
         &self,
         part_id: usize,
@@ -2319,10 +2326,53 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     ) -> Result<Q::Storage> {
         if !self.supports_candidate_reads() {
             return Err(Error::invalid_input(
-                "the lazy full-precision scan requires an index without a row-id remapper",
+                "sign preparation requires current native RaBitQ sign/ex planes",
             ));
         }
         let sign = self.load_plane(part_id, 0, cache, io_stats).await?;
+        let sign = if self.batch_remapper.is_some() || self.frag_reuse_index.is_some() {
+            let row_id_idx = sign.schema().index_of(ROW_ID)?;
+            let row_ids = sign
+                .column(row_id_idx)
+                .as_primitive_opt::<UInt64Type>()
+                .filter(|ids| ids.null_count() == 0)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "sign preparation requires non-null uint64 column {ROW_ID}"
+                    ))
+                })?;
+            if let Some(remapper) = &self.batch_remapper {
+                remap_row_ids_preserving_layout_async(remapper.as_ref(), sign, row_id_idx)
+                    .await?
+                    .0
+            } else if let Some(remapper) = &self.frag_reuse_index {
+                let remapper = remapper.clone();
+                let row_ids = row_ids.clone();
+                spawn_cpu(move || {
+                    let mut translated: Option<Vec<u64>> = None;
+                    for (offset, &id) in row_ids.values().iter().enumerate() {
+                        let mapped = remapper
+                            .remap_row_id(id)
+                            .unwrap_or(RowAddress::TOMBSTONE_ROW);
+                        if mapped != id {
+                            translated.get_or_insert_with(|| row_ids.values().to_vec())[offset] =
+                                mapped;
+                        }
+                    }
+                    match translated {
+                        Some(ids) => {
+                            sign.replace_column_by_name(ROW_ID, Arc::new(UInt64Array::from(ids)))
+                        }
+                        None => Ok(sign),
+                    }
+                })
+                .await?
+            } else {
+                sign
+            }
+        } else {
+            sign
+        };
         Q::Storage::try_from_sign_plane_for_full(sign, self.metadata(), self.distance_type)
     }
 

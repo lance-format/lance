@@ -41,7 +41,7 @@ use pyo3::types::{PyList, PyTuple};
 use pyo3::{exceptions::*, types::PyDict};
 use pyo3::{intern, prelude::*};
 
-use crate::dataset::{PyWriteDest, get_write_params, transforms_from_python};
+use crate::dataset::write::{PyWriteDest, get_write_params, transforms_from_python};
 use crate::error::PythonErrorExt;
 use crate::schema::{LanceSchema, logical_schema_from_lance};
 use crate::utils::{PyLance, export_vec, extract_vec};
