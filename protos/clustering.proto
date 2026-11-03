@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.table;
+
+// Immutable clustering definition shared by fragments and index segments.
+message Clustering {
+  // Non-zero table-local ID allocated through Manifest.max_clustering_id, not a list position.
+  uint32 id = 1;
+  // Ordered, non-empty list of distinct, existing schema field IDs.
+  repeated int32 columns = 2;
+  // Non-empty, case-sensitive clustering implementation name.
+  string provider = 3;
+  // Non-zero layout/configuration identifier, not a dataset or software version.
+  uint64 version = 4;
+}

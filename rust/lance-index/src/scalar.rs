@@ -6,10 +6,10 @@
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_array::ListArray;
 use arrow_schema::Field;
-use datafusion::functions::regex::regexplike::RegexpLikeFunc;
-use datafusion::functions::string::contains::ContainsFunc;
-use datafusion::functions_nested::array_has;
 use datafusion_common::{Column, scalar::ScalarValue};
+use datafusion_functions::regex::regexplike::RegexpLikeFunc;
+use datafusion_functions::string::contains::ContainsFunc;
+use datafusion_functions_nested::array_has;
 use std::collections::HashSet;
 use std::{any::Any, ops::Bound, sync::Arc};
 
@@ -20,7 +20,7 @@ use datafusion_expr::{
 use inverted::query::{FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, fill_fts_query_column};
 use lance_core::Result;
 
-use lance_datafusion::udf::CONTAINS_TOKENS_UDF;
+use lance_datafusion_exec::udf::CONTAINS_TOKENS_UDF;
 
 use crate::IndexParams;
 pub use crate::metrics::MetricsCollector;
@@ -31,9 +31,13 @@ pub use lance_index_core::remapping::{
 };
 pub use lance_index_core::scalar::{
     AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter,
-    LANCE_SCALAR_INDEX, OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams,
-    SearchOptions, SearchResult, TrainingCriteria, TrainingOrdering, UpdateCriteria,
+    LANCE_SCALAR_INDEX, LOOKUP_KEY_INDEX, OldIndexDataFilter, RowIdRemapper, ScalarIndex,
+    ScalarIndexParams, SearchOptions, SearchResult, TrainingCriteria, TrainingOrdering,
+    UpdateCriteria, lookup_batch, lookup_schema,
 };
+
+/// The most matches one built-in index's [`ScalarIndex::lookup`] batch holds.
+pub(crate) const LOOKUP_BATCH_SIZE: usize = 8192;
 
 pub mod bitmap;
 pub mod bloomfilter;
@@ -44,6 +48,8 @@ pub mod inverted;
 pub mod json;
 pub mod label_list;
 pub mod lance_format;
+#[cfg(test)]
+pub(crate) mod lookup_test_util;
 pub mod minhash_lsh;
 pub mod ngram;
 pub mod registry;
@@ -60,8 +66,8 @@ pub use inverted::tokenizer::InvertedIndexParams;
 /// Convert a `Vec<`[`lance_index_core::scalar::IndexFile`]`>` to a
 /// `Vec<`[`lance_table::format::IndexFile`]`>`.
 ///
-/// These two structs have identical fields; this helper bridges the crate
-/// boundary without relying on orphan-rule–violating `From` impls.
+/// These structs share their path and total size fields; this helper bridges the
+/// crate boundary without relying on orphan-rule–violating `From` impls.
 pub fn index_files_to_table(
     files: Vec<lance_index_core::scalar::IndexFile>,
 ) -> Vec<lance_table::format::IndexFile> {
@@ -70,6 +76,7 @@ pub fn index_files_to_table(
         .map(|f| lance_table::format::IndexFile {
             path: f.path,
             size_bytes: f.size_bytes,
+            file_metadata_size_bytes: None,
         })
         .collect()
 }
@@ -77,8 +84,8 @@ pub fn index_files_to_table(
 /// Convert a `Vec<`[`lance_table::format::IndexFile`]`>` to a
 /// `Vec<`[`lance_index_core::scalar::IndexFile`]`>`.
 ///
-/// These two structs have identical fields; this helper bridges the crate
-/// boundary without relying on orphan-rule–violating `From` impls.
+/// These structs share their path and total size fields; this helper bridges the
+/// crate boundary without relying on orphan-rule–violating `From` impls.
 pub fn table_files_to_index(
     files: Vec<lance_table::format::IndexFile>,
 ) -> Vec<lance_index_core::scalar::IndexFile> {

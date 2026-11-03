@@ -102,8 +102,8 @@ pub mod pb {
 
 pub use blob::{
     BlobArrayBuilder, BlobDescriptor, BlobDescriptorArrayBuilder, BlobDescriptorColumn,
-    BlobFieldOptions, BlobRange, DedicatedBlobWriter, PackedBlobWriter, blob_field,
-    blob_field_with_options,
+    BlobFieldOptions, BlobRange, DedicatedBlobWriter, ManagedBlobWriter, PackedBlobWriter,
+    blob_field, blob_field_with_options,
 };
 pub use dataset::Dataset;
 use lance_index::vector::DIST_COL;

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Test-only object store that injects WAL-write failures (for the WAL
-//! persistence-failure fencing path) and records the paths it serves (for
+//! Test-only object store that injects WAL and SSTable write failures and
+//! records the paths it serves (for
 //! asserting which opens actually resolved through a given `ObjectStoreParams`).
 
 use std::fmt::{Debug, Display, Formatter};
@@ -19,14 +19,21 @@ use object_store::{
     ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     RenameOptions, Result as OSResult,
 };
+use tokio::sync::Notify;
 
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
 };
 
-/// Knobs controlling injected WAL-entry write failures, shared with the test.
+/// Knobs controlling injected write failures, shared with the test.
 #[derive(Debug, Default)]
 pub struct FailControls {
+    /// Hold generation writes while later flushes are queued, then fail a
+    /// bounded number of attempts once released. WAL writes remain independent.
+    sstable_put_failures: AtomicUsize,
+    block_sstable_puts: AtomicBool,
+    sstable_put_release: Notify,
+    sstable_put_attempts: AtomicUsize,
     /// Remaining WAL-entry `put_opts` calls to fail; saturates at 0. Set high to
     /// "always fail", set to 0 to "recover".
     wal_put_failures: AtomicUsize,
@@ -35,13 +42,59 @@ pub struct FailControls {
     simulate_lost_ack: AtomicBool,
     /// WAL-entry `put_opts` attempts observed, for assertions.
     wal_put_attempts: AtomicUsize,
+    /// Remaining Blob sidecar `put_opts` calls to fail.
+    blob_put_failures: AtomicUsize,
+    /// Block Blob sidecar PUTs forever so cancellation can drop the caller.
+    block_blob_puts: AtomicBool,
+    /// Blob sidecar `put_opts` attempts observed, for assertions.
+    blob_put_attempts: AtomicUsize,
     /// Every location written through this store.
     put_paths: StdMutex<Vec<String>>,
     /// Every location read through this store.
     get_paths: StdMutex<Vec<String>>,
+    /// Fail every write whose path contains this substring.
+    fail_writes_under: StdMutex<Option<String>>,
 }
 
 impl FailControls {
+    pub fn fail_sstable_puts(&self, n: usize) {
+        self.sstable_put_failures.store(n, Ordering::SeqCst);
+    }
+    pub fn hold_sstable_puts(&self) {
+        self.block_sstable_puts.store(true, Ordering::SeqCst);
+    }
+    pub fn release_sstable_puts(&self) {
+        self.block_sstable_puts.store(false, Ordering::SeqCst);
+        self.sstable_put_release.notify_waiters();
+    }
+    pub fn sstable_attempts(&self) -> usize {
+        self.sstable_put_attempts.load(Ordering::SeqCst)
+    }
+
+    async fn before_sstable_put(&self, location: &Path) -> OSResult<()> {
+        if !location.as_ref().contains("_gen_") {
+            return Ok(());
+        }
+        self.sstable_put_attempts.fetch_add(1, Ordering::SeqCst);
+        let released = self.sstable_put_release.notified();
+        tokio::pin!(released);
+        released.as_mut().enable();
+        if self.block_sstable_puts.load(Ordering::SeqCst) {
+            released.await;
+        }
+        if self
+            .sstable_put_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(object_store::Error::Generic {
+                store: "failing-test-store",
+                source: "injected SSTable write failure".into(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn fail_wal_puts(&self, n: usize) {
         self.wal_put_failures.store(n, Ordering::SeqCst);
     }
@@ -51,8 +104,33 @@ impl FailControls {
     pub fn set_lost_ack(&self, v: bool) {
         self.simulate_lost_ack.store(v, Ordering::SeqCst);
     }
+    /// Fail every write whose path contains `needle`, until cleared.
+    pub fn fail_writes_under(&self, needle: &str) {
+        *self.fail_writes_under.lock().unwrap() = Some(needle.to_string());
+    }
+    /// Stop failing the writes [`Self::fail_writes_under`] targets.
+    pub fn clear_write_failures(&self) {
+        *self.fail_writes_under.lock().unwrap() = None;
+    }
+    /// Whether a write to `location` should fail.
+    fn fails_write(&self, location: &Path) -> bool {
+        self.fail_writes_under
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|needle| location.as_ref().contains(needle))
+    }
     pub fn attempts(&self) -> usize {
         self.wal_put_attempts.load(Ordering::SeqCst)
+    }
+    pub fn fail_blob_puts(&self, n: usize) {
+        self.blob_put_failures.store(n, Ordering::SeqCst);
+    }
+    pub fn set_block_blob_puts(&self, value: bool) {
+        self.block_blob_puts.store(value, Ordering::SeqCst);
+    }
+    pub fn blob_attempts(&self) -> usize {
+        self.blob_put_attempts.load(Ordering::SeqCst)
     }
 
     /// Did any write land on a path containing `needle`? An open that resolved
@@ -141,6 +219,24 @@ impl OSObjectStore for FailingObjectStore {
             .lock()
             .unwrap()
             .push(location.to_string());
+        self.controls.before_sstable_put(location).await?;
+        if self.controls.fails_write(location) {
+            return Err(Self::injected_error());
+        }
+        if location.as_ref().ends_with(".blob") {
+            self.controls
+                .blob_put_attempts
+                .fetch_add(1, Ordering::SeqCst);
+            if self.controls.block_blob_puts.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if self.controls.blob_put_failures.load(Ordering::SeqCst) > 0 {
+                self.controls
+                    .blob_put_failures
+                    .fetch_sub(1, Ordering::SeqCst);
+                return Err(Self::injected_error());
+            }
+        }
         if Self::is_wal_entry(location) {
             self.controls
                 .wal_put_attempts
@@ -170,6 +266,10 @@ impl OSObjectStore for FailingObjectStore {
             .lock()
             .unwrap()
             .push(location.to_string());
+        self.controls.before_sstable_put(location).await?;
+        if self.controls.fails_write(location) {
+            return Err(Self::injected_error());
+        }
         self.inner.put_multipart_opts(location, opts).await
     }
 

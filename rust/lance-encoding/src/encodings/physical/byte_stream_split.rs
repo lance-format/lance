@@ -64,8 +64,8 @@ use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
     MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext, MiniBlockCompressor,
 };
-use crate::format::ProtobufUtils21;
-use crate::format::pb21::CompressiveEncoding;
+use crate::format::EncodingUtils;
+use crate::format::metadata::CompressiveEncoding;
 use crate::statistics::{GetStat, Stat};
 use arrow_array::{cast::AsArray, types::UInt64Type};
 use lance_core::Result;
@@ -124,7 +124,7 @@ impl MiniBlockCompressor for ByteStreamSplitEncoder {
                             chunks: vec![],
                             num_values: 0,
                         },
-                        ProtobufUtils21::byte_stream_split(ProtobufUtils21::flat(
+                        EncodingUtils::byte_stream_split(EncodingUtils::flat(
                             self.bits_per_value as u64,
                             None,
                         )),
@@ -172,7 +172,7 @@ impl MiniBlockCompressor for ByteStreamSplitEncoder {
                 let data_buffers = vec![LanceBuffer::from(global_buffer)];
 
                 // TODO: Should support underlying compression
-                let encoding = ProtobufUtils21::byte_stream_split(ProtobufUtils21::flat(
+                let encoding = EncodingUtils::byte_stream_split(EncodingUtils::flat(
                     self.bits_per_value as u64,
                     None,
                 ));

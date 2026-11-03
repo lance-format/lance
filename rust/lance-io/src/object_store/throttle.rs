@@ -31,7 +31,6 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use lance_core::utils::aimd::{AimdConfig, AimdController, RequestOutcome};
 use lance_core::utils::tracing::TRACE_OBJECT_STORE_THROTTLE;
-#[cfg(test)]
 use object_store::ObjectStoreExt;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::client::{
@@ -40,9 +39,9 @@ use object_store::client::{
 };
 use object_store::path::Path;
 use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
-    UploadPart,
+    CopyMode, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+    RenameTargetMode, Result as OSResult, UploadPart,
 };
 use rand::Rng;
 use tokio::sync::Mutex;
@@ -51,6 +50,10 @@ use tracing::{debug, warn};
 use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
 
 use crate::object_store::ObjectStoreParams;
+
+/// Match ObjectStore's documented delete concurrency to bound in-flight operations
+/// and token reservations for stores without HTTP-level admission.
+const DELETE_CONCURRENCY: usize = 10;
 
 /// Check whether an `object_store::Error` represents a throttle response
 /// (HTTP 429 / 503) from a cloud object store.
@@ -194,7 +197,7 @@ impl AimdThrottleConfig {
     /// |----------------------|----------------------------------|----------------------------------|---------|
     /// | Initial rate         | `lance_aimd_initial_rate`        | `LANCE_AIMD_INITIAL_RATE`        | 2000    |
     /// | Min rate             | `lance_aimd_min_rate`            | `LANCE_AIMD_MIN_RATE`            | 1       |
-    /// | Max rate             | `lance_aimd_max_rate`            | `LANCE_AIMD_MAX_RATE`            | 5000    |
+    /// | Max rate             | `lance_aimd_max_rate`            | `LANCE_AIMD_MAX_RATE`            | 10000   |
     /// | Decrease factor      | `lance_aimd_decrease_factor`     | `LANCE_AIMD_DECREASE_FACTOR`     | 0.5     |
     /// | Additive increment   | `lance_aimd_additive_increment`  | `LANCE_AIMD_ADDITIVE_INCREMENT`  | 300     |
     /// | Burst capacity       | `lance_aimd_burst_capacity`      | `LANCE_AIMD_BURST_CAPACITY`      | 100     |
@@ -298,7 +301,11 @@ impl AimdThrottleConfig {
 
         let initial_rate = resolve_f64("lance_aimd_initial_rate", storage_options, 2000.0)?;
         let min_rate = resolve_f64("lance_aimd_min_rate", storage_options, 1.0)?;
-        let max_rate = resolve_f64("lance_aimd_max_rate", storage_options, 5000.0)?;
+        let max_rate = resolve_f64(
+            "lance_aimd_max_rate",
+            storage_options,
+            AimdConfig::default().max_rate,
+        )?;
         let decrease_factor = resolve_f64("lance_aimd_decrease_factor", storage_options, 0.5)?;
         let additive_increment =
             resolve_f64("lance_aimd_additive_increment", storage_options, 300.0)?;
@@ -525,6 +532,16 @@ pub(crate) struct AimdThrottleState {
 
 impl AimdThrottleState {
     pub(crate) fn new(config: AimdThrottleConfig) -> lance_core::Result<Self> {
+        // A retry draws its backoff from `min..=max`, and sampling an empty
+        // range panics, so a range that cannot be sampled is rejected while
+        // the store is being built rather than on the first throttled request.
+        if config.min_backoff_ms > config.max_backoff_ms {
+            return Err(lance_core::Error::invalid_input(format!(
+                "lance_aimd_min_backoff_ms ({}) must not exceed lance_aimd_max_backoff_ms \
+                 ({}): the retry backoff is drawn from that range",
+                config.min_backoff_ms, config.max_backoff_ms
+            )));
+        }
         let burst_capacity = config.burst_capacity as f64;
         let max_retries = config.max_retries;
         let min_backoff_ms = config.min_backoff_ms;
@@ -627,17 +644,19 @@ pub(crate) fn shared_throttle_state(
 
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 #[derive(Debug)]
-pub(crate) struct AimdMultipartUploadConnector<C> {
+pub(crate) struct AimdHttpConnector<C> {
     inner: C,
     write: Option<Arc<OperationThrottle>>,
+    delete: Option<Arc<OperationThrottle>>,
 }
 
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-impl<C> AimdMultipartUploadConnector<C> {
+impl<C> AimdHttpConnector<C> {
     fn new(inner: C, state: Option<&AimdThrottleState>) -> Self {
         Self {
             inner,
             write: state.map(|state| Arc::clone(&state.write)),
+            delete: state.map(|state| Arc::clone(&state.delete)),
         }
     }
 }
@@ -649,8 +668,8 @@ impl<C> AimdMultipartUploadConnector<C> {
 pub(crate) fn cloud_http_connector(
     state: Option<&AimdThrottleState>,
     metrics_base: String,
-) -> AimdMultipartUploadConnector<crate::object_store::metrics::MeteringHttpConnector> {
-    AimdMultipartUploadConnector::new(
+) -> AimdHttpConnector<crate::object_store::metrics::MeteringHttpConnector> {
+    AimdHttpConnector::new(
         crate::object_store::metrics::MeteringHttpConnector::new(metrics_base),
         state,
     )
@@ -663,29 +682,71 @@ pub(crate) fn cloud_http_connector(
 pub(crate) fn cloud_http_connector(
     state: Option<&AimdThrottleState>,
     _metrics_base: String,
-) -> AimdMultipartUploadConnector<object_store::client::ReqwestConnector> {
-    AimdMultipartUploadConnector::new(object_store::client::ReqwestConnector::default(), state)
+) -> AimdHttpConnector<object_store::client::ReqwestConnector> {
+    AimdHttpConnector::new(object_store::client::ReqwestConnector::default(), state)
 }
 
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-impl<C: HttpConnector> HttpConnector for AimdMultipartUploadConnector<C> {
+impl<C: HttpConnector> HttpConnector for AimdHttpConnector<C> {
     fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
-        Ok(HttpClient::new(AimdMultipartUploadService {
+        Ok(HttpClient::new(AimdHttpService {
             inner: self.inner.connect(options)?,
             write: self.write.clone(),
+            delete: self.delete.clone(),
         }))
     }
 }
 
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 #[derive(Debug)]
-struct AimdMultipartUploadService {
+struct AimdHttpService {
     inner: HttpClient,
     write: Option<Arc<OperationThrottle>>,
+    delete: Option<Arc<OperationThrottle>>,
 }
 
+/// Whether the request completes a multipart upload.
+///
+/// S3 and the GCS XML API complete with `POST ?uploadId=<id>` (no
+/// `partNumber`); Azure completes with `PUT ?comp=blocklist`. Upload
+/// initiation (`POST ?uploads`) is deliberately excluded.
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-fn is_multipart_part_request(request: &HttpRequest) -> bool {
+fn is_multipart_complete_request(request: &HttpRequest) -> bool {
+    let Some(query) = request.uri().query() else {
+        return false;
+    };
+    let mut has_upload_id = false;
+    let mut has_part_number = false;
+    let mut is_blocklist = false;
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if key.eq_ignore_ascii_case("uploadId") {
+            has_upload_id = true;
+        } else if key.eq_ignore_ascii_case("partNumber") {
+            has_part_number = true;
+        } else if key.eq_ignore_ascii_case("comp") && value.eq_ignore_ascii_case("blocklist") {
+            is_blocklist = true;
+        }
+    }
+    match *request.method() {
+        ::http::Method::POST => has_upload_id && !has_part_number,
+        ::http::Method::PUT => is_blocklist,
+        _ => false,
+    }
+}
+
+/// Whether the request carries one multipart upload's data: an uploaded part
+/// (S3/GCS `PUT ?partNumber=..&uploadId=..`, Azure `PUT ?comp=block`) or the
+/// complete request itself.
+///
+/// Completes are included because `MultipartUpload::complete` consumes the
+/// recorded part ids before issuing the request, so retries must happen here
+/// at the HTTP layer, where the request — including its serialized part list
+/// — can simply be re-sent.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+fn is_multipart_upload_request(request: &HttpRequest) -> bool {
+    if is_multipart_complete_request(request) {
+        return true;
+    }
     if request.method() != ::http::Method::PUT {
         return false;
     }
@@ -695,6 +756,140 @@ fn is_multipart_part_request(request: &HttpRequest) -> bool {
                 || (key.eq_ignore_ascii_case("comp") && value.eq_ignore_ascii_case("block"))
         })
     })
+}
+
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+fn is_delete_request(request: &HttpRequest) -> bool {
+    let query = request.uri().query();
+    if request.method() == ::http::Method::DELETE {
+        // Multipart aborts belong to the write budget.
+        return !query.is_some_and(|query| {
+            url::form_urlencoded::parse(query.as_bytes())
+                .any(|(key, _)| key.eq_ignore_ascii_case("uploadId"))
+        });
+    }
+    request.method() == ::http::Method::POST
+        && query.is_some_and(|query| {
+            url::form_urlencoded::parse(query.as_bytes()).any(|(key, value)| {
+                key.eq_ignore_ascii_case("delete")
+                    || (key.eq_ignore_ascii_case("comp") && value.eq_ignore_ascii_case("batch"))
+            })
+        })
+}
+
+/// The `Code` of an XML error document — a root `Error` element, optionally
+/// namespaced or carrying attributes, whose first `Code` child holds the error
+/// code — or `None` when `body` is not one.
+///
+/// S3, GCS and Azure all answer errors with this shape. Success documents
+/// (e.g. `CompleteMultipartUploadResult`) return `None` whatever text they
+/// carry, so an object key echoed in `<Key>` or `<Location>` cannot be
+/// mistaken for an error code.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+fn error_document_code(body: &str) -> Option<String> {
+    use quick_xml::events::Event;
+
+    let mut reader = quick_xml::Reader::from_str(body);
+    reader.config_mut().trim_text(true);
+
+    let root = loop {
+        match reader.read_event().ok()? {
+            Event::Decl(_) | Event::PI(_) | Event::Comment(_) | Event::DocType(_) => {}
+            Event::Start(root) => break root,
+            _ => return None,
+        }
+    };
+    if !root.local_name().as_ref().eq_ignore_ascii_case(b"Error") {
+        return None;
+    }
+
+    // Track depth so only a direct child of the root counts.
+    let mut depth = 0usize;
+    loop {
+        match reader.read_event().ok()? {
+            Event::Start(child)
+                if depth == 0 && child.local_name().as_ref().eq_ignore_ascii_case(b"Code") =>
+            {
+                break;
+            }
+            Event::Start(_) => depth += 1,
+            // At depth 0 this closes the root, which had no `Code` child.
+            Event::End(_) => depth = depth.checked_sub(1)?,
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+
+    let mut code = String::new();
+    loop {
+        match reader.read_event().ok()? {
+            Event::Text(text) => code.push_str(&text.decode().ok()?),
+            Event::CData(data) => code.push_str(&data.decode().ok()?),
+            Event::GeneralRef(entity) => match entity.resolve_char_ref().ok()? {
+                Some(ch) => code.push(ch),
+                None => code.push_str(quick_xml::escape::resolve_predefined_entity(
+                    &entity.decode().ok()?,
+                )?),
+            },
+            Event::End(_) => break,
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+    let code = code.trim();
+    (!code.is_empty()).then(|| code.to_string())
+}
+
+/// Whether an error code reports throttling or overload.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+fn is_throttle_error_code(code: &str) -> bool {
+    code.eq_ignore_ascii_case("RequestTimeout")
+        || code.eq_ignore_ascii_case("SlowDown")
+        || code.eq_ignore_ascii_case("ServerBusy")
+        || code.to_ascii_lowercase().contains("throttl")
+}
+
+/// What a multipart request's response body says beyond its status.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BodyVerdict {
+    retryable: bool,
+    throttle: bool,
+}
+
+/// Classifies a multipart request's response body.
+///
+/// An XML error document is judged by its `Code` alone. A complete answered
+/// with `InternalError` is retryable even under HTTP 200: S3 can report a
+/// failed `CompleteMultipartUpload` that way, and re-sending the request
+/// repeats the exact completion because it carries the serialized part list.
+/// A 2xx body that is not an error document is a success. Any other body on
+/// an error status falls back to matching throttle markers anywhere in it.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+fn classify_multipart_response_body(
+    status: ::http::StatusCode,
+    body: &str,
+    is_complete: bool,
+) -> BodyVerdict {
+    if let Some(code) = error_document_code(body) {
+        let throttle = is_throttle_error_code(&code);
+        return BodyVerdict {
+            retryable: throttle || (is_complete && code.eq_ignore_ascii_case("InternalError")),
+            throttle,
+        };
+    }
+    if status.is_success() {
+        return BodyVerdict::default();
+    }
+    let body = body.to_ascii_lowercase();
+    let throttle = body.contains("requesttimeout")
+        || body.contains("slowdown")
+        || body.contains("serverbusy")
+        || body.contains("throttl");
+    BodyVerdict {
+        retryable: throttle,
+        throttle,
+    }
 }
 
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
@@ -710,14 +905,41 @@ fn is_retryable_http_error(error: &HttpError) -> bool {
 
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 #[async_trait]
-impl HttpService for AimdMultipartUploadService {
+impl HttpService for AimdHttpService {
     async fn call(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        if let Some(delete) = self.delete.as_ref().filter(|_| is_delete_request(&request)) {
+            // The cloud client owns retry and bulk response handling. Each HTTP
+            // attempt draws one token, including retries of a bulk request.
+            delete.acquire_token().await;
+            let result = self.inner.execute(request).await;
+            let is_throttle = match &result {
+                Ok(response) => matches!(
+                    response.status(),
+                    ::http::StatusCode::TOO_MANY_REQUESTS | ::http::StatusCode::SERVICE_UNAVAILABLE
+                ),
+                // Non-throttle errors do not indicate capacity problems, matching
+                // the multipart write hook and the AIMD controller's policy.
+                Err(_) => false,
+            };
+            let outcome = if is_throttle {
+                RequestOutcome::Throttled
+            } else {
+                RequestOutcome::Success
+            };
+            let new_rate = delete.record_outcome(
+                outcome,
+                result.as_ref().err().map(|err| err as &dyn Display),
+            );
+            delete.update_bucket_rate(new_rate).await;
+            return result;
+        }
         let Some(write) = self.write.as_ref() else {
             return self.inner.execute(request).await;
         };
-        if !is_multipart_part_request(&request) {
+        if !is_multipart_upload_request(&request) {
             return self.inner.execute(request).await;
         }
+        let is_complete = is_multipart_complete_request(&request);
 
         for attempt in 0..=write.max_retries {
             write.acquire_token().await;
@@ -738,13 +960,13 @@ impl HttpService for AimdMultipartUploadService {
                 let (parts, body) = response.into_parts();
                 result = match body.bytes().await {
                     Ok(bytes) => {
-                        let body = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
-                        let is_throttle_body = body.contains("requesttimeout")
-                            || body.contains("slowdown")
-                            || body.contains("serverbusy")
-                            || body.contains("throttl");
-                        is_retryable |= is_throttle_body;
-                        is_throttle |= is_throttle_body;
+                        let verdict = classify_multipart_response_body(
+                            status,
+                            &String::from_utf8_lossy(&bytes),
+                            is_complete,
+                        );
+                        is_retryable |= verdict.retryable;
+                        is_throttle |= verdict.throttle;
                         Ok(HttpResponse::from_parts(
                             parts,
                             HttpResponseBody::from(bytes),
@@ -785,7 +1007,7 @@ impl HttpService for AimdMultipartUploadService {
                     attempt = attempt + 1,
                     max_retries = write.max_retries,
                     backoff_ms,
-                    "Retrying multipart upload part after retryable HTTP response"
+                    "Retrying multipart upload request after retryable HTTP response"
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 continue;
@@ -800,7 +1022,7 @@ impl HttpService for AimdMultipartUploadService {
 struct ThrottledMultipartUpload {
     target: Box<dyn MultipartUpload>,
     write: Arc<OperationThrottle>,
-    parts_throttled_at_http: bool,
+    requests_throttled_at_http: bool,
 }
 
 impl Debug for ThrottledMultipartUpload {
@@ -815,7 +1037,7 @@ impl MultipartUpload for ThrottledMultipartUpload {
         // Call put_part synchronously to preserve part ordering regardless
         // of which futures are awaited first.
         let fut = self.target.put_part(data);
-        if self.parts_throttled_at_http {
+        if self.requests_throttled_at_http {
             return fut;
         }
         let write = Arc::clone(&self.write);
@@ -827,24 +1049,24 @@ impl MultipartUpload for ThrottledMultipartUpload {
         })
     }
 
+    /// Completes the multipart upload by calling the target exactly once.
+    ///
+    /// `MultipartUpload::complete` consumes the recorded part ids before
+    /// sending the completion request, so a wrapper-level retry cannot repeat
+    /// it: the second call fails deterministically with "Missing part" and
+    /// masks the real error. Retries happen at the HTTP layer instead, which
+    /// re-sends the same serialized request.
     async fn complete(&mut self) -> OSResult<PutResult> {
-        let target = &mut self.target;
-        for attempt in 0..=self.write.max_retries {
-            self.write.acquire_token().await;
-            let result = target.complete().await;
-            self.write.observe_outcome(&result);
-
-            match &result {
-                Err(err) if is_throttle_error(err) && attempt < self.write.max_retries => {
-                    let backoff_ms = rand::rng()
-                        .random_range(self.write.min_backoff_ms..=self.write.max_backoff_ms);
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                    continue;
-                }
-                _ => return result,
-            }
+        if self.requests_throttled_at_http {
+            // The HTTP connector acquires a token, observes the outcome and
+            // retries each attempt of the complete request; wrapping it here
+            // would double-count.
+            return self.target.complete().await;
         }
-        unreachable!()
+        self.write.acquire_token().await;
+        let result = self.target.complete().await;
+        self.write.observe_outcome(&result);
+        result
     }
 
     async fn abort(&mut self) -> OSResult<()> {
@@ -877,9 +1099,12 @@ impl MultipartUpload for ThrottledMultipartUpload {
 /// - **delete**: `delete`
 /// - **list**: `list`, `list_with_offset`, `list_with_delimiter`
 ///
+/// Native cloud deletes draw one token per HTTP request, including bulk requests.
+/// Other stores delete paths individually with bounded concurrency so each
+/// request starts only after acquiring a delete token.
+///
 /// Streaming list operations acquire a token before starting the underlying list stream.
-/// Streaming operations also observe each yielded item and feed the result back to the
-/// AIMD controller so it can adjust the rate for other operations in the same category.
+/// List items also feed their outcomes back to the AIMD controller.
 ///
 /// This is not perfect but probably as close as we can get without moving the throttle into
 /// the object_store crate itself.
@@ -889,7 +1114,7 @@ pub struct AimdThrottledStore {
     write: Arc<OperationThrottle>,
     delete: Arc<OperationThrottle>,
     list: Arc<OperationThrottle>,
-    multipart_parts_throttled_at_http: bool,
+    native_http_throttling: bool,
 }
 
 impl Debug for AimdThrottledStore {
@@ -900,10 +1125,7 @@ impl Debug for AimdThrottledStore {
             .field("write", &self.write)
             .field("delete", &self.delete)
             .field("list", &self.list)
-            .field(
-                "multipart_parts_throttled_at_http",
-                &self.multipart_parts_throttled_at_http,
-            )
+            .field("native_http_throttling", &self.native_http_throttling)
             .finish()
     }
 }
@@ -929,7 +1151,7 @@ impl AimdThrottledStore {
     pub(crate) fn new_with_state(
         target: Arc<dyn ObjectStore>,
         state: AimdThrottleState,
-        multipart_parts_throttled_at_http: bool,
+        native_http_throttling: bool,
     ) -> Self {
         Self {
             target,
@@ -937,7 +1159,7 @@ impl AimdThrottledStore {
             write: state.write,
             delete: state.delete,
             list: state.list,
-            multipart_parts_throttled_at_http,
+            native_http_throttling,
         }
     }
 
@@ -965,7 +1187,7 @@ type StoreWithLister = (Arc<dyn ObjectStore>, Option<Arc<dyn PaginatedListStore>
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 pub(crate) fn with_throttling(
     state: Option<AimdThrottleState>,
-    multipart_parts_throttled_at_http: bool,
+    native_http_throttling: bool,
     store: Arc<dyn ObjectStore>,
     lister: Option<Arc<dyn PaginatedListStore>>,
 ) -> StoreWithLister {
@@ -975,7 +1197,7 @@ pub(crate) fn with_throttling(
     let store = Arc::new(AimdThrottledStore::new_with_state(
         store,
         state,
-        multipart_parts_throttled_at_http,
+        native_http_throttling,
     ));
     let lister = lister.map(|lister| store.wrap_paginated(lister));
     (store, lister)
@@ -1030,7 +1252,7 @@ impl ObjectStore for AimdThrottledStore {
         Ok(Box::new(ThrottledMultipartUpload {
             target,
             write: Arc::clone(&self.write),
-            parts_throttled_at_http: self.multipart_parts_throttled_at_http,
+            requests_throttled_at_http: self.native_http_throttling,
         }))
     }
 
@@ -1050,13 +1272,53 @@ impl ObjectStore for AimdThrottledStore {
         &self,
         locations: BoxStream<'static, OSResult<Path>>,
     ) -> BoxStream<'static, OSResult<Path>> {
+        if self.native_http_throttling {
+            let delete = Arc::clone(&self.delete);
+            return self
+                .target
+                .delete_stream(locations)
+                .map(move |item| {
+                    // A successful bulk HTTP response can contain per-object
+                    // throttle failures that only the native client can parse.
+                    // Admission and request-level outcomes stay at the HTTP hook.
+                    let is_unobserved_throttle = item.as_ref().err().is_some_and(|error| {
+                        let object_store::Error::Generic { source, .. } = error else {
+                            return false;
+                        };
+                        // Native per-object errors have no nested source. RetryError
+                        // wraps RequestError: only its successful-status error body
+                        // needs feedback here; HTTP failures were already observed.
+                        // These private types cannot be downcast through the public API.
+                        let is_parsed_response = source.source().is_none_or(|cause| {
+                            cause
+                                .to_string()
+                                .starts_with("Server returned error response:")
+                        });
+                        is_parsed_response && is_throttle_error(error)
+                    });
+                    if is_unobserved_throttle {
+                        delete.observe_outcome(&item);
+                    }
+                    item
+                })
+                .boxed();
+        }
+
+        // Generic stores do not expose their request boundaries. Delete paths
+        // individually so each operation waits for a token before it starts.
+        let target = Arc::clone(&self.target);
         let delete = Arc::clone(&self.delete);
-        self.target
-            .delete_stream(locations)
-            .map(move |item| {
-                delete.observe_outcome(&item);
-                item
+        locations
+            .map(move |location| {
+                let target = Arc::clone(&target);
+                let delete = Arc::clone(&delete);
+                async move {
+                    let location = location?;
+                    delete.throttled(|| target.delete(&location)).await?;
+                    Ok(location)
+                }
             })
+            .buffered(DELETE_CONCURRENCY)
             .boxed()
     }
 
@@ -1112,9 +1374,56 @@ impl ObjectStore for AimdThrottledStore {
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OSResult<()> {
-        self.write
-            .throttled(|| self.target.rename_opts(from, to, opts.clone()))
-            .await
+        let RenameOptions {
+            target_mode,
+            extensions,
+        } = opts;
+
+        match target_mode {
+            RenameTargetMode::Overwrite => {
+                // Delegate to the underlying store to preserve atomic rename
+                // semantics where the store supports them (e.g. local filesystem).
+                self.write
+                    .throttled(|| {
+                        self.target.rename_opts(
+                            from,
+                            to,
+                            RenameOptions {
+                                target_mode,
+                                extensions: extensions.clone(),
+                            },
+                        )
+                    })
+                    .await
+            }
+            RenameTargetMode::Create => {
+                // For rename_if_not_exists, the default object_store implementation
+                // is copy + delete. Perform the two steps under their respective
+                // throttles so they can be retried independently. If copy succeeds
+                // but delete is throttled, the caller's intent is satisfied: the
+                // destination now exists and the data has been committed.
+                let copy_options = CopyOptions {
+                    mode: CopyMode::Create,
+                    extensions: extensions.clone(),
+                };
+                self.write
+                    .throttled(|| self.target.copy_opts(from, to, copy_options.clone()))
+                    .await?;
+
+                // Best-effort cleanup of the source. Failure here does not change
+                // the outcome of the rename, so do not propagate the error.
+                if let Err(err) = self.delete.throttled(|| self.target.delete(from)).await {
+                    warn!(
+                        target: TRACE_OBJECT_STORE_THROTTLE,
+                        source = %from,
+                        destination = %to,
+                        error = %err,
+                        "rename_if_not_exists source cleanup failed after destination was created"
+                    );
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -1156,6 +1465,7 @@ mod tests {
                 .is_none()
         );
     }
+
     use object_store::memory::InMemory;
     use rstest::rstest;
     use std::collections::VecDeque;
@@ -1168,6 +1478,70 @@ mod tests {
             store: "test",
             source: msg.into(),
         }
+    }
+
+    fn params_with(options: &[(&str, &str)]) -> ObjectStoreParams {
+        ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                options
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            ))),
+            ..Default::default()
+        }
+    }
+
+    /// A backoff range that cannot be sampled is rejected while the store is
+    /// being built. Reaching the sampler with one panics, and raising only the
+    /// minimum above the default maximum is enough to get there.
+    #[rstest]
+    #[case::min_above_explicit_max(
+        &[("lance_aimd_min_backoff_ms", "500"), ("lance_aimd_max_backoff_ms", "100")]
+    )]
+    #[case::min_above_default_max(&[("lance_aimd_min_backoff_ms", "500")])]
+    fn test_shared_throttle_state_rejects_an_unsamplable_backoff_range(
+        #[case] options: &[(&str, &str)],
+    ) {
+        let Err(err) = shared_throttle_state("s3$backoff-bucket", &params_with(options)) else {
+            panic!("an unsamplable backoff range must be rejected");
+        };
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "got: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("lance_aimd_min_backoff_ms"), "{message}");
+        assert!(message.contains("lance_aimd_max_backoff_ms"), "{message}");
+    }
+
+    /// Equal bounds are a one-value range, which samples fine.
+    #[test]
+    fn test_shared_throttle_state_accepts_equal_backoff_bounds() {
+        let params = params_with(&[
+            ("lance_aimd_min_backoff_ms", "250"),
+            ("lance_aimd_max_backoff_ms", "250"),
+        ]);
+        assert!(
+            shared_throttle_state("s3$equal-bounds-bucket", &params)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// With retries off nothing samples the range, and a store that opens
+    /// today has to keep opening.
+    #[test]
+    fn test_shared_throttle_state_ignores_the_backoff_range_when_disabled() {
+        let params = params_with(&[
+            ("lance_aimd_max_retries", "0"),
+            ("lance_aimd_min_backoff_ms", "500"),
+        ]);
+        assert!(
+            shared_throttle_state("s3$disabled-bucket", &params)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[rstest]
@@ -1205,17 +1579,591 @@ mod tests {
 
     #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
     #[rstest]
-    #[case::s3("https://bucket/object?partNumber=1&uploadId=id", true)]
-    #[case::azure_block("https://account/object?comp=block&blockid=id", true)]
-    #[case::azure_block_list("https://account/object?comp=blocklist", false)]
-    #[case::ordinary_put("https://bucket/object", false)]
-    fn test_is_multipart_part_request(#[case] uri: &str, #[case] expected: bool) {
+    #[case::s3_part(
+        ::http::Method::PUT,
+        "https://bucket/object?partNumber=1&uploadId=id",
+        true
+    )]
+    #[case::s3_complete(::http::Method::POST, "https://bucket/object?uploadId=id", true)]
+    #[case::s3_initiate(::http::Method::POST, "https://bucket/object?uploads", false)]
+    #[case::azure_block(
+        ::http::Method::PUT,
+        "https://account/object?comp=block&blockid=id",
+        true
+    )]
+    #[case::azure_block_list(::http::Method::PUT, "https://account/object?comp=blocklist", true)]
+    #[case::s3_list_parts(::http::Method::GET, "https://bucket/object?uploadId=id", false)]
+    #[case::ordinary_put(::http::Method::PUT, "https://bucket/object", false)]
+    fn test_is_multipart_upload_request(
+        #[case] method: ::http::Method,
+        #[case] uri: &str,
+        #[case] expected: bool,
+    ) {
         let request = ::http::Request::builder()
-            .method(::http::Method::PUT)
+            .method(method)
             .uri(uri)
             .body(object_store::client::HttpRequestBody::empty())
             .unwrap();
-        assert_eq!(is_multipart_part_request(&request), expected);
+        assert_eq!(is_multipart_upload_request(&request), expected);
+    }
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    #[rstest]
+    #[case::plain(
+        "<Error><Code>InternalError</Code><Message>internal error</Message></Error>",
+        Some("InternalError")
+    )]
+    #[case::namespaced(
+        "<Error xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Code>SlowDown</Code></Error>",
+        Some("SlowDown")
+    )]
+    #[case::prefixed(
+        "<s3:Error><s3:Code>ServerBusy</s3:Code></s3:Error>",
+        Some("ServerBusy")
+    )]
+    #[case::declaration_and_bom(
+        "\u{feff}<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\n  <Code> RequestTimeout </Code>\n</Error>",
+        Some("RequestTimeout")
+    )]
+    #[case::code_after_other_children(
+        "<Error><Message>m</Message><Code>AccessDenied</Code></Error>",
+        Some("AccessDenied")
+    )]
+    #[case::nested_code_is_not_a_child(
+        "<Error><Details><Code>SlowDown</Code></Details></Error>",
+        None
+    )]
+    #[case::success_document_with_throttle_words(
+        "<?xml version=\"1.0\"?><CompleteMultipartUploadResult><Location>https://bucket/slowdown/object</Location><Key>throttle-demo/object</Key><Code>SlowDown</Code></CompleteMultipartUploadResult>",
+        None
+    )]
+    #[case::error_without_code("<Error><Message>SlowDown</Message></Error>", None)]
+    #[case::empty_code("<Error><Code></Code></Error>", None)]
+    #[case::self_closing_root("<Error/>", None)]
+    #[case::not_xml("SlowDown: Please reduce your request rate", None)]
+    #[case::empty("", None)]
+    #[case::comment_with_markup(
+        "<Error><!-- <Code>SlowDown</Code> --><Code>NoSuchUpload</Code></Error>",
+        Some("NoSuchUpload")
+    )]
+    #[case::cdata_code("<Error><Code><![CDATA[SlowDown]]></Code></Error>", Some("SlowDown"))]
+    #[case::cdata_with_markup(
+        "<Error><Message><![CDATA[<Code>SlowDown</Code>]]></Message><Code>NoSuchUpload</Code></Error>",
+        Some("NoSuchUpload")
+    )]
+    #[case::attribute_with_gt(
+        "<Error><Code note=\"a>b\">SlowDown</Code></Error>",
+        Some("SlowDown")
+    )]
+    #[case::entity_in_code("<Error><Code>Slow&#68;own</Code></Error>", Some("SlowDown"))]
+    fn test_error_document_code(#[case] body: &str, #[case] expected: Option<&str>) {
+        assert_eq!(error_document_code(body).as_deref(), expected);
+    }
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    #[rstest]
+    #[case::complete_success_key_with_throttle_word(
+        200,
+        "<CompleteMultipartUploadResult><Key>throttle-demo/object</Key></CompleteMultipartUploadResult>",
+        true,
+        false,
+        false
+    )]
+    #[case::complete_200_internal_error(
+        200,
+        "<Error xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Code>InternalError</Code></Error>",
+        true,
+        true,
+        false
+    )]
+    #[case::part_200_internal_error(
+        200,
+        "<Error><Code>InternalError</Code></Error>",
+        false,
+        false,
+        false
+    )]
+    #[case::complete_200_slowdown(200, "<Error><Code>SlowDown</Code></Error>", true, true, true)]
+    #[case::part_503_slowdown(503, "<Error><Code>SlowDown</Code></Error>", false, true, true)]
+    #[case::azure_throttled_code(
+        503,
+        "<Error><Code>OperationTimedOutThrottled</Code></Error>",
+        false,
+        true,
+        true
+    )]
+    #[case::other_code_with_throttle_word_in_key(
+        404,
+        "<Error><Code>NoSuchUpload</Code><Key>slowdown/object</Key></Error>",
+        true,
+        false,
+        false
+    )]
+    #[case::success_not_xml(200, "slowdown", false, false, false)]
+    #[case::error_not_xml_fallback(
+        503,
+        "SlowDown: Please reduce your request rate",
+        false,
+        true,
+        true
+    )]
+    #[case::error_other_document_fallback(
+        400,
+        "<html><body>Request throttled</body></html>",
+        true,
+        true,
+        true
+    )]
+    #[case::error_without_marker(400, "bad request", false, false, false)]
+    fn test_classify_multipart_response_body(
+        #[case] status: u16,
+        #[case] body: &str,
+        #[case] is_complete: bool,
+        #[case] retryable: bool,
+        #[case] throttle: bool,
+    ) {
+        let status = ::http::StatusCode::from_u16(status).unwrap();
+        assert_eq!(
+            classify_multipart_response_body(status, body, is_complete),
+            BodyVerdict {
+                retryable,
+                throttle
+            }
+        );
+    }
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    #[rstest]
+    #[case::ordinary_delete(::http::Method::DELETE, "https://bucket/object", true)]
+    #[case::s3_bulk(::http::Method::POST, "https://bucket/?delete", true)]
+    #[case::azure_batch(::http::Method::POST, "https://account/?comp=batch", true)]
+    #[case::multipart_abort(::http::Method::DELETE, "https://bucket/object?uploadId=id", false)]
+    #[case::unrelated_post(::http::Method::POST, "https://bucket/object?uploads", false)]
+    fn test_is_delete_request(
+        #[case] method: ::http::Method,
+        #[case] uri: &str,
+        #[case] expected: bool,
+    ) {
+        let request = ::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(object_store::client::HttpRequestBody::empty())
+            .unwrap();
+        assert_eq!(is_delete_request(&request), expected);
+    }
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    #[derive(Debug)]
+    struct CountingDeleteHttpService {
+        requests: Arc<AtomicUsize>,
+    }
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    #[async_trait]
+    impl HttpService for CountingDeleteHttpService {
+        async fn call(&self, _request: HttpRequest) -> Result<HttpResponse, HttpError> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            Ok(::http::Response::builder()
+                .status(::http::StatusCode::NO_CONTENT)
+                .body(HttpResponseBody::from(Bytes::new()))
+                .unwrap())
+        }
+    }
+
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    #[tokio::test(start_paused = true)]
+    async fn test_native_delete_http_requests_share_budget() {
+        use futures::FutureExt;
+
+        let state = AimdThrottleState::new(
+            AimdThrottleConfig::default()
+                .with_burst_capacity(0)
+                .with_delete_aimd(AimdConfig::default().with_initial_rate(1.0)),
+        )
+        .unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let service = AimdHttpService {
+            inner: HttpClient::new(CountingDeleteHttpService {
+                requests: Arc::clone(&requests),
+            }),
+            write: Some(state.write),
+            delete: Some(state.delete),
+        };
+
+        for (index, (method, uri)) in [
+            (::http::Method::DELETE, "https://bucket/object"),
+            (::http::Method::POST, "https://bucket/?delete"),
+            (::http::Method::POST, "https://account/?comp=batch"),
+            (::http::Method::DELETE, "https://bucket/object"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = ::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(object_store::client::HttpRequestBody::empty())
+                .unwrap();
+            let mut call = Box::pin(service.call(request));
+            assert!(call.as_mut().now_or_never().is_none());
+            assert_eq!(requests.load(Ordering::SeqCst), index);
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            assert_eq!(call.await.unwrap().status(), ::http::StatusCode::NO_CONTENT);
+            assert_eq!(requests.load(Ordering::SeqCst), index + 1);
+        }
+
+        let abort = ::http::Request::builder()
+            .method(::http::Method::DELETE)
+            .uri("https://bucket/object?uploadId=id")
+            .body(object_store::client::HttpRequestBody::empty())
+            .unwrap();
+        assert_eq!(
+            service.call(abort).await.unwrap().status(),
+            ::http::StatusCode::NO_CONTENT
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 5);
+    }
+
+    #[cfg(feature = "aws")]
+    #[derive(Debug)]
+    struct BulkDeleteConnector {
+        requests: Arc<AtomicUsize>,
+        failures_remaining: Arc<AtomicUsize>,
+        error_code: &'static str,
+    }
+
+    #[cfg(feature = "aws")]
+    impl HttpConnector for BulkDeleteConnector {
+        fn connect(&self, _options: &ClientOptions) -> OSResult<HttpClient> {
+            Ok(HttpClient::new(BulkDeleteService {
+                requests: Arc::clone(&self.requests),
+                failures_remaining: Arc::clone(&self.failures_remaining),
+                error_code: self.error_code,
+            }))
+        }
+    }
+
+    #[cfg(feature = "aws")]
+    #[derive(Debug)]
+    struct BulkDeleteService {
+        requests: Arc<AtomicUsize>,
+        failures_remaining: Arc<AtomicUsize>,
+        error_code: &'static str,
+    }
+
+    #[cfg(feature = "aws")]
+    #[async_trait]
+    impl HttpService for BulkDeleteService {
+        async fn call(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+            assert_eq!(request.method(), ::http::Method::POST);
+            assert_eq!(request.uri().query(), Some("delete"));
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            if self
+                .failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Ok(::http::Response::builder()
+                    .status(::http::StatusCode::SERVICE_UNAVAILABLE)
+                    .body(HttpResponseBody::from(
+                        "<Error><Code>SlowDown</Code></Error>".to_string(),
+                    ))
+                    .unwrap());
+            }
+            Ok(::http::Response::builder()
+                .status(::http::StatusCode::OK)
+                .body(HttpResponseBody::from(
+                    format!("<DeleteResult><Deleted><Key>fragments/1</Key></Deleted><Error><Key>fragments/2</Key><Code>{}</Code><Message>denied</Message></Error></DeleteResult>", self.error_code),
+                ))
+                .unwrap())
+        }
+    }
+
+    #[cfg(feature = "aws")]
+    #[tokio::test]
+    #[rstest]
+    #[case::single_request(0, Some(1), "AccessDenied", true, 0.0, 110.0)]
+    #[case::native_retry(1, Some(2), "AccessDenied", true, 0.0, 50.0)]
+    #[case::exhausted_retries(3, Some(2), "SlowDown", false, 0.0, 50.0)]
+    #[case::exhausted_retries_counted_once(3, Some(2), "SlowDown", false, 0.7, 110.0)]
+    #[case::parsed_slowdown(0, Some(1), "slowdown", true, 0.0, 50.0)]
+    #[case::native_slowdown(0, None, "SlowDown", false, 0.0, 50.0)]
+    async fn test_native_s3_bulk_delete_keeps_per_object_results(
+        #[case] failures: usize,
+        #[case] expected_requests: Option<usize>,
+        #[case] error_code: &'static str,
+        #[case] has_per_object_result: bool,
+        #[case] throttle_threshold: f64,
+        #[case] expected_rate: f64,
+    ) {
+        use futures::stream;
+        use object_store::aws::AmazonS3Builder;
+        use object_store::{BackoffConfig, RetryConfig};
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let failures_remaining = Arc::new(AtomicUsize::new(failures));
+        let config = AimdThrottleConfig::default().with_delete_aimd(
+            AimdConfig::default()
+                .with_initial_rate(100.0)
+                .with_throttle_threshold(throttle_threshold)
+                .with_additive_increment(10.0)
+                .with_window_duration(std::time::Duration::from_millis(100)),
+        );
+        let state = AimdThrottleState::new(config).unwrap();
+        // With one prior success, two throttled attempts give a 2/3 ratio.
+        // Counting the final error again would give 3/4 and cross the 0.7 threshold.
+        state
+            .delete
+            .controller
+            .record_outcome(RequestOutcome::Success);
+        let connector = AimdHttpConnector::new(
+            BulkDeleteConnector {
+                requests: Arc::clone(&requests),
+                failures_remaining,
+                error_code,
+            },
+            Some(&state),
+        );
+        let target = AmazonS3Builder::new()
+            .with_bucket_name("bucket")
+            .with_region("us-east-1")
+            .with_skip_signature(true)
+            .with_retry(RetryConfig {
+                max_retries: 1,
+                backoff: BackoffConfig {
+                    init_backoff: std::time::Duration::from_millis(1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .with_http_connector(connector)
+            .build()
+            .unwrap();
+        let throttled = AimdThrottledStore::new_with_state(Arc::new(target), state, true);
+        let results = throttled
+            .delete_stream(
+                stream::iter(vec![
+                    Ok(Path::from("fragments/1")),
+                    Ok(Path::from("fragments/2")),
+                ])
+                .boxed(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        let request_count = requests.load(Ordering::SeqCst);
+        if let Some(expected_requests) = expected_requests {
+            assert_eq!(request_count, expected_requests);
+        } else {
+            assert!((1..=2).contains(&request_count));
+        }
+        if has_per_object_result {
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0].as_ref().unwrap(), &Path::from("fragments/1"));
+            assert!(matches!(
+                results[1],
+                Err(object_store::Error::Generic { .. })
+            ));
+        }
+        assert!(results.iter().any(|result| {
+            result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string().contains(error_code))
+        }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        throttled
+            .delete
+            .controller
+            .record_outcome(RequestOutcome::Success);
+        assert_eq!(throttled.delete.controller.current_rate(), expected_rate);
+    }
+
+    #[cfg(feature = "azure")]
+    #[derive(Debug)]
+    struct AzureBatchConnector {
+        requests: Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "azure")]
+    impl HttpConnector for AzureBatchConnector {
+        fn connect(&self, _options: &ClientOptions) -> OSResult<HttpClient> {
+            Ok(HttpClient::new(AzureBatchService {
+                requests: Arc::clone(&self.requests),
+            }))
+        }
+    }
+
+    #[cfg(feature = "azure")]
+    #[derive(Debug)]
+    struct AzureBatchService {
+        requests: Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "azure")]
+    #[async_trait]
+    impl HttpService for AzureBatchService {
+        async fn call(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+            assert_eq!(request.method(), ::http::Method::POST);
+            assert!(
+                request
+                    .uri()
+                    .query()
+                    .unwrap_or_default()
+                    .contains("comp=batch")
+            );
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            let body = "--batchresponse_test\r\nContent-Type: application/http\r\nContent-ID: 0\r\n\r\nHTTP/1.1 202 Accepted\r\n\r\n--batchresponse_test\r\nContent-Type: application/http\r\nContent-ID: 1\r\n\r\nHTTP/1.1 503 ServerBusy\r\nx-ms-error-code: ServerBusy\r\n\r\n--batchresponse_test--\r\n";
+            Ok(::http::Response::builder()
+                .status(::http::StatusCode::ACCEPTED)
+                .header(
+                    "Content-Type",
+                    "multipart/mixed; boundary=batchresponse_test",
+                )
+                .body(HttpResponseBody::from(body.to_string()))
+                .unwrap())
+        }
+    }
+
+    #[cfg(feature = "azure")]
+    #[tokio::test]
+    async fn test_native_azure_batch_server_busy_reduces_rate() {
+        use futures::stream;
+        use object_store::azure::MicrosoftAzureBuilder;
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let config = AimdThrottleConfig::default().with_delete_aimd(
+            AimdConfig::default()
+                .with_initial_rate(100.0)
+                .with_additive_increment(10.0)
+                .with_window_duration(std::time::Duration::from_millis(100)),
+        );
+        let state = AimdThrottleState::new(config).unwrap();
+        let connector = AimdHttpConnector::new(
+            AzureBatchConnector {
+                requests: Arc::clone(&requests),
+            },
+            Some(&state),
+        );
+        let target = MicrosoftAzureBuilder::new()
+            .with_account("account")
+            .with_container_name("container")
+            .with_skip_signature(true)
+            .with_http_connector(connector)
+            .build()
+            .unwrap();
+        let throttled = AimdThrottledStore::new_with_state(Arc::new(target), state, true);
+        let results = throttled
+            .delete_stream(
+                stream::iter(vec![
+                    Ok(Path::from("fragments/1")),
+                    Ok(Path::from("fragments/2")),
+                ])
+                .boxed(),
+            )
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].as_ref().unwrap(), &Path::from("fragments/1"));
+        let error = results[1].as_ref().unwrap_err();
+        assert!(matches!(error, object_store::Error::Generic { .. }));
+        assert!(error.to_string().contains("ServerBusy"), "{error}");
+
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        throttled
+            .delete
+            .controller
+            .record_outcome(RequestOutcome::Success);
+        assert_eq!(throttled.delete.controller.current_rate(), 50.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_generic_delete_stream_shares_budget_and_preserves_errors() {
+        use futures::{FutureExt, stream};
+
+        let target = Arc::new(InMemory::new());
+        let first = Path::from("fragments/1");
+        let second = Path::from("fragments/2");
+        for path in [&first, &second] {
+            target
+                .put(path, PutPayload::from_static(b"data"))
+                .await
+                .unwrap();
+        }
+        let config = AimdThrottleConfig::default()
+            .with_burst_capacity(0)
+            .with_delete_aimd(AimdConfig::default().with_initial_rate(1.0));
+        let throttled = Arc::new(AimdThrottledStore::new(target.clone(), config).unwrap());
+        let input_error = object_store::Error::NotFound {
+            path: "input".to_string(),
+            source: "upstream failure".into(),
+        };
+        let mut results = throttled.delete_stream(
+            stream::iter(vec![
+                Ok(first.clone()),
+                Err(input_error),
+                Ok(second.clone()),
+            ])
+            .boxed(),
+        );
+
+        assert!(results.next().now_or_never().is_none());
+        assert!(target.head(&first).await.is_ok());
+        assert!(target.head(&second).await.is_ok());
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert_eq!(results.next().await.unwrap().unwrap(), first);
+        let error = results.next().await.unwrap().unwrap_err();
+        assert!(matches!(error, object_store::Error::NotFound { .. }));
+        assert!(error.to_string().contains("input"));
+        assert!(target.head(&second).await.is_ok());
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert_eq!(results.next().await.unwrap().unwrap(), second);
+        assert!(results.next().await.is_none());
+        assert!(target.head(&first).await.is_err());
+        assert!(target.head(&second).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_generic_delete_throttle_error_reduces_rate() {
+        let target = Arc::new(RetryTestMockStore::new(1));
+        let config = AimdThrottleConfig {
+            max_retries: 0,
+            ..Default::default()
+        }
+        .with_delete_aimd(
+            AimdConfig::default()
+                .with_initial_rate(100.0)
+                .with_window_duration(std::time::Duration::from_millis(100)),
+        );
+        let throttled = AimdThrottledStore::new(target.clone(), config).unwrap();
+        let results = throttled
+            .delete_stream(futures::stream::iter([Ok(Path::from("object"))]).boxed())
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(results.len(), 1);
+        let error = results[0].as_ref().unwrap_err();
+        assert!(matches!(error, object_store::Error::Generic { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Server returned non-2xx status code: 503")
+        );
+        assert_eq!(*target.errors_remaining.lock().unwrap(), 0);
+
+        // AIMD uses std::time::Instant, which Tokio's paused clock cannot advance.
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        throttled
+            .delete
+            .controller
+            .record_outcome(RequestOutcome::Success);
+        assert_eq!(throttled.delete.controller.current_rate(), 50.0);
     }
 
     /// One page of a fixed directory, counting the requests that reached it.
@@ -2038,7 +2986,7 @@ mod tests {
     }
 
     /// A mock store that returns a configurable number of throttle errors
-    /// before succeeding on `get` operations. Used to test the retry logic
+    /// before succeeding on `get` and delete operations. Used to test the retry logic
     /// inside `OperationThrottle::throttled()`.
     struct RetryTestMockStore {
         inner: InMemory,
@@ -2054,6 +3002,19 @@ mod tests {
                 inner: InMemory::new(),
                 errors_remaining: std::sync::Mutex::new(errors_before_success),
                 get_call_count: AtomicU64::new(0),
+            }
+        }
+
+        fn take_throttle_error(&self) -> OSResult<()> {
+            let mut remaining = self.errors_remaining.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                Err(object_store::Error::Generic {
+                    store: "RetryTestMock",
+                    source: THROTTLE_ERROR_RESPONSE.into(),
+                })
+            } else {
+                Ok(())
             }
         }
     }
@@ -2089,23 +3050,8 @@ mod tests {
         }
         async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
             self.get_call_count.fetch_add(1, Ordering::Relaxed);
-            let should_error = {
-                let mut remaining = self.errors_remaining.lock().unwrap();
-                if *remaining > 0 {
-                    *remaining -= 1;
-                    true
-                } else {
-                    false
-                }
-            };
-            if should_error {
-                Err(object_store::Error::Generic {
-                    store: "RetryTestMock",
-                    source: THROTTLE_ERROR_RESPONSE.into(),
-                })
-            } else {
-                self.inner.get_opts(location, options).await
-            }
+            self.take_throttle_error()?;
+            self.inner.get_opts(location, options).await
         }
         async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
             self.inner.get_ranges(location, ranges).await
@@ -2114,7 +3060,10 @@ mod tests {
             &self,
             locations: BoxStream<'static, OSResult<Path>>,
         ) -> BoxStream<'static, OSResult<Path>> {
-            self.inner.delete_stream(locations)
+            match self.take_throttle_error() {
+                Ok(()) => self.inner.delete_stream(locations),
+                Err(error) => futures::stream::once(async move { Err(error) }).boxed(),
+            }
         }
         fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
             self.inner.list(prefix)
@@ -2190,6 +3139,10 @@ mod tests {
     struct MultipartRetryState {
         failures_remaining: AtomicUsize,
         part_uris: std::sync::Mutex<Vec<String>>,
+        complete_failures_remaining: AtomicUsize,
+        /// Body of every complete request that reached the mock, in order.
+        complete_bodies: std::sync::Mutex<Vec<Bytes>>,
+        complete_error_on_200: bool,
     }
 
     #[cfg(feature = "aws")]
@@ -2260,11 +3213,48 @@ mod tests {
                     (::http::StatusCode::OK, "", Some("\"part-etag\""))
                 }
             } else if method == ::http::Method::POST && query.contains("uploadId=") {
-                (
-                    ::http::StatusCode::OK,
-                    "<CompleteMultipartUploadResult><Location>https://bucket/object</Location><Bucket>bucket</Bucket><Key>object</Key><ETag>\"object-etag\"</ETag></CompleteMultipartUploadResult>",
-                    None,
-                )
+                let body = request
+                    .body()
+                    .as_bytes()
+                    .cloned()
+                    .expect("S3 sends the complete request as one contiguous body");
+                self.state.complete_bodies.lock().unwrap().push(body);
+                let mut remaining = self
+                    .state
+                    .complete_failures_remaining
+                    .load(Ordering::SeqCst);
+                let should_fail = loop {
+                    let Some(next) = remaining.checked_sub(1) else {
+                        break false;
+                    };
+                    match self
+                        .state
+                        .complete_failures_remaining
+                        .compare_exchange_weak(remaining, next, Ordering::SeqCst, Ordering::SeqCst)
+                    {
+                        Ok(_) => break true,
+                        Err(actual) => remaining = actual,
+                    }
+                };
+                if !should_fail {
+                    (
+                        ::http::StatusCode::OK,
+                        "<CompleteMultipartUploadResult><Location>https://bucket/object</Location><Bucket>bucket</Bucket><Key>object</Key><ETag>\"object-etag\"</ETag></CompleteMultipartUploadResult>",
+                        None,
+                    )
+                } else if self.state.complete_error_on_200 {
+                    (
+                        ::http::StatusCode::OK,
+                        "<Error xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Code>InternalError</Code><Message>We encountered an internal error. Please try again.</Message></Error>",
+                        None,
+                    )
+                } else {
+                    (
+                        ::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>",
+                        None,
+                    )
+                }
             } else {
                 (::http::StatusCode::BAD_REQUEST, "unexpected request", None)
             };
@@ -2291,9 +3281,12 @@ mod tests {
         let retry_state = Arc::new(MultipartRetryState {
             failures_remaining: AtomicUsize::new(3),
             part_uris: std::sync::Mutex::new(Vec::new()),
+            complete_failures_remaining: AtomicUsize::new(0),
+            complete_bodies: std::sync::Mutex::new(Vec::new()),
+            complete_error_on_200: false,
         });
         let throttle_state = AimdThrottleState::new(AimdThrottleConfig::default()).unwrap();
-        let connector = AimdMultipartUploadConnector::new(
+        let connector = AimdHttpConnector::new(
             MultipartRetryConnector {
                 state: Arc::clone(&retry_state),
             },
@@ -2322,6 +3315,189 @@ mod tests {
         assert_eq!(part_uris.len(), 4);
         assert!(part_uris.iter().all(|uri| uri == &part_uris[0]));
         assert!(part_uris[0].contains("partNumber=1"));
+    }
+
+    /// `MultipartUpload::complete` consumes the recorded part ids before
+    /// sending, so it must be called exactly once. A failed complete is retried
+    /// at the HTTP layer instead, by re-sending the same request with its
+    /// serialized part list. S3 can report a failed complete as a throttling
+    /// status or as HTTP 200 carrying an `InternalError` document.
+    #[cfg(feature = "aws")]
+    #[tokio::test(start_paused = true)]
+    #[rstest]
+    #[case::throttled(false)]
+    #[case::internal_error_on_200(true)]
+    async fn test_multipart_http_retry_resends_failed_complete(
+        #[case] complete_error_on_200: bool,
+    ) {
+        use object_store::RetryConfig;
+        use object_store::aws::AmazonS3Builder;
+
+        let retry_state = Arc::new(MultipartRetryState {
+            failures_remaining: AtomicUsize::new(0),
+            part_uris: std::sync::Mutex::new(Vec::new()),
+            complete_failures_remaining: AtomicUsize::new(1),
+            complete_bodies: std::sync::Mutex::new(Vec::new()),
+            complete_error_on_200,
+        });
+        let throttle_state = AimdThrottleState::new(AimdThrottleConfig::default()).unwrap();
+        let connector = AimdHttpConnector::new(
+            MultipartRetryConnector {
+                state: Arc::clone(&retry_state),
+            },
+            Some(&throttle_state),
+        );
+        let store = AmazonS3Builder::new()
+            .with_bucket_name("bucket")
+            .with_region("us-east-1")
+            .with_skip_signature(true)
+            .with_retry(RetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            })
+            .with_http_connector(connector)
+            .build()
+            .unwrap();
+
+        let mut upload = store.put_multipart(&Path::from("object")).await.unwrap();
+        upload
+            .put_part(PutPayload::from_static(b"payload"))
+            .await
+            .unwrap();
+        upload.complete().await.unwrap();
+
+        let bodies = retry_state.complete_bodies.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "the failed complete should be retried exactly once at the HTTP layer"
+        );
+        let first = std::str::from_utf8(&bodies[0]).unwrap();
+        assert!(
+            first.contains("<PartNumber>1</PartNumber>") && first.contains("part-etag"),
+            "the complete request should carry the uploaded part list, got: {first}"
+        );
+        assert_eq!(
+            bodies[1], bodies[0],
+            "the retried complete should re-send the original part list"
+        );
+    }
+
+    /// A successful complete echoes the object key in `<Key>`; a key holding a
+    /// throttle word must not trigger a retry, which would replay an upload
+    /// that already completed and fail with `NoSuchUpload`.
+    #[cfg(feature = "aws")]
+    #[tokio::test(start_paused = true)]
+    #[rstest]
+    #[case::throttle("throttle-demo/object")]
+    #[case::slowdown("slowdown/object")]
+    #[case::serverbusy("serverbusy/object")]
+    #[case::requesttimeout("requesttimeout/object")]
+    #[case::ordinary("data/object")]
+    async fn test_gate_successful_completion_response(#[case] key: &str) {
+        #[derive(Debug)]
+        struct Completed {
+            key: String,
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl HttpService for Completed {
+            async fn call(&self, _: HttpRequest) -> Result<HttpResponse, HttpError> {
+                let (status, body) = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (
+                        ::http::StatusCode::OK,
+                        format!(
+                            "<CompleteMultipartUploadResult><Location>https://bucket/{0}</Location><Key>{0}</Key><ETag>\"etag\"</ETag></CompleteMultipartUploadResult>",
+                            self.key
+                        ),
+                    )
+                } else {
+                    (
+                        ::http::StatusCode::NOT_FOUND,
+                        "<Error><Code>NoSuchUpload</Code></Error>".to_string(),
+                    )
+                };
+                Ok(::http::Response::builder()
+                    .status(status)
+                    .body(HttpResponseBody::from(body))
+                    .unwrap())
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = AimdThrottleState::new(AimdThrottleConfig::default()).unwrap();
+        let service = AimdHttpService {
+            inner: HttpClient::new(Completed {
+                key: key.to_string(),
+                calls: Arc::clone(&calls),
+            }),
+            write: Some(state.write),
+            delete: None,
+        };
+        let request = ::http::Request::builder()
+            .method(::http::Method::POST)
+            .uri(format!("https://bucket/{key}?uploadId=id"))
+            .body(object_store::client::HttpRequestBody::empty())
+            .unwrap();
+        let response = service.call(request).await.unwrap();
+        assert_eq!(response.status(), ::http::StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The wrapper must surface the target's real error rather than retry
+    /// `complete` and mask it with "Missing part".
+    #[tokio::test(start_paused = true)]
+    async fn test_throttled_multipart_complete_calls_target_once() {
+        use object_store::PutResult;
+        use object_store::UploadPart;
+
+        #[derive(Debug)]
+        struct FailingComplete {
+            complete_calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl MultipartUpload for FailingComplete {
+            fn put_part(&mut self, _data: PutPayload) -> UploadPart {
+                Box::pin(async { Ok(()) })
+            }
+
+            async fn complete(&mut self) -> OSResult<PutResult> {
+                self.complete_calls.fetch_add(1, Ordering::SeqCst);
+                Err(make_generic_error(
+                    "SlowDown: Please reduce your request rate",
+                ))
+            }
+
+            async fn abort(&mut self) -> OSResult<()> {
+                Ok(())
+            }
+        }
+
+        let state = AimdThrottleState::new(AimdThrottleConfig::default()).unwrap();
+        let complete_calls = Arc::new(AtomicUsize::new(0));
+        let mut upload = ThrottledMultipartUpload {
+            target: Box::new(FailingComplete {
+                complete_calls: Arc::clone(&complete_calls),
+            }),
+            write: Arc::clone(&state.write),
+            requests_throttled_at_http: false,
+        };
+
+        let err = upload.complete().await.unwrap_err();
+        assert_eq!(
+            complete_calls.load(Ordering::SeqCst),
+            1,
+            "complete must call the target exactly once"
+        );
+        assert!(
+            !err.to_string().contains("Missing part"),
+            "complete retry surfaced the masked error: {err}"
+        );
+        assert!(
+            is_throttle_error(&err),
+            "the target's throttle error should surface unchanged: {err}"
+        );
     }
 
     #[tokio::test]
@@ -2353,5 +3529,231 @@ mod tests {
             "Parts were reordered! Got {:?} instead of AAAABBBB.",
             std::str::from_utf8(&bytes).unwrap_or("<non-utf8>"),
         );
+    }
+
+    #[tokio::test]
+    async fn test_rename_moves_object() {
+        let store = Arc::new(InMemory::new());
+        let config = AimdThrottleConfig::default();
+        let throttled = AimdThrottledStore::new(store, config).unwrap();
+
+        let from = Path::from("test/from.txt");
+        let to = Path::from("test/to.txt");
+        throttled
+            .put(&from, PutPayload::from_static(b"payload"))
+            .await
+            .unwrap();
+
+        throttled.rename(&from, &to).await.unwrap();
+
+        // Destination has the data and source is gone.
+        let bytes = throttled.get(&to).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"payload");
+        assert!(matches!(
+            throttled.head(&from).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_rename_if_not_exists_rejects_existing_target() {
+        let store = Arc::new(InMemory::new());
+        let config = AimdThrottleConfig::default();
+        let throttled = AimdThrottledStore::new(store, config).unwrap();
+
+        let from = Path::from("test/from.txt");
+        let to = Path::from("test/to.txt");
+        throttled
+            .put(&from, PutPayload::from_static(b"src"))
+            .await
+            .unwrap();
+        throttled
+            .put(&to, PutPayload::from_static(b"existing"))
+            .await
+            .unwrap();
+
+        // RenameTargetMode::Create must map to CopyMode::Create and reject the
+        // pre-existing destination.
+        let err = throttled
+            .rename_if_not_exists(&from, &to)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, object_store::Error::AlreadyExists { .. }),
+            "expected AlreadyExists, got {err:?}"
+        );
+
+        // The failed copy must not have deleted the source.
+        let bytes = throttled.get(&from).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"src");
+    }
+
+    /// A mock store that returns a configurable number of throttle errors on
+    /// `copy_opts` and `delete` independently before succeeding. Used to verify
+    /// that `rename_opts` retries the copy and the delete separately.
+    struct RenameRetryMockStore {
+        inner: InMemory,
+        copy_errors_remaining: std::sync::Mutex<usize>,
+        delete_errors_remaining: std::sync::Mutex<usize>,
+        copy_call_count: AtomicU64,
+        delete_call_count: AtomicU64,
+    }
+
+    impl RenameRetryMockStore {
+        fn new(copy_errors: usize, delete_errors: usize) -> Self {
+            Self {
+                inner: InMemory::new(),
+                copy_errors_remaining: std::sync::Mutex::new(copy_errors),
+                delete_errors_remaining: std::sync::Mutex::new(delete_errors),
+                copy_call_count: AtomicU64::new(0),
+                delete_call_count: AtomicU64::new(0),
+            }
+        }
+
+        fn should_error(counter: &std::sync::Mutex<usize>) -> bool {
+            let mut remaining = counter.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                true
+            } else {
+                false
+            }
+        }
+
+        fn throttle_error() -> object_store::Error {
+            object_store::Error::Generic {
+                store: "RenameRetryMock",
+                source: THROTTLE_ERROR_RESPONSE.into(),
+            }
+        }
+    }
+
+    impl Display for RenameRetryMockStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RenameRetryMockStore")
+        }
+    }
+
+    impl Debug for RenameRetryMockStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RenameRetryMockStore").finish()
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for RenameRetryMockStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+        // `delete` is provided by `ObjectStoreExt` and delegates to
+        // `delete_stream`, so we inject throttle errors here to exercise the
+        // separate delete-retry path in `rename_opts`.
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            self.delete_call_count.fetch_add(1, Ordering::Relaxed);
+            if Self::should_error(&self.delete_errors_remaining) {
+                futures::stream::once(async { Err(Self::throttle_error()) }).boxed()
+            } else {
+                self.inner.delete_stream(locations)
+            }
+        }
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+            self.copy_call_count.fetch_add(1, Ordering::Relaxed);
+            if Self::should_error(&self.copy_errors_remaining) {
+                Err(Self::throttle_error())
+            } else {
+                self.inner.copy_opts(from, to, opts).await
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rename_if_not_exists_retries_copy_and_delete_independently() {
+        // Copy fails twice then succeeds; delete fails once then succeeds.
+        // Both are within max_retries=3, so the rename_if_not_exists should
+        // ultimately succeed, with copy and delete retried independently.
+        let mock = Arc::new(RenameRetryMockStore::new(2, 1));
+        let from = Path::from("test/from.txt");
+        let to = Path::from("test/to.txt");
+        mock.put(&from, PutPayload::from_static(b"payload"))
+            .await
+            .unwrap();
+
+        let config = AimdThrottleConfig::default();
+        let throttled =
+            AimdThrottledStore::new(mock.clone() as Arc<dyn ObjectStore>, config).unwrap();
+
+        throttled.rename_if_not_exists(&from, &to).await.unwrap();
+
+        // Copy: 2 failures + 1 success. Delete: 1 failure + 1 success.
+        assert_eq!(mock.copy_call_count.load(Ordering::Relaxed), 3);
+        assert_eq!(mock.delete_call_count.load(Ordering::Relaxed), 2);
+
+        // Source cleaned up, destination present.
+        let bytes = throttled.get(&to).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"payload");
+        assert!(matches!(
+            throttled.head(&from).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_rename_if_not_exists_succeeds_when_delete_throttled() {
+        // Copy succeeds, but delete is throttled beyond max_retries.
+        // The rename must still report success because the destination exists
+        // and the caller's intent has been satisfied.
+        let mock = Arc::new(RenameRetryMockStore::new(0, 10));
+        let from = Path::from("test/from.txt");
+        let to = Path::from("test/to.txt");
+        mock.put(&from, PutPayload::from_static(b"payload"))
+            .await
+            .unwrap();
+
+        let config = AimdThrottleConfig::default();
+        let throttled =
+            AimdThrottledStore::new(mock.clone() as Arc<dyn ObjectStore>, config).unwrap();
+
+        throttled.rename_if_not_exists(&from, &to).await.unwrap();
+
+        // Destination has the data.
+        let bytes = throttled.get(&to).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"payload");
+        // Source was not cleaned up because delete kept failing.
+        let bytes = throttled.get(&from).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"payload");
     }
 }

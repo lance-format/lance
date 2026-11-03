@@ -183,6 +183,31 @@ need enough memory to hold one batch. Once batches are delivered to your applica
 by Lance and so if memory is a concern then you should also be careful not to accumulate memory in your own
 application (e.g. by running `to_table` or otherwise collecting all batches in memory.)
 
+#### Large allocations and transparent huge pages
+
+Decoding allocates a fresh output buffer for every batch, and large columns (long strings, JSON documents,
+vectors) fill gigabytes of such buffers per scan. With the default glibc allocator every 4 KiB page of those
+buffers is faulted in on first touch, and on a scan that produces several gigabytes of Arrow data the page
+faults can cost as much CPU as the decoding itself (one profile of an 11 GB string scan showed 5.4 million
+page faults and about half of the CPU time in the kernel memory manager).
+
+On Linux with transparent huge pages in `madvise` mode (the default on most distributions, see
+`/sys/kernel/mm/transparent_hugepage/enabled`) you can let glibc back large allocations with 2 MiB pages:
+
+```shell
+GLIBC_TUNABLES=glibc.malloc.hugetlb=1 python scan.py
+```
+
+On the same 11 GB scan this cut page faults by 9x and the scan time by 2-3.5x, both for 2.0 files and for
+compressed 2.2 files, and it made a full-table rewrite to 2.2 about 1.5x faster. Takes of a few rows are not
+affected.
+
+The setting is opt-in because its effect depends on the host. Huge pages are managed in 2 MiB units, so
+check the resident set against your memory limits. When free memory is fragmented and
+`/sys/kernel/mm/transparent_hugepage/defrag` is `madvise`, the kernel may compact memory synchronously on
+first touch: one 256 MiB allocation measured 0.09 s without the tunable and 1.2 s with it on a long-running
+host. Measure scan latency and memory on the deployment host before enabling it.
+
 The default `batch_size` is 8192 rows. When you are working with mostly scalar data you want to keep batches
 around 1MB and so the amount of memory needed by the compute threads is fairly small. However, when working with
 large data you may need to turn down the `batch_size` to keep memory usage under control. For example, when
@@ -245,15 +270,15 @@ over environment variables:
 | ------------------ | ------------------------------- | ------------------------------- | ------- |
 | Initial rate       | `lance_aimd_initial_rate`       | `LANCE_AIMD_INITIAL_RATE`       | 2000    |
 | Min rate           | `lance_aimd_min_rate`           | `LANCE_AIMD_MIN_RATE`           | 1       |
-| Max rate           | `lance_aimd_max_rate`           | `LANCE_AIMD_MAX_RATE`           | 5000    |
+| Max rate           | `lance_aimd_max_rate`           | `LANCE_AIMD_MAX_RATE`           | 10000   |
 | Decrease factor    | `lance_aimd_decrease_factor`    | `LANCE_AIMD_DECREASE_FACTOR`    | 0.5     |
 | Additive increment | `lance_aimd_additive_increment` | `LANCE_AIMD_ADDITIVE_INCREMENT` | 300     |
 | Burst capacity     | `lance_aimd_burst_capacity`     | `LANCE_AIMD_BURST_CAPACITY`     | 100     |
 
-These initial settings are balanced and should work for most
-use cases. For example, S3 can typically get up to 5000
-req/s and with these settings we should get there in about
-10 seconds.
+Under sustained success, the default rate grows from 2000 to 10000 requests/s
+in about 27 seconds. Each operation category has its own rate controller.
+The ceiling is a client-side tuning parameter, not a storage-provider limit;
+override it to match the workload and the store's throttling behavior.
 
 ## Fragment Sizing
 
