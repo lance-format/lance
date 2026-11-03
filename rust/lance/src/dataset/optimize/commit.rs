@@ -159,8 +159,13 @@ pub async fn commit_compaction(
              a plan may put a fragment in one kind of task only"
         )));
     }
+    // Commit the repacks from the handle as passed in, as the rewrites are.
+    // The one the rewrite commit moved on is past the planned version, so
+    // committing from it would load that version's manifest back, and it may
+    // have been expired since.
+    let repack_base = dataset.clone();
     let mut metrics = Box::pin(commit_rewrites(dataset, rewrites, remap_options, options)).await?;
-    metrics += super::repack::commit_repacked_files(dataset, repacks, options).await?;
+    metrics += super::repack::commit_repacked_files(dataset, repack_base, repacks, options).await?;
     Ok(metrics)
 }
 

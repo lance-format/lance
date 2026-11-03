@@ -286,6 +286,50 @@ async fn compaction_rewrites_and_repacks_in_one_run() {
     dataset.validate().await.unwrap();
 }
 
+/// The repack commits after the rewrite has moved `dataset` on, against the
+/// version both were planned at. A concurrent writer can expire that version's
+/// manifest before then, so the repack must not read it back from storage.
+#[tokio::test]
+async fn repack_commits_after_its_read_version_is_expired() {
+    use crate::dataset::expire::{ExpireVersionsPolicyBuilder, expire_versions};
+
+    let mut dataset = write_backfilled().await;
+    dataset.delete("a = 0 OR a = 1").await.unwrap();
+    let read_version = dataset.manifest.version;
+    let options = CompactionOptions {
+        target_rows_per_fragment: 3,
+        max_data_files_per_fragment: Some(1),
+        ..Default::default()
+    };
+    let results = stale_repack_results(&dataset, &options).await;
+    assert_eq!(results.len(), 2);
+
+    let mut writer = dataset.clone();
+    let appended = dataset.scan().try_into_batch().await.unwrap();
+    writer
+        .append(
+            RecordBatchIterator::new([Ok(appended.clone())], appended.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    expire_versions(
+        &writer,
+        ExpireVersionsPolicyBuilder::default()
+            .before_version(writer.manifest.version)
+            .build(),
+    )
+    .await
+    .unwrap();
+    assert!(dataset.checkout_version(read_version).await.is_err());
+
+    commit_results(&mut dataset, results).await.unwrap();
+    let operation = dataset.read_transaction().await.unwrap().unwrap().operation;
+    assert_eq!(operation.to_string(), "DataReplacement");
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 2 * 6);
+    dataset.validate().await.unwrap();
+}
+
 #[tokio::test]
 async fn compaction_scope_selects_task_kinds() {
     let mut dataset = write_backfilled().await;

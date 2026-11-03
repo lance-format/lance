@@ -351,9 +351,11 @@ async fn write_one_file(
 
 /// Commit the files of repack results as one `DataReplacement` that moves
 /// values without changing them. Each result applies to its fragment as it
-/// stands at commit.
+/// stands at commit. The commit goes through `base`; if it lands, `dataset`
+/// is set to it.
 pub(super) async fn commit_repacked_files(
     dataset: &mut Dataset,
+    mut base: Dataset,
     results: Vec<RewriteResult>,
     options: &CompactionOptions,
 ) -> Result<CompactionMetrics> {
@@ -389,8 +391,8 @@ pub(super) async fn commit_repacked_files(
     .build();
     // Like a rewrite's, a repack result can be retried after an ambiguous
     // success, so its files are left for cleanup rather than deleted here.
-    dataset
-        .apply_commit(transaction, &Default::default(), &Default::default())
+    base.apply_commit(transaction, &Default::default(), &Default::default())
         .await?;
+    *dataset = base;
     Ok(metrics)
 }
