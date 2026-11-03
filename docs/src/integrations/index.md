@@ -9,28 +9,19 @@ Because Lance is built on Apache Arrow and exposes
 a stable Rust core with Python and Java bindings, it can be consumed from query engines, ML frameworks, databases,
 and catalog systems without copying or converting data.
 
-This page lists the database, SDKs, engines, and ecosystem integrations maintained by the Lance community. Some live in this repository as first-party
+This page lists the integrations maintained by the Lance community. Some live in this repository as first-party
 Rust, Python, and Java APIs; others are maintained as dedicated subprojects under the [lance-format](https://github.com/lance-format)
 GitHub organization.
-
-## Database and Language SDKs
-
-| Layer | Project | Documentation |
-|---|---|---|
-| **Database** | **LanceDB** — Embedded and distributed AI retrieval database built on Lance | [Quickstart](../quickstart/lancedb.md) · [LanceDB Docs ↗](https://docs.lancedb.com/) |
-| **Language SDK** | **Python (`pylance`)** — Native Python SDK for Lance datasets and fragments | [Quickstart](../quickstart/pylance.md) · [Python API Docs ↗](https://lance-format.github.io/lance-python-doc) |
-| **Language SDK** | **Rust (`lance`)** — Native Rust core and dataset API | [Quickstart](../quickstart/rust.md) · [docs.rs/lance ↗](https://docs.rs/lance/latest/lance) |
-| **Language SDK** | **Java (`org.lance:lance-core`)** — JNI and Arrow C Data Interface bindings for the JVM | [Quickstart](../quickstart/java.md) · [Javadoc ↗](https://www.javadoc.io/doc/org.lance/lance-core/latest/index.html) |
 
 ## Query Engines and SQL
 
 | Integration | Description | Source |
 |---|---|---|
+| [Apache DataFusion](datafusion.md) | Register Lance datasets as DataFusion tables and run SQL with predicate/projection pushdown. Available in both Rust and Python. | Built-in |
 | [Apache Spark](spark/index.md) | Read and write Lance datasets from Spark SQL and DataFrames. | [lance-format/lance-spark](https://github.com/lance-format/lance-spark) |
+| [Apache Doris](https://doris.apache.org/docs/4.x/lakehouse/catalogs/lance-catalog/) | Query Lance datasets with Doris SQL through filesystem and REST catalogs, with predicate pushdown and vector search. Read-only. | [apache/doris](https://github.com/apache/doris) |
 | [DuckDB](duckdb/index.md) | Query Lance datasets directly from DuckDB. | [lance-format/lance-duckdb](https://github.com/lance-format/lance-duckdb) |
 | [Trino](trino/index.md) | Federate Lance into Trino alongside other connectors. | [lance-format/lance-trino](https://github.com/lance-format/lance-trino) |
-| [Apache DataFusion](datafusion.md) | Register Lance datasets as DataFusion tables and run SQL with predicate/projection pushdown. Available in both Rust and Python. | Built-in |
-| [Apache Doris](https://doris.apache.org/docs/4.x/lakehouse/catalogs/lance-catalog/) | Query Lance datasets with Doris SQL through filesystem and REST catalogs, with predicate pushdown and vector search. Read-only. | [apache/doris](https://github.com/apache/doris) |
 
 ## Machine Learning and AI
 
