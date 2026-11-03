@@ -772,12 +772,8 @@ impl FragmentSteps {
                         add(frag_id, step);
                     }
                 }
-                RemapStep::Direct(direct) => {
-                    let frag_ids = direct
-                        .keys()
-                        .map(|addr| (addr >> 32) as u32)
-                        .collect::<HashSet<_>>();
-                    for frag_id in frag_ids {
+                RemapStep::Direct(_) | RemapStep::RemoveFragments(_) | RemapStep::Shared(_) => {
+                    for frag_id in remap.affected_fragments() {
                         add(frag_id, step);
                     }
                 }
@@ -835,12 +831,10 @@ impl CompactRowAddrRemap {
         mapping: Arc<RowAddrRemap>,
         removed_fragments: RoaringBitmap,
     ) -> Self {
-        Self {
-            steps: vec![
-                RemapStep::RemoveFragments(removed_fragments),
-                RemapStep::Shared(mapping),
-            ],
-        }
+        Self::from_steps(vec![
+            RemapStep::RemoveFragments(removed_fragments),
+            RemapStep::Shared(mapping),
+        ])
     }
 
     fn chained(remaps: Vec<RowAddrRemap>) -> Self {
@@ -907,33 +901,19 @@ impl CompactRowAddrRemap {
                 let mut idle = 0;
                 for remap in &self.steps[next_step..] {
                     next_step += 1;
-                    // `None` if the step does not name the row's fragment.
-                    let named = match remap {
-                        RemapStep::Compact(compact) => compact
-                            .frags
-                            .get(&((current >> 32) as u32))
-                            .map(|old_frag| compact.get_in(old_frag, current)),
-                        RemapStep::Direct(direct) => {
-                            direct.get(&current).map(|&answer| Some(answer))
-                        }
-                    };
-                    match named {
+                    // `None` if the step does not affect the current address.
+                    match remap.get(current) {
                         None => {
                             idle += 1;
                             if idle == WALK_UNTIL_IDLE_STEPS {
                                 break;
                             }
                         }
-                        Some(answer) => {
+                        Some(None) => return Some(None),
+                        Some(Some(mapped)) => {
                             idle = 0;
-                            match answer {
-                                None => {}
-                                Some(None) => return Some(None),
-                                Some(Some(mapped)) => {
-                                    current = mapped;
-                                    was_affected = true;
-                                }
-                            }
+                            current = mapped;
+                            was_affected = true;
                         }
                     }
                 }
@@ -1004,6 +984,32 @@ impl CompactRowAddrRemap {
                     }),
                     RemapStep::Direct(direct) => rows_by_fragment.retain(|_, rows| {
                         apply_step(rows, batch, &mut moved, |addr| direct.get(&addr).copied());
+                        !rows.is_empty()
+                    }),
+                    RemapStep::RemoveFragments(fragments) => {
+                        if fragments.len() <= rows_by_fragment.len() as u64 {
+                            for frag_id in fragments.iter() {
+                                if let Some(rows) = rows_by_fragment.remove(&frag_id) {
+                                    for position in rows {
+                                        batch[position as usize] = None;
+                                    }
+                                }
+                            }
+                        } else {
+                            rows_by_fragment.retain(|frag_id, rows| {
+                                if fragments.contains(*frag_id) {
+                                    for &position in rows.iter() {
+                                        batch[position as usize] = None;
+                                    }
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
+                        }
+                    }
+                    RemapStep::Shared(mapping) => rows_by_fragment.retain(|_, rows| {
+                        apply_step(rows, batch, &mut moved, |addr| mapping.get(addr));
                         !rows.is_empty()
                     }),
                 }
@@ -1670,6 +1676,99 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(batch, remapped);
         }
+    }
+
+    #[test]
+    fn test_indexed_removed_and_shared_steps_match_materialized_steps() {
+        enum OracleStep {
+            Map(HashMap<u64, Option<u64>>),
+            Remove(RoaringBitmap),
+        }
+
+        impl OracleStep {
+            fn get(&self, addr: u64) -> Option<Option<u64>> {
+                match self {
+                    Self::Map(map) => map.get(&addr).copied(),
+                    Self::Remove(fragments) => fragments
+                        .contains(RowAddress::from(addr).fragment_id())
+                        .then_some(None),
+                }
+            }
+        }
+
+        let removed = RoaringBitmap::from_iter([2u32]);
+        let shared_map = HashMap::from([
+            (addr(1, 0), Some(addr(40, 0))),
+            (addr(1, 1), None),
+            (addr(1, 2), Some(addr(40, 1))),
+        ]);
+        let mut remaps = vec![RowAddrRemap::with_removed_fragments(
+            Arc::new(RowAddrRemap::direct(shared_map.clone())),
+            removed.clone(),
+        )];
+        let mut oracle = vec![OracleStep::Remove(removed), OracleStep::Map(shared_map)];
+
+        for step in 0..MIN_STEPS_TO_INDEX as u32 - 2 {
+            let map = HashMap::from([
+                (addr(40 + step, 0), Some(addr(41 + step, 0))),
+                (addr(100 + step, 0), None),
+            ]);
+            remaps.push(RowAddrRemap::direct(map.clone()));
+            oracle.push(OracleStep::Map(map));
+        }
+
+        let chain = RowAddrRemap::chained(remaps);
+        let compact = compact_chain(&chain);
+        assert_eq!(compact.steps.len(), MIN_STEPS_TO_INDEX);
+        assert!(matches!(compact.steps[0], RemapStep::RemoveFragments(_)));
+        assert!(matches!(compact.steps[1], RemapStep::Shared(_)));
+        let fragment_steps = &compact.fragment_steps.as_ref().unwrap().0;
+        assert_eq!(fragment_steps.get(&1), Some(&vec![1]));
+        assert_eq!(fragment_steps.get(&2), Some(&vec![0]));
+        assert_eq!(fragment_steps.get(&40), Some(&vec![2]));
+
+        let reference = |old_addr: u64| {
+            let mut current = old_addr;
+            let mut was_affected = false;
+            for step in &oracle {
+                match step.get(current) {
+                    None => {}
+                    Some(None) => return Some(None),
+                    Some(Some(mapped)) => {
+                        current = mapped;
+                        was_affected = true;
+                    }
+                }
+            }
+            was_affected.then_some(Some(current))
+        };
+        let queries = [
+            addr(1, 0),
+            addr(1, 1),
+            addr(1, 2),
+            addr(2, 0),
+            addr(40, 1),
+            addr(100, 0),
+            addr(100, 1),
+            addr(999, 0),
+        ];
+        for query in queries {
+            assert_eq!(chain.get(query), reference(query), "address {query:#x}");
+        }
+
+        let mut batch = queries
+            .into_iter()
+            .map(Some)
+            .chain([None, Some(addr(1, 0))])
+            .collect::<Vec<_>>();
+        let expected = batch
+            .iter()
+            .map(|row_addr| {
+                row_addr.and_then(|old_addr| reference(old_addr).unwrap_or(Some(old_addr)))
+            })
+            .collect::<Vec<_>>();
+        chain.remap_in_place(&mut batch);
+        assert_eq!(batch, expected);
     }
 
     #[test]

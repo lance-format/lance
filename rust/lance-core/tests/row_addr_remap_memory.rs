@@ -7,10 +7,11 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::{GroupInputWithLayout, RowAddrRemap};
-use roaring::RoaringTreemap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use rstest::rstest;
 
 struct MeasuringAllocator;
@@ -207,6 +208,50 @@ fn many_fragment_scratch_is_bounded_by_the_batch() {
         (0..FRAGMENTS)
             .map(|fragment| (fragment % 100 != 99).then(|| addr(fragment, 0)))
             .collect(),
+    );
+}
+
+#[test]
+fn shared_large_mapping_scratch_is_bounded_by_the_batch() {
+    const SOURCE_FRAGMENTS: u32 = 100_000;
+    const BATCH_ROWS: usize = 64;
+
+    let mut shared = HashMap::with_capacity(SOURCE_FRAGMENTS as usize);
+    for index in 0..SOURCE_FRAGMENTS {
+        let source_fragment = index.wrapping_mul(10_003);
+        let destination_fragment = 3_000_000_000 + index;
+        shared.insert(
+            addr(source_fragment, 0),
+            Some(addr(destination_fragment, 0)),
+        );
+    }
+    let shared = RowAddrRemap::with_removed_fragments(
+        Arc::new(RowAddrRemap::direct(shared)),
+        RoaringBitmap::new(),
+    );
+
+    let mut steps = vec![shared];
+    for step in 0..31 {
+        let source_fragment = 2_000_000_000 + step;
+        steps.push(RowAddrRemap::direct(HashMap::from([(
+            addr(source_fragment, 0),
+            Some(addr(2_100_000_000 + step, 0)),
+        )])));
+    }
+    let chain = RowAddrRemap::chained(steps);
+
+    let mut batch = (0..BATCH_ROWS as u32)
+        .map(|index| Some(addr(index.wrapping_mul(10_003), 0)))
+        .collect::<Vec<_>>();
+    let expected = (0..BATCH_ROWS as u32)
+        .map(|index| Some(addr(3_000_000_000 + index, 0)))
+        .collect::<Vec<_>>();
+    let peak = remap_measuring_peak(&chain, &mut batch);
+    assert_eq!(batch, expected);
+    let bound = scratch_bound(BATCH_ROWS, 2 * BATCH_ROWS);
+    assert!(
+        peak <= bound,
+        "held {peak} B, over the {bound} B bound for {BATCH_ROWS} rows through a large shared mapping"
     );
 }
 
