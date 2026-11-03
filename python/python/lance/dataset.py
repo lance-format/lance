@@ -1343,6 +1343,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["all_binary", "blobs_descriptions", "all_descriptions"]
         ] = None,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[Iterable[str]] = None,
         include_deleted_rows: Optional[bool] = None,
         scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
         strict_batch_size: Optional[bool] = None,
@@ -1503,6 +1504,14 @@ class LanceDataset(pa.dataset.Dataset):
             Lance will automatically use scalar indices to optimize a query.  In some
             corner cases this can make query performance worse and this parameter can
             be used to disable scalar indices in these cases.
+        ignored_scalar_indices: iterable of str, default None
+            Logical scalar index names to ignore during expression-filter planning.
+            Other scalar indices remain eligible, and the original filter is still
+            evaluated. Inverted indices used by ``contains_tokens`` filters are
+            included; vector index segments and explicit full-text search queries
+            are unaffected. If no index query remains, ``fast_search`` falls back
+            to scanning all selected fragments and may return more matching rows.
+            See ``ScannerBuilder.ignored_scalar_indices`` for more information.
         late_materialization: bool or List[str], default None
             Allows custom control over late materialization.  Late materialization
             fetches non-query columns using a take operation after the filter.  This
@@ -1681,6 +1690,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.with_row_address, with_row_address)
         setopt(builder.use_stats, use_stats)
         setopt(builder.use_scalar_index, use_scalar_index)
+        setopt(builder.ignored_scalar_indices, ignored_scalar_indices)
         setopt(builder.fast_search, fast_search)
         setopt(builder.include_deleted_rows, include_deleted_rows)
         setopt(builder.scan_stats_callback, scan_stats_callback)
@@ -1783,6 +1793,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[Iterable[str]] = None,
         include_deleted_rows: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
@@ -1849,6 +1860,9 @@ class LanceDataset(pa.dataset.Dataset):
         use_scalar_index: bool, default True
             Allows custom control over scalar index usage.  See
             ``ScannerBuilder.use_scalar_index`` for more information.
+        ignored_scalar_indices: iterable of str, default None
+            Scalar index names to ignore during expression-filter planning. See
+            ``ScannerBuilder.ignored_scalar_indices`` for more information.
         with_row_id: bool, optional, default False
             Return row ID.
         with_row_address: bool, optional, default False
@@ -1912,6 +1926,7 @@ class LanceDataset(pa.dataset.Dataset):
             late_materialization=late_materialization,
             blob_handling=blob_handling,
             use_scalar_index=use_scalar_index,
+            ignored_scalar_indices=ignored_scalar_indices,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -1946,6 +1961,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         blob_mode: str = _BLOB_PANDAS_MODE_LAZY,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[Iterable[str]] = None,
         include_deleted_rows: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
@@ -1979,6 +1995,7 @@ class LanceDataset(pa.dataset.Dataset):
             fragment_readahead=fragment_readahead,
             late_materialization=late_materialization,
             use_scalar_index=use_scalar_index,
+            ignored_scalar_indices=ignored_scalar_indices,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -2382,6 +2399,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[Iterable[str]] = None,
         strict_batch_size: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
@@ -2412,6 +2430,7 @@ class LanceDataset(pa.dataset.Dataset):
             late_materialization=late_materialization,
             blob_handling=blob_handling,
             use_scalar_index=use_scalar_index,
+            ignored_scalar_indices=ignored_scalar_indices,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -3355,6 +3374,11 @@ class LanceDataset(pa.dataset.Dataset):
     def versions(self) -> List[Version]:
         """
         Return all versions in this dataset.
+
+        Each entry is a :class:`Version` with ``version``, ``timestamp``,
+        ``metadata``, and ``manifest_size``. ``manifest_size`` is the size in
+        bytes of that version's manifest file, or ``None`` if the commit
+        handler could not report it.
         """
         versions = self._ds.versions()
         for v in versions:
@@ -5326,10 +5350,11 @@ class LanceDataset(pa.dataset.Dataset):
             A message to associate with this commit. This message will be stored in the
             dataset's metadata and can be retrieved using read_transaction().
         enable_stable_row_ids: bool, optional
-            If True, enables stable row IDs when creating a new dataset.  Stable
-            row IDs assign each row a monotonically increasing id that persists
-            across compaction and other maintenance operations.  This option is
-            ignored for existing datasets.
+            If True, enables stable row IDs when creating a new dataset.  Each new
+            row is assigned the next id in increasing order and keeps that id for
+            its lifetime: compaction, update and merge insert relocate or rewrite
+            the row without changing its id.  This option is ignored for existing
+            datasets.
         namespace_client : LanceNamespace, optional
             A namespace client. Must be provided together with table_id.
             Use lance.namespace.connect() to create a namespace.
@@ -6514,6 +6539,11 @@ class Version(TypedDict):
     version: int
     timestamp: int | datetime
     metadata: Dict[str, str]
+    #: Size of this version's manifest file, in bytes, or ``None`` when the
+    #: commit handler could not report the size. The manifest grows with the
+    #: number of columns and fragments, so this is useful for observing
+    #: metadata amplification in wide tables.
+    manifest_size: int | None
 
 
 def _convert_version_timestamp(version: Version) -> Version:
@@ -7385,6 +7415,7 @@ class ScannerBuilder:
         self._fast_search = False
         self._full_text_query = None
         self._use_scalar_index = None
+        self._ignored_scalar_indices = None
         self._include_deleted_rows = None
         self._scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None
         self._strict_batch_size = False
@@ -7630,6 +7661,31 @@ class ScannerBuilder:
         self._use_scalar_index = use_scalar_index
         return self
 
+    def ignored_scalar_indices(self, index_names: Iterable[str]) -> ScannerBuilder:
+        """Ignore named scalar indices from expression-filter planning.
+
+        Other scalar indices remain eligible, and the original filter is still
+        evaluated. Names that do not identify an available scalar index have no
+        effect. This option is ignored when scalar indices are disabled with
+        :meth:`use_scalar_index`.
+
+        Inverted index names are also honored for expression filters such as
+        ``contains_tokens``, which fall back to evaluating the function without
+        that index. This does not control vector index segments or explicit
+        full-text search queries.
+
+        With :meth:`fast_search`, only a filter plan that still uses an index
+        skips unindexed fragments. If ignoring indices removes every index query,
+        the scan falls back to evaluating the filter over all selected fragments,
+        potentially returning more matching rows. Explicit fragment and row
+        selections still apply; use them to preserve a caller-defined scan scope.
+        """
+        index_names = list(index_names)
+        if any(not isinstance(name, str) or not name for name in index_names):
+            raise ValueError("ignored_scalar_indices must contain non-empty strings")
+        self._ignored_scalar_indices = index_names
+        return self
+
     def with_fragments(
         self, fragments: Optional[Iterable[LanceFragment]]
     ) -> ScannerBuilder:
@@ -7782,6 +7838,14 @@ class ScannerBuilder:
         Use :meth:`LanceDataset.create_index` or
         :meth:`DatasetOptimizer.optimize_indices` to index newly appended data.
         See :meth:`LanceDataset.scanner` for a mixed-search example.
+
+        For scalar expression filters, this applies only when the filter plan
+        uses an index. If no index query remains, including after
+        :meth:`ignored_scalar_indices`, the scan falls back to all selected
+        fragments while retaining the original filter and explicit row selections.
+
+        Users can use `Table::optimize()` or `create_index()` to include new data
+        in an index, thus making new data searchable.
         """
         self._fast_search = flag
         return self
@@ -7940,6 +8004,7 @@ class ScannerBuilder:
             self._late_materialization,
             self._blob_handling,
             self._use_scalar_index,
+            self._ignored_scalar_indices,
             self._include_deleted_rows,
             self._scan_stats_callback,
             self._strict_batch_size,
@@ -8851,9 +8916,10 @@ def write_dataset(
         :meth:`LanceDataset.migrate_manifest_paths_v2` method. Default is True.
     enable_stable_row_ids : bool, optional
         Experimental parameter: if set to true, the writer will use stable row ids.
-        These row ids are stable after compaction operations, but not after updates.
-        This makes compaction more efficient, since with stable row ids no
-        secondary indices need to be updated to point to new row ids.
+        A row then keeps the same id for its lifetime: compaction, update and merge
+        insert relocate or rewrite the row without changing its id. This only
+        applies to new datasets; a write to an existing dataset keeps that
+        dataset's own setting.
     auto_cleanup_options: optional, AutoCleanupConfig
         Config options for automatic cleanup of the dataset.
         If set, and this is a new dataset, old dataset versions will be automatically

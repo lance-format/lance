@@ -2851,6 +2851,90 @@ mod test {
         Ok(())
     }
 
+    /// A legacy blob column added to a 2.2 table is stored as Blob v2, as
+    /// `Dataset::write` does, so its promotion on commit never meets legacy
+    /// pages in a 2.2 file.
+    #[tokio::test]
+    async fn test_add_columns_promotes_legacy_blob_input_at_v2_2() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..3))],
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let output_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("blob", DataType::LargeBinary, true).with_metadata(
+                std::collections::HashMap::from([(
+                    lance_arrow::BLOB_META_KEY.to_string(),
+                    "true".to_string(),
+                )]),
+            ),
+        ]));
+        let mapper_schema = output_schema.clone();
+        let mapper = move |batch: &RecordBatch| {
+            let ids = batch["id"].as_primitive::<arrow_array::types::Int32Type>();
+            let blobs = arrow_array::LargeBinaryArray::from_iter_values(
+                ids.values()
+                    .iter()
+                    .map(|id| vec![*id as u8; *id as usize + 1]),
+            );
+            Ok(RecordBatch::try_new(
+                mapper_schema.clone(),
+                vec![Arc::new(blobs)],
+            )?)
+        };
+        dataset
+            .add_columns(
+                NewColumnTransform::BatchUDF(BatchUDF {
+                    mapper: Box::new(mapper),
+                    output_schema,
+                    result_checkpoint: None,
+                }),
+                None,
+                None,
+            )
+            .await?;
+
+        assert!(dataset.schema().field("blob").unwrap().is_blob_v2());
+        let fragment = dataset.get_fragments().into_iter().next().unwrap();
+        let data_file = fragment.metadata().files.last().unwrap().clone();
+        let file_schema = crate::utils::test::data_file_schema(&dataset, &data_file.path).await;
+        // The footer keeps the writer's view: a Blob v2 descriptor struct, where
+        // the legacy layout keeps the large_binary input type.
+        assert!(
+            matches!(
+                file_schema.field("blob").unwrap().data_type(),
+                DataType::Struct(_)
+            ),
+            "{file_schema:?}"
+        );
+
+        let blobs = Arc::new(dataset)
+            .take_blobs_by_indices(&[0, 1, 2], "blob")
+            .await?;
+        for (id, blob) in blobs.iter().enumerate() {
+            assert_eq!(
+                blob.as_ref().unwrap().read().await?.as_ref(),
+                vec![id as u8; id + 1].as_slice()
+            );
+        }
+        Ok(())
+    }
+
     /// A legacy fragment whose trailing row group is entirely deleted cannot defer its
     /// blanks: that batch reaches `add_blanks` with no live row to copy, so the update
     /// is refused rather than writing a data file short of the deleted rows. Deferring

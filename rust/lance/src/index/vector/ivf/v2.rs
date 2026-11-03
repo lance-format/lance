@@ -30,6 +30,7 @@ use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures::FutureExt;
 use futures::future::BoxFuture;
 use futures::prelude::stream::{self, TryStreamExt};
 use futures::stream::FuturesUnordered;
@@ -500,7 +501,10 @@ fn prewarm_parallelism(io_parallelism: usize, cpu_parallelism: usize) -> usize {
 }
 
 struct PreparedPartitionSearch<S: IvfSubIndex, Q: Quantization> {
-    query: Query,
+    /// Shared across every probed partition; only [`Self::dist_q_c`] differs.
+    query: Arc<Query>,
+    /// Distance from the query to this partition's centroid.
+    dist_q_c: f32,
     pre_filter: Arc<dyn PreFilter>,
     partition_id: usize,
     partition_centroid: Option<ArrayRef>,
@@ -1325,7 +1329,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     async fn prepare_partition(
         &self,
         partition_id: usize,
-        query: &Query,
+        query: Arc<Query>,
+        dist_q_c: f32,
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
         raw_query_context: Option<Arc<RabitRawQueryContext>>,
@@ -1340,7 +1345,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             Self::prefilter_for_partition(&self.index_cache, partition_id, &part_entry, pre_filter)
                 .await?;
         Ok(PreparedPartitionSearch {
-            query: query.clone(),
+            query,
+            dist_q_c,
             pre_filter,
             partition_id,
             partition_centroid: self.ivf.centroid(partition_id),
@@ -1355,7 +1361,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     async fn prepare_partition_without_prefilter_wait(
         &self,
         partition_id: usize,
-        query: &Query,
+        query: Arc<Query>,
+        dist_q_c: f32,
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
         raw_query_context: Option<Arc<RabitRawQueryContext>>,
@@ -1366,7 +1373,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             Self::prefilter_for_partition(&self.index_cache, partition_id, &part_entry, pre_filter)
                 .await?;
         Ok(PreparedPartitionSearch {
-            query: query.clone(),
+            query,
+            dist_q_c,
             pre_filter,
             partition_id,
             partition_centroid: self.ivf.centroid(partition_id),
@@ -1391,6 +1399,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         }
         let PreparedPartitionSearch {
             query,
+            dist_q_c,
             pre_filter,
             partition_id,
             partition_centroid,
@@ -1410,18 +1419,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             rotated_partition_centroid,
             raw_query_context.as_deref(),
         )?;
-        let query = Self::preprocess_partition_query_owned(
+        let query_key = Self::preprocess_partition_query_key(
             use_query_residual,
             use_residual_scratch,
             partition_id,
             partition_centroid.as_ref(),
-            query,
+            query.key.clone(),
         )?;
-        let param = (&query).into();
+        let param = S::query_params(query.as_ref(), &query_key, dist_q_c);
         let refine_factor = query.refine_factor.unwrap_or(1) as usize;
         let k = query.k * refine_factor;
         let batch = part_entry.index.search_with_scratch(
-            query.key,
+            query_key,
             k,
             param,
             &part_entry.storage,
@@ -1478,6 +1487,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         }
         let PreparedPartitionSearch {
             query,
+            dist_q_c,
             pre_filter,
             partition_id,
             partition_centroid,
@@ -1497,18 +1507,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             rotated_partition_centroid,
             raw_query_context.as_deref(),
         )?;
-        let query = Self::preprocess_partition_query_owned(
+        let query_key = Self::preprocess_partition_query_key(
             use_query_residual,
             use_residual_scratch,
             partition_id,
             partition_centroid.as_ref(),
-            query,
+            query.key.clone(),
         )?;
-        let param = (&query).into();
+        let param = S::query_params(query.as_ref(), &query_key, dist_q_c);
         let refine_factor = query.refine_factor.unwrap_or(1) as usize;
         let k = query.k * refine_factor;
         part_entry.index.accumulate_topk_with_scratch(
-            query.key,
+            query_key,
             k,
             param,
             &part_entry.storage,
@@ -1567,13 +1577,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         partition_centroid: Option<&ArrayRef>,
         query: &Query,
     ) -> Result<Query> {
-        Self::preprocess_partition_query_owned(
+        let mut query = query.clone();
+        query.key = Self::preprocess_partition_query_key(
             use_query_residual,
             use_residual_scratch,
             partition_id,
             partition_centroid,
-            query.clone(),
-        )
+            query.key,
+        )?;
+        Ok(query)
     }
 
     fn preprocess_partition_query_owned(
@@ -1583,17 +1595,36 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         partition_centroid: Option<&ArrayRef>,
         mut query: Query,
     ) -> Result<Query> {
+        query.key = Self::preprocess_partition_query_key(
+            use_query_residual,
+            use_residual_scratch,
+            partition_id,
+            partition_centroid,
+            query.key,
+        )?;
+        Ok(query)
+    }
+
+    /// Residualize the query key for one partition when residual scratch is off.
+    /// With residual scratch the key is left as-is and the residual is applied
+    /// inside the distance calculator, so this is a no-op Arc clone of `key`.
+    fn preprocess_partition_query_key(
+        use_query_residual: bool,
+        use_residual_scratch: bool,
+        partition_id: usize,
+        partition_centroid: Option<&ArrayRef>,
+        key: ArrayRef,
+    ) -> Result<ArrayRef> {
         if use_query_residual {
             let partition_centroid = partition_centroid.ok_or_else(|| {
                 Error::index(format!("partition centroid {partition_id} does not exist"))
             })?;
             if use_residual_scratch {
-                return Ok(query);
+                return Ok(key);
             }
-            let residual_key = sub(&query.key, partition_centroid)?;
-            query.key = residual_key;
+            return Ok(sub(&key, partition_centroid)?);
         }
-        Ok(query)
+        Ok(key)
     }
 
     fn query_centroid_distance(&self, partition_id: usize, query: &Query) -> Result<f32> {
@@ -3051,8 +3082,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
     ) -> Result<PreparedPartitionSearchHandle> {
         let raw_query_context = self.prepare_rq_raw_query_context(&query.key)?;
         Ok(Box::new(
-            self.prepare_partition(partition_id, query, pre_filter, metrics, raw_query_context)
-                .await?,
+            self.prepare_partition(
+                partition_id,
+                Arc::new(query.clone()),
+                query.dist_q_c,
+                pre_filter,
+                metrics,
+                raw_query_context,
+            )
+            .await?,
         ))
     }
 
@@ -3156,26 +3194,31 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             // `buffered` preserves the probe order, so the heap accumulates
             // partitions in the same order as before (which decides which of
             // several rows tied at the k-th distance the capped heap keeps).
+            let shared_query = Arc::new(query.clone());
             let mut prepared = stream::iter(start_idx..end_idx)
                 .map(move |idx| {
                     let part_id = partitions.value(idx);
-                    let mut query = query.clone();
-                    query.dist_q_c = q_c_dists.value(idx);
+                    let dist_q_c = q_c_dists.value(idx);
+                    let query = shared_query.clone();
                     let index = prepare_index.clone();
                     let pre_filter = pre_filter.clone();
                     let metrics = prepare_metrics.clone();
                     let raw_query_context = prepare_raw_query_context.clone();
+                    // Box the large prepare-partition future before handing it to
+                    // FuturesOrdered; polling goes through the pinned boxed pointer.
                     async move {
                         index
                             .prepare_partition_without_prefilter_wait(
                                 part_id as usize,
-                                &query,
+                                query,
+                                dist_q_c,
                                 pre_filter,
                                 metrics.as_ref(),
                                 raw_query_context,
                             )
                             .await
                     }
+                    .boxed()
                 })
                 .buffered(prepare_parallelism)
                 .fuse();
@@ -3252,26 +3295,30 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let prepare_metrics = metrics.clone();
         let prepare_raw_query_context = raw_query_context.clone();
         tokio::spawn(async move {
+            let shared_query = Arc::new(query.clone());
             let prepare_stream = stream::iter(start_idx..end_idx)
                 .map(move |idx| {
                     let part_id = partitions.value(idx);
-                    let mut query = query.clone();
-                    query.dist_q_c = q_c_dists.value(idx);
+                    let dist_q_c = q_c_dists.value(idx);
+                    let query = shared_query.clone();
                     let index = prepare_index.clone();
                     let pre_filter = pre_filter.clone();
                     let metrics = prepare_metrics.clone();
                     let raw_query_context = prepare_raw_query_context.clone();
+                    // See the global-heap path: box the large prepare-partition future.
                     async move {
                         index
                             .prepare_partition(
                                 part_id as usize,
-                                &query,
+                                query,
+                                dist_q_c,
                                 pre_filter,
                                 metrics.as_ref(),
                                 raw_query_context,
                             )
                             .await
                     }
+                    .boxed()
                 })
                 .buffered(prepare_parallelism);
 
@@ -3486,6 +3533,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         }
         // Shared across every chunk's scoring dispatch below, so wrap once in an
         // `Arc` instead of cloning the whole `Vec` per chunk.
+        let base_queries = base_queries.into_iter().map(Arc::new).collect::<Vec<_>>();
         let base_queries = Arc::new(base_queries);
         let raw_query_contexts = Arc::new(raw_query_contexts);
 
@@ -3587,10 +3635,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
                     for (part_id, part_entry, probing_queries, pre_filter) in &chunk {
                         let partition_centroid = index.ivf.centroid(*part_id);
                         for (query_index, dist_q_c) in probing_queries {
-                            let mut single_query = base_queries[*query_index].clone();
-                            single_query.dist_q_c = *dist_q_c;
                             let prepared = PreparedPartitionSearch::<S, Q> {
-                                query: single_query,
+                                query: base_queries[*query_index].clone(),
+                                dist_q_c: *dist_q_c,
                                 pre_filter: pre_filter.clone(),
                                 partition_id: *part_id,
                                 partition_centroid: partition_centroid.clone(),

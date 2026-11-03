@@ -872,6 +872,27 @@ impl InvertedIndex {
         state.satisfies(with_position) && self.has_resident_document_projections()
     }
 
+    /// Prewarm postings and, optionally, positions into the index cache.
+    ///
+    /// Modern posting groups default to a 32 KiB logical row-buffer budget.
+    /// `LANCE_FTS_POSTING_GROUP_MAX_BYTES` overrides that budget; an oversized
+    /// posting remains a singleton. Positions and cache serialization overhead
+    /// are excluded. Group boundaries are cached alongside postings, so source
+    /// index files do not change and existing indices need no rebuild.
+    ///
+    /// `LANCE_FTS_POSTING_GROUP_MAX_TOKENS` explicitly selects the previous
+    /// token-count policy instead. Both settings require positive integers and
+    /// are mutually exclusive. Set them before the first index is opened.
+    /// Without cached byte boundaries, cold queries keep their existing read
+    /// policy. Legacy per-document position layouts keep token-count grouping.
+    ///
+    /// ```
+    /// # use lance_index::{FtsPrewarmOptions, scalar::inverted::InvertedIndex};
+    /// # async fn example(index: &InvertedIndex) -> lance_core::Result<()> {
+    /// index.prewarm_with_options(&FtsPrewarmOptions::default()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn prewarm_with_options(&self, options: &FtsPrewarmOptions) -> Result<()> {
         self.prewarm_with_options_result(options).await.map(|_| ())
     }
@@ -1021,12 +1042,9 @@ impl InvertedIndex {
             failing_partitions,
         }
     }
-    /// Search docs match the input text.
-    async fn do_search(&self, text: &str) -> Result<RecordBatch> {
+    /// Search docs match the input tokens.
+    async fn do_search(&self, tokens: Tokens) -> Result<RecordBatch> {
         let params = FtsSearchParams::new();
-        let mut tokenizer = self.tokenizer.clone();
-        let tokens = try_collect_query_tokens(text, &mut tokenizer)?;
-
         let (doc_ids, _) = self
             .bm25_search(
                 Arc::new(tokens),
@@ -1083,7 +1101,14 @@ impl ScalarIndex for InvertedIndex {
 
         match query {
             TokenQuery::TokensContains(text) => {
-                let records = self.do_search(text).await?;
+                let mut tokenizer = self.tokenizer.clone();
+                let tokens = try_collect_query_tokens(text, &mut tokenizer)?;
+                // A query the index tokenizer empties, such as one made only of
+                // stop words, may still match rows; the index cannot narrow them.
+                if tokens.is_empty() {
+                    return Ok(SearchResult::at_least(RowAddrTreeMap::new()));
+                }
+                let records = self.do_search(tokens).await?;
                 let row_ids = records
                     .column(0)
                     .as_any()

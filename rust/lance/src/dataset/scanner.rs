@@ -133,8 +133,8 @@ use crate::io::exec::{
     LancePushdownScanExec, LanceScanExec, MinHashSearchExec, Planner, PreFilterSource,
     RowAddrMaskFilterExec, ScanConfig, TakeExec,
     knn::{
-        KnnBatchParams, QUERY_INDEX_COL, knn_empty_result_schema, new_knn_batch_exec, new_knn_exec,
-        query_index_field,
+        BatchRefineExec, KnnBatchParams, QUERY_INDEX_COL, knn_empty_result_schema,
+        new_knn_batch_exec, new_knn_exec, query_index_field,
     },
     project,
 };
@@ -1228,6 +1228,9 @@ pub struct Scanner {
     /// to handle this better in the future as well)
     use_scalar_index: bool,
 
+    /// Scalar indices that must not participate in expression-filter planning.
+    ignored_scalar_index_names: HashSet<String>,
+
     /// Whether to use statistics to optimize the scan (default: true)
     ///
     /// This is used for debugging or benchmarking purposes.
@@ -1721,6 +1724,7 @@ impl Scanner {
             index_segments: None,
             fast_search: false,
             use_scalar_index: true,
+            ignored_scalar_index_names: HashSet::new(),
             include_deleted_rows: false,
             scan_stats_callback: None,
             strict_batch_size: false,
@@ -2542,6 +2546,45 @@ impl Scanner {
         self
     }
 
+    /// Ignore named scalar indices from expression-filter planning.
+    ///
+    /// Other scalar indices remain eligible, and the original filter is still
+    /// evaluated for rows selected by the remaining scan plan. Names that do
+    /// not identify an available scalar index have no effect. This option is
+    /// ignored when scalar indices are disabled with [`Self::use_scalar_index`].
+    ///
+    /// Inverted index names are also honored for expression filters such as
+    /// `contains_tokens`, which fall back to evaluating the function without that
+    /// index. This does not control vector index segments or the index selected
+    /// by an explicit full-text search query.
+    ///
+    /// With [`Self::fast_search`], only a filter plan that still uses an index
+    /// skips unindexed fragments. If ignoring indices removes every index query,
+    /// the scan falls back to evaluating the filter over all selected fragments,
+    /// potentially returning more matching rows. Explicit fragment and row
+    /// selections still apply; use them to preserve a caller-defined scan scope.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn scan_without_one_index(dataset: &Dataset) -> Result<()> {
+    /// let mut scanner = dataset.scan();
+    /// scanner
+    ///     .filter("id = 42")?
+    ///     .with_ignored_scalar_indices(["id_zonemap"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_ignored_scalar_indices<I, S>(&mut self, index_names: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.ignored_scalar_index_names = index_names.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Set whether to use strict batch size.
     ///
     /// If this is true then output batches (except the last batch) will have exactly `batch_size` rows.
@@ -2867,6 +2910,13 @@ impl Scanner {
     /// This is a weak consistency search: newly appended or updated rows may be absent.
     /// SQL [`Self::prefilter`] placement is unchanged. See [`Self::with_index_segments`]
     /// for the default mixed-search behavior.
+    ///
+    /// This is essentially a weak consistency search, only on the indexed data.
+    /// For scalar expression filters, this applies only when the filter plan
+    /// uses an index. If no index query remains, including after
+    /// [`Self::with_ignored_scalar_indices`], the scan falls back to all selected
+    /// fragments while retaining the original filter and explicit row selections.
+    ///
     /// Row IDs are used internally but are only returned when explicitly requested.
     pub fn fast_search(&mut self) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
@@ -3824,10 +3874,17 @@ impl Scanner {
             let index_info = match self.scalar_index_selection.as_ref() {
                 Some(selection) => {
                     self.dataset
-                        .scalar_index_info_for_segments(selection.segments.as_ref())
+                        .scalar_index_info_for_segments_ignoring(
+                            selection.segments.as_ref(),
+                            &self.ignored_scalar_index_names,
+                        )
                         .await?
                 }
-                None => self.dataset.scalar_index_info().await?,
+                None => {
+                    self.dataset
+                        .scalar_index_info_ignoring(&self.ignored_scalar_index_names)
+                        .await?
+                }
             };
             let filter_plan = create_filter_plan(expr.clone(), &index_info, use_scalar_index)?;
 
@@ -7543,7 +7600,7 @@ impl Scanner {
     /// search per query vector.
     ///
     /// Requires all of:
-    /// - no exact or quantized refine step (the batch path does not yet rerank);
+    /// - no quantized refine step (exact refinement is supported);
     /// - fixed nprobes (`minimum_nprobes == maximum_nprobes`) — see below;
     /// - every segment an IVF index with a flat-style sub-index (i.e. not HNSW);
     /// - every target fragment covered by the *selected* `index_segments` (or
@@ -7568,13 +7625,9 @@ impl Scanner {
         index_segments: &[IndexMetadata],
         q: &Query,
     ) -> Result<bool> {
-        // Any exact or quantized refine factor sends the query onto a reranking
-        // path that the shared batch scan does not implement. Exact refinement
-        // reranks with the original vectors even when the factor is 1, while
-        // quantized refinement overfetches and reranks with Accurate RQ scores.
-        // The batch path does neither, so fall back to the per-query loop for
-        // every configured refinement.
-        if q.refine_factor.is_some() || self.quantized_refine_factor.is_some() {
+        // Quantized refinement reranks with Accurate RQ scores, which the shared
+        // batch path does not implement. Fall back to the per-query loop.
+        if self.quantized_refine_factor.is_some() {
             return Ok(false);
         }
         // Only fixed nprobes is provably equivalent to single-query search; see
@@ -7689,24 +7742,56 @@ impl Scanner {
         // Fast path: when every index segment is an IVF index with a flat-style
         // sub-index (IVF_FLAT/PQ/SQ/RQ), search all query vectors in a single
         // pass that reads each partition's storage once and shares the prefilter
-        // across the batch. HNSW, refine, and mixed indexed/unindexed scans fall
+        // across the batch. HNSW and mixed indexed/unindexed scans fall
         // back to the per-query loop below, which never regresses behavior.
+        if q.refine_factor == Some(0) {
+            return Err(Error::invalid_input("Refine factor cannot be zero"));
+        }
         if self
             .batch_index_search_supported(index_name, index_segments, q)
             .await?
         {
             let mut batch_query = q.clone();
             batch_query.metric_type = Some(index_metric);
+            batch_query.k =
+                q.k.checked_mul(q.refine_factor.unwrap_or(1) as usize)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "Candidate count overflows usize: k={}, refine_factor={:?}",
+                            q.k, q.refine_factor
+                        ))
+                    })?;
+            if q.refine_factor.is_some() {
+                // Refinement applies the range to exact distances, while the
+                // ANN stage ranks on the index's own scale. Transform only the
+                // candidate bounds; BatchRefineExec receives the original query.
+                let scale = index_distance_scale(index_metric, index_segments);
+                batch_query.lower_bound = q.lower_bound.map(|bound| bound * scale);
+                batch_query.upper_bound = q.upper_bound.map(|bound| bound * scale);
+            }
+            batch_query.refine_factor = None;
             let prefilter_source = self
                 .ann_prefilter_source(filter_plan, index_segments)
                 .await?;
-            return new_knn_batch_exec(
+            let input = new_knn_batch_exec(
                 self.dataset.clone(),
                 index_segments,
                 &batch_query,
                 self.nearest_query_count,
                 prefilter_source,
-            );
+            )?;
+            return if q.refine_factor.is_some() {
+                let mut refine_query = q.clone();
+                refine_query.metric_type = Some(index_metric);
+                Ok(Arc::new(BatchRefineExec::try_new(
+                    self.dataset.clone(),
+                    input,
+                    refine_query,
+                    self.nearest_query_count,
+                )?))
+            } else {
+                Ok(input)
+            };
         }
 
         let query_dim = q.key.len() / self.nearest_query_count;
@@ -13187,6 +13272,144 @@ mod test {
         }
     }
 
+    /// The batch ANN stage must translate the exact cosine range to the SQ
+    /// index's L2 scale before collecting refinement candidates.
+    #[tokio::test]
+    async fn test_batch_refined_knn_scales_cosine_range_for_ann_stage() {
+        use lance_linalg::distance::cosine_distance;
+
+        const DIM: usize = 16;
+        const ROWS: usize = 512;
+        let mut seed: u64 = 42;
+        let values: Vec<f32> = (0..ROWS * DIM)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+            })
+            .collect();
+        let query_values = values[..2 * DIM].to_vec();
+        let queries = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(query_values.clone()),
+            DIM as i32,
+        )
+        .unwrap();
+        let rows = values.as_chunks::<DIM>().0;
+        let exact = query_values
+            .as_chunks::<DIM>()
+            .0
+            .iter()
+            .map(|query| {
+                let mut distances = rows
+                    .iter()
+                    .map(|row| cosine_distance(query, row))
+                    .collect::<Vec<_>>();
+                distances.sort_by(f32::total_cmp);
+                distances
+            })
+            .collect::<Vec<_>>();
+        // Make the unscaled ANN range exclude every exact in-range candidate.
+        let lower = exact
+            .iter()
+            .map(|distances| distances[20])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let upper = exact
+            .iter()
+            .map(|distances| distances[60])
+            .fold(f32::INFINITY, f32::min)
+            .min(2.0 * lower);
+        assert!(upper > lower);
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    DIM as i32,
+                ),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..ROWS as i32)),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM as i32)
+                        .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let tmp = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &tmp,
+            None,
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                None,
+                &VectorIndexParams::with_ivf_sq_params(
+                    DistanceType::Cosine,
+                    IvfBuildParams::new(1),
+                    SQBuildParams::default(),
+                ),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, 5)
+            .unwrap()
+            .minimum_nprobes(1)
+            .maximum_nprobes(1)
+            .refine(10)
+            .distance_range(Some(lower), Some(upper))
+            .project(&["id"])
+            .unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ANNIvfBatch"), "{plan}");
+        assert!(plan.contains("BatchRefine"), "{plan}");
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), 10);
+        for query_index in 0..2 {
+            let query = Float32Array::from(
+                query_values[query_index * DIM..(query_index + 1) * DIM].to_vec(),
+            );
+            let single = dataset
+                .scan()
+                .nearest("vec", &query, 5)
+                .unwrap()
+                .minimum_nprobes(1)
+                .maximum_nprobes(1)
+                .refine(10)
+                .distance_range(Some(lower), Some(upper))
+                .project(&["id"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(single.num_rows(), 5);
+            let mask = BooleanArray::from_iter(
+                batch[QUERY_INDEX_COL]
+                    .as_primitive::<Int32Type>()
+                    .iter()
+                    .map(|value| value.map(|value| value == query_index as i32)),
+            );
+            let actual = arrow::compute::filter_record_batch(&batch, &mask).unwrap();
+            assert_eq!(actual["id"].as_ref(), single["id"].as_ref());
+            assert_eq!(actual[DIST_COL].as_ref(), single[DIST_COL].as_ref());
+        }
+    }
+
     #[tokio::test]
     async fn test_batch_knn_indexed() {
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
@@ -13363,62 +13586,139 @@ mod test {
         );
     }
 
-    /// Any `refine_factor` sends the query onto a reranking path the shared-scan
-    /// batch node does not implement, so the scanner must fall back to the
-    /// per-query indexed loop and still produce correctly grouped results.
-    ///
-    /// All of `refine(0)`, `refine(1)`, and `refine(2)` must fall back:
-    /// `refine(1)` still reranks on the single-query path (a factor of 1 is not
-    /// a no-op), and `refine(0)` is rejected there with `Refine factor cannot be
-    /// zero` — the batch path would instead return empty results. Covering the
-    /// boundary factors guards the `refine_factor.is_some()` gate against
-    /// regressing back to a `> 1` check.
+    #[rstest]
+    #[case::factor_one(1, true, MetricType::L2, "none")]
+    #[case::shared(2, true, MetricType::L2, "none")]
+    #[case::cosine(2, true, MetricType::Cosine, "none")]
+    #[case::dot(2, true, MetricType::Dot, "none")]
+    #[case::adaptive(2, false, MetricType::L2, "none")]
+    #[case::prefilter(2, true, MetricType::L2, "prefilter")]
+    #[case::postfilter(2, true, MetricType::L2, "postfilter")]
+    #[case::empty(2, true, MetricType::L2, "empty")]
+    #[case::deleted(2, true, MetricType::L2, "deleted")]
+    #[case::bounded(2, true, MetricType::L2, "bounded")]
     #[tokio::test]
-    async fn test_batch_knn_indexed_refine_falls_back() {
+    async fn test_batch_knn_indexed_refine(
+        #[case] factor: u32,
+        #[case] fixed_probes: bool,
+        #[case] metric: MetricType,
+        #[case] scenario: &str,
+    ) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        test_ds.make_vector_index_with_metric(metric).await.unwrap();
+        if scenario == "deleted" {
+            test_ds.dataset.delete("i % 2 = 0").await.unwrap();
+        }
+        let dataset = &test_ds.dataset;
+        let (queries, query_values) = batch_knn_two_queries();
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &queries, 10).unwrap();
+        scan.refine(factor).project(&["i", "vec"]).unwrap();
+        if fixed_probes {
+            scan.nprobes(2);
+        }
+        match scenario {
+            "prefilter" | "postfilter" => {
+                scan.filter("i > 100")
+                    .unwrap()
+                    .prefilter(scenario == "prefilter");
+            }
+            "empty" => {
+                scan.filter("i < 0").unwrap().prefilter(true);
+            }
+            "bounded" => {
+                scan.distance_range(Some(1.0), Some(1_000_000.0));
+            }
+            _ => {}
+        }
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert_eq!(plan.contains("BatchRefine"), fixed_probes, "{plan}");
+        assert_eq!(plan.contains("ANNIvfBatch"), fixed_probes, "{plan}");
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_query_index_field(&batch);
+        for query_index in 0..2 {
+            let key =
+                Float32Array::from(query_values[query_index * 32..(query_index + 1) * 32].to_vec());
+            let mut single = dataset.scan();
+            single.nearest("vec", &key, 10).unwrap();
+            single.refine(factor).project(&["i", "vec"]).unwrap();
+            if fixed_probes {
+                single.nprobes(2);
+            }
+            match scenario {
+                "prefilter" | "postfilter" => {
+                    single
+                        .filter("i > 100")
+                        .unwrap()
+                        .prefilter(scenario == "prefilter");
+                }
+                "empty" => {
+                    single.filter("i < 0").unwrap().prefilter(true);
+                }
+                "bounded" => {
+                    single.distance_range(Some(1.0), Some(1_000_000.0));
+                }
+                _ => {}
+            }
+            let single = single.try_into_batch().await.unwrap();
+            let mask = BooleanArray::from_iter(
+                batch[QUERY_INDEX_COL]
+                    .as_primitive::<Int32Type>()
+                    .iter()
+                    .map(|value| value.map(|value| value == query_index as i32)),
+            );
+            let actual = arrow::compute::filter_record_batch(&batch, &mask).unwrap();
+            assert_eq!(actual["i"].as_ref(), single["i"].as_ref());
+            assert_eq!(actual["vec"].as_ref(), single["vec"].as_ref());
+            assert_eq!(actual[DIST_COL].as_ref(), single[DIST_COL].as_ref());
+            if scenario != "none" {
+                continue;
+            }
+            let exact = dataset
+                .scan()
+                .nearest("vec", &key, 10)
+                .unwrap()
+                .use_index(false)
+                .distance_metric(metric)
+                .project(&["i"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let expected_ids = exact["i"].as_primitive::<Int32Type>();
+            let hits = actual["i"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .filter(|id| expected_ids.values().contains(id))
+                .count();
+            assert!(
+                hits as f32 / 10.0 >= 0.5,
+                "recall={hits}/10, metric={metric:?}"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::fixed(true)]
+    #[case::adaptive(false)]
+    #[tokio::test]
+    async fn test_batch_knn_indexed_refine_zero(#[case] fixed_probes: bool) {
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
             .await
             .unwrap();
         test_ds.make_vector_index().await.unwrap();
-        let dataset = &test_ds.dataset;
-        let (queries, _query_values) = batch_knn_two_queries();
-
-        for refine_factor in [1u32, 2] {
-            let mut scan = dataset.scan();
-            scan.nearest("vec", &queries, 2).unwrap();
-            scan.refine(refine_factor);
-            scan.project(&["i"]).unwrap();
-
-            let plan = scan.explain_plan(false).await.unwrap();
-            assert!(
-                !plan.contains("ANNIvfBatch"),
-                "refine({refine_factor}) must not use the shared-scan batch node, got:\n{plan}"
-            );
-            assert!(
-                plan.contains("ANNSubIndex"),
-                "refine({refine_factor}) batch search should fall back to the per-query \
-                 indexed loop, got:\n{plan}"
-            );
-
-            let batch = scan.try_into_batch().await.unwrap();
-            assert_query_index_field(&batch);
-            assert_eq!(
-                batch[QUERY_INDEX_COL].as_primitive::<Int32Type>().values(),
-                &[0, 0, 1, 1],
-                "refine({refine_factor}) should still group results per query"
-            );
+        let (queries, _) = batch_knn_two_queries();
+        let mut scan = test_ds.dataset.scan();
+        scan.nearest("vec", &queries, 2).unwrap().refine(0);
+        if fixed_probes {
+            scan.nprobes(2);
         }
-
-        // refine(0) is rejected on the fallback (per-query) path; the batch path
-        // must not silently accept it and return empty results instead.
-        let mut scan = dataset.scan();
-        scan.nearest("vec", &queries, 2).unwrap();
-        scan.refine(0);
-        scan.project(&["i"]).unwrap();
-        let result = scan.try_into_batch().await;
-        assert!(
-            result.is_err(),
-            "refine(0) must error rather than fall through to an empty batch result"
-        );
+        let error = scan.try_into_batch().await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("Refine factor cannot be zero"));
     }
 
     #[tokio::test]
@@ -13820,8 +14120,9 @@ mod test {
     /// query must therefore fall back to the per-query loop when a mask is present,
     /// and every returned row must honor the mask — otherwise the batch path would
     /// silently return masked-out rows.
+    #[rstest]
     #[tokio::test]
-    async fn test_batch_knn_indexed_external_mask_falls_back() {
+    async fn test_batch_knn_indexed_external_mask_falls_back(#[values(false, true)] refine: bool) {
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
             .await
             .unwrap();
@@ -13853,6 +14154,9 @@ mod test {
         let mut scan = dataset.scan();
         scan.nearest("vec", &queries, k).unwrap();
         scan.minimum_nprobes(2).maximum_nprobes(2);
+        if refine {
+            scan.refine(2);
+        }
         scan.with_row_id_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
             allow.iter().copied(),
         )));
@@ -13892,8 +14196,11 @@ mod test {
     /// selected segments' coverage (as `knn_combined` does), not the whole
     /// logical index, so the scanner falls back to the per-query loop, which
     /// re-scores the uncovered fragment on the flat path and returns every row.
+    #[rstest]
     #[tokio::test]
-    async fn test_batch_knn_indexed_partial_segment_selection_falls_back() {
+    async fn test_batch_knn_indexed_partial_segment_selection_falls_back(
+        #[values(false, true)] refine: bool,
+    ) {
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
             .await
             .unwrap();
@@ -13912,6 +14219,9 @@ mod test {
         let mut scan = dataset.scan();
         scan.nearest("vec", &queries, k).unwrap();
         scan.minimum_nprobes(2).maximum_nprobes(2);
+        if refine {
+            scan.refine(2);
+        }
         // Request both indexed fragments but select only the segment covering
         // fragment 0; fragment 1 is covered only by the unselected segment.
         scan.with_fragments(vec![fragments[0].clone(), fragments[1].clone()]);
@@ -17823,6 +18133,82 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         );
     }
 
+    #[rstest]
+    #[case::known_names(false)]
+    #[case::unknown_name(true)]
+    #[tokio::test]
+    async fn test_ignored_scalar_indices(#[case] include_unknown_name: bool) {
+        use lance_index::scalar::BuiltinIndexType;
+
+        let data = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .col("b", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+
+        dataset
+            .create_index(
+                &["a"],
+                IndexType::Scalar,
+                Some("a_zonemap".to_string()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+                false,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["b"],
+                IndexType::BTree,
+                Some("b_btree".to_string()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let mut default_scan = dataset.scan();
+        default_scan.filter("a < 50 AND b < 50").unwrap();
+        let default_plan = default_scan.explain_plan(true).await.unwrap();
+        assert!(
+            default_plan.contains("@a_zonemap(ZoneMap)"),
+            "{default_plan}"
+        );
+        assert!(default_plan.contains("@b_btree(BTree)"), "{default_plan}");
+
+        let mut ignore_a = dataset.scan();
+        ignore_a
+            .filter("a < 50 AND b < 50")
+            .unwrap()
+            .with_ignored_scalar_indices(if include_unknown_name {
+                vec!["a_zonemap", "missing_index"]
+            } else {
+                vec!["a_zonemap"]
+            });
+        let ignore_a_plan = ignore_a.explain_plan(true).await.unwrap();
+        assert!(
+            !ignore_a_plan.contains("@a_zonemap(ZoneMap)"),
+            "{ignore_a_plan}"
+        );
+        assert!(ignore_a_plan.contains("@b_btree(BTree)"), "{ignore_a_plan}");
+
+        let result = ignore_a.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), 50);
+
+        let mut ignore_both = dataset.scan();
+        ignore_both
+            .filter("a < 50 AND b < 50")
+            .unwrap()
+            .with_ignored_scalar_indices(["a_zonemap", "b_btree"]);
+        let ignore_both_plan = ignore_both.explain_plan(true).await.unwrap();
+        assert!(
+            !ignore_both_plan.contains("ScalarIndexQuery"),
+            "{ignore_both_plan}"
+        );
+        let result = ignore_both.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), 50);
+    }
+
     #[tokio::test]
     async fn test_like_prefix_correctness_with_btree_index() {
         // Create dataset with deterministic string data for exact result verification
@@ -21121,6 +21507,55 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             project_first_scanner.try_into_batch().await.unwrap(),
             fast_batch
         );
+    }
+
+    #[rstest]
+    #[case::no_ignored_indices(vec![], false, 5)]
+    #[case::remaining_index(vec!["a_btree"], false, 5)]
+    #[case::all_ignored(vec!["a_btree", "b_btree"], false, 15)]
+    #[case::explicit_rows(vec!["a_btree", "b_btree"], true, 2)]
+    #[case::unknown_name(vec!["missing_index"], false, 5)]
+    #[tokio::test]
+    async fn test_fast_search_ignored_scalar_indices(
+        #[case] ignored_names: Vec<&str>,
+        #[case] restrict_rows: bool,
+        #[case] expected_rows: usize,
+    ) {
+        let (_tmp_dir, schema, mut dataset) =
+            make_scalar_filter_test_dataset(LanceFileVersion::Stable).await;
+        for column in ["a", "b"] {
+            dataset
+                .create_index(
+                    &[column],
+                    IndexType::BTree,
+                    Some(format!("{column}_btree")),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        append_scalar_filter_test_data(&mut dataset, schema, 100, 110).await;
+
+        let mut scanner = dataset.scan();
+        scanner
+            .filter("a >= 95 AND b >= 95")
+            .unwrap()
+            .with_ignored_scalar_indices(ignored_names)
+            .fast_search();
+        if restrict_rows {
+            // The caller's selection must survive fallback, and its rows must
+            // still be refined by the original expression (which excludes 90).
+            scanner.with_row_id_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+                90u64, 97, 99,
+            ])));
+        }
+        let batch = scanner.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), expected_rows);
+        if restrict_rows {
+            let values = batch["a"].as_primitive::<Int32Type>();
+            assert_eq!(values.values().as_ref(), &[97, 99]);
+        }
     }
 
     fn make_scalar_filter_test_batch(schema: SchemaRef, start: i32, end: i32) -> RecordBatch {

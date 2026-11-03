@@ -615,10 +615,11 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         };
 
         if Self::can_accelerate_queries(&index_details) {
-            Some(Box::new(FtsQueryParser::new(
-                index_name,
-                self.name().to_string(),
-            )))
+            let mut parser = FtsQueryParser::new(index_name, self.name().to_string());
+            if let Ok(params) = InvertedIndexParams::try_from(&index_details) {
+                parser = parser.with_tokenizer_params(params);
+            }
+            Some(Box::new(parser))
         } else {
             None
         }
