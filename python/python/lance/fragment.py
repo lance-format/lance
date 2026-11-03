@@ -53,17 +53,12 @@ from .udf import BatchUDF, normalize_transform
 if TYPE_CHECKING:
     from pyarrow._compute import Expression
 
-    from .dataset import (
-        ColumnOrdering,
-        DatasetBasePath,
-        LanceDataset,
-        LanceOperation,
-        LanceScanner,
-        ReaderLike,
-        Transaction,
-    )
-    from .lance import LanceSchema, ScanStatistics
+    from ._dataset.scanner import ColumnOrdering, LanceScanner
+    from ._dataset.transaction import LanceOperation, Transaction
+    from .dataset import LanceDataset
+    from .lance import DatasetBasePath, LanceSchema, ScanStatistics
     from .namespace import LanceNamespace
+    from .types import ReaderLike
 
 
 DEFAULT_MAX_BYTES_PER_FILE = 90 * 1024 * 1024 * 1024
@@ -221,7 +216,7 @@ class FragmentMetadata:
         overlays = []
         overlays_json = json_data.get("overlays")
         if overlays_json:
-            from .dataset import LanceOperation
+            from ._dataset.transaction import LanceOperation
 
             overlays = [
                 LanceOperation.DataOverlayFile(
@@ -484,11 +479,11 @@ class LanceFragment(pa.dataset.Fragment):
 
         See Also
         --------
-        lance.dataset.LanceOperation.Overwrite :
+        lance.LanceOperation.Overwrite :
             The operation used to create a new dataset or overwrite one using
             fragments created with this API. See the doc page for an example of
             using this API.
-        lance.dataset.LanceOperation.Append :
+        lance.LanceOperation.Append :
             The operation used to append fragments created with this API to an
             existing dataset. See the doc page for an example of using this API.
 
@@ -619,7 +614,7 @@ class LanceFragment(pa.dataset.Fragment):
             scan is complete.  Errors raised by the callback will be logged but not
             re-raised.
         """
-        from .dataset import LanceScanner, _serialize_expression
+        from ._dataset.scanner import LanceScanner, _serialize_expression
 
         if isinstance(filter, pa.compute.Expression):
             filter_str = None
@@ -1131,7 +1126,7 @@ class LanceFragment(pa.dataset.Fragment):
             Internal API. This method is not intended to be used by end users.
 
         The parameters and their interpretation are the same as in the
-        :meth:`lance.dataset.LanceDataset.add_columns` operation.
+        :meth:`lance.LanceDataset.add_columns` operation.
 
         The only difference is that, instead of modifying the dataset, a new
         fragment is created.  The new schema of the fragment is returned as well.
@@ -1145,7 +1140,7 @@ class LanceFragment(pa.dataset.Fragment):
 
         See Also
         --------
-        lance.dataset.LanceOperation.Merge :
+        lance.LanceOperation.Merge :
             The operation used to commit these changes to the dataset. See the
             doc page for an example of using this API.
 
@@ -1214,7 +1209,7 @@ class LanceFragment(pa.dataset.Fragment):
 
         See Also
         --------
-        lance.dataset.LanceOperation.Delete :
+        lance.LanceOperation.Delete :
             The operation used to commit these changes to a dataset. See the
             doc page for an example of using this API.
         """
