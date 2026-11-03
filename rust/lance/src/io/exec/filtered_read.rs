@@ -3998,6 +3998,11 @@ impl ExecutionPlan for FilteredReadExec {
             stream.boxed(),
             self.dataset.metadata_cache.clone(),
             self.dataset.manifest().version,
+            self.dataset
+                .manifest_location
+                .e_tag
+                .clone()
+                .map(Arc::<str>::from),
             output_schema.clone(),
             representative,
         );

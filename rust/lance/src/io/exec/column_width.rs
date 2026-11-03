@@ -53,15 +53,19 @@ pub struct MeasuredWidth(pub f64);
 /// Cache key for one column's measured width. `DSMetadataCache` supplies the
 /// dataset URI prefix.
 ///
-/// Keyed by version because a manifest version is immutable, so an entry can never
-/// go stale. Named by column rather than field id because [`measure`] works on
-/// whole top-level columns and the node holds a bare Arrow schema.
+/// Keyed by the manifest generation token as well as the version: a dataset
+/// dropped and recreated at the same URI restarts its version history at 1, so a
+/// version alone can name the earlier generation's data. Callers without a
+/// generation token must not share widths at all. Named by column rather than
+/// field id because [`measure`] works on whole top-level columns and the node
+/// holds a bare Arrow schema.
 ///
 /// `layout` is the column's Arrow type. One name can carry different types within a
 /// version -- a partially projected struct, or a blob read as a descriptor rather
 /// than its payload -- and a width measured on one says nothing about the other.
 #[derive(Debug)]
 pub struct MeasuredWidthKey<'a> {
+    pub generation: &'a str,
     pub version: u64,
     pub column: &'a str,
     pub layout: &'a DataType,
@@ -72,8 +76,8 @@ impl CacheKey for MeasuredWidthKey<'_> {
 
     fn key(&self) -> Cow<'_, str> {
         Cow::Owned(format!(
-            "column-width/{}/{}/{:?}",
-            self.version, self.column, self.layout
+            "column-width/{}/{}/{}/{:?}",
+            self.version, self.generation, self.column, self.layout
         ))
     }
 
@@ -138,6 +142,7 @@ pub fn measuring<S, E>(
     stream: S,
     cache: Arc<DSMetadataCache>,
     version: u64,
+    generation: Option<Arc<str>>,
     schema: Arc<ArrowSchema>,
     representative: bool,
 ) -> impl Stream<Item = Result<RecordBatch, E>>
@@ -148,6 +153,7 @@ where
     let totals = vec![ColumnBytes::default(); schema.fields().len()];
     futures::stream::unfold(Some((stream, totals)), move |state| {
         let cache = cache.clone();
+        let generation = generation.clone();
         let schema = schema.clone();
         async move {
             let (mut inner, mut totals) = state?;
@@ -164,8 +170,8 @@ where
                     // width would be published as the column's and reused by a full
                     // scan, which is how a narrow filtered read under-reports a wide
                     // column by orders of magnitude.
-                    if representative {
-                        record(&cache, version, &schema, &totals).await;
+                    if representative && let Some(generation) = generation.as_deref() {
+                        record(&cache, version, generation, &schema, &totals).await;
                     }
                     None
                 }
@@ -180,6 +186,7 @@ where
 pub async fn record(
     cache: &LanceCache,
     version: u64,
+    generation: &str,
     schema: &ArrowSchema,
     totals: &[ColumnBytes],
 ) {
@@ -188,6 +195,7 @@ pub async fn record(
             continue;
         };
         let key = MeasuredWidthKey {
+            generation,
             version,
             column: field.name(),
             layout: field.data_type(),
@@ -213,11 +221,16 @@ pub async fn record(
 pub async fn resolve<'a>(
     cache: &LanceCache,
     version: u64,
+    generation: Option<&str>,
     fields: impl Iterator<Item = &'a arrow_schema::Field>,
 ) -> MeasuredWidths {
+    let Some(generation) = generation else {
+        return MeasuredWidths::default();
+    };
     let mut widths = HashMap::new();
     for field in fields {
         let key = MeasuredWidthKey {
+            generation,
             version,
             column: field.name(),
             layout: field.data_type(),
@@ -288,6 +301,7 @@ mod tests {
         let cache = lance_core::cache::LanceCache::with_capacity(1024 * 1024);
         let name = arrow_schema::Field::new("name", DataType::Utf8, false);
         let key = MeasuredWidthKey {
+            generation: "etag-a",
             version: 3,
             column: name.name(),
             layout: name.data_type(),
@@ -301,11 +315,19 @@ mod tests {
 
         for miss in [
             MeasuredWidthKey {
+                generation: "etag-b",
+                version: 3,
+                column: name.name(),
+                layout: name.data_type(),
+            },
+            MeasuredWidthKey {
+                generation: "etag-a",
                 version: 4,
                 column: name.name(),
                 layout: name.data_type(),
             },
             MeasuredWidthKey {
+                generation: "etag-a",
                 version: 3,
                 column: "title",
                 layout: name.data_type(),
@@ -316,6 +338,55 @@ mod tests {
                 "{miss:?} must not read back the width measured for {key:?}"
             );
         }
+    }
+
+    /// A dataset recreated at the same URI and version is a different
+    /// generation. Its widths must not come from the dataset that used to live
+    /// there, and a read with no generation token must not publish at all.
+    #[tokio::test]
+    async fn a_measured_width_is_not_shared_across_generations() {
+        use futures::TryStreamExt;
+
+        let cache = Arc::new(DSMetadataCache(LanceCache::with_capacity(1024 * 1024)));
+        let batch = test_batch();
+        let schema = batch.schema();
+        let field = schema.field_with_name("name").unwrap().clone();
+        let read = |generation| {
+            measuring(
+                futures::stream::iter(vec![Ok::<_, ()>(batch.clone())]),
+                cache.clone(),
+                1,
+                generation,
+                schema.clone(),
+                true,
+            )
+            .try_collect::<Vec<_>>()
+        };
+
+        read(Some(Arc::from("first-generation"))).await.unwrap();
+        assert!(
+            resolve(&cache, 1, Some("first-generation"), [&field].into_iter())
+                .await
+                .get(&field)
+                .is_some(),
+            "the scanned generation must be able to read its own width"
+        );
+        assert_eq!(
+            resolve(&cache, 1, Some("second-generation"), [&field].into_iter())
+                .await
+                .get(&field),
+            None,
+            "a recreated dataset version must not inherit the old width"
+        );
+
+        read(None).await.unwrap();
+        assert_eq!(
+            resolve(&cache, 1, None, [&field].into_iter())
+                .await
+                .get(&field),
+            None,
+            "a read without a generation token must not publish a shared width"
+        );
     }
 
     /// Two observations of one column share a cache key: partitions of a read, or
@@ -340,6 +411,7 @@ mod tests {
                 futures::stream::iter(vec![Ok::<_, ()>(batch)]),
                 cache.clone(),
                 3,
+                Some(Arc::from("etag-a")),
                 schema.clone(),
                 true,
             )
@@ -347,7 +419,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let cached = resolve(&cache, 3, [&field].into_iter())
+        let cached = resolve(&cache, 3, Some("etag-a"), [&field].into_iter())
             .await
             .get(&field)
             .unwrap();
@@ -372,6 +444,7 @@ mod tests {
         cache
             .insert_with_key(
                 &MeasuredWidthKey {
+                    generation: "etag-a",
                     version: 1,
                     column: descriptor.name(),
                     layout: descriptor.data_type(),
@@ -380,10 +453,10 @@ mod tests {
             )
             .await;
 
-        let same = resolve(&cache, 1, [&descriptor].into_iter()).await;
+        let same = resolve(&cache, 1, Some("etag-a"), [&descriptor].into_iter()).await;
         assert_eq!(same.get(&descriptor), Some(8.0));
 
-        let other = resolve(&cache, 1, [&payload].into_iter()).await;
+        let other = resolve(&cache, 1, Some("etag-a"), [&payload].into_iter()).await;
         assert_eq!(
             other.get(&payload),
             None,

@@ -190,6 +190,101 @@ async fn test_plan_join_build_side_follows_source_statistics() {
     );
 }
 
+/// The same build-side choice, now driven by a width measured from the target's
+/// string column instead of the decoder's cold seed. The target is small enough
+/// to be collected under the seed, while its decoded values are larger than the
+/// materialized source and the collection threshold.
+#[tokio::test]
+async fn test_plan_join_build_side_uses_measured_widths() {
+    fn find_hash_join(plan: &dyn ExecutionPlan) -> Option<&HashJoinExec> {
+        if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
+            return Some(join);
+        }
+        for child in plan.children() {
+            if let Some(join) = find_hash_join(child.as_ref()) {
+                return Some(join);
+            }
+        }
+        None
+    }
+
+    fn sides(join: &HashJoinExec) -> (String, String) {
+        let render = |plan: &Arc<dyn ExecutionPlan>| {
+            format!(
+                "{}",
+                datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+            )
+        };
+        (render(join.left()), render(join.right()))
+    }
+
+    let wide: &'static str = Box::leak("x".repeat(4_096).into_boxed_str());
+    let tmp = TempStrDir::default();
+    let target = lance_datagen::gen_batch()
+        .with_seed(Seed::from(1))
+        .col("key", array::step::<UInt32Type>())
+        .col("value", array::step::<UInt32Type>())
+        .col("payload", array::cycle_utf8_literals(&[wide]))
+        .into_reader_rows(RowCount::from(1_024), BatchCount::from(1));
+    let ds = Arc::new(Dataset::write(target, tmp.as_str(), None).await.unwrap());
+
+    // Larger than the target's cold seed estimate (1,024 rows x ~72 B) but
+    // smaller than its measured payload (1,024 x 4 KB).
+    let source = lance_datagen::gen_batch()
+        .with_seed(Seed::from(2))
+        .col("key", array::step::<UInt32Type>())
+        .col("value", array::step::<UInt32Type>())
+        .into_batch_rows(RowCount::from(20_000))
+        .unwrap();
+    let new_job = || {
+        crate::dataset::MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
+            .unwrap()
+            .when_matched(crate::dataset::WhenMatched::UpdateAll)
+            .when_not_matched(crate::dataset::WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+    };
+    let materialized = || {
+        Arc::new(MemTable::try_new(source.schema(), vec![vec![source.clone()]]).unwrap())
+            as Arc<dyn TableProvider>
+    };
+
+    let cold_plan = new_job().create_plan(materialized()).await.unwrap();
+    let cold_join = find_hash_join(cold_plan.as_ref()).expect("cold plan must have a hash join");
+    let (cold_build, _) = sides(cold_join);
+    assert_eq!(
+        (*cold_join.partition_mode(), *cold_join.join_type()),
+        (PartitionMode::CollectLeft, JoinType::Right),
+        "the seed makes the target look smaller than the source:\n{cold_build}"
+    );
+    assert!(cold_build.contains("LanceRead"), "{cold_build}");
+
+    ds.scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+
+    let warm_plan = new_job().create_plan(materialized()).await.unwrap();
+    let warm_join = find_hash_join(warm_plan.as_ref()).expect("warm plan must have a hash join");
+    let (warm_build, warm_probe) = sides(warm_join);
+    assert_eq!(
+        (*warm_join.partition_mode(), *warm_join.join_type()),
+        (PartitionMode::CollectLeft, JoinType::Left),
+        "the measured width must make the source the smaller, collected side:\n{warm_build}"
+    );
+    assert!(
+        warm_build.contains("DataSourceExec") && !warm_build.contains("LanceRead"),
+        "the materialized source must be the build side:\n{warm_build}"
+    );
+    assert!(
+        warm_probe.contains("LanceRead"),
+        "the wide target must be the probe side:\n{warm_probe}"
+    );
+}
+
 /// `analyze_plan` is a diagnostic, so it has to report the plan the source it
 /// was handed would actually run. The batches entry point must therefore not
 /// fall back to the streaming plan: with the row counts used below the join

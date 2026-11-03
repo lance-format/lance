@@ -1091,6 +1091,7 @@ impl Scanner {
         let measured = column_width::resolve(
             &self.dataset.metadata_cache,
             self.dataset.manifest().version,
+            self.dataset.manifest_location.e_tag.as_deref(),
             fields.iter().map(|field| field.as_ref()),
         )
         .await;
@@ -1189,6 +1190,7 @@ mod tests {
 
     use arrow::datatypes::Int32Type;
     use arrow_schema::Fields;
+    use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_file::version::LanceFileVersion;
 
@@ -1485,7 +1487,10 @@ mod tests {
 
         let plan = dataset.scan().create_plan().await.unwrap();
         let read = find_read(plan.as_ref()).expect("a filtered read");
-        let before = read.partition_statistics(None).unwrap().total_byte_size;
+        let before = StatisticsContext::new()
+            .compute(read, &StatisticsArgs::new())
+            .unwrap()
+            .total_byte_size;
         assert!(
             matches!(before, Precision::Inexact(n) if n > 0),
             "the warm cache must give the read a width, got {before:?}"
@@ -1494,7 +1499,10 @@ mod tests {
         let rebuilt = read
             .with_fetch(Some(10))
             .expect("the read accepts a pushed-down limit");
-        let after = rebuilt.partition_statistics(None).unwrap().total_byte_size;
+        let after = StatisticsContext::new()
+            .compute(rebuilt.as_ref(), &StatisticsArgs::new())
+            .unwrap()
+            .total_byte_size;
         assert!(
             matches!(after, Precision::Inexact(n) if n > 0),
             "a rebuilt read must keep the measured width, got {after:?}"
@@ -1520,9 +1528,15 @@ mod tests {
     })]
     #[case::physical_rows(|scan: &mut Scanner, dataset: &Dataset| {
         let fragment_id = dataset.get_fragments()[0].id() as u32;
-        let start = u64::from(RowAddress::new_from_parts(fragment_id, 0));
-        let end = u64::from(RowAddress::new_from_parts(fragment_id, 10));
-        scan.with_physical_row_addr_prefilter(RowAddrTreeMap::from_iter(start..end));
+        let start = u64::from(lance_core::utils::address::RowAddress::new_from_parts(
+            fragment_id,
+            0,
+        ));
+        let end = u64::from(lance_core::utils::address::RowAddress::new_from_parts(
+            fragment_id,
+            10,
+        ));
+        scan.with_physical_row_addr_prefilter(lance_select::RowAddrTreeMap::from_iter(start..end));
     })]
     #[tokio::test]
     async fn a_restricted_read_does_not_publish_a_width_for_the_column(
@@ -1530,9 +1544,7 @@ mod tests {
     ) {
         use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
         use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-        use lance_core::utils::address::RowAddress;
         use lance_core::utils::tempfile::TempStrDir;
-        use lance_select::RowAddrTreeMap;
 
         let tmp = TempStrDir::default();
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -1566,12 +1578,9 @@ mod tests {
         .unwrap();
 
         let full_plan_size = async || {
-            dataset
-                .scan()
-                .create_plan()
-                .await
-                .unwrap()
-                .partition_statistics(None)
+            let plan = dataset.scan().create_plan().await.unwrap();
+            StatisticsContext::new()
+                .compute(plan.as_ref(), &StatisticsArgs::new())
                 .unwrap()
                 .total_byte_size
         };
@@ -1613,12 +1622,9 @@ mod tests {
             .unwrap();
 
         let byte_size = async || {
-            dataset
-                .scan()
-                .create_plan()
-                .await
-                .unwrap()
-                .partition_statistics(None)
+            let plan = dataset.scan().create_plan().await.unwrap();
+            StatisticsContext::new()
+                .compute(plan.as_ref(), &StatisticsArgs::new())
                 .unwrap()
                 .total_byte_size
         };
@@ -1651,6 +1657,122 @@ mod tests {
             measured < seeded,
             "the measurement must replace the seed, not sit beside it: \
              seeded={seeded}, measured={measured}"
+        );
+    }
+
+    /// A dataset dropped and recreated at the same URI restarts its version
+    /// history at 1. A long-lived session must not answer the new dataset's
+    /// version-1 lookups with the previous generation's measured width.
+    #[tokio::test]
+    async fn a_recreated_dataset_does_not_inherit_measured_widths() {
+        use arrow_array::{RecordBatch, RecordBatchIterator, StringArray};
+        use futures::TryStreamExt;
+        use lance_core::utils::tempfile::TempStrDir;
+
+        use crate::dataset::WriteParams;
+        use crate::dataset::builder::DatasetBuilder;
+        use crate::io::exec::column_width;
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str().to_string();
+        let first = lance_datagen::gen_batch()
+            .col("name", array::cycle_utf8_literals(&["a"]))
+            .into_dataset(&uri, FragmentCount::from(1), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+        let session = first.session();
+        let narrow = DatasetBuilder::from_uri(&uri)
+            .with_session(session.clone())
+            .load()
+            .await
+            .unwrap();
+        let narrow_schema: ArrowSchema = narrow.schema().into();
+        let name = narrow_schema.field_with_name("name").unwrap().clone();
+
+        narrow
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let narrow_width = column_width::resolve(
+            &narrow.metadata_cache,
+            narrow.version().version,
+            narrow.manifest_location.e_tag.as_deref(),
+            [&name].into_iter(),
+        )
+        .await
+        .get(&name)
+        .expect("the first scan must measure a width");
+        assert!(
+            narrow_width < 100.0,
+            "fixture stopped being narrow: {narrow_width} bytes per row"
+        );
+
+        std::fs::remove_dir_all(&uri).unwrap();
+        let wide_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "name",
+            DataType::Utf8,
+            false,
+        )]));
+        let wide_value = "x".repeat(4_096);
+        let batch = RecordBatch::try_new(
+            wide_schema.clone(),
+            vec![Arc::new(StringArray::from(vec![wide_value.as_str(); 100]))],
+        )
+        .unwrap();
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], wide_schema),
+            &uri,
+            Some(WriteParams {
+                enable_v2_manifest_paths: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let wide = DatasetBuilder::from_uri(&uri)
+            .with_session(session)
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(wide.version().version, narrow.version().version);
+        assert_ne!(wide.manifest_location.e_tag, narrow.manifest_location.e_tag);
+        assert_eq!(
+            column_width::resolve(
+                &wide.metadata_cache,
+                wide.version().version,
+                wide.manifest_location.e_tag.as_deref(),
+                [&name].into_iter(),
+            )
+            .await
+            .get(&name),
+            None,
+            "the recreated generation must not inherit the old measured width"
+        );
+
+        wide.scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let wide_width = column_width::resolve(
+            &wide.metadata_cache,
+            wide.version().version,
+            wide.manifest_location.e_tag.as_deref(),
+            [&name].into_iter(),
+        )
+        .await
+        .get(&name)
+        .expect("the recreated dataset must measure its own width");
+        assert!(
+            wide_width > 1_000.0,
+            "the recreated dataset's 4 KB values must measure as wide, got {wide_width}"
         );
     }
 }

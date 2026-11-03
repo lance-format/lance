@@ -854,15 +854,22 @@ impl ExecutionPlan for LanceScanExec {
         let lance_stream = lance_fut_stream.try_flatten();
 
         // Measure what the scan decodes and record it when the scan finishes.
-        // Only a scan over every row of every fragment measures the column rather
-        // than a slice of it.
+        // Only a scan over the dataset's own current fragment list measures the
+        // column rather than a slice of it. A matching count or matching ids is
+        // not enough: callers can pass duplicates or stale fragments that happen
+        // to have the same shape.
         let representative = self.range.is_none()
-            && self.fragments.len() == self.dataset.fragments().len()
+            && Arc::ptr_eq(&self.fragments, self.dataset.fragments())
             && !self.config.with_make_deletions_null;
         let measured_stream = column_width::measuring(
             lance_stream.boxed(),
             self.dataset.metadata_cache.clone(),
             self.dataset.manifest().version,
+            self.dataset
+                .manifest_location
+                .e_tag
+                .clone()
+                .map(Arc::<str>::from),
             self.schema(),
             representative,
         );
@@ -1323,7 +1330,13 @@ mod tests {
         let schema = dataset.schema().into();
         let name: &arrow_schema::Schema = &schema;
         let name = name.field_with_name("name").unwrap();
+        let generation = dataset
+            .manifest_location
+            .e_tag
+            .as_deref()
+            .expect("a local dataset has an e-tag");
         let key = MeasuredWidthKey {
+            generation,
             version: dataset.version().version,
             column: name.name(),
             layout: name.data_type(),
@@ -1351,6 +1364,83 @@ mod tests {
         assert!(
             width > 0.0,
             "a string column cannot measure as free, got {width}"
+        );
+    }
+
+    /// A fragment list with the dataset's fragment count is not necessarily the
+    /// dataset's fragment set. Publishing a width from one would let a later
+    /// unrestricted scan believe a subset speaks for the whole column.
+    #[tokio::test]
+    async fn a_same_count_fragment_subset_does_not_publish_a_width() {
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_datagen::array;
+
+        use super::super::column_width;
+        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+        let tmp = TempStrDir::default();
+        let dataset = Arc::new(
+            gen_batch()
+                .col("name", array::cycle_utf8_literals(&["alpha", "bb", "c"]))
+                .into_dataset(
+                    tmp.as_str(),
+                    FragmentCount::from(2),
+                    FragmentRowCount::from(10),
+                )
+                .await
+                .unwrap(),
+        );
+        let arrow_schema: arrow_schema::Schema = dataset.schema().into();
+        let name = arrow_schema.field_with_name("name").unwrap();
+        let projection = Arc::new(dataset.schema().clone());
+        let build = |fragments| {
+            LanceScanExec::new(
+                dataset.clone(),
+                fragments,
+                None,
+                projection.clone(),
+                LanceScanConfig::default(),
+            )
+        };
+        let resolve = || {
+            column_width::resolve(
+                &dataset.metadata_cache,
+                dataset.version().version,
+                dataset.manifest_location.e_tag.as_deref(),
+                [name].into_iter(),
+            )
+        };
+
+        // Same count as the dataset, but fragment 0 twice instead of both
+        // fragments. The scan still drains successfully; it just must not speak
+        // for the column.
+        let duplicate = Arc::new(vec![
+            dataset.fragments()[0].clone(),
+            dataset.fragments()[0].clone(),
+        ]);
+        assert_eq!(duplicate.len(), dataset.fragments().len());
+        let subset = build(duplicate);
+        let _: Vec<_> = subset
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            resolve().await.get(name).is_none(),
+            "a same-count fragment subset must not publish a version-wide width"
+        );
+
+        let full = build(dataset.fragments().clone());
+        let _: Vec<_> = full
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            resolve().await.get(name).is_some(),
+            "the dataset's own fragment list must still publish a width"
         );
     }
 
@@ -1388,8 +1478,8 @@ mod tests {
 
         let uninformed = build();
         // Unmeasured, the string column reports the decoder's 64-byte seed.
-        let Precision::Inexact(seeded) = uninformed
-            .partition_statistics(None)
+        let Precision::Inexact(seeded) = StatisticsContext::new()
+            .compute(&uninformed, &StatisticsArgs::new())
             .unwrap()
             .total_byte_size
         else {
@@ -1404,12 +1494,13 @@ mod tests {
         let measured = column_width::resolve(
             &dataset.metadata_cache,
             version,
+            dataset.manifest_location.e_tag.as_deref(),
             build().schema().fields().iter().map(|f| f.as_ref()),
         )
         .await;
-        let stats = build()
-            .with_measured_widths(&measured)
-            .partition_statistics(None)
+        let informed = build().with_measured_widths(&measured);
+        let stats = StatisticsContext::new()
+            .compute(&informed, &StatisticsArgs::new())
             .unwrap();
 
         let Precision::Inexact(measured) = stats.total_byte_size else {
