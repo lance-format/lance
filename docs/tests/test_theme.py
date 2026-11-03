@@ -32,6 +32,7 @@ class SidenavTests(unittest.TestCase):
                 config_file=StringIO("""
 nav:
   - Integrations:
+      - External Docs: https://docs.lancedb.com/
       - Overview: index.md
       - Apache Spark:
           - Welcome: spark/index.md
@@ -52,8 +53,13 @@ nav:
             )
             build(config)
             cls.sidebars = {}
+            cls.topnavs = {}
             for name in ("spark/ddl/create/index.html", "standalone/index.html"):
                 html = (root / "site" / name).read_text(encoding="utf-8")
+                topnav = html.split('<nav class="ld-topnav"', 1)[1].split("</nav>", 1)[
+                    0
+                ]
+                cls.topnavs[name] = ElementTree.fromstring("<nav" + topnav + "</nav>")
                 sidebar = html.split('<aside class="ld-sidenav"', 1)[1].split(
                     "</aside>", 1
                 )[0]
@@ -103,3 +109,6 @@ nav:
         self.assertEqual(
             sidebar.find("./div/a").attrib, {"class": "active", "href": "./"}
         )
+        tabs = self.topnavs["standalone/index.html"].findall("a")
+        self.assertEqual(tabs[0].text, "Integrations")
+        self.assertEqual(tabs[0].get("href"), "..")

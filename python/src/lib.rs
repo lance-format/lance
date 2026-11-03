@@ -99,7 +99,8 @@ use crate::utils::Hnsw;
 use crate::utils::KMeans;
 pub use dataset::Dataset;
 use fragment::{
-    FileFragment, FragmentAddColumnsCleanup, PyDeletionFile, PyRowDatasetVersionMeta, PyRowIdMeta,
+    FileFragment, FragmentAddColumnsCleanup, OverlayWriter, PyDeletionFile,
+    PyRowDatasetVersionMeta, PyRowIdMeta,
 };
 pub use indices::register_indices;
 pub use reader::LanceReader;
@@ -270,6 +271,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Dataset>()?;
     m.add_class::<DatasetBasePath>()?;
     m.add_class::<FileFragment>()?;
+    m.add_class::<OverlayWriter>()?;
     m.add_class::<FragmentAddColumnsCleanup>()?;
     m.add_class::<PyDeletionFile>()?;
     m.add_class::<PyRowIdMeta>()?;
