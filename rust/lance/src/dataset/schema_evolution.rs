@@ -14,7 +14,7 @@ use super::{
     write::cleanup_data_fragments,
 };
 use crate::dataset::mem_wal::DatasetMemWalExt;
-use crate::index::load_all_indices;
+use crate::index::loading::load_all_indices;
 use crate::{Error, Result, io::exec::Planner};
 use arrow::compute::CastOptions;
 use arrow::compute::can_cast_types;
@@ -968,15 +968,20 @@ pub(super) async fn alter_columns(
         let affected: Vec<&lance_table::format::IndexMetadata> = indices
             .iter()
             .filter(|idx| {
+                let dependency_fields = idx.dependency_fields();
                 cast_fields
                     .iter()
-                    .any(|(old, _)| idx.fields.contains(&old.id))
+                    .any(|(old, _)| dependency_fields.contains(&old.id))
             })
             .collect();
         if !affected.is_empty() {
             let affected_cols: Vec<String> = cast_fields
                 .iter()
-                .filter(|(old, _)| affected.iter().any(|i| i.fields.contains(&old.id)))
+                .filter(|(old, _)| {
+                    affected
+                        .iter()
+                        .any(|i| i.dependency_fields().contains(&old.id))
+                })
                 .map(|(old, _)| old.name.clone())
                 .collect();
             let affected_idx_names: Vec<String> = affected.iter().map(|i| i.name.clone()).collect();
@@ -1320,6 +1325,9 @@ mod test {
     use std::{collections::HashMap, fs, num::NonZero, path::Path as StdPath, sync::Mutex};
 
     use crate::index::DatasetIndexExt;
+    use crate::session::index_caches::IndexMetadataKey;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use arrow_array::types::Int32Type;
 
     /// What the `add_columns` guard refuses, and what it lets through.
     ///
@@ -2840,6 +2848,90 @@ mod test {
             sizes.push(blob.size() as usize);
         }
         assert_eq!(sizes, SIZES.to_vec());
+        Ok(())
+    }
+
+    /// A legacy blob column added to a 2.2 table is stored as Blob v2, as
+    /// `Dataset::write` does, so its promotion on commit never meets legacy
+    /// pages in a 2.2 file.
+    #[tokio::test]
+    async fn test_add_columns_promotes_legacy_blob_input_at_v2_2() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..3))],
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        let output_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("blob", DataType::LargeBinary, true).with_metadata(
+                std::collections::HashMap::from([(
+                    lance_arrow::BLOB_META_KEY.to_string(),
+                    "true".to_string(),
+                )]),
+            ),
+        ]));
+        let mapper_schema = output_schema.clone();
+        let mapper = move |batch: &RecordBatch| {
+            let ids = batch["id"].as_primitive::<arrow_array::types::Int32Type>();
+            let blobs = arrow_array::LargeBinaryArray::from_iter_values(
+                ids.values()
+                    .iter()
+                    .map(|id| vec![*id as u8; *id as usize + 1]),
+            );
+            Ok(RecordBatch::try_new(
+                mapper_schema.clone(),
+                vec![Arc::new(blobs)],
+            )?)
+        };
+        dataset
+            .add_columns(
+                NewColumnTransform::BatchUDF(BatchUDF {
+                    mapper: Box::new(mapper),
+                    output_schema,
+                    result_checkpoint: None,
+                }),
+                None,
+                None,
+            )
+            .await?;
+
+        assert!(dataset.schema().field("blob").unwrap().is_blob_v2());
+        let fragment = dataset.get_fragments().into_iter().next().unwrap();
+        let data_file = fragment.metadata().files.last().unwrap().clone();
+        let file_schema = crate::utils::test::data_file_schema(&dataset, &data_file.path).await;
+        // The footer keeps the writer's view: a Blob v2 descriptor struct, where
+        // the legacy layout keeps the large_binary input type.
+        assert!(
+            matches!(
+                file_schema.field("blob").unwrap().data_type(),
+                DataType::Struct(_)
+            ),
+            "{file_schema:?}"
+        );
+
+        let blobs = Arc::new(dataset)
+            .take_blobs_by_indices(&[0, 1, 2], "blob")
+            .await?;
+        for (id, blob) in blobs.iter().enumerate() {
+            assert_eq!(
+                blob.as_ref().unwrap().read().await?.as_ref(),
+                vec![id as u8; id + 1].as_slice()
+            );
+        }
         Ok(())
     }
 
@@ -5850,6 +5942,67 @@ mod test {
         );
 
         Ok(())
+    }
+
+    /// The index goes into the session's index cache because decode and
+    /// commit reject a `fields` that omits a carried column.
+    #[rstest]
+    #[case::suffix(&["key", "carried"])]
+    #[case::keys_only(&["key"])]
+    #[tokio::test]
+    async fn test_alter_columns_cast_fails_with_covering_index(#[case] fields: &[&str]) {
+        for (column, refused) in [("key", true), ("carried", true), ("other", false)] {
+            let dataset = lance_datagen::gen_batch()
+                .col("key", lance_datagen::array::step::<Int32Type>())
+                .col("carried", lance_datagen::array::step::<Int32Type>())
+                .col("other", lance_datagen::array::step::<Int32Type>())
+                .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(4))
+                .await
+                .unwrap();
+            let field_id = |name: &str| dataset.schema().field_id(name).unwrap();
+            let covered = lance_table::format::IndexMetadata {
+                uuid: uuid::Uuid::new_v4(),
+                name: "covered".to_string(),
+                fields: fields.iter().map(|name| field_id(name)).collect(),
+                covering_fields: vec![field_id("carried")],
+                dataset_version: dataset.manifest.version,
+                fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
+                index_details: None,
+                index_version: 0,
+                created_at: None,
+                base_id: None,
+                files: None,
+                clustering_id: None,
+                metadata: Default::default(),
+            };
+            let metadata_key = IndexMetadataKey {
+                version: dataset.manifest.version,
+                store_identity: &dataset.object_store.store_prefix,
+                e_tag: dataset.manifest_location.e_tag.as_deref(),
+            };
+            dataset
+                .index_cache
+                .insert_with_key(&metadata_key, Arc::new(vec![covered]))
+                .await;
+
+            let mut dataset = dataset;
+            let error = dataset
+                .alter_columns(&[ColumnAlteration::new(column.into()).cast_to(DataType::Int64)])
+                .await
+                .err()
+                .map(|err| err.to_string());
+            if refused {
+                let names_both = error.as_ref().is_some_and(|msg| {
+                    msg.contains(&format!("[{column}]")) && msg.contains("[covered]")
+                });
+                assert!(
+                    names_both,
+                    "fields {fields:?}: casting {column} should name it and the index, got {error:?}"
+                );
+            } else {
+                assert_eq!(error, None, "fields {fields:?}: casting {column}");
+            }
+        }
     }
 
     #[test]

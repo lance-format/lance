@@ -825,6 +825,17 @@ def test_index_take_batch_size(tmp_path):
     assert len(batches) == 21
 
 
+def test_btree_rejects_zero_zone_size(tmp_path):
+    """A zero-sized BTree zone must be rejected."""
+    dataset = lance.write_dataset(pa.table({"value": [1, 2, 3]}), tmp_path)
+
+    with pytest.raises(ValueError, match="zone_size"):
+        dataset.create_scalar_index(
+            "value",
+            index_type=IndexConfig("btree", {"zone_size": 0}),
+        )
+
+
 def test_all_null_chunk(tmp_path):
     def gen_string(idx: int):
         if idx % 2 == 0:
@@ -6876,7 +6887,9 @@ def test_describe_indices(tmp_path, format_version, expected_format_version):
         "{}",
         "{}",
         "{}",
-        '{"path":"x","target_details":{}}',
+        # `$.x` is absent from every document, so the target type was inferred
+        # as utf8, the fallback for an all-null path.
+        '{"path":"x","target_data_type":"utf8","target_details":{}}',
         "{}",
         "{}",
     ]
@@ -7156,3 +7169,64 @@ def test_large_string_scalar_index(tmp_path, index_type):
     result = ds.scanner(filter="category = 'alpha'").to_table()
     assert result.num_rows == 2
     assert set(result.column("id").to_pylist()) == {1, 3}
+
+
+def _assert_row_address_query(dataset, value, filter_expression):
+    table = dataset.to_table(filter=filter_expression)
+    assert table.num_rows == 1
+    assert table.column("idx").to_pylist() == [value]
+
+    plan = dataset.scanner(filter=filter_expression).explain_plan()
+    assert "ScalarIndexQuery" in plan or "MaterializeIndex" in plan
+
+
+def _assert_row_address_case(index_type, dataset, value):
+    if index_type == "LABEL_LIST":
+        filter_expression = f"array_has_any(label_list, ['label{value}'])"
+    else:
+        filter_expression = f"{index_type.lower()} == {value}"
+    _assert_row_address_query(dataset, value, filter_expression)
+
+
+@pytest.mark.parametrize("index_type", ["BTREE", "BITMAP", "LABEL_LIST"])
+def test_row_address_index_maintenance(tmp_path, index_type):
+    column = "label_list" if index_type == "LABEL_LIST" else index_type.lower()
+    data = pa.table(
+        {
+            "idx": range(16),
+            column: (
+                [[f"label{i}"] for i in range(16)]
+                if index_type == "LABEL_LIST"
+                else range(16)
+            ),
+        }
+    )
+    dataset = lance.write_dataset(
+        data,
+        tmp_path,
+        max_rows_per_file=8,
+        data_storage_version="2.1",
+        enable_stable_row_ids=True,
+    )
+    dataset.create_scalar_index(column, index_type)
+    _assert_row_address_case(index_type, dataset, 7)
+
+    dataset.insert(
+        pa.table(
+            {
+                "idx": [16],
+                column: [["label16"]] if index_type == "LABEL_LIST" else [16],
+            }
+        )
+    )
+    dataset.optimize.optimize_indices()
+    dataset.optimize.compact_files()
+
+    dataset = lance.dataset(tmp_path)
+    _assert_row_address_case(index_type, dataset, 7)
+    _assert_row_address_case(index_type, dataset, 16)
+
+    # Compaction can leave coverage addressed by stable row ids. Rebuild it so
+    # both rows remain available through physical-address coverage as well.
+    dataset.optimize.optimize_indices()
+    _assert_row_address_case(index_type, dataset, 16)

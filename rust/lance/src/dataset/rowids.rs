@@ -89,6 +89,8 @@ impl RowVersionKind {
 
 /// Load one of `fragment`'s per-row version sequences, wherever it is stored.
 ///
+/// Requires stable row ids on the dataset.
+///
 /// `None` when the fragment carries no such metadata, which readers treat as
 /// every row being at version 1. A sequence spilled to a data file is cached
 /// per fragment and file; an inline one is decoded from the manifest bytes.
@@ -97,6 +99,12 @@ pub async fn load_row_version_sequence(
     fragment: &Fragment,
     kind: RowVersionKind,
 ) -> Result<Option<Arc<RowDatasetVersionSequence>>> {
+    if !dataset.manifest.uses_stable_row_ids() {
+        return Err(Error::invalid_input(format!(
+            "row version tracking requires stable row ids, version {} does not use them",
+            dataset.manifest.version
+        )));
+    }
     let Some(meta) = kind.meta(fragment) else {
         return Ok(None);
     };
@@ -1107,7 +1115,8 @@ mod test {
 
     #[tokio::test]
     async fn test_row_ids_update() {
-        // Updated fragments get fresh row ids.
+        // With stable row ids an update remaps the row's id onto the rewritten
+        // row's address; it does not mint a new id.
         let num_rows = 5u64;
         let batch = sequence_batch(0..num_rows as i32);
 

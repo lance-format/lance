@@ -179,7 +179,7 @@ async fn has_usable_vector_index(
     let column_id = dataset.schema().field_id(column)?;
     Ok(dataset.load_indices().await?.iter().any(|index| {
         index.fields.first() == Some(&column_id)
-            && crate::index::index_type_is_known(index)
+            && crate::index::segment::index_type_is_known(index)
             && crate::index::vector::details::metric_type_from_index_metadata(index)
                 .is_none_or(|metric| metric == distance_type)
     }))
