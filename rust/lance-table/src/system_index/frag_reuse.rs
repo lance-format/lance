@@ -3,10 +3,13 @@
 
 pub mod gate;
 pub mod history;
+mod imp;
 pub mod ledger;
+mod legacy;
 pub mod lineage;
 pub mod metadata;
 pub mod policy;
+mod tagged;
 
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 

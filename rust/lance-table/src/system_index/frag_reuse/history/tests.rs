@@ -8,9 +8,10 @@ use roaring::RoaringTreemap;
 use rstest::rstest;
 
 use super::*;
+use crate::format::pb::fragment_reuse_index_details::transition;
 use crate::system_index::frag_reuse::ledger::Mapping;
 
-fn digest(id: u64, physical_rows: u64, num_deleted_rows: u64) -> pb::FragmentDigest {
+pub fn digest(id: u64, physical_rows: u64, num_deleted_rows: u64) -> pb::FragmentDigest {
     pb::FragmentDigest {
         id,
         physical_rows,
@@ -18,14 +19,14 @@ fn digest(id: u64, physical_rows: u64, num_deleted_rows: u64) -> pb::FragmentDig
     }
 }
 
-fn address(fragment: u64, offset: u64) -> u64 {
+pub fn address(fragment: u64, offset: u64) -> u64 {
     (fragment << 32) | offset
 }
 
 /// A fragment as a rewrite sees it: its physical row count and which
 /// offsets are deleted.
 #[derive(Debug, Clone)]
-struct Source {
+pub struct Source {
     id: u64,
     physical_rows: u64,
     deleted: BTreeSet<u64>,
@@ -50,7 +51,7 @@ fn changed_row_addrs(sources: &[Source]) -> Vec<u8> {
     bytes
 }
 
-fn ordered(sources: &[Source], destinations: &[(u64, u64)]) -> pb::Transition {
+pub fn ordered(sources: &[Source], destinations: &[(u64, u64)]) -> pb::Transition {
     pb::Transition {
         sources: sources.iter().map(Source::digest).collect(),
         destinations: destinations
@@ -65,7 +66,11 @@ fn ordered(sources: &[Source], destinations: &[(u64, u64)]) -> pb::Transition {
     }
 }
 
-fn legacy(dataset_version: u64, sources: &[Source], destinations: &[(u64, u64)]) -> pb::Version {
+pub fn legacy(
+    dataset_version: u64,
+    sources: &[Source],
+    destinations: &[(u64, u64)],
+) -> pb::Version {
     let transition = ordered(sources, destinations);
     let Some(transition::Mapping::OrderedCompaction(mapping)) = transition.mapping else {
         unreachable!()
@@ -80,7 +85,7 @@ fn legacy(dataset_version: u64, sources: &[Source], destinations: &[(u64, u64)])
     }
 }
 
-fn whole(id: u64, physical_rows: u64) -> Source {
+pub fn whole(id: u64, physical_rows: u64) -> Source {
     Source {
         id,
         physical_rows,
@@ -88,7 +93,7 @@ fn whole(id: u64, physical_rows: u64) -> Source {
     }
 }
 
-fn partition(source: u64, destination: u64, map_id: &str) -> pb::Transition {
+pub fn partition(source: u64, destination: u64, map_id: &str) -> pb::Transition {
     pb::Transition {
         sources: vec![digest(source, 4, 0)],
         destinations: vec![digest(destination, 4, 0)],
@@ -100,8 +105,8 @@ fn partition(source: u64, destination: u64, map_id: &str) -> pb::Transition {
     }
 }
 
-const MAP_A: &str = "00000000-0000-0000-0000-00000000000a";
-const MAP_B: &str = "00000000-0000-0000-0000-00000000000b";
+pub const MAP_A: &str = "00000000-0000-0000-0000-00000000000a";
+pub const MAP_B: &str = "00000000-0000-0000-0000-00000000000b";
 
 /// An envelope field no released writer emits.
 fn unknown_record() -> Vec<u8> {
@@ -164,34 +169,6 @@ fn whole_history_edits_refuse_records_they_cannot_interpret(#[case] record: Vec<
 }
 
 #[test]
-fn appended_transitions_are_validated_against_the_whole_lineage() {
-    let history = FragReuseHistory::empty(HistoryFormat::Tagged)
-        .append_transitions(&[ordered(&[whole(0, 2)], &[(1, 2)])])
-        .unwrap();
-    let error = history
-        .append_transitions(&[ordered(&[whole(0, 2)], &[(2, 2)])])
-        .unwrap_err();
-    assert!(error.to_string().contains("duplicate consumer"), "{error}");
-}
-
-#[test]
-fn a_row_map_belongs_to_one_transition() {
-    let history = FragReuseHistory::empty(HistoryFormat::Tagged)
-        .append_transitions(&[partition(0, 1, MAP_A)])
-        .unwrap();
-    let error = history
-        .append_transitions(&[partition(2, 3, MAP_A)])
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("more than one transition"),
-        "{error}"
-    );
-    history
-        .append_transitions(&[partition(2, 3, MAP_B)])
-        .unwrap();
-}
-
-#[test]
 fn record_kinds_require_their_format() {
     let error = FragReuseHistory::empty(HistoryFormat::Legacy)
         .append_transitions(&[ordered(&[whole(0, 1)], &[(1, 1)])])
@@ -201,23 +178,6 @@ fn record_kinds_require_their_format() {
         .insert_legacy_version(legacy(1, &[whole(0, 1)], &[(1, 1)]))
         .unwrap_err();
     assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-}
-
-#[test]
-fn legacy_versions_stay_ordered_by_dataset_version() {
-    let history = FragReuseHistory::empty(HistoryFormat::Legacy)
-        .insert_legacy_version(legacy(5, &[whole(0, 1)], &[(1, 1)]))
-        .unwrap()
-        .insert_legacy_version(legacy(3, &[whole(2, 1)], &[(3, 1)]))
-        .unwrap();
-    let versions: Vec<u64> = history
-        .records()
-        .map(|record| match record {
-            Record::LegacyVersion(version) => version.dataset_version,
-            other => panic!("{other:?}"),
-        })
-        .collect();
-    assert_eq!(versions, [3, 5]);
 }
 
 #[test]
@@ -257,52 +217,6 @@ fn retain_drops_only_the_rejected_records() {
 }
 
 #[test]
-fn base_relocation_keeps_unknown_nested_fields() {
-    let mut partition_payload = pb::StablePartition {
-        map_id: MAP_A.to_string(),
-        map_size_bytes: 64,
-        base_id: Some(2),
-    }
-    .encode_to_vec();
-    partition_payload.extend_from_slice(&length_delimited(9, b"future"));
-    let mut transition = pb::Transition {
-        sources: vec![digest(0, 4, 0)],
-        destinations: vec![digest(1, 4, 0)],
-        mapping: None,
-    }
-    .encode_to_vec();
-    transition.extend_from_slice(&length_delimited(
-        STABLE_PARTITION_FIELD,
-        &partition_payload,
-    ));
-    let history = RawHistory::new(
-        HistoryFormat::Tagged,
-        length_delimited(TRANSITION_FIELD, &transition).into(),
-    )
-    .validate()
-    .unwrap();
-
-    let relocated = history
-        .remap_stable_partition_bases(&|base| {
-            assert_eq!(base, Some(2));
-            Ok(Some(7))
-        })
-        .unwrap();
-    let Mapping::StablePartition(partition) = relocated.ledger().transitions()[0].mapping() else {
-        panic!("not a stable partition");
-    };
-    assert_eq!(partition.base_id, Some(7));
-    let content = relocated.content();
-    let unknown = length_delimited(9, b"future");
-    assert!(
-        content
-            .windows(unknown.len())
-            .any(|window| window == unknown),
-        "the unknown nested field was dropped"
-    );
-}
-
-#[test]
 fn records_added_since_is_append_only() {
     let base = FragReuseHistory::empty(HistoryFormat::Tagged)
         .append_transitions(&[ordered(&[whole(0, 1)], &[(1, 1)])])
@@ -335,47 +249,6 @@ fn records_added_since_is_append_only() {
         .unwrap();
     let error = changed.records_added_since(&recorded).unwrap_err();
     assert!(error.to_string().contains("changes"), "{error}");
-}
-
-#[test]
-fn repair_drops_versions_that_break_the_kept_lineage() {
-    let first = legacy(1, &[whole(0, 2)], &[(1, 2)]);
-    // Consumes fragment 0 a second time.
-    let reconsumes = legacy(2, &[whole(0, 2)], &[(2, 2)]);
-    // Produces fragment 1 a second time.
-    let reproduces = legacy(3, &[whole(5, 2)], &[(1, 2)]);
-    // Invalid on its own: two survivors recorded into one destination row.
-    let mut miscounted = legacy(4, &[whole(6, 2)], &[(7, 2)]);
-    miscounted.groups[0].new_fragments[0].physical_rows = 1;
-    let chained = legacy(5, &[whole(1, 2)], &[(8, 2)]);
-
-    let error = FragReuseHistory::from_legacy_versions(vec![
-        first.clone(),
-        reconsumes.clone(),
-        reproduces.clone(),
-        miscounted.clone(),
-        chained.clone(),
-    ])
-    .unwrap_err();
-    assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
-
-    let (repaired, dropped) = FragReuseHistory::repair_legacy_versions(vec![
-        chained, miscounted, reproduces, reconsumes, first,
-    ])
-    .unwrap();
-    assert_eq!(dropped, [2, 3, 4]);
-    let kept: Vec<u64> = repaired
-        .records()
-        .map(|record| match record {
-            Record::LegacyVersion(version) => version.dataset_version,
-            other => panic!("{other:?}"),
-        })
-        .collect();
-    assert_eq!(kept, [1, 5]);
-    assert_eq!(
-        translate(repaired.ledger(), address(0, 1)),
-        Some(address(8, 1))
-    );
 }
 
 #[test]
@@ -519,7 +392,7 @@ fn simulate(
 }
 
 /// Follow `addr` through every transition that consumes its fragment.
-fn translate(ledger: &FragReuseLedger, mut addr: u64) -> Option<u64> {
+pub fn translate(ledger: &FragReuseLedger, mut addr: u64) -> Option<u64> {
     while let Some(position) = ledger.consumer((addr >> 32) as u32) {
         let Mapping::OrderedCompaction(remap) = ledger.transitions()[position].mapping() else {
             panic!("the model only records ordered compactions");

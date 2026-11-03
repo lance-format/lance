@@ -24,24 +24,22 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use lance_core::{Error, Result};
 use prost::Message;
-use prost::encoding::{WireType, decode_key, decode_varint};
+use prost::encoding::WireType;
 use roaring::RoaringBitmap;
 
-use super::ledger::{
-    FragReuseLedger, STABLE_PARTITION_FIELD, corrupt, is_interpretable_transition, next_field,
-    require_message,
-};
-use crate::format::pb::fragment_reuse_index_details::{self as pb, transition};
+use super::imp::{FriImpl, StoredRecord, concat};
+use super::ledger::{FragReuseLedger, corrupt, is_interpretable_transition, next_field};
+use super::legacy::{self, LegacyHistory};
+use super::tagged::TaggedHistory;
+use crate::format::pb::fragment_reuse_index_details as pb;
 
 /// `InlineContent.legacy_versions`.
-const LEGACY_VERSION_FIELD: u32 = 1;
+pub(super) const LEGACY_VERSION_FIELD: u32 = 1;
 /// `InlineContent.transitions`.
-const TRANSITION_FIELD: u32 = 2;
-/// `StablePartition.base_id`.
-const STABLE_PARTITION_BASE_ID_FIELD: u32 = 3;
+pub(super) const TRANSITION_FIELD: u32 = 2;
 
 /// How an FRI entry's records are interpreted, as its `index_version` says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,13 +89,6 @@ pub enum Record {
     Uninterpretable { field: u32 },
 }
 
-#[derive(Debug, Clone)]
-struct StoredRecord {
-    /// The complete field: key, length and payload.
-    raw: Bytes,
-    record: Record,
-}
-
 /// The serialized records of an FRI entry, not yet checked against the
 /// history's rules. Whether a history that breaks them is refused or repaired
 /// depends on who wrote it, so the caller decides by how it consumes this:
@@ -129,52 +120,33 @@ impl RawHistory {
     /// repaired, since every writer of that format validates it: one that
     /// breaks the rules is refused as by [`Self::validate`].
     pub fn repair(self) -> Result<(FragReuseHistory, Vec<u64>)> {
-        match FragReuseHistory::from_content(self.format, self.content.clone()) {
-            Ok(history) => Ok((history, Vec::new())),
-            Err(Error::CorruptFile { .. }) if self.format == HistoryFormat::Legacy => {
-                let versions = split_records(self.content)?
-                    .into_iter()
-                    .filter_map(|stored| match stored.record {
-                        Record::LegacyVersion(version) => Some(version),
-                        _ => None,
-                    })
-                    .collect();
-                FragReuseHistory::repair_legacy_versions(versions)
-            }
-            Err(error) => Err(error),
+        match self.format {
+            HistoryFormat::Legacy => LegacyHistory::decode_repairing(self.content),
+            HistoryFormat::Tagged => Ok((self.validate()?, Vec::new())),
         }
     }
 }
 
-/// A validated fragment reuse history and its lineage view.
+/// A validated fragment reuse history and its lineage view. Cheap to clone.
 #[derive(Debug, Clone)]
-pub struct FragReuseHistory {
-    format: HistoryFormat,
-    records: Vec<StoredRecord>,
-    ledger: Arc<FragReuseLedger>,
-}
+pub struct FragReuseHistory(Arc<dyn FriImpl>);
 
 impl FragReuseHistory {
+    pub(super) fn from_impl(imp: Arc<dyn FriImpl>) -> Self {
+        Self(imp)
+    }
+
     /// A history with no records, in `format`.
     pub fn empty(format: HistoryFormat) -> Self {
-        Self {
-            format,
-            records: Vec::new(),
-            ledger: Arc::new(FragReuseLedger::default()),
+        match format {
+            HistoryFormat::Legacy => Self(Arc::new(LegacyHistory::default())),
+            HistoryFormat::Tagged => Self(Arc::new(TaggedHistory::default())),
         }
     }
 
     /// A version 0 history holding `versions`, ordered by dataset version.
-    pub fn from_legacy_versions(mut versions: Vec<pb::Version>) -> Result<Self> {
-        versions.sort_by_key(|version| version.dataset_version);
-        let mut content = BytesMut::new();
-        for version in &versions {
-            content.extend_from_slice(&length_delimited(
-                LEGACY_VERSION_FIELD,
-                &version.encode_to_vec(),
-            ));
-        }
-        Self::from_content(HistoryFormat::Legacy, content.freeze())
+    pub fn from_legacy_versions(versions: Vec<pb::Version>) -> Result<Self> {
+        legacy::from_versions(versions)
     }
 
     /// A version 0 history of the `versions` that can be kept, and the dataset
@@ -186,86 +158,47 @@ impl FragReuseHistory {
     /// producing a fragment that is already consumed). Dropping a version only
     /// loses the translation it records: rows an index reaches only through it
     /// are scanned instead.
-    pub fn repair_legacy_versions(mut versions: Vec<pb::Version>) -> Result<(Self, Vec<u64>)> {
-        versions.sort_by_key(|version| version.dataset_version);
-        let mut kept = Vec::with_capacity(versions.len());
-        let mut dropped = Vec::new();
-        let mut produced: HashMap<u64, u64> = HashMap::new();
-        let mut consumed: HashSet<u64> = HashSet::new();
-        for version in versions {
-            let fits_lineage = version.groups.iter().all(|group| {
-                group.old_fragments.iter().all(|source| {
-                    !consumed.contains(&source.id)
-                        && produced
-                            .get(&source.id)
-                            .is_none_or(|&rows| rows == source.physical_rows)
-                }) && group.new_fragments.iter().all(|destination| {
-                    !produced.contains_key(&destination.id) && !consumed.contains(&destination.id)
-                })
-            });
-            if !fits_lineage || Self::from_legacy_versions(vec![version.clone()]).is_err() {
-                dropped.push(version.dataset_version);
-                continue;
-            }
-            for group in &version.groups {
-                consumed.extend(group.old_fragments.iter().map(|source| source.id));
-                produced.extend(
-                    group
-                        .new_fragments
-                        .iter()
-                        .map(|destination| (destination.id, destination.physical_rows)),
-                );
-            }
-            kept.push(version);
-        }
-        Ok((Self::from_legacy_versions(kept)?, dropped))
+    pub fn repair_legacy_versions(versions: Vec<pb::Version>) -> Result<(Self, Vec<u64>)> {
+        legacy::repair_versions(versions)
     }
 
     fn from_content(format: HistoryFormat, content: Bytes) -> Result<Self> {
-        let ledger = FragReuseLedger::decode_content(format, content.clone())?;
-        let records = split_records(content)?;
-        validate_records(format, &records)?;
-        Ok(Self {
-            format,
-            records,
-            ledger: Arc::new(ledger),
-        })
+        Ok(Self(match format {
+            HistoryFormat::Legacy => Arc::new(LegacyHistory::decode(content)?),
+            HistoryFormat::Tagged => Arc::new(TaggedHistory::decode(content)?),
+        }))
     }
 
     /// The FRI format these records are interpreted under.
     pub fn format(&self) -> HistoryFormat {
-        self.format
+        self.0.format()
     }
 
     /// Whether the history uses the tagged format.
     pub fn is_tagged(&self) -> bool {
-        self.format == HistoryFormat::Tagged
+        self.format() == HistoryFormat::Tagged
     }
 
     /// The lineage view used for translation.
     pub fn ledger(&self) -> &Arc<FragReuseLedger> {
-        &self.ledger
+        &self.0.records().ledger
     }
 
     /// Records in serialized order.
     pub fn records(&self) -> impl Iterator<Item = &Record> {
-        self.records.iter().map(|stored| &stored.record)
+        self.0.records().stored.iter().map(|stored| &stored.record)
     }
 
     /// Whether every record is one this implementation interprets. Edits
     /// that reason about the whole history require it.
     pub fn is_fully_interpretable(&self) -> bool {
-        !self.ledger.has_unsupported_transitions()
+        self.0.records().is_fully_interpretable()
     }
 
     /// The serialized `InlineContent`: every record's bytes, unchanged and in
     /// order.
     pub fn content(&self) -> Bytes {
-        let mut content = BytesMut::with_capacity(self.records.iter().map(|r| r.raw.len()).sum());
-        for stored in &self.records {
-            content.extend_from_slice(&stored.raw);
-        }
-        content.freeze()
+        concat(&self.0.records().stored)
     }
 
     /// The `fragment_bitmap` for this history's FRI entry.
@@ -276,96 +209,38 @@ impl FragReuseHistory {
     /// retained lineage, sources included, so a rewrite of a fragment the
     /// history still translates from is seen as covered.
     pub fn fragment_bitmap(&self) -> RoaringBitmap {
-        let mut bitmap = RoaringBitmap::new();
-        let mut insert = |digests: &[pb::FragmentDigest]| {
-            bitmap.extend(digests.iter().map(|digest| digest.id as u32));
-        };
-        for record in self.records() {
-            match record {
-                Record::LegacyVersion(version) => {
-                    for group in &version.groups {
-                        if self.is_tagged() {
-                            insert(&group.old_fragments);
-                        }
-                        insert(&group.new_fragments);
-                    }
-                }
-                Record::Transition(transition) => {
-                    insert(&transition.sources);
-                    insert(&transition.destinations);
-                }
-                Record::Uninterpretable { .. } => {}
-            }
-        }
-        bitmap
+        self.0.fragment_bitmap()
     }
 
     /// The same records interpreted under the tagged format. Version 0
     /// records are valid tagged records, so the bytes are unchanged.
     pub fn into_tagged(self) -> Result<Self> {
-        if self.is_tagged() {
-            return Ok(self);
-        }
-        Self::from_content(HistoryFormat::Tagged, self.content())
+        self.0.into_tagged().map(Self)
     }
 
     /// Append `transitions` after every existing record.
     pub fn append_transitions(&self, transitions: &[pb::Transition]) -> Result<Self> {
-        if !self.is_tagged() {
-            return Err(Error::invalid_input(
-                "transitions require the tagged fragment reuse format; convert the history with \
-                 `into_tagged` first",
-            ));
-        }
-        self.require_fully_interpretable("append transitions to")?;
-        let mut content = BytesMut::from(self.content());
-        for transition in transitions {
-            content.extend_from_slice(&length_delimited(
-                TRANSITION_FIELD,
-                &transition.encode_to_vec(),
-            ));
-        }
-        Self::from_content(self.format, content.freeze()).map_err(invalid_edit)
+        self.0.append_transitions(transitions).map(Self)
     }
 
     /// Insert a compaction version into a version 0 history, keeping
     /// versions ordered by `dataset_version` as version 0 readers expect.
     pub fn insert_legacy_version(&self, version: pb::Version) -> Result<Self> {
-        if self.is_tagged() {
-            return Err(Error::invalid_input(
-                "a compaction version cannot be added to a tagged fragment reuse history; append \
-                 transitions instead",
-            ));
-        }
-        let position = self
-            .records
-            .iter()
-            .position(|stored| {
-                matches!(&stored.record, Record::LegacyVersion(existing)
-                    if existing.dataset_version > version.dataset_version)
-            })
-            .unwrap_or(self.records.len());
-        let mut records = self.records.clone();
-        records.insert(
-            position,
-            StoredRecord {
-                raw: length_delimited(LEGACY_VERSION_FIELD, &version.encode_to_vec()).into(),
-                record: Record::LegacyVersion(version),
-            },
-        );
-        self.rebuilt(&records).map_err(invalid_edit)
+        self.0.insert_legacy_version(version).map(Self)
     }
 
     /// Keep only the records `keep` accepts.
     pub fn retain(&self, keep: &mut dyn FnMut(&Record) -> bool) -> Result<Self> {
-        self.require_fully_interpretable("trim")?;
+        self.0.records().require_fully_interpretable("trim")?;
         let records: Vec<StoredRecord> = self
-            .records
+            .0
+            .records()
+            .stored
             .iter()
             .filter(|stored| keep(&stored.record))
             .cloned()
             .collect();
-        self.rebuilt(&records)
+        self.0.rebuilt(concat(&records)).map(Self)
     }
 
     /// Restamp every stable-partition `base_id` through `remap`, leaving
@@ -375,28 +250,7 @@ impl FragReuseHistory {
         &self,
         remap: &dyn Fn(Option<u32>) -> Result<Option<u32>>,
     ) -> Result<Self> {
-        self.require_fully_interpretable("relocate")?;
-        let mut records = Vec::with_capacity(self.records.len());
-        for stored in &self.records {
-            let raw = match &stored.record {
-                Record::Transition(pb::Transition {
-                    mapping: Some(transition::Mapping::StablePartition(_)),
-                    ..
-                }) => {
-                    let mut field = stored.raw.clone();
-                    let (tag, payload) = next_field(&mut field)?;
-                    let patched =
-                        patch_transition_stable_partition(&require_message(tag, payload)?, remap)?;
-                    length_delimited(TRANSITION_FIELD, &patched).into()
-                }
-                _ => stored.raw.clone(),
-            };
-            records.push(StoredRecord {
-                raw,
-                record: stored.record.clone(),
-            });
-        }
-        self.rebuilt(&records)
+        self.0.clone().remap_stable_partition_bases(remap).map(Self)
     }
 
     /// The records `self` adds to `base`, refusing anything else: a rewrite
@@ -444,29 +298,11 @@ impl FragReuseHistory {
             .cloned()
             .collect())
     }
-
-    fn require_fully_interpretable(&self, operation: &str) -> Result<()> {
-        if self.is_fully_interpretable() {
-            return Ok(());
-        }
-        Err(Error::not_supported(format!(
-            "the fragment reuse history contains records this writer cannot maintain, so it \
-             cannot {operation} it; upgrade to a newer version of Lance"
-        )))
-    }
-
-    fn rebuilt(&self, records: &[StoredRecord]) -> Result<Self> {
-        let mut content = BytesMut::with_capacity(records.iter().map(|r| r.raw.len()).sum());
-        for stored in records {
-            content.extend_from_slice(&stored.raw);
-        }
-        Self::from_content(self.format, content.freeze())
-    }
 }
 
 impl PartialEq for FragReuseHistory {
     fn eq(&self, other: &Self) -> bool {
-        self.format == other.format && self.content() == other.content()
+        self.format() == other.format() && self.content() == other.content()
     }
 }
 
@@ -506,7 +342,7 @@ impl std::fmt::Display for RecordIdentity {
     }
 }
 
-fn split_records(content: Bytes) -> Result<Vec<StoredRecord>> {
+pub(super) fn split_records(content: Bytes) -> Result<Vec<StoredRecord>> {
     let mut remaining = content.clone();
     let mut records = Vec::new();
     while remaining.has_remaining() {
@@ -531,41 +367,6 @@ fn split_records(content: Bytes) -> Result<Vec<StoredRecord>> {
     Ok(records)
 }
 
-/// Rules the lineage decode does not see. Each stable-partition transition
-/// owns its row map: cleanup deletes a map once no retained transition
-/// references it, so a shared map would be deleted while still in use.
-fn validate_records(format: HistoryFormat, records: &[StoredRecord]) -> Result<()> {
-    if format == HistoryFormat::Legacy {
-        return Ok(());
-    }
-    let mut map_ids = HashSet::new();
-    for stored in records {
-        if let Record::Transition(pb::Transition {
-            mapping: Some(transition::Mapping::StablePartition(partition)),
-            ..
-        }) = &stored.record
-            && !map_ids.insert(partition.map_id.as_str())
-        {
-            return Err(corrupt(format!(
-                "stable-partition row map {} is referenced by more than one transition",
-                partition.map_id
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// A validated history became invalid by an edit: the records the caller
-/// added are what is wrong, not the stored history.
-fn invalid_edit(error: Error) -> Error {
-    match error {
-        Error::CorruptFile { source, .. } => Error::invalid_input(format!(
-            "the records added to the fragment reuse history are invalid: {source}"
-        )),
-        other => other,
-    }
-}
-
 /// One length-delimited protobuf field.
 pub fn length_delimited(tag: u32, payload: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(payload.len() + 8);
@@ -575,65 +376,5 @@ pub fn length_delimited(tag: u32, payload: &[u8]) -> Vec<u8> {
     output
 }
 
-/// Patch a transition's stable-partition mapping, copying every other
-/// field's bytes as written.
-fn patch_transition_stable_partition(
-    raw: &Bytes,
-    remap: &dyn Fn(Option<u32>) -> Result<Option<u32>>,
-) -> Result<Vec<u8>> {
-    let mut remaining = raw.clone();
-    let mut output = Vec::with_capacity(raw.len() + 8);
-    while remaining.has_remaining() {
-        let start = raw.len() - remaining.len();
-        let (tag, payload) = next_field(&mut remaining)?;
-        if tag == STABLE_PARTITION_FIELD {
-            let patched = patch_stable_partition_base(&require_message(tag, payload)?, remap)?;
-            output.extend_from_slice(&length_delimited(STABLE_PARTITION_FIELD, &patched));
-        } else {
-            output.extend_from_slice(&raw[start..raw.len() - remaining.len()]);
-        }
-    }
-    Ok(output)
-}
-
-/// Drop `base_id` wherever it occurs (the last occurrence is the effective
-/// value) and append the remapped value; every other byte is kept.
-fn patch_stable_partition_base(
-    raw: &Bytes,
-    remap: &dyn Fn(Option<u32>) -> Result<Option<u32>>,
-) -> Result<Vec<u8>> {
-    let mut remaining = raw.clone();
-    let mut output = Vec::with_capacity(raw.len() + 8);
-    let mut existing = None;
-    while remaining.has_remaining() {
-        let start = raw.len() - remaining.len();
-        let mut peek = remaining.clone();
-        let (tag, wire_type) = decode_key(&mut peek).map_err(|e| corrupt(e.to_string()))?;
-        if tag == STABLE_PARTITION_BASE_ID_FIELD {
-            if wire_type != WireType::Varint {
-                return Err(corrupt("stable partition base_id must be a varint"));
-            }
-            let value = decode_varint(&mut peek).map_err(|e| corrupt(e.to_string()))?;
-            existing =
-                Some(u32::try_from(value).map_err(|_| {
-                    corrupt(format!("stable partition base_id {value} overflows u32"))
-                })?);
-            remaining = peek;
-        } else {
-            next_field(&mut remaining)?;
-            output.extend_from_slice(&raw[start..raw.len() - remaining.len()]);
-        }
-    }
-    if let Some(base_id) = remap(existing)? {
-        prost::encoding::encode_key(
-            STABLE_PARTITION_BASE_ID_FIELD,
-            WireType::Varint,
-            &mut output,
-        );
-        prost::encoding::encode_varint(u64::from(base_id), &mut output);
-    }
-    Ok(output)
-}
-
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
