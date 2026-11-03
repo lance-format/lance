@@ -109,7 +109,8 @@ pub(super) enum IndexKind {
 
 impl IndexKind {
     /// Whether the kind has a batch row-id remapper, without which the tagged
-    /// reader leaves out every segment naming a fragment the history names.
+    /// reader leaves out every segment that has not caught up with the
+    /// history.
     pub(super) fn translates_tagged_history(self) -> bool {
         !matches!(self, Self::Fm)
     }
