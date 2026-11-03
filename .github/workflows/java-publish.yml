@@ -124,22 +124,44 @@ jobs:
     name: Build on MacOS Arm64
     runs-on: warp-macos-14-arm64-6x
     timeout-minutes: 90
+    env:
+      JNI_BUILD_PROFILE: ${{ (github.event_name == 'pull_request' || contains(inputs.ref || github.ref_name, '-beta.')) && 'release-with-debug' || 'release' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ inputs.ref || github.ref }}
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
-      - uses: Homebrew/actions/setup-homebrew@50b8c2ab4a835c38897ed2c56c293b07167c0b59 # master 2026-03-07
-      - name: Install dependencies
-        run: brew install protobuf
+        with:
+          workspaces: java/lance-jni -> target
+      - name: Install protoc
+        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
+        with:
+          tool: protoc
       - name: Build native lib
         working-directory: java/lance-jni
-        run: cargo build --release --locked
+        # Use the existing optimized ThinLTO profile for beta and PR builds.
+        # lance-jni inherits strip=true, so the published library stays stripped.
+        run: cargo build --profile "$JNI_BUILD_PROFILE" --locked --timings
+      - name: Set up Java 11 for native smoke tests
+        if: env.JNI_BUILD_PROFILE == 'release-with-debug'
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: 11
+          cache: maven
+      - name: Test the built native library
+        if: env.JNI_BUILD_PROFILE == 'release-with-debug'
+        working-directory: java
+        run: |
+          mkdir -p target/classes/nativelib/darwin-aarch64
+          cp "lance-jni/target/${JNI_BUILD_PROFILE}/liblance_jni.dylib" target/classes/nativelib/darwin-aarch64/
+          ./mvnw --batch-mode -Dskip.build.jni=true \
+            '-Dtest=DatasetTest#testWriteStreamAndOpenPath+testCountRows+testDeleteRows' test
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: liblance_jni_darwin_aarch64.zip
-          path: java/lance-jni/target/release/liblance_jni.dylib
+          path: java/lance-jni/target/${{ env.JNI_BUILD_PROFILE }}/liblance_jni.dylib
           retention-days: 1
           if-no-files-found: error
   publish:
