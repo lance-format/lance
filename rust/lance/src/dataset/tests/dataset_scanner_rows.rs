@@ -16,6 +16,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 use arrow_select::take;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::col;
 use futures::TryStreamExt;
 use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
@@ -25,6 +26,7 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{
     ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION, ROW_OFFSET,
 };
+use lance_datafusion::exec::RecordBatchExec;
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
@@ -1520,22 +1522,19 @@ async fn test_filter_to_take() {
         let mut scanner = ds_copy.scan();
         scanner.filter(filt).unwrap();
         // Verify the optimization is applied
-        let plan = scanner.explain_plan(true).await.unwrap();
-        if applies_optimization {
-            assert!(
-                plan.contains("OneShotStream"),
-                "expected take optimization to be applied. Filter: '{}'.  Plan:\n{}",
-                filt,
-                plan
-            );
-        } else {
-            assert!(
-                !plan.contains("OneShotStream"),
-                "expected take optimization to not be applied. Filter: '{}'.  Plan:\n{}",
-                filt,
-                plan
-            );
-        }
+        let plan = scanner.create_plan().await.unwrap();
+        let mut has_literal = false;
+        plan.apply(|node| {
+            has_literal |= node.is::<RecordBatchExec>();
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        assert_eq!(
+            has_literal,
+            applies_optimization,
+            "unexpected take optimization for {filt}: {}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
 
         // Verify the results
         let stream = scanner.try_into_stream().await.unwrap();
