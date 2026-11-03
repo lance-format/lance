@@ -35,7 +35,7 @@ macro_rules! skip_if_no_thread_local_uring {
         let ring: std::io::Result<IoUring> = IoUring::builder()
             .setup_defer_taskrun()
             .setup_single_issuer()
-            .build(2);
+            .build(super::current_thread::DEFAULT_THREAD_LOCAL_QUEUE_DEPTH as u32);
         if ring.is_err() {
             return Ok(());
         }

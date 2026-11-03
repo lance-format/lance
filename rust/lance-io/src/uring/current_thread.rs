@@ -38,6 +38,14 @@ use super::reader::{CacheKey, CachedReaderData, HANDLE_CACHE, UringFileHandle};
 /// Global counter for generating unique user_data values
 static USER_DATA_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Keep unit-test rings small enough for low-memlock CI hosts. Queue capacity does not participate
+/// in the request-lifetime behavior these tests exercise.
+#[cfg(test)]
+pub(super) const DEFAULT_THREAD_LOCAL_QUEUE_DEPTH: usize = 2;
+
+#[cfg(not(test))]
+const DEFAULT_THREAD_LOCAL_QUEUE_DEPTH: usize = DEFAULT_URING_QUEUE_DEPTH;
+
 /// Thread-local io_uring instance with pending requests
 struct ThreadLocalUring {
     ring: IoUring,
@@ -66,7 +74,7 @@ thread_local! {
         let queue_depth = std::env::var("LANCE_URING_QUEUE_DEPTH")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_URING_QUEUE_DEPTH);
+            .unwrap_or(DEFAULT_THREAD_LOCAL_QUEUE_DEPTH);
 
         let ring = IoUring::builder()
             // Ensures work is only done in submit_and_wait
