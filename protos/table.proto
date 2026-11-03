@@ -37,16 +37,17 @@ message UUID {
 /* An active resource pin owned by the branch whose current manifest contains it.
  * Historical copies do not impose retention requirements. All fields except
  * job_label are required by the pin contract; protobuf presence permits
- * detecting an invalid partial record. IDs are compared as exact UTF-8 bytes,
- * without normalization.
+ * detecting an invalid partial record. IDs contain exactly 16 UUID bytes and
+ * are compared by those bytes.
  */
 message OngoingWorkPin {
-  /* The registering Transaction.uuid. Absent or empty is invalid.
+  /* The registering Transaction.uuid parsed into its 16-byte UUID value.
+   * Absent or any length other than 16 bytes is invalid.
    * Distinct logical registrations must use distinct IDs, including after reuse
    * of a branch name or table path. Retries preserve the original ID.
    */
-  optional string id = 1;
-  /* The fixed attached source manifest version. Absent or zero is invalid.
+  UUID id = 1;
+  /* The version created by the successful registration commit. Absent or zero is invalid.
    * Renewal never changes this version. Active pins retain complete attached
    * versions from their oldest source version through the current branch head,
    * including committed transaction history, as specified in Ongoing Work Pins.
@@ -57,8 +58,8 @@ message OngoingWorkPin {
    */
   google.protobuf.Timestamp created_at = 4;
   /* Absolute UTC expiry time. Absent or not later than created_at is invalid.
-   * Passing it makes the pin eligible for committed expiration; it does not
-   * remove the active record. Renewals may only increase it.
+   * Passing it makes the pin eligible for removal by the next attached commit;
+   * it does not remove the stored record. Renewals may only increase it.
    */
   google.protobuf.Timestamp expires_at = 5;
   /* Optional human-readable context. Absent or empty means no label.
@@ -215,7 +216,7 @@ message Manifest {
    * * 1 << 16: paired with the reader bit for version 1 zone-level statistics
    *   seeds. Writers must preserve the seed contract and the required bits
    *   during data writes, index maintenance, cleanup, clone, and restore.
-   * * 1 << 19: ongoing-work pins. Writer-only and sticky; maintenance must honor
+   * * 1 << 20: ongoing-work pins. Writer-only and sticky; maintenance must honor
    *   the current active-pin list. Reserved until the pin contract is implemented.
    */
   uint64 writer_feature_flags = 10;
@@ -354,7 +355,8 @@ message Manifest {
   /* The authoritative active pins when this is the current attached manifest.
    * Absent/empty means no active pins. Order is insignificant; IDs must be
    * unique. A nonempty list requires writer bit 20. Once set, that bit remains
-   * set even when this list becomes empty. Restore/overwrite carry current pins;
+   * set even when this list becomes empty. Attached commits remove expired pins.
+   * Restore/overwrite start from current pins, never a historical list;
    * new clones/branches start with an empty list. Detached manifests cannot own
    * or mutate active pins. No reader capability is required solely for pins.
    */

@@ -53,23 +53,27 @@ Committing schema metadata `lance.blob.managed = "true"` activates the Managed B
 
 ## Current state for pin decisions
 
-Pin acquisition, recovery, renewal, release, expiration, restore, overwrite,
+Pin acquisition, recovery, renewal, explicit release, restore, overwrite,
 compaction, retention planning, and branch-deletion checks
 must resolve the authoritative current attached manifest. A previously opened
 Dataset, historical transaction read-back, or hint that stops probing at a gap
 is insufficient.
 
-Ordinary attached commits that only carry pin state forward may use the existing
+Ordinary attached commits that carry pins and prune expired records may use the existing
 commit and retry protocol without an additional complete-history listing solely
-for pins. Copy the pin list, all record fields, and the sticky capability from
-the predecessor manifest used for each attempt, including after rebasing, and
+for pins. Derive the pin list and sticky capability from the predecessor
+manifest used for each attempt, including after rebasing. Recheck expiration
+on that list and preserve every field of remaining records. Then
 atomically publish at that predecessor's version plus one without replacing an
 occupied version. Do not copy membership from the transaction's original read
-version after rebasing. Required transaction persistence still applies.
+version after rebasing. Only an authoritative committed removal ends retention;
+a successful write into an old reclaimed slot is insufficient. Required
+transaction persistence still applies.
 
 A write that advances the head must carry that head's pin state. A successful
 write to a reclaimed older slot does not make it the authoritative head or
-revive its historical pins. This exemption does not apply to pin mutations,
+revive its historical pins. This exemption does not apply to explicit pin mutations
+or a transaction carrying `release_pin_id`,
 Restore or Overwrite, rewrite/trim validation, retention planning, or branch
 deletion. Cleanup triggered by an ordinary write must resolve current membership
 even when invoked through an older or unflagged Dataset. Supported external

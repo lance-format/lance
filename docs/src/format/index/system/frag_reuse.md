@@ -210,9 +210,11 @@ rows during the build, the job still needs the movements to C when it publishes
 the index. Checking only published indices would miss that requirement.
 
 [Ongoing-work pins](../../table/ongoing_work_pins.md) record these dependencies.
-For each pin, load its source-version manifest and use all fragment IDs listed
-there. This reads manifest metadata, not the rows. Cleanup must consider both
-active pins and existing consumers before removing history.
+For each pin, resolve its source version's complete fragment metadata using
+the declared layout, then use all fragment IDs. This reads metadata, not the
+rows; an empty inline list on a fragment-tree table is not an empty source.
+Unresolvable metadata must not become empty coverage. Cleanup must consider
+both active pins and existing consumers before removing history.
 
 FRI version 0 uses an inclusive source-version boundary. FRI version 1 follows
 movements from the pinned source fragments and retains the downstream records
@@ -224,12 +226,15 @@ version stamp. The exact rules are defined in
 
 Every operation that trims or replaces history must recheck all consumers'
 requirements against the current table version before committing, even if it
-was planned before a pin registered. Restore and Overwrite apply this check to
+was planned before a pin registered. A pin may be excluded only if its release
+or expiration is published in that same commit; passing its deadline alone is
+insufficient. Recheck removals after conflicts so a renewal is not lost.
+Restore and Overwrite apply this check to
 the resulting current history; they may discard translation paths while
-preserving current pins and their retained versions.
+preserving the remaining pins and their retained versions.
 
-Compaction must record the movements active pins need and recheck those pins
-before committing. Reject a result lacking required mappings so the caller can
+Compaction must record the movements the remaining pins need and recheck those
+pins before committing. Reject a result lacking required mappings so the caller can
 replan. A pin does not require mappings solely into a discarded intermediate
 layout, establish index freshness, or authorize publication of an old result.
 

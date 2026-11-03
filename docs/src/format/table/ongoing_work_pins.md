@@ -22,24 +22,28 @@ mutation and maintenance.
 Each record contains `id`, `source_version`, `created_at`, `expires_at`, and
 optional `job_label`. Presence and absence semantics are defined in
 `protos/table.proto`. The pin ID is the registering
-transaction's `uuid`; the source version is that transaction's `read_version`.
+transaction's `uuid` parsed as a UUID. The source version is the version that
+the successful registration commit creates, not its initial `read_version`.
 
-`expires_at` is the UTC time after which cleanup may expire the pin. Passing
-that time does not automatically remove it. Renewal changes only `expires_at`;
+`expires_at` is the UTC time when the pin becomes eligible for removal by the
+next attached commit. Passing that time does not edit a manifest or authorize
+physical deletion. Renewal changes only `expires_at`;
 the source version, creation time, and label stay fixed. No generation counter
 is needed because every extension strictly increases `expires_at`.
 
-The first registration sets writer feature bit 20, `FLAG_ONGOING_WORK_PINS`,
-in the same commit as the pin. A nonempty list without the bit is invalid.
+Registration sets writer feature bit 20, `FLAG_ONGOING_WORK_PINS`,
+in the same commit as the pin. A transaction using `release_pin_id` also sets
+the bit. A nonempty list without the bit is invalid.
 The bit is sticky on subsequent versions, including when the list becomes
 empty, and introduces no reader requirement solely for pins. Ordinary reads
 may ignore the pin list. Pin-aware maintenance must validate it.
 
 ## Identity
 
-Pin IDs are nonempty UTF-8 strings compared byte-for-byte. Do not case-fold,
-normalize, or replace a stored ID with a different textual representation.
-This feature imposes no new canonical UUID spelling. Distinct logical
+Pin IDs and references use the existing `UUID` message with exactly 16 bytes.
+Missing values or any other byte length are invalid. Compare the UUID bytes.
+A registration's textual `Transaction.uuid` must parse as that UUID; ordinary
+transactions keep their existing UUID representation. Distinct logical
 registrations must use fresh transaction IDs, including after branch-name or
 table-path reuse. A retry preserves its original ID. A pin ID must not be reused
 for another registration, even after the original pin ends. No persistent
@@ -47,7 +51,9 @@ registry of ended pins is required.
 
 The source is the attached `source_version` in the pin's table and branch.
 Requests and handles must remain bound to that table location and, for named
-branches, the acquired branch identifier. Within that table and branch, the
+branches, the acquired [branch identifier](branch_tag.md#branch-identity).
+Use the existing identifier and legacy fallback defined there; their recreation
+limits also apply to pins. Within that table and branch, the
 version number identifies the source. Registration does not require the source
 transaction's UUID or contents.
 
@@ -81,8 +87,9 @@ Each renewal likewise fixes one requested `expires_at` before its first attempt.
 
 Participating clients use reasonably synchronized clocks. Consumers choose a
 renewal margin; no table setting or absolute lifetime cap is required. A pin
-remains active after `expires_at` until a committed ReleasePin or ExpirePins
-removes it from the authoritative list.
+continues to retain resources while its record remains in the authoritative
+list, including after `expires_at`. Consumers must renew before the deadline;
+physical cleanup waits for committed removal.
 
 ## Current state and acquisition
 
@@ -91,24 +98,22 @@ Resolve the authoritative current attached head as specified in
 Dataset or a successful write to a previously reclaimed slot is insufficient.
 
 Validate the request's table location and named-branch identity before
-submitting or recovering a registration. For an attempt with pin ID P and
-source version V:
+submitting or recovering a registration with pin ID P:
 
-1. If current membership already contains P with source version V, recover
-   that pin's current `expires_at` and label without committing or resetting them.
-   A different source under P is an error.
-2. Otherwise the authoritative current version must equal V. If the branch
-   has moved on, registration fails. Compare the version numbers directly;
-   intervening transaction files are not needed for this check.
-3. Construct the next manifest from that current source, add the pin, and set
-   the sticky capability. Publish only at V+1 through the existing atomic
-   version-slot protocol. A conflict cannot rebase this acquisition onto another
-   source. After a definite conflict, a caller that has not started work may
-   explicitly acquire the new head with a new ID.
+1. If current membership already contains P, recover its stored source version,
+   current `expires_at`, and label without committing or resetting them.
+2. Otherwise resolve the current attached version H. Reject a fresh request
+   whose fixed `expires_at` has already passed. The request does not choose a
+   source version; the job has not started planning or reading yet.
+3. Construct the next manifest from H, add P with `source_version = H+1`, and
+   set the sticky capability. Publish at H+1 through the existing atomic
+   version-slot protocol. On conflict, repeat against the newer head with the
+   same ID and request times. Recompute the source for each uncommitted attempt;
+   once registration succeeds, its stored source never moves.
 4. Before acknowledging either a fresh acquisition or recovery, confirm the
    current named-branch reference still has the acquired branch ID, the
-   authoritative head contains P with source version V, and that source
-   manifest can still be read and validated as version V.
+   authoritative head contains P with its stored source version V, and that
+   source manifest can still be read and validated as version V. Return V.
    The pin may have been carried into a newer head. A historical transaction
    matching P alone is insufficient. If these facts cannot be established,
    return an indeterminate outcome or failure, never acknowledge registration.
@@ -124,9 +129,11 @@ No permanent table identity is introduced here.
 Jobs begin work only after confirmation. Jobs that need recovery after a restart
 must save their pin ID and, until registration is confirmed, the original
 request needed to retry it. Recovery returns the current pin, whose `expires_at`
-may already have passed; the consumer chooses whether to renew before continuing.
-The pin remains active until its removal commits. Ended registration outcomes
-are not retained indefinitely.
+may already have passed. Recovering a record does not extend its deadline.
+A consumer that missed renewal must acquire a new pin before starting new work.
+The old record still retains resources until its removal commits. Do not retry
+registration after a known release or expiration; ended outcomes are not
+retained indefinitely.
 
 Concurrent commits, including other pin operations, can repeatedly move the
 head before registration commits. Callers should bound their registration
@@ -135,32 +142,69 @@ unknown. A definitively rejected attempt does not require recovery state.
 
 ## Renewal, release, and expiration
 
-`RenewPin` requires the target ID to exist. If the current `expires_at` already
-equals or exceeds the fixed request, return the current pin without a commit.
+`RenewPin` requires the target ID to exist and its current deadline to be in
+the future when the attempt is validated. Check this again after conflicts.
+If the current `expires_at` already equals or exceeds the fixed request,
+return the current pin without a commit.
 Otherwise commit the requested later `expires_at` while preserving every other
-field. Re-evaluate after conflicts. A concurrent Release or ExpirePins that
-wins first makes renewal fail; renewal never creates a missing pin.
+field. A concurrent release or committed expiration that wins first makes
+renewal fail; renewal never creates a missing pin.
 
-`ReleasePin` removes only its target ID. Absence is a successful no-op. It does
+`ReleasePin` explicitly removes its target ID. Absence is a successful no-op. It does
 not stop the worker or cancel an unconfirmed registration still in flight.
 Different jobs have independent IDs even when their source files are identical.
+A release that commits also applies the ordinary expiration rule to other pins.
 
-`ExpirePins` contains the inspection time `observed_at` and candidates
-`(pin_id, expected_expires_at)`. All timestamps must be valid, candidate IDs
-unique, and each `expected_expires_at` at or before `observed_at`.
+Expiration happens during ordinary attached commits; there is no separate
+expiration operation. For each commit attempt, sample the current UTC time and
+derive pin state from that attempt's predecessor manifest. Omit records whose
+`expires_at` is at or before that time. Preserve every field of the remaining
+records except for explicit pin changes requested by the transaction. A fresh
+registration must have a future deadline; renewal must pass the check above.
+After a conflict, rebuild from the new predecessor and recheck expiration.
+Never reuse an old removal list without checking renewed records.
 
-Before committing expiration, remove a candidate only if its ID is still active
-and its current `expires_at` exactly equals `expected_expires_at`. If renewal
-changed that value, skip the candidate. Also skip absent IDs and preserve all
-other pins. Retries use the same `observed_at` and candidates; cleanup may make
-a new inspection later. If no candidate qualifies, make no commit.
+The removal becomes effective only when that manifest becomes an authoritative
+attached version. A renewed deadline that is still in the future survives a
+retry; removal that commits first prevents renewal from recreating the pin.
+A local time check is not an atomic storage deadline: a validated write can
+finish later. The committed ordering, not response timing, protects against
+delayed writes and lost responses.
 
-This orders renewal against expiration: a prior extension invalidates the old
-expiration decision; prior expiration prevents renewal. Renewal and other pin
-commits count as ordinary versions and cleanup intervals. No-op operations do
-not create versions. Expiration commits precede planning physical reclamation
-of the resources they release. Cleanup's maintenance commits must not recursively
-trigger the same cleanup.
+No-op pin requests create no version solely to remove other expired pins.
+Real commits use ordinary version counting and cleanup intervals. Cleanup does
+not create an expiration commit: on a quiet table, expired records and their
+retention requirements remain until another attached commit or explicit
+release. Physical deletion must wait until removal is committed and current
+retention has been resolved again.
+
+## Publication and release
+
+An ordinary attached transaction may set `Transaction.release_pin_id` (field 5)
+to release one pin in the same commit as its operation. The field uses the
+16-byte `UUID` type. It names the existing pin; the publication transaction has
+its own UUID. Absence requests no explicit release. A missing target is a no-op
+for the release, not for the accompanying operation. The field is invalid on
+RegisterPin, RenewPin, ReleasePin, Clone, and detached commits.
+
+Validate the operation and its publication evidence before releasing the pin.
+Then publish the operation's result and the pin's removal in the same manifest.
+Failure without publication leaves both unapplied. A conflict re-evaluates both
+against the new predecessor. Pin release never bypasses data conflicts,
+publication validation, or the retention requirements of other pins and consumers.
+
+Persist this transaction inline or in its referenced sidecar before publishing
+the manifest, even when it releases the last pin or the target is already absent.
+If neither representation can be stored, reject before publication. This
+preserves evidence for commit recovery; it does not extend retention after the
+pin ends. If later cleanup removes the evidence, recovery may be indeterminate.
+
+After a lost response, resolve the publication transaction's outcome using its
+UUID and normal commit recovery. An absent pin alone does not prove that the
+results were published: another commit may have expired or released it. Keep
+standalone ReleasePin for cancellation, abandonment, and callers that release
+after separately confirming publication. This uses the current transaction
+format and does not depend on Transaction V2.
 
 ## Retention and data operations
 
@@ -177,11 +221,12 @@ transaction sidecars, and external mapping files. Retain shared physical files
 once. These remain ordinary readable versions; retaining their manifests
 while deleting their referenced data does not satisfy this contract.
 
-Each attached commit whose result contains active pins must persist its own
-transaction, either inline in its manifest or in the referenced transaction
-sidecar, before publishing the manifest. This includes registration and commits
-carrying pins through Restore or Overwrite. Keep the transaction for every
-version after F through H so publication can inspect the committed changes in
+Each attached commit whose result contains active pins, or which sets
+`release_pin_id`, must persist its own transaction, either inline in its
+manifest or in the referenced transaction sidecar, before publishing the
+manifest. This includes registration, commits carrying pins through Restore or
+Overwrite, and publication that releases the last pin. Keep the transaction
+for every version after F through H so publication can inspect the committed changes in
 order. A transaction filename alone is not this evidence. The transaction that
 created F is not required solely for pin registration or this retention rule.
 
@@ -204,9 +249,10 @@ representation is introduced. Replacing complete version retention with a
 smaller evidence representation requires a separately specified compatible
 discovery and retention protocol.
 
-Compaction must record the FRI row movements active pins need. Before committing
-its result, compaction must recheck the active pins, including pins registered
-after planning began. If its result lacks required movement records, it must
+Compaction must record the FRI row movements retained pins need. Before committing
+its result, compaction must recheck the current pins, including pins registered
+after planning began, and apply only the removals published in that same commit.
+If its result lacks required movement records for the remaining pins, it must
 not commit; the caller can replan.
 
 History removal must retain the union of requirements from current pins and
@@ -225,8 +271,13 @@ boundary inclusive of V; it does not change stamps on existing records.
 For FRI version 1 (`index_version = 1`), including histories that also contain
 legacy records, determine pin requirements from fragment references rather
 than version stamps. For each active pin, load and validate the manifest at
-its `source_version` in the same table and branch. Take all fragment IDs listed
-in that manifest; no row-data scan is needed to obtain this set. Initialize a
+its `source_version` in the same table and branch. Resolve the source version's
+complete fragment metadata using its declared layout and take all fragment IDs.
+A flat layout uses `Manifest.fragments`; a [fragment-tree layout](fragment_metadata.md)
+requires reading its referenced metadata. Its empty inline fragment list does
+not mean an empty source. Reject acquisition for an unsupported layout; if
+required metadata cannot be resolved later, refuse the affected cleanup,
+rewrite, or trim. No row-data scan is needed to obtain this set. Initialize a
 set with these IDs from all active pins. Retain each current-history record
 with a source fragment in that set, and add its destination fragment IDs to
 the set. Repeat until no additional records are selected. If a selected record
@@ -245,10 +296,10 @@ metadata does not by itself make its mapping files eligible for deletion.
 Pin retention does not change overlay/index correctness requirements or make
 an unsupported overlay or rewrite operation valid.
 
-Attached Restore and Overwrite carry the current active list, fixed sources,
+Attached Restore and Overwrite start from the current pin list, apply the same
+expiration and explicit-release rules, and preserve the remaining fixed sources,
 timestamps, and sticky bit. They never import the target version's historical
-pin list.
-Neither operation shortens the retained version window.
+pin list. Restoring data does not itself end a pin or shorten its retention window.
 Apply FRI retention to the resulting current history. Neither operation is
 required to reconstruct discarded translation paths. Within that history,
 retain movement records needed to connect a pinned version to the current
@@ -263,18 +314,19 @@ New branches and clones have empty pin lists and preserve the sticky bit when
 inherited. Detached versions must serialize an empty pin list and preserve the
 sticky bit when inherited. Creating a detached version does not change the
 branch's current pin list. Detached versions cannot own active pins, and none
-of the four pin operations may be used in a detached commit.
+of the three pin operations or `release_pin_id` may be used in a detached commit.
 
-Other attached commits preserve the current list. All operations that rewrite
+Other attached commits preserve the current list except for the expiration and
+explicit-release rules above. All operations that rewrite
 or trim FRI revalidate the applicable retention requirements at commit, subject
 to the Restore and Overwrite rules above. Detailed directional rules are in
 [Transactions](transaction.md#ongoing-work-pin-transactions).
 
 Pins do not protect newly written, uncommitted output. Jobs need a separate
-staging and publication strategy for those files. Before releasing a pin, a job
-must publish its output and confirm that the result retains the files and FRI
-history it needs. Publication and release are separate transactions; the four
-pin operations do not add a combined publication-and-release transaction.
+staging and publication strategy for those files. A job may release its pin in
+the transaction that publishes its output, provided the resulting version
+retains the files and FRI history it needs. If using a separate release, confirm
+publication first.
 
 ## Compatibility and implementation boundary
 
@@ -301,7 +353,7 @@ Cleanup checks which versions and files are still needed, then deletes the
 eligible files. Registering a pin changes what later checks must retain. It
 does not cancel a deletion decision already made by an earlier operation.
 
-Pins only register against the current version. A cleanup run retains the
+Pins register the new version their registration commit creates. A cleanup run retains the
 current version it inspected. Cleanup also leaves recent files alone when it
 cannot verify that they belong to an old version being removed. This grace
 period gives writers time to commit their files. It ends as files age, and
@@ -312,8 +364,8 @@ deletion. For example:
 
 1. Cleanup decides that an old version's file A can be deleted.
 2. A user restores that version. The new current version references file A.
-3. A job registers a pin on the restored version. Registration succeeds while
-   file A still exists.
+3. A job registers a pin. Its registration version still references file A,
+   and registration succeeds while file A exists.
 4. Cleanup deletes file A using its earlier decision. The job now needs a
    missing file, even though its pin is active.
 
