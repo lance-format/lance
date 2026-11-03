@@ -548,10 +548,31 @@ impl<'a> CreateIndexBuilder<'a> {
                     .ok_or_else(|| {
                         Error::index("Vector index type must take a VectorIndexParams".to_string())
                     })?;
-                let index_version = vec_params.index_type().version() as u32;
-
                 let effective_fragments =
                     effective_vector_fragments(self.dataset, self.fragments.as_deref());
+                if vec_params.pca_params().is_some() {
+                    if vec_params.index_type() != IndexType::IvfRq {
+                        return Err(Error::invalid_input(
+                            "PCA pre-transform is only supported for IVF_RQ".to_string(),
+                        ));
+                    }
+                    if vec_params.metric_type != lance_linalg::distance::DistanceType::L2 {
+                        return Err(Error::invalid_input(
+                            "PCA pre-transform only supports L2 distance".to_string(),
+                        ));
+                    }
+                    if !train {
+                        return Err(Error::invalid_input(
+                            "PCA vector indexes require training data".to_string(),
+                        ));
+                    }
+                    if effective_fragments.is_some() {
+                        return Err(Error::not_supported(
+                            "PCA vector indexes must be trained on the whole dataset".to_string(),
+                        ));
+                    }
+                }
+                let index_version = vec_params.compatibility_version();
                 let (files, built_target) = if train {
                     // Check if this is distributed indexing (fragment-level)
                     if let Some(fragments) = effective_fragments.as_deref() {
@@ -5040,6 +5061,57 @@ mod tests {
         let loaded = dataset.load_indices_by_name(&committed.name).await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].index_version, IndexType::IvfRq.version());
+    }
+
+    #[tokio::test]
+    async fn test_create_index_ivf_rq_pca_round_trip() {
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let reader = gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(16)),
+            )
+            .into_reader_rows(
+                lance_datagen::RowCount::from(128),
+                lance_datagen::BatchCount::from(2),
+            );
+        let mut dataset = Dataset::write(reader, &dataset_uri, None).await.unwrap();
+
+        let cosine = VectorIndexParams::ivf_rq(4, 1, DistanceType::Cosine)
+            .with_pca(lance_index::vector::pca::PcaParams::new(8).with_sample_size(64));
+        let err = dataset
+            .create_index(&["vector"], IndexType::IvfRq, None, &cosine, false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("L2"),
+            "cosine PCA should be rejected, got {err}"
+        );
+
+        let params = VectorIndexParams::ivf_rq(4, 1, DistanceType::L2)
+            .with_pca(lance_index::vector::pca::PcaParams::new(8).with_sample_size(64));
+        let committed = dataset
+            .create_index(&["vector"], IndexType::IvfRq, None, &params, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            committed.index_version,
+            lance_index::VECTOR_PCA_INDEX_VERSION as i32
+        );
+
+        let dataset = Dataset::open(&dataset_uri).await.unwrap();
+        let query = arrow_array::Float32Array::from(vec![0.0_f32; 16]);
+        let batch = dataset
+            .scan()
+            .nearest("vector", &query, 5)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert!(batch.num_rows() > 0);
     }
 
     #[tokio::test]

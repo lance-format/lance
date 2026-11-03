@@ -349,6 +349,7 @@ async fn test_read_ivf_pq_index_v3_with_defer_index_remap() {
                 version: crate::index::vector::IndexFileVersion::V3,
                 skip_transpose: false,
                 runtime_hints: Default::default(),
+                pre_transform: None,
             },
             false,
         )
@@ -1425,6 +1426,7 @@ async fn test_read_ivf_rq_index_v3_with_defer_index_remap() {
                 version: crate::index::vector::IndexFileVersion::V3,
                 skip_transpose: false,
                 runtime_hints: Default::default(),
+                pre_transform: None,
             },
             false,
         )

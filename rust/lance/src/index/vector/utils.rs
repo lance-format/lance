@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -446,6 +447,106 @@ pub fn filter_finite_training_data(
         let filtered = arrow::compute::filter(&training_data, &finite_mask)?;
         Ok(filtered.as_fixed_size_list().clone())
     }
+}
+
+/// Sample up to `sample_size` finite vectors, replenishing invalid candidates.
+///
+/// Offsets are drawn with `seed` and returned in sorted read order. Rows that
+/// are null or non-finite are skipped and not drawn again. Sampling stops when
+/// `sample_size` valid rows are collected or every row has been considered.
+pub(crate) async fn sample_finite_vectors_seeded(
+    dataset: &Dataset,
+    column: &str,
+    sample_size: usize,
+    seed: u64,
+) -> Result<FixedSizeListArray> {
+    if sample_size == 0 {
+        return Err(Error::invalid_input(
+            "pca.sample_size must be greater than 0".to_string(),
+        ));
+    }
+    let num_rows = dataset.count_rows(None).await?;
+    if num_rows == 0 {
+        return Err(Error::invalid_input(
+            "PCA training requires a dataset with at least one row".to_string(),
+        ));
+    }
+    let num_rows = num_rows as u64;
+    let projection = Arc::new(dataset.schema().project(&[column])?);
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let mut seen = HashSet::new();
+    let mut parts = Vec::new();
+    let mut got = 0usize;
+
+    while got < sample_size && (seen.len() as u64) < num_rows {
+        let need = sample_size - got;
+        let available = (num_rows as usize).saturating_sub(seen.len());
+        let draw_count = need.saturating_mul(2).max(need).min(8192).min(available);
+        if draw_count == 0 {
+            break;
+        }
+        let mut offsets = draw_unseen_offsets(&mut rng, num_rows, &mut seen, draw_count);
+        offsets.sort_unstable();
+        let batch = dataset.take(&offsets, projection.clone()).await?;
+        let vectors = vector_column_to_fsl(&batch, column)?;
+        let finite = filter_finite_training_data(vectors)?;
+        let take_n = finite.len().min(need);
+        if take_n == 0 {
+            continue;
+        }
+        let piece = if take_n == finite.len() {
+            finite
+        } else {
+            finite.slice(0, take_n).as_fixed_size_list().clone()
+        };
+        got += piece.len();
+        parts.push(piece);
+    }
+
+    if parts.is_empty() {
+        return Err(Error::invalid_input(
+            "PCA training found no finite vectors".to_string(),
+        ));
+    }
+    let refs: Vec<&dyn Array> = parts.iter().map(|part| part as &dyn Array).collect();
+    let concatenated = arrow::compute::concat(&refs)?;
+    Ok(concatenated.as_fixed_size_list().clone())
+}
+
+fn draw_unseen_offsets(
+    rng: &mut SmallRng,
+    num_rows: u64,
+    seen: &mut HashSet<u64>,
+    count: usize,
+) -> Vec<u64> {
+    let available = (num_rows as usize).saturating_sub(seen.len());
+    let count = count.min(available);
+    let mut offsets = Vec::with_capacity(count);
+    if count == 0 {
+        return offsets;
+    }
+    if (seen.len() as u64).saturating_mul(2) < num_rows && num_rows > 1024 {
+        while offsets.len() < count {
+            let offset = rng.random_range(0..num_rows);
+            if seen.insert(offset) {
+                offsets.push(offset);
+            }
+        }
+        return offsets;
+    }
+    let mut rest = Vec::with_capacity(available);
+    for offset in 0..num_rows {
+        if !seen.contains(&offset) {
+            rest.push(offset);
+        }
+    }
+    for index in 0..count {
+        let swap = rng.random_range(index..rest.len());
+        rest.swap(index, swap);
+        seen.insert(rest[index]);
+        offsets.push(rest[index]);
+    }
+    offsets
 }
 
 #[derive(Debug)]

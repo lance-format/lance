@@ -640,6 +640,15 @@ impl DatasetIndexExt for Dataset {
             }
         }
         let all_vector = source_segments.iter().all(segment_has_vector_details);
+        if all_vector
+            && source_segments.iter().any(|segment| {
+                segment.index_version == lance_index::VECTOR_PCA_INDEX_VERSION as i32
+            })
+        {
+            return Err(Error::not_supported(
+                "Merging vector index segments with a pre-transform is not supported",
+            ));
+        }
         let all_inverted = source_segments.iter().all(segment_has_inverted_details);
         let all_bitmap = source_segments.iter().all(segment_has_bitmap_details);
         let all_bloomfilter = source_segments.iter().all(segment_has_bloomfilter_details);
