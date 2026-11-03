@@ -1,1 +1,1 @@
-pip install pylance pandas pyarrow numpy
+pip install pylance pandas pyarrow numpy tqdm

@@ -57,6 +57,7 @@ dependencies = [
     { name = "pyarrow" },
     { name = "pylance" },
     { name = "pyspark" },
+    { name = "tqdm" },
 ]
 
 [package.dev-dependencies]
@@ -73,6 +74,7 @@ requires-dist = [
     { name = "pyarrow", specifier = "==26.0.0" },
     { name = "pylance", specifier = "==14.0.2" },
     { name = "pyspark", specifier = "==4.2.1" },
+    { name = "tqdm", specifier = "==4.70.1" },
 ]
 
 [package.metadata.requires-dev]

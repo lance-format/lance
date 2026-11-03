@@ -13,6 +13,7 @@ dependencies = [
     "pyarrow==26.0.0",
     "pylance==14.0.2",
     "pyspark==4.2.1",
+    "tqdm==4.70.1",
 ]
 
 [dependency-groups]
