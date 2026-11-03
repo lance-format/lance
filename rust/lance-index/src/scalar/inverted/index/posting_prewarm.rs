@@ -23,6 +23,23 @@ impl PostingListReader {
         (postings_resident, positions_resident)
     }
 
+    /// Verify query readiness after prewarm without treating an unsupported
+    /// non-counting probe as proof that an entry is absent. The fallback reads
+    /// through a temporary warm handle because this is still prewarm work.
+    pub(super) async fn prewarm_readiness_status(
+        &self,
+        with_position: bool,
+    ) -> (bool, Option<bool>) {
+        let (postings_resident, positions_resident) =
+            self.prewarm_residency_status(with_position).await;
+        let postings_ready = postings_resident || self.postings_present_after_prewarm().await;
+        let positions_ready = match positions_resident {
+            Some(false) => Some(self.positions_present_after_prewarm().await),
+            ready => ready,
+        };
+        (postings_ready, positions_ready)
+    }
+
     async fn postings_resident_now(&self) -> bool {
         if self.is_empty() {
             return true;
@@ -54,12 +71,54 @@ impl PostingListReader {
         true
     }
 
+    async fn postings_present_after_prewarm(&self) -> bool {
+        if self.is_empty() {
+            return true;
+        }
+
+        let warm_cache = self.index_cache.with_load_origin(CacheLoadOrigin::Warm);
+        let mut seen_groups = BTreeSet::new();
+        for token_id in 0..self.len() as u32 {
+            if let Some((start, end)) = self.group_range_for_token(token_id) {
+                if seen_groups.insert((start, end))
+                    && warm_cache
+                        .get_with_key(&posting_list_group_cache_key(start, end, self.has_impacts))
+                        .await
+                        .is_none()
+                {
+                    return false;
+                }
+            } else if warm_cache
+                .get_with_key(&posting_list_cache_key(token_id, self.has_impacts))
+                .await
+                .is_none()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     async fn positions_resident_now(&self) -> bool {
         for token_id in 0..self.len() as u32 {
             if !self
                 .index_cache
                 .peek_resident_with_key(&PositionKey { token_id })
                 .await
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn positions_present_after_prewarm(&self) -> bool {
+        let warm_cache = self.index_cache.with_load_origin(CacheLoadOrigin::Warm);
+        for token_id in 0..self.len() as u32 {
+            if warm_cache
+                .get_with_key(&PositionKey { token_id })
+                .await
+                .is_none()
             {
                 return false;
             }

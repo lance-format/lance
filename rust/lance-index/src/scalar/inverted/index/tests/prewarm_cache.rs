@@ -1102,6 +1102,31 @@ async fn test_prewarm_streams_in_chunks_with_positions(
             "token {token_id} posting list / positions mismatch after chunked prewarm"
         );
     }
+    let before_readiness = cache.diagnostics().activity;
+    assert_eq!(
+        inverted_list.prewarm_readiness_status(true).await,
+        (true, Some(true)),
+        "active post-prewarm verification must not treat an unavailable probe as absence"
+    );
+    let after_readiness = cache.diagnostics().activity;
+    assert_eq!(
+        (
+            after_readiness.hits - after_readiness.warm.hits,
+            after_readiness.misses,
+            after_readiness.loads_started
+        ),
+        (
+            before_readiness.hits - before_readiness.warm.hits,
+            before_readiness.misses,
+            before_readiness.loads_started
+        ),
+        "active verification is prewarm work and must not count demand activity"
+    );
+    assert!(
+        after_readiness.warm.attempts > before_readiness.warm.attempts
+            && after_readiness.warm.hits > before_readiness.warm.hits,
+        "active verification must read through a temporary warm handle"
+    );
     assert_eq!(
         inverted_list.prewarm_residency_status(true).await,
         (false, Some(false)),
