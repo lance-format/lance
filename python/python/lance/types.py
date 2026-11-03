@@ -8,6 +8,7 @@ from functools import singledispatch
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal, Optional, Union
 
 import pyarrow as pa
+import pyarrow.dataset
 from pyarrow import RecordBatch
 
 from .dependencies import (
