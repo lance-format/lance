@@ -261,8 +261,8 @@ result = dataset.to_table(
 ```
 
 The calibrated profiles apply to L2, cosine and dot with `k <= 100000`.
-Targets describe average coverage of the true neighbors' partitions on calibration
-data. They are not guarantees for each query, dataset, or final Recall@k.
+Targets describe average coverage of the true neighbors' partitions on unfiltered
+calibration data. They are not guarantees for each query, dataset, or final Recall@k.
 Quantization, refinement, filtering and HNSW search can change final recall.
 Measure these settings on representative queries before choosing one.
 

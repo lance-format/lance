@@ -6,6 +6,10 @@ target. Zero and one retain their minimum/all-partitions meanings. Public
 parameter types and precedence are unchanged; non-default efforts below 0.5
 now use the calibrated anchors instead of the old single geometric segment.
 
+[Native S3 measurements and interpretation](RESULTS.md) cover FLAT/RQ5,
+refinement, filtering and cold index caches. The `iops` / `Mean IOPS` fields
+in the audit output count read operations per query, not operations per second.
+
 The implementation scales the existing metric/k-dependent Auto budget and
 rounds up to whole partitions. Each metric has two calibrated fractions:
 
