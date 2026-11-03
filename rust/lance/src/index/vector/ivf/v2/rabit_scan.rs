@@ -21,20 +21,20 @@ use futures::{StreamExt, stream};
 use lance_core::cache::WeakLanceCache;
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
-use lance_index::metrics::MetricsCollector;
+use lance_index::metrics::{IndexTimer, IndexTiming, MetricsCollector};
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::scan_stats;
 use lance_index::vector::bq::storage::{
-    ExRows, RabitPruneCounters, SignStage, StagePruneCounts, SurvivorRow,
+    ExRows, RabitPruneCounters, SignStage, StagePruneCounts, SurvivorRow, select_full_survivors,
 };
 use lance_index::vector::flat::index::FlatIndex;
 use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::storage::{
     DistanceCalculatorOptions, ExIndex, GatheredRabitEx, IndexFileKey, IvfQuantizationStorage,
-    OriginLatencyClass, RabitExLayout, RabitRawQueryContext, VectorStore,
+    OriginLatencyClass, RabitExLayout, RabitRawQueryContext, VectorStore, sequential_plane_loads,
 };
-use lance_index::vector::{PartitionSearchControl, Query, VECTOR_RESULT_SCHEMA};
+use lance_index::vector::{ApproxMode, PartitionSearchControl, Query, VECTOR_RESULT_SCHEMA};
 
 use super::{
     IVFIndex, PartitionEntry, PreparedPartitionGuard, PreparedPartitionSearch,
@@ -210,6 +210,7 @@ pub(super) fn controlled_partition_stream(
 /// The index and its Arrow buffers are shared; constructing this context does
 /// not copy partitions. Strategy calls operate on partitions or row batches,
 /// keeping the inner scoring loop concrete and free of virtual calls.
+#[derive(Clone)]
 pub struct RabitScanContext {
     index: Arc<RabitIndex>,
     raw_query: Option<Arc<RabitRawQueryContext>>,
@@ -228,7 +229,15 @@ pub struct RabitScanContext {
 }
 
 /// A prepared full partition whose ownership bounds its buffer lifetime.
-pub struct RabitPreparedPartition(PreparedPartitionSearch<FlatIndex, RabitQuantizer>);
+pub struct RabitPreparedPartition(PreparedRabitPartition);
+
+enum PreparedRabitPartition {
+    Ordinary(PreparedPartitionSearch<FlatIndex, RabitQuantizer>),
+    Planes {
+        sign: Box<RabitSignPartition>,
+        ex: RecordBatch,
+    },
+}
 
 /// A sign-only partition with native lower bounds and filter acceptance.
 pub struct RabitSignPartition {
@@ -290,12 +299,58 @@ impl RabitScanContext {
         !self.index.use_query_residual && self.raw_query.is_some()
     }
 
-    /// Prepare a whole partition with the ordinary full-scan implementation.
+    /// Prepare whole ex codes with the same address view as candidate gathers.
+    ///
+    /// With the plane cache layout, current native Full/Accurate storage keeps
+    /// encoded rows in file order; FRI only translates the sign view's addresses.
+    /// Partition cache layouts, other encodings and Fast mode retain their
+    /// ordinary partition reader so preparation uses the same entries as prewarm.
+    /// Wait for the query filter before preparing either representation.
+    ///
+    /// ```
+    /// # use std::collections::BinaryHeap;
+    /// # use lance::index::vector::ivf::v2::rabit_scan::RabitScanContext;
+    /// # async fn score(context: &RabitScanContext, partition: usize, distance: f32) -> lance::Result<()> {
+    /// context.pre_filter.wait_for_ready().await?;
+    /// let prepared = context.prepare_partition(partition, distance).await?;
+    /// let mut heap = BinaryHeap::new();
+    /// context.score_partition(prepared, &mut heap)?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn prepare_partition(
         &self,
         partition_id: usize,
         dist_q_c: f32,
     ) -> Result<RabitPreparedPartition> {
+        if self.index.uses_rabit_plane_cache()
+            && self.storage().supports_candidate_reads()
+            && self.has_raw_query_bounds()
+            && self.query.approx_mode != ApproxMode::Fast
+        {
+            let _prepare_timer =
+                IndexTimer::new(self.metrics.as_ref(), IndexTiming::PartitionPrepare);
+            let context = Arc::new(self.clone());
+            scan_stats::counters().stage1_dispatches.incr();
+            let sign = context.prepare_sign_partition(partition_id, dist_q_c);
+            let ex =
+                self.storage()
+                    .load_plane(partition_id, 1, self.cache(), self.metrics.io_stats());
+            let (sign, ex) = if sequential_plane_loads()? || self.cache().plane_admission_gated() {
+                (sign.await?, ex.await?)
+            } else {
+                tokio::try_join!(sign, ex)?
+            };
+            let sign = sign.ok_or_else(|| {
+                Error::internal(format!(
+                    "current native RaBitQ partition {partition_id} has no full-scoring sign bounds"
+                ))
+            })?;
+            return Ok(RabitPreparedPartition(PreparedRabitPartition::Planes {
+                sign: Box::new(sign),
+                ex,
+            }));
+        }
         let mut query = self.query.clone();
         query.dist_q_c = dist_q_c;
         self.index
@@ -308,7 +363,7 @@ impl RabitScanContext {
                 self.raw_query.clone(),
             )
             .await
-            .map(RabitPreparedPartition)
+            .map(|prepared| RabitPreparedPartition(PreparedRabitPartition::Ordinary(prepared)))
     }
 
     /// Read a sign plane and calculate its native bounds on the CPU pool.
@@ -409,16 +464,61 @@ impl RabitScanContext {
         prepared: RabitPreparedPartition,
         heap: &mut BinaryHeap<OrderedNode<u64>>,
     ) -> Result<()> {
-        self.index.scratch_pool.with_scratch(|scratch| {
-            RabitIndex::accumulate_prepared_partition_search(
-                self.index.use_query_residual,
-                self.index.use_residual_scratch,
-                prepared.0,
-                heap,
-                scratch,
-                self.metrics.as_ref(),
-            )
-        })
+        match prepared.0 {
+            PreparedRabitPartition::Ordinary(prepared) => {
+                self.index.scratch_pool.with_scratch(|scratch| {
+                    RabitIndex::accumulate_prepared_partition_search(
+                        self.index.use_query_residual,
+                        self.index.use_residual_scratch,
+                        prepared,
+                        heap,
+                        scratch,
+                        self.metrics.as_ref(),
+                    )
+                })
+            }
+            PreparedRabitPartition::Planes { sign, ex } => {
+                let _search_timer = IndexTimer::new(self.metrics.as_ref(), IndexTiming::Search);
+                let refine_factor = self.query.refine_factor.unwrap_or(1) as usize;
+                let candidate_count = self.query.k.checked_mul(refine_factor).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "RaBitQ candidate count overflow: k={}, refine_factor={refine_factor}",
+                        self.query.k
+                    ))
+                })?;
+                if candidate_count == 0 {
+                    return Ok(());
+                }
+                let mut survivors = Vec::with_capacity(candidate_count.min(sign.num_rows()));
+                let mut stage1 = StagePruneCounts::default();
+                select_full_survivors(
+                    &sign.stage.lower_bounds,
+                    sign.accept.as_deref(),
+                    self.query.upper_bound,
+                    heap.peek()
+                        .filter(|_| heap.len() >= candidate_count)
+                        .map(|node| node.dist.0),
+                    &mut survivors,
+                    &mut stage1,
+                );
+                let RabitExLayout::Native {
+                    rotated_dim,
+                    num_bits,
+                    ..
+                } = self.storage().rabit_ex_layout()?;
+                let ex_rows = ExRows::from_native_batch(&ex, rotated_dim, num_bits)?;
+                self.score_ex_survivors(
+                    &sign,
+                    &survivors,
+                    stage1,
+                    ExIndex::Identity,
+                    ex_rows,
+                    heap,
+                    |_| {},
+                )?;
+                Ok(())
+            }
+        }
     }
 
     /// Score native gathered rows with the same full-precision
