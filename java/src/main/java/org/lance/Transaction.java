@@ -57,8 +57,11 @@ public class Transaction implements AutoCloseable {
     this.readVersion = readVersion;
     this.uuid = uuid;
     this.operation = operation;
-    this.tag = Optional.ofNullable(tag);
-    this.transactionProperties = Optional.ofNullable(transactionProperties);
+    this.tag = tag == null || tag.isEmpty() ? Optional.empty() : Optional.of(tag);
+    this.transactionProperties =
+        transactionProperties == null || transactionProperties.isEmpty()
+            ? Optional.empty()
+            : Optional.of(transactionProperties);
   }
 
   /**
@@ -84,11 +87,12 @@ public class Transaction implements AutoCloseable {
     return operation;
   }
 
-  /** Returns the optional tag for this transaction. */
+  /** Returns the optional tag for this transaction; null and empty tags are both absent. */
   public Optional<String> tag() {
     return tag;
   }
 
+  /** Returns transaction properties; null and empty maps are both absent. */
   public Optional<Map<String, String>> transactionProperties() {
     return transactionProperties;
   }
@@ -165,7 +169,7 @@ public class Transaction implements AutoCloseable {
     /**
      * Set an optional tag for the transaction.
      *
-     * @param tag the tag string
+     * @param tag the tag string; null or empty means absent
      * @return this builder instance
      */
     public Builder tag(String tag) {
@@ -173,6 +177,7 @@ public class Transaction implements AutoCloseable {
       return this;
     }
 
+    /** Set transaction properties; null or an empty map means absent. */
     public Builder transactionProperties(Map<String, String> properties) {
       this.transactionProperties = properties;
       return this;

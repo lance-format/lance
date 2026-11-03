@@ -535,23 +535,36 @@ fn is_escape_code(pos: u16) -> bool {
     pos < FSST_CODE_BASE
 }
 
-// make_sample selects strings randoms from the input, and returns a set of strings of size around FSST_SAMPLETARGET
-fn make_sample<T: OffsetSizeTrait>(in_buf: &[u8], offsets: &[T]) -> (Vec<u8>, Vec<T>) {
+// Select roughly FSST_SAMPLETARGET bytes, preserving complete strings.
+fn make_sample<T: OffsetSizeTrait>(
+    in_buf: &[u8],
+    offsets: &[T],
+    rng: &mut impl Rng,
+) -> (Vec<u8>, Vec<T>) {
     let total_size = in_buf.len();
     if total_size <= FSST_SAMPLETARGET {
         return (in_buf.to_vec(), offsets.to_vec());
     }
     let mut sample_buf = Vec::with_capacity(FSST_SAMPLEMAXSZ);
-    let mut sample_offsets: Vec<T> = Vec::new();
+    let mut sample_offsets = Vec::with_capacity(FSST_SAMPLETARGET + 2);
 
-    sample_offsets.push(T::from_usize(0).unwrap());
-    let mut rng = StdRng::from_os_rng();
-    while sample_buf.len() < FSST_SAMPLETARGET {
-        let rand_num = rng.random_range(0..offsets.len()) % (offsets.len() - 1);
-        sample_buf.extend_from_slice(
-            &in_buf[offsets[rand_num].as_usize()..offsets[rand_num + 1].as_usize()],
-        );
+    sample_offsets.push(T::zero());
+    // Each nonempty draw contributes at least one byte. Limit unsuccessful
+    // draws too: sparse inputs must not allocate offsets or retry indefinitely.
+    // A single source sweep completes the sample if random draws miss its data.
+    let random_indices =
+        (0..FSST_SAMPLETARGET).map(|_| rng.random_range(0..offsets.len()) % (offsets.len() - 1));
+    for index in random_indices.chain(0..offsets.len() - 1) {
+        let start = offsets[index].as_usize();
+        let end = offsets[index + 1].as_usize();
+        if start == end {
+            continue;
+        }
+        sample_buf.extend_from_slice(&in_buf[start..end]);
         sample_offsets.push(T::from_usize(sample_buf.len()).unwrap());
+        if sample_buf.len() >= FSST_SAMPLETARGET {
+            break;
+        }
     }
     sample_offsets.push(T::from_usize(sample_buf.len()).unwrap());
     (sample_buf, sample_offsets)
@@ -1159,7 +1172,8 @@ impl<T: OffsetSizeTrait> FsstEncoder<T> {
         }
 
         self.encoder_switch = true;
-        let (sample, sample_offsets) = make_sample(in_buf, in_offsets_buf);
+        let (sample, sample_offsets) =
+            make_sample(in_buf, in_offsets_buf, &mut StdRng::from_os_rng());
         let st = build_symbol_table(sample, sample_offsets)?;
         self.symbol_table = st;
         Ok(())
@@ -1607,6 +1621,87 @@ The individual who corresponds thus with Evgenie Pavlovitch, and who engages so 
 We have never been able to discover clearly how such relations sprang up.
 Of course the root of them was in the events which we have already recorded, and which so filled Vera with grief on the prince’s account that she fell seriously ill.
 But exactly how the acquaintance and friendship came about, we cannot say.";
+
+    /// Always selects the empty first row for the power-of-two offset count
+    /// below, and fails promptly if the sampler exceeds its random-draw bound.
+    struct EmptyDraws {
+        draws: usize,
+    }
+
+    impl rand::RngCore for EmptyDraws {
+        fn next_u32(&mut self) -> u32 {
+            self.next_u64() as u32
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.draws += 1;
+            assert!(self.draws <= FSST_SAMPLETARGET);
+            u64::MAX
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for chunk in dest.chunks_mut(8) {
+                let bytes = self.next_u64().to_le_bytes();
+                chunk.copy_from_slice(&bytes[..chunk.len()]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_sample_preserves_small_and_empty_inputs() {
+        for input in [Vec::new(), vec![b'x'; FSST_SAMPLETARGET]] {
+            let offsets = [0_i32, 0, input.len() as i32, input.len() as i32];
+            let mut rng = EmptyDraws { draws: 0 };
+            let (sample, sample_offsets) = make_sample(&input, &offsets, &mut rng);
+            assert_eq!(sample, input);
+            assert_eq!(sample_offsets, offsets);
+            assert_eq!(rng.draws, 0);
+        }
+    }
+
+    #[test]
+    fn test_sparse_sample_is_bounded_and_roundtrips() {
+        sparse_sample_roundtrip::<i32>();
+        sparse_sample_roundtrip::<i64>();
+    }
+
+    fn sparse_sample_roundtrip<T: OffsetSizeTrait>() {
+        let input = vec![b'x'; FSST_LEAST_INPUT_SIZE];
+        // 62 empty values followed by one nonempty value; 64 offsets make
+        // every degenerate random draw above select the empty first value.
+        let mut offsets = vec![T::zero(); 64];
+        offsets[63] = T::from_usize(input.len()).unwrap();
+        let mut rng = EmptyDraws { draws: 0 };
+        let (sample, sample_offsets) = make_sample(&input, &offsets, &mut rng);
+        assert_eq!(rng.draws, FSST_SAMPLETARGET);
+        assert_eq!(sample, input);
+        assert_eq!(sample_offsets, [T::zero(), offsets[63], offsets[63]]);
+        assert!(sample_offsets.capacity() <= FSST_SAMPLETARGET + 2);
+
+        let mut symbols = [0; FSST_SYMBOL_TABLE_SIZE];
+        let mut compressed = vec![0; input.len()];
+        let mut compressed_offsets = vec![T::zero(); offsets.len()];
+        compress(
+            &mut symbols,
+            &input,
+            &offsets,
+            &mut compressed,
+            &mut compressed_offsets,
+        )
+        .unwrap();
+        let mut decoded = vec![0; compressed.len() * 8];
+        let mut decoded_offsets = vec![T::zero(); offsets.len()];
+        decompress(
+            &symbols,
+            &compressed,
+            &compressed_offsets,
+            &mut decoded,
+            &mut decoded_offsets,
+        )
+        .unwrap();
+        assert_eq!(decoded_offsets, offsets);
+        assert_eq!(&decoded[..input.len()], input);
+    }
 
     #[test_log::test(tokio::test)]
     async fn test_symbol_new() {

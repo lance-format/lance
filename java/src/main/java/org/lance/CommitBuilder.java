@@ -182,8 +182,8 @@ public class CommitBuilder {
   }
 
   /**
-   * Whether to use stable row ids. This makes the {@code _rowid} column stable after compaction,
-   * but not updates.
+   * Whether to use stable row ids. A row then keeps the same {@code _rowid} for its lifetime, even
+   * when compaction, an update or a merge insert rewrites it.
    *
    * <p>This is only used for new datasets. Existing datasets will use their existing setting.
    * Default is false.
@@ -199,11 +199,15 @@ public class CommitBuilder {
   /**
    * Set the storage format to use for the dataset.
    *
-   * <p>This is only needed when creating a new empty table. If any data files are passed, the
-   * storage format will be inferred from the data files. Valid values are the numeric versions
-   * ("0.1", "2.0", "2.1", "2.2", "2.3") and the release selectors ("legacy", "stable", "next"),
-   * matching {@link WriteParams.Builder#withDataStorageVersion(String)}. Parsing is
-   * case-insensitive.
+   * <p>On creation, this sets the default storage version. If omitted, the version is inferred from
+   * homogeneous data files, or uses the stable version for an empty table. Creating from mixed
+   * prewritten files requires an explicit default. For an existing dataset, only overwrite changes
+   * the default; other operations preserve it. Commit finalization validates the referenced file
+   * versions and derives the required mixed-version capability.
+   *
+   * <p>Valid values are the numeric versions ("0.1", "2.0", "2.1", "2.2", "2.3") and the release
+   * selectors ("legacy", "stable", "next"), matching {@link
+   * WriteParams.Builder#withDataStorageVersion(String)}. Parsing is case-insensitive.
    *
    * <p>The {@code v}-prefixed spellings ("v2_0", "v2.0", "v2_1", "v2.1", "v2_2", "v2.2") are
    * deprecated. They were accepted only by this method, never by the rest of Lance, and will be

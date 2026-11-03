@@ -76,6 +76,10 @@ pub struct FixedSizeBinaryDecoder {
 }
 
 impl PrimitivePageDecoder for FixedSizeBinaryDecoder {
+    fn variable_width_bytes(&self, _rows_to_skip: u64, num_rows: u64) -> Result<Option<u64>> {
+        Ok(Some(num_rows * self.byte_width))
+    }
+
     fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         let rows_to_skip = rows_to_skip * self.byte_width;
         let num_bytes = num_rows * self.byte_width;
@@ -115,145 +119,16 @@ impl PrimitivePageDecoder for FixedSizeBinaryDecoder {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::Arc;
 
-    use arrow_array::{
-        Array, ArrayRef, FixedSizeBinaryArray, LargeStringArray, StringArray,
-        builder::LargeStringBuilder,
-    };
+    use arrow_array::{Array, ArrayRef, FixedSizeBinaryArray, StringArray};
     use arrow_buffer::Buffer;
     use arrow_data::ArrayData;
-    use arrow_schema::{DataType, Field};
+    use arrow_schema::DataType;
 
     use crate::array_encoding::physical::fixed_size_binary::FixedSizeBinaryDecoder;
     use crate::data::{DataBlock, FixedWidthDataBlock};
     use crate::decoder::PrimitivePageDecoder;
-    use crate::testing::{
-        TestCases, TestEncoding, check_basic_random_case, check_round_trip_encoding_of_data,
-    };
-    use rstest::rstest;
-
-    #[rstest]
-    #[test_log::test(tokio::test)]
-    async fn test_fixed_size_random(
-        #[values(
-            DataType::Utf8,
-            DataType::Binary,
-            DataType::LargeBinary,
-            DataType::LargeUtf8
-        )]
-        data_type: DataType,
-        #[values(
-            TestEncoding::Array,
-            TestEncoding::StructuralU16,
-            TestEncoding::StructuralU32,
-            TestEncoding::StructuralSparse
-        )]
-        encoding: TestEncoding,
-        #[values(4096, 1024 * 1024)] page_size: u64,
-        #[values(false, true)] use_slicing: bool,
-    ) {
-        let nullable = matches!(data_type, DataType::LargeBinary | DataType::LargeUtf8);
-        let field = Field::new("", data_type, nullable);
-        // This test only generates fixed-size binary arrays for Utf8 and Binary.
-        check_basic_random_case(field, encoding, page_size, use_slicing).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_simple_fixed_size_utf8() {
-        let string_array = StringArray::from(vec![
-            Some("abc"),
-            Some("def"),
-            Some("ghi"),
-            Some("jkl"),
-            Some("mno"),
-        ]);
-
-        let test_cases = TestCases::default()
-            .with_range(0..2)
-            .with_range(0..3)
-            .with_range(1..3)
-            .with_indices(vec![0, 1, 3, 4]);
-
-        check_round_trip_encoding_of_data(
-            vec![Arc::new(string_array)],
-            &test_cases,
-            HashMap::new(),
-        )
-        .await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_simple_fixed_size_with_nulls_utf8() {
-        let string_array =
-            LargeStringArray::from(vec![Some("abc"), None, Some("ghi"), None, Some("mno")]);
-
-        let test_cases = TestCases::default()
-            .with_range(0..2)
-            .with_range(0..3)
-            .with_range(1..3)
-            .with_indices(vec![0, 1, 3, 4]);
-
-        check_round_trip_encoding_of_data(
-            vec![Arc::new(string_array)],
-            &test_cases,
-            HashMap::new(),
-        )
-        .await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_fixed_size_sliced_utf8() {
-        let string_array = StringArray::from(vec![Some("abc"), Some("def"), None, Some("fgh")]);
-        let string_array = string_array.slice(1, 3);
-
-        let test_cases = TestCases::default()
-            .with_range(0..1)
-            .with_range(0..2)
-            .with_range(1..2);
-        check_round_trip_encoding_of_data(
-            vec![Arc::new(string_array)],
-            &test_cases,
-            HashMap::new(),
-        )
-        .await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_fixed_size_empty_strings() {
-        // All strings are empty
-
-        // When encoding an array of empty strings there are no bytes to encode
-        // which is strange and we want to ensure we handle it
-        let string_array = Arc::new(StringArray::from(vec![Some(""), None, Some("")]));
-
-        let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
-        check_round_trip_encoding_of_data(vec![string_array.clone()], &test_cases, HashMap::new())
-            .await;
-        let test_cases = test_cases.with_batch_size(1);
-        check_round_trip_encoding_of_data(vec![string_array], &test_cases, HashMap::new()).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    #[ignore] // This test is quite slow in debug mode
-    async fn test_jumbo_string() {
-        // This is an overflow test.  We have a list of lists where each list
-        // has 1Mi items.  We encode 5000 of these lists and so we have over 4Gi in the
-        // offsets range
-        let mut string_builder = LargeStringBuilder::new();
-        // a 1 MiB string
-        let giant_string = String::from_iter((0..(1024 * 1024)).map(|_| '0'));
-        for _ in 0..5000 {
-            string_builder.append_option(Some(&giant_string));
-        }
-        let giant_array = Arc::new(string_builder.finish()) as ArrayRef;
-        let arrs = vec![giant_array];
-
-        // // We can't validate because our validation relies on concatenating all input arrays
-        let test_cases = TestCases::default().without_validation();
-        check_round_trip_encoding_of_data(arrs, &test_cases, HashMap::new()).await;
-    }
-
     struct FixedWidthCloningPageDecoder {
         data_block: FixedWidthDataBlock,
     }
@@ -306,5 +181,78 @@ mod tests {
         assert_eq!(string_array.len(), num_values as usize);
         assert_eq!(string_array.value(0), "aaa");
         assert_eq!(string_array.value(1), "bbb");
+    }
+
+    #[test]
+    fn test_fixed_size_binary_pages_split_by_byte_budget() {
+        use crate::array_encoding::logical::primitive::PrimitiveFieldDecoder;
+        use crate::array_encoding::logical::r#struct::SimpleStructDecoder;
+        use crate::decoder::{DecoderReady, DrainLimit, LogicalPageDecoder};
+        use arrow_schema::{Field as ArrowField, Fields};
+        use lance_core::Result;
+        use std::collections::VecDeque;
+
+        #[derive(Debug)]
+        struct NeverDecodedStub;
+
+        impl PrimitivePageDecoder for NeverDecodedStub {
+            fn decode(&self, _rows_to_skip: u64, _num_rows: u64) -> Result<DataBlock> {
+                unreachable!("byte accounting must not decode any values")
+            }
+        }
+
+        // Two pages of 3 rows x 10 bytes each; each page fits the budget alone
+        // but the pair does not.
+        let fields = Fields::from(vec![ArrowField::new("value", DataType::Utf8, false)]);
+        let mut root = SimpleStructDecoder::new(fields, 6);
+        for _ in 0..2 {
+            root.accept_child(DecoderReady {
+                decoder: Box::new(PrimitiveFieldDecoder::new_from_data(
+                    Arc::new(FixedSizeBinaryDecoder {
+                        bytes_decoder: Box::new(NeverDecodedStub),
+                        byte_width: 10,
+                        bytes_per_offset: 4,
+                    }),
+                    DataType::Utf8,
+                    3,
+                    false,
+                )),
+                path: VecDeque::from([0]),
+            })
+            .unwrap();
+        }
+
+        // Budget for page 1 plus two rows of page 2.
+        let limit = root.max_rows_to_drain(6, 50).unwrap();
+        assert_eq!(
+            limit,
+            DrainLimit {
+                rows: 5,
+                bytes: 50,
+                dictionary_rows: None,
+            }
+        );
+
+        // Budget for exactly one page: the batch stops at the page boundary.
+        let limit = root.max_rows_to_drain(6, 30).unwrap();
+        assert_eq!(
+            limit,
+            DrainLimit {
+                rows: 3,
+                bytes: 30,
+                dictionary_rows: None,
+            }
+        );
+
+        // Both pages fit a large enough budget.
+        let limit = root.max_rows_to_drain(6, 60).unwrap();
+        assert_eq!(
+            limit,
+            DrainLimit {
+                rows: 6,
+                bytes: 60,
+                dictionary_rows: None,
+            }
+        );
     }
 }

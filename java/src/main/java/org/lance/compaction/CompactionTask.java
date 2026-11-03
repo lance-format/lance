@@ -62,7 +62,8 @@ public class CompactionTask implements Serializable {
           compactionOptions.getMaxSourceFragments(),
           compactionOptions.getMaxSourceRows(),
           compactionOptions.getMaxSourceBytes(),
-          compactionOptions.getExcludedFragmentIds());
+          compactionOptions.getExcludedFragmentIds(),
+          compactionOptions.getDataStorageVersion());
     }
   }
 
@@ -83,7 +84,8 @@ public class CompactionTask implements Serializable {
       Optional<Long> maxSourceFragments,
       Optional<Long> maxSourceRows,
       Optional<Long> maxSourceBytes,
-      List<Long> excludedFragmentIds);
+      List<Long> excludedFragmentIds,
+      Optional<String> dataStorageVersion);
 
   public CompactionOptions getCompactionOptions() {
     return compactionOptions;

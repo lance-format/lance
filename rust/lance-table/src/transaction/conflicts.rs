@@ -138,6 +138,7 @@ impl PartialEq for Operation {
                     new_fragments: a_new,
                     fields_modified: a_fields,
                     compacted_sstables: a_compacted_sstables,
+                    mem_wal_dir_id: a_mem_wal_dir_id,
                     fields_for_preserving_frag_bitmap: a_fields_for_preserving_frag_bitmap,
                     update_mode: a_update_mode,
                     inserted_rows_filter: a_inserted_rows_filter,
@@ -149,6 +150,7 @@ impl PartialEq for Operation {
                     new_fragments: b_new,
                     fields_modified: b_fields,
                     compacted_sstables: b_compacted_sstables,
+                    mem_wal_dir_id: b_mem_wal_dir_id,
                     fields_for_preserving_frag_bitmap: b_fields_for_preserving_frag_bitmap,
                     update_mode: b_update_mode,
                     inserted_rows_filter: b_inserted_rows_filter,
@@ -160,6 +162,7 @@ impl PartialEq for Operation {
                     && compare_vec(a_new, b_new)
                     && compare_vec(a_fields, b_fields)
                     && compare_vec(a_compacted_sstables, b_compacted_sstables)
+                    && a_mem_wal_dir_id == b_mem_wal_dir_id
                     && compare_vec(
                         a_fields_for_preserving_frag_bitmap,
                         b_fields_for_preserving_frag_bitmap,
@@ -726,11 +729,13 @@ impl PartialEq for Operation {
             (
                 Self::UpdateMemWalState {
                     compacted_sstables: a_compacted,
+                    dir_id: a_dir_id,
                 },
                 Self::UpdateMemWalState {
                     compacted_sstables: b_compacted,
+                    dir_id: b_dir_id,
                 },
-            ) => compare_vec(a_compacted, b_compacted),
+            ) => compare_vec(a_compacted, b_compacted) && a_dir_id == b_dir_id,
             (Self::Clone { .. }, Self::Append { .. }) => {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
@@ -862,6 +867,8 @@ impl PartialEq for Operation {
             }
             (Self::DataOverlay { groups: a }, Self::DataOverlay { groups: b }) => compare_vec(a, b),
             (Self::DataOverlay { .. }, _) | (_, Self::DataOverlay { .. }) => false,
+            (Self::Unknown {}, Self::Unknown {}) => true,
+            (Self::Unknown {}, _) | (_, Self::Unknown {}) => false,
         }
     }
 }
@@ -938,7 +945,10 @@ impl Operation {
                 ) {
                     return true;
                 }
-                if schema_metadata_updates.is_some() && other_schema_metadata.is_some() {
+                if Self::update_maps_conflict(
+                    schema_metadata_updates.as_ref(),
+                    other_schema_metadata.as_ref(),
+                ) {
                     return true;
                 }
                 if !field_metadata_updates.is_empty() && !other_field_metadata.is_empty() {
@@ -994,6 +1004,7 @@ mod tests {
     use super::*;
     use crate::transaction::test_support::overlay_with_field;
     use crate::transaction::{DataOverlayGroup, UpdateMapEntry};
+    use rstest::rstest;
     use std::collections::HashMap;
 
     fn table_metadata_update(entries: Vec<(&str, Option<&str>)>, replace: bool) -> Operation {
@@ -1008,6 +1019,34 @@ mod tests {
         }
     }
 
+    fn schema_metadata_update(entries: Vec<(&str, Option<&str>)>, replace: bool) -> Operation {
+        Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: Some(UpdateMap {
+                update_entries: entries.into_iter().map(UpdateMapEntry::from).collect(),
+                replace,
+            }),
+            field_metadata_updates: HashMap::new(),
+        }
+    }
+
+    /// Schema metadata must use the same per-key conflict rules as table
+    /// metadata: disjoint-key merge-mode updates compose safely, while any
+    /// replace or key overlap conflicts. It previously used a blanket
+    /// any-vs-any check that rejected safe disjoint-key merges.
+    #[test]
+    fn test_schema_metadata_conflict_is_per_key() {
+        let left = schema_metadata_update(vec![("key", Some("1"))], false);
+        let same_key = schema_metadata_update(vec![("key", Some("2"))], false);
+        let different_key = schema_metadata_update(vec![("other", Some("2"))], false);
+        let replace = schema_metadata_update(vec![("other", Some("2"))], true);
+
+        assert!(left.modifies_same_metadata(&same_key));
+        assert!(!left.modifies_same_metadata(&different_key));
+        assert!(left.modifies_same_metadata(&replace));
+    }
+
     #[test]
     fn test_table_metadata_conflicts_on_same_key() {
         let left = table_metadata_update(vec![("key", Some("1"))], false);
@@ -1018,6 +1057,45 @@ mod tests {
         assert!(left.modifies_same_metadata(&same_key));
         assert!(!left.modifies_same_metadata(&different_key));
         assert!(left.modifies_same_metadata(&replace));
+    }
+
+    #[rstest]
+    #[case::table_metadata(false)]
+    #[case::schema_metadata(true)]
+    fn test_metadata_conflicts_on_same_key(#[case] is_schema_metadata: bool) {
+        let metadata_update = |entries: Vec<(&str, Option<&str>)>, replace| {
+            let update = UpdateMap {
+                update_entries: entries.into_iter().map(UpdateMapEntry::from).collect(),
+                replace,
+            };
+            Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: (!is_schema_metadata).then_some(update.clone()),
+                schema_metadata_updates: is_schema_metadata.then_some(update),
+                field_metadata_updates: HashMap::new(),
+            }
+        };
+        let left = metadata_update(vec![("key", Some("1"))], false);
+        let no_metadata = Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        };
+
+        for (other, expected_conflict) in [
+            (metadata_update(vec![("key", Some("2"))], false), true),
+            (metadata_update(vec![("key", None)], false), true),
+            (metadata_update(vec![("other", Some("2"))], false), false),
+            (metadata_update(vec![("other", None)], false), false),
+            (metadata_update(vec![("other", Some("2"))], true), true),
+            (metadata_update(vec![], true), true),
+            (metadata_update(vec![], false), false),
+            (no_metadata, false),
+        ] {
+            assert_eq!(left.modifies_same_metadata(&other), expected_conflict);
+            assert_eq!(other.modifies_same_metadata(&left), expected_conflict);
+        }
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 use std::{any::Any, collections::VecDeque, ops::Range, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, new_empty_array};
+use arrow_array::{Array, ArrayRef, new_empty_array, new_null_array};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::DataType;
 use bytes::Bytes;
@@ -20,9 +20,11 @@ use crate::{
     buffer::LanceBuffer,
     decoder::PageEncoding,
     encoder::EncodedPage,
-    encodings::logical::primitive::{CachedPageData, PageLoadTask},
-    format::ProtobufUtils21,
-    repdef::{DefinitionInterpretation, RepDefUnraveler},
+    encodings::logical::primitive::{
+        CachedPageData, PageInitialization, PageInitializationBuffers, PageLoadTask,
+    },
+    format::EncodingUtils,
+    repdef::{DefinitionInterpretation, RepDefUnraveler, max_visible_level},
 };
 
 pub(crate) fn encode_constant_page(
@@ -41,7 +43,7 @@ pub(crate) fn encode_constant_page(
         ))
     };
 
-    let description = ProtobufUtils21::constant_layout(&repdef.def_meaning, inline_value);
+    let description = EncodingUtils::constant_layout(&repdef.def_meaning, inline_value);
 
     let has_repdef = repdef.repetition_levels.is_some() || repdef.definition_levels.is_some();
 
@@ -101,16 +103,25 @@ enum ScalarSource {
     ValueBuffer(usize),
 }
 
+/// The (scalar, rep, def) file ranges a constant page reads, in the order
+/// `init_layout` declares and `init_from_buffers` consumes them.  Any field is
+/// `None` when that buffer is absent. Computed once at construction so the two
+/// halves share one source of truth and their buffer order cannot drift.
+#[derive(Debug)]
+struct ConstantBufferLayout {
+    scalar: Option<Range<u64>>,
+    rep: Option<Range<u64>>,
+    def: Option<Range<u64>>,
+}
+
 #[derive(Debug)]
 pub struct ConstantPageScheduler {
-    buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
     scalar_source: ScalarSource,
-    rep_buf_idx: Option<usize>,
-    def_buf_idx: Option<usize>,
     data_type: DataType,
     def_meaning: Arc<[DefinitionInterpretation]>,
     max_rep: u16,
     max_visible_def: u16,
+    layout: ConstantBufferLayout,
     repdef: Option<Arc<CachedConstantState>>,
 }
 
@@ -122,11 +133,7 @@ impl ConstantPageScheduler {
         def_meaning: Arc<[DefinitionInterpretation]>,
     ) -> Result<Self> {
         let max_rep = def_meaning.iter().filter(|d| d.is_list()).count() as u16;
-        let max_visible_def = def_meaning
-            .iter()
-            .take_while(|d| !d.is_list())
-            .map(|d| d.num_def_levels())
-            .sum();
+        let max_visible_def = max_visible_level(&def_meaning);
 
         let (scalar_source, rep_buf_idx, def_buf_idx) =
             match (inline_value, buffer_offsets_and_sizes.len()) {
@@ -169,123 +176,107 @@ impl ConstantPageScheduler {
                 }
             };
 
+        let range_of = |idx: usize| {
+            let (pos, len) = buffer_offsets_and_sizes[idx];
+            pos..pos + len
+        };
+        let layout = ConstantBufferLayout {
+            scalar: match &scalar_source {
+                ScalarSource::ValueBuffer(idx) => Some(range_of(*idx)),
+                ScalarSource::Inline(_) => None,
+            },
+            rep: rep_buf_idx
+                .filter(|&idx| buffer_offsets_and_sizes[idx].1 > 0)
+                .map(range_of),
+            def: def_buf_idx
+                .filter(|&idx| buffer_offsets_and_sizes[idx].1 > 0)
+                .map(range_of),
+        };
+
         Ok(Self {
-            buffer_offsets_and_sizes,
             scalar_source,
-            rep_buf_idx,
-            def_buf_idx,
             data_type,
             def_meaning,
             max_rep,
             max_visible_def,
+            layout,
             repdef: None,
         })
     }
 }
 
 impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantPageScheduler {
-    fn initialize<'a>(
+    fn init_layout(&self) -> Result<PageInitialization> {
+        // Order must match `init_from_buffers`' consumption: scalar, rep, def.
+        Ok(PageInitialization::new([
+            self.layout.scalar.clone(),
+            self.layout.rep.clone(),
+            self.layout.def.clone(),
+        ]))
+    }
+
+    fn init_from_buffers<'a>(
         &'a mut self,
-        io: &Arc<dyn EncodingsIo>,
+        buffers: PageInitializationBuffers,
+        _io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
-        let rep_range = self
-            .rep_buf_idx
-            .and_then(|idx| self.buffer_offsets_and_sizes.get(idx).copied())
-            .filter(|(_, len)| *len > 0)
-            .map(|(pos, len)| pos..pos + len);
-
-        let def_range = self
-            .def_buf_idx
-            .and_then(|idx| self.buffer_offsets_and_sizes.get(idx).copied())
-            .filter(|(_, len)| *len > 0)
-            .map(|(pos, len)| pos..pos + len);
-
-        let scalar_range = match self.scalar_source {
-            ScalarSource::ValueBuffer(idx) => {
-                let (pos, len) = self.buffer_offsets_and_sizes[idx];
-                Some(pos..pos + len)
-            }
-            ScalarSource::Inline(_) => None,
-        };
-
-        let mut reads = Vec::with_capacity(3);
-        if let Some(r) = scalar_range {
-            reads.push(r);
-        }
-        if let Some(r) = rep_range.clone() {
-            reads.push(r);
-        }
-        if let Some(r) = def_range.clone() {
-            reads.push(r);
-        }
-
-        if reads.is_empty() {
-            let ScalarSource::Inline(inline) = &self.scalar_source else {
-                return std::future::ready(Err(Error::invalid_input(
-                    "Invalid constant layout: missing scalar source",
-                )))
-                .boxed();
-            };
-
-            let scalar = match lance_arrow::scalar::decode_scalar_from_inline_value(
-                &self.data_type,
-                inline.as_slice(),
-            ) {
-                Ok(s) => s,
-                Err(e) => return std::future::ready(Err(e.into())).boxed(),
-            };
-            let cached = Arc::new(CachedConstantState {
-                scalar,
-                rep: None,
-                def: None,
-            });
-            self.repdef = Some(cached.clone());
-            return std::future::ready(Ok(cached as Arc<dyn CachedPageData>)).boxed();
-        }
-
-        let data = io.submit_request(reads, 0);
+        // Consume `buffers` in the same scalar, rep, def order `init_layout`
+        // declared them, using the shared layout's presence flags.
         let scalar_source = self.scalar_source.clone();
         let data_type = self.data_type.clone();
         async move {
-            let mut data_iter = data.await?.into_iter();
+            let [scalar_buffer, rep_buffer, def_buffer] = buffers.try_into_array("constant")?;
 
-            let scalar = match scalar_source {
-                ScalarSource::Inline(inline) => {
+            let scalar = match (scalar_source, scalar_buffer) {
+                (ScalarSource::Inline(inline), None) => {
                     lance_arrow::scalar::decode_scalar_from_inline_value(&data_type, &inline)?
                 }
-                ScalarSource::ValueBuffer(_) => {
-                    let bytes = data_iter.next().unwrap();
+                (ScalarSource::ValueBuffer(_), Some(bytes)) => {
                     let buf = LanceBuffer::from_bytes(bytes, 1);
                     lance_arrow::scalar::decode_scalar_from_value_buffer(&data_type, buf.as_ref())?
                 }
+                _ => {
+                    return Err(Error::internal(
+                        "Constant page scalar buffer does not match its initialization layout",
+                    ));
+                }
             };
 
-            let rep = rep_range.map(|_| {
-                let rep = data_iter.next().unwrap();
+            let rep = rep_buffer.map(|rep| {
                 let rep = LanceBuffer::from_bytes(rep, 2);
                 rep.borrow_to_typed_slice::<u16>()
             });
 
-            let def = def_range.map(|_| {
-                let def = data_iter.next().unwrap();
+            let def = def_buffer.map(|def| {
                 let def = LanceBuffer::from_bytes(def, 2);
                 def.borrow_to_typed_slice::<u16>()
             });
 
             let cached = Arc::new(CachedConstantState { scalar, rep, def });
-            self.repdef = Some(cached.clone());
             Ok(cached as Arc<dyn CachedPageData>)
         }
         .boxed()
     }
 
-    fn load(&mut self, data: &Arc<dyn CachedPageData>) {
-        self.repdef = Some(
-            data.clone()
-                .as_arc_any()
-                .downcast::<CachedConstantState>()
-                .unwrap(),
-        );
+    fn try_load(&mut self, data: &Arc<dyn CachedPageData>) -> Result<()> {
+        let cached: Arc<CachedConstantState> =
+            data.clone().as_arc_any().downcast().map_err(|_| {
+                Error::invalid_input_source(
+                    "Cached constant page data has an unexpected type".into(),
+                )
+            })?;
+        if cached.scalar.data_type() != &self.data_type {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Cached constant page scalar has data type {:?}, expected {:?}",
+                    cached.scalar.data_type(),
+                    self.data_type
+                )
+                .into(),
+            ));
+        }
+        self.repdef = Some(cached);
+        Ok(())
     }
 
     fn schedule_ranges(
@@ -347,7 +338,7 @@ impl ConstantPageDecoder {
         ranges
     }
 
-    fn take_row(&mut self) -> Result<(Range<usize>, u64)> {
+    fn take_row(&mut self) -> Result<()> {
         let start = self.cursor_level;
         let end = if let Some(rep) = &self.rep {
             if start >= rep.len() {
@@ -369,21 +360,22 @@ impl ConstantPageDecoder {
             start + 1
         };
 
-        let visible = if let Some(def) = &self.def {
-            def[start..end]
-                .iter()
-                .filter(|d| **d <= self.max_visible_def)
-                .count() as u64
-        } else {
-            (end - start) as u64
-        };
-
         self.cursor_level = end;
         self.cursor_row += 1;
-        Ok((start..end, visible))
+        Ok(())
     }
 
     fn skip_to_row(&mut self, target_row: u64) -> Result<()> {
+        debug_assert!(
+            target_row >= self.cursor_row,
+            "rows must be requested in order"
+        );
+        if self.rep.is_none() {
+            // Without repetition every row is exactly one level, so jump straight there
+            self.cursor_row = self.cursor_row.max(target_row);
+            self.cursor_level = self.cursor_row as usize;
+            return Ok(());
+        }
         while self.cursor_row < target_row {
             self.take_row()?;
         }
@@ -398,19 +390,24 @@ impl crate::encodings::logical::primitive::StructuralPageDecoder for ConstantPag
         let mut level_slices: Vec<Range<usize>> = Vec::new();
         let mut visible_items_total: u64 = 0;
 
+        // Each row range is one contiguous level slice, so locate both ends rather than
+        // stepping through it row by row
         for range in drained_ranges {
             self.skip_to_row(range.start)?;
-            for _ in range.start..range.end {
-                let (level_range, visible) = self.take_row()?;
-                visible_items_total += visible;
-                if let Some(last) = level_slices.last_mut()
-                    && last.end == level_range.start
-                {
-                    last.end = level_range.end;
-                    continue;
-                }
-                level_slices.push(level_range);
+            let level_start = self.cursor_level;
+            self.skip_to_row(range.end)?;
+            let level_range = level_start..self.cursor_level;
+            // With definition levels `decode` counts the visible items from the sliced levels
+            if self.def.is_none() {
+                visible_items_total += level_range.len() as u64;
             }
+            if let Some(last) = level_slices.last_mut()
+                && last.end == level_range.start
+            {
+                last.end = level_range.end;
+                continue;
+            }
+            level_slices.push(level_range);
         }
 
         Ok(Box::new(DecodeConstantTask {
@@ -455,7 +452,11 @@ impl DecodeConstantTask {
         })
     }
 
-    fn materialize_values(&self, num_values: u64) -> Result<ArrayRef> {
+    /// Repeats the scalar once per visible item.  Items that are null (definition
+    /// level > 0) are materialized as nulls instead of copies of the scalar so that
+    /// a large scalar with many null slots does not amplify into an oversized array
+    /// (e.g. overflowing i32 offsets for utf8/binary).
+    fn materialize_values(&self, def: Option<&[u16]>, num_values: u64) -> Result<ArrayRef> {
         if num_values == 0 {
             return Ok(new_empty_array(self.scalar.data_type()));
         }
@@ -467,6 +468,22 @@ impl DecodeConstantTask {
                 num_values as usize,
                 None,
             )) as ArrayRef);
+        }
+
+        if let Some(def) = def
+            && self.scalar.null_count() == 0
+            && def.iter().any(|d| *d != 0 && *d <= self.max_visible_def)
+        {
+            let null_slot = new_null_array(self.scalar.data_type(), 1);
+            let source = arrow_select::concat::concat(&[self.scalar.as_ref(), null_slot.as_ref()])?;
+            let indices = arrow_array::UInt64Array::from(
+                def.iter()
+                    .filter(|d| **d <= self.max_visible_def)
+                    .map(|d| if *d == 0 { 0u64 } else { 1u64 })
+                    .collect::<Vec<_>>(),
+            );
+            debug_assert_eq!(indices.len() as u64, num_values);
+            return Ok(arrow_select::take::take(source.as_ref(), &indices, None)?);
         }
 
         let indices = arrow_array::UInt64Array::from(vec![0u64; num_values as usize]);
@@ -489,8 +506,8 @@ impl crate::decoder::DecodePageTask for DecodeConstantTask {
             self.visible_items_total
         };
 
-        let values = self.materialize_values(visible_items_total)?;
-        let data = crate::data::DataBlock::from_array(values);
+        let values = self.materialize_values(def.as_deref(), visible_items_total)?;
+        let data = crate::data::DataBlock::from_decoded_array(values);
         let unraveler =
             RepDefUnraveler::new(rep, def, self.def_meaning.clone(), visible_items_total);
 
@@ -498,5 +515,34 @@ impl crate::decoder::DecodePageTask for DecodeConstantTask {
             data,
             repdef: unraveler,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::BooleanArray;
+
+    use super::*;
+    use crate::encodings::logical::primitive::StructuralPageScheduler;
+
+    #[test]
+    fn rejects_cached_scalar_with_different_data_type() {
+        let mut scheduler = ConstantPageScheduler::try_new(
+            Arc::from([]),
+            Some(Bytes::new()),
+            DataType::UInt8,
+            Arc::from([DefinitionInterpretation::AllValidItem]),
+        )
+        .unwrap();
+        let cached: Arc<dyn CachedPageData> = Arc::new(CachedConstantState {
+            scalar: Arc::new(BooleanArray::from(vec![true])),
+            rep: None,
+            def: None,
+        });
+
+        let error = scheduler.try_load(&cached).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("Boolean"));
+        assert!(error.to_string().contains("UInt8"));
     }
 }

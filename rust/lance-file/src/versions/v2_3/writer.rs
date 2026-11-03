@@ -76,6 +76,7 @@ impl Writer {
     }
 
     fn initialize(&mut self, schema: Schema) -> Result<()> {
+        self.encoding.validate_options()?;
         let encoding_options = self.encoding.encoding_options(&schema);
         schema.validate()?;
         let strategy = encoding_strategy(self.compression.clone());
@@ -112,6 +113,10 @@ impl Writer {
     pub async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         self.ensure_initialized(batch)?;
         self.encoding.write_batch(batch, &mut self.sink).await
+    }
+
+    pub fn prepare_for_flush(&mut self) {
+        self.encoding.prepare_for_flush();
     }
 
     /// Write one top-level field, advancing only that field's row count.

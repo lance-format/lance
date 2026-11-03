@@ -160,7 +160,7 @@ fn main() {
             let query = query_vec(query_id);
             let truth: Vec<u32> = official_gt[query_id][..K].to_vec();
             let t = Instant::now();
-            let nodes = hnsw
+            let (nodes, _) = hnsw
                 .search_basic(query, K, &params, None, storage.as_ref())
                 .unwrap();
             control.latency_us.push(t.elapsed().as_secs_f64() * 1e6);
@@ -240,7 +240,7 @@ fn main() {
                         bitset.insert(id);
                     }
                     let t = Instant::now();
-                    let nodes = hnsw
+                    let (nodes, _) = hnsw
                         .search_basic(query.clone(), K, &params, Some(bitset), storage.as_ref())
                         .unwrap();
                     basic.latency_us.push(t.elapsed().as_secs_f64() * 1e6);
@@ -255,7 +255,7 @@ fn main() {
                         bitset.insert(id);
                     }
                     let t = Instant::now();
-                    let nodes = hnsw
+                    let (nodes, _) = hnsw
                         .search_basic(query.clone(), K, &params_hi, Some(bitset), storage.as_ref())
                         .unwrap();
                     basic_hi.latency_us.push(t.elapsed().as_secs_f64() * 1e6);
@@ -270,7 +270,7 @@ fn main() {
                         bitset.insert(id);
                     }
                     let t = Instant::now();
-                    let nodes = hnsw
+                    let (nodes, _) = hnsw
                         .search_acorn(query.clone(), K, &params, &bitset, storage.as_ref())
                         .unwrap();
                     acorn.latency_us.push(t.elapsed().as_secs_f64() * 1e6);
@@ -285,7 +285,7 @@ fn main() {
                         bitset.insert(id);
                     }
                     let t = Instant::now();
-                    let nodes = hnsw
+                    let (nodes, _) = hnsw
                         .search_acorn(query.clone(), K, &params_hi, &bitset, storage.as_ref())
                         .unwrap();
                     acorn_hi.latency_us.push(t.elapsed().as_secs_f64() * 1e6);

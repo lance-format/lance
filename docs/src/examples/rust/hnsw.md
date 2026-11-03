@@ -8,40 +8,31 @@ This example will show how to:
 2. Build a hierarchical graph structure for efficient vector search using Lance API
 3. Perform vector search with different parameters and compute the ground truth using L2 distance search
 
+The example sets the search beam width `ef` explicitly. A query that leaves it
+unset gets `1.5 * k * refine_factor`, floored at 256; the floor is what keeps
+recall usable on a single large partition, which is the layout
+`IVF_HNSW_*` builds by default.
+
 ## Complete Example
 
 ```rust
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::array::{types::Float32Type, Array, FixedSizeListArray};
-use arrow::array::{AsArray, FixedSizeListBuilder, Float32Builder};
+use arrow::array::{AsArray, FixedSizeListBuilder, Float32Builder, types::UInt64Type};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow::record_batch::RecordBatchIterator;
-use arrow_select::concat::concat;
-use futures::stream::StreamExt;
 use lance::Dataset;
-use lance_index::vector::v3::subindex::IvfSubIndex;
-use lance_index::vector::{
-    flat::storage::FlatFloatStorage,
-    hnsw::{builder::HnswBuildParams, HNSW},
+use lance::dataset::ProjectionRequest;
+use lance::index::DatasetIndexExt;
+use lance::index::vector::VectorIndexParams;
+use lance_core::ROW_ID;
+use lance_index::{
+    IndexType,
+    vector::{hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams},
 };
-use lance_linalg::distance::DistanceType;
-
-fn ground_truth(fsl: &FixedSizeListArray, query: &[f32], k: usize) -> HashSet<u32> {
-    let mut dists = vec![];
-    for i in 0..fsl.len() {
-        let dist = lance_linalg::distance::l2_distance(
-            query,
-            fsl.value(i).as_primitive::<Float32Type>().values(),
-        );
-        dists.push((dist, i as u32));
-    }
-    dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    dists.truncate(k);
-    dists.into_iter().map(|(_, i)| i).collect()
-}
+use lance_linalg::distance::MetricType;
 
 pub async fn create_test_vector_dataset(output: &str, num_rows: usize, dim: i32) {
     let schema = Arc::new(Schema::new(vec![Field::new(
@@ -79,59 +70,86 @@ async fn main() {
     let ef = 100;
     let max_edges = 30;
     let max_level = 7;
+    let num_partitions = 2;
 
     // 1. Generate a synthetic test data of specified dimensions
-    let dataset = if uri.is_none() {
-        println!("No uri is provided, generating test dataset...");
-        let output = "test_vectors.lance";
-        create_test_vector_dataset(output, 1000, 64).await;
-        Dataset::open(output).await.expect("Failed to open dataset")
-    } else {
-        Dataset::open(uri.as_ref().unwrap())
-            .await
-            .expect("Failed to open dataset")
+    let mut dataset = match uri.as_deref() {
+        None => {
+            println!("No uri is provided, generating test dataset...");
+            let output = "test_vectors.lance";
+            create_test_vector_dataset(output, 1000, 64).await;
+            Dataset::open(output).await.expect("Failed to open dataset")
+        }
+        Some(uri) => Dataset::open(uri).await.expect("Failed to open dataset"),
     };
 
     println!("Dataset schema: {:#?}", dataset.schema());
-    let batches = dataset
-        .scan()
-        .project(&[column])
-        .unwrap()
-        .try_into_stream()
+    let first_row = dataset
+        .take(&[0], ProjectionRequest::from_columns([column], dataset.schema()))
         .await
-        .unwrap()
-        .then(|batch| async move { batch.unwrap().column_by_name(column).unwrap().clone() })
-        .collect::<Vec<_>>()
-        .await;
-    let arrs = batches.iter().map(|b| b.as_ref()).collect::<Vec<_>>();
-    let fsl = concat(&arrs).unwrap().as_fixed_size_list().clone();
-    println!("Loaded {:?} batches", fsl.len());
-
-    let vector_store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
-
-    let q = fsl.value(0);
+        .unwrap();
+    let q = first_row.column_by_name(column).unwrap().as_fixed_size_list().value(0);
     let k = 10;
-    let gt = ground_truth(&fsl, q.as_primitive::<Float32Type>().values(), k);
 
-    for ef_construction in [15, 30, 50] {
+    // Compute exact L2 ground truth with a brute-force scan (`use_index(false)`).
+    let gt_batch = dataset
+        .scan()
+        .project::<String>(&[])
+        .unwrap()
+        .with_row_id()
+        .nearest(column, q.as_ref(), k)
+        .unwrap()
+        .use_index(false)
+        .try_into_batch()
+        .await
+        .unwrap();
+    let gt: HashSet<u64> = gt_batch
+        .column_by_name(ROW_ID)
+        .unwrap()
+        .as_primitive::<UInt64Type>()
+        .values()
+        .iter()
+        .copied()
+        .collect();
+
+    for ef_construction in [30, 50, 100] {
         let now = std::time::Instant::now();
-        // 2. Build a hierarchical graph structure for efficient vector search using Lance API
-        let hnsw = HNSW::index_vectors(
-            vector_store.as_ref(),
+        // 2. Build a persistent IVF_HNSW_SQ vector index on the dataset
+        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+            MetricType::L2,
+            IvfBuildParams::new(num_partitions),
             HnswBuildParams::default()
                 .max_level(max_level)
                 .num_edges(max_edges)
                 .ef_construction(ef_construction),
-        )
-        .unwrap();
+            SQBuildParams::default(),
+        );
+        dataset
+            .create_index(&[column], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
         let construct_time = now.elapsed().as_secs_f32();
         let now = std::time::Instant::now();
-        // 3. Perform vector search with different parameters and compute the ground truth using L2 distance search
-        let results: HashSet<u32> = hnsw
-            .search_basic(q.clone(), k, ef, None, vector_store.as_ref())
+        // 3. Query the dataset through Scanner::nearest with explicit HNSW `ef`
+        let result_batch = dataset
+            .scan()
+            .project::<String>(&[])
             .unwrap()
+            .with_row_id()
+            .nearest(column, q.as_ref(), k)
+            .unwrap()
+            .ef(ef)
+            .minimum_nprobes(num_partitions)
+            .try_into_batch()
+            .await
+            .unwrap();
+        let results: HashSet<u64> = result_batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .values()
             .iter()
-            .map(|node| node.id)
+            .copied()
             .collect();
         let search_time = now.elapsed().as_micros();
         println!(

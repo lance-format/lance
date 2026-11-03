@@ -34,7 +34,7 @@ use lance_index::vector::sq::builder::SQBuildParams;
 
 use super::{StageParams, VectorIndexParams};
 use crate::dataset::Dataset;
-use crate::index::open_index_proto;
+use crate::index::loading::open_index_proto;
 use crate::index::vector::coarse_quantizer::CoarseQuantizerFingerprint;
 use crate::{Error, Result};
 
@@ -83,9 +83,15 @@ enum CompressionDetailsJson {
     },
 }
 
-/// Build vector metadata from the requested parameters and final routing identity.
+/// Build a `VectorIndexDetails` proto from build params at index creation time.
+///
+/// `built_target` is the vectors per partition the build settled on, which
+/// `params` may not carry: an index built from a partition count or centroids
+/// records the size they gave. A target in `params` wins.
+/// `fingerprint` describes the final routing model, not the requested build parameters.
 pub fn vector_index_details(
     params: &VectorIndexParams,
+    built_target: Option<usize>,
     fingerprint: Option<CoarseQuantizerFingerprint>,
 ) -> prost_types::Any {
     let metric_type = match params.metric_type {
@@ -103,7 +109,7 @@ pub fn vector_index_details(
     for stage in &params.stages {
         match stage {
             StageParams::Ivf(ivf) => {
-                if let Some(tps) = ivf.target_partition_size {
+                if let Some(tps) = ivf.target_partition_size.or(built_target) {
                     target_partition_size = tps as u64;
                 }
                 runtime_hints.insert("lance.ivf.max_iters".to_string(), ivf.max_iters.to_string());
@@ -242,6 +248,12 @@ pub fn apply_runtime_hints(hints: &HashMap<String, String>, params: &mut VectorI
 /// Reconstruct `VectorIndexParams` from a stored `VectorIndexDetails` proto.
 ///
 /// Returns `None` for legacy indices (empty details) or if the proto is malformed.
+/// The rows-per-partition target the index was created with, if it was recorded.
+pub fn target_partition_size_from_details(details: &prost_types::Any) -> Option<usize> {
+    let details = details.to_msg::<VectorIndexDetails>().ok()?;
+    (details.target_partition_size > 0).then_some(details.target_partition_size as usize)
+}
+
 /// Runtime hints are applied on top of the reconstructed spec.
 // TODO: wire into a general `Dataset::rebuild_index` method so users can
 // regenerate an index from its stored details (e.g. after file corruption).
@@ -944,6 +956,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let metric = metric_type_from_index_metadata(&index);
@@ -967,6 +981,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let metric = metric_type_from_index_metadata(&index);
@@ -988,6 +1004,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let metric = metric_type_from_index_metadata(&index);
@@ -1026,6 +1044,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -1113,6 +1133,8 @@ mod tests {
                 created_at: None,
                 base_id: None,
                 files: None,
+                clustering_id: None,
+                metadata: Default::default(),
             };
 
             let metric = metric_type_from_index_metadata(&index);
@@ -1147,7 +1169,7 @@ mod tests {
             },
         );
 
-        let any = vector_index_details(&params, None);
+        let any = vector_index_details(&params, None, None);
         let details = any.to_msg::<VectorIndexDetails>().unwrap();
         assert_eq!(
             details
@@ -1263,7 +1285,7 @@ mod tests {
         );
         params.skip_transpose = true;
 
-        let any = vector_index_details(&params, None);
+        let any = vector_index_details(&params, None, None);
         let details = any.to_msg::<VectorIndexDetails>().unwrap();
         assert_eq!(
             details.runtime_hints.get("lance.hnsw.prefetch_distance"),
@@ -1316,7 +1338,7 @@ mod tests {
         };
         let params = VectorIndexParams::ivf_hnsw(DistanceType::L2, IvfBuildParams::default(), hnsw);
 
-        let any = vector_index_details(&params, None);
+        let any = vector_index_details(&params, None, None);
         let details = any.to_msg::<VectorIndexDetails>().unwrap();
         assert_eq!(
             details.runtime_hints.get("lance.hnsw.prefetch_distance"),
@@ -1354,7 +1376,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let any = vector_index_details(&params, None);
+        let any = vector_index_details(&params, None, None);
         let json = vector_details_as_json(&any).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["runtime_hints"]["lance.ivf.max_iters"], "100");
@@ -1449,7 +1471,7 @@ mod tests {
 
         let params = build_roundtrip_params(combo, metric);
 
-        let any = vector_index_details(&params, None);
+        let any = vector_index_details(&params, None, None);
         let restored = vector_params_from_details(&any)
             .expect("non-empty details should round-trip to params");
 

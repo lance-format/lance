@@ -7,20 +7,25 @@ use chrono::{DateTime, Utc};
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
-use lance_table::io::commit::CommitHandler;
+use lance_table::io::commit::{CommitHandler, VERSIONS_DIR};
+use lance_table::io::deletion::DELETIONS_DIR;
 use object_store::{Error as ObjectStoreError, path::Path};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::dataset::branch_location::BranchLocation;
+use crate::dataset::mem_wal::util::is_mem_wal_dir_name;
 use crate::dataset::refs::Ref::{Tag, Version, VersionNumber};
+use crate::dataset::{BLOBS_DIR, DATA_DIR, FRAG_REUSE_DIR, INDICES_DIR, TRANSACTIONS_DIR};
 use crate::utils::temporal::utc_now;
 use crate::{Error, Result};
 use serde::de::DeserializeOwned;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Formatter;
+use std::io::ErrorKind;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 pub const MAIN_BRANCH: &str = "main";
@@ -339,6 +344,9 @@ impl Tags<'_> {
             }
         };
 
+        // Direct Ref::Version construction bypasses normalization in the tuple conversions.
+        let branch = branch.as_deref().and_then(standardize_branch);
+
         let branch_location = self.refs.base_location.find_branch(branch.as_deref())?;
         let manifest_file = if let Some(version_number) = version_number {
             self.refs
@@ -388,32 +396,36 @@ impl Branches<'_> {
     pub async fn fetch(&self) -> Result<Vec<(String, BranchContents)>> {
         let root_location = self.refs.root()?;
         let base_path = base_branches_contents_path(&root_location.path);
-        let branch_files = self.object_store().read_dir(base_path).await?;
+        // Branch names may contain '/'. Some object store adapters preserve the
+        // encoded separator in a flat key while others expose it as nested paths.
+        // Recursively list the metadata prefix so both layouts are discoverable.
+        let branch_files = self
+            .object_store()
+            .list(Some(base_path.clone()))
+            .try_collect::<Vec<_>>()
+            .await?;
 
-        let branch_names: Vec<String> = branch_files
-            .iter()
-            .filter_map(|name| name.strip_suffix(".json"))
-            .map(|str| {
-                Path::from_url_path(str)
-                    .map_err(|e| Error::InvalidRef {
-                        message: format!(
-                            "Failed to decode branch name: {} due to exception {}",
-                            str, e
-                        ),
-                    })
-                    .map(|path| path.to_string())
+        let branches: Vec<(String, Path)> = branch_files
+            .into_iter()
+            .filter_map(|meta| {
+                let relative_path = Path::from_iter(meta.location.prefix_match(&base_path)?);
+                let name = relative_path.as_ref().strip_suffix(".json")?;
+                Some(
+                    Path::from_url_path(name)
+                        .map_err(|e| Error::InvalidRef {
+                            message: format!(
+                                "Failed to decode branch name: {} due to exception {}",
+                                name, e
+                            ),
+                        })
+                        .map(|path| (path.to_string(), meta.location)),
+                )
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let branch_path = &root_location.path;
-        futures::stream::iter(branch_names)
-            .map(|name| async move {
-                let contents = BranchContents::from_path(
-                    &branch_contents_path(branch_path, &name),
-                    self.object_store(),
-                    &name,
-                )
-                .await?;
+        futures::stream::iter(branches)
+            .map(|(name, path)| async move {
+                let contents = BranchContents::from_path(&path, self.object_store(), &name).await?;
                 Ok((name, contents))
             })
             .buffer_unordered(10)
@@ -631,35 +643,327 @@ impl Branches<'_> {
         Ok(branches)
     }
 
-    /// Clean up empty parent directories
+    /// Remove branch files while preserving branches that share directories.
     async fn cleanup_branch_directories(&self, branch: &str) -> Result<()> {
         let branches = self.list().await?;
         let remaining_branches: Vec<&str> = branches.keys().map(|k| k.as_str()).collect();
+        let mut cleanup =
+            Self::get_cleanup_path(branch, &remaining_branches, &self.refs.base_location)?;
+        if matches!(cleanup, BranchCleanup::Skip) {
+            return Ok(());
+        }
 
-        if let Some(delete_path) =
-            Self::get_cleanup_path(branch, &remaining_branches, &self.refs.base_location)?
-            && let Err(e) = self.refs.object_store.remove_dir_all(delete_path).await
-        {
-            match &e {
-                Error::NotFound { .. } => {
-                    log::debug!("Branch directory already deleted");
+        let has_local_paths =
+            self.object_store().is_local() || self.object_store().scheme() == "file-object-store";
+        let mut remaining_paths = Vec::with_capacity(remaining_branches.len() + 1);
+        for remaining in &remaining_branches {
+            let path = self.refs.base_location.find_branch(Some(remaining))?.path;
+            let canonical_path = self.object_store().canonicalize_local_path(&path).await?;
+            if has_local_paths && canonical_path.is_none() {
+                log::warn!(
+                    "Keeping branch directories after deleting {branch}: cannot resolve surviving local branch at {path}"
+                );
+                return Ok(());
+            }
+            let canonical_retained_dirs = if has_local_paths {
+                match self.collect_canonical_retained_dirs(&path, branch).await? {
+                    Some(dirs) => dirs,
+                    None => return Ok(()),
                 }
-                _ => return Err(e),
+            } else {
+                Vec::new()
+            };
+            remaining_paths.push(RemainingBranchPath {
+                path,
+                canonical_path,
+                canonical_retained_dirs,
+                is_named_branch: true,
+            });
+        }
+
+        if has_local_paths {
+            let path = self.refs.root()?.path;
+            let canonical_path = self.object_store().canonicalize_local_path(&path).await?;
+            if canonical_path.is_none() {
+                log::warn!(
+                    "Keeping branch directories after deleting {branch}: cannot resolve main dataset at {path}"
+                );
+                return Ok(());
+            }
+            let Some(canonical_retained_dirs) =
+                self.collect_canonical_retained_dirs(&path, branch).await?
+            else {
+                return Ok(());
+            };
+            remaining_paths.push(RemainingBranchPath {
+                path,
+                canonical_path,
+                canonical_retained_dirs,
+                is_named_branch: false,
+            });
+        }
+
+        if has_local_paths {
+            let path = match &cleanup {
+                BranchCleanup::Recursive(path) | BranchCleanup::Selective(path) => path,
+                BranchCleanup::Skip => return Ok(()),
+            };
+            cleanup = match self
+                .classify_shared_branch_path(path, &remaining_paths)
+                .await?
+            {
+                SharedBranchPath::Remaining => BranchCleanup::Skip,
+                SharedBranchPath::Ancestor => BranchCleanup::Selective(path.clone()),
+                SharedBranchPath::Unrelated => cleanup,
+            };
+        }
+
+        if self.object_store().scheme() == "file-object-store" {
+            cleanup = match cleanup {
+                BranchCleanup::Recursive(path) => BranchCleanup::Selective(path),
+                cleanup => cleanup,
+            };
+        }
+
+        match cleanup {
+            BranchCleanup::Skip => Ok(()),
+            BranchCleanup::Recursive(path) => {
+                if let Err(e) = self.object_store().remove_dir_all(path).await {
+                    match &e {
+                        Error::NotFound { .. } => {
+                            log::debug!("Branch directory already deleted");
+                        }
+                        _ => return Err(e),
+                    }
+                }
+                Ok(())
+            }
+            BranchCleanup::Selective(delete_path) => {
+                let mut pending = vec![delete_path];
+                while let Some(path) = pending.pop() {
+                    let classification = self
+                        .classify_shared_branch_path(&path, &remaining_paths)
+                        .await?;
+                    if matches!(classification, SharedBranchPath::Remaining) {
+                        continue;
+                    }
+                    let traverse_unrelated =
+                        if matches!(classification, SharedBranchPath::Unrelated)
+                            && self.object_store().scheme() == "file-object-store"
+                        {
+                            self.recursive_delete_would_touch_retained_data(&path, &remaining_paths)
+                                .await?
+                        } else {
+                            false
+                        };
+                    if matches!(classification, SharedBranchPath::Unrelated) && !traverse_unrelated
+                    {
+                        if let Err(e) = self.object_store().remove_dir_all(path).await {
+                            match &e {
+                                Error::NotFound { .. } => {
+                                    log::debug!("Branch directory already deleted");
+                                }
+                                _ => return Err(e),
+                            }
+                        }
+                        continue;
+                    }
+                    if traverse_unrelated {
+                        log::warn!(
+                            "Inspecting branch subtree {path}: recursive deletion would reach retained dataset data"
+                        );
+                    }
+                    // A shared directory must remain, but the deleted branch's own
+                    // files (especially its manifests) must not remain accessible.
+                    let entries = self.object_store().list_with_delimiter(Some(&path)).await?;
+                    futures::stream::iter(entries.objects.into_iter().map(Ok))
+                        .try_for_each_concurrent(
+                            self.object_store().io_parallelism(),
+                            |file| async move { self.object_store().delete(&file.location).await },
+                        )
+                        .await?;
+                    // Hierarchical stores may include the listed directory's marker.
+                    let canonical_path = if has_local_paths {
+                        self.object_store().canonicalize_local_path(&path).await?
+                    } else {
+                        None
+                    };
+                    for child in entries
+                        .common_prefixes
+                        .into_iter()
+                        .filter(|child| child != &path && child.prefix_matches(&path))
+                    {
+                        if has_local_paths {
+                            let canonical_child =
+                                self.object_store().canonicalize_local_path(&child).await?;
+                            match (&canonical_path, canonical_child) {
+                                (Some(parent), Some(child)) if child.starts_with(parent) => {}
+                                _ => {
+                                    log::warn!(
+                                        "Keeping aliased branch subtree {child}: canonical path leaves parent {path}"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        pending.push(child);
+                    }
+                }
+                Ok(())
             }
         }
-        Ok(())
+    }
+
+    async fn collect_canonical_retained_dirs(
+        &self,
+        path: &Path,
+        deleted_branch: &str,
+    ) -> Result<Option<Vec<PathBuf>>> {
+        let mut canonical_retained_dirs = Vec::with_capacity(DATASET_DIRS.len() + 1);
+        let mut owned_paths = Vec::with_capacity(DATASET_DIRS.len() + 1);
+        owned_paths.extend(
+            DATASET_DIRS
+                .iter()
+                .copied()
+                .chain(std::iter::once(REFS_DIR))
+                .map(|name| path.clone().join(name)),
+        );
+        for name in self.object_store().read_dir(path.clone()).await? {
+            if is_mem_wal_dir_name(&name) {
+                owned_paths.push(path.clone().join(name));
+            }
+        }
+        for owned_path in owned_paths {
+            let Some(canonical_dir) = self
+                .object_store()
+                .canonicalize_local_path(&owned_path)
+                .await?
+            else {
+                // Optional dataset directories may not exist for this branch.
+                continue;
+            };
+            let Some(owned_dirs) = Self::collect_local_owned_directories(canonical_dir).await?
+            else {
+                log::warn!(
+                    "Keeping branch directories after deleting {deleted_branch}: cannot resolve retained storage below {owned_path}"
+                );
+                return Ok(None);
+            };
+            canonical_retained_dirs.extend(owned_dirs);
+        }
+        Ok(Some(canonical_retained_dirs))
+    }
+
+    async fn collect_local_owned_directories(
+        canonical_root: PathBuf,
+    ) -> Result<Option<Vec<PathBuf>>> {
+        let root_description = canonical_root.display().to_string();
+        // Stream filesystem entries: object listings would buffer every file in flat data
+        // directories. The provider has already mapped the root to a canonical local path.
+        let result = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<PathBuf>> {
+            let mut protected = HashSet::from([canonical_root.clone()]);
+            let mut pending = vec![canonical_root];
+            let mut visited = HashSet::new();
+            while let Some(directory) = pending.pop() {
+                if !visited.insert(directory.clone()) {
+                    continue;
+                }
+                for entry in std::fs::read_dir(&directory)? {
+                    let entry = entry?;
+                    let file_type = entry.file_type()?;
+                    if !file_type.is_dir() && !file_type.is_symlink() {
+                        continue;
+                    }
+                    let target = std::fs::canonicalize(entry.path())?;
+                    let is_directory = file_type.is_dir() || std::fs::metadata(&target)?.is_dir();
+                    if is_directory {
+                        pending.push(target.clone());
+                    }
+                    if !target.starts_with(&directory) {
+                        let owned = if is_directory {
+                            target
+                        } else if let Some(parent) = target.parent() {
+                            // Protect a file alias before cleanup reaches its payload.
+                            parent.to_path_buf()
+                        } else {
+                            return Err(std::io::Error::other(format!(
+                                "Retained file alias has no containing directory: {}",
+                                target.display()
+                            )));
+                        };
+                        // A deduplicated superset is sufficient and avoids quadratic
+                        // prefix pruning when many external aliases are present.
+                        protected.insert(owned);
+                    }
+                }
+            }
+            Ok(protected.into_iter().collect())
+        })
+        .await
+        .map_err(|error| {
+            Error::io(format!(
+                "retained directory inspection task failed: {error}"
+            ))
+        })?;
+        match result {
+            Ok(directories) => Ok(Some(directories)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(Error::io(format!(
+                "Cannot inspect retained storage below {root_description}: {error}"
+            ))),
+        }
+    }
+
+    async fn recursive_delete_would_touch_retained_data(
+        &self,
+        path: &Path,
+        remaining_paths: &[RemainingBranchPath],
+    ) -> Result<bool> {
+        let mut entries = self.object_store().read_dir_all(path, None);
+        while let Some(entry) = entries.next().await {
+            let entry = entry?;
+            let Some(canonical_file) = self
+                .object_store()
+                .canonicalize_local_path(&entry.location)
+                .await?
+            else {
+                continue;
+            };
+            if remaining_paths.iter().any(|remaining| {
+                remaining
+                    .canonical_retained_dirs
+                    .iter()
+                    .any(|directory| canonical_file.starts_with(directory))
+            }) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn get_cleanup_path(
         branch: &str,
         remaining_branches: &[&str],
         base_location: &BranchLocation,
-    ) -> Result<Option<Path>> {
+    ) -> Result<BranchCleanup> {
         let deleted_branch = BranchRelativePath::new(branch);
+
+        // Older releases allowed branches like `a/data`, which overlap
+        // directories owned by their ancestors. Preserve those directories.
+        if let Some(owner) = Self::dataset_dir_owner(&deleted_branch, remaining_branches) {
+            log::warn!(
+                "Keeping {} after deleting branch {}, since it lies in a dataset directory of branch {}",
+                branch,
+                branch,
+                owner
+            );
+            return Ok(BranchCleanup::Skip);
+        }
+
         let mut related_branches = Vec::new();
         let mut relative_dir = branch.to_string();
-        for branch in remaining_branches {
-            let branch = BranchRelativePath::new(branch);
+        for remaining_branch in remaining_branches {
+            let branch = BranchRelativePath::new(remaining_branch);
             if branch.is_parent(&deleted_branch) || branch.is_child(&deleted_branch) {
                 related_branches.push(branch);
             } else if let Some(common_prefix) = deleted_branch.find_common_prefix(&branch) {
@@ -668,19 +972,21 @@ impl Branches<'_> {
         }
 
         related_branches.sort_by(|a, b| a.segments.len().cmp(&b.segments.len()).reverse());
-        if let Some(branch) = related_branches.first() {
-            if branch.is_child(&deleted_branch) || branch == &deleted_branch {
-                // There are children of the deleted branch, we can't delete any directory for now
-                // Example: deleted_branch = "a/b/c", remaining_branches = ["a/b/c/d"], we need to delete nothing
-                return Ok(None);
+        if let Some(related_branch) = related_branches.first() {
+            if related_branch == &deleted_branch {
+                return Ok(BranchCleanup::Skip);
+            } else if related_branch.is_child(&deleted_branch) {
+                // No single recursive deletion can preserve child branches.
+                let absolute_dir = base_location.find_branch(Some(branch))?;
+                return Ok(BranchCleanup::Selective(absolute_dir.path));
             } else {
                 // We pick the longest common directory between the deleted branch and the remaining branches
                 // Then delete the first child of this common directory
                 // Example: deleted_branch = "a/b/c", remaining_branches = ["a"], we need to delete "a/b"
                 relative_dir = format!(
                     "{}/{}",
-                    branch.segments.join("/"),
-                    deleted_branch.segments[branch.segments.len()]
+                    related_branch.segments.join("/"),
+                    deleted_branch.segments[related_branch.segments.len()]
                 );
             }
         } else if !deleted_branch.segments.is_empty() {
@@ -691,8 +997,91 @@ impl Branches<'_> {
         }
 
         let absolute_dir = base_location.find_branch(Some(relative_dir.as_str()))?;
-        Ok(Some(absolute_dir.path))
+        Ok(BranchCleanup::Recursive(absolute_dir.path))
     }
+
+    async fn classify_shared_branch_path(
+        &self,
+        path: &Path,
+        remaining_paths: &[RemainingBranchPath],
+    ) -> Result<SharedBranchPath> {
+        let canonical_path = self.object_store().canonicalize_local_path(path).await?;
+        if canonical_path.is_none()
+            && (self.object_store().is_local()
+                || self.object_store().scheme() == "file-object-store")
+        {
+            log::warn!("Keeping local branch directory {path}: cannot resolve filesystem identity");
+            return Ok(SharedBranchPath::Remaining);
+        }
+        let mut is_ancestor = false;
+        for remaining in remaining_paths {
+            if &remaining.path == path
+                || canonical_path
+                    .as_ref()
+                    .zip(remaining.canonical_path.as_ref())
+                    .is_some_and(|(path, remaining)| path == remaining)
+            {
+                return Ok(SharedBranchPath::Remaining);
+            }
+            if remaining.canonical_retained_dirs.iter().any(|directory| {
+                canonical_path
+                    .as_ref()
+                    .is_some_and(|current| current.starts_with(directory))
+            }) {
+                return Ok(SharedBranchPath::Remaining);
+            }
+            let is_logical_descendant =
+                remaining.is_named_branch && remaining.path.prefix_matches(path);
+            let is_physical_descendant = canonical_path
+                .as_ref()
+                .zip(remaining.canonical_path.as_ref())
+                .is_some_and(|(path, remaining)| remaining.starts_with(path));
+            let has_dataset_dir_descendant = canonical_path.as_ref().is_some_and(|current| {
+                remaining
+                    .canonical_retained_dirs
+                    .iter()
+                    .any(|directory| directory.starts_with(current))
+            });
+            is_ancestor |=
+                is_logical_descendant || is_physical_descendant || has_dataset_dir_descendant;
+        }
+        if is_ancestor {
+            Ok(SharedBranchPath::Ancestor)
+        } else {
+            Ok(SharedBranchPath::Unrelated)
+        }
+    }
+
+    fn dataset_dir_owner<'a>(
+        deleted_branch: &BranchRelativePath<'_>,
+        remaining_branches: &[&'a str],
+    ) -> Option<&'a str> {
+        remaining_branches.iter().copied().find(|remaining| {
+            let remaining = BranchRelativePath::new(remaining);
+            remaining.is_parent(deleted_branch)
+                && is_dataset_dir(deleted_branch.segments[remaining.segments.len()])
+        })
+    }
+}
+
+struct RemainingBranchPath {
+    path: Path,
+    canonical_path: Option<PathBuf>,
+    canonical_retained_dirs: Vec<PathBuf>,
+    is_named_branch: bool,
+}
+
+enum SharedBranchPath {
+    Remaining,
+    Ancestor,
+    Unrelated,
+}
+
+#[derive(Debug)]
+enum BranchCleanup {
+    Skip,
+    Recursive(Path),
+    Selective(Path),
 }
 
 #[derive(Debug, PartialEq)]
@@ -867,7 +1256,9 @@ impl BranchIdentifier {
         }
 
         let version_mapping = parts
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| {
                 let version = chunk[0].parse::<u64>().map_err(|e| Error::InvalidRef {
                     message: format!("Invalid version number '{}': {}", chunk[0], e),
@@ -890,7 +1281,8 @@ impl BranchIdentifier {
     }
 
     /// Collects all branches that reference this branch, returning (branch_name, version) tuples.
-    /// Results are in post-order traversal (deepest branches first).
+    /// Results are in post-order traversal (deepest branches first). Branches written without
+    /// an identifier are not ordered by depth, so one may come before its descendants.
     pub fn collect_referenced_versions(
         &self,
         branches: &HashMap<String, BranchContents>,
@@ -906,9 +1298,46 @@ impl BranchIdentifier {
             .filter_map(|(branch_id, name)| {
                 branch_id
                     .find_referenced_version(self)
+                    .or_else(|| {
+                        let branch = branches.get(&name)?;
+                        self.find_legacy_referenced_version(branch, branches)
+                    })
                     .map(|version| (name, version))
             })
             .collect()
+    }
+
+    /// Finds the version of this branch that a branch with a legacy root was created from.
+    ///
+    /// Branch files written without an identifier read back with a version-0 placeholder that
+    /// does not record the parent, and branches created from them later keep it as their first
+    /// entry. [`Self::find_referenced_version`] cannot match those against the ancestors of the
+    /// legacy branch, so follow `parent_branch` up to the branch created from this one.
+    fn find_legacy_referenced_version(
+        &self,
+        branch: &BranchContents,
+        branches: &HashMap<String, BranchContents>,
+    ) -> Option<u64> {
+        if branch.identifier == *self || branch.identifier.version_mapping.first()?.0 != 0 {
+            return None;
+        }
+        let mut child = branch;
+        // Deleting a branch and reusing its name can make `parent_branch` links cycle.
+        for _ in 0..branches.len() {
+            let parent = match child.parent_branch.as_deref() {
+                Some(name) => Some(branches.get(name)?),
+                None => None,
+            };
+            let is_created_from_self = match parent {
+                Some(parent) => parent.identifier == *self,
+                None => self.version_mapping.is_empty(),
+            };
+            if is_created_from_self {
+                return Some(child.parent_version);
+            }
+            child = parent?;
+        }
+        None
     }
 }
 
@@ -924,7 +1353,8 @@ pub fn tag_path(base_path: &Path, branch: &str) -> Path {
     base_tags_path(base_path).join(format!("{}.json", branch))
 }
 
-// Note: child will encode '/' to '%2F'
+// Path::join encodes '/' to '%2F'. Some object store adapters decode that
+// separator when translating the path into a provider key.
 pub fn branch_contents_path(base_path: &Path, branch: &str) -> Path {
     base_branches_contents_path(base_path).join(format!("{}.json", branch))
 }
@@ -1042,7 +1472,47 @@ pub fn check_valid_branch(branch_name: &str) -> Result<()> {
 
     if branch_name.eq("main") {
         return Err(Error::InvalidRef {
-            message: "Branch name cannot be 'main'".to_string(),
+            message: "\"main\" is reserved for the default branch; use a different branch name"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+const REFS_DIR: &str = "_refs";
+
+// Nested branches cannot use these names because they overlap
+// directories owned by their ancestors.
+const DATASET_DIRS: &[&str] = &[
+    DATA_DIR,
+    VERSIONS_DIR,
+    TRANSACTIONS_DIR,
+    DELETIONS_DIR,
+    INDICES_DIR,
+    BLOBS_DIR,
+    FRAG_REUSE_DIR,
+];
+
+fn is_dataset_dir(segment: &str) -> bool {
+    DATASET_DIRS
+        .iter()
+        .any(|directory| segment.eq_ignore_ascii_case(directory))
+        || is_mem_wal_dir_name(segment)
+}
+
+/// Only restrict new branches so older branch names remain accessible.
+pub(crate) fn check_new_branch(branch_name: &str) -> Result<()> {
+    check_valid_branch(branch_name)?;
+    if let Some(segment) = branch_name
+        .split('/')
+        .skip(1)
+        .find(|segment| is_dataset_dir(segment))
+    {
+        return Err(Error::InvalidRef {
+            message: format!(
+                "Branch '{}' cannot use reserved directory '{}' after the first segment",
+                branch_name, segment
+            ),
         });
     }
     Ok(())
@@ -1153,7 +1623,9 @@ mod tests {
             "normal",
             "with-dash",
             "with_underscore",
-            "with.dot"
+            "with.dot",
+            "data",
+            "_versions/child"
         )]
         branch_name: &str,
     ) {
@@ -1162,6 +1634,31 @@ mod tests {
             "Branch name '{}' should be valid",
             branch_name
         );
+        assert!(
+            check_new_branch(branch_name).is_ok(),
+            "Branch name '{}' should be creatable",
+            branch_name
+        );
+    }
+
+    #[rstest]
+    #[case::data("outer/data")]
+    #[case::data_case_alias("outer/Data")]
+    #[case::versions("outer/_versions")]
+    #[case::transactions("outer/_transactions")]
+    #[case::deletions("outer/_deletions")]
+    #[case::indices("outer/_indices")]
+    #[case::blobs("outer/_blobs")]
+    #[case::frag_reuse("outer/_fri")]
+    #[case::mem_wal("outer/_mem_wal")]
+    #[case::dir_id_mem_wal("outer/_a1b2c3d4_mem_wal")]
+    #[case::below_a_nested_branch("a/b/_indices")]
+    #[case::above_another_segment("a/data/b")]
+    fn new_branch_cannot_nest_in_a_dataset_directory(#[case] branch_name: &str) {
+        check_valid_branch(branch_name).unwrap();
+        let error = check_new_branch(branch_name).unwrap_err();
+        assert!(matches!(error, Error::InvalidRef { .. }), "{error}");
+        assert_contains!(error.to_string(), "after the first segment");
     }
 
     #[rstest]
@@ -1377,21 +1874,27 @@ mod tests {
     }
 
     #[rstest]
-    #[case("feature/auth", &["feature/auth/sub"], None)]
-    #[case("feature", &["feature/sub1", "feature/sub2"], None)]
-    #[case("a/b", &["a/b/c", "b/c/d"], None)]
-    #[case("main", &[], Some("main"))]
-    #[case("a", &["a"], None)]
-    #[case("feature/auth", &["feature/login", "feature/signup"], Some("feature/auth"))]
-    #[case("feature/sub", &["feature", "other"], Some("feature/sub"))]
-    #[case("very/long/common/prefix/branch1", &["very/long/common/prefix/branch2"], Some("very/long/common/prefix/branch1"))]
-    #[case("feature/auth/module", &["feature/other"], Some("feature/auth"))]
-    #[case("feature/dev", &["bugfix", "hotfix"], Some("feature"))]
-    #[case("branch1", &["dev/branch2", "feature/nathan/branch3", "branch4"], Some("branch1"))]
+    #[case("feature/auth", &["feature/auth/sub"], ExpectedCleanup::Selective("feature/auth"))]
+    #[case("feature", &["feature/sub1", "feature/sub2"], ExpectedCleanup::Selective("feature"))]
+    #[case("a/b", &["a/b/c", "b/c/d"], ExpectedCleanup::Selective("a/b"))]
+    #[case("main", &[], ExpectedCleanup::Recursive("main"))]
+    #[case("a", &["a"], ExpectedCleanup::Skip)]
+    #[case("feature/auth", &["feature/login", "feature/signup"], ExpectedCleanup::Recursive("feature/auth"))]
+    #[case("feature/sub", &["feature", "other"], ExpectedCleanup::Recursive("feature/sub"))]
+    #[case("very/long/common/prefix/branch1", &["very/long/common/prefix/branch2"], ExpectedCleanup::Recursive("very/long/common/prefix/branch1"))]
+    #[case("feature/auth/module", &["feature/other"], ExpectedCleanup::Recursive("feature/auth"))]
+    #[case("feature/dev", &["bugfix", "hotfix"], ExpectedCleanup::Recursive("feature"))]
+    #[case("branch1", &["dev/branch2", "feature/nathan/branch3", "branch4"], ExpectedCleanup::Recursive("branch1"))]
+    #[case::data_directory_of_a_remaining_parent("outer/data", &["outer"], ExpectedCleanup::Skip)]
+    #[case::dir_id_mem_wal_directory_of_a_remaining_parent("outer/_a1b2c3d4_mem_wal", &["outer"], ExpectedCleanup::Skip)]
+    #[case::versions_directory_of_a_nested_parent("a/b/_versions", &["a", "a/b", "c"], ExpectedCleanup::Skip)]
+    #[case::inside_the_data_directory_of_a_remaining_ancestor("a/data/x", &["a", "a/data/y"], ExpectedCleanup::Skip)]
+    #[case::directory_name_without_a_remaining_parent("outer/data", &["other"], ExpectedCleanup::Recursive("outer"))]
+    #[case::ordinary_name_below_a_directory_name("outer/data/x", &["outer/data"], ExpectedCleanup::Recursive("outer/data/x"))]
     fn test_get_cleanup_path(
         #[case] branch_to_delete: &str,
         #[case] remaining_branches: &[&str],
-        #[case] expected_relative_cleanup_path: Option<&str>,
+        #[case] expected: ExpectedCleanup,
     ) {
         let dataset_root_dir = "file:///var/balabala/dataset1".to_string();
         let base_location = BranchLocation {
@@ -1404,28 +1907,27 @@ mod tests {
             Branches::get_cleanup_path(branch_to_delete, remaining_branches, &base_location)
                 .unwrap();
 
-        match expected_relative_cleanup_path {
-            Some(expected_relative) => {
-                assert!(
-                    result.is_some(),
-                    "Expected cleanup path but got None for branch: {}",
-                    branch_to_delete
-                );
-                let expected_full_path = base_location
-                    .find_branch(Some(expected_relative))
-                    .unwrap()
-                    .path;
-                assert_eq!(result.unwrap().as_ref(), expected_full_path.as_ref());
+        match (expected, result) {
+            (ExpectedCleanup::Skip, BranchCleanup::Skip) => {}
+            (ExpectedCleanup::Recursive(relative), BranchCleanup::Recursive(actual))
+            | (ExpectedCleanup::Selective(relative), BranchCleanup::Selective(actual)) => {
+                let expected = base_location.find_branch(Some(relative)).unwrap().path;
+                assert_eq!(actual, expected);
             }
-            None => {
-                assert!(
-                    result.is_none(),
-                    "Expected no cleanup but got: {:?} for branch: {}",
-                    result,
-                    branch_to_delete
+            (expected, actual) => {
+                panic!(
+                    "Expected {:?} but got {:?} for branch {}",
+                    expected, actual, branch_to_delete
                 );
             }
         }
+    }
+
+    #[derive(Debug)]
+    enum ExpectedCleanup {
+        Skip,
+        Recursive(&'static str),
+        Selective(&'static str),
     }
 
     /// Build a reusable mocked BranchContents map mirroring cleanup::lineage_tests::build_lineage_datasets.
@@ -1527,5 +2029,88 @@ mod tests {
         assert_eq!(children[1].1, 1);
         assert_eq!(children[2].1, 1);
         assert_eq!(children[3].1, 1);
+    }
+
+    fn build_legacy_branch(
+        name: &str,
+        parent_branch: Option<&str>,
+        parent_version: u64,
+    ) -> BranchContents {
+        BranchContents {
+            parent_branch: parent_branch.map(String::from),
+            identifier: BranchIdentifier::synthetic_identifier(
+                name,
+                parent_branch,
+                parent_version,
+                0,
+            ),
+            parent_version,
+            create_at: 0,
+            manifest_size: 1,
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// `legacy` and `legacy/child` have no stored identifier; `new_child` was created from
+    /// `legacy` after identifiers were introduced.
+    ///
+    ///    main:v3 ──▶ legacy ─┬─ legacy:v2 ──▶ legacy/child
+    ///                        └─ legacy:v4 ──▶ new_child
+    fn build_legacy_branch_contents() -> HashMap<String, BranchContents> {
+        let mut contents = HashMap::new();
+        contents.insert("legacy".to_string(), build_legacy_branch("legacy", None, 3));
+        contents.insert(
+            "legacy/child".to_string(),
+            build_legacy_branch("legacy/child", Some("legacy"), 2),
+        );
+        let new_child = BranchContents {
+            identifier: BranchIdentifier::new(&contents["legacy"].identifier, 4),
+            ..build_legacy_branch("new_child", Some("legacy"), 4)
+        };
+        contents.insert("new_child".to_string(), new_child);
+        contents
+    }
+
+    #[rstest]
+    #[case::main(None, &[("legacy", 3), ("legacy/child", 3), ("new_child", 3)])]
+    #[case::legacy(Some("legacy"), &[("legacy/child", 2), ("new_child", 4)])]
+    #[case::legacy_child(Some("legacy/child"), &[])]
+    #[case::new_child(Some("new_child"), &[])]
+    fn test_collect_children_for_legacy_branches(
+        #[case] branch: Option<&str>,
+        #[case] expected: &[(&str, u64)],
+    ) {
+        let all_branches = build_legacy_branch_contents();
+        let root_id = branch.map_or_else(BranchIdentifier::main, |name| {
+            all_branches[name].identifier.clone()
+        });
+        let mut children = root_id.collect_referenced_versions(&all_branches);
+        children.sort();
+        let expected = expected
+            .iter()
+            .map(|(name, version)| (name.to_string(), *version))
+            .collect::<Vec<_>>();
+        assert_eq!(children, expected);
+    }
+
+    #[test]
+    fn test_collect_children_for_legacy_branch_cycle() {
+        // Deleting a branch and reusing its name can leave `parent_branch` links in a cycle.
+        // Neither branch leads back to main, so the walk must stop and report nothing.
+        let all_branches = HashMap::from([
+            ("a".to_string(), build_legacy_branch("a", Some("b"), 1)),
+            ("b".to_string(), build_legacy_branch("b", Some("a"), 2)),
+        ]);
+        assert!(
+            BranchIdentifier::main()
+                .collect_referenced_versions(&all_branches)
+                .is_empty()
+        );
+        // A branch never references itself, even when the cycle leads back to it.
+        let a_id = all_branches["a"].identifier.clone();
+        assert_eq!(
+            a_id.collect_referenced_versions(&all_branches),
+            vec![("b".to_string(), 2)]
+        );
     }
 }

@@ -327,6 +327,7 @@
 .ld-sidenav-toggle svg { transition: transform var(--dur-fast) var(--ease-out); }
 .ld-sidenav-toggle.open svg { transform: rotate(180deg); }
 .ld-sidenav__group { margin-bottom: 6px; }
+.ld-sidenav__group .ld-sidenav__group { margin-left: 12px; }
 .ld-sidenav__label {
   font-family: var(--font-mono);
   font-size: 10.5px;
@@ -776,7 +777,7 @@
     padding: 0 0 20px;
   }
   .ld-sidenav.open { display: block; }
-  .ld-sidenav__group:first-child .ld-sidenav__label { margin-top: 16px; }
+  .ld-sidenav > .ld-sidenav__group:first-child > .ld-sidenav__label { margin-top: 16px; }
   .ld-article-col { padding-top: 24px; }
 
   .ld-hero, .ld-band, .ld-what, .ld-features { padding-left: 20px; padding-right: 20px; }

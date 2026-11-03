@@ -30,6 +30,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 
 /** Scanner over a Fragment. */
 public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
@@ -64,6 +65,8 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
           createScanner(
               dataset,
               options.getFragmentIds(),
+              options.getFragmentSlices(),
+              options.getIndexSegments(),
               options.getColumns(),
               options.getSubstraitFilter(),
               options.getFilter(),
@@ -83,6 +86,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
               options.getLateMaterialization(),
               options.getColumnOrderings(),
               options.isUseScalarIndex(),
+              options.getIgnoredScalarIndices(),
               options.isFastSearch(),
               options.getSubstraitAggregate(),
               options.isCollectStats(),
@@ -99,6 +103,8 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
   static native LanceScanner createScanner(
       Dataset dataset,
       Optional<List<Integer>> fragmentIds,
+      Optional<List<FragmentSlice>> fragmentSlices,
+      Optional<List<UUID>> indexSegments,
       Optional<List<String>> columns,
       Optional<ByteBuffer> substraitFilter,
       Optional<String> filter,
@@ -118,6 +124,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
       Optional<MaterializationStyle> lateMaterialization,
       Optional<List<ColumnOrdering>> columnOrderings,
       boolean useScalarIndex,
+      Optional<List<String>> ignoredScalarIndices,
       boolean fastSearch,
       Optional<ByteBuffer> substraitAggregate,
       boolean collectStats,

@@ -240,6 +240,7 @@ public class UpdateTest extends OperationTestBase {
                       .updatedFragments(
                           Collections.singletonList(updateResult.getUpdatedFragment()))
                       .fieldsModified(updateResult.getFieldsModified())
+                      .updateMode(Optional.of(UpdateMode.RewriteColumns))
                       .build())
               .build()) {
         try (Dataset dataset = new CommitBuilder(this.dataset).execute(updateTxn)) {

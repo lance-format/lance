@@ -6,200 +6,37 @@
 use std::{
     collections::HashMap,
     fmt::{self, Formatter},
-    num::NonZero,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
 use chrono::{DateTime, Utc};
 
-use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::{
     catalog::{TableProvider, streaming::StreamingTable},
     dataframe::DataFrame,
-    execution::{
-        TaskContext,
-        context::{SessionConfig, SessionContext},
-        disk_manager::DiskManagerBuilder,
-        memory_pool::FairSpillPool,
-        runtime_env::RuntimeEnvBuilder,
-    },
+    execution::{TaskContext, context::SessionContext},
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
-        SendableRecordBatchStream,
-        analyze::AnalyzeExec,
-        coalesce_partitions::CoalescePartitionsExec,
-        display::DisplayableExecutionPlan,
-        execution_plan::{Boundedness, CardinalityEffect, EmissionType},
-        metrics::MetricValue,
-        sorts::sort_preserving_merge::SortPreservingMergeExec,
-        stream::RecordBatchStreamAdapter,
-        streaming::PartitionStream,
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+        analyze::AnalyzeExec, coalesce_partitions::CoalescePartitionsExec, metrics::MetricType,
+        metrics::MetricValue, stream::RecordBatchStreamAdapter, streaming::PartitionStream,
     },
 };
-use datafusion::{execution::memory_pool::TrackConsumersPool, physical_plan::metrics::MetricType};
-use datafusion_common::{DataFusionError, Statistics};
-use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
-
-use futures::{StreamExt, stream};
-use lance_arrow::SchemaExt;
-use lance_core::{
-    Error, Result,
-    utils::{
-        futures::FinallyStreamExt,
-        tracing::{EXECUTION_PLAN_RUN, StreamTracingExt, TRACE_EXECUTION},
-    },
-};
-use log::{debug, info, warn};
+use datafusion_common::config::ConfigNonZeroUsize;
+use futures::StreamExt;
+use lance_core::{Error, Result, utils::tracing::StreamTracingExt};
 use tracing::Span;
 
-use crate::udf::register_functions;
-use crate::{
-    chunker::StrictBatchSizeStream,
-    utils::{
-        BYTES_READ_METRIC, INDEX_CACHE_HITS_METRIC, INDEX_CACHE_MISSES_METRIC,
-        INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC, MetricsExt,
-        PARTS_LOADED_METRIC, REQUESTS_METRIC,
-    },
+pub use lance_datafusion_exec::exec::{
+    ExecutionStatsCallback, ExecutionSummaryCounts, HardCapBatchSizeExec, LanceExecutionOptions,
+    OneShotExec, StrictBatchSizeExec, collect_execution_metrics,
 };
+use lance_datafusion_exec::exec::{execute_plan_with_context, new_runtime_env, new_session_config};
 
-/// An source execution node created from an existing stream
-///
-/// It can only be used once, and will return the stream.  After that the node
-/// is exhausted.
-///
-/// Note: the stream should be finite, otherwise we will report datafusion properties
-/// incorrectly.
-pub struct OneShotExec {
-    stream: Mutex<Option<SendableRecordBatchStream>>,
-    // We save off a copy of the schema to speed up formatting and so ExecutionPlan::schema & display_as
-    // can still function after exhausted
-    schema: Arc<ArrowSchema>,
-    properties: Arc<PlanProperties>,
-}
-
-impl OneShotExec {
-    /// Create a new instance from a given stream
-    pub fn new(stream: SendableRecordBatchStream) -> Self {
-        let schema = stream.schema();
-        Self {
-            stream: Mutex::new(Some(stream)),
-            schema: schema.clone(),
-            properties: Arc::new(PlanProperties::new(
-                EquivalenceProperties::new(schema),
-                Partitioning::RoundRobinBatch(1),
-                EmissionType::Incremental,
-                Boundedness::Bounded,
-            )),
-        }
-    }
-
-    pub fn from_batch(batch: RecordBatch) -> Self {
-        let schema = batch.schema();
-        let stream = Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream::iter(vec![Ok(batch)]),
-        ));
-        Self::new(stream)
-    }
-}
-
-impl std::fmt::Debug for OneShotExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let stream = self.stream.lock().unwrap();
-        f.debug_struct("OneShotExec")
-            .field("exhausted", &stream.is_none())
-            .field("schema", self.schema.as_ref())
-            .finish()
-    }
-}
-
-impl DisplayAs for OneShotExec {
-    fn fmt_as(
-        &self,
-        t: datafusion::physical_plan::DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
-        let stream = self.stream.lock().unwrap();
-        let exhausted = if stream.is_some() { "" } else { "EXHAUSTED" };
-        let columns = self
-            .schema
-            .field_names()
-            .iter()
-            .cloned()
-            .cloned()
-            .collect::<Vec<_>>();
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(
-                    f,
-                    "OneShotStream: {}columns=[{}]",
-                    exhausted,
-                    columns.join(",")
-                )
-            }
-            DisplayFormatType::TreeRender => {
-                write!(
-                    f,
-                    "OneShotStream\nexhausted={}\ncolumns=[{}]",
-                    exhausted,
-                    columns.join(",")
-                )
-            }
-        }
-    }
-}
-
-impl ExecutionPlan for OneShotExec {
-    fn name(&self) -> &str {
-        "OneShotExec"
-    }
-
-    fn schema(&self) -> arrow_schema::SchemaRef {
-        self.schema.clone()
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        // OneShotExec has no children, so this should only be called with an empty vector
-        if !children.is_empty() {
-            return Err(datafusion_common::DataFusionError::Internal(
-                "OneShotExec does not support children".to_string(),
-            ));
-        }
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        _partition: usize,
-        _context: Arc<datafusion::execution::TaskContext>,
-    ) -> datafusion_common::Result<SendableRecordBatchStream> {
-        let stream = self
-            .stream
-            .lock()
-            .map_err(|err| DataFusionError::Execution(err.to_string()))?
-            .take();
-        if let Some(stream) = stream {
-            Ok(stream)
-        } else {
-            Err(DataFusionError::Execution(
-                "OneShotExec has already been executed".to_string(),
-            ))
-        }
-    }
-
-    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
-        &self.properties
-    }
-}
+use crate::udf::register_functions;
 
 struct TracedExec {
     input: Arc<dyn ExecutionPlan>,
@@ -251,6 +88,13 @@ impl ExecutionPlan for TracedExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion_common::Result<TreeNodeRecursion>,
+    ) -> datafusion_common::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -275,115 +119,10 @@ impl ExecutionPlan for TracedExec {
     }
 }
 
-/// Callback for reporting statistics after a scan
-pub type ExecutionStatsCallback = Arc<dyn Fn(&ExecutionSummaryCounts) + Send + Sync>;
-
-#[derive(Default, Clone)]
-pub struct LanceExecutionOptions {
-    pub use_spilling: bool,
-    pub mem_pool_size: Option<u64>,
-    pub max_temp_directory_size: Option<u64>,
-    pub batch_size: Option<usize>,
-    pub target_partition: Option<usize>,
-    pub execution_stats_callback: Option<ExecutionStatsCallback>,
-    pub skip_logging: bool,
-}
-
-impl std::fmt::Debug for LanceExecutionOptions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LanceExecutionOptions")
-            .field("use_spilling", &self.use_spilling)
-            .field("mem_pool_size", &self.mem_pool_size)
-            .field("max_temp_directory_size", &self.max_temp_directory_size)
-            .field("batch_size", &self.batch_size)
-            .field("target_partition", &self.target_partition)
-            .field("skip_logging", &self.skip_logging)
-            .field(
-                "execution_stats_callback",
-                &self.execution_stats_callback.is_some(),
-            )
-            .finish()
-    }
-}
-
-const DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION: u64 = 150 * 1024 * 1024;
-const DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB
-
-impl LanceExecutionOptions {
-    pub fn mem_pool_size(&self) -> u64 {
-        let num_partitions = self.target_partition.unwrap_or(1) as u64;
-        self.mem_pool_size.unwrap_or_else(|| {
-            std::env::var("LANCE_MEM_POOL_SIZE")
-                .map(|s| match s.parse::<u64>() {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!("Failed to parse LANCE_MEM_POOL_SIZE: {}, using default", e);
-                        DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION * num_partitions
-                    }
-                })
-                .unwrap_or(DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION * num_partitions)
-        })
-    }
-
-    pub fn max_temp_directory_size(&self) -> u64 {
-        self.max_temp_directory_size.unwrap_or_else(|| {
-            std::env::var("LANCE_MAX_TEMP_DIRECTORY_SIZE")
-                .map(|s| match s.parse::<u64>() {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(
-                            "Failed to parse LANCE_MAX_TEMP_DIRECTORY_SIZE: {}, using default",
-                            e
-                        );
-                        DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE
-                    }
-                })
-                .unwrap_or(DEFAULT_LANCE_MAX_TEMP_DIRECTORY_SIZE)
-        })
-    }
-
-    pub fn use_spilling(&self) -> bool {
-        if !self.use_spilling {
-            return false;
-        }
-        std::env::var("LANCE_BYPASS_SPILLING")
-            .map(|_| {
-                info!("Bypassing spilling because LANCE_BYPASS_SPILLING is set");
-                false
-            })
-            .unwrap_or(true)
-    }
-}
-
 pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
-    let mut session_config = SessionConfig::new();
-    let mut runtime_env_builder = RuntimeEnvBuilder::new();
-    if let Some(target_partition) = options.target_partition {
-        session_config = session_config.with_target_partitions(target_partition);
-    }
-    if options.use_spilling() {
-        // The default 10MB sort spill reservation seems to be too small for many common cases.
-        //
-        // There currently is no reasonable guidance provided by DataFusion for setting this value.
-        // We bump this to 40MB but try a smaller value if the mem pool is small.
-        let sort_spill_reservation_bytes =
-            (options.mem_pool_size() / 3).min(40 * 1024 * 1024) as usize;
-        session_config =
-            session_config.with_sort_spill_reservation_bytes(sort_spill_reservation_bytes);
-        let disk_manager_builder = DiskManagerBuilder::default()
-            .with_max_temp_directory_size(options.max_temp_directory_size());
-        runtime_env_builder = runtime_env_builder
-            .with_disk_manager_builder(disk_manager_builder)
-            .with_memory_pool(Arc::new(TrackConsumersPool::new(
-                FairSpillPool::new(options.mem_pool_size() as usize),
-                NonZero::try_from(16).unwrap(),
-            )));
-    }
-    let runtime_env = runtime_env_builder.build_arc().unwrap();
-
-    let ctx = SessionContext::new_with_config_rt(session_config, runtime_env);
+    let ctx =
+        SessionContext::new_with_config_rt(new_session_config(options), new_runtime_env(options));
     register_functions(&ctx);
-
     ctx
 }
 
@@ -393,7 +132,6 @@ struct SessionContextCacheKey {
     mem_pool_size: u64,
     max_temp_directory_size: u64,
     target_partition: Option<usize>,
-    use_spilling: bool,
 }
 
 impl SessionContextCacheKey {
@@ -402,7 +140,6 @@ impl SessionContextCacheKey {
             mem_pool_size: options.mem_pool_size(),
             max_temp_directory_size: options.max_temp_directory_size(),
             target_partition: options.target_partition,
-            use_spilling: options.use_spilling(),
         }
     }
 }
@@ -429,7 +166,13 @@ fn get_max_cache_size() -> usize {
     })
 }
 
+/// Reuses unbounded sessions, while giving each spilling caller a fresh bounded
+/// memory pool so concurrent sorts cannot consume each other's headroom.
 pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
+    if options.use_spilling() {
+        return new_session_context(options);
+    }
+
     let key = SessionContextCacheKey::from_options(options);
     let mut cache = get_session_cache()
         .lock()
@@ -462,266 +205,77 @@ pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
     context
 }
 
+/// Returns a new task context to execute one plan with `options`.
+///
+/// Every execution needs its own context: Lance operators treat a task
+/// context's identity as the identity of one plan execution, for example to
+/// share a MultiMatch prefilter mask only between the fields of one query.
 fn get_task_context(
     session_ctx: &SessionContext,
     options: &LanceExecutionOptions,
-) -> Arc<TaskContext> {
-    let mut state = session_ctx.state();
-    if let Some(batch_size) = options.batch_size.as_ref() {
-        state.config_mut().options_mut().execution.batch_size = *batch_size;
-    }
-
-    state.task_ctx()
+) -> Result<Arc<TaskContext>> {
+    // Build from the session state in place. `SessionContext::state` would clone
+    // the whole state (every function map, rule list and option) only to drop
+    // it, which is a measurable share of CPU for short queries.
+    let task_ctx = TaskContext::from(session_ctx);
+    let Some(batch_size) = options.validated_batch_size()? else {
+        return Ok(Arc::new(task_ctx));
+    };
+    let batch_size = ConfigNonZeroUsize::try_new(batch_size).map_err(|_| {
+        Error::invalid_input(format!(
+            "LanceExecutionOptions.batch_size must be greater than 0, got {batch_size}"
+        ))
+    })?;
+    let mut session_config = task_ctx.session_config().clone();
+    session_config.options_mut().execution.batch_size = batch_size;
+    Ok(Arc::new(task_ctx.with_session_config(session_config)))
 }
 
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
-pub struct ExecutionSummaryCounts {
-    /// The number of I/O operations performed
-    pub iops: usize,
-    /// The number of requests made to the storage layer (may be larger or smaller than iops
-    /// depending on coalescing configuration)
-    pub requests: usize,
-    /// The number of bytes read during the execution of the plan
-    pub bytes_read: usize,
-    /// The number of top-level indices loaded
-    pub indices_loaded: usize,
-    /// The number of index partitions loaded
-    pub parts_loaded: usize,
-    /// The number of index comparisons performed (the exact meaning depends on the index type)
-    pub index_comparisons: usize,
-    /// Additional metrics for more detailed statistics.  These are subject to change in the future
-    /// and should only be used for debugging purposes.
-    ///
-    /// Newer metrics (e.g. [`INDEX_CACHE_HITS_METRIC`], [`INDEX_CACHE_MISSES_METRIC`]) are added
-    /// here rather than as `pub` fields, so this struct stays backwards compatible for callers
-    /// that construct or destructure it. Prefer the typed accessors below.
-    pub all_counts: HashMap<String, usize>,
-    /// Additional time metrics for more detailed statistics, stored in nanoseconds.
-    /// These are subject to change in the future and should only be used for debugging purposes.
-    pub all_times: HashMap<String, usize>,
-}
-
-impl ExecutionSummaryCounts {
-    /// Number of index cache page lookups where the loader was not executed
-    /// (per-page granularity).
-    ///
-    /// A "hit" is any page-level lookup at an instrumented cache boundary that
-    /// did not run the loader on this call. That covers both a true cache hit
-    /// on an already-populated entry and a coalesced concurrent load where an
-    /// in-flight loader started by a different caller produced the value.
-    ///
-    /// Instrumented boundaries in this release:
-    /// BTree page, IVF partition (v2, `write_cache=true` scan path), inverted
-    /// posting list (grouped and per-token), inverted per-token metadata
-    /// (`PostingMetadataKey`), inverted phrase positions (`PositionKey`),
-    /// bitmap posting (Equals / Range / IsIn), ngram posting, and rtree page
-    /// / null slot.
-    ///
-    /// Caveats:
-    /// * IVF v2 streaming scans and legacy v1 IVF partitions run
-    ///   `load_partition` with `write_cache=false`. Those loads always execute
-    ///   the loader and never write the result back, so they are reported as a
-    ///   miss on every call. See [`Self::index_cache_hit_ratio`].
-    /// * A cold posting-list lookup on the grouped inverted layout can record
-    ///   up to two misses (posting-list group + per-token metadata) for a
-    ///   single term.
-    ///
-    /// Other index cache boundaries such as HNSW graph pages and quantizer
-    /// codebooks are not yet instrumented; a scan that only touches those
-    /// paths returns `0` here.
-    pub fn index_cache_hits(&self) -> usize {
-        self.all_counts
-            .get(INDEX_CACHE_HITS_METRIC)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Number of index cache page lookups that had to execute the loader
-    /// (per-page granularity).
-    ///
-    /// A "miss" is any page-level lookup at an instrumented cache boundary
-    /// where the loader ran, i.e. the page was not resident and had to be
-    /// materialised (typically from storage). See
-    /// [`Self::index_cache_hits`] for the paired counter and the list of
-    /// instrumented boundaries.
-    pub fn index_cache_misses(&self) -> usize {
-        self.all_counts
-            .get(INDEX_CACHE_MISSES_METRIC)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Ratio of index cache hits to total lookups. Returns `0.0` when no lookups
-    /// were recorded in this scan.
-    ///
-    /// This ratio only reflects paths that write their result back to the
-    /// index cache. Streaming scans (IVF v2 `write_cache=false` and legacy v1
-    /// IVF `load_partition_stream`) intentionally bypass the cache and are
-    /// counted as misses on every call, so a workload dominated by streaming
-    /// vector scans will report a hit ratio near `0.0` regardless of cache
-    /// size.
-    pub fn index_cache_hit_ratio(&self) -> f32 {
-        // Widen to u128 before summing so a pathological (hits + misses)
-        // overflow can't panic in debug builds nor wrap in release builds.
-        let hits = self.index_cache_hits() as u128;
-        let total = hits + self.index_cache_misses() as u128;
-        if total == 0 {
-            0.0
-        } else {
-            hits as f32 / total as f32
-        }
-    }
-}
-
-pub fn collect_execution_metrics(node: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
-    if let Some(metrics) = node.metrics() {
-        for (metric_name, count) in metrics.iter_counts() {
-            match metric_name.as_ref() {
-                IOPS_METRIC => counts.iops += count.value(),
-                REQUESTS_METRIC => counts.requests += count.value(),
-                BYTES_READ_METRIC => counts.bytes_read += count.value(),
-                INDICES_LOADED_METRIC => counts.indices_loaded += count.value(),
-                PARTS_LOADED_METRIC => counts.parts_loaded += count.value(),
-                INDEX_COMPARISONS_METRIC => counts.index_comparisons += count.value(),
-                _ => {
-                    let existing = counts
-                        .all_counts
-                        .entry(metric_name.as_ref().to_string())
-                        .or_insert(0);
-                    *existing += count.value();
-                }
-            }
-        }
-        for (metric_name, time) in metrics.iter_times() {
-            let existing = counts
-                .all_times
-                .entry(metric_name.as_ref().to_string())
-                .or_insert(0);
-            *existing += time.value();
-        }
-        // Include gauge-based I/O metrics (some nodes record I/O as gauges)
-        for (metric_name, gauge) in metrics.iter_gauges() {
-            match metric_name.as_ref() {
-                IOPS_METRIC => counts.iops += gauge.value(),
-                REQUESTS_METRIC => counts.requests += gauge.value(),
-                BYTES_READ_METRIC => counts.bytes_read += gauge.value(),
-                _ => {}
-            }
-        }
-    }
-    for child in node.children() {
-        collect_execution_metrics(child.as_ref(), counts);
-    }
-}
-
-fn report_plan_summary_metrics(plan: &dyn ExecutionPlan, options: &LanceExecutionOptions) {
-    let output_rows = plan
-        .metrics()
-        .map(|m| m.output_rows().unwrap_or(0))
-        .unwrap_or(0);
-    let mut counts = ExecutionSummaryCounts::default();
-    collect_execution_metrics(plan, &mut counts);
-    if !options.skip_logging {
-        tracing::info!(
-            target: TRACE_EXECUTION,
-            r#type = EXECUTION_PLAN_RUN,
-            plan_summary = display_plan_one_liner(plan),
-            output_rows,
-            iops = counts.iops,
-            requests = counts.requests,
-            bytes_read = counts.bytes_read,
-            indices_loaded = counts.indices_loaded,
-            parts_loaded = counts.parts_loaded,
-            index_comparisons = counts.index_comparisons,
-            index_cache_hits = counts.index_cache_hits(),
-            index_cache_misses = counts.index_cache_misses(),
-        );
-    }
-    if let Some(callback) = options.execution_stats_callback.as_ref() {
-        callback(&counts);
-    }
-}
-
-/// Create a one-line rough summary of the given execution plan.
+/// Executes a plan under a task context of the cached session for `options`,
+/// which has Lance's functions registered.
 ///
-/// The summary just shows the name of the operators in the plan. It omits any
-/// details such as parameters or schema information.
-///
-/// Example: `Projection(Take(CoalesceBatches(Filter(LanceScan))))`
-fn display_plan_one_liner(plan: &dyn ExecutionPlan) -> String {
-    let mut output = String::new();
-
-    display_plan_one_liner_impl(plan, &mut output);
-
-    output
-}
-
-fn display_plan_one_liner_impl(plan: &dyn ExecutionPlan, output: &mut String) {
-    // Remove the "Exec" suffix from the plan name if present for brevity
-    let name = plan.name().trim_end_matches("Exec");
-    output.push_str(name);
-
-    let children = plan.children();
-    if !children.is_empty() {
-        output.push('(');
-        for (i, child) in children.iter().enumerate() {
-            if i > 0 {
-                output.push(',');
-            }
-            display_plan_one_liner_impl(child.as_ref(), output);
-        }
-        output.push(')');
-    }
-}
-
-/// Executes a plan using default session & runtime configuration
-///
-/// Only executes a single partition.  Panics if the plan has more than one partition.
+/// See [`execute_plan_with_context`] for how partitions and metrics are handled.
 pub fn execute_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
 ) -> Result<SendableRecordBatchStream> {
-    if !options.skip_logging {
-        debug!(
-            "Executing plan:\n{}",
-            DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
-        );
-    }
+    let task_context = get_task_context(&get_session_context(&options), &options)?;
+    execute_plan_with_context(plan, options, task_context)
+}
 
-    let session_ctx = get_session_context(&options);
-
-    // Coalesce to a single partition if the optimizer left more than one.
-    // EnforceDistribution may remove RepartitionExec(1) nodes when the parent
-    // declares UnspecifiedDistribution, leaving multi-partition plans here.
-    //
-    // If the plan carries an output ordering (e.g. a top-k `SortExec` whose
-    // result was later repartitioned to parallelize downstream operators),
-    // a plain `CoalescePartitionsExec` would scramble that order because it
-    // merges partitions in scheduling-dependent order. Use an order-preserving
-    // merge in that case instead, mirroring what `EnforceDistribution` itself
-    // does when it needs to merge an ordered, multi-partition plan.
-    let plan: Arc<dyn ExecutionPlan> = if plan.properties().partitioning.partition_count() == 1 {
-        plan
-    } else if let Some(ordering) = plan.output_ordering() {
-        Arc::new(SortPreservingMergeExec::new(ordering.clone(), plan))
-    } else {
-        Arc::new(CoalescePartitionsExec::new(plan))
-    };
-
-    let stream = plan.execute(0, get_task_context(&session_ctx, &options))?;
-
-    let schema = stream.schema();
-    let stream = stream.finally(move || {
-        if !options.skip_logging || options.execution_stats_callback.is_some() {
-            report_plan_summary_metrics(plan.as_ref(), &options);
-        }
-    });
-    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+/// Executes a plan with an existing session context.
+///
+/// This is useful when resources created outside the physical plan, such as
+/// replay spill files, must share the context's memory or disk managers with
+/// operators in the plan. `options` must describe the supplied context.
+pub fn execute_plan_with_session_context(
+    plan: Arc<dyn ExecutionPlan>,
+    options: LanceExecutionOptions,
+    session_ctx: &SessionContext,
+) -> Result<SendableRecordBatchStream> {
+    let task_context = get_task_context(session_ctx, &options)?;
+    execute_plan_with_context(plan, options, task_context)
 }
 
 pub async fn analyze_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
+) -> Result<String> {
+    analyze_plan_with_context(plan, options, None).await
+}
+
+/// Analyze a plan, optionally under a caller-provided [`TaskContext`].
+///
+/// When `task_context` is `Some`, the plan executes under it instead of the
+/// context derived from `options`. Callers whose nodes read session-config
+/// extensions at execution time (e.g. distributed routing identity) must pass
+/// the context carrying those extensions; otherwise the nodes error during
+/// `execute` and `AnalyzeExec` reports an empty, unexecuted plan tree instead
+/// of surfacing the error.
+pub async fn analyze_plan_with_context(
+    plan: Arc<dyn ExecutionPlan>,
+    options: LanceExecutionOptions,
+    task_context: Option<Arc<TaskContext>>,
 ) -> Result<String> {
     // This is needed as AnalyzeExec launches a thread task per
     // partition, and we want these to be connected to the parent span
@@ -729,19 +283,20 @@ pub async fn analyze_plan(
 
     let schema = plan.schema();
     // TODO(tsaucer) I chose SUMMARY here but do we also want DEV?
-    let analyze = Arc::new(AnalyzeExec::new(
-        true,
-        true,
-        vec![MetricType::Summary],
-        None,
-        plan,
-        schema,
-    ));
+    let analyze = Arc::new(
+        AnalyzeExec::builder(true, true, plan, schema)
+            .with_metric_types(vec![MetricType::Summary])
+            .build(),
+    );
 
     let session_ctx = get_session_context(&options);
+    let task_context = match task_context {
+        Some(task_context) => task_context,
+        None => get_task_context(&session_ctx, &options)?,
+    };
     assert_eq!(analyze.properties().partitioning.partition_count(), 1);
     let mut stream = analyze
-        .execute(0, get_task_context(&session_ctx, &options))
+        .execute(0, task_context)
         .map_err(|err| Error::io(format!("Failed to execute analyze plan: {}", err)))?;
 
     // fully execute the plan
@@ -1003,212 +558,17 @@ pub async fn provider_to_stream(
     Ok(plan.execute(0, ctx.task_ctx())?)
 }
 
-#[derive(Clone, Debug)]
-pub struct StrictBatchSizeExec {
-    input: Arc<dyn ExecutionPlan>,
-    batch_size: usize,
-}
-
-impl StrictBatchSizeExec {
-    pub fn new(input: Arc<dyn ExecutionPlan>, batch_size: usize) -> Self {
-        Self { input, batch_size }
-    }
-}
-
-impl DisplayAs for StrictBatchSizeExec {
-    fn fmt_as(
-        &self,
-        _t: datafusion::physical_plan::DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
-        write!(f, "StrictBatchSizeExec")
-    }
-}
-
-impl ExecutionPlan for StrictBatchSizeExec {
-    fn name(&self) -> &str {
-        "StrictBatchSizeExec"
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        self.input.properties()
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self {
-            input: children[0].clone(),
-            batch_size: self.batch_size,
-        }))
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> datafusion_common::Result<SendableRecordBatchStream> {
-        let stream = self.input.execute(partition, context)?;
-        let schema = stream.schema();
-        let stream = StrictBatchSizeStream::new(stream, self.batch_size);
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
-    }
-
-    fn maintains_input_order(&self) -> Vec<bool> {
-        vec![true]
-    }
-
-    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![false]
-    }
-
-    fn partition_statistics(
-        &self,
-        partition: Option<usize>,
-    ) -> datafusion_common::Result<std::sync::Arc<Statistics>> {
-        self.input.partition_statistics(partition)
-    }
-
-    fn cardinality_effect(&self) -> CardinalityEffect {
-        CardinalityEffect::Equal
-    }
-
-    fn supports_limit_pushdown(&self) -> bool {
-        true
-    }
-}
-
-/// Exec node that rechunks batches so no output batch exceeds `max_bytes`.
-///
-/// # Why this exists
-///
-/// DataFusion's sort operator cannot handle batches larger than the memory
-/// pool size.  When upstream operators produce very large batches this can
-/// cause the sort to fail.  This node caps batch sizes
-/// *before* the sort so the operation succeeds.  The trade-off is a
-/// potentially expensive deep copy of the batch data — see below — but that
-/// is preferable to failing the operation entirely.  This workaround may
-/// become unnecessary if a fix is upstreamed to DataFusion.
-///
-/// # Deep copy
-///
-/// After slicing a RecordBatch, `get_array_memory_size` still reports the
-/// size of the *original* backing buffers, not the slice.  To get accurate
-/// sizes the slices must be deep-copied.  This is a last resort and can be
-/// expensive for large batches, but the deep copy is only performed when a
-/// batch actually needs to be sliced — batches that are already within the
-/// target range pass through at zero cost.
-///
-/// If a single row exceeds `max_bytes`, execution fails with an error.
-#[derive(Clone, Debug)]
-pub struct HardCapBatchSizeExec {
-    input: Arc<dyn ExecutionPlan>,
-    max_bytes: usize,
-}
-
-impl HardCapBatchSizeExec {
-    pub fn new(input: Arc<dyn ExecutionPlan>, max_bytes: usize) -> Self {
-        Self { input, max_bytes }
-    }
-}
-
-impl DisplayAs for HardCapBatchSizeExec {
-    fn fmt_as(
-        &self,
-        _t: datafusion::physical_plan::DisplayFormatType,
-        f: &mut std::fmt::Formatter,
-    ) -> std::fmt::Result {
-        write!(f, "HardCapBatchSizeExec(max_bytes={})", self.max_bytes)
-    }
-}
-
-impl ExecutionPlan for HardCapBatchSizeExec {
-    fn name(&self) -> &str {
-        "HardCapBatchSizeExec"
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        self.input.properties()
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self {
-            input: children[0].clone(),
-            max_bytes: self.max_bytes,
-        }))
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> datafusion_common::Result<SendableRecordBatchStream> {
-        let stream = self.input.execute(partition, context)?;
-        let schema = stream.schema();
-        let max_bytes = self.max_bytes;
-        let rechunked = lance_arrow::stream::rechunk_stream_by_size_deep_copy(
-            stream,
-            schema.clone(),
-            0,
-            max_bytes,
-        );
-        // Check that no single-row batch exceeds the limit.
-        let validated = rechunked.map(move |result| {
-            let batch = result?;
-            if batch.num_rows() == 1 && batch.get_array_memory_size() > max_bytes {
-                return Err(DataFusionError::External(Box::new(Error::invalid_input(
-                    format!(
-                        "a single row is {} bytes which exceeds the maximum allowed batch \
-                         size of {} bytes",
-                        batch.get_array_memory_size(),
-                        max_bytes,
-                    ),
-                ))));
-            }
-            Ok(batch)
-        });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, validated)))
-    }
-
-    fn maintains_input_order(&self) -> Vec<bool> {
-        vec![true]
-    }
-
-    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![false]
-    }
-
-    fn partition_statistics(
-        &self,
-        partition: Option<usize>,
-    ) -> datafusion_common::Result<std::sync::Arc<Statistics>> {
-        self.input.partition_statistics(partition)
-    }
-
-    fn cardinality_effect(&self) -> CardinalityEffect {
-        CardinalityEffect::Equal
-    }
-
-    fn supports_limit_pushdown(&self) -> bool {
-        true
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::record_batch;
+    use datafusion::execution::memory_pool::MemoryConsumer;
+    use datafusion_common::DataFusionError;
+
+    use datafusion::execution::memory_pool::MemoryLimit;
+    use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
+    use futures::stream;
 
     // Serialize cache tests since they share global state
     static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1237,9 +597,9 @@ mod tests {
             assert_eq!(cache_guard.len(), 1);
         }
 
-        // Different options should create new entry
+        // Different non-spilling options should create a new entry.
         let opts2 = LanceExecutionOptions {
-            use_spilling: true,
+            target_partition: Some(1),
             ..Default::default()
         };
         let _ctx2 = get_session_context(&opts2);
@@ -1247,6 +607,30 @@ mod tests {
             let cache_guard = cache.lock().unwrap();
             assert_eq!(cache_guard.len(), 2);
         }
+    }
+
+    #[test]
+    fn test_spilling_executions_have_independent_memory_pools() {
+        let options = LanceExecutionOptions {
+            use_spilling: true,
+            mem_pool_size: Some(150 * 1024 * 1024),
+            target_partition: Some(1),
+            ..Default::default()
+        };
+        let contexts: Vec<_> = (0..3).map(|_| get_session_context(&options)).collect();
+        let mut reservations = Vec::with_capacity(contexts.len());
+
+        // Each reservation fits its own pool, but any two exceed a shared pool.
+        for context in &contexts {
+            let task_context = context.task_ctx();
+            let pool = task_context.memory_pool();
+            let reservation = MemoryConsumer::new("ExternalSorterMerge[0]").register(pool);
+            reservation.try_grow(100 * 1024 * 1024).unwrap();
+            assert_eq!(pool.reserved(), 100 * 1024 * 1024);
+            reservations.push(reservation);
+        }
+
+        assert_eq!(reservations.len(), 3);
     }
 
     #[test]
@@ -1314,33 +698,224 @@ mod tests {
     }
 
     #[test]
-    fn test_mem_pool_size_scales_with_partitions() {
-        let default_per_partition = DEFAULT_LANCE_MEM_POOL_SIZE_PER_PARTITION;
+    fn test_task_context_per_execution() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
 
-        // No partitions specified → defaults to 1 partition
-        let opts = LanceExecutionOptions::default();
-        assert_eq!(opts.mem_pool_size(), default_per_partition);
+        let default_options = LanceExecutionOptions::default();
+        let session_ctx = get_session_context(&default_options);
+        let task_ctx = get_task_context(&session_ctx, &default_options).unwrap();
+        // Lance operators key per-execution state on the task context's identity.
+        assert!(!Arc::ptr_eq(
+            &task_ctx,
+            &get_task_context(&session_ctx, &default_options).unwrap()
+        ));
+        assert_eq!(task_ctx.session_id(), session_ctx.session_id());
+        assert_eq!(
+            task_ctx.session_config().batch_size(),
+            session_ctx.copied_config().batch_size()
+        );
+        assert!(Arc::ptr_eq(
+            &task_ctx.runtime_env(),
+            &session_ctx.runtime_env()
+        ));
+        assert!(task_ctx.scalar_functions().contains_key("contains_tokens"));
 
-        // 4 partitions → 4x the per-partition size
-        let opts = LanceExecutionOptions {
-            target_partition: Some(4),
+        let spill_options = LanceExecutionOptions {
+            use_spilling: true,
+            mem_pool_size: Some(64 * 1024 * 1024),
+            target_partition: Some(3),
+            batch_size: Some(17),
             ..Default::default()
         };
-        assert_eq!(opts.mem_pool_size(), default_per_partition * 4);
+        let spill_session_ctx = get_session_context(&spill_options);
+        let spill_task_ctx = get_task_context(&spill_session_ctx, &spill_options).unwrap();
+        assert_eq!(spill_task_ctx.session_config().batch_size(), 17);
+        assert_eq!(spill_task_ctx.session_config().target_partitions(), 3);
+        assert!(
+            spill_task_ctx
+                .scalar_functions()
+                .contains_key("contains_tokens")
+        );
+        // The batch size override applies to this execution only, and the
+        // execution still shares the session's memory pool.
+        assert_ne!(spill_session_ctx.copied_config().batch_size(), 17);
+        assert!(Arc::ptr_eq(
+            &spill_task_ctx.runtime_env(),
+            &spill_session_ctx.runtime_env()
+        ));
+        assert!(matches!(
+            spill_task_ctx.memory_pool().memory_limit(),
+            MemoryLimit::Finite(limit) if limit == 64 * 1024 * 1024
+        ));
+    }
 
-        // 8 partitions → 8x the per-partition size
-        let opts = LanceExecutionOptions {
-            target_partition: Some(8),
+    #[tokio::test]
+    async fn test_zero_batch_size_is_rejected() {
+        let batch = record_batch!(("x", Int32, [1, 2, 3])).unwrap();
+        let options = LanceExecutionOptions {
+            batch_size: Some(0),
             ..Default::default()
         };
-        assert_eq!(opts.mem_pool_size(), default_per_partition * 8);
 
-        // Explicit mem_pool_size is not scaled
-        let opts = LanceExecutionOptions {
-            mem_pool_size: Some(50 * 1024 * 1024),
-            target_partition: Some(8),
-            ..Default::default()
+        let plan = Arc::new(OneShotExec::from_batch(batch.clone()));
+        let Err(err) = execute_plan(plan, options.clone()) else {
+            panic!("execute_plan accepted batch_size 0");
         };
-        assert_eq!(opts.mem_pool_size(), 50 * 1024 * 1024);
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("batch_size must be greater than 0")
+        );
+
+        let plan = Arc::new(OneShotExec::from_batch(batch));
+        let err = analyze_plan(plan, options).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("batch_size must be greater than 0")
+        );
+    }
+
+    /// A marker a node reads from the session-config extensions at execute time.
+    #[derive(Debug)]
+    struct RequiredExtension;
+
+    /// Execution node that only succeeds when [`RequiredExtension`] is present
+    /// on the task context's session config. This mirrors distributed routing
+    /// nodes that read a session-config identity extension during `execute`.
+    #[derive(Debug)]
+    struct NeedsExtensionExec {
+        properties: Arc<PlanProperties>,
+        /// Set once the node reaches execution with the extension present.
+        /// Observed by the test so that dropping context forwarding (which
+        /// makes `execute` error before this point) is detectable.
+        executed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl NeedsExtensionExec {
+        fn new(executed: Arc<std::sync::atomic::AtomicBool>) -> Self {
+            let schema = Arc::new(ArrowSchema::empty());
+            Self {
+                properties: Arc::new(PlanProperties::new(
+                    EquivalenceProperties::new(schema),
+                    Partitioning::UnknownPartitioning(1),
+                    EmissionType::Incremental,
+                    Boundedness::Bounded,
+                )),
+                executed,
+            }
+        }
+    }
+
+    impl DisplayAs for NeedsExtensionExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
+            write!(f, "NeedsExtensionExec")
+        }
+    }
+
+    impl ExecutionPlan for NeedsExtensionExec {
+        fn name(&self) -> &str {
+            "NeedsExtensionExec"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn PhysicalExpr>,
+            ) -> datafusion_common::Result<TreeNodeRecursion>,
+        ) -> datafusion_common::Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(
+            &self,
+            _partition: usize,
+            context: Arc<TaskContext>,
+        ) -> datafusion_common::Result<SendableRecordBatchStream> {
+            if context
+                .session_config()
+                .get_extension::<RequiredExtension>()
+                .is_none()
+            {
+                return Err(DataFusionError::Execution(
+                    "missing required session-config extension".to_string(),
+                ));
+            }
+            self.executed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let schema = self.schema();
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                stream::empty(),
+            )))
+        }
+    }
+
+    // Regression: analyze must run under a caller-provided TaskContext so nodes
+    // that read a session-config extension at execute time see it. Without the
+    // context the node errors and AnalyzeExec would otherwise report an empty,
+    // unexecuted plan tree.
+    #[tokio::test]
+    async fn test_analyze_plan_uses_provided_task_context() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let executed = Arc::new(AtomicBool::new(false));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(NeedsExtensionExec::new(executed.clone()));
+
+        // Default context lacks the extension: the node errors during execute
+        // (never reaching the `executed` flag), but AnalyzeExec absorbs that
+        // per-partition failure and reports an empty, unexecuted plan tree
+        // rather than propagating the error. This is the regression symptom.
+        let report = analyze_plan(plan.clone(), LanceExecutionOptions::default())
+            .await
+            .expect("AnalyzeExec swallows the node's execute error into an Ok report");
+        assert!(
+            report.contains("NeedsExtensionExec, metrics=[]"),
+            "expected an empty, unexecuted NeedsExtensionExec node, got: {report}"
+        );
+        assert!(
+            !executed.load(Ordering::SeqCst),
+            "node must not execute successfully without the extension"
+        );
+
+        // A context carrying the extension executes the node successfully.
+        let options = LanceExecutionOptions::default();
+        let session_ctx = get_session_context(&options);
+        let config = session_ctx
+            .task_ctx()
+            .session_config()
+            .clone()
+            .with_extension(Arc::new(RequiredExtension));
+        let task_ctx = session_ctx.task_ctx();
+        let task_ctx = Arc::new(TaskContext::new(
+            task_ctx.task_id(),
+            task_ctx.session_id(),
+            config,
+            task_ctx.scalar_functions().clone(),
+            task_ctx.higher_order_functions().clone(),
+            task_ctx.aggregate_functions().clone(),
+            task_ctx.window_functions().clone(),
+            task_ctx.runtime_env(),
+        ));
+        let report = analyze_plan_with_context(plan, options, Some(task_ctx))
+            .await
+            .expect("analyze should succeed when the extension is present");
+        assert!(report.contains("NeedsExtensionExec"));
+        // The node only reaches this flag when the supplied context is actually
+        // forwarded to `execute`; dropping the forwarding fails this assertion.
+        assert!(
+            executed.load(Ordering::SeqCst),
+            "supplied context must be forwarded so the node executes"
+        );
     }
 }
