@@ -135,23 +135,10 @@ pub fn index_details_are_row_addrs(details: &prost_types::Any, index_version: i3
         .is_some_and(|(_, details_type_name)| {
             details_type_name.eq_ignore_ascii_case("lance.index.pb.FMIndexDetails")
         });
-    // A BTree segment stores row addresses only from format version 1
-    // onward (`lance_index::scalar::btree::BTREE_ROW_ADDR_DOMAIN_VERSION`,
-    // kept in sync with this literal). A segment persisted before that
-    // by an older Lance version stores row ids directly and must not be
-    // reinterpreted as addresses.
-    let is_btree_addr_domain =
-        details.type_url.ends_with("BTreeIndexDetails") && index_version >= 1;
-    // Likewise for Bitmap, from format version 1 onward
-    // (`lance_index::scalar::bitmap::BITMAP_ROW_ADDR_DOMAIN_VERSION`).
-    let is_bitmap_addr_domain =
-        details.type_url.ends_with("BitmapIndexDetails") && index_version >= 1;
-    // Likewise for LabelList, from format version 2 onward
-    // (`lance_index::scalar::label_list::LABEL_LIST_ROW_ADDR_DOMAIN_VERSION`).
-    // Version 1 is the row-id-domain floor for list-null metadata
-    // support (`LABEL_LIST_NULLS_MIN_VERSION`), not address domain.
+    let is_btree_addr_domain = IndexMetadata::is_btree_addr_domain(details, index_version);
+    let is_bitmap_addr_domain = IndexMetadata::is_bitmap_addr_domain(details, index_version);
     let is_label_list_addr_domain =
-        details.type_url.ends_with("LabelListIndexDetails") && index_version >= 2;
+        IndexMetadata::is_label_list_addr_domain(details, index_version);
     // A JSON index takes its domain from the target index it wraps. It is
     // stamped with format version 1
     // (`lance_index::scalar::json::JSON_ROW_ADDR_DOMAIN_VERSION`) exactly
