@@ -1026,7 +1026,20 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
         // Schema estimates and post-decode feedback cannot protect the first
         // batch from overflowing when consecutive pages are concatenated.
         let mut rows = num_rows;
-        let mut bytes = match self.decoded_bytes_for_rows(rows) {
+        let planned_bytes = if self
+            .page_decoders
+            .iter()
+            .any(|page| page.dictionary_len().is_some())
+        {
+            // Page byte counts describe compact dictionaries, but a plain
+            // Binary/Utf8 field expands their values before concatenation.
+            Err(Error::not_supported(
+                "expanded dictionary byte size is unknown",
+            ))
+        } else {
+            self.decoded_bytes_for_rows(rows)
+        };
+        let mut bytes = match planned_bytes {
             Ok(bytes) => bytes,
             Err(Error::NotSupported { .. }) => {
                 // Without a reliable size, never concatenate multiple rows into

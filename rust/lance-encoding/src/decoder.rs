@@ -3662,6 +3662,8 @@ mod tests {
     };
     use std::collections::VecDeque;
 
+    use crate::testing::TestEncoding;
+
     struct StaticArrayDecodeTask(ArrayRef);
 
     impl DecodeArrayTask for StaticArrayDecodeTask {
@@ -4276,6 +4278,7 @@ mod tests {
     #[case::row_limit("nested", Some(8 * 1024 * 1024), Some(3 * 1024 * 1024), 1, vec![1; 5])]
     #[case::oversized_row("nested", None, Some(3 * 1024 * 1024 * 1024), 5, vec![1; 5])]
     #[case::unknown_size("nested", None, None, 5, vec![1; 5])]
+    #[case::expanded_dictionary("expanded_dictionary", None, Some(1), 5, vec![1; 5])]
     #[tokio::test]
     async fn test_structural_stream_limits_binary_bytes_before_decode(
         #[case] container: &str,
@@ -4324,11 +4327,12 @@ mod tests {
         for num_rows in [2, 3] {
             scheduled += num_rows;
             let path = path.clone();
+            let dictionary_len = (container == "expanded_dictionary").then_some(1);
             let page = async move {
                 Ok(LoadedPageShard {
                     decoder: Box::new(StaticStructuralPageDecoder {
                         num_rows,
-                        dictionary_len: None,
+                        dictionary_len,
                         fake_bytes_per_row: bytes_per_row,
                     }),
                     path,
@@ -4419,13 +4423,13 @@ mod tests {
         batch: &RecordBatch,
         batch_size: u32,
         batch_size_bytes: Option<u64>,
+        version: TestEncoding,
     ) -> Vec<RecordBatch> {
         use crate::{
             encoder::{EncodingOptions, encode_batch},
-            testing::{TestEncoding, test_encoding_strategy},
+            testing::test_encoding_strategy,
         };
 
-        let version = TestEncoding::StructuralU16;
         let options = EncodingOptions::default();
         let strategy = test_encoding_strategy(version);
         let schema = Schema::try_from(batch.schema().as_ref()).unwrap();
@@ -4482,8 +4486,11 @@ mod tests {
         batches
     }
 
+    #[rstest::rstest]
+    #[case::v21(TestEncoding::StructuralU16)]
+    #[case::v22(TestEncoding::StructuralU32)]
     #[tokio::test]
-    async fn test_byte_sized_batches_nested_binary_roundtrip() {
+    async fn test_byte_sized_batches_nested_binary_roundtrip(#[case] version: TestEncoding) {
         let mut frames = ListBuilder::new(BinaryBuilder::new());
         let payload = vec![42_u8; 1024];
         for row in 0..32 {
@@ -4506,7 +4513,7 @@ mod tests {
         let batch =
             RecordBatch::try_from_iter([("decoded", Arc::new(decoded) as ArrayRef)]).unwrap();
         let budget = 16 * 1024;
-        let batches = decode_batches_with_byte_limit(&batch, 1024, Some(budget)).await;
+        let batches = decode_batches_with_byte_limit(&batch, 1024, Some(budget), version).await;
         assert!(batches.len() > 1);
         for batch in &batches {
             let frames = batch["decoded"].as_struct().column(0).as_list::<i32>();
@@ -4544,8 +4551,13 @@ mod tests {
         let input_batch = RecordBatch::try_new(schema, arrays).unwrap();
 
         // 16 bytes/row, batch_size_bytes=1600 => 100 rows/batch
-        let batches =
-            decode_batches_with_byte_limit(&input_batch, /*batch_size=*/ 1024, Some(1600)).await;
+        let batches = decode_batches_with_byte_limit(
+            &input_batch,
+            /*batch_size=*/ 1024,
+            Some(1600),
+            TestEncoding::StructuralU16,
+        )
+        .await;
 
         // Should produce 10 batches of 100 rows each
         assert_eq!(batches.len(), 10);
@@ -4594,7 +4606,13 @@ mod tests {
         let input_batch = RecordBatch::try_new(schema, arrays).unwrap();
 
         // batch_size=250, batch_size_bytes=None => 4 batches of 250 rows
-        let batches = decode_batches_with_byte_limit(&input_batch, /*batch_size=*/ 250, None).await;
+        let batches = decode_batches_with_byte_limit(
+            &input_batch,
+            /*batch_size=*/ 250,
+            None,
+            TestEncoding::StructuralU16,
+        )
+        .await;
         assert_eq!(batches.len(), 4);
         for (i, batch) in batches.iter().enumerate() {
             assert_eq!(
@@ -4623,77 +4641,45 @@ mod tests {
         .unwrap();
 
         // The byte limit can hold every row, so the 100-row limit must win.
-        let batches =
-            decode_batches_with_byte_limit(&input_batch, /*batch_size=*/ 100, Some(10_000)).await;
+        let batches = decode_batches_with_byte_limit(
+            &input_batch,
+            /*batch_size=*/ 100,
+            Some(10_000),
+            TestEncoding::StructuralU16,
+        )
+        .await;
         assert_eq!(batches.len(), 10);
         assert!(batches.iter().all(|batch| batch.num_rows() == 100));
     }
 
     #[tokio::test]
-    async fn test_byte_sized_batches_feedback_convergence() {
-        use arrow_array::{
-            Array, StringArray, StructArray,
-            builder::{BinaryBuilder, ListBuilder},
-        };
-
-        // Each row has a 100-byte string. Schema estimate = 64 bytes (default
-        // for Utf8), so the first batch will overshoot. The feedback loop
-        // should correct subsequent batches toward the target.
+    async fn test_byte_sized_batches_variable_width_do_not_overshoot() {
         let num_rows = 500;
-        let value: String = "x".repeat(100);
-        let arrays: Vec<Arc<dyn arrow_array::Array>> = vec![Arc::new(StringArray::from(
-            (0..num_rows).map(|_| value.as_str()).collect::<Vec<_>>(),
-        ))];
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "s",
-            DataType::Utf8,
-            false,
-        )]));
-        let input_batch = RecordBatch::try_new(schema, arrays).unwrap();
-
-        // Target 5000 bytes/batch. At 100 bytes/row the ideal is 50 rows/batch.
-        // Schema estimate is 64 bytes/row → first batch ~78 rows (overshoot).
-        // After feedback kicks in, batches should converge to ~50 rows.
-        let target_bytes: u64 = 5000;
+        let values = (0..num_rows)
+            .map(|row| format!("{row:010}{}", "x".repeat(90)))
+            .collect::<Vec<_>>();
+        let input_batch =
+            RecordBatch::try_from_iter([("s", Arc::new(StringArray::from(values)) as ArrayRef)])
+                .unwrap();
+        let target_bytes = 5000;
         let batches = decode_batches_with_byte_limit(
             &input_batch,
-            /*batch_size=*/ 1024,
+            1024,
             Some(target_bytes),
+            TestEncoding::StructuralU16,
         )
         .await;
-
-        // Verify all data round-trips correctly
-        let all_batches: Vec<&RecordBatch> = batches.iter().collect();
-        let concatenated =
-            arrow_select::concat::concat_batches(&batches[0].schema(), all_batches.iter().copied())
-                .unwrap();
-        assert_eq!(concatenated.num_rows(), num_rows as usize);
-        assert_eq!(
-            concatenated.column(0).as_ref(),
-            input_batch.column(0).as_ref()
-        );
-
-        // After the first batch, subsequent batches should be closer to the
-        // target. The ideal is 50 rows/batch.
-        assert!(
-            batches.len() >= 2,
-            "need at least 2 batches to test convergence"
-        );
-        // The first batch uses the schema estimate (64 bytes/row) →
-        // ~78 rows. After feedback the rows should settle near 50.
-        if batches.len() >= 3 {
-            let second_batch_rows = batches[1].num_rows();
-            let third_batch_rows = batches[2].num_rows();
-            // Both should be within 20% of the ideal (50 rows)
+        assert!(batches.len() >= 2);
+        for batch in &batches {
+            let values = batch["s"].as_string::<i32>();
+            let offsets = values.value_offsets();
             assert!(
-                (40..=60).contains(&second_batch_rows),
-                "second batch should be near 50 rows, got {second_batch_rows}"
-            );
-            assert!(
-                (40..=60).contains(&third_batch_rows),
-                "third batch should be near 50 rows, got {third_batch_rows}"
+                batch.num_rows() == 1
+                    || (offsets.last().unwrap() - offsets.first().unwrap()) as u64 <= target_bytes
             );
         }
+        let actual = arrow_select::concat::concat_batches(&input_batch.schema(), &batches).unwrap();
+        assert_eq!(actual, input_batch);
     }
 
     #[tokio::test]
