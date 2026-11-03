@@ -63,7 +63,9 @@ impl AlterField {
     ///
     /// Tightening to non-nullable is only valid against the values it read,
     /// and applying it does not look at any. Values written since, or rows
-    /// added that leave the field unset, may hold nulls. Landing first, it
+    /// added that leave the field unset, may hold nulls -- in this field or,
+    /// through a struct, in an ancestor or descendant, which the footprint
+    /// cannot tell apart from any other field. Landing first, it
     /// makes the field required like a non-nullable add does, which fences a
     /// stale append whether or not that append names the field -- including a
     /// field minted in this set, which no other writer can name.

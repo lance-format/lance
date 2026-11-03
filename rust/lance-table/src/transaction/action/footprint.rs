@@ -38,14 +38,16 @@ pub enum Coordinate {
     FieldData { fragment: u64, field: i32 },
     /// A field's definition in the schema.
     FieldDefinition(i32),
-    /// The schema new rows are written in. Every set that adds rows requires
-    /// it, because a writer prepares rows against the schema it read: a row
-    /// minted later carries no value for a non-nullable column added in
-    /// between. A set that adds such a column, or makes a column required,
-    /// writes it. So does one that adds a child under a committed parent, which
-    /// a stale writer may write packed without the child. A stale writer
-    /// cannot name a field it does not write, so the field's own coordinates
-    /// cannot say this.
+    /// The schema new rows and values are written in. Every set that adds
+    /// rows, or writes values for a committed field, requires it, because a
+    /// writer prepares them against the schema it read: a row minted later
+    /// carries no value for a non-nullable column added in between, and a value
+    /// written later may be a null under an ancestor or descendant made
+    /// required in between. A set that adds such a column, or makes a column
+    /// required, writes it. So does one that adds a child under a committed
+    /// parent, which a stale writer may write packed without the child. A stale
+    /// writer cannot name a field it does not write, so the field's own
+    /// coordinates cannot say this.
     NewRowSchema,
     /// A field's name. Names only have to be unique among siblings, but a
     /// footprint has no schema to place a field among its siblings, so a name
@@ -193,10 +195,16 @@ fn pair_conflicts(committing: Mode, committed: Mode) -> bool {
 /// way around; that order is covered by the claims the later set makes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Precondition {
-    /// No values were written for this field, in any fragment. An added row
-    /// counts as writing every field, since it holds a value -- if only a null
-    /// -- for each.
-    NoValuesWritten(i32),
+    /// No values were written for any committed field, in any fragment. An
+    /// added row counts as writing every field, since it holds a value -- if
+    /// only a null -- for each.
+    ///
+    /// Table-wide rather than per field: a footprint has no schema to relate
+    /// fields, so matching the field named would miss a null written into a
+    /// descendant of a struct made required, or a parent written whole. Both
+    /// users -- a tightened nullability and a replacement -- are rare, so the
+    /// spurious conflict with an unrelated write is cheap.
+    NoValuesWritten,
     /// No fragment was added.
     NoRowsAdded,
     /// The field has the children it had when the set read it: none was
@@ -241,12 +249,11 @@ pub struct Footprint {
     /// Facts about the table this set is valid only against. See
     /// [`Precondition`].
     preconditions: Vec<Precondition>,
-    /// Committed fields this set writes values for, in any fragment, including
-    /// one it mints. Unlike [`Coordinate::FieldData`] this is not a claim: two
-    /// sets writing one field's values into different fragments commute, but a
-    /// set that needs the field to hold no new values cannot commit after
-    /// either.
-    values_written: HashSet<i32>,
+    /// Whether this set writes values for a committed field, in any fragment,
+    /// including one it mints. A fact for [`Precondition::NoValuesWritten`],
+    /// not a claim: two sets writing values commute, but a set that needs the
+    /// table to hold no new values cannot commit after either.
+    values_written: bool,
     /// Whether this set adds a fragment.
     rows_added: bool,
     /// Committed fields this set adds a child under. A fact for
@@ -337,9 +344,7 @@ impl Footprint {
         self.preconditions
             .iter()
             .any(|precondition| match precondition {
-                Precondition::NoValuesWritten(field) => {
-                    committed.rows_added || committed.values_written.contains(field)
-                }
+                Precondition::NoValuesWritten => committed.rows_added || committed.values_written,
                 Precondition::NoRowsAdded => committed.rows_added,
                 Precondition::ChildrenUnchanged(field) => committed.children_added.contains(field),
             })
@@ -398,14 +403,25 @@ impl Footprint {
     /// rejects a concurrent rename or nullability change that would not have
     /// invalidated the data. That matches the granularity of the coordinate:
     /// `AlterField` writes one `FieldDefinition` whichever facet it sets.
+    ///
+    /// Values for a committed field also require [`Coordinate::NewRowSchema`].
+    /// The definition required is only the field's own, so a concurrent
+    /// tightening of its parent struct or of a child would not otherwise
+    /// collide with a null written here.
     pub(super) fn write_field_data(
         &mut self,
         fragment: Ref,
         fields: impl IntoIterator<Item = FieldRef>,
     ) {
         let fields: Vec<FieldRef> = fields.into_iter().collect();
-        self.values_written
-            .extend(fields.iter().copied().filter_map(committed_field));
+        if fields
+            .iter()
+            .copied()
+            .any(|field| committed_field(field).is_some())
+        {
+            self.values_written = true;
+            self.require(Coordinate::NewRowSchema);
+        }
         self.move_field_data(fragment, fields);
     }
 
@@ -456,11 +472,12 @@ impl Footprint {
 
     /// Record that this set only holds if `field` has had no values written
     /// since it read it, such as a stricter nullability the apply does not
-    /// check the values against.
+    /// check the values against. Checked table-wide; see
+    /// [`Precondition::NoValuesWritten`]. A field this set mints has no
+    /// concurrent writers, so it needs nothing.
     pub(super) fn require_no_values_written(&mut self, field: FieldRef) {
-        if let Some(field) = committed_field(field) {
-            self.preconditions
-                .push(Precondition::NoValuesWritten(field));
+        if committed_field(field).is_some() {
+            self.preconditions.push(Precondition::NoValuesWritten);
         }
     }
 
@@ -572,8 +589,8 @@ mod tests {
     use crate::format::{BasePath, DataFile};
     use crate::transaction::action::test_support::footprint;
     use crate::transaction::action::{
-        Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, DropField, RemoveFragment,
-        SetDeletionFile, TombstoneFieldData,
+        Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, ConfigUpdate, DropField,
+        RemoveFragment, SetDeletionFile, TombstoneFieldData,
     };
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_core::datatypes::Field;
@@ -651,6 +668,18 @@ mod tests {
             field: FieldRef::Committed(field),
             name: None,
             nullable: Some(nullable),
+        })
+    }
+
+    fn config_entry(key: &str) -> Action {
+        Action::ConfigUpdate(ConfigUpdate {
+            config: Some(UpdateMap {
+                update_entries: vec![(key, Some("v")).into()],
+                replace: false,
+            }),
+            table_metadata: None,
+            schema_metadata: None,
+            field_metadata: Vec::new(),
         })
     }
 
@@ -941,10 +970,13 @@ mod tests {
         append(2),
         true,
     )]
+    // The footprint cannot tell another field from a child of the replaced
+    // one, whose values the replacement also rewrites, so any value write
+    // collides.
     #[case::a_replacement_landing_after_a_rewrite_of_another_field(
         vec![drop_field(1), add_field(0, "a", None)],
         vec![add_data_file(Ref::Committed(7), &[2])],
-        false,
+        true,
     )]
     // The reverse order is already caught: the append requires the definition
     // the replacement drops.
@@ -1005,9 +1037,62 @@ mod tests {
         append(2),
         true,
     )]
-    #[case::a_tightening_landing_after_a_rewrite_of_another_field(
+    // The footprint has no schema to tell another field from a child or
+    // parent of the tightened one, so any value write collides, in either
+    // order: a null written into a child of a struct made required, or a
+    // struct written whole with a null child, breaks the tightening alike.
+    #[case::a_tightening_of_a_struct_landing_after_a_rewrite_of_its_child(
         vec![set_nullability(1, false)],
         vec![add_data_file(Ref::Committed(7), &[2])],
+        true,
+    )]
+    #[case::a_rewrite_of_a_child_landing_after_its_struct_was_tightened(
+        vec![add_data_file(Ref::Committed(7), &[2])],
+        vec![set_nullability(1, false)],
+        true,
+    )]
+    #[case::a_tightening_of_a_child_landing_after_a_rewrite_of_its_struct(
+        vec![set_nullability(2, false)],
+        vec![add_data_file(Ref::Committed(7), &[1])],
+        true,
+    )]
+    #[case::a_rewrite_of_a_struct_landing_after_its_child_was_tightened(
+        vec![add_data_file(Ref::Committed(7), &[1])],
+        vec![set_nullability(2, false)],
+        true,
+    )]
+    // Moving values changes none of them, and a set that writes no values has
+    // nothing for a tightening to object to.
+    #[case::a_reencode_landing_after_a_tightening(
+        reencode(7, 2, false),
+        vec![set_nullability(1, false)],
+        false,
+    )]
+    #[case::a_tightening_landing_after_a_config_update(
+        vec![set_nullability(1, false)],
+        vec![config_entry("k")],
+        false,
+    )]
+    #[case::a_config_update_landing_after_a_tightening(
+        vec![config_entry("k")],
+        vec![set_nullability(1, false)],
+        false,
+    )]
+    // Value writes only require the new-row schema, so they still commute
+    // with each other and with appends.
+    #[case::a_rewrite_landing_after_a_rewrite_of_another_fragment(
+        vec![add_data_file(Ref::Committed(7), &[1])],
+        vec![add_data_file(Ref::Committed(8), &[1])],
+        false,
+    )]
+    #[case::a_rewrite_landing_after_an_append(
+        vec![add_data_file(Ref::Committed(7), &[1])],
+        append(1),
+        false,
+    )]
+    #[case::an_append_landing_after_a_rewrite(
+        append(1),
+        vec![add_data_file(Ref::Committed(7), &[1])],
         false,
     )]
     #[case::an_append_landing_after_a_tightening(
