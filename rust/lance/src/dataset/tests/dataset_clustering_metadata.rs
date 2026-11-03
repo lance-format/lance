@@ -379,6 +379,115 @@ async fn restore_keeps_the_high_water_mark_and_the_targets_definitions() {
     );
 }
 
+/// A commit anchored to the version a clustering run accepted is refused once
+/// a restore (or overwrite) landed after that version, even when the writer
+/// read the table after the restore; commits anchored after the restore, and
+/// unanchored commits, are unaffected.
+#[tokio::test]
+async fn a_commit_anchored_to_a_run_is_refused_across_a_restore() {
+    use lance_table::format::CLUSTERING_RUN_ANCHOR_KEY;
+    let dir = TempStrDir::default();
+    let dataset = write_dataset(&dir).await;
+    let accepted = dataset.manifest().version;
+    let anchored = |read_version: u64, metadata: Vec<(String, Option<String>)>, anchor: u64| {
+        let (desired, mut transaction) = submission(read_version, vec![], metadata);
+        transaction.transaction_properties = Some(Arc::new(HashMap::from([(
+            CLUSTERING_RUN_ANCHOR_KEY.to_string(),
+            anchor.to_string(),
+        )])));
+        (desired, transaction)
+    };
+    // The run's own writes land while nothing replaced the table.
+    let dataset = commit(
+        &dataset,
+        anchored(
+            accepted,
+            vec![("org.example.cluster.run".into(), Some("running".into()))],
+            accepted,
+        ),
+    )
+    .await
+    .unwrap();
+    let dataset = commit(
+        &dataset,
+        anchored(
+            dataset.manifest().version,
+            vec![("org.example.cluster.progress".into(), Some("1".into()))],
+            accepted,
+        ),
+    )
+    .await
+    .unwrap();
+    // Someone restores the table to the version the run accepted.
+    let mut restored = dataset.checkout_version(accepted).await.unwrap();
+    restored.restore().await.unwrap();
+    let after_restore = restored.manifest().version;
+    // The run re-reads the latest version and tries to write again: refused,
+    // the restore is inside its window although not after its read version.
+    let error = commit(
+        &restored,
+        anchored(
+            after_restore,
+            vec![("org.example.cluster.progress".into(), Some("2".into()))],
+            accepted,
+        ),
+    )
+    .await
+    .unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("anchored at version"), "{text}");
+    assert!(
+        text.contains(&format!("restored at version {after_restore}")),
+        "{text}"
+    );
+    assert_eq!(restored.manifest().version, after_restore, "nothing landed");
+    // A commit without an anchor, and a run anchored after the restore, land.
+    let dataset = commit(
+        &restored,
+        submission(
+            after_restore,
+            vec![],
+            vec![("org.example.other".into(), Some("x".into()))],
+        ),
+    )
+    .await
+    .unwrap();
+    let dataset = commit(
+        &dataset,
+        anchored(
+            dataset.manifest().version,
+            vec![("org.example.cluster.run".into(), Some("running".into()))],
+            after_restore,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.manifest().version, after_restore + 2);
+    // An anchor after the read version is a caller error.
+    let error = commit(
+        &dataset,
+        anchored(
+            dataset.manifest().version - 1,
+            vec![],
+            dataset.manifest().version,
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("which is earlier"), "{error}");
+    // A malformed anchor is an error, not an absent one.
+    let (desired, mut transaction) = submission(dataset.manifest().version, vec![], vec![]);
+    transaction.transaction_properties = Some(Arc::new(HashMap::from([(
+        CLUSTERING_RUN_ANCHOR_KEY.to_string(),
+        "soon".to_string(),
+    )])));
+    let error = commit(&dataset, (desired, transaction)).await.unwrap_err();
+    assert!(
+        error.to_string().contains("must be a table version"),
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn branch_and_shallow_clone_carry_definitions_and_metadata() {
     let dir = TempStrDir::default();

@@ -548,6 +548,30 @@ pub fn reset_removal_scan_visits() {
     LAST_REMOVAL_SCAN_VISITS.with(|cell| cell.set(0));
 }
 
+/// Transaction property a clustering run stamps on every commit it makes:
+/// the table version the run accepted (its read version). A commit carrying
+/// it is judged against every version from that anchor to the latest, on
+/// every attempt, and refused if a restore or overwrite landed in between,
+/// however late the worker re-read the table: the run's scope and pair no
+/// longer describe the table. The value is the version as a decimal string.
+pub const CLUSTERING_RUN_ANCHOR_KEY: &str = "lance.clustering.run_anchor_version";
+
+/// The run anchor a transaction carries under [`CLUSTERING_RUN_ANCHOR_KEY`],
+/// if any; a value that is not a version is an error, not an absent anchor.
+pub fn clustering_run_anchor(
+    properties: Option<&std::collections::HashMap<String, String>>,
+) -> Result<Option<u64>> {
+    let Some(value) = properties.and_then(|properties| properties.get(CLUSTERING_RUN_ANCHOR_KEY))
+    else {
+        return Ok(None);
+    };
+    value.parse::<u64>().map(Some).map_err(|_| {
+        Error::invalid_input(format!(
+            "transaction property {CLUSTERING_RUN_ANCHOR_KEY} must be a table version, got '{value}'"
+        ))
+    })
+}
+
 impl From<&ClusteringDefinition> for pb::Clustering {
     fn from(definition: &ClusteringDefinition) -> Self {
         Self {

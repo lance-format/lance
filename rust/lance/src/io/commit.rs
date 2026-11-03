@@ -1670,6 +1670,33 @@ async fn prepare_attempt(
     )
 }
 
+/// A restore or overwrite inside a clustering run's window invalidates the
+/// run: refuse its commit with a hard error, not a retryable conflict, since
+/// no re-read makes the run's scope and pair describe the table again.
+fn refuse_restore_in_run_window(anchor: u64, other: &Transaction, version: u64) -> Result<()> {
+    let what = match &other.operation {
+        Operation::Restore { .. } => "restored",
+        Operation::Overwrite { .. } => "overwritten",
+        _ => return Ok(()),
+    };
+    Err(Error::invalid_input(format!(
+        "clustering run anchored at version {anchor} cannot commit: the table was {what} at \
+         version {version}, so the run's scope and pair no longer describe it"
+    )))
+}
+
+/// A run's window with a cleaned-up version cannot be shown free of a
+/// restore, so it is refused.
+fn refuse_cleaned_up_run_window(anchor: u64, missing: &[u64]) -> Result<()> {
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(Error::invalid_input(format!(
+        "clustering run anchored at version {anchor} cannot commit: versions {missing:?} since \
+         its anchor were cleaned up, so the run cannot be shown not to have crossed a restore"
+    )))
+}
+
 pub(crate) async fn load_and_sort_new_transactions(
     dataset: &Dataset,
 ) -> Result<(Dataset, Vec<(u64, Arc<Transaction>)>)> {
@@ -1824,6 +1851,39 @@ pub(crate) async fn commit_transaction(
     let identity_fence = (!read_version_dataset.manifest.uses_non_reusable_field_ids()
         && write_config.allocates_clustering_definitions(&read_version_dataset.manifest))
     .then(|| read_version_dataset.schema().clone());
+    // A clustering run anchors its commits to the table version it accepted:
+    // a restore or overwrite after that version invalidates the run whatever
+    // version the worker read afterwards, so the window from the anchor to
+    // the read version is judged here, and the rest of the window up to the
+    // latest version on every attempt below.
+    let run_anchor =
+        lance_table::format::clustering_run_anchor(transaction.transaction_properties.as_deref())?;
+    if let Some(anchor) = run_anchor {
+        if anchor > read_version {
+            return Err(Error::invalid_input(format!(
+                "clustering run anchored at version {anchor} cannot read version \
+                 {read_version}, which is earlier"
+            )));
+        }
+        if anchor < read_version {
+            let anchored = read_version_dataset.checkout_version(anchor).await?;
+            let (_, since_anchor) = load_and_sort_new_transactions(&anchored).await?;
+            let seen = since_anchor
+                .iter()
+                .map(|(version, _)| *version)
+                .collect::<HashSet<_>>();
+            let missing = (anchor + 1..=read_version)
+                .filter(|version| !seen.contains(version))
+                .collect::<Vec<_>>();
+            refuse_cleaned_up_run_window(anchor, &missing)?;
+            for (version, other) in since_anchor
+                .iter()
+                .filter(|(version, _)| *version <= read_version)
+            {
+                refuse_restore_in_run_window(anchor, other, *version)?;
+            }
+        }
+    }
 
     while backoff.attempt() < num_attempts {
         // We are pessimistic here and assume there may be other transactions
@@ -1878,6 +1938,12 @@ pub(crate) async fn commit_transaction(
                     )
                     .into(),
                 ));
+            }
+            if let Some(anchor) = run_anchor {
+                refuse_cleaned_up_run_window(anchor, &missing)?;
+                for (other_version, other_transaction) in other_transactions.iter() {
+                    refuse_restore_in_run_window(anchor, other_transaction, *other_version)?;
+                }
             }
             // A cleaned-up version may have replaced a key field; an identity
             // window with a hole cannot be judged, so it is refused.

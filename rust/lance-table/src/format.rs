@@ -17,8 +17,9 @@ pub use crate::rowids::version::{
     RowDatasetVersionMeta, RowDatasetVersionRun, RowDatasetVersionSequence,
 };
 pub use clustering::{
-    ClusteringDefinition, apply_complete_clustering_definitions,
-    refuse_key_fields_that_changed_identity, same_field_identity, validate_clustering,
+    CLUSTERING_RUN_ANCHOR_KEY, ClusteringDefinition, apply_complete_clustering_definitions,
+    clustering_run_anchor, refuse_key_fields_that_changed_identity, same_field_identity,
+    validate_clustering,
 };
 pub use fragment::*;
 pub use index::{IndexFile, IndexMetadata, index_metadata_codec, list_index_files_with_sizes};
