@@ -620,15 +620,25 @@ impl<'a> TransactionRebase<'a> {
         if missing.is_empty() {
             return Ok(());
         }
-        // A missing transaction may have changed or removed any source fragment.
-        // Publishing a staged fragment without checking it can undo that write.
-        if !self.modified_fragment_ids.is_empty() {
+        // A missing transaction may have changed a source fragment or inserted
+        // the same keys without touching any shared fragment. Neither conflict
+        // check can establish safety across a gap.
+        if !self.modified_fragment_ids.is_empty()
+            || matches!(
+                &self.transaction.operation,
+                Operation::Update {
+                    inserted_rows_filter: Some(_),
+                    ..
+                }
+            )
+        {
             return Err(Error::retryable_commit_conflict_source(
                 latest_version,
                 format!(
                     "versions {missing:?} between transaction read version {} and latest \
-                     version {latest_version} were cleaned up, so {} cannot safely modify \
-                     existing fragments; retry the operation on the latest version",
+                     version {latest_version} were cleaned up, so {} cannot safely check \
+                     conflicts for existing fragments or inserted keys; retry the operation \
+                     on the latest version",
                     self.transaction.read_version, self.transaction.operation
                 )
                 .into(),
