@@ -497,7 +497,7 @@ pub(crate) async fn sample_finite_vectors_seeded(
         let piece = if take_n == finite.len() {
             finite
         } else {
-            finite.slice(0, take_n).as_fixed_size_list().clone()
+            finite.slice(0, take_n)
         };
         got += piece.len();
         parts.push(piece);

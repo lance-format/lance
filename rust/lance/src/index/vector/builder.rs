@@ -3125,13 +3125,12 @@ impl PartitionAdjuster<'_> {
             ));
         };
 
-        let transformer = lance_index::vector::ivf::new_ivf_transformer_with_pre_transform(
+        let transformer = lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
             centroids.clone(),
             self.distance_type,
             vector_field.name().as_str(),
-            quantizer.into(),
+            quantizer,
             None,
-            self.ivf_pre_transformer(),
         )?;
         Ok((transformer, vector_field))
     }
