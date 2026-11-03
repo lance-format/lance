@@ -68,8 +68,8 @@ pub struct TransactionRebase<'a> {
     /// child's id).
     current_schema: Option<lance_core::datatypes::Schema>,
     /// The fragments and schema at the read version, kept for a CreateIndex
-    /// so a concurrent `Merge` can be told which columns it rewrote in place
-    /// and which fields it removed or retyped.
+    /// to detect in-place column rewrites even after transaction cleanup,
+    /// and fields a concurrent `Merge` removed or retyped.
     read_fragments: Option<Arc<Vec<Fragment>>>,
     read_schema: Option<lance_core::datatypes::Schema>,
     /// For a `Rewrite` carrying a fragment reuse entry: what it adds relative
@@ -611,9 +611,9 @@ impl<'a> TransactionRebase<'a> {
         Ok(())
     }
 
-    /// Refuse gaps in the transaction history required to safely rebase.
+    /// Handle gaps in the transaction history required to safely rebase.
     pub(crate) fn check_missing_versions(
-        &self,
+        &mut self,
         missing: &[u64],
         latest_version: u64,
     ) -> Result<()> {
@@ -643,6 +643,17 @@ impl<'a> TransactionRebase<'a> {
                 )
                 .into(),
             ));
+        }
+
+        // Lineage proves where retired rows moved, but not whether their
+        // indexed values changed in a missing transaction. Those fragments
+        // cannot be compared with the build snapshot once their IDs retire.
+        if let (Some(lineage), Some(live), Operation::CreateIndex { new_indices, .. }) = (
+            &self.current_lineage,
+            &self.current_live,
+            &mut self.transaction.operation,
+        ) {
+            Transaction::withdraw_unverified_retired_coverage(new_indices, lineage, live);
         }
 
         // Gaps can hide changes to the source fragments an index covers, or to
@@ -3056,6 +3067,23 @@ impl<'a> TransactionRebase<'a> {
                         "Run the cleanup again on the latest version.",
                     ));
                 }
+            }
+
+            // Cleanup can hide in-place rewrites from the transaction checks.
+            // Compare the surviving fragments' field paths with the build
+            // snapshot; deletion files and added columns do not stale an index.
+            if dataset.manifest.version != self.transaction.read_version
+                && let Some(read_fragments) = &self.read_fragments
+            {
+                let rewrites =
+                    Transaction::merge_rewritten_fields(read_fragments, dataset.fragments());
+                Transaction::withdraw_in_place_rewrites(
+                    new_indices,
+                    rewrites,
+                    dataset.schema(),
+                    dataset.fragment_bitmap.as_ref(),
+                    self.current_lineage.as_ref(),
+                );
             }
 
             // Handle MEM_WAL_INDEX rebasing
