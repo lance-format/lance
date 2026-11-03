@@ -15,9 +15,8 @@ import math
 import os
 import re
 import sys
-from urllib.parse import urlsplit
 
-from backends.base import OPTIONS, RANGES, STATES, BackendError
+from backends.base import OPTIONS, RANGES, STATES, BackendError, table_location
 
 BACKENDS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backends")
 # "." and ".." would name a directory outside the one that holds the jobs.
@@ -81,19 +80,11 @@ def load_job(path: str) -> dict:
         if "older_than_seconds" not in options and "retain_versions" not in options:
             raise invalid("cleanup needs older_than_seconds or retain_versions")
 
-    table = job.get("table")
-    if not isinstance(table, str) or not table:
-        raise invalid("table must be a non-empty string")
-    if "://" in table:
-        try:
-            parts = urlsplit(table)
-        except ValueError as e:
-            raise invalid(f"table is not a valid URI: {e}") from e
-        if parts.username or parts.password:
-            raise invalid("table must not contain credentials")
-    else:
-        table = os.path.abspath(os.path.expanduser(table))
-    return {"table": table, "operation": operation, "options": options}
+    return {
+        "table": table_location(job.get("table")),
+        "operation": operation,
+        "options": options,
+    }
 
 
 def list_backends() -> list[str]:

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Protocol
+from urllib.parse import urlsplit
 
 STATES = ("queued", "running", "succeeded", "failed", "canceled")
 TERMINAL_STATES = ("succeeded", "failed", "canceled")
@@ -66,6 +68,25 @@ class BackendError(Exception):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+def table_location(table: str) -> str:
+    """Check a table URI or path and return the location to open.
+
+    A URI must not carry a user name or password: the health report and error
+    messages repeat the location, so a credential in it would be shown.
+    """
+    if not isinstance(table, str) or not table:
+        raise BackendError("invalid_input", "table must be a non-empty string")
+    if "://" not in table:
+        return os.path.abspath(os.path.expanduser(table))
+    try:
+        parts = urlsplit(table)
+    except ValueError as e:
+        raise BackendError("invalid_input", f"table is not a valid URI: {e}") from e
+    if parts.username or parts.password:
+        raise BackendError("invalid_input", "table must not contain credentials")
+    return table
 
 
 class Backend(Protocol):

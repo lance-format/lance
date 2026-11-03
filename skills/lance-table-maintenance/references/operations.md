@@ -79,22 +79,23 @@ are not job options. They belong to the execution backend.
 
 | `operation` | Preview on this machine |
 | --- | --- |
-| `compact` | `tasks`: tasks the run would execute. `tasks_without_budget`: tasks if no per-run budget applied. `budgets`: budgets in effect and where they come from. `fragments_rewritten`, `rows_rewritten`, `bytes_rewritten`: what those tasks read and write again; `bytes_rewritten` is null if the table does not record file sizes. `deleted_rows_dropped`: deleted rows they drop. This preview reads the metadata of every fragment in the plan, so on a table with many fragments it takes longer than the health check |
+| `compact` | `tasks`: tasks the run would execute. `tasks_without_budget`: tasks if no per-run budget applied. `budgets`: budgets in effect and where they come from. `fragments_rewritten`, `rows_rewritten`, `bytes_rewritten`: what those tasks rewrite. `bytes_rewritten` is the size of the base and overlay data files they read: an estimate of input I/O, not the exact size they write. It is null if the table does not record the size of one of those files. `deleted_rows_dropped`: deleted rows they drop. This preview reads the metadata of every fragment in the plan, so on a table with many fragments it takes longer than the health check |
 | `optimize_indices` | Per index: segments and rows not covered |
 | `cleanup` | Versions, files and bytes that would be deleted. Fails like the job would, for example with `invalid_input` when a tagged version is in the way. With a pylance that has no `explain_cleanup_old_versions`, the preview says which versions the retention options select instead: `old_versions`, the oldest and the newest of them, `versions_kept` and `tagged_versions_kept`; `bytes_removed` is null then. This preview reads the manifest of every version, so it takes longer the more versions the table has |
 
 ## Is a compaction worth it
 
-A compaction rewrites every row of the fragments it takes, so it costs `bytes_rewritten` of reads
-and writes. It gains fewer fragments, and less storage when `deleted_rows_dropped` is large. Each
-task leaves at least one fragment, so it removes at most `fragments_rewritten - tasks` fragments. It
-removes few when the fragments it takes already hold close to `target_rows_per_fragment` rows each,
-that is when `rows_rewritten / fragments_rewritten` is near that target.
+A compaction rewrites every row of the fragments it takes, so it reads `bytes_rewritten` of source
+data and writes those rows into new files. The preview counts the input files, not the output. It
+gains fewer fragments, and less storage when `deleted_rows_dropped` is large. Each task leaves at
+least one fragment, so it removes at most `fragments_rewritten - tasks` fragments. It removes few
+when the fragments it takes already hold close to `target_rows_per_fragment` rows each, that is when
+`rows_rewritten / fragments_rewritten` is near that target.
 
 When proposing a compaction, show the user `bytes_rewritten` and how many fragments it removes at
 most. If the fragments are near the target, say that the compaction gains little and let the user
-decide. If the job would run on this machine, also say that this machine reads and writes all those
-bytes.
+decide. If the job would run on this machine, also say that this machine reads all those bytes and
+writes the rewritten rows.
 
 ## Per-run budgets for compaction
 

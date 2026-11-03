@@ -85,8 +85,28 @@ def test_doctor_report_matches_the_table(env, table, tmp_path):
     assert index["num_unindexed_rows"] == ds.count_rows("id >= 3200")
     assert sorted(Path(table).rglob("*")) == files, "the health check is read-only"
 
+    uri = Path(table).as_uri()
+    code, uri_report = run(env, "doctor.py", uri)
+    assert code == 0 and uri_report["table"] == uri
+    assert uri_report["num_rows"] == report["num_rows"]
+
     code, out = run(env, "doctor.py", str(tmp_path / "nope.lance"))
     assert code != 0 and out["error"]["code"] == "table_not_found"
+
+
+def test_doctor_rejects_a_table_uri_with_credentials(env):
+    uri = "s3://ACCESSKEY:DO-NOT-ECHO-THIS@bucket/t.lance"
+    done = subprocess.run(
+        [sys.executable, str(SCRIPTS / "doctor.py"), uri],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert done.returncode != 0
+    out = json.loads(done.stdout)
+    assert out["error"]["code"] == "invalid_input"
+    assert "table must not contain credentials" in out["error"]["message"]
+    assert "DO-NOT-ECHO-THIS" not in done.stdout + done.stderr
 
 
 def test_jobs_in_the_recommended_order_leave_the_table_healthy(env, table, tmp_path):
@@ -119,6 +139,77 @@ def test_jobs_in_the_recommended_order_leave_the_table_healthy(env, table, tmp_p
     ds = lance.dataset(table)
     assert [v["version"] for v in ds.versions()] == [1, ds.version]
     assert sorted(ds.to_table()["id"].to_pylist()) == ids
+
+
+def test_compaction_preview_counts_overlay_data_files(
+    env, table, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES", "1")
+    env["LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES"] = "1"
+
+    ds = lance.dataset(table)
+    fragment = ds.get_fragment(0)
+    addresses = fragment.to_table(with_row_address=True)["_rowaddr"].to_pylist()
+    with fragment.write_overlay(["id"]) as writer:
+        writer.write_batch(
+            pa.table(
+                {
+                    "_rowaddr": pa.array([addresses[0]], pa.uint64()),
+                    "id": pa.array([9999], pa.int64()),
+                }
+            )
+        )
+        group = writer.finish()
+    ds = lance.LanceDataset.commit(
+        ds, lance.LanceOperation.DataOverlay([group]), read_version=ds.version
+    )
+
+    (overlay,) = ds.get_fragment(0).metadata.overlays
+    base_bytes = sum(
+        data_file.file_size_bytes
+        for fragment in ds.get_fragments()
+        for data_file in fragment.metadata.files
+    )
+    _, preview = run(env, "maintain.py", "preview", job(tmp_path, table, "compact", {}))
+    assert preview["fragments_rewritten"] == len(ds.get_fragments())
+    assert preview["bytes_rewritten"] == base_bytes + overlay.data_file.file_size_bytes
+
+
+def test_rewrite_reports_unknown_size_when_a_file_size_is_unknown():
+    sys.path.insert(0, str(SCRIPTS))
+    try:
+        from backends.local import rewrite
+    finally:
+        sys.path.pop(0)
+
+    class _File:
+        def __init__(self, size):
+            self.file_size_bytes = size
+
+    class _Overlay:
+        def __init__(self, size):
+            self.data_file = _File(size)
+
+    class _Fragment:
+        physical_rows = 1
+        deletion_file = None
+
+        def __init__(self, files, overlays):
+            self.files = files
+            self.overlays = overlays
+
+    class _Task:
+        def __init__(self, fragment):
+            self.fragments = [fragment]
+
+    class _Plan:
+        def __init__(self, fragment):
+            self.tasks = [_Task(fragment)]
+
+    known = rewrite(_Plan(_Fragment([_File(10)], [_Overlay(5)])))
+    assert known["bytes_rewritten"] == 15
+    unknown = rewrite(_Plan(_Fragment([_File(10)], [_Overlay(None)])))
+    assert unknown["bytes_rewritten"] is None
 
 
 @pytest.mark.parametrize(

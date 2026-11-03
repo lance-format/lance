@@ -246,7 +246,11 @@ def plan(ds, options: dict, max_source_fragments: int | None) -> dict:
 
 def rewrite(compaction) -> dict:
     """What the planned tasks rewrite. Reads the metadata of each fragment in
-    the plan, which takes longer than planning on a wide table."""
+    the plan, which takes longer than planning on a wide table.
+
+    ``bytes_rewritten`` estimates the input I/O: the size of the base and
+    overlay data files those tasks read. It is not the size of their output.
+    """
     fragments = rows = deleted = 0
     size = 0
     for task in compaction.tasks:
@@ -255,7 +259,12 @@ def rewrite(compaction) -> dict:
             fragments += 1
             rows += fragment.physical_rows - dropped
             deleted += dropped
-            for data_file in fragment.files:
+            data_files = [*fragment.files]
+            # Older pylance versions do not expose overlays.
+            data_files += [
+                overlay.data_file for overlay in getattr(fragment, "overlays", ())
+            ]
+            for data_file in data_files:
                 # None when the table does not record file sizes.
                 file_size = getattr(data_file, "file_size_bytes", None)
                 size = None if size is None or file_size is None else size + file_size

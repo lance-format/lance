@@ -17,7 +17,7 @@ import os
 import sys
 import time
 
-from backends.base import BUDGET_KEYS, CONFIG_PREFIX
+from backends.base import BUDGET_KEYS, CONFIG_PREFIX, table_location
 from backends.local import (
     classify,
     log,
@@ -130,15 +130,16 @@ def main() -> None:
     storage = None
     started = time.monotonic()
     try:
+        table = table_location(args.uri)
         storage = storage_options(storage_options_file())
-        ds = lance.dataset(args.uri, storage_options=storage)
+        ds = lance.dataset(table, storage_options=storage)
     except Exception as e:
         error = {"code": classify(e), "message": redact(str(e), storage)}
         print(json.dumps({"error": error}))
         sys.exit(1)
     # Reads the manifest, which is most of the cost on an object store.
     log.info("open took %.2fs", time.monotonic() - started)
-    print(json.dumps(check(ds, args.uri, storage), default=str))
+    print(json.dumps(check(ds, table, storage), default=str))
 
 
 if __name__ == "__main__":
