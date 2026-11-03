@@ -21,7 +21,6 @@ use std::fs::File;
 use std::future::Future;
 use std::io::{self, ErrorKind};
 use std::ops::Range;
-use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -64,15 +63,11 @@ pub(super) static HANDLE_CACHE: LazyLock<moka::future::Cache<CacheKey, CachedRea
 
 /// File handle for io_uring operations.
 ///
-/// Keeps the file alive and provides the raw file descriptor.
+/// Keeps the file open; each read request issued against it holds the file too.
 #[derive(Debug)]
 pub(super) struct UringFileHandle {
-    /// The file (kept alive via Arc)
-    #[allow(unused)]
-    file: Arc<File>,
-
-    /// Raw file descriptor for io_uring
-    pub(super) fd: RawFd,
+    /// The file to read from
+    pub(super) file: Arc<File>,
 
     /// Object store path
     pub(super) path: Path,
@@ -80,10 +75,8 @@ pub(super) struct UringFileHandle {
 
 impl UringFileHandle {
     pub(super) fn new(file: File, path: Path) -> Self {
-        let fd = file.as_raw_fd();
         Self {
             file: Arc::new(file),
-            fd,
             path,
         }
     }
@@ -195,7 +188,7 @@ impl UringReader {
 
         // Create IoRequest with all data
         let request = Arc::new(IoRequest {
-            fd: self.handle.fd,
+            file: Arc::clone(&self.handle.file),
             offset,
             length,
             thread_id: std::thread::current().id(),
