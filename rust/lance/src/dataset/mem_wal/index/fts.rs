@@ -77,13 +77,14 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
 use prost::Message as _;
 
+use super::super::memtable::batch_store::StoredBatch;
 use super::RowPosition;
 use super::plugin::{
     FlushContext, FlushOutcome, MemIndex, MemIndexBuildContext, MemIndexPlugin, MemIndexSpec,
     ResolveContext, ResolvedIndex,
 };
 use super::query::{FtsMemQuery, MemMatches, MemQuery, RankedMatch, SearchContext};
-use crate::index::scalar::inverted::{ResolvedFtsField, resolve_fts_field};
+use crate::index::scalar::inverted::{FtsDocument, ResolvedFtsField, resolve_fts_field};
 
 /// In-memory FTS index entry returned from search.
 #[derive(Debug, Clone)]
@@ -1626,6 +1627,14 @@ impl FtsMemIndex {
     /// cheap, small enough to bound it independent of corpus size.
     const DEFAULT_FREEZE_THRESHOLD_ROWS: usize = 50_000;
 
+    /// Smallest run of document text (bytes) handed to one tokenizer task.
+    /// Below this the rayon handoff costs more than the tokenizing it spreads.
+    const MIN_PARALLEL_RUN_BYTES: usize = 128 * 1024;
+
+    /// Most input (Arrow bytes) tokenized ahead of publication in one window,
+    /// bounding the transient term maps of a large multi-batch insert.
+    const MAX_TOKENIZE_WINDOW_BYTES: usize = 64 * 1024 * 1024;
+
     /// Hard cap on live partitions: when a freeze would exceed it, all
     /// partitions are merged into one synchronously. This is only a safety net;
     /// the background tiered merge normally keeps the count far below it.
@@ -1829,7 +1838,7 @@ impl FtsMemIndex {
 
     /// Insert a batch into the mutable tail.
     pub fn insert(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
-        self.insert_batch(batch, row_offset)
+        self.insert_rows(&[(batch, row_offset)], Self::MIN_PARALLEL_RUN_BYTES)
     }
 
     /// Insert a batch. The explicit `batch_position` is accepted for API
@@ -1841,7 +1850,7 @@ impl FtsMemIndex {
         row_offset: u64,
         _batch_position: usize,
     ) -> Result<()> {
-        self.insert_batch(batch, row_offset)
+        self.insert_rows(&[(batch, row_offset)], Self::MIN_PARALLEL_RUN_BYTES)
     }
 
     /// Insert explicit, potentially non-contiguous rows while retaining
@@ -1865,6 +1874,9 @@ impl FtsMemIndex {
         self.insert_batch_with_keys(batch, |row_index| Ok(row_ids.value(row_index)), Some(terms))
     }
 
+    /// Serial reference insert: one batch tokenized on the writer thread.
+    /// The equivalence tests pin [`Self::insert_rows`] to it.
+    #[cfg(test)]
     fn insert_batch(&self, batch: &RecordBatch, row_offset: u64) -> Result<()> {
         self.insert_batch_with_keys(
             batch,
@@ -1886,18 +1898,7 @@ impl FtsMemIndex {
     ) -> Result<QueryLocalFtsStats> {
         let st = self.state.load_full();
         let document_position_start = st.tail.doc_count();
-        if self.resolved_field.get().is_none() {
-            let schema = LanceSchema::try_from(batch.schema().as_ref())?;
-            let resolved = resolve_fts_field(
-                &schema,
-                self.column_name(),
-                self.params.get_document_granularity(),
-            )?;
-            let _ = self.resolved_field.set(resolved);
-        }
-        let resolved = self.resolved_field.get().ok_or_else(|| {
-            Error::internal("MemWAL FTS traversal was not initialized".to_string())
-        })?;
+        let resolved = self.resolve_field(batch)?;
         let extracted_documents = resolved.documents_from_batch(batch)?;
 
         let mut tok_guard = self
@@ -2002,6 +2003,170 @@ impl FtsMemIndex {
             self.freeze(&st)?;
         }
         Ok(query_local_stats)
+    }
+
+    /// Resolve (once) the document traversal for this index's column from the
+    /// schema of the first batch it sees.
+    fn resolve_field(&self, batch: &RecordBatch) -> Result<&ResolvedFtsField> {
+        if self.resolved_field.get().is_none() {
+            let schema = LanceSchema::try_from(batch.schema().as_ref())?;
+            let resolved = resolve_fts_field(
+                &schema,
+                self.column_name(),
+                self.params.get_document_granularity(),
+            )?;
+            let _ = self.resolved_field.set(resolved);
+        }
+        self.resolved_field
+            .get()
+            .ok_or_else(|| Error::internal("MemWAL FTS traversal was not initialized".to_string()))
+    }
+
+    /// Insert `batches` (each `(batch, row_offset)`) in order, tokenizing in
+    /// parallel and publishing on the calling (writer) thread.
+    ///
+    /// Each batch's documents are split into runs of roughly
+    /// `min_run_bytes`..(text / 4·threads) bytes; runs from every batch of a
+    /// window are tokenized concurrently on rayon, each with a pooled
+    /// tokenizer and run-local document positions. The writer then, batch by
+    /// batch, shifts each run to its tail document position, concatenates the
+    /// runs in document order (so postings stay sorted) and publishes the
+    /// batch through the same single `append_batch` + freeze check as the
+    /// serial path. The result is identical to inserting the batches one at a
+    /// time with [`Self::insert_batch_with_keys`]; on error, every batch before
+    /// the failing one is published, as in the serial loop.
+    fn insert_rows(&self, batches: &[(&RecordBatch, u64)], min_run_bytes: usize) -> Result<()> {
+        let mut start = 0;
+        while start < batches.len() {
+            // Bound how much tokenized-but-unpublished state a window holds.
+            let mut end = start + 1;
+            let mut bytes = batches[start].0.get_array_memory_size();
+            while end < batches.len() && bytes < Self::MAX_TOKENIZE_WINDOW_BYTES {
+                bytes += batches[end].0.get_array_memory_size();
+                end += 1;
+            }
+            self.insert_rows_window(&batches[start..end], min_run_bytes)?;
+            start = end;
+        }
+        Ok(())
+    }
+
+    fn insert_rows_window(
+        &self,
+        batches: &[(&RecordBatch, u64)],
+        min_run_bytes: usize,
+    ) -> Result<()> {
+        let Some((first, _)) = batches.first() else {
+            return Ok(());
+        };
+        let resolved = self.resolve_field(first)?;
+        let mut extracted: Vec<Result<Vec<FtsDocument>>> = if batches.len() == 1 {
+            vec![resolved.documents_from_batch(first)]
+        } else {
+            batches
+                .par_iter()
+                .map(|(batch, _)| resolved.documents_from_batch(batch))
+                .collect()
+        };
+
+        let total_bytes: usize = extracted
+            .iter()
+            .filter_map(|docs| docs.as_ref().ok())
+            .flatten()
+            .map(|doc| doc.text.len())
+            .sum();
+        let threads = rayon::current_num_threads().max(1);
+        let run_bytes = min_run_bytes.max(total_bytes.div_ceil(threads * 4)).max(1);
+
+        // Split every batch's documents into runs of consecutive documents.
+        let mut runs: Vec<(usize, u64, &mut [FtsDocument])> = Vec::new();
+        for (batch_idx, docs) in extracted.iter_mut().enumerate() {
+            let Ok(docs) = docs else { continue };
+            let row_offset = batches[batch_idx].1;
+            let mut rest: &mut [FtsDocument] = docs.as_mut_slice();
+            while !rest.is_empty() {
+                let mut len = 0;
+                let mut acc = 0;
+                while len < rest.len() && (len == 0 || acc < run_bytes) {
+                    acc += rest[len].text.len();
+                    len += 1;
+                }
+                let (head, tail) = std::mem::take(&mut rest).split_at_mut(len);
+                runs.push((batch_idx, row_offset, head));
+                rest = tail;
+            }
+        }
+
+        let preserve_zero_token_documents =
+            self.params.get_document_granularity().is_list_element();
+        let tokenized: Vec<(usize, Result<TokenizedRun>)> = if runs.len() <= 1 || threads == 1 {
+            let mut tok_guard = self
+                .writer_tokenizer
+                .lock()
+                .expect("writer tokenizer poisoned — single-writer invariant violated");
+            runs.into_iter()
+                .map(|(batch_idx, row_offset, docs)| {
+                    let run = tokenize_run(
+                        docs,
+                        row_offset,
+                        tok_guard.as_mut(),
+                        preserve_zero_token_documents,
+                    );
+                    (batch_idx, run)
+                })
+                .collect()
+        } else {
+            runs.into_par_iter()
+                .map_init(
+                    || PooledTokenizer::new(&self.tokenizer_pool),
+                    |tokenizer, (batch_idx, row_offset, docs)| {
+                        let run = tokenize_run(
+                            docs,
+                            row_offset,
+                            tokenizer.get_mut(),
+                            preserve_zero_token_documents,
+                        );
+                        (batch_idx, run)
+                    },
+                )
+                .collect()
+        };
+
+        // Publish batch by batch, in order, on this (the writer) thread.
+        let mut tokenized = tokenized.into_iter().peekable();
+        for (batch_idx, docs) in extracted.into_iter().enumerate() {
+            docs?;
+            let mut batch_runs = Vec::new();
+            while let Some((_, run)) = tokenized.next_if(|(idx, _)| *idx == batch_idx) {
+                batch_runs.push(run?);
+            }
+            self.publish_runs(batch_runs)?;
+        }
+        Ok(())
+    }
+
+    /// Merge one batch's tokenized runs at the tail's next document position
+    /// and publish them as a single batch — the serial path's tail step.
+    fn publish_runs(&self, runs: Vec<TokenizedRun>) -> Result<()> {
+        let st = self.state.load_full();
+        let document_position_start = st.tail.doc_count();
+        let merged = TokenizedRun::concat(runs, document_position_start);
+        if merged.documents.is_empty() {
+            return Ok(());
+        }
+        let batch_position = st.tail.next_position();
+        st.tail.append_batch(
+            batch_position,
+            document_position_start,
+            merged.documents,
+            merged.total_tokens,
+            merged.term_builders,
+            self.params.has_positions(),
+        );
+        if self.background_maintenance && st.tail.doc_count() >= self.freeze_threshold_rows as u64 {
+            self.freeze(&st)?;
+        }
+        Ok(())
     }
 
     /// Analyze every exact leaf and return the deduplicated query terms in
@@ -3146,6 +3311,25 @@ impl BatchTermBuilder {
         self.pos_data.push(position);
     }
 
+    /// Move every recorded document position up by `offset`.
+    fn shift(&mut self, offset: u64) {
+        for row_position in &mut self.row_positions {
+            *row_position += offset;
+        }
+    }
+
+    /// Append `other`'s postings, all of whose documents follow this
+    /// builder's last one.
+    fn append(&mut self, other: Self) {
+        debug_assert!(
+            self.row_positions.last() < other.row_positions.first(),
+            "runs must be appended in document order"
+        );
+        self.row_positions.extend(other.row_positions);
+        self.frequencies.extend(other.frequencies);
+        self.pos_data.extend(other.pos_data);
+    }
+
     /// Freeze the accumulated postings into a `TermChunk`. Positions are stored
     /// only when `with_position` (the column's FTS index config) is set — the
     /// same contract as the on-disk format and Lucene's
@@ -3175,6 +3359,100 @@ impl BatchTermBuilder {
             positions,
         })
     }
+}
+
+/// One tokenized run of consecutive documents from a single batch. Postings
+/// carry run-local document positions (`0..documents.len()`) until
+/// [`TokenizedRun::concat`] places the run at its tail position.
+struct TokenizedRun {
+    term_builders: FxHashMap<Arc<str>, BatchTermBuilder>,
+    documents: Vec<DocumentMetadata>,
+    total_tokens: u64,
+}
+
+impl TokenizedRun {
+    /// Concatenate one batch's runs, in document order, starting at tail
+    /// document position `document_position_start`. Each run's positions are
+    /// shifted past every earlier run's documents, so every term's postings
+    /// remain sorted and match a serial pass over the same documents.
+    fn concat(runs: Vec<Self>, document_position_start: u64) -> Self {
+        let mut runs = runs.into_iter();
+        let Some(mut merged) = runs.next() else {
+            return Self {
+                term_builders: FxHashMap::default(),
+                documents: Vec::new(),
+                total_tokens: 0,
+            };
+        };
+        if document_position_start != 0 {
+            for builder in merged.term_builders.values_mut() {
+                builder.shift(document_position_start);
+            }
+        }
+        let mut offset = document_position_start + merged.documents.len() as u64;
+        for run in runs {
+            // A run with no retained documents has no postings either: only
+            // documents that produced tokens (or, at list-element granularity,
+            // every document) are retained, and only tokens make postings.
+            if run.documents.is_empty() {
+                continue;
+            }
+            for (term, mut builder) in run.term_builders {
+                builder.shift(offset);
+                match merged.term_builders.entry(term) {
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        entry.into_mut().append(builder)
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(builder);
+                    }
+                }
+            }
+            offset += run.documents.len() as u64;
+            merged.documents.extend(run.documents);
+            merged.total_tokens += run.total_tokens;
+        }
+        merged
+    }
+}
+
+/// Tokenize `documents` (consecutive documents of one batch whose row `n` is
+/// at `row_offset + n`) into a run with run-local document positions. Mirrors
+/// the unfiltered arm of [`FtsMemIndex::insert_batch_with_keys`].
+fn tokenize_run(
+    documents: &mut [FtsDocument],
+    row_offset: u64,
+    tokenizer: &mut dyn LanceTokenizer,
+    preserve_zero_token_documents: bool,
+) -> Result<TokenizedRun> {
+    let mut run = TokenizedRun {
+        term_builders: FxHashMap::default(),
+        documents: Vec::with_capacity(documents.len()),
+        total_tokens: 0,
+    };
+    for document in documents {
+        let row_position = row_offset
+            .checked_add(document.row_index as u64)
+            .ok_or_else(|| Error::invalid_input("MemWAL FTS row position overflow"))?;
+        let document_position = run.documents.len() as u64;
+        let num_tokens = index_text(
+            &document.text,
+            document_position,
+            tokenizer,
+            &mut run.term_builders,
+        )?;
+        if preserve_zero_token_documents || num_tokens > 0 {
+            run.documents.push(DocumentMetadata {
+                key: DocumentKey {
+                    row_position,
+                    doc_index: std::mem::take(&mut document.doc_index),
+                },
+                num_tokens,
+            });
+            run.total_tokens += num_tokens as u64;
+        }
+    }
+    Ok(run)
 }
 
 fn index_text(
@@ -5235,6 +5513,16 @@ impl MemIndex for FtsMemIndex {
 
     fn insert(&self, batch: &RecordBatch, row_offset: RowPosition) -> Result<()> {
         Self::insert(self, batch, row_offset)
+    }
+
+    /// Tokenizes the batches of one write in parallel, then publishes them in
+    /// order exactly as one-at-a-time inserts would.
+    fn insert_batches(&self, batches: &[StoredBatch]) -> Result<()> {
+        let batches: Vec<(&RecordBatch, u64)> = batches
+            .iter()
+            .map(|stored| (&stored.data, stored.row_offset))
+            .collect();
+        self.insert_rows(&batches, Self::MIN_PARALLEL_RUN_BYTES)
     }
 
     fn resident_bytes(&self) -> usize {
@@ -8305,5 +8593,497 @@ mod tests {
         assert_eq!(c.doc(), Some(100));
         c.skip_to(260);
         assert_eq!(c.doc(), Some(260));
+    }
+}
+
+/// Parallel (`insert_rows`) vs serial (`insert_batch`) ingest equivalence, and
+/// an ignored ingest-throughput micro-benchmark.
+#[cfg(test)]
+mod parallel_insert_tests {
+    use super::*;
+    use arrow_array::builder::{ListBuilder, StringBuilder};
+    use arrow_array::{ArrayRef, StringArray};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use lance_index::scalar::inverted::DocumentGranularity;
+    use rstest::rstest;
+    use std::time::Instant;
+
+    /// Deterministic xorshift64* generator.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Synthetic English-like vocabulary: a few real (incl. stop) words plus
+    /// pseudo-words built from syllables, picked with a Zipf-ish skew.
+    struct Corpus {
+        vocab: Vec<String>,
+        rng: Rng,
+    }
+
+    impl Corpus {
+        fn new(seed: u64, vocab_size: usize) -> Self {
+            const COMMON: &[&str] = &[
+                "the", "of", "and", "to", "in", "is", "that", "for", "it", "as", "was", "with",
+                "learning", "students", "running", "runs", "water", "history", "science",
+            ];
+            const SYLLABLES: &[&str] = &[
+                "ka", "lo", "mi", "ter", "son", "pra", "vel", "dun", "ex", "qui", "ra", "to",
+                "ing", "ed", "ment", "al", "ous", "be", "con", "re", "st", "an", "or", "ly",
+            ];
+            let mut rng = Rng(seed | 1);
+            let mut vocab: Vec<String> = COMMON.iter().map(|w| w.to_string()).collect();
+            while vocab.len() < vocab_size {
+                let n = 1 + rng.below(4) as usize;
+                let word: String = (0..n)
+                    .map(|_| SYLLABLES[rng.below(SYLLABLES.len() as u64) as usize])
+                    .collect();
+                vocab.push(word);
+            }
+            Self { vocab, rng }
+        }
+
+        fn word(&mut self) -> &str {
+            // Squaring a uniform draw skews toward low (common) ranks.
+            let u = self.rng.below(1 << 20) as f64 / (1u64 << 20) as f64;
+            let idx = ((u * u * u) * self.vocab.len() as f64) as usize;
+            &self.vocab[idx.min(self.vocab.len() - 1)]
+        }
+
+        fn document(&mut self, max_words: u64) -> String {
+            let words = self.rng.below(max_words + 1);
+            let mut text = String::new();
+            for i in 0..words {
+                if i > 0 {
+                    text.push(if self.rng.below(12) == 0 { '.' } else { ' ' });
+                    text.push(' ');
+                }
+                let w = self.word().to_string();
+                text.push_str(&w);
+            }
+            text
+        }
+
+        /// Row-granularity batch: nulls, empty / stop-word-only (zero token)
+        /// rows, and documents of varying length.
+        fn text_batch(&mut self, rows: usize, max_words: u64) -> RecordBatch {
+            let values: Vec<Option<String>> = (0..rows)
+                .map(|_| match self.rng.below(20) {
+                    0 => None,
+                    1 => Some(String::new()),
+                    2 => Some("the of and".to_string()),
+                    _ => Some(self.document(max_words)),
+                })
+                .collect();
+            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                "text",
+                DataType::Utf8,
+                true,
+            )]));
+            RecordBatch::try_new(
+                schema,
+                vec![Arc::new(StringArray::from(values)) as ArrayRef],
+            )
+            .unwrap()
+        }
+
+        /// List-element batch: each row a list of short documents, some empty.
+        fn list_batch(&mut self, rows: usize) -> RecordBatch {
+            let mut builder = ListBuilder::new(StringBuilder::new());
+            for _ in 0..rows {
+                if self.rng.below(15) == 0 {
+                    builder.append_null();
+                    continue;
+                }
+                for _ in 0..self.rng.below(4) {
+                    if self.rng.below(6) == 0 {
+                        builder.values().append_value("");
+                    } else {
+                        let doc = self.document(12);
+                        builder.values().append_value(doc);
+                    }
+                }
+                builder.append(true);
+            }
+            let list = builder.finish();
+            let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+                "tags",
+                list.data_type().clone(),
+                true,
+            )]));
+            RecordBatch::try_new(schema, vec![Arc::new(list) as ArrayRef]).unwrap()
+        }
+    }
+
+    type ChunkState = (usize, Vec<u64>, Vec<u32>, u32, Option<(Vec<u32>, Vec<u32>)>);
+
+    /// Every observable piece of index state, in a comparable form.
+    #[derive(Debug, PartialEq)]
+    struct IndexDump {
+        partitions: Vec<PartitionDump>,
+        tail_terms: Vec<(String, Vec<ChunkState>)>,
+        tail_batches: Vec<(usize, u64, Vec<(DocumentKey, u32)>)>,
+        tail_visible: usize,
+        tail_doc_count: u64,
+        tail_total_tokens: u64,
+        tail_next_position: usize,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct PartitionDump {
+        term_fst: Vec<u8>,
+        postings: Vec<(u32, u32, u32)>,
+        block_bytes: Vec<u8>,
+        doc_freq_data: Vec<u8>,
+        pos_data: Vec<u8>,
+        docs: Vec<(DocumentKey, u32)>,
+        total_tokens: u64,
+    }
+
+    fn dump(index: &FtsMemIndex) -> IndexDump {
+        let st = index.state.load_full();
+        let partitions = st
+            .partitions
+            .iter()
+            .map(|p| PartitionDump {
+                term_fst: p.term_fst.as_fst().as_bytes().to_vec(),
+                postings: p
+                    .postings
+                    .iter()
+                    .map(|r| (r.meta_offset, r.block_count, r.doc_count))
+                    .collect(),
+                block_bytes: p.block_bytes.to_vec(),
+                doc_freq_data: p.doc_freq_data.to_vec(),
+                pos_data: p.pos_data.to_vec(),
+                docs: (0..p.docs.len() as u32)
+                    .map(|d| (doc_set_key(&p.docs, d), p.docs.num_tokens(d)))
+                    .collect(),
+                total_tokens: p.docs.total_tokens_num(),
+            })
+            .collect();
+        let tail = &st.tail;
+        let snap = tail.snapshot();
+        let tail_terms = tail
+            .terms
+            .iter()
+            .map(|entry| {
+                let mut chunks: Vec<ChunkState> = entry
+                    .value()
+                    .load()
+                    .chunks()
+                    .map(|c| {
+                        (
+                            c.batch_position,
+                            c.row_positions.clone(),
+                            c.frequencies.clone(),
+                            c.max_freq,
+                            c.positions
+                                .as_ref()
+                                .map(|p| (p.offsets.clone(), p.data.clone())),
+                        )
+                    })
+                    .collect();
+                chunks.sort_by_key(|c| c.0);
+                (entry.key().to_string(), chunks)
+            })
+            .collect();
+        let tail_batches = snap
+            .batches
+            .iter()
+            .map(|b| {
+                (
+                    b.batch_position,
+                    b.document_position_start,
+                    b.documents
+                        .iter()
+                        .map(|d| (d.key.clone(), d.num_tokens))
+                        .collect(),
+                )
+            })
+            .collect();
+        IndexDump {
+            partitions,
+            tail_terms,
+            tail_batches,
+            tail_visible: snap.visible_count,
+            tail_doc_count: snap.cumulative_doc_count,
+            tail_total_tokens: snap.cumulative_total_tokens,
+            tail_next_position: tail.next_batch_position.load(Ordering::Relaxed),
+        }
+    }
+
+    fn sorted_results(mut entries: Vec<FtsEntry>) -> Vec<(u64, Option<Vec<u32>>, u32)> {
+        let mut out: Vec<_> = entries
+            .drain(..)
+            .map(|e| (e.row_position, e.doc_index, e.score.to_bits()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn queries(corpus: &mut Corpus, with_position: bool) -> Vec<FtsQueryExpr> {
+        let mut out = Vec::new();
+        for _ in 0..12 {
+            let a = corpus.word().to_string();
+            let b = corpus.word().to_string();
+            out.push(FtsQueryExpr::match_query(a.clone()));
+            out.push(FtsQueryExpr::match_query(format!("{a} {b}")));
+            out.push(FtsQueryExpr::match_query_with_operator(
+                format!("{a} {b}"),
+                Operator::And,
+            ));
+            out.push(FtsQueryExpr::fuzzy(a.clone()));
+            if with_position {
+                out.push(FtsQueryExpr::phrase(format!("{a} {b}")));
+                out.push(FtsQueryExpr::phrase_with_slop(format!("{a} {b}"), 2));
+            }
+        }
+        out
+    }
+
+    fn assert_same_search(
+        serial: &FtsMemIndex,
+        parallel: &FtsMemIndex,
+        queries: &[FtsQueryExpr],
+        column: &str,
+    ) {
+        for query in queries {
+            let query = query.clone().bind_unbound_leaves(column);
+            let s = sorted_results(serial.search_with_options(&query, SearchOptions::new()));
+            let p = sorted_results(parallel.search_with_options(&query, SearchOptions::new()));
+            assert_eq!(s, p, "query {query:?}");
+            let s = sorted_results(
+                serial.search_with_options(&query, SearchOptions::new().with_limit(10)),
+            );
+            let p = sorted_results(
+                parallel.search_with_options(&query, SearchOptions::new().with_limit(10)),
+            );
+            assert_eq!(s, p, "top-10 query {query:?}");
+        }
+    }
+
+    fn row_batches(corpus: &mut Corpus, count: usize) -> Vec<(RecordBatch, u64)> {
+        let mut offset = 0u64;
+        (0..count)
+            .map(|i| {
+                // > 64 rows per batch, uneven sizes.
+                let rows = 65 + (i * 37) % 160;
+                let batch = corpus.text_batch(rows, 40);
+                let out = (batch, offset);
+                offset += rows as u64;
+                out
+            })
+            .collect()
+    }
+
+    /// The parallel path yields exactly the serial index — partitions, tail,
+    /// batch metadata, counters — and identical search results, across
+    /// several freezes. `min_run_bytes` 1 forces many runs per batch; the
+    /// large value keeps one run per batch so parallelism is across batches.
+    #[rstest]
+    #[case::positions_many_runs(true, 1)]
+    #[case::positions_batch_runs(true, usize::MAX / 2)]
+    #[case::no_positions_many_runs(false, 1)]
+    fn parallel_insert_matches_serial(#[case] with_position: bool, #[case] min_run_bytes: usize) {
+        let mut corpus = Corpus::new(7, 3_000);
+        let batches = row_batches(&mut corpus, 60);
+        let total_docs: usize = batches.iter().map(|(b, _)| b.num_rows()).sum();
+        let threshold = 1_500;
+        assert!(
+            total_docs > 3 * threshold,
+            "must cross the freeze threshold"
+        );
+        let params = InvertedIndexParams::default().with_position(with_position);
+        let new_index = || {
+            FtsMemIndex::try_with_params(1, "text".to_string(), params.clone())
+                .unwrap()
+                .with_freeze_threshold_rows(threshold)
+        };
+
+        let serial = new_index();
+        for (batch, offset) in &batches {
+            serial.insert_batch(batch, *offset).unwrap();
+        }
+
+        // Feed the parallel index in uneven multi-batch writes.
+        let parallel = new_index();
+        let refs: Vec<(&RecordBatch, u64)> = batches.iter().map(|(b, o)| (b, *o)).collect();
+        let mut start = 0;
+        for (i, len) in [1usize, 7, 3, 20, 2, 27].into_iter().enumerate() {
+            let end = (start + len).min(refs.len());
+            if i % 2 == 0 {
+                parallel
+                    .insert_rows(&refs[start..end], min_run_bytes)
+                    .unwrap();
+            } else {
+                let stored: Vec<StoredBatch> = refs[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(j, (b, o))| StoredBatch::new((*b).clone(), *o, start + j))
+                    .collect();
+                // Through the `MemIndex` trait, as the WAL applier calls it.
+                MemIndex::insert_batches(&parallel, &stored).unwrap();
+            }
+            start = end;
+        }
+        assert_eq!(start, refs.len());
+
+        let serial_dump = dump(&serial);
+        assert!(serial_dump.partitions.len() >= 3);
+        assert!(!serial_dump.tail_batches.is_empty());
+        assert_eq!(serial_dump, dump(&parallel));
+        assert_eq!(serial.doc_count(), parallel.doc_count());
+        assert_eq!(serial.entry_count(), parallel.entry_count());
+
+        let qs = queries(&mut corpus, with_position);
+        assert_same_search(&serial, &parallel, &qs, "text");
+    }
+
+    /// List-element granularity retains zero-token documents, which shifts
+    /// every later document position; runs must account for them.
+    #[test]
+    fn parallel_insert_matches_serial_list_elements() {
+        let mut corpus = Corpus::new(11, 500);
+        let mut offset = 0u64;
+        let batches: Vec<(RecordBatch, u64)> = (0..12)
+            .map(|_| {
+                let batch = corpus.list_batch(120);
+                let out = (batch, offset);
+                offset += 120;
+                out
+            })
+            .collect();
+        let params = InvertedIndexParams::default()
+            .with_position(true)
+            .document_granularity(DocumentGranularity::ListElement);
+        let new_index = || {
+            FtsMemIndex::try_with_params(1, "tags".to_string(), params.clone())
+                .unwrap()
+                .with_freeze_threshold_rows(400)
+        };
+        let serial = new_index();
+        for (batch, offset) in &batches {
+            serial.insert_batch(batch, *offset).unwrap();
+        }
+        let parallel = new_index();
+        let refs: Vec<(&RecordBatch, u64)> = batches.iter().map(|(b, o)| (b, *o)).collect();
+        parallel.insert_rows(&refs, 1).unwrap();
+
+        let serial_dump = dump(&serial);
+        assert!(!serial_dump.partitions.is_empty());
+        assert_eq!(serial_dump, dump(&parallel));
+        let qs = queries(&mut corpus, true);
+        assert_same_search(&serial, &parallel, &qs, "tags");
+    }
+
+    /// A failing batch stops the write after publishing every earlier batch,
+    /// exactly as the serial one-at-a-time loop does.
+    #[test]
+    fn parallel_insert_publishes_batches_before_a_failure() {
+        let mut corpus = Corpus::new(3, 200);
+        let good = corpus.text_batch(100, 20);
+        let other_schema = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "other",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(vec!["x"; 80])) as ArrayRef],
+        )
+        .unwrap();
+        let serial = FtsMemIndex::new(1, "text".to_string());
+        serial.insert_batch(&good, 0).unwrap();
+        serial.insert_batch(&other_schema, 100).unwrap_err();
+
+        let parallel = FtsMemIndex::new(1, "text".to_string());
+        parallel
+            .insert_rows(&[(&good, 0), (&other_schema, 100), (&good, 180)], 1)
+            .unwrap_err();
+        assert_eq!(dump(&serial), dump(&parallel));
+        assert_eq!(parallel.doc_count(), serial.doc_count());
+    }
+
+    /// Ingest throughput, serial vs parallel, over ~200 MB of synthetic
+    /// English-like text in 512-row batches written 8 batches at a time.
+    ///
+    /// `cargo test -p lance --release --lib fts_ingest_throughput -- --ignored --nocapture`
+    /// (`FTS_BENCH_MB` overrides the corpus size).
+    #[test]
+    #[ignore]
+    #[allow(clippy::print_stdout)]
+    fn fts_ingest_throughput() {
+        let target_mb: usize = std::env::var("FTS_BENCH_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
+        let mut corpus = Corpus::new(42, 60_000);
+        let rows_per_batch = 512;
+        let mut batches: Vec<(RecordBatch, u64)> = Vec::new();
+        let mut bytes = 0usize;
+        let mut offset = 0u64;
+        while bytes < target_mb * 1_000_000 {
+            // ~600 words ≈ 4 KB average, close to FineWeb-Edu documents.
+            let batch = corpus.text_batch(rows_per_batch, 1_200);
+            let text = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            bytes += text.value_data().len();
+            batches.push((batch, offset));
+            offset += rows_per_batch as u64;
+        }
+        let rows = offset as f64;
+        let mb = bytes as f64 / 1e6;
+        println!(
+            "corpus: {} batches, {} rows, {:.1} MB text, rayon threads {}",
+            batches.len(),
+            offset,
+            mb,
+            rayon::current_num_threads()
+        );
+        for with_position in [false, true] {
+            let params = InvertedIndexParams::default().with_position(with_position);
+            let serial =
+                FtsMemIndex::try_with_params(1, "text".to_string(), params.clone()).unwrap();
+            let t = Instant::now();
+            for (batch, offset) in &batches {
+                serial.insert_batch(batch, *offset).unwrap();
+            }
+            let serial_secs = t.elapsed().as_secs_f64();
+
+            let parallel = FtsMemIndex::try_with_params(1, "text".to_string(), params).unwrap();
+            let t = Instant::now();
+            for group in batches.chunks(8) {
+                let stored: Vec<StoredBatch> = group
+                    .iter()
+                    .enumerate()
+                    .map(|(j, (b, o))| StoredBatch::new(b.clone(), *o, j))
+                    .collect();
+                MemIndex::insert_batches(&parallel, &stored).unwrap();
+            }
+            let parallel_secs = t.elapsed().as_secs_f64();
+            assert_eq!(serial.doc_count(), parallel.doc_count());
+            println!(
+                "with_position={with_position}: serial {:.0} rows/s {:.1} MB/s ({:.2}s) | parallel {:.0} rows/s {:.1} MB/s ({:.2}s) | speedup {:.2}x",
+                rows / serial_secs,
+                mb / serial_secs,
+                serial_secs,
+                rows / parallel_secs,
+                mb / parallel_secs,
+                parallel_secs,
+                serial_secs / parallel_secs
+            );
+        }
     }
 }
