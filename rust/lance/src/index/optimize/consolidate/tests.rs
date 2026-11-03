@@ -578,3 +578,168 @@ async fn additional_deletions_reuse_staged_output(#[case] stable: bool) {
     assert_eq!(files(&dir, uuid), staged_files);
     assert_query(&dataset, BASE + 2 * SMALL - 2).await;
 }
+
+async fn indexed_rows(dataset: &Dataset, segment: &IndexMetadata) -> u64 {
+    dataset
+        .open_vector_index("vector", &segment.uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap()
+        .num_rows()
+}
+
+fn select(segments: &[&IndexMetadata]) -> OptimizeOptions {
+    OptimizeOptions::consolidate(4 * BASE as u64)
+        .index_names(vec![NAME.to_string()])
+        .consolidate_segments(segments.iter().map(|segment| segment.uuid).collect())
+}
+
+/// The selection can name older segments, not only the newest; the newest one
+/// it leaves out is untouched, its model re-encodes the selection, and
+/// re-encoding drops the deleted rows even though the old segments still hold
+/// their entries.
+#[rstest]
+#[case(false)]
+#[case(true)]
+#[tokio::test]
+async fn selected_older_segments_are_rewritten_without_deleted_rows(#[case] stable: bool) {
+    let dir = TempStrDir::default();
+    let mut dataset = fixture(&dir, stable).await;
+    let old = segments(&dataset).await;
+    let newest_files = files(&dir, old[2].uuid);
+    // Half of fragment 0 and a quarter of fragment 1.
+    dataset
+        .delete(&format!(
+            "id < {} OR (id >= {BASE} AND id < {})",
+            BASE / 2,
+            BASE + SMALL / 4
+        ))
+        .await
+        .unwrap();
+    let live = (BASE / 2 + SMALL * 3 / 4) as u64;
+    assert_eq!(
+        indexed_rows(&dataset, &old[0]).await + indexed_rows(&dataset, &old[1]).await,
+        (BASE + SMALL) as u64
+    );
+
+    let options = select(&[&old[0], &old[1]]);
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    assert_eq!(plan.merges.len(), 1);
+    assert_eq!(plan.merges[0].replaces, vec![old[0].uuid, old[1].uuid]);
+    assert!(
+        plan.tasks
+            .iter()
+            .all(|task| task.reference.uuid == old[2].uuid)
+    );
+    let reference = model(&dataset, &old[2]).await;
+    dataset.optimize_indices(&options).await.unwrap();
+
+    let new = segments(&dataset).await;
+    assert_eq!(new.len(), 2);
+    assert!(new.iter().any(|segment| *segment == old[2]));
+    assert_eq!(files(&dir, old[2].uuid), newest_files);
+    let output = new
+        .iter()
+        .find(|segment| segment.uuid != old[2].uuid)
+        .unwrap();
+    assert_eq!(indexed_rows(&dataset, output).await, live);
+    assert_eq!(model(&dataset, output).await, reference);
+    assert_query(&dataset, live as usize + SMALL).await;
+}
+
+/// Segments are packed whole, in index order, into outputs of at most
+/// `max_rows_per_segment` live rows, and each output replaces only its own.
+#[tokio::test]
+async fn selected_segments_pack_into_bounded_outputs() {
+    let dir = TempStrDir::default();
+    let mut dataset = fixture(&dir, false).await;
+    let old = segments(&dataset).await;
+    let options =
+        select(&[&old[0], &old[1], &old[2]]).max_rows_per_segment(Some((BASE + SMALL / 2) as u64));
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    assert_eq!(
+        plan.merges
+            .iter()
+            .map(|merge| merge.replaces.clone())
+            .collect::<Vec<_>>(),
+        vec![vec![old[0].uuid], vec![old[1].uuid, old[2].uuid]]
+    );
+    dataset.optimize_indices(&options).await.unwrap();
+    let new = segments(&dataset).await;
+    assert_eq!(new.len(), 2);
+    assert!(new.iter().all(|segment| !old.contains(segment)));
+    let mut sizes = Vec::new();
+    for segment in &new {
+        sizes.push(indexed_rows(&dataset, segment).await);
+    }
+    sizes.sort_unstable();
+    assert_eq!(sizes, vec![2 * SMALL as u64, BASE as u64]);
+    assert_query(&dataset, BASE + 2 * SMALL).await;
+}
+
+/// Deleting every row of a segment's fragments removes the segment, so a
+/// selection made before that delete names a segment that is gone: it is
+/// skipped, and the rest is still rewritten.
+#[tokio::test]
+async fn a_selected_segment_removed_since_selection_is_skipped() {
+    let dir = TempStrDir::default();
+    let mut dataset = fixture(&dir, false).await;
+    let old = segments(&dataset).await;
+    let options = select(&[&old[1], &old[2]]);
+    dataset
+        .delete(&format!("id >= {BASE} AND id < {}", BASE + SMALL))
+        .await
+        .unwrap();
+    assert!(
+        segments(&dataset)
+            .await
+            .iter()
+            .all(|segment| segment.uuid != old[1].uuid)
+    );
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    assert_eq!(plan.merges.len(), 1);
+    assert_eq!(plan.merges[0].replaces, vec![old[2].uuid]);
+    dataset.optimize_indices(&options).await.unwrap();
+    let new = segments(&dataset).await;
+    assert_eq!(new.len(), 2);
+    assert_eq!(new[0], old[0]);
+    assert_query(&dataset, BASE + SMALL).await;
+
+    // Nothing selected is left: nothing to plan.
+    let gone = select(&[&old[1]]);
+    let plan = plan_optimize_indices(&dataset, &gone).await.unwrap();
+    assert!(plan.tasks.is_empty() && plan.merges.is_empty());
+}
+
+#[tokio::test]
+async fn invalid_selections_are_rejected() {
+    let dir = TempStrDir::default();
+    let dataset = fixture(&dir, false).await;
+    let old = segments(&dataset).await;
+    let base = select(&[&old[0], &old[1]]);
+    let unnamed =
+        OptimizeOptions::consolidate(4 * BASE as u64).consolidate_segments(vec![old[0].uuid]);
+    let duplicate = base
+        .clone()
+        .consolidate_segments(vec![old[0].uuid, old[0].uuid]);
+    let empty = base.clone().consolidate_segments(Vec::new());
+    let zero_output = base.clone().max_rows_per_segment(Some(0));
+    for (invalid, message) in [
+        (unnamed, "exactly one index name"),
+        (duplicate, "more than once"),
+        (empty, "at least one segment"),
+        (zero_output, "positive max_rows_per_segment"),
+    ] {
+        let error = plan_optimize_indices(&dataset, &invalid).await.unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+    }
+    // Over budget is an error, not a shorter selection.
+    let mut over = base;
+    over.max_rows_to_consolidate = Some(BASE as u64);
+    let error = plan_optimize_indices(&dataset, &over).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("more than the consolidation budget"),
+        "{error}"
+    );
+}
