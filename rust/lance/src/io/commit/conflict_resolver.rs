@@ -68,8 +68,8 @@ pub struct TransactionRebase<'a> {
     /// child's id).
     current_schema: Option<lance_core::datatypes::Schema>,
     /// The fragments and schema at the read version, kept for a CreateIndex
-    /// so a concurrent `Merge` can be told which columns it rewrote in place
-    /// and which fields it removed or retyped.
+    /// to detect in-place column rewrites even after transaction cleanup,
+    /// and fields a concurrent `Merge` removed or retyped.
     read_fragments: Option<Arc<Vec<Fragment>>>,
     read_schema: Option<lance_core::datatypes::Schema>,
     /// For a `Rewrite` carrying a fragment reuse entry: what it adds relative
@@ -3046,6 +3046,23 @@ impl<'a> TransactionRebase<'a> {
                         "Run the cleanup again on the latest version.",
                     ));
                 }
+            }
+
+            // Cleanup can hide in-place rewrites from the transaction checks.
+            // Compare the surviving fragments' field paths with the build
+            // snapshot; deletion files and added columns do not stale an index.
+            if dataset.manifest.version != self.transaction.read_version
+                && let Some(read_fragments) = &self.read_fragments
+            {
+                let rewrites =
+                    Transaction::merge_rewritten_fields(read_fragments, dataset.fragments());
+                Transaction::withdraw_in_place_rewrites(
+                    new_indices,
+                    rewrites,
+                    dataset.schema(),
+                    dataset.fragment_bitmap.as_ref(),
+                    self.current_lineage.as_ref(),
+                );
             }
 
             // Handle MEM_WAL_INDEX rebasing

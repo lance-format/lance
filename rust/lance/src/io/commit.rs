@@ -2477,10 +2477,14 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::append(false)]
-    #[case::index(true)]
+    #[case::append(false, false)]
+    #[case::index_after_delete(true, false)]
+    #[case::index_after_add_columns(true, true)]
     #[tokio::test]
-    async fn test_safe_commit_survives_cleaned_history(#[case] is_index: bool) {
+    async fn test_safe_commit_survives_cleaned_history(
+        #[case] is_index: bool,
+        #[case] is_column_add: bool,
+    ) {
         let stale = Arc::new(
             gen_batch()
                 .col("id", array::step::<Int32Type>())
@@ -2522,7 +2526,21 @@ mod tests {
                 .unwrap()
         };
         let mut latest = stale.as_ref().clone();
-        latest.delete("id = 0").await.unwrap();
+        if is_column_add {
+            latest
+                .add_columns(
+                    crate::dataset::NewColumnTransform::SqlExpressions(vec![(
+                        "extra".into(),
+                        "id * 2".into(),
+                    )]),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        } else {
+            latest.delete("id = 0").await.unwrap();
+        }
         let latest = CommitBuilder::new(Arc::new(latest))
             .execute(Transaction::new(
                 2,
@@ -2547,13 +2565,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.version().version, 4);
-        assert_eq!(result.count_rows(Some("id = 0".into())).await.unwrap(), 0);
+        assert_eq!(
+            result.count_rows(Some("id = 0".into())).await.unwrap(),
+            usize::from(is_column_add)
+        );
         assert_eq!(
             result.count_rows(None).await.unwrap(),
-            if is_index { 7 } else { 8 }
+            if is_index {
+                7 + usize::from(is_column_add)
+            } else {
+                8
+            }
         );
         if is_index {
-            assert_eq!(result.load_indices().await.unwrap().len(), 1);
+            let indices = result.load_indices().await.unwrap();
+            assert_eq!(indices.len(), 1);
+            assert_eq!(
+                indices[0].fragment_bitmap.as_ref().unwrap(),
+                &RoaringBitmap::from_iter([0u32, 1])
+            );
             assert_eq!(result.count_rows(Some("id = 3".into())).await.unwrap(), 1);
         }
     }

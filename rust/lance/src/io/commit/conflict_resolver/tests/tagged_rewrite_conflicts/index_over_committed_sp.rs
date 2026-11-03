@@ -13,7 +13,11 @@
 //! eager rule.
 
 use super::*;
-use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
+use crate::dataset::cleanup::CleanupPolicyBuilder;
+use crate::dataset::{
+    InsertBuilder, MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched,
+    WriteMode, WriteParams,
+};
 
 /// Two fragments of four rows: `i` 0..8, a constant `text` and a payload
 /// `w` (so a partial-schema in-place rewrite is expressible).
@@ -95,6 +99,121 @@ fn stored_bitmap(indices: &[IndexMetadata]) -> RoaringBitmap {
         .fragment_bitmap
         .clone()
         .unwrap()
+}
+
+#[rstest::rstest]
+#[case::indexed_payload("text", true)]
+#[case::preserved_join_key("i", false)]
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn index_build_withdraws_columns_rewritten_before_cleanup(
+    #[case] indexed_column: &str,
+    #[case] is_withdrawn: bool,
+    #[values(false, true)] is_tagged: bool,
+    #[values(false, true)] is_staged: bool,
+) {
+    let dir = TempStrDir::default();
+    let dataset = fixture(dir.as_str()).await;
+    let mut stale = if is_tagged {
+        make_tagged(dataset).await
+    } else {
+        dataset
+    };
+    let read_version = stale.version().version;
+    let fragments = stale.fragments().iter().map(|f| f.id as u32).collect();
+    let segment = if is_staged {
+        Some(
+            stage(&stale, indexed_column, IndexType::BTree, fragments)
+                .await
+                .1,
+        )
+    } else {
+        None
+    };
+
+    // Only one fragment is rewritten. Its join key keeps its original file,
+    // while the text column moves to a new file under the same field id.
+    let source =
+        arrow_array::record_batch!(("i", Int32, [0]), ("text", Utf8, ["patched"])).unwrap();
+    let (latest, _) = MergeInsertBuilder::try_new(Arc::new(stale.clone()), vec!["i".into()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .write_mode(MergeInsertWriteMode::RewriteColumns)
+        .try_build()
+        .unwrap()
+        .execute_batches(vec![source])
+        .await
+        .unwrap();
+    let rewrite_version = latest.version().version;
+    let latest = crate::dataset::CommitBuilder::new(latest)
+        .execute(Transaction::new(
+            rewrite_version,
+            Operation::ReserveFragments { num_fragments: 1 },
+            None,
+        ))
+        .await
+        .unwrap();
+    let stats = latest
+        .cleanup(
+            CleanupPolicyBuilder::default()
+                .versions((1..=rewrite_version).collect())
+                .unwrap()
+                .build(),
+        )
+        .execute()
+        .await
+        .unwrap();
+    assert_eq!(stats.old_versions, rewrite_version);
+    assert_eq!(stale.version().version, read_version);
+
+    if let Some(segment) = segment {
+        stale
+            .commit_existing_index_segments("idx", indexed_column, vec![segment])
+            .await
+            .unwrap();
+    } else {
+        stale
+            .create_index(
+                &[indexed_column],
+                IndexType::BTree,
+                Some("idx".to_string()),
+                &ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    let dataset = fresh_session(dir.as_str()).await;
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
+    let expected = if is_tagged { [10u32, 11] } else { [0u32, 1] };
+    assert_eq!(
+        stored_bitmap(&stored),
+        if is_withdrawn {
+            RoaringBitmap::from_iter([expected[1]])
+        } else {
+            RoaringBitmap::from_iter(expected)
+        }
+    );
+    let predicates = if is_withdrawn {
+        ["text = 'document'", "text = 'patched'"]
+    } else {
+        ["i = 0", "i = 7"]
+    };
+    for predicate in predicates {
+        let expected_rows = i_values(&dataset, Some(predicate), false).await;
+        assert_eq!(
+            assert_index_serves(&dataset, predicate).await,
+            expected_rows
+        );
+    }
+    assert_eq!(
+        i_values(&dataset, Some("text = 'patched'"), false).await,
+        vec![0]
+    );
 }
 
 #[tokio::test]
