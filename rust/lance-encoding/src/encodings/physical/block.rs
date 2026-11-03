@@ -27,6 +27,7 @@ use lance_core::{Error, Result};
 use rayon::prelude::*;
 
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::compression::{BlockCompressor, BlockDecompressor, require_block_payload};
 use crate::encodings::physical::binary::{BinaryBlockDecompressor, VariableEncoder};
@@ -721,13 +722,12 @@ impl CompressedBufferEncoder {
         offsets: &[T],
         compressed: &mut Vec<u8>,
     ) -> Result<LanceBuffer> {
-        map_values(
-            data,
-            offsets,
-            compressed,
-            parallelism(offsets),
-            &|value, out| self.compressor.compress(value, out),
-        )
+        let total = input_bytes(offsets);
+        let in_flight = LargePagesInFlight::enter(total);
+        let chunks = parallelism(total, in_flight.count, get_num_compute_intensive_cpus());
+        map_values(data, offsets, compressed, chunks, &|value, out| {
+            self.compressor.compress(value, out)
+        })
     }
 
     pub fn per_value_decompress<T: ArrowNativeType>(
@@ -751,17 +751,59 @@ const PARALLEL_MIN_BYTES: usize = 8 * 1024 * 1024;
 /// Each parallel chunk gets at least this many input bytes.
 const PARALLEL_MIN_CHUNK_BYTES: usize = 1024 * 1024;
 
-fn parallelism<T: ArrowNativeType>(offsets: &[T]) -> usize {
-    let total = match offsets {
+/// Pages of at least [`PARALLEL_MIN_BYTES`] currently in `per_value_compress`.
+static LARGE_PAGES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Registers a page while it is being compressed. A page splits over the pool only
+/// while at most half of it is claimed by other large pages; once concurrent page
+/// tasks fill the pool on their own they take the serial loop, which stages and
+/// copies nothing.
+struct LargePagesInFlight {
+    /// Large pages in flight, this one included; 1 for a small page.
+    count: usize,
+    registered: bool,
+}
+
+impl LargePagesInFlight {
+    fn enter(total: usize) -> Self {
+        if total < PARALLEL_MIN_BYTES {
+            return Self {
+                count: 1,
+                registered: false,
+            };
+        }
+        Self {
+            count: LARGE_PAGES_IN_FLIGHT.fetch_add(1, Ordering::Relaxed) + 1,
+            registered: true,
+        }
+    }
+}
+
+impl Drop for LargePagesInFlight {
+    fn drop(&mut self) {
+        if self.registered {
+            LARGE_PAGES_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn input_bytes<T: ArrowNativeType>(offsets: &[T]) -> usize {
+    match offsets {
         [first, .., last] => last.as_usize() - first.as_usize(),
         _ => 0,
-    };
-    if total < PARALLEL_MIN_BYTES {
+    }
+}
+
+/// Chunks for a page of `total` input bytes when `in_flight` large pages (this one
+/// included) share a pool of `cpus` threads. A split page gets `cpus` chunks rather
+/// than its share, so it still fills the pool after its neighbours finish; with more
+/// than half the pool claimed, staging the chunks costs more than the idle threads
+/// would gain (21% at full load in a four-page, four-thread encode).
+fn parallelism(total: usize, in_flight: usize, cpus: usize) -> usize {
+    if total < PARALLEL_MIN_BYTES || in_flight > cpus / 2 {
         return 1;
     }
-    get_num_compute_intensive_cpus()
-        .min(total / PARALLEL_MIN_CHUNK_BYTES)
-        .max(1)
+    cpus.min(total / PARALLEL_MIN_CHUNK_BYTES).max(1)
 }
 
 /// Appends the encoded form of one value to the output buffer.
@@ -819,7 +861,8 @@ fn map_values<T: ArrowNativeType>(
             .par_windows(2)
             .map(|w| {
                 let (lo, hi) = (w[0], w[1]);
-                let mut out = Vec::new();
+                // Sized for incompressible input so the chunk never regrows.
+                let mut out = Vec::with_capacity(offsets[hi].as_usize() - offsets[lo].as_usize());
                 let mut ends = Vec::with_capacity(hi - lo);
                 for off in offsets[lo..=hi].windows(2) {
                     f(&data[off[0].as_usize()..off[1].as_usize()], &mut out)?;
@@ -969,6 +1012,23 @@ mod tests {
     use std::str::FromStr;
 
     use crate::encodings::physical::block::zstd::ZstdBufferCompressor;
+
+    #[rstest::rstest]
+    #[case::small_page(PARALLEL_MIN_BYTES - 1, 1, 64, 1)]
+    #[case::alone(64 << 20, 1, 8, 8)]
+    #[case::bounded_by_chunk_size(16 << 20, 1, 64, 16)]
+    #[case::half_pool_free(64 << 20, 4, 8, 8)]
+    #[case::pool_mostly_claimed(64 << 20, 5, 8, 1)]
+    #[case::pool_oversubscribed(64 << 20, 20, 8, 1)]
+    #[case::single_thread(64 << 20, 1, 1, 1)]
+    fn test_parallelism(
+        #[case] total: usize,
+        #[case] in_flight: usize,
+        #[case] cpus: usize,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(parallelism(total, in_flight, cpus), expected);
+    }
 
     #[test]
     fn test_per_value_parallel_matches_sequential() {
