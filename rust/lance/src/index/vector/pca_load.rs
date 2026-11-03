@@ -15,7 +15,7 @@ use crate::{Error, Result};
 /// Version 4 requires `lance:pca` and physical type `IVF_RQ`. Every other
 /// index metadata version must not carry that key. The buffer itself is
 /// decoded separately.
-pub(crate) fn validate_pca_metadata(
+pub fn validate_pca_metadata(
     metadata: &HashMap<String, String>,
     index_version: i32,
     index_type: &str,
@@ -52,7 +52,7 @@ pub(crate) fn validate_pca_metadata(
     Ok(())
 }
 
-pub(crate) fn pca_buffer_index(metadata: &HashMap<String, String>) -> Result<u32> {
+pub fn pca_buffer_index(metadata: &HashMap<String, String>) -> Result<u32> {
     let raw = metadata.get(PCA_METADATA_KEY).ok_or_else(|| {
         Error::corrupt_file_named(
             "index.idx",

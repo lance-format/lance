@@ -14,7 +14,7 @@ use crate::{Error, Result};
 
 const SCATTER_CHUNK_ROWS: usize = 1024;
 
-pub(crate) struct PcaTrainer;
+pub struct PcaTrainer;
 
 impl PcaTrainer {
     /// Trains one global model from finite rows of `column`.
@@ -23,7 +23,7 @@ impl PcaTrainer {
     /// `sample_size` valid rows are collected or the dataset is exhausted.
     /// Mean and scatter are accumulated in row chunks, without retaining a
     /// centered copy of the sample.
-    pub(crate) async fn train_dataset(
+    pub async fn train_dataset(
         dataset: &Dataset,
         column: &str,
         params: &PcaParams,
