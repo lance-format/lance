@@ -188,6 +188,12 @@ impl Stream for BlobRefReadStream {
 /// payload memory is controlled by the shared [`BlobMaterializationContext`].
 /// The application must retain source snapshots throughout reads and retries.
 ///
+/// Source contexts and locators must come from trusted producers, or the caller
+/// must authorize every object URI before submitting references. The `source_id`
+/// fingerprint associates a locator with a context; it does not authenticate the
+/// locator's contents. Standalone external URIs are opened with the worker
+/// snapshot's storage settings and may point outside the table's storage root.
+///
 /// ```
 /// # use std::sync::Arc;
 /// # use futures::TryStreamExt;
@@ -411,6 +417,8 @@ impl BlobRefReader {
             {
                 binding.dataset.object_store(locator.object.base_id).await?
             } else {
+                // The caller must trust the producer or authorize this external
+                // URI before allowing it to use the worker's storage settings.
                 let params = binding
                     .dataset
                     .store_params

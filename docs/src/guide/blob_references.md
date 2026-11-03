@@ -141,6 +141,16 @@ with its transported context using `BlobRefBinding::try_new`. Supply bindings in
 reference context table. Construction checks the loaded manifest; each request
 also checks its locator fingerprint, registered base, and bound storage root.
 
+Source contexts and locators must come from trusted producers. If an application
+accepts references from an untrusted producer, it must authorize every object URI
+before submitting those references to the reader. The `source_id` fingerprint
+binds a locator to its source context; it does not authenticate `object_uri` or
+the locator's other contents. A producer can copy that fingerprint into a locator
+with a different URI. Standalone external URIs are opened with the worker
+snapshot's storage settings and credentials, and may point outside the table's
+storage root. The external-immutability capability does not grant access to those
+objects.
+
 ```rust
 use futures::TryStreamExt;
 use lance::Result;

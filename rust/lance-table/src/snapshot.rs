@@ -272,6 +272,7 @@ mod tests {
                 naming_scheme: ManifestNamingScheme::V1,
                 e_tag: None,
                 identity: None,
+                last_modified: None,
             },
             [42; 32],
         )
