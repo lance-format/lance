@@ -1005,16 +1005,59 @@ impl StructuralPrimitiveFieldDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
-    fn max_rows_to_drain(&self, num_rows: u64, _byte_budget: u64) -> Result<DrainLimit> {
+    fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
         let dictionary_rows = self
             .page_decoders
             .iter()
             .filter_map(|page| page.dictionary_len())
             .filter_map(|len| dictionary_batch_limit(self.field.data_type(), len))
             .min();
+        if !matches!(
+            self.field.data_type(),
+            DataType::Binary | DataType::Utf8 | DataType::LargeBinary | DataType::LargeUtf8
+        ) {
+            return Ok(DrainLimit {
+                rows: num_rows,
+                bytes: 0,
+                dictionary_rows,
+            });
+        }
+
+        // Schema estimates and post-decode feedback cannot protect the first
+        // batch from overflowing when consecutive pages are concatenated.
+        let mut rows = num_rows;
+        let mut bytes = match self.decoded_bytes_for_rows(rows) {
+            Ok(bytes) => bytes,
+            Err(Error::NotSupported { .. }) => {
+                // Without a reliable size, never concatenate multiple rows into
+                // an i32-offset array. An individually oversized row still errors.
+                return Ok(DrainLimit {
+                    rows: num_rows.min(1),
+                    bytes: 0,
+                    dictionary_rows,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        if bytes > byte_budget {
+            let mut low = 0;
+            let mut high = rows;
+            bytes = 0;
+            while low < high {
+                let mid = low + (high - low).div_ceil(2);
+                let candidate_bytes = self.decoded_bytes_for_rows(mid)?;
+                if candidate_bytes <= byte_budget {
+                    low = mid;
+                    bytes = candidate_bytes;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            rows = low;
+        }
         Ok(DrainLimit {
-            rows: num_rows,
-            bytes: 0,
+            rows,
+            bytes,
             dictionary_rows,
         })
     }

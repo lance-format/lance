@@ -167,25 +167,15 @@ impl StructuralListDecoder {
 impl StructuralFieldDecoder for StructuralListDecoder {
     fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
         let child_limit = self.child.max_rows_to_drain(num_rows, byte_budget)?;
-        let child_plan_rows = child_limit
-            .dictionary_rows
-            .map(|dictionary_rows| child_limit.rows.min(dictionary_rows))
-            .unwrap_or(child_limit.rows);
-        if child_plan_rows < num_rows {
-            // The child limit is expressed in decoded child rows. Without walking
-            // repetition levels here, one parent row is the largest universally safe
-            // batch size. A single parent row that still exceeds the limit will be
-            // reported by the dictionary conversion path.
-            return Ok(DrainLimit {
-                rows: num_rows,
-                bytes: child_limit.bytes,
-                dictionary_rows: Some(num_rows.min(1)),
-            });
-        }
+        // Structural leaf pages count top-level rows even under repetition, so
+        // their byte limit already uses the coordinates passed to drain().
         Ok(DrainLimit {
-            rows: num_rows,
+            rows: child_limit.rows,
             bytes: child_limit.bytes,
-            dictionary_rows: None,
+            dictionary_rows: child_limit
+                .dictionary_rows
+                .filter(|rows| *rows < num_rows)
+                .map(|_| num_rows.min(1)),
         })
     }
 

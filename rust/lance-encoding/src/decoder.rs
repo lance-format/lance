@@ -2179,7 +2179,9 @@ impl StructuralBatchDecodeStream {
         let limit = StructuralFieldDecoder::max_rows_to_drain(
             &self.root_decoder,
             to_take,
-            I32_OFFSET_BYTE_BUDGET,
+            self.batch_size_bytes
+                .unwrap_or(I32_OFFSET_BYTE_BUDGET)
+                .min(I32_OFFSET_BYTE_BUDGET),
         )?;
         to_take = apply_drain_limit(limit, to_take, &mut self.rows_remaining);
         let next_task = self.root_decoder.drain_batch_task(to_take)?;
@@ -3654,7 +3656,10 @@ pub async fn decode_batch(
 // test coalesce indices to ranges
 mod tests {
     use super::*;
-    use arrow_array::StringArray;
+    use arrow_array::{
+        Array, StringArray, StructArray,
+        builder::{BinaryBuilder, ListBuilder},
+    };
     use std::collections::VecDeque;
 
     struct StaticArrayDecodeTask(ArrayRef);
@@ -3669,6 +3674,7 @@ mod tests {
     struct StaticStructuralPageDecoder {
         num_rows: u64,
         dictionary_len: Option<u64>,
+        fake_bytes_per_row: Option<u64>,
     }
 
     #[derive(Debug)]
@@ -3683,6 +3689,12 @@ mod tests {
     }
 
     impl StructuralPageDecoder for StaticStructuralPageDecoder {
+        fn decoded_bytes(&self, num_rows: u64) -> Result<u64> {
+            self.fake_bytes_per_row
+                .map(|bytes| bytes * num_rows)
+                .ok_or_else(|| Error::not_supported("test page has no byte estimate"))
+        }
+
         fn dictionary_len(&self) -> Option<u64> {
             self.dictionary_len
         }
@@ -4227,6 +4239,7 @@ mod tests {
                 decoder: Box::new(StaticStructuralPageDecoder {
                     num_rows: 300 * 8,
                     dictionary_len: Some(129),
+                    fake_bytes_per_row: None,
                 }),
                 path: VecDeque::from([0, 0]),
             })
@@ -4251,6 +4264,114 @@ mod tests {
 
         assert_eq!(task.num_rows, 16);
         assert_eq!(stream.rows_remaining, 284);
+    }
+
+    #[rstest::rstest]
+    #[case::flat_i32("binary", None, Some(800 * 1024 * 1024), 5, vec![2, 2, 1])]
+    #[case::utf8_i32("utf8", None, Some(800 * 1024 * 1024), 5, vec![2, 2, 1])]
+    #[case::nested_i32("nested", None, Some(800 * 1024 * 1024), 5, vec![2, 2, 1])]
+    #[case::large_list("large_list", None, Some(800 * 1024 * 1024), 5, vec![2, 2, 1])]
+    #[case::map("map", None, Some(800 * 1024 * 1024), 5, vec![2, 2, 1])]
+    #[case::first_batch("nested", Some(8 * 1024 * 1024), Some(3 * 1024 * 1024), 5, vec![2, 2, 1])]
+    #[case::row_limit("nested", Some(8 * 1024 * 1024), Some(3 * 1024 * 1024), 1, vec![1; 5])]
+    #[case::oversized_row("nested", None, Some(3 * 1024 * 1024 * 1024), 5, vec![1; 5])]
+    #[case::unknown_size("nested", None, None, 5, vec![1; 5])]
+    #[tokio::test]
+    async fn test_structural_stream_limits_binary_bytes_before_decode(
+        #[case] container: &str,
+        #[case] byte_budget: Option<u64>,
+        #[case] bytes_per_row: Option<u64>,
+        #[case] rows_per_batch: u32,
+        #[case] expected_rows: Vec<u64>,
+    ) {
+        let jpeg = ArrowField::new("jpeg", DataType::Binary, true);
+        let (field, path) = match container {
+            "nested" => {
+                let frame = ArrowField::new("item", DataType::Struct(vec![jpeg].into()), true);
+                let frames = ArrowField::new("frames", DataType::List(Arc::new(frame)), true);
+                (
+                    ArrowField::new("decoded", DataType::Struct(vec![frames].into()), true),
+                    VecDeque::from([0, 0, 0]),
+                )
+            }
+            "large_list" => (
+                ArrowField::new("frames", DataType::LargeList(Arc::new(jpeg)), true),
+                VecDeque::from([0]),
+            ),
+            "map" => {
+                let entries = ArrowField::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![ArrowField::new("key", DataType::Int32, false), jpeg].into(),
+                    ),
+                    false,
+                );
+                (
+                    ArrowField::new("frames", DataType::Map(Arc::new(entries), false), true),
+                    VecDeque::from([0, 1]),
+                )
+            }
+            "utf8" => (
+                ArrowField::new("text", DataType::Utf8, true),
+                VecDeque::from([0]),
+            ),
+            _ => (jpeg, VecDeque::from([0])),
+        };
+        let root_decoder =
+            StructuralStructDecoder::new(vec![field].into(), false, true, false).unwrap();
+        let (tx, rx) = unbounded_channel();
+        let mut scheduled = 0;
+        for num_rows in [2, 3] {
+            scheduled += num_rows;
+            let path = path.clone();
+            let page = async move {
+                Ok(LoadedPageShard {
+                    decoder: Box::new(StaticStructuralPageDecoder {
+                        num_rows,
+                        dictionary_len: None,
+                        fake_bytes_per_row: bytes_per_row,
+                    }),
+                    path,
+                })
+            }
+            .boxed();
+            let mut decoders = vec![MessageType::UnloadedPage(UnloadedPageShard(page))];
+            if container == "map" {
+                let keys = async move {
+                    Ok(LoadedPageShard {
+                        decoder: Box::new(StaticStructuralPageDecoder {
+                            num_rows,
+                            dictionary_len: None,
+                            fake_bytes_per_row: Some(4),
+                        }),
+                        path: VecDeque::from([0, 0]),
+                    })
+                }
+                .boxed();
+                decoders.push(MessageType::UnloadedPage(UnloadedPageShard(keys)));
+            }
+            tx.send(Ok(DecoderMessage {
+                scheduled_so_far: scheduled,
+                decoders,
+            }))
+            .unwrap();
+        }
+        drop(tx);
+        let mut stream = StructuralBatchDecodeStream::new(
+            rx,
+            rows_per_batch,
+            5,
+            root_decoder,
+            false,
+            byte_budget,
+        );
+        let mut actual_rows = Vec::new();
+        while let Some(task) = stream.next_batch_task().await.unwrap() {
+            actual_rows.push(task.num_rows);
+        }
+        assert_eq!(actual_rows, expected_rows);
+        assert_eq!(stream.rows_remaining, 0);
+        assert_eq!(stream.rows_drained, 5);
     }
 
     #[test]
@@ -4359,6 +4480,45 @@ mod tests {
             batches.push(task.task.await.unwrap());
         }
         batches
+    }
+
+    #[tokio::test]
+    async fn test_byte_sized_batches_nested_binary_roundtrip() {
+        let mut frames = ListBuilder::new(BinaryBuilder::new());
+        let payload = vec![42_u8; 1024];
+        for row in 0..32 {
+            for _ in 0..(row % 8) {
+                frames.values().append_value(&payload);
+            }
+            frames.append(row % 5 != 0);
+        }
+        let frames: ArrayRef = Arc::new(frames.finish());
+        let decoded = StructArray::new(
+            vec![Arc::new(ArrowField::new(
+                "frames",
+                frames.data_type().clone(),
+                true,
+            ))]
+            .into(),
+            vec![frames],
+            None,
+        );
+        let batch =
+            RecordBatch::try_from_iter([("decoded", Arc::new(decoded) as ArrayRef)]).unwrap();
+        let budget = 16 * 1024;
+        let batches = decode_batches_with_byte_limit(&batch, 1024, Some(budget)).await;
+        assert!(batches.len() > 1);
+        for batch in &batches {
+            let frames = batch["decoded"].as_struct().column(0).as_list::<i32>();
+            let values = frames.values().as_binary::<i32>();
+            let offsets = values.value_offsets();
+            assert!(
+                batch.num_rows() == 1
+                    || (offsets.last().unwrap() - offsets.first().unwrap()) as u64 <= budget
+            );
+        }
+        let actual = arrow_select::concat::concat_batches(&batch.schema(), &batches).unwrap();
+        assert_eq!(actual, batch);
     }
 
     #[tokio::test]
@@ -4471,7 +4631,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_byte_sized_batches_feedback_convergence() {
-        use arrow_array::StringArray;
+        use arrow_array::{
+            Array, StringArray, StructArray,
+            builder::{BinaryBuilder, ListBuilder},
+        };
 
         // Each row has a 100-byte string. Schema estimate = 64 bytes (default
         // for Utf8), so the first batch will overshoot. The feedback loop
