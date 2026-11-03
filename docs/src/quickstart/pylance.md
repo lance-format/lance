@@ -5,7 +5,7 @@ description: Get started with PyLance, the Python SDK for the Lance format - cre
 
 # Getting Started with PyLance
 
-PyLance is the Python SDK for the Lance format itself. It gives you direct, low-level control over Lance datasets: their files, versions, and indices. If you are building an application or a data pipeline, start with [LanceDB](index.md) or [Apache Spark](spark.md) instead. Both build on the same format and handle more of the work for you.
+PyLance is the Python SDK for the Lance format itself. It gives you direct, low-level control over Lance datasets: their files, versions, and indices. If you are building an application or a data pipeline, start with [LanceDB](lancedb.md) or [Apache Spark](spark.md) instead. Both build on the same format and handle more of the work for you.
 
 This quickstart guide will walk you through the core features of Lance including creating datasets, versioning, and vector search.
 
