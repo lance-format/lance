@@ -3065,18 +3065,28 @@ def test_vector_index_with_prefilter_and_scalar_index(indexed_dataset):
 @pytest.mark.parametrize("metric", ["l2", "cosine", "dot"])
 @pytest.mark.parametrize("index_type", ["IVF_FLAT", "IVF_RQ"])
 @pytest.mark.parametrize(
-    "effort,probes,bounded_probes",
+    "effort,probes_by_metric,bounded_by_metric",
     [
-        (0, 1, (1, 1)),
-        (0.25, 2, (2, 2)),
-        (0.5, 4, (2, 4)),
-        (0.75, 8, (2, 6)),
-        (1, 16, (2, 8)),
+        (0, (1, 1, 1), ((1, 1), (1, 1), (1, 1))),
+        (0.1, (2, 2, 1), ((1, 2), (1, 2), (1, 1))),
+        (0.25, (3, 3, 2), ((2, 3), (2, 3), (1, 2))),
+        (0.5, (4, 4, 4), ((2, 4), (2, 4), (2, 4))),
+        (0.75, (8, 8, 8), ((2, 6), (2, 6), (2, 6))),
+        (1, (16, 16, 16), ((2, 8), (2, 8), (2, 8))),
     ],
 )
 def test_vector_search_effort(
-    tmp_path, monkeypatch, metric, index_type, effort, probes, bounded_probes
+    tmp_path,
+    monkeypatch,
+    metric,
+    index_type,
+    effort,
+    probes_by_metric,
+    bounded_by_metric,
 ):
+    metric_position = ("l2", "cosine", "dot").index(metric)
+    probes = probes_by_metric[metric_position]
+    bounded_probes = bounded_by_metric[metric_position]
     centroids = np.eye(16, dtype=np.float32)
     vectors = np.repeat(centroids, 16, axis=0)
     vectors += (
@@ -3150,7 +3160,7 @@ def test_vector_search_effort(
         assert sorted(filtered["id"].to_pylist()) == sorted(actual["id"].to_pylist())
         # The shared counter also includes the inverted index's one partition.
         assert captured[0].all_counts["partitions_searched"] == probes + 1
-    if effort == 0:
+    if effort in (0, 0.1):
         captured.clear()
         filtered = ds.scanner(
             columns=["id"],
@@ -3161,7 +3171,7 @@ def test_vector_search_effort(
         ).to_table()
         assert len(filtered) == 8
         assert min(filtered["id"].to_pylist()) >= 240
-        assert captured[0].all_counts["partitions_searched"] > 1
+        assert captured[0].all_counts["partitions_searched"] > probes
     for maximum, expected_probes in zip((2, 8), bounded_probes):
         captured.clear()
         bounded = ds.scanner(

@@ -22,6 +22,10 @@
 //! Dot uses the magnitude of the best centroid inner product to scale its gap,
 //! rather than the signed `1 - dot` distance. Corpus and query norms are preserved.
 //! No extra index statistics or file-format changes are needed.
+//! Below default effort, 0.1 and 0.25 target 80% and 90% mean routing recall.
+//! Fractions of the metric/k-dependent Auto budget were selected on calibration
+//! queries and independently evaluated (benchmarks/auto-ivf-effort). These targets
+//! do not account for quantization, filtering, or approximate centroid routing.
 
 use std::env;
 
@@ -94,13 +98,40 @@ impl AutoProbePolicy {
         } else if effort == 1.0 {
             upper
         } else if effort < 0.5 {
-            let budget = lower as f64 * (auto as f64 / lower as f64).powf(2.0 * effort);
-            (budget.ceil() as usize).clamp(lower, auto)
+            // Keep the existing metric/k-dependent shape and calibrate only the
+            // fraction of its budget. Ordered anchors make probing monotone for
+            // each query, including queries clipped by explicit caller bounds.
+            let scales = match (self, metric) {
+                (Self::Adaptive(_), DistanceType::L2) => Some((0.286, 0.601)),
+                (Self::Adaptive(_), DistanceType::Cosine) => Some((0.278, 0.563)),
+                (Self::Adaptive(_), DistanceType::Dot) => Some((0.161, 0.441)),
+                _ => None,
+            };
+            if let Some((low_scale, medium_scale)) = scales {
+                let low = ((auto as f64 * low_scale).ceil() as usize).clamp(lower, auto);
+                let medium = ((auto as f64 * medium_scale).ceil() as usize).clamp(lower, auto);
+                if effort <= 0.1 {
+                    interpolate_budget(effort, (0.0, lower), (0.1, low))
+                } else if effort <= 0.25 {
+                    interpolate_budget(effort, (0.1, low), (0.25, medium))
+                } else {
+                    interpolate_budget(effort, (0.25, medium), (0.5, auto))
+                }
+            } else {
+                interpolate_budget(effort, (0.0, lower), (0.5, auto))
+            }
         } else {
-            let budget = auto as f64 * (upper as f64 / auto as f64).powf(2.0 * effort - 1.0);
-            (budget.ceil() as usize).clamp(auto, upper)
+            interpolate_budget(effort, (0.5, auto), (1.0, upper))
         };
     }
+}
+
+/// Interpolate between positive partition budgets, preserving both anchor bounds
+/// when floating-point rounding puts the result just outside the interval.
+fn interpolate_budget(effort: f64, start: (f64, usize), end: (f64, usize)) -> usize {
+    let fraction = (effort - start.0) / (end.0 - start.0);
+    let budget = start.1 as f64 * (end.1 as f64 / start.1 as f64).powf(fraction);
+    (budget.ceil() as usize).clamp(start.1, end.1)
 }
 
 /// Preserve the pre-experiment f32 heuristic, including signed distances and
@@ -358,8 +389,25 @@ mod tests {
     }
 
     #[rstest]
+    #[case::low_start(0.0, (0.0, 1), (0.1, 4), 1)]
+    #[case::low_middle(0.05, (0.0, 1), (0.1, 4), 2)]
+    #[case::low_end(0.1, (0.0, 1), (0.1, 4), 4)]
+    #[case::middle(0.175, (0.1, 4), (0.25, 16), 8)]
+    #[case::at_auto(0.5, (0.25, 16), (0.5, 32), 32)]
+    #[case::equal_budgets(0.2, (0.1, 8), (0.25, 8), 8)]
+    fn test_interpolate_budget(
+        #[case] effort: f64,
+        #[case] start: (f64, usize),
+        #[case] end: (f64, usize),
+        #[case] expected: usize,
+    ) {
+        assert_eq!(interpolate_budget(effort, start, end), expected);
+    }
+
+    #[rstest]
     #[case::minimum(0.0, 1)]
-    #[case::below_auto(0.25, 4)]
+    #[case::recall80(0.1, 5)]
+    #[case::recall90(0.25, 10)]
     #[case::auto(0.5, 16)]
     #[case::above_auto(0.75, 32)]
     #[case::all(1.0, 64)]
@@ -382,6 +430,7 @@ mod tests {
         #[values(0, 1, 7, 11, 64, 100)] caller_minimum: usize,
         #[values(None, Some(0), Some(16), Some(128))] maximum: Option<usize>,
         #[values(0, 1, 64)] available: usize,
+        #[values(DistanceType::L2, DistanceType::Cosine, DistanceType::Dot)] metric: DistanceType,
     ) {
         let config = AutoProbeConfig {
             min_initial_nprobes: 25,
@@ -395,10 +444,12 @@ mod tests {
         let mut efforts = (0..=100)
             .map(|step| f64::from(step) / 100.0)
             .collect::<Vec<_>>();
-        efforts.extend([
-            f64::from_bits(0.5_f64.to_bits() - 1),
-            f64::from_bits(0.5_f64.to_bits() + 1),
-        ]);
+        for anchor in [0.1_f64, 0.25, 0.5] {
+            efforts.extend([
+                f64::from_bits(anchor.to_bits() - 1),
+                f64::from_bits(anchor.to_bits() + 1),
+            ]);
+        }
         efforts.sort_by(f64::total_cmp);
         for (step, effort) in efforts.into_iter().enumerate() {
             let mut query = query();
@@ -409,7 +460,7 @@ mod tests {
             if maximum == Some(caller_minimum) {
                 continue;
             }
-            AutoProbePolicy::Adaptive(config).apply(&mut query, &distances, DistanceType::L2);
+            AutoProbePolicy::Adaptive(config).apply(&mut query, &distances, metric);
             assert!((lower..=upper).contains(&query.minimum_nprobes));
             assert!(
                 query.minimum_nprobes >= previous,
@@ -425,6 +476,46 @@ mod tests {
         if maximum != Some(caller_minimum) {
             assert_eq!(previous, upper);
         }
+    }
+
+    #[rstest]
+    #[case::l2(DistanceType::L2, 29, 61)]
+    #[case::cosine(DistanceType::Cosine, 28, 57)]
+    #[case::dot(DistanceType::Dot, 17, 45)]
+    fn test_calibrated_effort_anchors(
+        #[case] metric: DistanceType,
+        #[case] low: usize,
+        #[case] medium: usize,
+        #[values(1, 10, 100, 1000, 10_000, 100_000)] k: usize,
+    ) {
+        let config = AutoProbeConfig {
+            min_initial_nprobes: 100,
+            margin: 0.0,
+            max_initial_nprobes: Some(100),
+        };
+        for (effort, expected) in [(0.1, low), (0.25, medium), (0.5, 100)] {
+            let mut query = query();
+            query.k = k;
+            query.search_effort = effort;
+            AutoProbePolicy::Adaptive(config).apply(&mut query, &[1.0; 200], metric);
+            assert_eq!(query.minimum_nprobes, expected);
+            assert_eq!(query.maximum_nprobes, None);
+        }
+    }
+
+    #[rstest]
+    #[case::hamming(DistanceType::Hamming, 10)]
+    #[case::large_k(DistanceType::L2, 100_001)]
+    fn test_uncalibrated_effort_preserves_interpolation(
+        #[case] metric: DistanceType,
+        #[case] k: usize,
+    ) {
+        let mut query = query();
+        query.k = k;
+        query.search_effort = 0.25;
+        AutoProbePolicy::Legacy.apply(&mut query, &[1.0; 64], metric);
+        assert_eq!(query.minimum_nprobes, 8);
+        assert_eq!(query.maximum_nprobes, None);
     }
 
     #[rstest]
