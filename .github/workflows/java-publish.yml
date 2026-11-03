@@ -28,7 +28,56 @@ permissions:
   contents: read
 
 jobs:
+  native-scope:
+    # Reuse Linux validation when a PR changes only the macOS job.
+    # Release and manual runs still build every platform before publishing.
+    name: Select native validation
+    runs-on: ubuntu-latest
+    outputs:
+      linux: ${{ steps.scope.outputs.linux }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 0
+      - id: scope
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          def shared_workflow(text):
+              text = re.sub(
+                  r"(?ms)^  (?:build-macos|native-scope):\n.*?(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+                  "", text,
+              )
+              scheduling = {
+                  "    needs: native-scope",
+                  "    if: needs.native-scope.outputs.linux == 'true'",
+              }
+              return "\n".join(line for line in text.splitlines() if line.strip() and line not in scheduling)
+
+          event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+          linux = True
+          if "pull_request" in event:
+              pr = event["pull_request"]
+              head = pr["head"]["sha"]
+              base = subprocess.check_output(["git", "merge-base", pr["base"]["sha"], head], text=True).strip()
+              changed = subprocess.check_output(["git", "diff", "--name-only", base, head], text=True).splitlines()
+              workflow = ".github/workflows/java-publish.yml"
+              before = subprocess.check_output(["git", "show", f"{base}:{workflow}"], text=True)
+              after = subprocess.check_output(["git", "show", f"{head}:{workflow}"], text=True)
+              linux = changed != [workflow] or shared_workflow(before) != shared_workflow(after)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"linux={str(linux).lower()}\n")
+          print(f"Linux native validation required: {linux}")
+          PY
   build-linux:
+    needs: native-scope
+    if: needs.native-scope.outputs.linux == 'true'
     name: Build on Linux ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -130,7 +179,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref }}
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
           workspaces: java/lance-jni -> target
@@ -142,7 +191,32 @@ jobs:
         working-directory: java/lance-jni
         # Use the existing optimized ThinLTO profile for beta and PR builds.
         # lance-jni inherits strip=true, so the published library stays stripped.
-        run: cargo build --profile "$JNI_BUILD_PROFILE" --locked --timings
+        run: |
+          rustc -vV
+          xcrun clang --version
+          xcrun --show-sdk-version
+          shasum -a 256 "$(xcrun --find ld)"
+          if [ "$JNI_BUILD_PROFILE" = release-with-debug ]; then
+            # Reuse #10594's linker adaptation for tags predating that config.
+            cargo rustc --lib --profile "$JNI_BUILD_PROFILE" --locked --timings -- \
+              -C link-arg=-Wl,-rename_section,__TEXT,__text_startup,__TEXT,__text
+          else
+            cargo build --release --locked --timings
+          fi
+      - name: Check constructor sections
+        if: env.JNI_BUILD_PROFILE == 'release-with-debug'
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+
+          library = f"java/lance-jni/target/{os.environ['JNI_BUILD_PROFILE']}/liblance_jni.dylib"
+          headers = subprocess.check_output(["otool", "-l", library], text=True)
+          sections = set(re.findall(r"sectname\s+(\S+)", headers))
+          assert "__text_startup" not in sections, "startup code must share the text section"
+          assert "__mod_init_func" in sections, "constructor registration must be retained"
+          PY
       - name: Set up Java 11 for native smoke tests
         if: env.JNI_BUILD_PROFILE == 'release-with-debug'
         uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
