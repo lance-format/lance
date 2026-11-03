@@ -1636,7 +1636,7 @@ async fn composite_frag_reuse_update(
     Ok(Some(FragReuseUpdate::Actions(Arc::new(
         lance_table::system_index::frag_reuse::FragReuseActionInputs {
             history,
-            index_is_usable: crate::index::index_is_usable,
+            index_is_usable: crate::index::segment::index_is_usable,
         },
     ))))
 }

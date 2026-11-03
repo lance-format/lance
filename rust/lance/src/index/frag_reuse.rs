@@ -2096,7 +2096,7 @@ pub(crate) const FRAG_REUSE_INLINE_DETAILS_LIMIT: usize = 204800;
 pub(crate) async fn preload_external_frag_reuse_history(
     dataset: &Dataset,
 ) -> lance_core::Result<Option<PreloadedFragReuseHistory>> {
-    let indices = super::load_all_indices(dataset).await?;
+    let indices = super::loading::load_all_indices(dataset).await?;
     let Some(entry) = indices
         .iter()
         .find(|index| index.name == FRAG_REUSE_INDEX_NAME)

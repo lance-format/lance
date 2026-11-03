@@ -5105,6 +5105,7 @@ mod composite {
                         file_type: DeletionFileType::Array,
                         num_deleted_rows: Some(1),
                         base_id: None,
+                        inline: None,
                     }),
                     data_change: true,
                     base: None,

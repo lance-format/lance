@@ -584,7 +584,8 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
         ));
     }
     let elements = split_trim_elements(&content)?;
-    let retained = compute_tagged_retention(&elements, &indices, crate::index::index_is_usable);
+    let retained =
+        compute_tagged_retention(&elements, &indices, crate::index::segment::index_is_usable);
 
     if retained.iter().all(|kept| *kept) {
         return Ok(TaggedTrimOutcome::NothingToTrim);
@@ -1113,7 +1114,8 @@ mod tests {
         fn transition_retention_rules() {
             let elements = vec![transition_element(&[1, 2], &[5, 6])];
             let retain = |indices: &[IndexMetadata]| {
-                compute_tagged_retention(&elements, indices, crate::index::index_is_usable)[0]
+                compute_tagged_retention(&elements, indices, crate::index::segment::index_is_usable)
+                    [0]
             };
 
             // B1: a disjoint index does not block the trim.
@@ -1161,7 +1163,7 @@ mod tests {
                 compute_tagged_retention(
                     &elements,
                     &[named_index("a_idx", 1, &[1])],
-                    crate::index::index_is_usable
+                    crate::index::segment::index_is_usable
                 ),
                 vec![true, true]
             );
@@ -1170,7 +1172,7 @@ mod tests {
                 compute_tagged_retention(
                     &elements,
                     &[named_index("a_idx", 1, &[2])],
-                    crate::index::index_is_usable
+                    crate::index::segment::index_is_usable
                 ),
                 vec![false, true]
             );
@@ -1179,7 +1181,7 @@ mod tests {
                 compute_tagged_retention(
                     &elements,
                     &[named_index("a_idx", 2, &[3])],
-                    crate::index::index_is_usable
+                    crate::index::segment::index_is_usable
                 ),
                 vec![false, false]
             );
@@ -1199,7 +1201,7 @@ mod tests {
                 compute_tagged_retention(
                     &elements,
                     &[named_index("a_idx", 5, &[1])],
-                    crate::index::index_is_usable
+                    crate::index::segment::index_is_usable
                 ),
                 vec![true, true]
             );
@@ -1209,7 +1211,7 @@ mod tests {
                 compute_tagged_retention(
                     &elements,
                     &[named_index("a_idx", 11, &[3])],
-                    crate::index::index_is_usable
+                    crate::index::segment::index_is_usable
                 ),
                 vec![false, false]
             );
@@ -1226,7 +1228,7 @@ mod tests {
                 compute_tagged_retention(
                     &elements,
                     &[named_index("a_idx", 5, &[1])],
-                    crate::index::index_is_usable
+                    crate::index::segment::index_is_usable
                 ),
                 vec![true, true]
             );
@@ -2023,7 +2025,7 @@ mod tests {
                 compute_tagged_retention(
                     &elements,
                     &[pinner.clone(), unusable_taker],
-                    crate::index::index_is_usable
+                    crate::index::segment::index_is_usable
                 ),
                 vec![true],
                 "an unusable segment's bitmap must not stand in as direct coverage"
@@ -2033,7 +2035,7 @@ mod tests {
                 compute_tagged_retention(
                     &elements,
                     &[pinner, named_index("a_idx", 2, &[5, 6])],
-                    crate::index::index_is_usable
+                    crate::index::segment::index_is_usable
                 ),
                 vec![false]
             );

@@ -247,6 +247,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(1),
             base_id: None,
+            inline: None,
         });
         let mut actions = compaction(&[0], 0, false, Some(ordered(survivors(&[0], &[(0, 3)]))));
         if let Action::AddFragment(add) = &mut actions[1] {
@@ -317,6 +318,7 @@ mod tests {
                     file_type: DeletionFileType::Array,
                     num_deleted_rows: Some(1),
                     base_id: None,
+                    inline: None,
                 }),
                 data_change: true,
                 base: None,
