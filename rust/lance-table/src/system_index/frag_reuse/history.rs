@@ -116,7 +116,7 @@ pub enum Record {
 /// [`Self::validate`] for an entry a caller proposes, [`Self::repair`] for an
 /// entry already committed.
 #[derive(Debug, Clone)]
-pub struct RawHistory {
+pub(crate) struct RawHistory {
     format: HistoryFormat,
     content: Bytes,
 }
@@ -172,7 +172,9 @@ impl RewriteRecord {
     /// The fragments the rewrite consumes, as the table holds them, so the
     /// history can refuse sources its format cannot record a rewrite of.
     /// A caller that only builds intent for a later commit may leave them
-    /// out; the commit supplies them.
+    /// out: `lance`'s commit path (`build_frag_reuse_rewrite_entry`) appends
+    /// the rewrite again with the committed groups' sources, so the refusal
+    /// holds for every committed rewrite.
     pub fn with_source_fragments<'a>(
         mut self,
         sources: impl IntoIterator<Item = &'a Fragment>,
@@ -243,7 +245,8 @@ impl FragReuseHistory {
     }
 
     /// A version 0 history holding `versions`, ordered by dataset version.
-    pub fn from_legacy_versions(versions: Vec<pb::Version>) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn from_legacy_versions(versions: Vec<pb::Version>) -> Result<Self> {
         legacy::from_versions(versions)
     }
 
@@ -256,6 +259,10 @@ impl FragReuseHistory {
     /// producing a fragment that is already consumed). Dropping a version only
     /// loses the translation it records: rows an index reaches only through it
     /// are scanned instead.
+    ///
+    /// Used by the version 0 cleanup in `lance`, which still edits
+    /// compaction versions directly; not part of the stable interface.
+    #[doc(hidden)]
     pub fn repair_legacy_versions(versions: Vec<pb::Version>) -> Result<(Self, Vec<u64>)> {
         legacy::repair_versions(versions)
     }
@@ -284,6 +291,12 @@ impl FragReuseHistory {
     /// the file [`Self::locate`] named. A version 0 history an older writer
     /// left invalid is repaired: invalid versions are dropped with a warning,
     /// and rows they translated are scanned.
+    ///
+    /// The result reads the history as on a table with row addresses. The
+    /// entry does not record the table's row-ID mode, so a caller reading a
+    /// table with stable row IDs applies [`Self::on_stable_row_ids`] itself
+    /// before planning reads; [`FriPolicy`](super::policy::FriPolicy) does so
+    /// for the history a rewrite records onto.
     pub fn decode(entry: &IndexMetadata, external: Option<Bytes>) -> Result<Self> {
         let raw = raw_history(entry, external, || {
             Error::index("Index details is not for the fragment reuse index")
@@ -340,6 +353,10 @@ impl FragReuseHistory {
     /// This history as a new FRI entry with its details always inline, for an
     /// entry that only carries intent to the commit path and is never itself
     /// committed.
+    ///
+    /// Used by `lance`'s rewrite intent (`frag_reuse_entry_appending`); not
+    /// part of the stable interface.
+    #[doc(hidden)]
     pub fn encode_inline(&self, dataset_version: u64) -> IndexMetadata {
         let details = length_delimited(INLINE_CONTENT_FIELD, &self.content());
         self.entry_with_details(details, dataset_version)
@@ -366,34 +383,45 @@ impl FragReuseHistory {
         }
     }
 
-    /// The FRI format these records are interpreted under.
+    /// The FRI format these records are interpreted under, which
+    /// [`Self::encode`] stamps as the entry's `index_version`.
     pub fn format(&self) -> HistoryFormat {
         self.0.format()
     }
 
-    /// Whether the history uses the tagged format.
-    pub fn is_tagged(&self) -> bool {
-        self.format() == HistoryFormat::Tagged
-    }
-
     /// The lineage view used for translation.
+    ///
+    /// Used by `lance`'s reader, cleanup and remapping until address
+    /// translation moves behind this type; not part of the stable interface.
+    #[doc(hidden)]
     pub fn ledger(&self) -> &Arc<FragReuseLedger> {
         &self.0.records().ledger
     }
 
     /// Records in serialized order.
+    ///
+    /// Used by `lance`'s version 0 cleanup and commit checks; not part of
+    /// the stable interface.
+    #[doc(hidden)]
     pub fn records(&self) -> impl Iterator<Item = &Record> {
         self.0.records().stored.iter().map(|stored| &stored.record)
     }
 
     /// Whether every record is one this implementation interprets. Edits
     /// that reason about the whole history require it.
+    ///
+    /// Used by `lance`'s cleanup and trim to refuse early; not part of the
+    /// stable interface.
+    #[doc(hidden)]
     pub fn is_fully_interpretable(&self) -> bool {
         self.0.records().is_fully_interpretable()
     }
 
     /// The serialized `InlineContent`: every record's bytes, unchanged and in
     /// order.
+    ///
+    /// Used by `lance`'s cached FRI entry; not part of the stable interface.
+    #[doc(hidden)]
     pub fn content(&self) -> Bytes {
         concat(&self.0.records().stored)
     }
@@ -405,7 +433,7 @@ impl FragReuseHistory {
     /// compaction version. The tagged format names every fragment of the
     /// retained lineage, sources included, so a rewrite of a fragment the
     /// history still translates from is seen as covered.
-    pub fn fragment_bitmap(&self) -> RoaringBitmap {
+    pub(crate) fn fragment_bitmap(&self) -> RoaringBitmap {
         self.0.fragment_bitmap()
     }
 
@@ -435,7 +463,13 @@ impl FragReuseHistory {
         self.0.append(&rewrite).map(Self)
     }
 
-    /// Keep only the records `keep` accepts.
+    /// Keep only the records `keep` accepts. `keep` is called exactly once
+    /// per record, in serialized order (the order of [`Self::records`]), so
+    /// a caller may decide by position.
+    ///
+    /// Used by `lance`'s trim (`derive_tagged_trim`) until trimming moves
+    /// here; not part of the stable interface.
+    #[doc(hidden)]
     pub fn retain(&self, keep: &mut dyn FnMut(&Record) -> bool) -> Result<Self> {
         self.0.records().require_fully_interpretable("trim")?;
         let records: Vec<StoredRecord> = self
@@ -459,12 +493,22 @@ impl FragReuseHistory {
         self.0.clone().remap_bases(remap).map(Self)
     }
 
-    /// The same history, read on a table with stable row IDs. Its read plans
+    /// The same history, read on a table with stable row IDs.
+    ///
+    /// A wrapper rather than part of [`Self::decode`] because the entry does
+    /// not record the table's row-ID mode: only the caller knows it. Every
+    /// caller that plans reads or records a rewrite on such a table applies
+    /// it: `lance`'s stable-row-ID index listing, and
+    /// [`FriPolicy::recording_history`](super::policy::FriPolicy::recording_history).
+    /// Not part of the stable interface.
+    ///
+    /// Its read plans
     /// also exclude every segment that does not store row addresses or whose
     /// kind cannot apply the history, whether or not it is caught up: the
     /// legacy reader applies the history to every segment it opens, so it
     /// would rewrite stable row IDs as if they were addresses. Only a legacy
     /// history can describe such a table.
+    #[doc(hidden)]
     pub fn on_stable_row_ids(self) -> Result<Self> {
         self.0.on_stable_row_ids().map(Self)
     }
@@ -483,6 +527,10 @@ impl FragReuseHistory {
     /// Whether [`Self::plan`] consults `segment.translation`. Computing it can
     /// require reading the segment's files, so a caller may skip it (and pass
     /// any value) for a segment this returns false for.
+    ///
+    /// Used by `lance`'s reader to skip reading segment files; not part of
+    /// the stable interface.
+    #[doc(hidden)]
     pub fn needs_translation_support(
         &self,
         context: &ReadContext,
@@ -526,6 +574,10 @@ impl FragReuseHistory {
     /// appends history, so every record `base` holds must still be present
     /// with the same content. Transitions are identified by their source and
     /// destination fragments, compaction versions by their dataset version.
+    ///
+    /// Used by `lance`'s commit path to find what a rewrite adds; not part
+    /// of the stable interface.
+    #[doc(hidden)]
     pub fn records_added_since(&self, base: &Self) -> Result<Vec<Record>> {
         let mut proposed: HashMap<RecordIdentity, &Record> = HashMap::new();
         for record in self.records() {
@@ -682,7 +734,7 @@ pub(super) fn split_records(content: Bytes) -> Result<Vec<StoredRecord>> {
 }
 
 /// One length-delimited protobuf field.
-pub fn length_delimited(tag: u32, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn length_delimited(tag: u32, payload: &[u8]) -> Vec<u8> {
     let mut output = Vec::with_capacity(payload.len() + 8);
     prost::encoding::encode_key(tag, WireType::LengthDelimited, &mut output);
     prost::encoding::encode_varint(payload.len() as u64, &mut output);

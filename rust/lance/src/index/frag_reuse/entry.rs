@@ -17,7 +17,9 @@ use lance_io::object_store::ObjectStore;
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb::ExternalFile;
 use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
-use lance_table::system_index::frag_reuse::history::{EncodedHistory, FragReuseHistory};
+use lance_table::system_index::frag_reuse::history::{
+    EncodedHistory, FragReuseHistory, HistoryFormat,
+};
 use object_store::path::Path;
 use prost::Message;
 use tokio::io::AsyncWriteExt;
@@ -69,6 +71,10 @@ pub async fn load_proposed_frag_reuse_history(
     dataset: &Dataset,
     entry: &IndexMetadata,
 ) -> Result<FragReuseHistory> {
+    // Locating and reading the external file decodes the entry's details
+    // and checks their range before `decode_proposed` sees the entry, so a
+    // proposal with bad details can fail here first. It is the caller's
+    // error either way.
     let external =
         read_entry_external_history(dataset, entry)
             .await
@@ -132,7 +138,7 @@ pub async fn encode_frag_reuse_entry(
                 Arc::new(FragReuseContent(history.content())),
             )
             .await;
-        if !history.is_tagged() {
+        if history.format() == HistoryFormat::Legacy {
             let legacy = FragReuseIndexDetails::try_from(
                 InlineContent::decode(history.content()).map_err(|e| {
                     Error::corrupt_file_named(

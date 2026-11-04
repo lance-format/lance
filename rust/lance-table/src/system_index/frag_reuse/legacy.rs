@@ -54,7 +54,7 @@ impl LegacyHistory {
     }
 }
 
-/// See [`FragReuseHistory::from_legacy_versions`].
+/// A version 0 history holding `versions`, ordered by dataset version.
 pub fn from_versions(mut versions: Vec<pb::Version>) -> Result<FragReuseHistory> {
     versions.sort_by_key(|version| version.dataset_version);
     let mut content = BytesMut::new();

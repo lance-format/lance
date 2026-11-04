@@ -242,7 +242,7 @@ async fn cleanup_stable_row_id_history(
     Ok(())
 }
 
-fn warn_dropped_versions(dropped: &[u64]) {
+pub(crate) fn warn_dropped_versions(dropped: &[u64]) {
     if !dropped.is_empty() {
         warn!(
             "dropping invalid fragment reuse versions {dropped:?}; rows they translated are \
@@ -1241,7 +1241,7 @@ mod tests {
         use lance_index::IndexType;
         use lance_index::scalar::ScalarIndexParams;
         use lance_table::format::Fragment;
-        use lance_table::system_index::frag_reuse::history::{HistoryFormat, RawHistory};
+        use lance_table::system_index::frag_reuse::history::HistoryFormat;
         use lance_table::system_index::frag_reuse::ledger::Mapping;
         use lance_table::transaction::RewriteGroup;
         use uuid::Uuid;
@@ -2075,9 +2075,11 @@ mod tests {
             prost::encoding::encode_varint(6, &mut content);
             content.extend_from_slice(b"future");
 
-            let history = RawHistory::new(HistoryFormat::Tagged, content.clone().into())
-                .validate()
-                .unwrap();
+            let history = crate::utils::test::frag_reuse_history_from_content(
+                HistoryFormat::Tagged,
+                &content,
+            )
+            .unwrap();
             let Err(error) = trim_elements(&history) else {
                 panic!("an unknown envelope record must refuse the splice")
             };

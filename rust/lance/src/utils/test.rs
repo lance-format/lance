@@ -641,20 +641,38 @@ pub async fn frag_reuse_records(
         .map_err(|e| lance_core::Error::corrupt_file_named("FRI details", e.to_string()))
 }
 
+/// `payload` as one length-delimited protobuf field numbered `tag`, for
+/// hand-built FRI content and details.
+pub fn length_delimited_field(tag: u32, payload: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(payload.len() + 8);
+    prost::encoding::encode_key(tag, prost::encoding::WireType::LengthDelimited, &mut output);
+    prost::encoding::encode_varint(payload.len() as u64, &mut output);
+    output.extend_from_slice(payload);
+    output
+}
+
+/// The validated history of serialized `content`, read as an inline entry
+/// in `format` would be.
+pub fn frag_reuse_history_from_content(
+    format: lance_table::system_index::frag_reuse::history::HistoryFormat,
+    content: &[u8],
+) -> lance_core::Result<lance_table::system_index::frag_reuse::history::FragReuseHistory> {
+    use lance_table::system_index::frag_reuse::history::FragReuseHistory;
+    let mut entry = FragReuseHistory::empty(format).encode_inline(0);
+    let mut details = entry.index_details.as_deref().unwrap().clone();
+    details.value = length_delimited_field(1, content);
+    entry.index_details = Some(Arc::new(details));
+    FragReuseHistory::decode_proposed(&entry, None)
+}
+
 /// The lineage view of serialized history `content`.
 pub fn frag_reuse_ledger_from_content(
     format: lance_table::system_index::frag_reuse::history::HistoryFormat,
     content: &[u8],
 ) -> lance_core::Result<Arc<lance_table::system_index::frag_reuse::ledger::FragReuseLedger>> {
-    Ok(
-        lance_table::system_index::frag_reuse::history::RawHistory::new(
-            format,
-            bytes::Bytes::copy_from_slice(content),
-        )
-        .validate()?
+    Ok(frag_reuse_history_from_content(format, content)?
         .ledger()
-        .clone(),
-    )
+        .clone())
 }
 
 /// Commits `count` padding versions as the dataset's fragment reuse history.

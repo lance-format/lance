@@ -200,6 +200,7 @@ impl FragmentReuseIndex {
                 } else {
                     RowDomain::StableRowId
                 },
+                // Never read unless the check below says the plan consults it.
                 translation: TranslationSupport::Unsupported,
             };
             if self.history.needs_translation_support(&context, &summary) {
@@ -1668,11 +1669,10 @@ pub mod tests {
             }
             content.extend(field(2, &raw));
         }
-        let history = lance_table::system_index::frag_reuse::history::RawHistory::new(
+        let history = crate::utils::test::frag_reuse_history_from_content(
             lance_table::system_index::frag_reuse::history::HistoryFormat::Tagged,
-            content.into(),
+            &content,
         )
-        .validate()
         .unwrap();
         let mapping = Arc::new(FragmentReuseIndex {
             live_fragments: Arc::new(RoaringBitmap::from_iter([3, 9])),

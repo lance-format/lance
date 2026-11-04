@@ -215,7 +215,8 @@ impl std::fmt::Display for MissingCoverageReason {
 }
 
 /// Why the reader derives no coverage for `segment` under `plan`, or `None`
-/// when it derives some.
+/// when it derives some. A translated segment has a reason only when its
+/// remaining coverage is empty.
 fn missing_coverage_reason(
     mapping: &super::frag_reuse_reader::FragmentReuseIndex,
     segment: &SegmentSummary,
@@ -235,6 +236,9 @@ fn missing_coverage_reason(
             },
         ),
         ReadPlan::Translate(_) => None,
+        // A history or coverage this build cannot interpret excludes the
+        // segment whatever its details say (they may not even have been
+        // read), so only otherwise is an uninterpretable segment the cause.
         ReadPlan::Excluded => Some(
             if mapping.has_unsupported_transitions() || segment.fragment_bitmap.is_none() {
                 MissingCoverageReason::Unsupported
@@ -1062,6 +1066,10 @@ pub(crate) async fn frag_reuse_entry_recording(
 ) -> lance_core::Result<IndexMetadata> {
     let stored = super::loading::load_all_indices(dataset).await?;
     let current = stored_frag_reuse_history(dataset, &stored).await?;
+    // Lifted even where the policy would record the legacy format (the
+    // read-version snapshot may predate the table turning tagged): the commit
+    // path takes only a tagged entry as transition intent, and treats a
+    // version 0 entry as a complete legacy record instead.
     let history = FriPolicy::new(&dataset.manifest, &stored)
         .recording_history(current, &rewrite)?
         .lift()?
@@ -1686,12 +1694,10 @@ mod tests {
             ),
         };
         for transition in &transitions {
-            content.extend_from_slice(
-                &lance_table::system_index::frag_reuse::history::length_delimited(
-                    2,
-                    &transition.encode_to_vec(),
-                ),
-            );
+            content.extend_from_slice(&crate::utils::test::length_delimited_field(
+                2,
+                &transition.encode_to_vec(),
+            ));
             for digest in transition
                 .sources
                 .iter()
@@ -1709,9 +1715,7 @@ mod tests {
             fragment_bitmap: Some(bitmap),
             index_details: Some(Arc::new(prost_types::Any {
                 type_url: "/lance.table.FragmentReuseIndexDetails".into(),
-                value: lance_table::system_index::frag_reuse::history::length_delimited(
-                    1, &content,
-                ),
+                value: crate::utils::test::length_delimited_field(1, &content),
             })),
             index_version: 1,
             created_at: None,
@@ -1854,10 +1858,7 @@ mod tests {
             dataset_version: read_version,
             index_details: Some(Arc::new(prost_types::Any {
                 type_url: "/lance.table.FragmentReuseIndexDetails".into(),
-                value: lance_table::system_index::frag_reuse::history::length_delimited(
-                    1,
-                    &records.encode_to_vec(),
-                ),
+                value: crate::utils::test::length_delimited_field(1, &records.encode_to_vec()),
             })),
             ..entry.clone()
         };
@@ -2177,11 +2178,7 @@ mod tests {
         assert!(lifted.starts_with(&v0_content));
         assert_eq!(
             &lifted[v0_content.len()..],
-            lance_table::system_index::frag_reuse::history::length_delimited(
-                2,
-                &transition.encode_to_vec()
-            )
-            .as_slice()
+            crate::utils::test::length_delimited_field(2, &transition.encode_to_vec()).as_slice()
         );
         // The tagged bitmap names every fragment in the retained lineage,
         // the legacy version's source (100) included.
@@ -2336,10 +2333,7 @@ mod tests {
         let expected: Vec<u8> = transitions
             .iter()
             .flat_map(|transition| {
-                lance_table::system_index::frag_reuse::history::length_delimited(
-                    2,
-                    &transition.encode_to_vec(),
-                )
+                crate::utils::test::length_delimited_field(2, &transition.encode_to_vec())
             })
             .collect();
         assert!(expected.len() > 204800);
@@ -2491,7 +2485,7 @@ mod tests {
             fragment_bitmap: Some(RoaringBitmap::from_iter([0u32, 1])),
             index_details: Some(Arc::new(prost_types::Any {
                 type_url: "/lance.table.FragmentReuseIndexDetails".into(),
-                value: lance_table::system_index::frag_reuse::history::length_delimited(1, &[]),
+                value: crate::utils::test::length_delimited_field(1, &[]),
             })),
             index_version: 1,
             created_at: None,
@@ -2948,7 +2942,7 @@ mod tests {
             fragment_bitmap: Some(RoaringBitmap::from_iter([0u32, 1])),
             index_details: Some(Arc::new(prost_types::Any {
                 type_url: "/lance.table.FragmentReuseIndexDetails".into(),
-                value: lance_table::system_index::frag_reuse::history::length_delimited(1, &[]),
+                value: crate::utils::test::length_delimited_field(1, &[]),
             })),
             index_version: 1,
             created_at: None,

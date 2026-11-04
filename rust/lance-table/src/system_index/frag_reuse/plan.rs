@@ -80,8 +80,9 @@ pub struct ReadContext<'a> {
 /// How a reader uses one index segment.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReadPlan {
-    /// The segment is caught up with the history and its fragments are all
-    /// live: its addresses are used as stored.
+    /// The segment is caught up with the history: its addresses are used as
+    /// stored, and it answers for the fragments it covers that are still
+    /// live.
     Direct,
     /// The segment's addresses are translated through the plan. Its
     /// remaining coverage may be empty; such a segment is still listed, so
