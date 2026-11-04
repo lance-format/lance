@@ -532,13 +532,6 @@ struct PrewarmFiles<'a> {
 trait PrewarmCache: Sync {
     fn is_cached(&self, partition_id: usize) -> BoxFuture<'_, bool>;
 
-    /// Cache the entry built from `batches` unless one is cached already.
-    fn insert<'a>(
-        &'a self,
-        partition_id: usize,
-        batches: PartitionPrewarmBatches,
-    ) -> BoxFuture<'a, Result<()>>;
-
     /// Cache the entry built from the batches `load` yields unless one is
     /// cached already, in which case `load` is not polled. Returns whether
     /// an entry was already cached.
@@ -547,11 +540,6 @@ trait PrewarmCache: Sync {
         partition_id: usize,
         load: BoxFuture<'a, Result<PartitionPrewarmBatches>>,
     ) -> BoxFuture<'a, Result<bool>>;
-}
-
-/// An index whose partition windows `prewarm_partitions` warms.
-trait PrewarmWindows: Sync {
-    fn prewarm_window(&self, partitions: Range<usize>) -> BoxFuture<'_, Result<()>>;
 }
 
 struct PrewarmEntryCache<'a, S: IvfSubIndex + 'static, Q: Quantization + 'static> {
@@ -570,15 +558,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> PrewarmCache
                 .is_some()
         }
         .boxed()
-    }
-
-    fn insert<'a>(
-        &'a self,
-        partition_id: usize,
-        batches: PartitionPrewarmBatches,
-    ) -> BoxFuture<'a, Result<()>> {
-        let inserted = self.insert_with(partition_id, async move { Ok(batches) }.boxed());
-        async move { inserted.await.map(|_| ()) }.boxed()
     }
 
     fn insert_with<'a>(
@@ -604,12 +583,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> PrewarmCache
             Ok(was_cached)
         }
         .boxed()
-    }
-}
-
-impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> PrewarmWindows for IVFIndex<S, Q> {
-    fn prewarm_window(&self, partitions: Range<usize>) -> BoxFuture<'_, Result<()>> {
-        self.prewarm_partition_window(partitions).boxed()
     }
 }
 
@@ -681,7 +654,9 @@ async fn prewarm_partition_window(
             })?;
             let mut follower_loads = payloads
                 .enumerate()
-                .map(|(offset, batches)| cache.insert(run.start + offset + 1, batches))
+                .map(|(offset, batches)| {
+                    cache.insert_with(run.start + offset + 1, async move { Ok(batches) }.boxed())
+                })
                 .collect::<FuturesUnordered<_>>();
             let mut first_error = None;
             while let Some(result) = follower_loads.next().await {
@@ -712,8 +687,8 @@ async fn prewarm_partition_window(
 /// [`Index::prewarm`] of an index that is not native: its partitions,
 /// in byte windows ([`IVF_PREWARM_WINDOW_SIZE_ENV`]) read with bounded
 /// parallelism.
-async fn prewarm_partitions(
-    index: &dyn PrewarmWindows,
+async fn prewarm_partitions<'a>(
+    prewarm_window: &'a (dyn Fn(Range<usize>) -> BoxFuture<'a, Result<()>> + Sync),
     uuid: &Uuid,
     io_parallelism: usize,
     index_layout: PrewarmFileLayout<'_>,
@@ -739,7 +714,7 @@ async fn prewarm_partitions(
     stream::iter(windows)
         .map(Ok)
         .try_for_each_concurrent(Some(parallelism), |window| {
-            index.prewarm_window(window.partitions)
+            prewarm_window(window.partitions)
         })
         .await?;
     let elapsed = started.elapsed();
@@ -2619,7 +2594,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// parallelism.
     async fn prewarm_partitions(&self) -> Result<()> {
         prewarm_partitions(
-            self,
+            &|partitions| self.prewarm_partition_window(partitions).boxed(),
             &self.uuid,
             self.io_parallelism,
             PrewarmFileLayout {
