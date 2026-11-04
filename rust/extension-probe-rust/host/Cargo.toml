@@ -1,0 +1,10 @@
+[package]
+name = "lance-extension-rust-host"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+lance-extension-runtime = { path = "../runtime" }
+tokio = { version = "1.23", features = ["macros", "rt"] }

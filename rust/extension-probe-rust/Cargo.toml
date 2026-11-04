@@ -1,0 +1,3 @@
+[workspace]
+members = ["runtime", "goosefs-plugin", "host"]
+resolver = "3"

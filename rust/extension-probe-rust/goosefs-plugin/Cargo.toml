@@ -1,0 +1,18 @@
+[package]
+name = "lance-extension-goosefs-plugin"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+async-trait = "0.1"
+goosefs-sdk = { version = "=0.2.2", default-features = false }
+lance-extension-runtime = { path = "../runtime" }
+opendal = { version = "=0.59.2", default-features = false, features = ["services-goosefs"] }
+opendal-service-goosefs = { version = "=0.59.2", default-features = false, features = ["metadata-cache", "page-cache-io-uring"] }
+tonic = "0.14.9"
+url = "2.5.7"

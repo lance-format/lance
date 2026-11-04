@@ -24,12 +24,13 @@ use opendal::Operator;
 /// Locations that already match the requested prefix retain their spelling to
 /// preserve paths containing literal percent escapes.
 #[derive(Debug, Clone)]
-pub(super) struct OpendalStore {
+pub struct OpendalStore {
     inner: InnerOpendalStore,
 }
 
 impl OpendalStore {
-    pub(super) fn new(operator: Operator) -> Self {
+    /// Create the Lance-owned adapter around an OpenDAL operator.
+    pub fn new(operator: Operator) -> Self {
         Self {
             inner: InnerOpendalStore::new(operator),
         }

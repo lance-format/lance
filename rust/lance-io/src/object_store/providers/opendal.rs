@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use http::header::{ACCEPT_ENCODING, HeaderValue};
 use http::{Request, Response};
 use opendal::layers::RetryLayer;
 use opendal::{Buffer, HttpBody, HttpTransport, HttpTransporter, Operator};
+
+use crate::object_store::opendal_store::OpendalStore;
+use crate::object_store::{DEFAULT_MAX_IOP_SIZE, ObjectStore, ObjectStoreParams};
 
 /// Sends `Accept-Encoding: identity` unless the request already sets an encoding.
 ///
@@ -29,10 +33,11 @@ impl HttpTransport for IdentityEncodingTransport {
     }
 }
 
-pub(in crate::object_store) fn finish_opendal_operator(
-    operator: Operator,
-    max_retries: usize,
-) -> Operator {
+/// Install Lance's transport and retry policy on an OpenDAL operator.
+///
+/// `opendal::install_default` is explicit so large dylibs do not depend on
+/// OpenDAL's process constructor for service registration.
+pub fn finish_opendal_operator(operator: Operator, max_retries: usize) -> Operator {
     // OpenDAL's auto-registration process constructor can emit an ARM64 branch
     // outside the +/-128 MiB range in large dynamic libraries. Initialize the
     // registry and default transport explicitly at the operator boundary.
@@ -57,6 +62,48 @@ pub(in crate::object_store) fn finish_opendal_operator(
         .with_jitter();
 
     operator.layer(retry_layer)
+}
+
+/// Options for adapting an OpenDAL operator to a Lance [`ObjectStore`].
+#[derive(Debug, Clone)]
+pub struct OpendalStoreOptions {
+    pub scheme: String,
+    pub block_size: usize,
+    pub io_parallelism: usize,
+    pub list_is_lexically_ordered: bool,
+    pub download_retry_count: usize,
+    pub max_retries: usize,
+    pub store_prefix: String,
+}
+
+/// Build a Lance [`ObjectStore`] from a provider-owned OpenDAL operator.
+///
+/// This is the reusable boundary for OpenDAL-backed storage providers. It
+/// applies Lance's identity transport, retry layer, and path-normalizing
+/// `OpendalStore` adapter before returning the store to an
+/// [`ObjectStoreProvider`](crate::object_store::ObjectStoreProvider).
+pub fn from_opendal_operator(
+    operator: Operator,
+    params: &ObjectStoreParams,
+    options: OpendalStoreOptions,
+) -> ObjectStore {
+    let operator = finish_opendal_operator(operator, options.max_retries);
+    ObjectStore {
+        inner: Arc::new(OpendalStore::new(operator)),
+        local_dir_operations: None,
+        local_fsync: false,
+        scheme: options.scheme,
+        block_size: options.block_size,
+        max_iop_size: *DEFAULT_MAX_IOP_SIZE,
+        use_constant_size_upload_parts: params.use_constant_size_upload_parts,
+        list_is_lexically_ordered: options.list_is_lexically_ordered,
+        io_parallelism: options.io_parallelism,
+        download_retry_count: options.download_retry_count,
+        scheduler_error_mode: Default::default(),
+        io_tracker: Default::default(),
+        store_prefix: options.store_prefix,
+        paginated_lister: None,
+    }
 }
 
 #[cfg(test)]
@@ -94,6 +141,34 @@ mod tests {
         let operator =
             Operator::via_iter("memory", []).expect("memory service should be registered");
         assert_eq!(operator.info().scheme(), "memory");
+    }
+
+    #[tokio::test]
+    async fn test_from_opendal_operator_round_trip() {
+        use object_store::path::Path;
+
+        let operator = Operator::new(opendal::services::Memory::default())
+            .expect("memory operator should be created");
+        let store = from_opendal_operator(
+            operator,
+            &ObjectStoreParams::default(),
+            OpendalStoreOptions {
+                scheme: "test".to_string(),
+                block_size: 64 * 1024,
+                io_parallelism: 8,
+                list_is_lexically_ordered: true,
+                download_retry_count: 3,
+                max_retries: 0,
+                store_prefix: "test$".to_string(),
+            },
+        );
+
+        let path = Path::from("probe/data.bin");
+        store.put(&path, b"lance-opendal").await.unwrap();
+        assert_eq!(
+            store.read_one_all(&path).await.unwrap().as_ref(),
+            b"lance-opendal"
+        );
     }
 
     #[derive(Debug, Clone)]
