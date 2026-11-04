@@ -105,11 +105,6 @@ async fn segment_supports_batch_remapping(
             super::frag_reuse_remapping::vector_supports_batch_remapping(dataset, index).await?,
         ));
     }
-    if details.type_url.ends_with("InvertedIndexDetails") {
-        return Ok(Some(
-            super::frag_reuse_remapping::inverted_supports_batch_remapping(dataset, index).await?,
-        ));
-    }
     Ok(super::frag_reuse_remapping::scalar_plugin_translates(
         details,
     ))

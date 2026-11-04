@@ -334,23 +334,52 @@ impl InvertedIndex {
             let index_cache_clone = index_cache.clone();
             async move {
                 let invert_list_reader = store.open_index_file(INVERT_LIST_FILE).await?;
-                let invert_list =
-                    PostingListReader::try_new(invert_list_reader, &index_cache_clone).await?;
-                Result::Ok(Arc::new(invert_list))
+                PostingListReader::try_new(invert_list_reader, &index_cache_clone).await
             }
         });
         let docs_fut = tokio::spawn({
             let store = store.clone();
             async move {
                 let docs_reader = store.open_index_file(DOCS_FILE).await?;
-                let docs = DocSet::load_remapped(docs_reader, true, remapper.as_ref()).await?;
-                Result::Ok(docs)
+                let Some(remapper) = remapper else {
+                    let docs = DocSet::load_remapped(docs_reader, true, None).await?;
+                    return Result::Ok((docs, None));
+                };
+                // The postings name documents by the row addresses the index was
+                // built with, so they translate through the pairs the documents
+                // give: every row the postings hold has exactly one document.
+                let batch = docs_reader
+                    .read_range(0..docs_reader.num_rows(), None)
+                    .await?;
+                let row_id_idx = batch.schema().index_of(ROW_ID)?;
+                let built_with = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
+                let (batch, _) = translate_preserving_layout(&remapper, batch, row_id_idx).await?;
+                let translated = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let mut translation = built_with
+                    .values()
+                    .iter()
+                    .copied()
+                    .zip(translated.values().iter().copied())
+                    .filter(|(_, translated)| *translated != RowAddress::TOMBSTONE_ROW)
+                    .collect::<Vec<_>>();
+                translation.sort_unstable();
+                let docs = DocSet::from_columns(
+                    translated,
+                    batch[NUM_TOKEN_COL].as_primitive::<UInt32Type>(),
+                    true,
+                    None,
+                )?;
+                Result::Ok((docs, Some(Arc::<[(u64, u64)]>::from(translation))))
             }
         });
 
         let (tokenizer_config, tokens) = tokens_fut.await??;
-        let inverted_list = invert_list_fut.await??;
-        let docs = docs_fut.await??;
+        let mut inverted_list = invert_list_fut.await??;
+        let (docs, translation) = docs_fut.await??;
+        if let Some(translation) = translation {
+            inverted_list.set_legacy_translation(translation)?;
+        }
+        let inverted_list = Arc::new(inverted_list);
 
         let tokenizer = tokenizer_config.build()?;
 
@@ -605,39 +634,11 @@ impl InvertedIndex {
                 }))
             }
             Err(_) => {
-                // Old index format. Its document store keeps per-document
-                // lengths positionally aligned with the row ids it was built
-                // with; translating the row ids under a mapping that drops
-                // rows would misalign them and change scoring. Version 0
-                // histories have always translated it that way and keep
-                // doing so; under any other history the reader excludes such
-                // a segment from coverage and the planner scans its
-                // fragments instead.
-                if remapper
-                    .as_ref()
-                    .is_some_and(|remapper| !translates_a_version_0_history(remapper))
-                {
-                    return Err(Error::not_supported(
-                        "a legacy-layout full-text index cannot be translated under a tagged \
-                         fragment reuse history; rebuild the index to use it there",
-                    ));
-                }
+                // Old index format.
                 Self::load_legacy_index(store, remapper, index_cache).await
             }
         }
     }
-}
-
-/// Whether `remapper` applies a version 0 fragment reuse history, or a
-/// synchronous remapper a deprecated entry point was handed: the
-/// translations a legacy-layout full-text index has always accepted.
-fn translates_a_version_0_history(remapper: &Remapper) -> bool {
-    let backing = remapper.backing().as_any();
-    backing.is::<crate::frag_reuse::LegacyRemapper>()
-        || matches!(
-            backing.downcast_ref::<DeprecatedRemapper>(),
-            Some(DeprecatedRemapper::Sync(_))
-        )
 }
 
 #[async_trait]

@@ -597,17 +597,19 @@ impl DocSet {
             .iter()
             .map(|column| column.values().to_vec())
             .collect::<Vec<_>>();
-        // for legacy format, the row id is doc id; sorting keeps binary search viable
+        // for legacy format, the row id is doc id; sorting keeps binary search viable.
+        // A deleted row keeps its document as a tombstone: the corpus statistics
+        // (document count, total length) were taken over every document, and
+        // a document's length is paired with its own row before sorting.
         if is_legacy {
             let (row_ids, num_tokens): (Vec<_>, Vec<_>) = row_id_col
                 .values()
                 .iter()
-                .filter_map(|id| {
-                    if let Some(frag_reuse_index_ref) = frag_reuse_index.as_ref() {
-                        frag_reuse_index_ref.remap_row_id(*id)
-                    } else {
-                        Some(*id)
-                    }
+                .map(|id| match frag_reuse_index.as_ref() {
+                    Some(frag_reuse_index_ref) => frag_reuse_index_ref
+                        .remap_row_id(*id)
+                        .unwrap_or(RowAddress::TOMBSTONE_ROW),
+                    None => *id,
                 })
                 .zip(num_tokens_col.values().iter())
                 .sorted_unstable_by_key(|x| x.0)

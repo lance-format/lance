@@ -3602,76 +3602,34 @@ async fn legacy_layout_fts_keeps_scores_through_a_version_0_history() {
     }
 }
 
-// A legacy-layout full-text index (tokens, postings and documents at the
-// index root, no metadata file) keeps its per-document lengths aligned with
-// the row ids it was built with, so it cannot be translated under a tagged
-// history. The tagged reader excludes the segment from coverage, and a real
-// full-text query on the tagged table returns exactly what an index-free scan
-// returns: neither misaligned scores nor an error.
+// The same released legacy-layout index under a tagged history: it translates
+// like any other segment and keeps the scores it gave before the rewrite.
 #[tokio::test]
-async fn legacy_layout_fts_on_tagged_table_is_excluded_and_scans() {
-    let batch = arrow_array::record_batch!(
-        ("i", Int32, [0, 1, 2, 3, 4, 5, 6, 7]),
-        (
-            "text",
-            Utf8,
-            [
-                Some("even"),
-                Some("odd"),
-                Some("even"),
-                Some("odd"),
-                None,
-                Some("odd"),
-                Some("even"),
-                Some("odd")
-            ]
-        )
-    )
-    .unwrap();
-    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
-    let mut dataset = Dataset::write(
-        reader,
-        "memory://",
-        Some(WriteParams {
-            max_rows_per_file: 4,
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
+async fn legacy_layout_fts_keeps_scores_through_a_tagged_history() {
+    let test_dir = crate::utils::test::copy_test_data_to_tmp("0.27.0/legacy_fts_index").unwrap();
+    let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    dataset.delete("text = 'frodo was a puppy'").await.unwrap();
+    // `prepare` splits rows by the parity of `i`: the two survivors (11, 14)
+    // land in different destinations.
     dataset
-        .create_index(
-            &["text"],
-            IndexType::Inverted,
-            Some("text_idx".into()),
-            // The fixture below rewrites the initial partition's file names.
-            &lance_index::scalar::InvertedIndexParams::default().num_workers(1),
-            true,
+        .add_columns(
+            crate::dataset::NewColumnTransform::SqlExpressions(vec![(
+                "i".into(),
+                "CAST(length(text) / 2 AS INT)".into(),
+            )]),
+            None,
+            None,
         )
         .await
         .unwrap();
-    let index = dataset
-        .load_index_by_name("text_idx")
-        .await
-        .unwrap()
-        .unwrap();
-
-    // Rewrite the single-partition index into the legacy layout: the
-    // partition files move to the root names and the metadata file goes.
-    let index_dir = dataset.indices_dir().join(index.uuid.to_string());
-    for name in ["tokens.lance", "invert.lance", "docs.lance"] {
-        let from = index_dir.clone().join(format!("part_0_{name}"));
-        let to = index_dir.clone().join(name);
-        dataset.object_store.copy(&from, &to).await.unwrap();
-        dataset.object_store.delete(&from).await.unwrap();
+    let index_name = dataset.load_indices().await.unwrap()[0].name.clone();
+    let queries = ["puppy", "happy", "tail", "frodo puppy"];
+    let mut before = Vec::new();
+    for query in queries {
+        before.push(legacy_fts_scores(&dataset, query).await);
     }
-    dataset
-        .object_store
-        .delete(&index_dir.clone().join("metadata.lance"))
-        .await
-        .unwrap();
+    assert_eq!(before[0].len(), 2, "{before:?}");
 
-    dataset.delete("i = 3").await.unwrap();
     let (transition, destinations) = prepare(&dataset).await;
     let content = InlineContent {
         legacy_versions: vec![],
@@ -3680,53 +3638,22 @@ async fn legacy_layout_fts_on_tagged_table_is_excluded_and_scans() {
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
 
-    // Excluded from coverage: no usable segment is advertised for the column.
     let usable =
-        crate::index::scalar_logical::load_named_scalar_segments(&dataset, "text", "text_idx")
+        crate::index::scalar_logical::load_named_scalar_segments(&dataset, "text", &index_name)
             .await
             .unwrap();
-    assert!(usable.is_empty(), "{usable:?}");
+    assert_eq!(usable.len(), 1, "{usable:?}");
+    assert_eq!(
+        usable[0].fragment_bitmap.as_ref().unwrap(),
+        &RoaringBitmap::from_iter([10, 11])
+    );
 
-    // The truth: an index-free scan of the tagged snapshot.
-    let mut scan = dataset.scan();
-    scan.filter("text = 'even'").unwrap();
-    scan.use_scalar_index(false);
-    let expected = scan
-        .try_into_batch()
-        .await
-        .unwrap()
-        .column_by_name("i")
-        .unwrap()
-        .as_primitive::<Int32Type>()
-        .values()
-        .iter()
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(expected, std::collections::BTreeSet::from([0, 2, 6]));
-
-    // A real full-text query on the tagged table matches it, cold and warm.
+    // Cold and warm.
     for _ in 0..2 {
-        let mut scan = dataset.scan();
-        // The column is named: a column-less query discovers its columns from
-        // the usable segments, and this snapshot advertises none.
-        scan.full_text_search(
-            lance_index::scalar::FullTextSearchQuery::new("even".into())
-                .with_column("text".into())
-                .unwrap(),
-        )
-        .unwrap();
-        let actual = scan
-            .try_into_batch()
-            .await
-            .unwrap()
-            .column_by_name("i")
-            .unwrap()
-            .as_primitive::<Int32Type>()
-            .values()
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(actual, expected);
+        for (query, before) in queries.into_iter().zip(&before) {
+            let after = legacy_fts_scores(&dataset, query).await;
+            assert_eq!(&after, before, "query {query:?}");
+        }
     }
 }
 
