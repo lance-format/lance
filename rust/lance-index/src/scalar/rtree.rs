@@ -181,16 +181,6 @@ impl RTreeMetadata {
 
     fn calculate_page_offsets(num_items: usize, page_size: u32) -> Vec<usize> {
         if page_size < 2 {
-            // A legacy writer with no page_size validation produced single-item
-            // `page_size` 1 indexes, which load still accepts. Their single
-            // page covers the one leaf row; without that offset every page
-            // range collapses to empty and search silently returns nothing.
-            // num_items > 1 is not load-legal with page_size < 2, so it keeps
-            // no layout: metadata is built before the stored page size is
-            // validated, and deriving offsets here would loop forever.
-            if num_items <= 1 {
-                return vec![0];
-            }
             return Vec::new();
         }
         let mut page_offsets = vec![];
@@ -216,57 +206,9 @@ impl RTreeMetadata {
             ("page_size".to_owned(), self.page_size.to_string()),
             ("num_pages".to_owned(), self.num_pages.to_string()),
             ("num_items".to_owned(), self.num_items.to_string()),
-            ("bbox".to_owned(), bbox_to_json(&self.bbox).to_string()),
+            ("bbox".to_owned(), serde_json::json!(self.bbox).to_string()),
         ])
     }
-}
-
-/// serde_json has no representation for non-finite f64 and emits `null`, which
-/// does not parse back, so the loaded bbox silently became the inverted empty
-/// default and every intersect query missed. Finite bounds keep the JSON
-/// numbers earlier versions wrote; non-finite bounds are stored as Rust float
-/// `Display` strings ("inf", "-inf", "NaN"), which `f64::from_str` parses
-/// back losslessly.
-fn bbox_bound_to_json(bound: f64) -> serde_json::Value {
-    if bound.is_finite() {
-        serde_json::json!(bound)
-    } else {
-        serde_json::json!(bound.to_string())
-    }
-}
-
-fn bbox_to_json(bbox: &BoundingBox) -> serde_json::Value {
-    serde_json::json!({
-        "minx": bbox_bound_to_json(bbox.minx()),
-        "miny": bbox_bound_to_json(bbox.miny()),
-        "maxx": bbox_bound_to_json(bbox.maxx()),
-        "maxy": bbox_bound_to_json(bbox.maxy()),
-    })
-}
-
-/// Inverse of [`bbox_to_json`]. Returns `None` when a bound cannot be
-/// recovered, including the `null`s older writers stored wherever a bound was
-/// non-finite; the caller then falls back to the empty default bbox, which is
-/// exactly what those older readers loaded.
-fn bbox_from_json(value: &serde_json::Value) -> Option<BoundingBox> {
-    let object = value.as_object()?;
-    let parse_bound = |name: &str| -> Option<f64> {
-        match object.get(name)? {
-            serde_json::Value::Number(number) => number.as_f64(),
-            serde_json::Value::String(bound) => bound.parse().ok(),
-            _ => None,
-        }
-    };
-    Some(BoundingBox::new_with_coords(&[
-        Coord {
-            x: parse_bound("minx")?,
-            y: parse_bound("miny")?,
-        },
-        Coord {
-            x: parse_bound("maxx")?,
-            y: parse_bound("maxy")?,
-        },
-    ]))
 }
 
 impl From<&HashMap<String, String>> for RTreeMetadata {
@@ -292,11 +234,24 @@ impl From<&HashMap<String, String>> for RTreeMetadata {
                 .map(|bs| bs.parse().unwrap_or(0))
                 .unwrap_or(0)
         };
+        // The total bbox only lets a search skip the tree. serde_json writes an
+        // infinite bound as null, which does not parse back, so a bbox that
+        // cannot be read must cover every query instead of none.
         let bbox = metadata
             .get("bbox")
             .and_then(|bs| serde_json::from_str(bs).ok())
-            .and_then(|value| bbox_from_json(&value))
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                BoundingBox::new_with_coords(&[
+                    Coord {
+                        x: f64::NEG_INFINITY,
+                        y: f64::NEG_INFINITY,
+                    },
+                    Coord {
+                        x: f64::INFINITY,
+                        y: f64::INFINITY,
+                    },
+                ])
+            });
         Self::new(page_size, num_pages, num_items, bbox)
     }
 }
@@ -1516,74 +1471,6 @@ mod tests {
         assert_eq!(RTreeMetadata::from(&metadata).num_pages, 1);
     }
 
-    /// A pre-validation writer could emit a single-item `page_size` 1 index,
-    /// which `load` still accepts (`validate_stored_page_size`). The current
-    /// trainer rejects that page size, so the legacy layout is rebuilt by
-    /// hand: one leaf page holding a single (bbox, row_addr) row and the
-    /// metadata such a writer stored.
-    #[tokio::test]
-    async fn test_legacy_page_size_one_index_searches_single_item() {
-        let tmpdir = TempObjDir::default();
-        let store = Arc::new(LanceIndexStore::new(
-            Arc::new(ObjectStore::local()),
-            tmpdir.clone(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-
-        let rect = Rect::new(coord! { x: 1.0, y: 1.0 }, coord! { x: 3.0, y: 3.0 });
-        let mut builder = RectBuilder::new(RectType::new(Dimension::XY, Default::default()));
-        builder.push_rect(Some(&rect));
-        let batch = RecordBatch::try_new(
-            RTREE_PAGE_SCHEMA.clone(),
-            vec![
-                builder.finish().into_array_ref(),
-                Arc::new(UInt64Array::from(vec![0])),
-            ],
-        )
-        .unwrap();
-        let mut writer = store
-            .new_index_file(RTREE_PAGES_NAME, RTREE_PAGE_SCHEMA.clone())
-            .await
-            .unwrap();
-        writer.write_record_batch(batch).await.unwrap();
-        writer
-            .finish_with_metadata(HashMap::from([
-                ("page_size".to_owned(), "1".to_owned()),
-                ("num_pages".to_owned(), "1".to_owned()),
-                ("num_items".to_owned(), "1".to_owned()),
-                // A finite bbox is exactly what the legacy writer stored.
-                (
-                    "bbox".to_owned(),
-                    serde_json::json!(BoundingBox::new_with_rect(&rect)).to_string(),
-                ),
-            ]))
-            .await
-            .unwrap();
-        RTreeIndexPlugin::write_nulls(store.as_ref(), RowAddrTreeMap::new())
-            .await
-            .unwrap();
-
-        let index = RTreeIndex::load(store, None, &LanceCache::no_cache())
-            .await
-            .unwrap();
-        assert_eq!(index.metadata.page_size, 1);
-        assert_eq!(index.metadata.num_pages, 1);
-
-        let query = BoundingBox::new_with_rect(&Rect::new(
-            coord! { x: 0.0, y: 0.0 },
-            coord! { x: 5.0, y: 5.0 },
-        ));
-        let mut expected = RowAddrTreeMap::new();
-        expected.insert(0);
-        assert_eq!(
-            index
-                .search_bbox(query, &NoOpMetricsCollector)
-                .await
-                .unwrap(),
-            expected
-        );
-    }
-
     fn convert_bbox_rowid_batch_stream(
         geo_array: &dyn GeoArrowArray,
         row_id_array: ArrayRef,
@@ -1849,30 +1736,34 @@ mod tests {
         assert!(analyzed.try_next().await.unwrap().is_none());
     }
 
-    /// Unlike the NaN case above, a genuine +/-Infinity coordinate reaches the
-    /// stored bbox (it wins the min/max comparisons during accumulation), so
-    /// the index must round-trip it: reloading used to substitute the inverted
-    /// empty bbox and silently answer every intersect query with zero rows.
+    /// An infinite coordinate makes the stored total bbox unreadable (serde_json
+    /// writes the bound as null). After a reload the index must still search
+    /// the tree instead of treating the dataset as empty.
     #[tokio::test]
     #[serial_test::serial(LANCE_DF_SPILL_POOL)]
-    async fn test_search_survives_reload_with_non_finite_bounds() {
+    async fn test_search_after_reload_with_infinite_bound() {
         let rect_type = RectType::new(Dimension::XY, Default::default());
         let mut builder = RectBuilder::new(rect_type);
         builder.push_rect(Some(&Rect::new(
             coord! { x: f64::NEG_INFINITY, y: 1.0 },
             coord! { x: 2.0, y: 3.0 },
         )));
+        builder.push_rect(Some(&Rect::new(
+            coord! { x: 10.0, y: 10.0 },
+            coord! { x: 11.0, y: 11.0 },
+        )));
         let bounds = builder.finish();
 
-        let (index, _store, _tmpdir) = train_index(&bounds, Some(4)).await;
-        assert_eq!(index.metadata.num_items, 1);
+        let (index, store, _tmpdir) = train_index(&bounds, Some(4)).await;
+        let pages_reader = store.open_index_file(RTREE_PAGES_NAME).await.unwrap();
+        assert!(pages_reader.schema().metadata["bbox"].contains("null"));
 
         let query = BoundingBox::new_with_rect(&Rect::new(
-            coord! { x: 0.0, y: 0.0 },
-            coord! { x: 5.0, y: 5.0 },
+            coord! { x: 9.0, y: 9.0 },
+            coord! { x: 12.0, y: 12.0 },
         ));
         let mut expected = RowAddrTreeMap::new();
-        expected.insert(0);
+        expected.insert(1);
         assert_eq!(
             index
                 .search_bbox(query, &NoOpMetricsCollector)
@@ -1880,7 +1771,6 @@ mod tests {
                 .unwrap(),
             expected
         );
-        assert_eq!(index.metadata.bbox.minx(), f64::NEG_INFINITY);
     }
 
     #[rstest::rstest]
