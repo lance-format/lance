@@ -53,8 +53,8 @@ update_rewrite_rows          | L  L  R  R  R  R  R  L  R  R  R  L  R  X  X  L  L
 update_rewrite_columns       | L  R  R  R  R  R  R  R  R  R  R  L  R  X  X  L  L  L  L  R  R  L  L  L  R  R  R
 data_overlay                 | L  L  R  R  L  L  L  R  R  R  R  L  R  X  X  L  L  L  L  L  L  L  L  L  L  R  R
 data_replacement             | L  L  X  R  R  L  R  X  R  R  R  L  R  X  X  L  L  L  L  L  R  L  L  L  L  R  R
-project                      | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  R  L  R* R* R  L  R  L  L  L  L  L
-project_alter_nullability    | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  R  L  R* R  R  L  R  L  L  L  L  L
+project                      | L  L  L  L  L  L  L  R  R  R  R  L  L  X  X  R  L  R  R  R  L  R  L  L  L  L  L
+project_alter_nullability    | R  L  L  R  R  R  R  R  R  R  R  L  L  X  X  R  L  R  R  R  L  R  L  L  L  L  L
 merge                        | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R  R  R  R  L  R  R  R  R
 merge_alter_nullability      | R  R  R  R  R  R  R  X  X  R  R  L  R  X  X  R  R  R  R  R  R  R  L  R  R  R  R
 create_index                 | L  L  L  L  L  L  L  L  L  L  L  R  R  X  X  L  L  L  L  L  L  L  R  R  L  L  L
