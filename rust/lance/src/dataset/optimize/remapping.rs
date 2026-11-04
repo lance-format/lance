@@ -255,7 +255,7 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
         })?;
     let history = crate::index::frag_reuse::cached_frag_reuse_history(dataset, entry).await?;
     // An empty history moves nothing, whatever became of the segment.
-    if history.records().next().is_none() {
+    if history.is_empty() {
         return Ok(());
     }
     let curr_index_meta = stored

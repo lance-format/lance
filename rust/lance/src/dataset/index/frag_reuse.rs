@@ -586,7 +586,7 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
     if trimmed == history {
         return Ok(TaggedTrimOutcome::NothingToTrim);
     }
-    if trimmed.records().next().is_none() {
+    if trimmed.is_empty() {
         return Ok(TaggedTrimOutcome::Delete {
             current_entry: Box::new(entry),
         });

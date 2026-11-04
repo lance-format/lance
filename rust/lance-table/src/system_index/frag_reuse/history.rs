@@ -388,6 +388,11 @@ impl FragReuseHistory {
         }
     }
 
+    /// Whether the history holds no record at all.
+    pub fn is_empty(&self) -> bool {
+        self.0.records().stored.is_empty()
+    }
+
     /// The FRI format these records are interpreted under, which
     /// [`Self::encode`] stamps as the entry's `index_version`.
     pub fn format(&self) -> HistoryFormat {
@@ -470,10 +475,15 @@ impl FragReuseHistory {
 
     /// The history without the records no live index segment needs any
     /// more. `live` holds the table's stored index segments, one entry per
-    /// logical index (system indices left out); a segment whose
-    /// `translation` is [`TranslationSupport::Uninterpretable`] (this build
-    /// cannot serve it) still pins the records its addresses need, but its
-    /// coverage does not release anyone else's.
+    /// logical index (system indices left out).
+    ///
+    /// As trim input, a segment's `translation` only says whether this
+    /// build can serve the segment: one marked
+    /// [`TranslationSupport::Uninterpretable`] still pins the records its
+    /// addresses need, but its coverage does not release anyone else's;
+    /// [`TranslationSupport::Supported`] and
+    /// [`TranslationSupport::Unsupported`] are treated alike. `domain` is
+    /// not consulted.
     ///
     /// A record is never dropped while a segment needs it: a version 0
     /// history keeps every version some segment is not caught up with (the
@@ -485,7 +495,32 @@ impl FragReuseHistory {
     /// an empty one when nothing is needed. A tagged history holding records
     /// this writer cannot interpret is refused with `NotSupported`.
     ///
+    /// Trimming is cleanup, not a caller's proposal, so a version 0 history
+    /// keeps the released cleanup's behaviour: when it drops a version it
+    /// writes only the compaction versions it keeps, dropping any record it
+    /// cannot interpret, and when it drops nothing it returns the history
+    /// unchanged, such records included.
+    ///
+    /// ```
+    /// # use lance_table::system_index::frag_reuse::history::FragReuseHistory;
+    /// # use lance_table::system_index::frag_reuse::plan::SegmentSummary;
+    /// # fn example(
+    /// #     history: &FragReuseHistory,
+    /// #     segments_by_index: Vec<Vec<SegmentSummary>>,
+    /// # ) -> lance_core::Result<()> {
+    /// let trimmed = history.trim(&segments_by_index)?;
+    /// if trimmed == *history {
+    ///     // Every record is still needed: there is nothing to commit.
+    /// } else if trimmed.is_empty() {
+    ///     // No segment needs the history any more: the entry can go.
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// [`TranslationSupport::Uninterpretable`]: super::plan::TranslationSupport::Uninterpretable
+    /// [`TranslationSupport::Supported`]: super::plan::TranslationSupport::Supported
+    /// [`TranslationSupport::Unsupported`]: super::plan::TranslationSupport::Unsupported
     pub fn trim(&self, live: &[Vec<SegmentSummary>]) -> Result<Self> {
         self.0.clone().trim(live).map(Self)
     }

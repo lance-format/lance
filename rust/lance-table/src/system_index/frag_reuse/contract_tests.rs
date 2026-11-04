@@ -1209,6 +1209,91 @@ fn trim_refuses_a_tagged_history_it_cannot_interpret() {
     assert!(matches!(error, Error::NotSupported { .. }), "{error}");
 }
 
+/// `versions` serialized as compaction-version records, in order.
+fn version_records(versions: &[pb::Version]) -> Vec<u8> {
+    versions
+        .iter()
+        .flat_map(|version| length_delimited(LEGACY_VERSION_FIELD, &version.encode_to_vec()))
+        .collect()
+}
+
+fn version_stamps(history: &FragReuseHistory) -> Vec<u64> {
+    history
+        .records()
+        .map(|record| match record {
+            Record::LegacyVersion(version) => version.dataset_version,
+            other => panic!("{other:?}"),
+        })
+        .collect()
+}
+
+/// The version 0 trim is the released cleanup, which decoded the compaction
+/// versions and, when it removed one, wrote only the versions it kept: a
+/// record it cannot interpret is dropped along with the trimmed versions.
+/// When nothing is trimmed the entry is left exactly as written.
+#[rstest]
+#[case::legacy(Reading::Legacy)]
+#[case::legacy_stable_row_ids(Reading::LegacyStableRowIds)]
+fn legacy_trim_drops_uninterpretable_records_only_when_it_trims(#[case] reading: Reading) {
+    let first = version_records(&[legacy(10, &[whole(0, 1)], &[(1, 1)])]);
+    let second = version_records(&[legacy(20, &[whole(2, 1)], &[(3, 1)])]);
+    let content: Bytes = [first, unknown_record(), second.clone()].concat().into();
+    let mut history = RawHistory::new(HistoryFormat::Legacy, content.clone())
+        .validate()
+        .unwrap();
+    if reading == Reading::LegacyStableRowIds {
+        history = history.on_stable_row_ids().unwrap();
+    }
+    let supported = TranslationSupport::Supported;
+    let needs_both = segment(&[0], 1, supported);
+    // Built after the first rewrite, over none of its fragments.
+    let needs_second = segment(&[2], 15, supported);
+
+    let untrimmed = history
+        .trim(&[vec![needs_both], vec![needs_second.clone()]])
+        .unwrap();
+    assert_eq!(untrimmed.content(), content);
+
+    let trimmed = history.trim(&[vec![needs_second]]).unwrap();
+    assert_eq!(trimmed.content(), Bytes::from(second));
+    assert!(trimmed.is_fully_interpretable());
+}
+
+/// A version some segment covers only part of a rewrite group of can only
+/// be corrupt. Trimming per version drops it, as the released cleanup did,
+/// and keeps what other segments need. A stable-row-ID history only ever
+/// removes a prefix, so it counts the version as needed and stops there.
+#[rstest]
+#[case::legacy(Reading::Legacy, &[20])]
+#[case::legacy_stable_row_ids(Reading::LegacyStableRowIds, &[10, 20])]
+#[case::tagged(Reading::Tagged, &[20])]
+fn trim_drops_a_version_a_segment_splits_unless_it_trims_a_prefix(
+    #[case] reading: Reading,
+    #[case] kept: &[u64],
+) {
+    let content = version_records(&[
+        legacy(10, &[whole(0, 1), whole(1, 1)], &[(2, 2)]),
+        legacy(20, &[whole(3, 1)], &[(4, 1)]),
+    ]);
+    let format = match reading {
+        Reading::Tagged => HistoryFormat::Tagged,
+        _ => HistoryFormat::Legacy,
+    };
+    let mut history = RawHistory::new(format, content.into()).validate().unwrap();
+    if reading == Reading::LegacyStableRowIds {
+        history = history.on_stable_row_ids().unwrap();
+    }
+    let supported = TranslationSupport::Supported;
+    // Covers one of the two sources of the first rewrite, and is caught up
+    // with the second.
+    let splits = segment(&[0], 21, supported);
+    // Caught up with the first rewrite, still needs the second.
+    let needs_second = segment(&[3], 15, supported);
+
+    let trimmed = history.trim(&[vec![splits], vec![needs_second]]).unwrap();
+    assert_eq!(version_stamps(&trimmed), kept);
+}
+
 /// The files a history references cover every row map its trimmed form can
 /// still read, and a format without external mappings references none.
 #[rstest]
