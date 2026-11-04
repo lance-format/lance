@@ -7,9 +7,7 @@
 use crate::Result;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::index::DatasetIndexExt;
-use crate::index::frag_reuse::{
-    MissingCoverageReason, load_frag_reuse_index_details, open_frag_reuse_index,
-};
+use crate::index::frag_reuse::MissingCoverageReason;
 use crate::{Dataset, index};
 use async_trait::async_trait;
 use lance_core::Error;
@@ -224,206 +222,25 @@ pub fn transpose_row_ids_from_digest(
     mapping
 }
 
-/// Remap a given index using the fragment reuse index if possible.
-/// If the frag reuse index does not exist, the operation fails with [Error::NotSupported]
-/// If the frag reuse index exists but is empty, the operation succeeds without a commit.
+/// Remap one stored segment of a user index through the fragment reuse
+/// history, as [`FragReuseHistory::compose`] plans it, and commit the
+/// rewritten segment.
+///
+/// Fails with [Error::NotSupported] when the table has no fragment reuse
+/// index. A segment that is caught up, or that the history cannot rewrite, is
+/// left as it is without a commit (logged when it keeps translating through
+/// the history), so a maintenance pass proceeds to the other segments.
+///
+/// [`FragReuseHistory::compose`]: lance_table::system_index::frag_reuse::history::FragReuseHistory::compose
 async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
-    let indices = dataset.load_indices().await?;
-    let frag_reuse_index_meta = match indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
-        None => Err(Error::not_supported_source(
+    let listed = dataset.load_indices().await?;
+    if !listed.iter().any(|idx| idx.name == FRAG_REUSE_INDEX_NAME) {
+        return Err(Error::not_supported_source(
             "Fragment reuse index not found, cannot remap an index post compaction".into(),
-        )),
-        Some(frag_reuse_index_meta) => Ok(frag_reuse_index_meta),
-    }?;
-
-    // Hard fork by index_version: a tagged history remaps per-segment through
-    // compaction-only chains in fresh code below, while the v0 path stays
-    // exactly as it was.
-    if frag_reuse_index_meta.index_version != 0 {
-        return remap_index_tagged(dataset, index_id).await;
+        ));
     }
-
-    let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta).await?;
-    let frag_reuse_index =
-        open_frag_reuse_index(frag_reuse_index_meta.uuid, frag_reuse_details.as_ref()).await?;
-
-    if frag_reuse_index.is_empty() {
-        return Ok(());
-    }
-
-    // Read the index's on-disk metadata once. Its stored row addresses are at
-    // this baseline; we compose all reuse versions into a single remap so the
-    // index file is rebuilt and committed exactly once, rather than once per
-    // version (the reuse index can accumulate many versions before remap runs).
-    let curr_index_meta = read_manifest_indexes(
-        &dataset.object_store,
-        &dataset.manifest_location,
-        &dataset.manifest,
-    )
-    .await?
-    .into_iter()
-    .find(|idx| idx.uuid == *index_id)
-    .ok_or_else(|| {
-        Error::index(format!(
-            "index {index_id} not found in manifest; it may have been concurrently dropped"
-        ))
-    })?;
-
-    // Compose the coverage (fragment bitmap) remap across every reuse version in
-    // one pass. Chaining is automatic: a version inserts its new fragments,
-    // which a later version then sees as its old fragments. `data_predates_version`
-    // is evaluated against the fixed baseline (there are no intermediate
-    // commits), and the new-fragment branch handles a bitmap that was already
-    // coverage-remapped + persisted before the data was remapped (e.g. while
-    // remapping a *sibling* index). The comparison is inclusive: an index built
-    // at a version's dataset_version predates its rewrite.
-    let baseline_version = curr_index_meta.dataset_version;
-    let has_unknown_coverage = curr_index_meta.fragment_bitmap.is_none();
-    let (should_remap, mut bitmap_after_remap) = match curr_index_meta.fragment_bitmap.clone() {
-        Some(mut index_frag_bitmap) => {
-            let mut should_remap = false;
-            for version in frag_reuse_index.details.versions.iter() {
-                let data_predates_version = baseline_version <= version.dataset_version;
-                for group in version.groups.iter() {
-                    let mut old_frag_in_index = 0;
-                    for old_frag in group.old_frags.iter() {
-                        if index_frag_bitmap.remove(old_frag.id as u32) {
-                            old_frag_in_index += 1;
-                        }
-                    }
-
-                    if old_frag_in_index > 0 {
-                        if old_frag_in_index != group.old_frags.len() {
-                            // this should never happen because we always commit a full rewrite group
-                            // and we always reindex either the entire group or nothing.
-                            // We use invalid input to be consistent with
-                            // dataset::transaction::recalculate_fragment_bitmap
-                            return Err(Error::invalid_input(format!(
-                                "The compaction plan included a rewrite group that was a split of indexed and non-indexed data: {:?}",
-                                group.old_frags
-                            )));
-                        }
-                        index_frag_bitmap.extend(group.new_frags.iter().map(|f| f.id as u32));
-                        should_remap = true;
-                    } else if data_predates_version
-                        && group
-                            .new_frags
-                            .iter()
-                            .any(|new_frag| index_frag_bitmap.contains(new_frag.id as u32))
-                    {
-                        // The bitmap was already coverage-remapped onto this
-                        // group's new fragments and persisted before the data was
-                        // remapped, so the old fragments are gone from the bitmap
-                        // but the index data still needs remapping.
-                        should_remap = true;
-                    }
-                }
-            }
-            (should_remap, Some(index_frag_bitmap))
-        }
-        None => (true, None),
-    };
-
-    if !should_remap {
-        return Ok(());
-    }
-
-    // Apply the compact version chain directly while rebuilding the index. The
-    // remapper passes intermediate moved addresses into later FRI versions and
-    // leaves missing mappings unchanged, so no composed per-row map is needed.
-    // This also handles the sibling-coverage-remap case: remapping is driven by
-    // the row addresses stored in the index, not by its already-advanced bitmap.
-    let remap_result = index::remap::remap_index(
-        dataset,
-        index_id,
-        &RowAddrTranslator::sync(frag_reuse_index.row_addr_remap().clone()),
-        None,
-    )
-    .await?;
-
-    // Remapping advances the index watermark for fragment-reuse cleanup, but it
-    // does not incorporate overlays committed after the source index was built.
-    // Exclude those fragments so queries scan their current values instead.
-    if let Some(fragment_bitmap) = &mut bitmap_after_remap {
-        remove_overlay_stale_frags(
-            fragment_bitmap,
-            &dataset.manifest.fragments,
-            &curr_index_meta,
-            dataset.schema(),
-        );
-    }
-    let new_dataset_version = if has_unknown_coverage {
-        curr_index_meta.dataset_version
-    } else {
-        dataset.manifest.version
-    };
-
-    let new_index_meta = match remap_result {
-        // Nothing to commit: either the composed remap emptied the index (every
-        // row deleted), matching the prior per-version behavior, or
-        // `index::remap::remap_index` withdrew a covered index it cannot carry payload
-        // through. Either way the existing entry is left untouched.
-        //
-        // The withdrawal case is unreachable here today: the only caller is
-        // `remap_column_index`, which refuses a covered index first. Compaction
-        // reaches that withdrawal through `DatasetIndexRemapper`, which handles
-        // `RemapResult::Drop` in `dataset/index.rs` rather than through here.
-        RemapResult::Drop => return Ok(()),
-        RemapResult::Keep(new_id) => IndexMetadata {
-            uuid: new_id,
-            name: curr_index_meta.name.clone(),
-            fields: curr_index_meta.fields.clone(),
-            covering_fields: curr_index_meta.covering_fields.clone(),
-            dataset_version: new_dataset_version,
-            fragment_bitmap: bitmap_after_remap,
-            index_details: curr_index_meta.index_details.clone(),
-            index_version: curr_index_meta.index_version,
-            created_at: curr_index_meta.created_at,
-            base_id: curr_index_meta.base_id,
-            files: curr_index_meta.files.clone(),
-            clustering_id: curr_index_meta.clustering_id,
-            metadata: curr_index_meta.metadata.clone(),
-        },
-        RemapResult::Remapped(remapped_index) => IndexMetadata {
-            uuid: remapped_index.new_id,
-            name: curr_index_meta.name.clone(),
-            fields: curr_index_meta.fields.clone(),
-            covering_fields: curr_index_meta.covering_fields.clone(),
-            dataset_version: new_dataset_version,
-            fragment_bitmap: bitmap_after_remap,
-            index_details: Some(Arc::new(remapped_index.index_details)),
-            index_version: remapped_index.index_version as i32,
-            created_at: curr_index_meta.created_at,
-            base_id: None,
-            files: remapped_index.files,
-            clustering_id: curr_index_meta.clustering_id,
-            metadata: curr_index_meta.metadata.clone(),
-        },
-    };
-
-    let transaction = Transaction::new(
-        dataset.manifest.version,
-        Operation::CreateIndex {
-            new_indices: vec![new_index_meta],
-            removed_indices: vec![curr_index_meta],
-        },
-        None,
-    );
-
-    dataset
-        .apply_commit(transaction, &Default::default(), &Default::default())
-        .await?;
-
-    Ok(())
-}
-
-/// Remap one segment of a user index through a tagged history's
-/// compaction-only chain. Stable-partition-touching segments are skipped
-/// cleanly (logged, not an error) so a maintenance pipeline proceeds to the
-/// other segments and indices.
-async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
-    // Stored metadata: the segment's provenance bitmap and the entry, never
-    // the query-rewritten listing `load_indices` produces on tagged tables.
+    // Stored metadata: the segment's own bitmap and the entry, never the
+    // query listing, which may rewrite a segment's bitmap or leave it out.
     let stored = read_manifest_indexes(
         &dataset.object_store,
         &dataset.manifest_location,
@@ -437,11 +254,9 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
             Error::index("the fragment reuse index entry disappeared during remap".to_string())
         })?;
     let history = crate::index::frag_reuse::cached_frag_reuse_history(dataset, entry).await?;
-    if !history.is_fully_interpretable() {
-        return Err(Error::not_supported(
-            "the tagged FRI history carries transitions this client cannot interpret; \
-             upgrade to a newer version of Lance before remapping",
-        ));
+    // An empty history moves nothing, whatever became of the segment.
+    if history.records().next().is_none() {
+        return Ok(());
     }
     let curr_index_meta = stored
         .iter()
@@ -452,6 +267,34 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
                 "index {index_id} not found in manifest; it may have been concurrently dropped"
             ))
         })?;
+    let fragment_rows: HashMap<u32, u64> = dataset
+        .fragments()
+        .iter()
+        .filter_map(|fragment| {
+            Some((
+                u32::try_from(fragment.id).ok()?,
+                fragment.physical_rows? as u64,
+            ))
+        })
+        .collect();
+    let lineage = entry.fragment_bitmap.clone().unwrap_or_default();
+    let context = RewriteContext {
+        live_fragments: dataset.fragment_bitmap.as_ref(),
+        lineage: &lineage,
+        fragment_rows: &fragment_rows,
+        served: listed
+            .iter()
+            .find(|idx| idx.uuid == *index_id)
+            .and_then(|idx| idx.fragment_bitmap.as_ref()),
+    };
+    let summary = SegmentSummary {
+        uuid: curr_index_meta.uuid,
+        fragment_bitmap: curr_index_meta.fragment_bitmap.clone(),
+        dataset_version: curr_index_meta.dataset_version,
+        domain: RowDomain::Address,
+        translation: TranslationSupport::Supported,
+    };
+    let composition = history.compose(&context, &summary)?;
     // Eligibility is decided at the plan level, before any file is read: a
     // segment the reader derives no coverage for is skipped when it will be
     // replaced anyway (withdrawn, superseded) or cannot be translated by
@@ -480,45 +323,17 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
             )));
         }
     }
-    let Some(stored_bitmap) = curr_index_meta.fragment_bitmap.clone() else {
-        log::warn!(
-            "Index {} ({}) has no stored fragment bitmap; its lineage through the tagged \
-             history cannot be determined, skipping remap. Consider rebuilding the index",
-            curr_index_meta.name,
-            curr_index_meta.uuid
-        );
-        return Ok(());
-    };
-    let fragment_rows: HashMap<u32, u64> = dataset
-        .fragments()
-        .iter()
-        .filter_map(|fragment| {
-            Some((
-                u32::try_from(fragment.id).ok()?,
-                fragment.physical_rows? as u64,
-            ))
-        })
-        .collect();
-    let lineage = entry.fragment_bitmap.clone().unwrap_or_default();
-    let listed = dataset.load_indices().await?;
-    let context = RewriteContext {
-        live_fragments: dataset.fragment_bitmap.as_ref(),
-        lineage: &lineage,
-        fragment_rows: &fragment_rows,
-        served: listed
-            .iter()
-            .find(|idx| idx.uuid == *index_id)
-            .and_then(|idx| idx.fragment_bitmap.as_ref()),
-    };
-    let summary = SegmentSummary {
-        uuid: curr_index_meta.uuid,
-        fragment_bitmap: Some(stored_bitmap),
-        dataset_version: curr_index_meta.dataset_version,
-        domain: RowDomain::Address,
-        translation: TranslationSupport::Supported,
-    };
-    let plan = match history.compose(&context, &summary)? {
-        Composition::CaughtUp | Composition::LineageUnknown => return Ok(()),
+    let plan = match composition {
+        Composition::CaughtUp => return Ok(()),
+        Composition::LineageUnknown => {
+            log::warn!(
+                "Index {} ({}) has no stored fragment bitmap; its lineage through the tagged \
+                 history cannot be determined, skipping remap. Consider rebuilding the index",
+                curr_index_meta.name,
+                curr_index_meta.uuid
+            );
+            return Ok(());
+        }
         Composition::Blocked { fragment } => {
             log::info!(
                 "Skipping remap of index {} ({}): at fragment {} its coverage reaches a \
@@ -534,28 +349,36 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
         }
         Composition::Rewrite(plan) => plan,
     };
-    let mut coverage = plan.coverage().clone();
 
     // Overlays committed after the source index was built are not
     // incorporated by the remap; exclude those fragments so queries scan
-    // their current values instead (mirrors the v0 path).
-    remove_overlay_stale_frags(
-        &mut coverage,
-        &dataset.manifest.fragments,
-        &curr_index_meta,
-        dataset.schema(),
-    );
+    // their current values instead.
+    let mut published = plan.published_bitmap().cloned();
+    if let Some(bitmap) = &mut published {
+        remove_overlay_stale_frags(
+            bitmap,
+            &dataset.manifest.fragments,
+            &curr_index_meta,
+            dataset.schema(),
+        );
+    }
+    let new_dataset_version = if published.is_some() {
+        dataset.manifest.version
+    } else {
+        curr_index_meta.dataset_version
+    };
 
     // Straddle-only outcome: coverage was dropped but no address moves, so
     // the index files stay as they are and only the swapped bitmap (plus the
     // advanced dataset_version) is committed. This also avoids opening the
     // index, which the query planner may refuse for a straddled segment.
-    let plan = plan.restrict_coverage(&coverage);
+    let plan = match &published {
+        Some(bitmap) => plan.restrict_coverage(bitmap),
+        None => plan,
+    };
     let remap_result = if !plan.moves_addresses() {
         RemapResult::Keep(*index_id)
     } else {
-        // Addresses enter the hops from anywhere on the retained lineage;
-        // what the hops leave outside the published coverage is dropped.
         let mappings =
             crate::index::frag_reuse_remapping::frag_reuse_mapping_source(dataset, &history)
                 .await?;
@@ -584,15 +407,14 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
     };
 
     let new_index_meta = match remap_result {
-        // The index type cannot be remapped (or the segment is otherwise
-        // withdrawn by `remap_index`). On a tagged table that is not a drop:
-        // the segment is kept as it is and queries keep translating through
-        // the reuse index, exactly like a blocked hop.
+        // Nothing to commit: the remap emptied the index (every row deleted),
+        // or its type cannot be remapped or it is otherwise withdrawn by
+        // `remap_index`. The segment is kept as it is; under a tagged history
+        // queries keep translating through it.
         RemapResult::Drop => {
             log::info!(
-                "Skipping remap of index {} ({}): its index type cannot be remapped. \
-                 Queries keep translating through the reuse index; rebuild the index \
-                 to catch it up",
+                "Skipping remap of index {} ({}): the remap left nothing to publish. Queries \
+                 keep translating through the reuse index; rebuild the index to catch it up",
                 curr_index_meta.name,
                 curr_index_meta.uuid
             );
@@ -603,8 +425,8 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
             name: curr_index_meta.name.clone(),
             fields: curr_index_meta.fields.clone(),
             covering_fields: curr_index_meta.covering_fields.clone(),
-            dataset_version: dataset.manifest.version,
-            fragment_bitmap: Some(coverage),
+            dataset_version: new_dataset_version,
+            fragment_bitmap: published,
             index_details: curr_index_meta.index_details.clone(),
             index_version: curr_index_meta.index_version,
             created_at: curr_index_meta.created_at,
@@ -623,8 +445,8 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
             name: curr_index_meta.name.clone(),
             fields: curr_index_meta.fields.clone(),
             covering_fields: curr_index_meta.covering_fields.clone(),
-            dataset_version: dataset.manifest.version,
-            fragment_bitmap: Some(coverage),
+            dataset_version: new_dataset_version,
+            fragment_bitmap: published,
             index_details: Some(Arc::new(remapped_index.index_details)),
             index_version: remapped_index.index_version as i32,
             created_at: curr_index_meta.created_at,
@@ -685,7 +507,9 @@ pub async fn remap_column_index(
     // its replacement at the end of the list and the per-segment remap
     // re-reads the manifest by uuid, so the uuids taken here stay valid.
     // Tagged tables resolve from the stored list: the query listing may
-    // exclude a straddled segment that maintenance must still reach.
+    // exclude a straddled segment that maintenance must still reach. A
+    // version 0 table remaps what its query listing serves, as released
+    // versions did.
     let tagged = crate::index::loading::load_all_indices(dataset)
         .await?
         .iter()
@@ -734,11 +558,7 @@ pub async fn remap_column_index(
     }
 
     for index in &segments {
-        if tagged {
-            remap_index_tagged(dataset, &index.uuid).await?;
-        } else {
-            remap_index(dataset, &index.uuid).await?;
-        }
+        remap_index(dataset, &index.uuid).await?;
     }
     Ok(())
 }
@@ -2266,10 +2086,7 @@ mod tests {
 
             let index_id = stored_index(&dataset, "i_idx").await.uuid;
             let version = dataset.manifest.version;
-            match path {
-                RemapPath::Untagged => remap_index(&mut dataset, &index_id).await.unwrap(),
-                RemapPath::Tagged => remap_index_tagged(&mut dataset, &index_id).await.unwrap(),
-            }
+            remap_index(&mut dataset, &index_id).await.unwrap();
             assert!(
                 dataset.manifest.version > version,
                 "{path:?}: the remap commits"
@@ -4012,5 +3829,73 @@ mod tests {
             .open_scalar_index("i", &kept.uuid, &NoOpMetricsCollector)
             .await
             .unwrap();
+    }
+
+    /// A committed version 0 history is repaired before it is composed: a
+    /// version that breaks the history's rules (here, a group recording no
+    /// survivors of a source whose digest deletes nothing) is dropped, and a
+    /// segment only it would move is left as it is.
+    #[tokio::test]
+    async fn remap_leaves_a_segment_only_a_dropped_version_moves() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("i_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        let mut no_survivors = Vec::new();
+        RoaringTreemap::new()
+            .serialize_into(&mut no_survivors)
+            .unwrap();
+        let details = FragReuseIndexDetails {
+            versions: vec![FragReuseVersion {
+                dataset_version: dataset.manifest.version,
+                groups: vec![FragReuseGroup {
+                    changed_row_addrs: no_survivors,
+                    old_frags: vec![FragDigest::from(&dataset.manifest.fragments[0])],
+                    new_frags: vec![],
+                }],
+            }],
+        };
+        let frag_reuse_index =
+            crate::utils::test::legacy_frag_reuse_entry(&dataset, details, RoaringBitmap::new())
+                .await
+                .unwrap();
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![frag_reuse_index],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        let before = dataset.load_index_by_name("i_idx").await.unwrap().unwrap();
+        let version = dataset.manifest.version;
+
+        remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.manifest.version, version, "nothing is committed");
+        let after = dataset.load_index_by_name("i_idx").await.unwrap().unwrap();
+        assert_eq!(after.uuid, before.uuid);
+        assert_eq!(after.dataset_version, before.dataset_version);
+        assert_eq!(after.fragment_bitmap, before.fragment_bitmap);
     }
 }
