@@ -50,6 +50,22 @@ pub trait RemapperBacking: Send + Sync + Debug {
 /// Cheap to clone. Fragments the remapper does not need to translate keep
 /// their addresses; an address whose row was deleted, or that the segment no
 /// longer answers for, translates to `None`.
+///
+/// An index is handed a remapper when it is loaded (see
+/// `lance_index::scalar::registry::RemappingIndexLoader`) and translates the
+/// addresses it reads in batches:
+///
+/// ```
+/// # use lance_core::Result;
+/// # use lance_select::Remapper;
+/// /// The current addresses of the rows a segment stored at `stored`,
+/// /// without the rows a rewrite deleted.
+/// async fn current_addresses(remapper: &Remapper, stored: &[u64]) -> Result<Vec<u64>> {
+///     let mut addresses: Vec<Option<u64>> = stored.iter().copied().map(Some).collect();
+///     remapper.translate_in_place(&mut addresses).await?;
+///     Ok(addresses.into_iter().flatten().collect())
+/// }
+/// ```
 #[derive(Clone, Debug)]
 pub struct Remapper(Arc<dyn RemapperBacking>);
 
