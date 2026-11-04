@@ -29,8 +29,11 @@ use crate::system_index::frag_reuse::mapping::{
     MappingRef, MappingSource, translate_stable_partition,
 };
 use crate::system_index::frag_reuse::plan::{
-    ReadContext, ReadPlan, SegmentSummary, TranslationPlan, TranslationSupport, segment_plans,
+    Composition, ReadContext, ReadPlan, RewriteContext, SegmentSummary, TranslationPlan,
+    TranslationSupport, segment_plans,
 };
+
+mod compose;
 
 /// `StablePartition.base_id`.
 const STABLE_PARTITION_BASE_ID_FIELD: u32 = 3;
@@ -271,7 +274,23 @@ impl FriImpl for TaggedHistory {
         plans
     }
 
+    fn compose(
+        self: Arc<Self>,
+        context: &RewriteContext,
+        segment: &SegmentSummary,
+    ) -> Result<Composition> {
+        compose::compose(self, context, segment)
+    }
+
     fn bind(&self, plan: TranslationPlan, mappings: Arc<dyn MappingSource>) -> Remapper {
+        if let Some(path) = plan.rewrite_path() {
+            return Remapper::from_backing(Arc::new(compose::RewriteRemapper::new(
+                self.0.ledger.clone(),
+                path.clone(),
+                plan.coverage().clone(),
+                mappings,
+            )));
+        }
         Remapper::from_backing(Arc::new(TaggedRemapper {
             ledger: self.0.ledger.clone(),
             coverage: plan.coverage().clone(),

@@ -15,11 +15,13 @@
 //! returns futures that are complete on first poll. Indices never learn
 //! which format produced their remapper.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 
@@ -39,6 +41,19 @@ pub trait RemapperBacking: Send + Sync + Debug {
     fn translate_fragments(&self, fragments: &RoaringBitmap) -> RoaringBitmap;
 
     fn translate_in_place<'a>(&'a self, addrs: &'a mut [Option<u64>]) -> TranslateFuture<'a>;
+
+    /// The physical row count of `fragment` in the address space translated
+    /// from, when the backing knows it. [`Remapper::materialize`] declines
+    /// for a fragment that needs translation and cannot be sized.
+    fn fragment_physical_rows(&self, _fragment: u32) -> Option<u64> {
+        None
+    }
+
+    /// The memory [`Remapper::materialize`] may spend, temporary buffers and
+    /// the map together.
+    fn materialization_budget_bytes(&self) -> u64 {
+        DEFAULT_MATERIALIZATION_BUDGET_BYTES
+    }
 }
 
 /// Translates the row addresses one index segment stores into the addresses
@@ -129,6 +144,180 @@ impl Remapper {
         }
         Ok(translated)
     }
+
+    /// The complete in-memory map of every address in `stored_fragments`
+    /// that translation changes, a row it drops mapped explicitly to `None`,
+    /// for an index whose rewrite takes a [`RowAddrRemap`] (where a missing
+    /// address means "unchanged"). `stored_fragments` must list every
+    /// fragment the index's files may hold addresses for, retired ones
+    /// included.
+    ///
+    /// Whether this is affordable is the remapper's decision, not the
+    /// caller's: the fragment reuse history that produced it knows the row
+    /// counts of the fragments it translates, and bounds the map. The cost is
+    /// checked before anything is allocated, and the call declines with a
+    /// [`RemapUnavailable`] (inside [`Error::NotSupported`]) when the
+    /// fragments are unknown, one that needs translation cannot be sized, or
+    /// the map would exceed the budget. Translation errors propagate as they
+    /// are.
+    pub async fn materialize(
+        &self,
+        stored_fragments: Option<&RoaringBitmap>,
+    ) -> Result<RowAddrRemap> {
+        let Some(fragments) = stored_fragments else {
+            return Err(RemapUnavailable::StoredFragmentsUnknown.into_error());
+        };
+        let mut sized = Vec::with_capacity(fragments.len() as usize);
+        let mut total_rows: u64 = 0;
+        for fragment in fragments
+            .iter()
+            .filter(|&fragment| self.fragment_needs_translation(fragment))
+        {
+            let rows = self
+                .0
+                .fragment_physical_rows(fragment)
+                .ok_or_else(|| RemapUnavailable::FragmentRowsUnknown { fragment }.into_error())?;
+            total_rows = total_rows.saturating_add(rows);
+            sized.push((fragment, rows));
+        }
+        let budget_bytes = self.0.materialization_budget_bytes();
+        let estimated_bytes =
+            hash_map_bytes(total_rows).saturating_add((MATERIALIZE_BATCH_SIZE as u64) * (8 + 16));
+        if estimated_bytes > budget_bytes {
+            return Err(RemapUnavailable::OverBudget {
+                estimated_bytes,
+                budget_bytes,
+            }
+            .into_error());
+        }
+        let mut map: HashMap<u64, Option<u64>> =
+            HashMap::with_capacity(usize::try_from(total_rows).unwrap_or(usize::MAX));
+        let mut slice: Vec<Option<u64>> =
+            Vec::with_capacity(MATERIALIZE_BATCH_SIZE.min(total_rows as usize));
+        for (fragment, rows) in sized {
+            let base = u64::from(fragment) << 32;
+            let mut start = 0u64;
+            while start < rows {
+                let end = rows.min(start + MATERIALIZE_BATCH_SIZE as u64);
+                slice.clear();
+                slice.extend((start..end).map(|offset| Some(base | offset)));
+                self.translate_in_place(&mut slice).await?;
+                for (offset, result) in (start..end).zip(&slice) {
+                    let address = base | offset;
+                    if *result != Some(address) {
+                        map.insert(address, *result);
+                    }
+                }
+                start = end;
+            }
+        }
+        Ok(RowAddrRemap::direct(map))
+    }
+}
+
+/// Addresses [`Remapper::materialize`] translates at a time. Bitmap
+/// compression can hide millions of rows, so the buffer is bounded.
+const MATERIALIZE_BATCH_SIZE: usize = 64 * 1024;
+
+/// The default [`RemapperBacking::materialization_budget_bytes`]: 256 MiB.
+pub const DEFAULT_MATERIALIZATION_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Bytes hashbrown allocates for the `HashMap<u64, Option<u64>>` that
+/// `HashMap::with_capacity(entries)` reserves.
+///
+/// hashbrown's `capacity_to_buckets` rounds the capacity up to
+/// `next_power_of_two(ceil(entries * 8 / 7))` buckets (4 below four entries, 8
+/// below eight) and lays the table out as one slot of
+/// `size_of::<(u64, Option<u64>)>()` (24) bytes plus one control byte per
+/// bucket, followed by one group width (16) of trailing control bytes. The
+/// rounding is what a flat per-entry charge misses: 7,350,000 entries adjust
+/// to 8,400,000 and round to 16,777,216 buckets, 419,430,416 bytes, where 32
+/// bytes per entry would have charged 235,200,000.
+#[doc(hidden)]
+pub fn hash_map_bytes(entries: u64) -> u64 {
+    const SLOT_BYTES: u64 = std::mem::size_of::<(u64, Option<u64>)>() as u64;
+    const CTRL_BYTES_PER_BUCKET: u64 = 1;
+    const GROUP_WIDTH: u64 = 16;
+    let buckets = if entries < 4 {
+        4
+    } else if entries < 8 {
+        8
+    } else {
+        entries
+            .saturating_mul(8)
+            .div_ceil(7)
+            .checked_next_power_of_two()
+            .unwrap_or(u64::MAX)
+    };
+    buckets
+        .saturating_mul(SLOT_BYTES + CTRL_BYTES_PER_BUCKET)
+        .saturating_add(GROUP_WIDTH)
+}
+
+/// Why an index could not be rewritten through a remapper by the in-memory
+/// fallback ([`Remapper::materialize`]), as opposed to an I/O or data error:
+/// nothing is wrong with the index or the history, this build simply cannot
+/// prove a complete mapping within its means. A maintenance job leaves such a
+/// segment as it is (its files and the history it translates through stay)
+/// and moves on; the reason travels inside [`Error::NotSupported`], see
+/// [`Self::from_error`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RemapUnavailable {
+    /// The index does not report which fragments its files hold addresses
+    /// for, so a complete mapping cannot be proven.
+    StoredFragmentsUnknown,
+    /// The translator cannot size a fragment the index holds.
+    FragmentRowsUnknown { fragment: u32 },
+    /// Materializing the mapping would exceed the translator's budget.
+    OverBudget {
+        estimated_bytes: u64,
+        budget_bytes: u64,
+    },
+}
+
+impl std::fmt::Display for RemapUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StoredFragmentsUnknown => write!(
+                f,
+                "the index does not report the fragments its files hold addresses for, so a \
+                 complete in-memory mapping cannot be built for its legacy remap"
+            ),
+            Self::FragmentRowsUnknown { fragment } => write!(
+                f,
+                "the translator cannot size fragment {fragment}, which the index holds addresses \
+                 for, so a complete in-memory mapping cannot be built for its legacy remap"
+            ),
+            Self::OverBudget {
+                estimated_bytes,
+                budget_bytes,
+            } => write!(
+                f,
+                "materializing the mapping for the index's legacy remap needs about \
+                 {estimated_bytes} bytes, above the {budget_bytes} byte budget"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RemapUnavailable {}
+
+impl RemapUnavailable {
+    /// This reason as the error an index rewrite returns.
+    pub fn into_error(self) -> Error {
+        Error::not_supported_source(Box::new(self))
+    }
+
+    /// The reason carried by an error an index rewrite returned, if it
+    /// declined for one; `None` for any other error (I/O, corrupt data, a
+    /// translation failure), which a caller must not treat as a skip.
+    pub fn from_error(error: &Error) -> Option<&Self> {
+        match error {
+            Error::NotSupported { source, .. } => source.downcast_ref::<Self>(),
+            _ => None,
+        }
+    }
 }
 
 /// A [`Remapper`] that follows a script instead of a fragment reuse history,
@@ -144,6 +333,8 @@ impl Remapper {
 pub struct ScriptedRemapper {
     moves: std::collections::HashMap<u64, Option<u64>>,
     rewritten: RoaringBitmap,
+    fragment_rows: std::collections::HashMap<u32, u64>,
+    budget_bytes: Option<u64>,
     batches: std::sync::atomic::AtomicUsize,
     addresses: std::sync::atomic::AtomicUsize,
 }
@@ -163,6 +354,19 @@ impl ScriptedRemapper {
     /// The row at `addr` was deleted.
     pub fn deleted(mut self, addr: u64) -> Self {
         self.script(addr, None);
+        self
+    }
+
+    /// Fragment `fragment` holds `rows` physical rows, so
+    /// [`Remapper::materialize`] can enumerate it.
+    pub fn sized(mut self, fragment: u32, rows: u64) -> Self {
+        self.fragment_rows.insert(fragment, rows);
+        self
+    }
+
+    /// [`Remapper::materialize`] may spend at most `bytes`.
+    pub fn with_budget(mut self, bytes: u64) -> Self {
+        self.budget_bytes = Some(bytes);
         self
     }
 
@@ -223,6 +427,15 @@ impl RemapperBacking for ScriptedRemapper {
             Ok(())
         });
         Box::pin(std::future::ready(result))
+    }
+
+    fn fragment_physical_rows(&self, fragment: u32) -> Option<u64> {
+        self.fragment_rows.get(&fragment).copied()
+    }
+
+    fn materialization_budget_bytes(&self) -> u64 {
+        self.budget_bytes
+            .unwrap_or(DEFAULT_MATERIALIZATION_BUDGET_BYTES)
     }
 }
 
@@ -329,6 +542,119 @@ mod tests {
             RoaringBitmap::from_iter([2, 3])
         );
         assert_eq!(script.batches(), 0);
+    }
+
+    /// Fragment 1's four rows move to fragment 5 (offset 1 deleted), fragment
+    /// 3's two rows are dropped, fragment 2 is untouched.
+    fn sized_script(budget: u64) -> (Remapper, Arc<ScriptedRemapper>) {
+        ScriptedRemapper::new()
+            .moved(address(1, 0), address(5, 0))
+            .deleted(address(1, 1))
+            .moved(address(1, 2), address(5, 2))
+            .moved(address(1, 3), address(5, 3))
+            .deleted(address(3, 0))
+            .deleted(address(3, 1))
+            .sized(1, 4)
+            .sized(3, 2)
+            .with_budget(budget)
+            .into_remapper()
+    }
+
+    #[tokio::test]
+    async fn materialize_maps_every_changed_address_explicitly() {
+        let (remapper, _) = sized_script(u64::MAX);
+        let stored = RoaringBitmap::from_iter([1u32, 2, 3]);
+        let remap = remapper.materialize(Some(&stored)).await.unwrap();
+        // Moved rows, a deleted row and a dropped fragment are all explicit:
+        // the map's consumer keeps any address it cannot find.
+        assert_eq!(remap.get(address(1, 0)), Some(Some(address(5, 0))));
+        assert_eq!(remap.get(address(1, 1)), Some(None));
+        assert_eq!(remap.get(address(1, 3)), Some(Some(address(5, 3))));
+        assert_eq!(remap.get(address(3, 0)), Some(None));
+        assert_eq!(remap.get(address(3, 1)), Some(None));
+        // An untouched fragment needs no size and nothing is stored for it.
+        assert_eq!(remap.get(address(2, 0)), None);
+        assert_eq!(remap.get(address(1, 4)), None);
+    }
+
+    #[tokio::test]
+    async fn materialize_declines_before_translating() {
+        let (remapper, script) = sized_script(u64::MAX);
+        let error = remapper.materialize(None).await.unwrap_err();
+        assert_eq!(
+            RemapUnavailable::from_error(&error),
+            Some(&RemapUnavailable::StoredFragmentsUnknown)
+        );
+        let (unsizable, unsized_script) = ScriptedRemapper::new()
+            .deleted(address(9, 0))
+            .into_remapper();
+        let error = unsizable
+            .materialize(Some(&RoaringBitmap::from_iter([9u32])))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            RemapUnavailable::from_error(&error),
+            Some(&RemapUnavailable::FragmentRowsUnknown { fragment: 9 })
+        );
+        let (tight, tight_script) = sized_script(1);
+        let error = tight
+            .materialize(Some(&RoaringBitmap::from_iter([1u32])))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            RemapUnavailable::from_error(&error),
+            Some(RemapUnavailable::OverBudget {
+                budget_bytes: 1,
+                ..
+            })
+        ));
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert_eq!(script.batches(), 0);
+        assert_eq!(unsized_script.batches(), 0);
+        assert_eq!(tight_script.batches(), 0);
+    }
+
+    #[tokio::test]
+    async fn materialize_propagates_translation_errors() {
+        // Fragment 1 is rewritten but only offset 0 is scripted.
+        let (remapper, _) = ScriptedRemapper::new()
+            .moved(address(1, 0), address(2, 0))
+            .sized(1, 4)
+            .into_remapper();
+        let error = remapper
+            .materialize(Some(&RoaringBitmap::from_iter([1u32])))
+            .await
+            .unwrap_err();
+        assert!(RemapUnavailable::from_error(&error).is_none());
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    }
+
+    #[tokio::test]
+    async fn materialize_translates_in_bounded_slices() {
+        let rows = 2 * MATERIALIZE_BATCH_SIZE as u64 + 1;
+        let mut script = ScriptedRemapper::new().sized(2, rows);
+        for offset in 0..rows {
+            script = script.moved(address(2, offset), address(4, offset));
+        }
+        let (remapper, script) = script.into_remapper();
+        let remap = remapper
+            .materialize(Some(&RoaringBitmap::from_iter([2u32])))
+            .await
+            .unwrap();
+        assert_eq!(script.batches(), 3);
+        assert_eq!(
+            remap.get(address(2, rows - 1)),
+            Some(Some(address(4, rows - 1)))
+        );
+    }
+
+    #[test]
+    fn materialization_charges_the_rounded_hash_table() {
+        // 7,350,000 entries adjust to 8,400,000 and round to 16,777,216
+        // buckets of 25 bytes: 419,430,416 bytes, not 32 bytes per entry.
+        assert_eq!(hash_map_bytes(7_350_000), 419_430_416);
+        assert_eq!(hash_map_bytes(0), 4 * 25 + 16);
+        assert!(hash_map_bytes(7_350_000) > DEFAULT_MATERIALIZATION_BUDGET_BYTES);
     }
 
     #[tokio::test]

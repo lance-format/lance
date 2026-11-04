@@ -42,7 +42,7 @@ use super::ledger::{
     DetailsContent, FragReuseLedger, corrupt, is_interpretable_transition, next_field,
     verify_external_content,
 };
-use super::plan::{ReadContext, ReadPlan, SegmentSummary};
+use super::plan::{Composition, ReadContext, ReadPlan, RewriteContext, SegmentSummary};
 use super::{FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME};
 use crate::format::pb::ExternalFile;
 use crate::format::pb::fragment_reuse_index_details as pb;
@@ -567,6 +567,30 @@ impl FragReuseHistory {
                 ReadPlan::Excluded => RoaringBitmap::new(),
             })
             .collect()
+    }
+
+    /// How an index rewrite catches `segment` up with the history: the
+    /// translation its stored addresses are moved through and the bitmap
+    /// the rewritten segment publishes, or why it is left as it is.
+    ///
+    /// Whether the composed translation is ever held in memory is the
+    /// history's decision, not the caller's: the bound
+    /// [`Remapper`](lance_select::Remapper) translates batches through the
+    /// recorded hops as the rewrite asks for them, and sizes and bounds
+    /// [`Remapper::materialize`](lance_select::Remapper::materialize) for an
+    /// index that needs a complete map.
+    ///
+    /// Only the tagged format composes; a version 0 history is refused with
+    /// `NotSupported`, since its segments are rewritten by the frozen
+    /// version 0 remap. A history holding transitions this build cannot
+    /// interpret is refused with `NotSupported` too, and a segment without a
+    /// fragment bitmap with `InvalidInput`.
+    pub fn compose(
+        &self,
+        context: &RewriteContext,
+        segment: &SegmentSummary,
+    ) -> Result<Composition> {
+        self.0.clone().compose(context, segment)
     }
 
     /// The records `self` adds to `base`, refusing anything else: a rewrite

@@ -27,7 +27,8 @@ use crate::system_index::frag_reuse::history::{
 };
 use crate::system_index::frag_reuse::mapping::MappingSource;
 use crate::system_index::frag_reuse::plan::{
-    ReadContext, ReadPlan, SegmentSummary, TranslationPlan, TranslationSupport,
+    Composition, ReadContext, ReadPlan, RewriteContext, SegmentSummary, TranslationPlan,
+    TranslationSupport,
 };
 use crate::system_index::frag_reuse::{
     CompactFragReuseIndex, FragReuseIndexDetails, FragReuseVersion,
@@ -372,6 +373,19 @@ impl FriImpl for LegacyHistory {
             .iter()
             .map(|segment| self.plan_segment(self.clone(), context, segment))
             .collect()
+    }
+
+    /// Version 0 segments are caught up by the frozen version 0 remap,
+    /// which composes every compaction version into one in-memory map.
+    fn compose(
+        self: Arc<Self>,
+        _context: &RewriteContext,
+        _segment: &SegmentSummary,
+    ) -> Result<Composition> {
+        Err(Error::not_supported(
+            "a version 0 fragment reuse history is not composed per segment; its segments are \
+             remapped through the version 0 remap",
+        ))
     }
 
     /// Every plan binds to the same translation, the frozen version 0 one:

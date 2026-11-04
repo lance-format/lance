@@ -110,6 +110,61 @@ pub struct TranslationPlan {
     excluded_fragments: RoaringBitmap,
     stops: RoaringBitmap,
     fingerprint: [u8; 32],
+    /// Set on a plan [`FragReuseHistory::compose`] made: the hops a rewrite
+    /// moves the segment's stored addresses through.
+    rewrite: Option<Arc<RewritePath>>,
+}
+
+/// The hops a rewrite moves a segment's stored addresses through, in
+/// lineage order, as [`FragReuseHistory::compose`] planned them.
+#[derive(Debug)]
+pub(super) struct RewritePath {
+    pub hops: Vec<RewriteHop>,
+    /// Every fragment the segment's rows may sit in along the retained
+    /// lineage; an address anywhere else is dropped before the first hop.
+    pub admitted: RoaringBitmap,
+    /// Physical row counts of every fragment the history or the snapshot
+    /// knows, for [`lance_select::Remapper::materialize`].
+    pub fragment_rows: HashMap<u32, u64>,
+}
+
+/// One hop of a [`RewritePath`]: the position of a transition in the
+/// ledger and the fragments of its sources the segment's addresses occupy
+/// when they reach it. Only addresses in those fragments enter the hop.
+#[derive(Debug)]
+pub(super) struct RewriteHop {
+    pub transition: usize,
+    pub enter: RoaringBitmap,
+}
+
+/// What [`FragReuseHistory::compose`] needs to know about the table,
+/// beyond the history and the segment.
+#[derive(Debug, Clone, Copy)]
+pub struct RewriteContext<'a> {
+    /// The fragments of the snapshot being rewritten.
+    pub live_fragments: &'a RoaringBitmap,
+    /// The FRI entry's `fragment_bitmap`, the lineage it recorded. A
+    /// fragment it names that the history no longer maps lost its mapping.
+    pub lineage: &'a RoaringBitmap,
+    /// The physical row counts of the snapshot's fragments.
+    pub fragment_rows: &'a HashMap<u32, u64>,
+}
+
+/// How [`FragReuseHistory::compose`] answers for one segment.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Composition {
+    /// No recorded transition moves the segment's stored addresses.
+    CaughtUp,
+    /// The segment cannot be rewritten through the history: at `fragment`
+    /// its coverage reaches a transition it only partially covers (a stable
+    /// partition, or any hop after a stable-partition restamp), or a
+    /// retired fragment the history no longer maps. It keeps translating
+    /// through the history until it is rebuilt.
+    Blocked { fragment: u32 },
+    /// The segment is rewritten through the plan: bind it and translate the
+    /// segment's files through the [`Remapper`], then publish the plan's
+    /// [`coverage`](TranslationPlan::coverage) as the segment's bitmap.
+    Rewrite(TranslationPlan),
 }
 
 impl PartialEq for TranslationPlan {
@@ -164,7 +219,44 @@ impl TranslationPlan {
             excluded_fragments,
             stops,
             fingerprint,
+            rewrite: None,
         }
+    }
+
+    /// A rewrite plan publishing `coverage`, whose addresses move through
+    /// `path`.
+    pub(super) fn rewrite(
+        history: Arc<dyn FriImpl>,
+        coverage: RoaringBitmap,
+        path: RewritePath,
+    ) -> Self {
+        let mut plan = Self::nothing(history);
+        plan.coverage = coverage;
+        plan.rewrite = Some(Arc::new(path));
+        plan
+    }
+
+    pub(super) fn rewrite_path(&self) -> Option<&Arc<RewritePath>> {
+        self.rewrite.as_ref()
+    }
+
+    /// Whether binding the plan moves any stored address. A rewrite plan
+    /// that only drops coverage (a partially covered compaction leaves its
+    /// rows to the scan) changes the segment's bitmap, not its files.
+    pub fn moves_addresses(&self) -> bool {
+        self.rewrite
+            .as_ref()
+            .is_none_or(|path| !path.hops.is_empty())
+    }
+
+    /// The same plan answering only for the fragments of `fragments` it
+    /// already covers: a rewrite drops every address the published bitmap
+    /// does not claim, so the rewritten files carry nothing it leaves out
+    /// (rows a sibling segment covers directly, fragments an overlay made
+    /// stale).
+    pub fn restrict_coverage(mut self, fragments: &RoaringBitmap) -> Self {
+        self.coverage &= fragments;
+        self
     }
 
     /// The translation an index loads the segment with. `mappings` reads
