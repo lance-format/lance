@@ -98,10 +98,6 @@ semver.workspace = true
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 
-[build-dependencies]
-prost-build.workspace = true
-protobuf-src = { workspace = true, optional = true }
-
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true
 # Need this so we can prevent dynamic linking in binaries (see cli feature)
@@ -163,13 +159,8 @@ cli = ["dep:clap", "lzma-sys/static"]
 dynamodb = ["lance-table/dynamodb", "dep:aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]
 substrait = ["lance-datafusion/substrait"]
-protoc = [
-    "dep:protobuf-src",
-    "lance-encoding/protoc",
-    "lance-file/protoc",
-    "lance-index/protoc",
-    "lance-table/protoc",
-]
+# Retained for compatibility and forwarded to optional upstream protobuf code.
+protoc = ["lance-datafusion/protoc"]
 aws = ["lance-io/aws"]
 gcp = ["lance-io/gcp"]
 azure = ["lance-io/azure"]
