@@ -4,8 +4,9 @@
 mod entry;
 
 pub(crate) use entry::{
-    EncodedEntry, encode_frag_reuse_entry, encode_frag_reuse_entry_at, load_frag_reuse_history,
-    load_proposed_frag_reuse_history, read_external_history, stored_frag_reuse_history,
+    EncodedEntry, cached_frag_reuse_history, encode_frag_reuse_entry, encode_frag_reuse_entry_at,
+    load_frag_reuse_history, load_proposed_frag_reuse_history, read_external_history,
+    stored_frag_reuse_history,
 };
 use entry::{fri_external_location, read_fri_external_file};
 
@@ -19,7 +20,7 @@ use lance_index::frag_reuse::{
     CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_INDEX_NAME, FragReuseGroup,
     FragReuseIndexDetails, FragReuseVersion,
 };
-use lance_index::scalar::{BatchRowIdRemapper, MetricsCollector, RowIdRemapper};
+use lance_index::scalar::{BatchRowIdRemapper, MetricsCollector, Remapper, RowIdRemapper};
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
 use lance_table::format::pb::FragmentReuseIndexDetails;
 use lance_table::format::pb::fragment_reuse_index_details::{
@@ -29,8 +30,9 @@ use lance_table::format::{Fragment, IndexMetadata, Manifest};
 use lance_table::system_index::frag_reuse::gate::{BareRewriteRefusal, covered_bare_rewrite};
 use lance_table::system_index::frag_reuse::history::{FragReuseHistory, RewriteRecord};
 use lance_table::system_index::frag_reuse::ledger::FragReuseLedger;
+use lance_table::system_index::frag_reuse::mapping::MappingSource;
 pub(crate) use lance_table::system_index::frag_reuse::plan::{
-    ReadPlan, RowDomain, SegmentSummary, TranslationPlan, TranslationSupport,
+    ReadContext, ReadPlan, RowDomain, SegmentSummary, TranslationPlan, TranslationSupport,
 };
 use lance_table::system_index::frag_reuse::policy::FriPolicy;
 use lance_table::transaction::RewriteGroup;
@@ -61,6 +63,10 @@ pub(crate) enum ResolvedRemapping {
         /// The segment's translation identity (see
         /// [`TranslationPlan::fingerprint`]).
         fingerprint: [u8; 32],
+        /// The plan `remapper` translates by, for loaders that take a
+        /// [`Remapper`], and the source it is bound to.
+        translation: TranslationPlan,
+        mappings: Arc<dyn MappingSource>,
     },
 }
 
@@ -668,14 +674,128 @@ pub(super) async fn open_row_id_remapping_with_plan(
             fri.uuid,
             ResolvedRemapping::V1Translate {
                 remapper: Arc::new(super::frag_reuse_remapping::QueryRowIdRemapper::new(
-                    mapping,
+                    mapping.clone(),
                     translation.coverage().clone(),
                     translation.excluded_fragments().clone(),
                 )),
                 fingerprint: *translation.fingerprint(),
+                translation: translation.clone(),
+                mappings: mapping.mapping_source().clone(),
             },
         ))),
     }
+}
+
+/// The [`Remapper`] a segment `resolved` for is loaded with by a plugin's
+/// remapping loader: `None` when its addresses are current.
+pub(crate) async fn segment_remapper(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+    resolved: &Option<(Uuid, ResolvedRemapping)>,
+) -> lance_core::Result<Option<Remapper>> {
+    match resolved.as_ref().map(|(_, remapping)| remapping) {
+        None | Some(ResolvedRemapping::V1Identity) => Ok(None),
+        Some(ResolvedRemapping::V1Translate {
+            translation,
+            mappings,
+            ..
+        }) => Ok(Some(translation.clone().bind(mappings.clone()))),
+        Some(ResolvedRemapping::V0(_)) => legacy_segment_remapper(dataset, index).await,
+    }
+}
+
+/// The plan of `index` under the version 0 history, as one segment of its
+/// own: the legacy reader translates every segment through the whole
+/// history, whatever its siblings cover.
+fn legacy_segment_plan(
+    dataset: &Dataset,
+    fri: &IndexMetadata,
+    history: &FragReuseHistory,
+    index: &IndexMetadata,
+    translation: TranslationSupport,
+) -> ReadPlan {
+    let context = ReadContext {
+        entry_version: fri.dataset_version,
+        live_fragments: &dataset.fragment_bitmap,
+    };
+    let summary = SegmentSummary {
+        uuid: index.uuid,
+        fragment_bitmap: index.fragment_bitmap.clone(),
+        dataset_version: index.dataset_version,
+        domain: if index.results_are_row_addrs() {
+            RowDomain::Address
+        } else {
+            RowDomain::StableRowId
+        },
+        translation,
+    };
+    history
+        .plan(&context, std::slice::from_ref(&summary))
+        .remove(0)
+}
+
+async fn legacy_segment_remapper(
+    dataset: &Dataset,
+    index: &IndexMetadata,
+) -> lance_core::Result<Option<Remapper>> {
+    let stored = super::loading::load_all_indices(dataset).await?;
+    let Some(fri) = stored
+        .iter()
+        .find(|entry| entry.name == FRAG_REUSE_INDEX_NAME)
+    else {
+        return Ok(None);
+    };
+    let history = cached_frag_reuse_history(dataset, fri).await?;
+    match legacy_segment_plan(dataset, fri, &history, index, TranslationSupport::Supported) {
+        ReadPlan::Direct => Ok(None),
+        ReadPlan::Translate(translation) => {
+            let mappings =
+                super::frag_reuse_remapping::frag_reuse_mapping_source(dataset, &history).await?;
+            Ok(Some(translation.bind(mappings)))
+        }
+        ReadPlan::Excluded => Err(Error::not_supported(format!(
+            "segment {} cannot be translated through the version 0 fragment reuse history",
+            index.uuid
+        ))),
+    }
+}
+
+/// The version 0 query listing: `indices` without the scalar segments the
+/// history still has to translate but whose plugin cannot. Their rows are
+/// scanned instead of answered from the addresses the segment was built
+/// with. Commit and maintenance bookkeeping keep every segment.
+pub(crate) async fn exclude_untranslatable_v0_segments(
+    dataset: &Dataset,
+    fri: &IndexMetadata,
+    indices: Arc<Vec<IndexMetadata>>,
+) -> lance_core::Result<Arc<Vec<IndexMetadata>>> {
+    let untranslatable = |index: &IndexMetadata| {
+        !lance_table::system_index::is_system_index(index)
+            && !super::segment::segment_has_vector_details(index)
+            && index.index_details.as_ref().is_some_and(|details| {
+                super::frag_reuse_remapping::scalar_plugin_translates(details, false) == Some(false)
+            })
+    };
+    if !indices.iter().any(untranslatable) {
+        return Ok(indices);
+    }
+    let history = cached_frag_reuse_history(dataset, fri).await?;
+    Ok(Arc::new(
+        indices
+            .iter()
+            .filter(|index| {
+                !untranslatable(index)
+                    || legacy_segment_plan(
+                        dataset,
+                        fri,
+                        &history,
+                        index,
+                        TranslationSupport::Unsupported,
+                    ) != ReadPlan::Excluded
+            })
+            .cloned()
+            .collect(),
+    ))
 }
 
 /// Load fragment reuse index details from index metadata

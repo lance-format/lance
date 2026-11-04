@@ -26,8 +26,40 @@ pub mod row_map;
 /// Fragment-level stable-partition mapping reader.
 pub mod stable_partition;
 
-use crate::scalar::RowIdRemapper;
+use crate::scalar::{BatchRowIdRemapper, Remapper, RowIdRemapper};
 use crate::{Index, IndexType};
+use lance_index_core::remapping::RemapperAsBatch;
+
+/// The synchronous and batch remappers of [`deprecated_remappers`].
+#[doc(hidden)]
+pub type DeprecatedRemappers = (
+    Option<Arc<dyn RowIdRemapper>>,
+    Option<Arc<dyn BatchRowIdRemapper>>,
+);
+
+/// The remappers the deprecated loaders take for `remapper`: the version 0
+/// remap itself as a synchronous remapper, so a version 0 segment loads
+/// exactly as before, and any other remapper as a batch one.
+///
+/// Transitional: it serves the indices that have not yet moved to
+/// translating through the [`Remapper`] they are loaded with.
+#[doc(hidden)]
+pub fn deprecated_remappers(remapper: Option<&Remapper>) -> Result<DeprecatedRemappers> {
+    let Some(remapper) = remapper else {
+        return Ok((None, None));
+    };
+    Ok(
+        match remapper.backing().as_any().downcast_ref::<LegacyRemapper>() {
+            Some(legacy) => (
+                Some(Arc::new(CompactFragReuseIndexHandle(
+                    legacy.compact_index()?,
+                ))),
+                None,
+            ),
+            None => (None, Some(Arc::new(RemapperAsBatch(remapper.clone())))),
+        },
+    )
+}
 
 /// Newtype wrapping [`FragReuseIndex`] so that `lance-index` can implement
 /// the `Index` and `RowIdRemapper` traits (orphan rules prevent implementing

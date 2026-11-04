@@ -408,14 +408,15 @@ fn effective_coverage_never_claims_an_untranslatable_fragment(#[case] reading: R
 }
 
 /// A segment is excluded only when it needs translation its kind cannot
-/// provide. Legacy trusts every kind (fail-closed plugins come with the
-/// `Remapper`); on a table with stable row IDs the legacy reader applies the
-/// history to every segment it opens, so a kind that cannot apply it, or one
-/// storing stable row IDs, is excluded even when caught up. Tagged cannot
-/// translate a segment whose coverage was never recorded; legacy translates
-/// it as covering nothing.
+/// provide, under every format. On a table with stable row IDs the legacy
+/// reader applies the history to every segment it opens, so a kind that
+/// cannot apply it, or one storing stable row IDs, is excluded even when
+/// caught up. A kind whose details cannot be interpreted is still trusted by
+/// the legacy reader, which infers the details of indices written before
+/// they were recorded. Tagged cannot translate a segment whose coverage was
+/// never recorded; legacy translates it as covering nothing.
 #[rstest]
-#[case::legacy(Reading::Legacy, [false, false, false], false)]
+#[case::legacy(Reading::Legacy, [true, false, false], false)]
 #[case::legacy_stable_row_ids(Reading::LegacyStableRowIds, [true, true, true], false)]
 #[case::tagged(Reading::Tagged, [true, false, false], true)]
 fn excluded_only_when_translation_is_needed_and_unsupported(
@@ -440,6 +441,15 @@ fn excluded_only_when_translation_is_needed_and_unsupported(
         let plan = plan_one(reading, segment(covered, 1, TranslationSupport::Supported));
         assert_ne!(plan, ReadPlan::Excluded, "{covered:?}");
     }
+    let uninterpretable = plan_one(
+        reading,
+        segment(&[0, 3], 1, TranslationSupport::Uninterpretable),
+    );
+    assert_eq!(
+        uninterpretable == ReadPlan::Excluded,
+        reading != Reading::Legacy,
+        "{uninterpretable:?}"
+    );
     let mut unknown_coverage = segment(&[], 1, TranslationSupport::Supported);
     unknown_coverage.fragment_bitmap = None;
     let plan = plan_one(reading, unknown_coverage);

@@ -32,8 +32,8 @@ use crate::{
         CreatedIndex, RowIdRemapper, UpdateCriteria,
         expression::{SargableQueryParser, ScalarQueryParser},
         registry::{
-            BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingOrdering, TrainingRequest,
-            VALUE_COLUMN_NAME, single_flight_open,
+            BasicTrainer, RemappingIndexLoader, ScalarIndexLoad, ScalarIndexPlugin,
+            TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
         },
     },
 };
@@ -4102,6 +4102,10 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         Ok(true)
     }
 
+    fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
+        Some(self)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -4214,6 +4218,37 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
             move |state| state.reconstruct(index_store, cache, frag_reuse_index),
         )
         .await
+    }
+}
+
+#[async_trait]
+impl RemappingIndexLoader for BTreeIndexPlugin {
+    // TODO: translate through the remapper directly; until then the remapper
+    // is served to the existing loaders, which apply it as before.
+    async fn load_remapped(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        index_version: u32,
+        remapper: Option<crate::scalar::Remapper>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        match crate::frag_reuse::deprecated_remappers(remapper.as_ref())? {
+            (legacy, None) => {
+                self.load_index(index_store, index_details, index_version, legacy, cache)
+                    .await
+            }
+            (_, batch) => {
+                self.load_index_with_remapping(
+                    index_store,
+                    index_details,
+                    index_version,
+                    batch,
+                    cache,
+                )
+                .await
+            }
+        }
     }
 }
 

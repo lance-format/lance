@@ -28,7 +28,7 @@ use crate::system_index::frag_reuse::history::{
 };
 use crate::system_index::frag_reuse::mapping::MappingSource;
 use crate::system_index::frag_reuse::plan::{
-    ReadContext, ReadPlan, SegmentSummary, TranslationPlan,
+    ReadContext, ReadPlan, SegmentSummary, TranslationPlan, TranslationSupport,
 };
 use crate::system_index::frag_reuse::{
     CompactFragReuseIndex, FragReuseIndexDetails, FragReuseVersion,
@@ -224,6 +224,14 @@ impl LegacyHistory {
             })
     }
 
+    fn is_direct(&self, context: &ReadContext, segment: &SegmentSummary) -> bool {
+        segment
+            .fragment_bitmap
+            .as_ref()
+            .is_some_and(|bitmap| !bitmap.is_empty())
+            && self.is_caught_up(context.entry_version, segment)
+    }
+
     fn plan_segment(
         &self,
         history: Arc<dyn FriImpl>,
@@ -235,13 +243,10 @@ impl LegacyHistory {
             .as_ref()
             .map(|bitmap| bitmap & context.live_fragments)
             .unwrap_or_default();
-        let is_direct = segment
-            .fragment_bitmap
-            .as_ref()
-            .is_some_and(|bitmap| !bitmap.is_empty())
-            && self.is_caught_up(context.entry_version, segment);
-        if is_direct {
+        if self.is_direct(context, segment) {
             ReadPlan::Direct
+        } else if segment.translation == TranslationSupport::Unsupported {
+            ReadPlan::Excluded
         } else {
             ReadPlan::Translate(TranslationPlan::new(
                 history,
@@ -351,10 +356,8 @@ impl FriImpl for LegacyHistory {
         })
     }
 
-    // The legacy reader applies the history to every segment it opens and
-    // trusts every kind to translate.
-    fn needs_translation_support(&self, _context: &ReadContext, _segment: &SegmentSummary) -> bool {
-        false
+    fn needs_translation_support(&self, context: &ReadContext, segment: &SegmentSummary) -> bool {
+        !self.is_direct(context, segment)
     }
 
     /// Every segment that is not caught up translates its live coverage: the

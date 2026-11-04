@@ -9,6 +9,7 @@ use lance_core::{Error, Result};
 use lance_table::format::IndexMetadata;
 use lance_table::system_index::frag_reuse::history::FragReuseHistory;
 use lance_table::system_index::frag_reuse::ledger::FragReuseLedger;
+use lance_table::system_index::frag_reuse::mapping::MappingSource;
 use lance_table::system_index::frag_reuse::plan::{
     ReadContext, ReadPlan, RowDomain, SegmentSummary, TranslationSupport, segment_plans,
     translation_fingerprint,
@@ -109,10 +110,9 @@ async fn segment_supports_batch_remapping(
             super::frag_reuse_remapping::inverted_supports_batch_remapping(dataset, index).await?,
         ));
     }
-    Ok(super::scalar::SCALAR_INDEX_PLUGIN_REGISTRY
-        .get_plugin_by_details(details)
-        .ok()
-        .map(|plugin| plugin.supports_batch_row_id_remapping()))
+    Ok(super::frag_reuse_remapping::scalar_plugin_translates(
+        details, true,
+    ))
 }
 
 /// One segment's derived query-time inputs from the coverage backtrack.
@@ -133,6 +133,7 @@ pub struct FragmentReuseIndex {
     entry_version: u64,
     live_fragments: Arc<RoaringBitmap>,
     readers: Vec<Arc<CachedMapping>>,
+    mappings: Arc<dyn MappingSource>,
 }
 
 impl FragmentReuseIndex {
@@ -152,16 +153,24 @@ impl FragmentReuseIndex {
         for transition in ledger.transitions() {
             readers.push(cache::open_mapping(dataset, transition).await?);
         }
+        let mappings =
+            super::frag_reuse_remapping::frag_reuse_mapping_source(dataset, &history).await?;
         Ok(Arc::new(Self {
             history,
             entry_version: index.dataset_version,
             live_fragments: dataset.fragment_bitmap.clone(),
             readers,
+            mappings,
         }))
     }
 
     pub(crate) fn history(&self) -> &FragReuseHistory {
         &self.history
+    }
+
+    /// The source the history's translation plans are bound to.
+    pub(crate) fn mapping_source(&self) -> &Arc<dyn MappingSource> {
+        &self.mappings
     }
 
     fn ledger(&self) -> &FragReuseLedger {
@@ -349,36 +358,6 @@ impl FragmentReuseIndex {
 
 fn corrupt(message: impl Into<String>) -> Error {
     Error::corrupt_file_named("FRI query", message)
-}
-
-async fn load_history(dataset: &Dataset, index: &IndexMetadata) -> Result<FragReuseHistory> {
-    #[cfg(test)]
-    check_reader_path()?;
-    if index.index_details.is_none() {
-        return Err(corrupt("missing FRI details"));
-    }
-    let external = super::frag_reuse::read_external_history(index, |file| async move {
-        let end = file
-            .offset
-            .checked_add(file.size)
-            .and_then(|n| usize::try_from(n).ok())
-            .ok_or_else(|| corrupt("external FRI range overflow"))?;
-        let path = dataset
-            .indice_files_dir(index)?
-            .join(index.uuid.to_string())
-            .join(file.path.as_str());
-        dataset
-            .object_store_for_index(index)
-            .await?
-            .open(&path)
-            .await?
-            .get_range(file.offset as usize..end)
-            .await
-            .map_err(Error::from)
-    })
-    .await?;
-    // The reader only opens tagged histories, which are never repaired.
-    FragReuseHistory::decode(index, external)
 }
 
 #[cfg(test)]
@@ -1689,6 +1668,17 @@ pub mod tests {
                 })
                 .collect(),
             history: Arc::new(history),
+            // Ordered compactions only: no row map is read.
+            mappings: Arc::new(
+                lance_index::frag_reuse::mapping_source::RowMapMappingSource::new(
+                    Arc::new(|base| {
+                        Err(Error::internal(format!("unexpected row map base {base:?}")))
+                    }),
+                    lance_core::cache::WeakLanceCache::from(
+                        &lance_core::cache::LanceCache::no_cache(),
+                    ),
+                ),
+            ),
         });
         let inputs = [0, 1, 2, 3, 9].map(|f| u64::from(RowAddress::new_from_parts(f, 1)));
         assert_eq!(

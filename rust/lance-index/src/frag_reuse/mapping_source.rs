@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow_array::UInt16Array;
 use async_trait::async_trait;
@@ -36,9 +36,13 @@ pub type BaseResolver = dyn Fn(Option<u32>) -> Result<(Arc<ObjectStore>, Path)> 
 /// entry stays valid across dataset versions. The cache is held weakly
 /// because remappers bound to this source live inside cached indices; a
 /// strong reference from there would keep the cache alive through itself.
+/// The source also keeps every row map it opened, so a cache too small to
+/// retain one does not make each read reopen it.
 pub struct RowMapMappingSource {
     stores: Arc<BaseResolver>,
     cache: WeakLanceCache,
+    metadata_cache: LanceCache,
+    opened: Mutex<HashMap<String, Arc<OpenedRowMap>>>,
 }
 
 impl std::fmt::Debug for RowMapMappingSource {
@@ -50,7 +54,20 @@ impl std::fmt::Debug for RowMapMappingSource {
 
 impl RowMapMappingSource {
     pub fn new(stores: Arc<BaseResolver>, cache: WeakLanceCache) -> Self {
-        Self { stores, cache }
+        Self {
+            stores,
+            cache,
+            metadata_cache: LanceCache::no_cache(),
+            opened: Mutex::default(),
+        }
+    }
+
+    /// Keep the file metadata of row maps (their column and page layout) in
+    /// `metadata_cache`, under each file's directory, so a label read does
+    /// not fetch it again. Without one, every read fetches it.
+    pub fn with_metadata_cache(mut self, metadata_cache: LanceCache) -> Self {
+        self.metadata_cache = metadata_cache;
+        self
     }
 
     async fn open(&self, mapping: &MappingRef) -> Result<Arc<OpenedRowMap>> {
@@ -61,6 +78,10 @@ impl RowMapMappingSource {
             path: directory.clone().join(MAPPING_FILE).to_string(),
             binding: Arc::as_ptr(&store) as usize as u64,
         };
+        let memo_key = key.key().into_owned();
+        if let Some(opened) = self.opened_row_map(&memo_key)? {
+            return Ok(opened);
+        }
         let row_map_id = *blake3::hash(format!("{}:{}", key.store, key.path).as_bytes()).as_bytes();
         // A cache known to be smaller than one chunk can never retain a
         // chunk: every read would load a whole chunk only to discard it, so
@@ -70,13 +91,12 @@ impl RowMapMappingSource {
             _ => Some(RowMapBlockCache::new(self.cache.clone(), row_map_id)),
         };
         let size_bytes = mapping.size_bytes();
-        self.cache
+        let metadata_cache = Arc::new(self.metadata_cache.with_key_prefix(directory.as_ref()));
+        let opened = self
+            .cache
             .get_or_insert_with_key(key, || async move {
-                // The opened reader is cached itself; its file metadata needs
-                // no second cache.
-                let index_store =
-                    LanceIndexStore::new(store, directory, Arc::new(LanceCache::no_cache()))
-                        .with_file_sizes(HashMap::from([(MAPPING_FILE.to_string(), size_bytes)]));
+                let index_store = LanceIndexStore::new(store, directory, metadata_cache)
+                    .with_file_sizes(HashMap::from([(MAPPING_FILE.to_string(), size_bytes)]));
                 let reader = RowMapReader::open_with_cache(
                     index_store.open_index_file(MAPPING_FILE).await?,
                     block_cache,
@@ -84,7 +104,19 @@ impl RowMapMappingSource {
                 .await?;
                 Ok(OpenedRowMap(reader))
             })
-            .await
+            .await?;
+        self.lock_opened()?.insert(memo_key, opened.clone());
+        Ok(opened)
+    }
+
+    fn opened_row_map(&self, key: &str) -> Result<Option<Arc<OpenedRowMap>>> {
+        Ok(self.lock_opened()?.get(key).cloned())
+    }
+
+    fn lock_opened(&self) -> Result<std::sync::MutexGuard<'_, HashMap<String, Arc<OpenedRowMap>>>> {
+        self.opened
+            .lock()
+            .map_err(|_| lance_core::Error::internal("row map source lock was poisoned"))
     }
 }
 

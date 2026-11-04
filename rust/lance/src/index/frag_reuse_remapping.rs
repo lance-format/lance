@@ -5,13 +5,113 @@
 use super::frag_reuse_reader::FragmentReuseIndex;
 use crate::Dataset;
 use async_trait::async_trait;
-use lance_core::Result;
-use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
+use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, WeakLanceCache};
 use lance_core::utils::address::RowAddress;
+use lance_core::{Error, Result};
 use lance_index::INDEX_FILE_NAME;
+use lance_index::frag_reuse::mapping_source::RowMapMappingSource;
 use lance_table::format::IndexMetadata;
+use lance_table::system_index::frag_reuse::history::FragReuseHistory;
+use lance_table::system_index::frag_reuse::ledger::Mapping;
+use lance_table::system_index::frag_reuse::mapping::MappingSource;
 use roaring::RoaringBitmap;
+use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Built-in scalar index kinds that apply fragment reuse translation through
+/// the deprecated loaders rather than a
+/// [`RemappingIndexLoader`](lance_index::scalar::registry::RemappingIndexLoader).
+/// A kind leaves this list when it implements one.
+const DEPRECATED_LOADER_BUILTINS: &[&str] = &[
+    "BitmapIndexDetails",
+    "BloomFilterIndexDetails",
+    "FmIndexDetails",
+    "InvertedIndexDetails",
+    "JsonIndexDetails",
+    "LabelListIndexDetails",
+    "MinHashLshIndexDetails",
+    "NGramIndexDetails",
+    "RTreeIndexDetails",
+    "ZoneMapIndexDetails",
+];
+
+/// Whether this build translates the row addresses of scalar segments with
+/// `details`: `None` when no plugin reads them.
+///
+/// A plugin translates when it implements a remapping loader. Built-in
+/// kinds not yet on one keep their existing support: every one under a
+/// version 0 history (`is_tagged` false), the ones with a batch loader under
+/// a tagged history. A plugin outside the build that implements only the
+/// deprecated loaders does not translate, under either format.
+pub(super) fn scalar_plugin_translates(
+    details: &prost_types::Any,
+    is_tagged: bool,
+) -> Option<bool> {
+    let plugin = super::scalar::SCALAR_INDEX_PLUGIN_REGISTRY
+        .get_plugin_by_details(details)
+        .ok()?;
+    if plugin.remapping_loader().is_some() {
+        return Some(true);
+    }
+    let message = details
+        .type_url
+        .rsplit(['/', '.'])
+        .next()
+        .unwrap_or_default();
+    let is_deprecated_builtin = DEPRECATED_LOADER_BUILTINS
+        .iter()
+        .any(|builtin| builtin.eq_ignore_ascii_case(message));
+    Some(is_deprecated_builtin && (!is_tagged || plugin.supports_batch_row_id_remapping()))
+}
+
+/// The source of the row maps `history`'s transitions reference, reading
+/// through `dataset`'s base stores and caching in its index cache.
+///
+/// Every base a row map lives under is resolved now, so the source holds the
+/// stores but not the dataset: remappers bound to it live in cached indices.
+pub(super) async fn frag_reuse_mapping_source(
+    dataset: &Dataset,
+    history: &FragReuseHistory,
+) -> Result<Arc<dyn MappingSource>> {
+    let mut stores = HashMap::new();
+    for transition in history.ledger().transitions() {
+        let Mapping::StablePartition(reference) = transition.mapping() else {
+            continue;
+        };
+        if stores.contains_key(&reference.base_id) {
+            continue;
+        }
+        let root = match reference.base_id {
+            None => dataset.base.clone(),
+            Some(id) => dataset
+                .manifest
+                .base_paths
+                .get(&id)
+                .ok_or_else(|| {
+                    Error::corrupt_file_named(
+                        "FRI query",
+                        format!("mapping {} references missing base {id}", reference.map_id),
+                    )
+                })?
+                .extract_path(dataset.session.store_registry())?,
+        };
+        let store = dataset.object_store(reference.base_id).await?;
+        stores.insert(reference.base_id, (store, root));
+    }
+    Ok(Arc::new(
+        RowMapMappingSource::new(
+            Arc::new(move |base| {
+                stores.get(&base).cloned().ok_or_else(|| {
+                    Error::internal(format!(
+                        "row map base {base:?} is not referenced by the fragment reuse history"
+                    ))
+                })
+            }),
+            WeakLanceCache::from(&dataset.index_cache),
+        )
+        .with_metadata_cache(dataset.metadata_cache.0.clone()),
+    ))
+}
 #[derive(Clone)]
 struct VectorFormatKey(uuid::Uuid);
 

@@ -5,10 +5,12 @@
 //! [`FragReuseHistory::decode`] needs and writing the one
 //! [`FragReuseHistory::encode`] spills.
 
+use std::borrow::Cow;
 use std::future::Future;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
 use lance_core::{Error, Result};
 use lance_index::frag_reuse::{
     FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME, FragReuseIndexDetails,
@@ -23,6 +25,7 @@ use lance_table::system_index::frag_reuse::history::{
 use object_store::path::Path;
 use prost::Message;
 use tokio::io::AsyncWriteExt;
+use uuid::Uuid;
 
 use crate::Dataset;
 use crate::session::index_caches::{FragReuseContent, FragReuseContentKey, FragReuseDetailsKey};
@@ -246,4 +249,93 @@ pub(super) async fn read_fri_external_file(
         )
         .await?;
     Ok(content.0.clone())
+}
+
+impl Dataset {
+    /// The fragment reuse history of this snapshot, or `None` when the table
+    /// has none.
+    ///
+    /// The history is decoded once per session for each fragment reuse
+    /// entry, and shared by every version and index segment that sees it.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn test(dataset: &Dataset) -> Result<()> {
+    /// if let Some(history) = dataset.frag_reuse_history().await? {
+    ///     let transitions = history.ledger().transitions();
+    ///     assert!(transitions.iter().all(|transition| !transition.sources().is_empty()));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn frag_reuse_history(&self) -> Result<Option<FragReuseHistory>> {
+        let indices = crate::index::loading::load_all_indices(self).await?;
+        match indices
+            .iter()
+            .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+        {
+            Some(entry) => Ok(Some(
+                cached_frag_reuse_history(self, entry)
+                    .await?
+                    .as_ref()
+                    .clone(),
+            )),
+            None => Ok(None),
+        }
+    }
+}
+
+/// [`load_frag_reuse_history`], once per session for each entry.
+pub async fn cached_frag_reuse_history(
+    dataset: &Dataset,
+    entry: &IndexMetadata,
+) -> Result<Arc<FragReuseHistory>> {
+    let store = dataset.object_store_for_index(entry).await?;
+    let key = FragReuseHistoryKey {
+        entry: super::v0_cache_identity(dataset, entry),
+        index_version: entry.index_version,
+        store: &store.store_prefix,
+        directory: dataset.indice_files_dir(entry)?.to_string(),
+    };
+    dataset
+        .index_cache
+        .get_or_insert_with_key(key, || load_frag_reuse_history(dataset, entry))
+        .await
+}
+
+/// Keys a decoded history by its entry. The entry identity covers the
+/// entry's uuid and stored details: released version 0 writers could change
+/// a history without minting a new uuid.
+struct FragReuseHistoryKey<'a> {
+    entry: Uuid,
+    index_version: i32,
+    store: &'a str,
+    directory: String,
+}
+
+impl CacheKey for FragReuseHistoryKey<'_> {
+    type ValueType = FragReuseHistory;
+
+    fn key(&self) -> Cow<'_, str> {
+        format!(
+            "{}:{}:{}:{}",
+            self.entry, self.index_version, self.store, self.directory
+        )
+        .into()
+    }
+
+    fn type_name() -> &'static str {
+        "FragmentReuseHistory"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.fri-history", 2)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.entry.as_bytes());
+        builder.write_i32(self.index_version);
+        builder.write_str(self.store);
+        builder.write_str(&self.directory);
+    }
 }

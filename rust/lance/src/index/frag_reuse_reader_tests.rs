@@ -1372,13 +1372,6 @@ async fn legacy_reader_guard_rejects_new_entry_points() {
                     .to_string()
                     .contains("V1 operation entered the new FRI reader")
             );
-            let error = load_history(&dataset, &index).await.unwrap_err();
-            assert!(matches!(error, Error::Internal { .. }));
-            assert!(
-                error
-                    .to_string()
-                    .contains("V1 operation entered the new FRI reader")
-            );
         })
         .await;
 }
@@ -1640,7 +1633,7 @@ async fn released_legacy_fri_keeps_version_zero_on_append() {
         .unwrap();
     assert_eq!(fri.index_version, 0);
     // Decode the released writer's actual Any, not a reserialized modern protobuf.
-    let history = load_history(&dataset, fri).await.unwrap();
+    let history = dataset.frag_reuse_history().await.unwrap().unwrap();
     let ledger = history.ledger();
     assert!(!ledger.transitions().is_empty());
     let legacy = dataset

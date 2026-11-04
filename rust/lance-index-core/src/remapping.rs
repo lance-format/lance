@@ -49,6 +49,25 @@ pub trait BatchRowIdRemapper: Send + Sync + std::fmt::Debug {
 /// The default [`BatchRowIdRemapper::materialization_budget_bytes`]: 256 MiB.
 pub const DEFAULT_MATERIALIZATION_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
+pub use lance_select::Remapper;
+
+/// A [`Remapper`] served to index code that still takes a
+/// [`BatchRowIdRemapper`]. Transitional: it goes away once every index
+/// translates through the [`Remapper`] it is loaded with.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct RemapperAsBatch(pub Remapper);
+
+#[async_trait]
+impl BatchRowIdRemapper for RemapperAsBatch {
+    async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+        check_batch_remapping_entry()?;
+        let mut translated: Vec<Option<u64>> = row_ids.iter().copied().map(Some).collect();
+        self.0.translate_in_place(&mut translated).await?;
+        Ok(translated)
+    }
+}
+
 /// Bytes hashbrown allocates for the `HashMap<u64, Option<u64>>` that
 /// `HashMap::with_capacity(entries)` reserves.
 ///

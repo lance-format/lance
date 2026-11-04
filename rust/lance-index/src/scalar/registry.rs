@@ -20,7 +20,7 @@ use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
 use crate::scalar::RowIdRemapper;
 use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser};
-use lance_index_core::remapping::BatchRowIdRemapper;
+use lance_index_core::remapping::{BatchRowIdRemapper, Remapper};
 // Re-export training types that were previously defined here
 pub use crate::scalar::{TrainingCriteria, TrainingOrdering};
 
@@ -209,6 +209,21 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>>;
+
+    /// This plugin's loader for segments whose rows a rewrite may have moved,
+    /// if it can translate them.
+    ///
+    /// A fragment reuse history lets a rewrite (compaction) move rows without
+    /// rebuilding the indices over them. A segment built before such a
+    /// rewrite still stores the old row addresses, and is read through a
+    /// [`Remapper`] that translates them. Implementing
+    /// [`RemappingIndexLoader`] declares that this plugin applies one; a
+    /// plugin that returns `None` (the default) cannot, so a segment of it
+    /// that needs translation is left out of query listings under every
+    /// fragment reuse history format, and its rows are scanned instead.
+    fn remapping_loader(&self) -> Option<&dyn RemappingIndexLoader> {
+        None
+    }
 
     /// Whether this plugin can await batch row-ID translation while loading its data.
     ///
@@ -430,6 +445,29 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     ) -> Result<Option<CreatedIndex>> {
         Ok(None)
     }
+}
+
+/// Loads a scalar index segment whose stored row addresses are translated
+/// through a [`Remapper`]. See [`ScalarIndexPlugin::remapping_loader`].
+#[async_trait]
+pub trait RemappingIndexLoader: Send + Sync {
+    /// Load a segment, as [`ScalarIndexPlugin::load_index`] does, translating
+    /// every row address the loaded index reports through `remapper`.
+    ///
+    /// `remapper` is `None` when the segment's addresses are current. The
+    /// remapper translates asynchronously and in batches: translate the
+    /// addresses at hand together (a page, a posting list, a search result)
+    /// rather than one at a time, and use
+    /// [`Remapper::fragment_needs_translation`] to skip fragments it leaves
+    /// unchanged.
+    async fn load_remapped(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        index_version: u32,
+        remapper: Option<Remapper>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>>;
 }
 
 /// A boxed, `Send` future performing the storage-level load of a scalar index

@@ -899,7 +899,17 @@ pub(crate) async fn open_scalar_index_with_plan(
     let cache_id = super::frag_reuse::fri_cache_id(&resolved);
     let index_cache =
         super::frag_reuse::scoped_index_cache(dataset, &resolved).for_index(&index.uuid, cache_id);
-    let (frag_reuse_index, batch_remapping) =
+    let remapping_loader = plugin.remapping_loader();
+    let remapper = match remapping_loader {
+        Some(_) => super::frag_reuse::segment_remapper(dataset, index, &resolved).await?,
+        None => None,
+    };
+    // The cache hooks still take the deprecated remappers: a plugin with a
+    // remapping loader gets the ones its remapper stands for, so a warm
+    // reconstruct translates exactly as its load did.
+    let (frag_reuse_index, batch_remapping) = if remapping_loader.is_some() {
+        lance_index::frag_reuse::deprecated_remappers(remapper.as_ref())?
+    } else {
         match resolved.as_ref().map(|(_, remapping)| remapping) {
             Some(ResolvedRemapping::V0(remapper)) => (Some(remapper.clone()), None),
             // An untouched segment on a tagged dataset loads the original way,
@@ -908,7 +918,8 @@ pub(crate) async fn open_scalar_index_with_plan(
             Some(ResolvedRemapping::V1Identity) => (None, None),
             Some(ResolvedRemapping::V1Translate { remapper, .. }) => (None, Some(remapper.clone())),
             None => (None, None),
-        };
+        }
+    };
 
     // Runs only on a cold miss, and at most once even under concurrent opens
     // (the plugin coalesces). The compat check lives here because a warm hit was
@@ -931,8 +942,19 @@ pub(crate) async fn open_scalar_index_with_plan(
 
             let index_version = u32::try_from(index.index_version).unwrap_or(0);
 
-            let index = match batch_remapping {
-                Some(remapping) => {
+            let index = match (remapping_loader, batch_remapping) {
+                (Some(loader), _) => {
+                    loader
+                        .load_remapped(
+                            index_store,
+                            &index_details,
+                            index_version,
+                            remapper,
+                            &index_cache,
+                        )
+                        .await?
+                }
+                (None, Some(remapping)) => {
                     plugin
                         .load_index_with_remapping(
                             index_store,
@@ -943,7 +965,7 @@ pub(crate) async fn open_scalar_index_with_plan(
                         )
                         .await?
                 }
-                None => {
+                (None, None) => {
                     plugin
                         .load_index(
                             index_store,

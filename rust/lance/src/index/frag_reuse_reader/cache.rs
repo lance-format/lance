@@ -18,55 +18,14 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::IndexMetadata;
 use lance_table::system_index::frag_reuse::history::FragReuseHistory;
 use lance_table::system_index::frag_reuse::ledger::{Mapping, Transition};
-use uuid::Uuid;
 
 use crate::Dataset;
-
-struct LedgerKey {
-    uuid: Uuid,
-    version: i32,
-    store: String,
-    directory: String,
-}
-
-impl CacheKey for LedgerKey {
-    type ValueType = FragReuseHistory;
-    fn key(&self) -> Cow<'_, str> {
-        format!(
-            "{}:{}:{}:{}",
-            self.uuid, self.version, self.store, self.directory
-        )
-        .into()
-    }
-    fn type_name() -> &'static str {
-        "FragmentReuseHistory"
-    }
-    fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.index.fri-history", 1)
-    }
-    fn write_key(&self, builder: &mut KeyBuilder) {
-        builder.write_fixed_bytes(self.uuid.as_bytes());
-        builder.write_i32(self.version);
-        builder.write_str(&self.store);
-        builder.write_str(&self.directory);
-    }
-}
 
 pub(super) async fn open_history(
     dataset: &Dataset,
     index: &IndexMetadata,
 ) -> Result<Arc<FragReuseHistory>> {
-    let store = dataset.object_store_for_index(index).await?;
-    let key = LedgerKey {
-        uuid: index.uuid,
-        version: index.index_version,
-        store: store.store_prefix.clone(),
-        directory: dataset.indice_files_dir(index)?.to_string(),
-    };
-    dataset
-        .index_cache
-        .get_or_insert_with_key(key, || super::load_history(dataset, index))
-        .await
+    crate::index::frag_reuse::cached_frag_reuse_history(dataset, index).await
 }
 
 #[derive(Clone)]
