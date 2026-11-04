@@ -600,7 +600,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        Array, FixedSizeListArray,
+        Array, ArrayRef, FixedSizeListArray,
         builder::{Int32Builder, ListBuilder},
         cast::AsArray,
     };
@@ -812,6 +812,37 @@ mod tests {
         let arrow_field = Field::new("test", data_type, true);
         let err = lance_core::datatypes::Field::try_from(&arrow_field).unwrap_err();
         assert!(err.to_string().contains("Unsupported data type"));
+    }
+
+    /// Only fixed-size lists that carry string values are refused. Null lists and
+    /// lists of null items still round-trip.
+    #[rstest]
+    #[case::null_lists(true)]
+    #[case::null_items(false)]
+    #[tokio::test]
+    async fn test_null_fsl_of_strings_round_trip(#[case] null_lists: bool) {
+        let num_lists = 300;
+        let (items, nulls): (ArrayRef, _) = if null_lists {
+            let items = (0..num_lists * 2).map(|i| format!("s{i}"));
+            (
+                Arc::new(arrow_array::StringArray::from_iter_values(items)),
+                Some(arrow_buffer::NullBuffer::new_null(num_lists)),
+            )
+        } else {
+            (
+                arrow_array::new_null_array(&DataType::Utf8, num_lists * 2),
+                None,
+            )
+        };
+        let fsl = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            2,
+            items,
+            nulls,
+        );
+        let test_cases = TestCases::default()
+            .with_encodings([TestEncoding::StructuralU16, TestEncoding::StructuralU32]);
+        check_round_trip_encoding_of_data(vec![Arc::new(fsl)], &test_cases, HashMap::new()).await;
     }
 
     #[test]

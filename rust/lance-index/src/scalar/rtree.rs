@@ -27,12 +27,12 @@ use futures::future::BoxFuture;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, stream};
 use geoarrow_array::array::{RectArray, from_arrow_array};
 use geoarrow_array::builder::RectBuilder;
-use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor, IntoArrow};
+use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
 use geoarrow_schema::{Dimension, RectType};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
-    KeyBuilder, LanceCache, WeakLanceCache,
+    CacheLoadOrigin, KeyBuilder, LanceCache, WeakLanceCache,
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
@@ -736,6 +736,7 @@ impl Index for RTreeIndex {
             let range = self.page_range(page_id).await?;
             let batch = Arc::new(self.pages_reader.read_range(range, None).await?);
             self.index_cache
+                .with_load_origin(CacheLoadOrigin::Warm)
                 .insert_with_key(
                     &RTreeCacheKey::Page(page_id),
                     Arc::new(RTreeCacheValue(batch.clone())),
@@ -745,6 +746,7 @@ impl Index for RTreeIndex {
 
         let batch = self.nulls_reader.read_range(0..1, None).await?;
         self.index_cache
+            .with_load_origin(CacheLoadOrigin::Warm)
             .insert_with_key(
                 &RTreeCacheKey::Nulls,
                 Arc::new(RTreeCacheValue(Arc::new(batch))),
@@ -958,7 +960,9 @@ impl RTreeIndexPlugin {
                 let bbox_array = extract_bounding_boxes(geometry_array, geometry_field)?;
 
                 let bbox_schema = Arc::new(ArrowSchema::new(vec![
-                    bbox_array.extension_type().clone().to_field("bbox", true),
+                    // Index bounds use a fixed schema; CRS metadata stays on the
+                    // dataset's geometry field.
+                    BBOX_FIELD.as_ref().clone().with_nullable(true),
                     ArrowField::new(ROW_ID, DataType::UInt64, false),
                 ]));
                 RecordBatch::try_new(
@@ -1253,6 +1257,10 @@ impl BasicTrainer for RTreeIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for RTreeIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(false)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }

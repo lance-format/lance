@@ -66,6 +66,7 @@ use datafusion_physical_plan::{
 };
 use futures::{Stream, StreamExt, TryStreamExt, stream, stream::BoxStream};
 use hashbrown::{HashTable, hash_table::Entry};
+use lance_core::cache::CacheLoadOrigin;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{
     Error, ROW_ADDR, Result,
@@ -2762,6 +2763,7 @@ impl Index for BTreeIndex {
         while let Some((page_idx, page)) = pages.try_next().await? {
             let inserted = self
                 .index_cache
+                .with_load_origin(CacheLoadOrigin::Warm)
                 .insert_with_key(
                     &BTreePageKey {
                         page_number: page_idx,
@@ -4096,6 +4098,10 @@ impl BasicTrainer for BTreeIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BTreeIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(true)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }

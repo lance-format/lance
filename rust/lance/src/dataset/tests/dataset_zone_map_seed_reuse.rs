@@ -36,7 +36,7 @@ use crate::Dataset;
 use crate::dataset::WriteParams;
 use crate::dataset::optimize::{CompactionMode, CompactionOptions, compact_files};
 use crate::index::scalar::zonemap::{SEED_REUSE_REPORTS, SeedReuseReport, harvest_concurrency};
-use crate::index::{CreateIndexBuilder, DatasetIndexExt, DatasetIndexInternalExt};
+use crate::index::{CreateIndexBuilder, DatasetIndexExt, loading::DatasetIndexInternalExt};
 
 const ROWS_PER_FILE: usize = 20000;
 /// Rows per written fragment.

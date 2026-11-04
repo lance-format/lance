@@ -788,8 +788,20 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         false
     }
 
-    /// Returns true if the remap operation is supported
-    fn can_remap(&self) -> bool;
+    /// Returns true if the remap operation is supported.
+    ///
+    /// Deprecated: new index implementations should report remap support from
+    /// persisted metadata through their scalar index plugin, so callers can
+    /// decide without opening the index. This instance-level check remains for
+    /// existing implementations; returning `false` keeps the index on the
+    /// safe fallback path during maintenance. The default is `true` because an
+    /// index that does not override this method may still be remappable.
+    #[deprecated(
+        note = "report remap support from persisted metadata through the scalar index plugin instead"
+    )]
+    fn can_remap(&self) -> bool {
+        true
+    }
 
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     ///

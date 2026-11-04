@@ -12,8 +12,8 @@ use jni::objects::{JObject, JString, JValueGen};
 use jni::sys::jlong;
 use lance::dataset::scanner::ExprFilter;
 use lance::dataset::{
-    MergeInsertBuilder, MergeInsertWriteMode, MergeStats, WhenMatched, WhenNotMatched,
-    WhenNotMatchedBySource,
+    MergeInsertBuilder, MergeInsertWriteMode, MergeStats, SourceDedupeBehavior, WhenMatched,
+    WhenNotMatched, WhenNotMatchedBySource,
 };
 use lance_core::datatypes::Schema;
 use lance_file::version::LanceFileVersion;
@@ -61,6 +61,7 @@ fn inner_merge_insert<'local>(
     let compacted_sstables = extract_compacted_sstables(env, &jparam)?;
     let mem_wal_dir_id = env.get_optional_string_from_method(&jparam, "getMemWalDirId")?;
     let data_storage_version = extract_data_storage_version(env, &jparam)?;
+    let source_dedupe_behavior = extract_source_dedupe_behavior(env, &jparam)?;
 
     let (new_ds, merge_stats) = unsafe {
         let dataset = env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET)?;
@@ -83,7 +84,8 @@ fn inner_merge_insert<'local>(
             .retry_timeout(Duration::from_millis(retry_timeout_ms as u64))
             .skip_auto_cleanup(skip_auto_cleanup)
             .use_index(use_index)
-            .write_mode(write_mode);
+            .write_mode(write_mode)
+            .source_dedupe_behavior(source_dedupe_behavior);
         if let Some(dir_id) = mem_wal_dir_id {
             builder.mark_sstables_as_compacted(dir_id, compacted_sstables);
         }
@@ -287,6 +289,29 @@ fn extract_write_mode<'local>(
         "RewriteColumns" => Ok(MergeInsertWriteMode::RewriteColumns),
         _ => Err(Error::input_error(format!(
             "Illegal write_mode: {write_mode}",
+        ))),
+    }
+}
+
+fn extract_source_dedupe_behavior<'local>(
+    env: &mut JNIEnv<'local>,
+    jparam: &JObject,
+) -> Result<SourceDedupeBehavior> {
+    let behavior: JString = env
+        .call_method(
+            jparam,
+            "sourceDedupeBehaviorValue",
+            "()Ljava/lang/String;",
+            &[],
+        )?
+        .l()?
+        .into();
+    let behavior = behavior.extract(env)?;
+    match behavior.as_str() {
+        "Fail" => Ok(SourceDedupeBehavior::Fail),
+        "FirstSeen" => Ok(SourceDedupeBehavior::FirstSeen),
+        _ => Err(Error::input_error(format!(
+            "Illegal source_dedupe_behavior: {behavior}",
         ))),
     }
 }
