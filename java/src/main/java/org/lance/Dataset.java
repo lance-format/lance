@@ -2524,7 +2524,7 @@ public class Dataset implements Closeable {
      */
     public void update(String tag, long versionNumber) {
       Preconditions.checkArgument(versionNumber > 0, "version_number must be greater than 0");
-      nativeUpdateTag(tag, Ref.ofMain(versionNumber));
+      update(tag, Ref.ofMain(versionNumber));
     }
 
     /**
