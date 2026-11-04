@@ -37,15 +37,22 @@ use datafusion_ffi::proto::logical_extension_codec::FFI_LogicalExtensionCodec;
 use datafusion_ffi::table_provider::FFI_TableProvider;
 #[cfg(feature = "datagen")]
 use datagen::register_datagen;
+use dataset::base_path::DatasetBasePath;
 use dataset::blob::LanceBlobFile;
 use dataset::cleanup::{
     CleanupCandidateFile, CleanupExplanation, CleanupReferencedBranch, CleanupStats,
+    ExpireVersionsPlan, ExpireVersionsStats,
 };
 use dataset::io_stats::IoStats;
+use dataset::merge_insert::MergeInsertBuilder;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
-use dataset::{DatasetBasePath, MergeInsertBuilder, PyFullTextQuery, PySearchFilter};
+use dataset::optimize_indices::{
+    PyIndexSegmentResult, PyOptimizeIndexMerge, PyOptimizeIndexTask, PyOptimizeIndices,
+    PyOptimizeIndicesPlan,
+};
+use dataset::write::write_dataset;
 use env_logger::{Builder, Env};
 use file::{
     LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
@@ -56,9 +63,8 @@ use pyo3::exceptions::PyIOError;
 use pyo3::ffi::c_str;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyAnyMethods, PyCapsule};
-use scanner::ScanStatistics;
+use scanner::{PyFullTextQuery, PySearchFilter, ScanStatistics};
 use session::Session;
-use std::ffi::CString;
 use std::ptr::NonNull;
 
 pub(crate) mod arrow;
@@ -96,15 +102,16 @@ pub use crate::tracing::{TraceGuard, trace_to_chrome};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
 pub use dataset::Dataset;
-pub use dataset::serialize_row_addrs;
-pub use dataset::write_dataset;
 use fragment::{
-    FileFragment, FragmentAddColumnsCleanup, PyDeletionFile, PyRowDatasetVersionMeta, PyRowIdMeta,
+    FileFragment, FragmentAddColumnsCleanup, OverlayWriter, PyDeletionFile,
+    PyRowDatasetVersionMeta, PyRowIdMeta,
 };
 pub use indices::register_indices;
 pub use reader::LanceReader;
 use rowids::{PyRowIdSequence, PyRowIdSequenceIterator};
 pub use scanner::Scanner;
+pub use scanner::serialize_row_addrs;
+use transaction::PyInsertedRowsFilter;
 
 use crate::blob::{
     PyBlobDescriptor, PyBlobDescriptorArrayBuilder, PyDedicatedBlobWriter, PyManagedBlobWriter,
@@ -269,6 +276,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Dataset>()?;
     m.add_class::<DatasetBasePath>()?;
     m.add_class::<FileFragment>()?;
+    m.add_class::<OverlayWriter>()?;
     m.add_class::<FragmentAddColumnsCleanup>()?;
     m.add_class::<PyDeletionFile>()?;
     m.add_class::<PyRowIdMeta>()?;
@@ -293,6 +301,8 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LanceBufferDescriptor>()?;
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;
+    m.add_class::<ExpireVersionsStats>()?;
+    m.add_class::<ExpireVersionsPlan>()?;
     m.add_class::<CleanupCandidateFile>()?;
     m.add_class::<CleanupReferencedBranch>()?;
     m.add_class::<CleanupExplanation>()?;
@@ -304,6 +314,11 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCompactionPlan>()?;
     m.add_class::<PyRewriteResult>()?;
     m.add_class::<PyCompactionMetrics>()?;
+    m.add_class::<PyOptimizeIndices>()?;
+    m.add_class::<PyOptimizeIndicesPlan>()?;
+    m.add_class::<PyOptimizeIndexTask>()?;
+    m.add_class::<PyOptimizeIndexMerge>()?;
+    m.add_class::<PyIndexSegmentResult>()?;
     m.add_class::<ScanStatistics>()?;
     m.add_class::<Session>()?;
     m.add_class::<object_store::PyObjectStoreProvider>()?;
@@ -314,6 +329,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<schema::LanceSchema>()?;
     m.add_class::<bitmap::PyBitmap>()?;
     m.add_class::<bitmap::PyBitmapIter>()?;
+    m.add_class::<PyInsertedRowsFilter>()?;
     m.add_class::<PyFullTextQuery>()?;
     m.add_class::<PySearchFilter>()?;
     m.add_class::<namespace::PyDirectoryNamespace>()?;
@@ -493,7 +509,6 @@ impl FFILanceTableProvider {
         py: Python<'py>,
         session: Bound<PyAny>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
-        let name = CString::new("datafusion_table_provider").unwrap();
         let a_lance_table_provider = Arc::new(LanceTableProvider::new(
             self.dataset.clone(),
             self.with_row_id,
@@ -507,7 +522,7 @@ impl FFILanceTableProvider {
             rt().get_runtime_handle(),
             codec,
         );
-        PyCapsule::new(py, ffi_provider, Some(name.clone()))
+        PyCapsule::new_with_value(py, ffi_provider, c"datafusion_table_provider")
     }
 }
 

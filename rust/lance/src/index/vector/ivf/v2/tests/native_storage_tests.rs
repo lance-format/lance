@@ -85,6 +85,7 @@ pub(super) async fn native_fixture(uri: &str) -> (Dataset, RecordBatch) {
             "vector",
             array::rand_vec::<Float32Type>(Dimension::from(32)),
         )
+        .col("i", array::step::<arrow_array::types::Int32Type>())
         .into_batch_rows(RowCount::from(256))
         .unwrap();
     let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());

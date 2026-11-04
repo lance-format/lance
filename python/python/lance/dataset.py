@@ -4,18 +4,13 @@
 from __future__ import annotations
 
 import copy
-import dataclasses
 import json
-import operator
 import os
 import random
 import re
 import time
-import uuid
 import warnings
-from abc import ABC
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -29,16 +24,44 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
-    TypedDict,
     Union,
-    cast,
 )
 
 import pyarrow as pa
 import pyarrow.dataset
-from pyarrow import RecordBatch, Schema
+from pyarrow import Schema
 
 from lance.log import LOGGER
+
+from ._dataset.cleanup import CleanupPolicy, KeepOne, _cleanup_policy_to_json
+from ._dataset.delta import DatasetDelta, _DatasetDeltaBuilder
+from ._dataset.merge_insert import MergeInsertBuilder
+from ._dataset.optimize import AutoCleanupConfig, DatasetOptimizer
+from ._dataset.refs import (
+    Branches,
+    Tags,
+    Version,
+    VersionRef,
+    _convert_version_timestamp,
+)
+from ._dataset.scanner import (
+    _BLOB_PANDAS_MODE_LAZY,
+    ColumnOrdering,
+    LanceScanner,
+    ScannerBuilder,
+    VectorSearchQuery,
+    _serialize_expression,
+)
+from ._dataset.sql import SqlQueryBuilder
+from ._dataset.stats import LanceStats
+from ._dataset.transaction import (
+    AlterColumn,
+    BulkCommitResult,
+    DeleteResult,
+    LanceOperation,
+    Transaction,
+    UpdateResult,
+)
 
 # Imported at runtime, not only for the annotations below: importing it here
 # is what registers `Bitmap` as a `collections.abc.MutableSet`.
@@ -54,31 +77,25 @@ from .dependencies import (
 )
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
-from .fragment import DataFile, FragmentMetadata, LanceFragment
+from .fragment import LanceFragment
 from .indices import IndexConfig, IndexSegment, SupportedDistributedIndices
 from .lance import (
     CleanupExplanation,
     CleanupStats,
-    Compaction,
-    CompactionMetrics,
     DatasetBasePath,
+    ExpireVersionsPlan,
+    ExpireVersionsStats,
     IOStats,
     LanceSchema,
-    PySearchFilter,
     ScanStatistics,
     _Dataset,
-    _format_field_path,
-    _MergeInsertBuilder,
-    _parse_field_path,
-    _Scanner,
-    _serialize_row_addrs,
     _write_dataset,
     indices,
 )
 from .lance import __version__ as __version__
 from .lance import _Session as Session
 from .query import DocumentGranularity, FullTextQuery, MinHashQuery
-from .types import _coerce_reader, _is_materialized
+from .types import _coerce_reader, _coerce_source, _WriteSource
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
 from .udf import batch_udf as batch_udf
@@ -89,273 +106,22 @@ from .util import (
 )
 
 if TYPE_CHECKING:
+    import uuid
+
     from pyarrow._compute import Expression
 
     from lance.namespace import LanceNamespace
 
     from . import mem_wal
+    from ._dataset.index import Index, IndexInformation
     from .commit import CommitLock
     from .lance.indices import IndexDescription
     from .progress import FragmentWriteProgress, IndexProgress
     from .types import ReaderLike
 
-    QueryVectorLike = Union[
-        pd.Series,
-        pa.Array,
-        pa.Scalar,
-        np.ndarray,
-        Iterable[Union[float, Iterable[float]]],
-    ]
 LANCE_COMMIT_MESSAGE_KEY = "__lance_commit_message"
 # Mirrors Rust's `lance::dataset::DEFAULT_COMMIT_TIMEOUT`; keep the two in sync.
 _DEFAULT_COMMIT_TIMEOUT = timedelta(minutes=30)
-_BLOB_PANDAS_MODE_LAZY = "lazy"
-_BLOB_PANDAS_MODE_BYTES = "bytes"
-_BLOB_PANDAS_MODE_DESCRIPTIONS = "descriptions"
-_BLOB_PANDAS_MODES = frozenset(
-    {
-        _BLOB_PANDAS_MODE_LAZY,
-        _BLOB_PANDAS_MODE_BYTES,
-        _BLOB_PANDAS_MODE_DESCRIPTIONS,
-    }
-)
-_BLOB_ROW_ADDR_COLUMN = "_rowaddr"
-
-
-def _field_metadata_value(field: pa.Field, key: str) -> Optional[bytes]:
-    metadata = field.metadata
-    if metadata is None:
-        return None
-    return metadata.get(key.encode("utf-8"))
-
-
-def _is_blob_field(field: pa.Field) -> bool:
-    return (
-        _field_metadata_value(field, "lance-encoding:blob") == b"true"
-        or _field_metadata_value(field, "ARROW:extension:name") == b"lance.blob.v2"
-    )
-
-
-def _field_blob_paths(field: pa.Field, parent: str = "") -> Iterator[str]:
-    segment = _format_field_path([field.name])
-    field_path = f"{parent}.{segment}" if parent else segment
-    if _is_blob_field(field):
-        yield field_path
-    elif pa.types.is_struct(field.type):
-        for i in range(field.type.num_fields):
-            yield from _field_blob_paths(field.type.field(i), field_path)
-
-
-def _blob_paths_in_schema(schema: pa.Schema) -> list[str]:
-    return [path for field in schema for path in _field_blob_paths(field)]
-
-
-def _normalize_blob_pandas_mode(
-    blob_mode: str,
-) -> Literal["lazy", "bytes", "descriptions"]:
-    if blob_mode not in _BLOB_PANDAS_MODES:
-        raise ValueError("blob_mode must be one of: 'lazy', 'bytes', 'descriptions'")
-    return cast("Literal['lazy', 'bytes', 'descriptions']", blob_mode)
-
-
-def _sources_from_transforms(
-    output_paths: list[str],
-    transforms: dict[str, str],
-) -> dict[str, str]:
-    result = {}
-    for path in output_paths:
-        segments = _parse_field_path(path)
-        source_path = transforms[segments[0]]
-        result[path] = (
-            source_path
-            if not segments[1:]
-            else _format_field_path(_parse_field_path(source_path) + segments[1:])
-        )
-    return result
-
-
-def _sources_from_direct_projection(
-    output_paths: list[str],
-    dataset_schema: pa.Schema,
-) -> dict[str, str]:
-    source_paths = set(_blob_paths_in_schema(dataset_schema))
-    result = {}
-    for path in output_paths:
-        segments = _parse_field_path(path)
-        result[path] = (
-            segments[0] if len(segments) == 1 and segments[0] in source_paths else path
-        )
-    return result
-
-
-def _blob_column_sources(
-    schema: pa.Schema,
-    snapshot: Dict[str, Any],
-    dataset_schema: pa.Schema,
-) -> dict[str, str]:
-    output_paths = _blob_paths_in_schema(schema)
-    transforms = dict(snapshot.get("_columns_with_transform") or ())
-    if transforms:
-        return _sources_from_transforms(output_paths, transforms)
-    return _sources_from_direct_projection(output_paths, dataset_schema)
-
-
-def _snapshot_scanner_builder(builder: "ScannerBuilder") -> Dict[str, Any]:
-    """Capture Python-side scanner config needed to rebuild the scan later.
-
-    The native scanner object does not preserve the original builder arguments.
-    We need these values to recreate the same scan when `to_pandas` switches blob
-    handling modes or injects `_rowaddr` for lazy blob export.
-    """
-
-    def snapshot_value(value: Any) -> Any:
-        try:
-            return copy.deepcopy(value)
-        except (TypeError, AttributeError):
-            return value
-
-    return {
-        key: snapshot_value(value)
-        for key, value in vars(builder).items()
-        if key != "ds"
-    }
-
-
-def _scanner_from_snapshot(
-    ds: "LanceDataset", snapshot: Dict[str, Any]
-) -> "LanceScanner":
-    builder = ScannerBuilder(ds)
-    for key, value in snapshot.items():
-        if key == "_columns" and value is not None:
-            setattr(builder, key, list(value))
-        elif key == "_columns_with_transform" and value is not None:
-            setattr(builder, key, list(value))
-        elif key == "_fragments" and value is not None:
-            setattr(builder, key, list(value))
-        elif key == "_orderings" and value is not None:
-            setattr(builder, key, list(value))
-        else:
-            setattr(builder, key, value)
-    return builder.to_scanner()
-
-
-def _is_null_blob_description(description: Any) -> bool:
-    if description is None:
-        return True
-    if not isinstance(description, dict):
-        return False
-    if description.keys() == {"position", "size"}:
-        return description["position"] == 1 and description["size"] == 0
-    return False
-
-
-def _descriptors_at_path(table: pa.Table, path: str) -> list[Optional[Dict[str, Any]]]:
-    segments = _parse_field_path(path)
-    values = table.column(segments[0]).to_pylist()
-
-    for segment in segments[1:]:
-        values = [value.get(segment) if value is not None else None for value in values]
-
-    return values
-
-
-def _replace_value_at_path(
-    parent: Optional[Dict[str, Any]],
-    segments: list[str],
-    value: Any,
-) -> Optional[Dict[str, Any]]:
-    if parent is None:
-        return None
-
-    segment = segments[0]
-    updated = dict(parent)
-
-    if len(segments) == 1:
-        updated[segment] = value
-    else:
-        updated[segment] = _replace_value_at_path(
-            parent[segment],
-            segments[1:],
-            value,
-        )
-
-    return updated
-
-
-def _replace_in_struct_column(
-    dataframe: "pd.DataFrame",
-    path: str,
-    values: list[Optional[BlobFile]],
-) -> None:
-    segments = _parse_field_path(path)
-    parent_name = segments[0]
-    nested_segments = segments[1:]
-
-    parents = dataframe[parent_name].tolist()
-
-    dataframe[parent_name] = [
-        _replace_value_at_path(parent, nested_segments, value)
-        for parent, value in zip(parents, values)
-    ]
-
-
-def _fetch_blob_files_for_paths(
-    dataset: "LanceDataset",
-    table: pa.Table,
-    blob_paths: list[str],
-    blob_sources: dict[str, str],
-    row_addrs: list[int],
-) -> dict[str, list[Optional[BlobFile]]]:
-    blob_files: dict[str, list[Optional[BlobFile]]] = {}
-    for path in blob_paths:
-        descriptors = _descriptors_at_path(table, path)
-
-        null_mask = [
-            _is_null_blob_description(descriptor) for descriptor in descriptors
-        ]
-
-        non_null_addresses = [
-            row_addrs[index] for index, is_null in enumerate(null_mask) if not is_null
-        ]
-
-        fetched_blobs = (
-            iter(dataset.take_blobs(blob_sources[path], addresses=non_null_addresses))
-            if non_null_addresses
-            else iter([])
-        )
-
-        blobs_for_path = []
-        for is_null in null_mask:
-            if is_null:
-                blobs_for_path.append(None)
-            else:
-                blobs_for_path.append(next(fetched_blobs))
-
-        blob_files[path] = blobs_for_path
-
-    return blob_files
-
-
-def _place_blob_files(
-    dataframe: "pd.DataFrame",
-    blob_files: dict[str, list[Optional[BlobFile]]],
-    schema: pa.Schema,
-) -> None:
-    top_level: dict[str, list[Optional[BlobFile]]] = {}
-    nested: dict[str, list[Optional[BlobFile]]] = {}
-    for path, values in blob_files.items():
-        segments = _parse_field_path(path)
-        if len(segments) == 1:
-            top_level[segments[0]] = values
-        else:
-            nested[path] = values
-
-    for index, field in enumerate(schema):
-        if field.name in top_level:
-            dataframe.insert(index, field.name, top_level[field.name])
-
-    for path, values in nested.items():
-        _replace_in_struct_column(dataframe, path, values)
 
 
 def _resolve_blob_selection(
@@ -373,487 +139,6 @@ def _resolve_blob_selection(
     if indices is not None:
         return "indices", indices
     raise ValueError("Either ids, addresses, or indices must be specified")
-
-
-class MergeInsertBuilder(_MergeInsertBuilder):
-    def execute(self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None):
-        """Executes the merge insert operation
-
-        This function updates the original dataset and returns a dictionary with
-        information about merge statistics - i.e. the number of inserted, updated,
-        and deleted rows.
-
-        Parameters
-        ----------
-
-        data_obj: ReaderLike
-            The new data to use as the source table for the operation.  This parameter
-            can be any source of data (e.g. table / dataset) that
-            :func:`~lance.write_dataset` accepts.
-        schema: Optional[pa.Schema]
-            The schema of the data.  This only needs to be supplied whenever the data
-            source is some kind of generator.
-        """
-        reader = _coerce_reader(data_obj, schema)
-
-        # Materialized sources are wrapped in an in-memory table so retries never
-        # spill and the source's statistics can drive the join; everything else is
-        # treated as a one-shot stream.
-        if _is_materialized(data_obj):
-            return super(MergeInsertBuilder, self).execute_batches(reader)
-
-        return super(MergeInsertBuilder, self).execute(reader)
-
-    def execute_uncommitted(
-        self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None
-    ) -> Tuple[Transaction, Dict[str, Any]]:
-        """Executes the merge insert operation without committing
-
-        This function updates the original dataset and returns a dictionary with
-        information about merge statistics - i.e. the number of inserted, updated,
-        and deleted rows.
-
-        Parameters
-        ----------
-
-        data_obj: ReaderLike
-            The new data to use as the source table for the operation.  This parameter
-            can be any source of data (e.g. table / dataset) that
-            :func:`~lance.write_dataset` accepts.
-        schema: Optional[pa.Schema]
-            The schema of the data.  This only needs to be supplied whenever the data
-            source is some kind of generator.
-        """
-        reader = _coerce_reader(data_obj, schema)
-
-        if _is_materialized(data_obj):
-            return super(MergeInsertBuilder, self).execute_uncommitted_batches(reader)
-
-        return super(MergeInsertBuilder, self).execute_uncommitted(reader)
-
-    # These next three overrides exist only to document the methods
-
-    def when_matched_update_all(
-        self, condition: Optional[str] = None
-    ) -> "MergeInsertBuilder":
-        """
-        Configure the operation to update matched rows
-
-        After this method is called, when the merge insert operation executes,
-        any rows that match both the source table and the target table will be
-        updated.  The rows from the target table will be removed and the rows
-        from the source table will be added.
-
-        An optional condition may be specified.  This should be an SQL filter
-        and, if present, then only matched rows that also satisfy this filter will
-        be updated.  The SQL filter should use the prefix `target.` to refer to
-        columns in the target table and the prefix `source.` to refer to columns
-        in the source table.  For example, `source.last_update < target.last_update`.
-
-        If a condition is specified and rows do not satisfy the condition then these
-        rows will not be updated.  Failure to satisfy the filter does not cause
-        a "matched" row to become a "not matched" row.
-        """
-        return super(MergeInsertBuilder, self).when_matched_update_all(condition)
-
-    def when_matched_delete(self) -> "MergeInsertBuilder":
-        """
-        Configure the operation to delete matched rows in the target table.
-
-        After this method is called, when the merge insert operation executes,
-        any rows that match both the source table and the target table will be
-        deleted.
-        """
-        return super(MergeInsertBuilder, self).when_matched_delete()
-
-    def when_matched_fail(self) -> "MergeInsertBuilder":
-        """
-        Configure the operation to fail if any rows match
-
-        After this method is called, when the merge insert operation executes,
-        if there are any rows that match between the source table and the target table,
-        the entire operation will fail with an exception.
-        This is useful for ensuring that no existing rows are overwritten or modified.
-        """
-        return super(MergeInsertBuilder, self).when_matched_fail()
-
-    def when_not_matched_insert_all(self) -> "MergeInsertBuilder":
-        """
-        Configure the operation to insert not matched rows
-
-        After this method is called, when the merge insert operation executes,
-        any rows that exist only in the source table will be inserted into
-        the target table.
-        """
-        return super(MergeInsertBuilder, self).when_not_matched_insert_all()
-
-    def when_not_matched_by_source_delete(
-        self, expr: Optional[str] = None
-    ) -> "MergeInsertBuilder":
-        """
-        Configure the operation to delete source rows that do not match
-
-        After this method is called, when the merge insert operation executes,
-        any rows that exist only in the target table will be deleted.  An
-        optional filter can be specified to limit the scope of the delete
-        operation.  If given (as an SQL filter) then only rows which match
-        the filter will be deleted.
-        """
-        return super(MergeInsertBuilder, self).when_not_matched_by_source_delete(expr)
-
-    def conflict_retries(self, max_retries: int) -> "MergeInsertBuilder":
-        """
-        Set number of times to retry the operation if there is contention.
-
-        If this is set > 0, then the operation will keep a copy of the input data
-        either in memory or on disk (depending on the size of the data) and will
-        retry the operation if there is contention.
-
-        Default is 10.
-        """
-        return super(MergeInsertBuilder, self).conflict_retries(max_retries)
-
-    def retry_timeout(self, timeout: timedelta) -> "MergeInsertBuilder":
-        """
-        Set the timeout used to limit retries.
-
-        This is the maximum time to spend on the operation before giving up. At
-        least one attempt will be made, regardless of how long it takes to complete.
-        Subsequent attempts will be cancelled once this timeout is reached. If
-        the timeout has been reached during the first attempt, the operation
-        will be cancelled immediately before making a second attempt.
-
-        The default is 30 seconds.
-        """
-        return super(MergeInsertBuilder, self).retry_timeout(timeout)
-
-    def data_storage_version(self, version: str) -> "MergeInsertBuilder":
-        """Set the exact data storage version for files written by this operation.
-
-        If omitted, use the dataset's default write version without changing it.
-        Accepts "2.0", "2.1", "2.2", "2.3", "stable", or "next" for V2
-        datasets. Release selectors are resolved by the engine; V1/V2
-        cross-family targets are rejected.
-
-        Examples
-        --------
-        ``dataset.merge_insert("id").data_storage_version("2.2")`` selects V2.2
-        for the files written when the builder executes.
-        """
-        return super(MergeInsertBuilder, self).data_storage_version(version)
-
-    def use_index(self, use_index: bool) -> "MergeInsertBuilder":
-        """
-        Controls whether to use indices for the merge operation.
-
-        When set to False, forces a full table scan even if an index exists on
-        the join key. This can be useful for benchmarking or when the optimizer
-        chooses a suboptimal path.
-
-        Parameters
-        ----------
-        use_index : bool
-            If True (default), uses an index if available. If False, forces a
-            full table scan.
-
-        Returns
-        -------
-        MergeInsertBuilder
-            The builder instance for method chaining.
-        """
-        return super(MergeInsertBuilder, self).use_index(use_index)
-
-    def write_mode(
-        self, mode: Literal["auto", "rewrite_rows", "rewrite_columns"]
-    ) -> "MergeInsertBuilder":
-        """
-        Selects how the merged rows are written to disk.
-
-        For a partial-schema update (the source omits some dataset columns) the
-        two modes have different cost shapes. ``rewrite_columns`` never reads or
-        writes the columns the source omits, but its replacement column file
-        covers every row of each fragment it touches, so the bytes written barely
-        fall as fewer rows match. ``rewrite_rows`` instead scales with the number
-        of matched rows. Patching columns wins once the fraction of rows matched
-        exceeds roughly the fraction of each row's bytes the source columns
-        occupy: for a KB-scale update of a MB-per-row table that is nearly
-        always, and for a table whose columns are all narrow it may never be.
-
-        The per-fragment matched row count that decides this is only known once
-        the join has run, so the caller picks rather than the planner guessing.
-
-        Parameters
-        ----------
-        mode : {'auto', 'rewrite_rows', 'rewrite_columns'}
-            ``auto`` (default) lets the engine choose. It rewrites whole rows,
-            except on the one path that predates this parameter: a
-            partial-schema update whose join key carries a scalar index patches
-            columns. ``rewrite_rows`` deletes the matched rows and writes whole
-            rows into new fragments; for a partial-schema update it gives up
-            that index probe, since the indexed path only ever patches columns.
-            ``rewrite_columns`` attaches new data files holding the source
-            columns to the fragments that already hold the matched rows; it
-            raises if the merge cannot be expressed that way, which requires
-            updating matched rows only (no inserts, no matched deletes, no
-            delete-by-source) with a source that omits at least one dataset
-            column, carries at least one column besides the join key, and
-            carries no blob column.
-
-        Returns
-        -------
-        MergeInsertBuilder
-            The builder instance for method chaining.
-        """
-        return super(MergeInsertBuilder, self).write_mode(mode)
-
-    def target_bases(self, bases: List[str]) -> "MergeInsertBuilder":
-        """
-        Write new fragments produced by this merge insert to these bases.
-
-        Each entry references a base path registered in the dataset manifest,
-        by name or by path URI, like the ``target_bases`` parameter of
-        :func:`~lance.write_dataset`. An entry equal to the dataset's URI
-        includes the dataset's primary storage in the rotation, e.g.
-        ``[ds.uri, "base1", "base2"]`` spreads new data files across primary
-        storage and both bases. New data files are distributed across the
-        target bases round-robin. Data files that patch existing fragments
-        and deletion files are always written to the dataset's primary
-        storage.
-
-        Parameters
-        ----------
-        bases : List[str]
-            Base names or path URIs to write new data files to.
-
-        Returns
-        -------
-        MergeInsertBuilder
-            The builder instance for method chaining.
-        """
-        return super(MergeInsertBuilder, self).target_bases(bases)
-
-    def target_all_bases(self, include_primary: bool = True) -> "MergeInsertBuilder":
-        """
-        Write new fragments to every base registered in the dataset manifest.
-
-        The bases are resolved when the merge insert executes, so bases added
-        later are picked up automatically. When ``include_primary`` is True
-        (the default), the dataset's primary storage participates in the
-        round-robin rotation as the first slot. Cannot be combined with
-        :meth:`target_bases`.
-
-        Parameters
-        ----------
-        include_primary : bool, default True
-            Whether the dataset's primary storage is part of the rotation.
-
-        Returns
-        -------
-        MergeInsertBuilder
-            The builder instance for method chaining.
-        """
-        return super(MergeInsertBuilder, self).target_all_bases(include_primary)
-
-    def explain_plan(
-        self, schema: Optional[pa.Schema] = None, verbose: bool = False
-    ) -> str:
-        """
-        Generate the execution plan for the merge insert operation.
-
-        This reports the plan a *streaming* source of the given schema would run.
-        It takes a schema rather than data, so it cannot know how ``execute`` would
-        wrap the source; see the note under the example.
-
-        Parameters
-        ----------
-        schema : Optional[pa.Schema], default None
-            The schema of the source data that would be merged into the dataset.
-            If None, defaults to the dataset's schema. This determines the columns
-            available and their types, which affects the generated execution plan.
-        verbose : bool, default False
-            If True, provides more detailed information in the plan output.
-
-        Returns
-        -------
-        str
-            A formatted string representation of the execution plan.
-
-        Examples
-        --------
-        >>> import lance
-        >>> import pyarrow as pa
-        >>> data = pa.table([
-        ...     pa.array([1, 2, 3]),
-        ...     pa.array(['alice', 'bob', 'charlie']),
-        ...     pa.array([100.0, 200.0, 300.0])
-        ... ], names=['id', 'name', 'score'])
-        >>> dataset = lance.write_dataset(data, "memory://test_dataset")
-
-        >>> # Using default dataset schema
-        >>> builder = dataset.merge_insert("id")
-        >>> builder = builder.when_matched_update_all().when_not_matched_insert_all()
-        >>> plan = builder.explain_plan()  # Uses dataset schema
-        >>> print(plan) # doctest: +ELLIPSIS
-        MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, ...
-          CoalescePartitionsExec
-            ProjectionExec: expr=[...]
-              HashJoinExec: mode=CollectLeft, join_type=Right, ...
-                LanceRead: uri=test_dataset/data, projection=[id], ...
-                RepartitionExec: ...
-                  ProjectionExec: expr=[..., true as __merge_source_sentinel]
-                    StreamingTableExec: partition_sizes=1, ...
-        <BLANKLINE>
-
-        This is always the streaming shape. `explain_plan` receives a schema rather
-        than data, so it cannot know how `execute` would wrap the source, and the
-        wrapping affects the plan. Use `analyze_plan`, which receives the real
-        source, when that matters. Note that `analyze_plan` runs the merge to
-        collect metrics and may write data files, whereas `explain_plan` writes
-        nothing.
-
-        >>> # Or with explicit schema
-        >>> source_schema = pa.schema([
-        ...     pa.field("id", pa.int64()),
-        ...     pa.field("name", pa.string()),
-        ...     pa.field("score", pa.float64())
-        ... ])
-        >>> plan = builder.explain_plan(source_schema, verbose=True)
-        >>> print(plan) # doctest: +ELLIPSIS
-        MergeInsert: on=[id], when_matched=UpdateAll, when_not_matched=InsertAll, ...
-          CoalescePartitionsExec
-            ProjectionExec: expr=[...]
-              HashJoinExec: mode=CollectLeft, join_type=Right, ...
-                ...
-        """
-        return super(MergeInsertBuilder, self).explain_plan(schema, verbose=verbose)
-
-    def analyze_plan(
-        self,
-        data_obj: ReaderLike,
-        *,
-        schema: Optional[pa.Schema] = None,
-    ) -> str:
-        """
-        Generate the execution plan and analyze its performance with real data.
-
-        This method creates the execution plan using the provided source data,
-        executes it to collect performance metrics, and returns the analysis
-        as a formatted string. This is useful for understanding the actual
-        performance characteristics of the merge insert operation with your data.
-
-        .. warning::
-            This method executes the merge insert operation to collect metrics
-            but **does not commit the changes**. While data files may be written
-            to storage during execution, they will not be referenced by any dataset
-            version and the dataset remains unchanged. This is intended for
-            performance analysis only.
-
-        Parameters
-        ----------
-        data_obj : ReaderLike
-            The source data that would be merged into the dataset. This parameter
-            can be any source of data (e.g. table / dataset) that
-            :func:`~lance.write_dataset` accepts.
-        schema : Optional[pa.Schema], default None
-            The schema of the data. This only needs to be supplied whenever the data
-            source is some kind of generator.
-
-        Returns
-        -------
-        str
-            A formatted string representation of the plan analysis with metrics.
-
-        Examples
-        --------
-        >>> import lance
-        >>> import pyarrow as pa
-        >>> data = pa.table([
-        ...     pa.array([1, 2, 3]),
-        ...     pa.array(['alice', 'bob', 'charlie']),
-        ...     pa.array([100.0, 200.0, 300.0])
-        ... ], names=['id', 'name', 'score'])
-        >>> dataset = lance.write_dataset(data, "memory://analyze_dataset")
-        >>> new_data = pa.table([
-        ...     pa.array([1, 4]),
-        ...     pa.array(["updated_alice", "david"]),
-        ...     pa.array([150.0, 400.0])
-        ... ], names=["id", "name", "score"])
-        >>> builder = dataset.merge_insert("id")
-        >>> builder = builder.when_matched_update_all().when_not_matched_insert_all()
-        >>> analysis = builder.analyze_plan(new_data)
-        >>> print(analysis) # doctest: +ELLIPSIS
-            MergeInsert: elapsed=..., on=[id], ..., metrics=[..., bytes_written=..., ...]
-              CoalescePartitionsExec, elapsed=..., metrics=[output_rows=..., elapsed_compute=...]
-                ProjectionExec: elapsed=..., expr=[...], metrics=[...]
-                  RepartitionExec: ...
-                    HashJoinExec: elapsed=..., mode=CollectLeft, join_type=Right, ...
-                      LanceRead: elapsed=..., ..., metrics=[..., bytes_read=..., ...]
-                      ProjectionExec: elapsed=..., expr=[..., true as __merge_source_sentinel], metrics=[...]
-                        DataSourceExec: ..., metrics=[]
-
-        The reported plan follows how the source was passed. `new_data` above is a
-        `pa.Table`, so it is wrapped in an in-memory table that reports exact
-        statistics, while a `pa.RecordBatchReader` reports none. DataFusion picks
-        the side it collects from those statistics and from the two sides' sizes.
-        The target here is three rows, so it is the collected side either way; with
-        a larger target the same merge can plan differently depending on which
-        source you hand it. Use `explain_plan` only for the streaming shape: it
-        takes a schema rather than data, so it cannot know how the source would be
-        wrapped.
-
-        The two key parts of the plan analysis are LanceRead and MergeInsert.
-        LanceRead scans join keys and columns in conditions. MergeInsert writes
-        data files to storage.
-
-        Key metrics in MergeInsert operations:
-        - bytes_written: total bytes written to storage
-        - num_files_written: number of new data files created
-        - num_inserted_rows: rows added that didn't match existing data
-        - num_updated_rows: existing rows that were updated
-        - num_deleted_rows: rows removed (when using delete conditions)
-
-        Key metrics in LanceRead operations:
-        - bytes_read: bytes read from storage
-        - fragments_scanned: number of data fragments accessed
-        - rows_scanned: total rows examined during the scan
-        - iops: number of I/O operations performed
-        - requests: number of storage requests made
-        """  # noqa: E501
-        reader = _coerce_reader(data_obj, schema)
-
-        # Route exactly as execute() does, so the reported plan is the one that
-        # would run. A materialized source reports exact statistics where a stream
-        # reports none, which can change which side of the join is collected.
-        if _is_materialized(data_obj):
-            return super(MergeInsertBuilder, self).analyze_plan_batches(reader)
-
-        return super(MergeInsertBuilder, self).analyze_plan(reader)
-
-    def mark_sstables_as_compacted(
-        self, sstables: "List[mem_wal.CompactedSsTable]"
-    ) -> "MergeInsertBuilder":
-        """Mark MemWAL SSTables as compacted into the base table.
-
-        Call this before executing merge_insert when it compacts MemWAL SSTables.
-        The progress is recorded in the same commit as the data.
-
-        For multi-pass compaction, call this only on the final successful
-        data-changing pass. Intermediate passes must not carry compaction
-        progress. Lance cannot tell whether a caller has another pass planned,
-        so it cannot enforce this: if a delete pass carried the marker and the
-        process then died before the matching upsert, the recorded progress
-        would claim rows were copied in that never were.
-
-        Parameters
-        ----------
-        sstables : list of CompactedSsTable
-            SSTables to mark as compacted.
-        """
-        from .mem_wal import _to_raw_compacted_sstables
-
-        raw_sstables = _to_raw_compacted_sstables(sstables)
-        super(MergeInsertBuilder, self).mark_sstables_as_compacted(raw_sstables)
-        return self
 
 
 class LanceDataset(pa.dataset.Dataset):
@@ -1251,6 +536,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["all_binary", "blobs_descriptions", "all_descriptions"]
         ] = None,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[Iterable[str]] = None,
         include_deleted_rows: Optional[bool] = None,
         scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
         strict_batch_size: Optional[bool] = None,
@@ -1374,27 +660,51 @@ class LanceDataset(pa.dataset.Dataset):
             false, throughput may be higher, but batches will be returned out of
             order and memory use might increase.
         fragments: iterable of LanceFragment, default None
-            If specified, only scan these fragments. If scan_in_order is True, then
-            the fragments will be scanned in the order given.
+            Restrict the search scope to these fragments; an empty iterable returns
+            no rows. Vector search enforces this scope before candidate selection,
+            even with ``prefilter=False``. Index segments cannot return rows outside
+            it. Ordinary scans preserve the given order when ``scan_in_order=True``;
+            vector search ranks results by distance.
         index_segments: iterable of str or uuid.UUID, default None
-            If specified, restrict vector index search to these index segment UUIDs.
-            Only supported for vector search. If fragments is also specified, rows
-            from those fragments not covered by the selected index segments will be
-            searched with flat KNN.
-        prefilter: bool, default False
-            If True then the filter will be applied before the vector query is run.
-            This will generate more correct results but it may be a more costly
-            query.  It's generally good when the filter is highly selective.
+            Restrict vector index search to these segment UUIDs. When omitted, Lance
+            selects a suitable logical index and its relevant segments automatically.
+            With explicit ``fragments`` and ``fast_search=False``, fragments not
+            covered by the selected segments are searched with flat KNN, including
+            fragments covered only by an unselected segment. Without ``fragments``,
+            indexed search searches only the selected segments and does not add
+            appended unindexed fragments.
 
-            If False then the filter will be applied after the vector query is run.
-            This will perform well but the results may have fewer than the requested
-            number of rows (or be empty) if the rows closest to the query do not
-            match the filter.  It's generally good when the filter is not very
-            selective.
+            The list must be nonempty. With index use enabled, UUIDs must identify
+            existing segments of one logical index on the query's vector column.
+            Query metric compatibility is checked when selected segments overlap
+            the fragment scope. With no overlap, ordinary search uses flat KNN with
+            the query metric, or the selected index's metric when unset, while fast
+            search returns no rows.
+            Only supported for vector search.
+            With ``nearest["use_index"]=False``, a flat scan uses the fragment scope
+            rather than segment selection.
+        prefilter: bool, default False
+            If True, select vector top-k from rows matching the SQL filter. This can
+            be more expensive and does not guarantee exact results from an
+            approximate index.
+
+            If False, apply the SQL filter after the combined ANN and flat top-k.
+            Rejected rows are not replaced, so fewer than ``k`` rows (or none) may
+            be returned. This also applies to searches without a vector index.
+            The fragment scope, deletions, and external row masks restrict candidates
+            regardless of this setting.
         use_scalar_index: bool, default True
             Lance will automatically use scalar indices to optimize a query.  In some
             corner cases this can make query performance worse and this parameter can
             be used to disable scalar indices in these cases.
+        ignored_scalar_indices: iterable of str, default None
+            Logical scalar index names to ignore during expression-filter planning.
+            Other scalar indices remain eligible, and the original filter is still
+            evaluated. Inverted indices used by ``contains_tokens`` filters are
+            included; vector index segments and explicit full-text search queries
+            are unaffected. If no index query remains, ``fast_search`` falls back
+            to scanning all selected fragments and may return more matching rows.
+            See ``ScannerBuilder.ignored_scalar_indices`` for more information.
         late_materialization: bool or List[str], default None
             Allows custom control over late materialization.  Late materialization
             fetches non-query columns using a take operation after the filter.  This
@@ -1431,7 +741,10 @@ class LanceDataset(pa.dataset.Dataset):
         fast_search:  bool, default False
             If True, then vector search, full text search, and scalar-indexed
             filters will only search indexed fragments, which yields faster
-            search time but may skip recently appended unindexed data.
+            search time but may skip recently appended unindexed data. Vector search
+            skips flat fallback outside the selected segments' coverage and stale
+            overlay rows needing replay. The fragment scope and SQL filter placement
+            still apply. With no usable vector index coverage, the result is empty.
         scan_stats_callback: Callable[[ScanStatistics], None], default None
             A callback function that will be called with the scan statistics after the
             scan is complete.  Errors raised by the callback will be logged but not
@@ -1474,10 +787,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         .. note::
 
-            For now, if BOTH filter and nearest is specified, then:
-
-            1. nearest is executed first.
-            2. The results are filtered afterwards.
+            With both ``filter`` and ``nearest``, SQL filtering runs after vector
+            top-k by default. Set ``prefilter=True`` to filter before top-k instead.
+            Both strategies support explicit fragments and mixed ANN and flat search.
 
 
         For debugging ANN results, you can choose to not use the index
@@ -1492,7 +804,48 @@ class LanceDataset(pa.dataset.Dataset):
                 "k": 10,
                 "q": <query vector>,
                 "use_index": False
-            }
+            })
+
+        Examples
+        --------
+        A segment covers F0/F1 and F2 is appended after indexing. Searching F1/F2
+        combines indexed and unindexed rows; fast search keeps only indexed F1.
+
+        >>> from tempfile import TemporaryDirectory
+        >>> import lance
+        >>> import numpy as np
+        >>> import pyarrow as pa
+        >>> table = pa.table({
+        ...     "id": range(12),
+        ...     "vector": pa.array(
+        ...         [[float(i), 0, 0, 0] for i in range(12)],
+        ...         type=pa.list_(pa.float32(), 4),
+        ...     ),
+        ... })
+        >>> with TemporaryDirectory() as uri:
+        ...     dataset = lance.write_dataset(
+        ...         table.slice(0, 8), uri, max_rows_per_file=4,
+        ...     )
+        ...     dataset = dataset.create_index(
+        ...         "vector", "IVF_FLAT", num_partitions=1,
+        ...         ivf_centroids=np.zeros((1, 4), dtype=np.float32),
+        ...     )
+        ...     dataset = lance.write_dataset(table.slice(8), uri, mode="append")
+        ...     segment_uuid = dataset.describe_indices()[0].segments[0].uuid
+        ...     options = dict(
+        ...         columns=["id"], fragments=dataset.get_fragments()[1:],
+        ...         index_segments=[segment_uuid], prefilter=False,
+        ...         nearest={
+        ...             "column": "vector", "q": [0.0] * 4, "k": 6, "metric": "l2",
+        ...         },
+        ...     )
+        ...     mixed = dataset.scanner(**options, fast_search=False).to_table()
+        ...     fast = dataset.scanner(**options, fast_search=True).to_table()
+        ...     mixed_ids, fast_ids = mixed["id"].to_pylist(), fast["id"].to_pylist()
+        >>> mixed_ids
+        [4, 5, 6, 7, 8, 9]
+        >>> fast_ids
+        [4, 5, 6, 7]
 
         """
         builder = ScannerBuilder(self)
@@ -1530,6 +883,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.with_row_address, with_row_address)
         setopt(builder.use_stats, use_stats)
         setopt(builder.use_scalar_index, use_scalar_index)
+        setopt(builder.ignored_scalar_indices, ignored_scalar_indices)
         setopt(builder.fast_search, fast_search)
         setopt(builder.include_deleted_rows, include_deleted_rows)
         setopt(builder.scan_stats_callback, scan_stats_callback)
@@ -1632,6 +986,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[Iterable[str]] = None,
         include_deleted_rows: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
@@ -1686,7 +1041,9 @@ class LanceDataset(pa.dataset.Dataset):
             throughput may be higher, but batches will be returned out of order
             and memory use might increase.
         prefilter: bool, optional, default False
-            Run filter before the vector search.
+            If True, select vector top-k from rows matching the SQL filter. If False,
+            filter the top-k result without replacing rejected rows. See
+            :meth:`scanner` for details; approximate indices remain approximate.
         late_materialization: bool or List[str], default None
             Allows custom control over late materialization.  See
             ``ScannerBuilder.late_materialization`` for more information.
@@ -1696,6 +1053,9 @@ class LanceDataset(pa.dataset.Dataset):
         use_scalar_index: bool, default True
             Allows custom control over scalar index usage.  See
             ``ScannerBuilder.use_scalar_index`` for more information.
+        ignored_scalar_indices: iterable of str, default None
+            Scalar index names to ignore during expression-filter planning. See
+            ``ScannerBuilder.ignored_scalar_indices`` for more information.
         with_row_id: bool, optional, default False
             Return row ID.
         with_row_address: bool, optional, default False
@@ -1740,10 +1100,10 @@ class LanceDataset(pa.dataset.Dataset):
 
         Notes
         -----
-        If BOTH filter and nearest is specified, then:
-
-        1. nearest is executed first.
-        2. The results are filtered afterward, unless pre-filter sets to True.
+        With both ``filter`` and ``nearest``, SQL filtering runs after vector top-k
+        by default. Set ``prefilter=True`` to filter before top-k instead. Postfilter
+        may return fewer than ``k`` rows. For fragment and segment selection, use
+        :meth:`scanner` followed by :meth:`LanceScanner.to_table`.
         """
         return self.scanner(
             columns=columns,
@@ -1759,6 +1119,7 @@ class LanceDataset(pa.dataset.Dataset):
             late_materialization=late_materialization,
             blob_handling=blob_handling,
             use_scalar_index=use_scalar_index,
+            ignored_scalar_indices=ignored_scalar_indices,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -1793,6 +1154,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         blob_mode: str = _BLOB_PANDAS_MODE_LAZY,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[Iterable[str]] = None,
         include_deleted_rows: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
@@ -1826,6 +1188,7 @@ class LanceDataset(pa.dataset.Dataset):
             fragment_readahead=fragment_readahead,
             late_materialization=late_materialization,
             use_scalar_index=use_scalar_index,
+            ignored_scalar_indices=ignored_scalar_indices,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -2229,6 +1592,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
+        ignored_scalar_indices: Optional[Iterable[str]] = None,
         strict_batch_size: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
@@ -2259,6 +1623,7 @@ class LanceDataset(pa.dataset.Dataset):
             late_materialization=late_materialization,
             blob_handling=blob_handling,
             use_scalar_index=use_scalar_index,
+            ignored_scalar_indices=ignored_scalar_indices,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -2751,6 +2116,9 @@ class LanceDataset(pa.dataset.Dataset):
         is the right side. Rows existing in the dataset but not on the left will
         be filled with null values, unless Lance doesn't support null values for
         some types, in which case an error will be raised.
+        The right-side join column must contain unique keys; null counts as a
+        key, so at most one null value is allowed. Duplicate right-side keys
+        raise an error.
 
         Parameters
         ----------
@@ -3199,6 +2567,11 @@ class LanceDataset(pa.dataset.Dataset):
     def versions(self) -> List[Version]:
         """
         Return all versions in this dataset.
+
+        Each entry is a :class:`Version` with ``version``, ``timestamp``,
+        ``metadata``, and ``manifest_size``. ``manifest_size`` is the size in
+        bytes of that version's manifest file, or ``None`` if the commit
+        handler could not report it.
         """
         versions = self._ds.versions()
         for v in versions:
@@ -3431,6 +2804,8 @@ class LanceDataset(pa.dataset.Dataset):
         delete_rate_limit: Optional[int] = None,
         versions: Optional[List[int]] = None,
         delete_concurrency: Optional[int] = None,
+        keep_one: Optional[KeepOne] = None,
+        policy: Optional[CleanupPolicy] = None,
     ) -> CleanupStats:
         """
         Cleans up old versions of the dataset.
@@ -3447,8 +2822,10 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
 
         older_than: timedelta, optional
-            Only versions older than this will be removed.  If ``older_than`` and
-            ``retain_versions`` are not specified, this will default to two weeks.
+            Remove all versions older than this wall-clock age, including sampled
+            commits from ``keep_one``. Without ``keep_one``, ``retain_versions``
+            or ``versions``, defaults to two weeks. With ``keep_one`` alone,
+            sampled history has no expiration limit.
 
         retain_versions: int, optional
             Retain the last N versions of the dataset. Must be positive.
@@ -3486,18 +2863,156 @@ class LanceDataset(pa.dataset.Dataset):
             Clean up only the specified dataset versions. The current version is
             never removed, and tagged versions are still protected by
             ``error_if_tagged_old_versions``.
+
+        keep_one: KeepOne, optional
+            Keep the newest eligible commit per UTC epoch-aligned interval, breaking
+            timestamp ties by version. Its ``older_than`` age controls when thinning
+            begins and is independent of this method's expiration ``older_than``.
+            The hinted version and all later versions are protected from thinning
+            even with backwards clocks. Tags, current versions and branch
+            dependencies remain protected. For daily history between two and seven
+            days, use ``older_than=timedelta(days=7),
+            keep_one=KeepOne(timedelta(days=1), timedelta(days=2))``.
+            The two-day delay bounds exposure to delayed hint writes; it does not
+            make hint updates monotonic.
+
+        policy: CleanupPolicy, optional
+            Retention rules ordered by strictly increasing ``older_than`` ages.
+            Each version uses the oldest matching KeepOne rule. RemoveAll is
+            optional and must be last; without it, sampled history never expires.
+            KeepOne ages are hint-relative and at least two days; RemoveAll uses
+            wall-clock age. All comparisons are strictly older-than, so a version
+            exactly at a threshold remains in the younger band. Version filters,
+            tags and branch protections still apply. Cannot be combined with
+            ``older_than`` or ``keep_one``. For example::
+
+                dataset.cleanup_old_versions(policy=CleanupPolicy(rules=[
+                    KeepOne(timedelta(hours=1), timedelta(days=2)),
+                    KeepOne(timedelta(days=1), timedelta(days=7)),
+                    RemoveAll(timedelta(days=30)),
+                ]))
         """
-        if older_than is None and retain_versions is None and versions is None:
-            older_than = timedelta(days=14)
+        if policy is not None and (older_than is not None or keep_one is not None):
+            raise ValueError("policy cannot be combined with older_than or keep_one")
+        if (
+            older_than is None
+            and retain_versions is None
+            and versions is None
+            and keep_one is None
+            and policy is None
+        ):
+            policy = CleanupPolicy()
 
         return self._ds.cleanup_old_versions(
-            td_to_micros(older_than) if older_than else None,
+            td_to_micros(older_than) if older_than is not None else None,
             retain_versions,
             delete_unverified,
             error_if_tagged_old_versions,
             delete_rate_limit,
             versions,
             delete_concurrency,
+            (
+                td_to_micros(keep_one.per_interval),
+                td_to_micros(keep_one.older_than),
+            )
+            if keep_one is not None
+            else None,
+            _cleanup_policy_to_json(policy) if policy is not None else None,
+        )
+
+    def expire_versions(
+        self,
+        before: Optional[timedelta] = None,
+        before_version: Optional[int] = None,
+        *,
+        keep_one_per: Optional[timedelta] = None,
+        error_if_tagged_old_versions: bool = True,
+        delete_rate_limit: Optional[int] = None,
+    ) -> "ExpireVersionsStats":
+        """Remove version history without deleting any data files.
+
+        Unlike :meth:`cleanup_old_versions`, this never computes the set of live data
+        files, so it does not read the manifests it is expiring. On a table with a very
+        large number of versions that difference is hours against minutes.
+
+        The data files that only an expired version referenced are **not** removed. They
+        become unreferenced, and the next :meth:`cleanup_old_versions` reclaims them --
+        and is much cheaper for having fewer manifests left to read. The intended order
+        is expire, then clean up.
+
+        The newest version, tags on the current branch, and versions a branch is rooted
+        at are never removed.
+
+        Parameters
+        ----------
+        before: timedelta, optional
+            Expire versions written more than this long ago. Age comes from the manifest
+            object's write time, not the commit timestamp recorded inside it; use
+            ``before_version`` when an exact boundary matters.
+        before_version: int, optional
+            Expire versions numbered below this. Exact, and needs no timestamps.
+        keep_one_per: timedelta, optional
+            Instead of expiring every version past the cutoff, keep the newest one in
+            each bucket of this width. ``timedelta(hours=1)`` keeps one per hour.
+            Applies only beyond the cutoff, so ``before=timedelta(days=7)`` with
+            ``keep_one_per=timedelta(hours=1)`` reads as "full history for a week,
+            hourly before that". Must be at least one hour.
+
+            .. warning::
+                Thinning carries a rollback risk on an actively committing table.
+                Resolving the latest version starts at the version hint and probes
+                upward, stopping at the first version that is missing. Expiry refuses to
+                remove anything at or above the hint, but that floor is read once and
+                hint writes are unconditional, so a commit that started earlier can
+                publish a *lower* hint afterwards. A gap above that lowered hint hides
+                every version above it, and the table reads as an older state while the
+                newer manifests are still there. The one-hour minimum bounds the
+                exposure rather than removing it. Use thinning to repair a table that
+                has accumulated far more versions than it can carry, not as a default.
+        error_if_tagged_old_versions: bool, default True
+            Raise instead of silently keeping a tagged version the policy would expire.
+        delete_rate_limit: int, optional
+            Maximum delete requests per second. One request is one manifest.
+
+        Returns
+        -------
+        ExpireVersionsStats
+            Counts of what was removed and retained. ``failed_deletes`` is non-zero
+            when the run completed but could not remove everything it selected; those
+            versions remain expirable and a later run retries them.
+
+        Notes
+        -----
+        With no ``before`` and no ``before_version`` this expires nothing, rather than
+        everything.
+        """
+        return self._ds.expire_versions(
+            td_to_micros(before) if before is not None else None,
+            before_version,
+            td_to_micros(keep_one_per) if keep_one_per is not None else None,
+            error_if_tagged_old_versions,
+            delete_rate_limit,
+        )
+
+    def explain_expire_versions(
+        self,
+        before: Optional[timedelta] = None,
+        before_version: Optional[int] = None,
+        *,
+        keep_one_per: Optional[timedelta] = None,
+        error_if_tagged_old_versions: bool = True,
+        delete_rate_limit: Optional[int] = None,
+    ) -> "ExpireVersionsPlan":
+        """Report what :meth:`expire_versions` would remove, without removing it.
+
+        Takes the same arguments as :meth:`expire_versions`.
+        """
+        return self._ds.explain_expire_versions(
+            td_to_micros(before) if before is not None else None,
+            before_version,
+            td_to_micros(keep_one_per) if keep_one_per is not None else None,
+            error_if_tagged_old_versions,
+            delete_rate_limit,
         )
 
     def explain_cleanup_old_versions(
@@ -3511,6 +3026,8 @@ class LanceDataset(pa.dataset.Dataset):
         versions: Optional[List[int]] = None,
         include_files: bool = False,
         max_files: int = 1000,
+        keep_one: Optional[KeepOne] = None,
+        policy: Optional[CleanupPolicy] = None,
     ) -> CleanupExplanation:
         """
         Explain what :meth:`cleanup_old_versions` would remove without deleting files.
@@ -3519,8 +3036,9 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
 
         older_than: timedelta, optional
-            Only versions older than this would be removed. If ``older_than`` and
-            ``retain_versions`` are not specified, this will default to two weeks.
+            Remove all versions older than this wall-clock age, including sampled
+            commits. Defaults to two weeks only when no version filters or
+            ``keep_one`` are specified, as in :meth:`cleanup_old_versions`.
 
         retain_versions: int, optional
             Retain the last N versions of the dataset. Must be positive.
@@ -3545,14 +3063,30 @@ class LanceDataset(pa.dataset.Dataset):
         max_files: int, default 1000
             Maximum number of candidate files to include when ``include_files``
             is `True`.
+
+        keep_one: KeepOne, optional
+            Thinning interval and minimum age, as in :meth:`cleanup_old_versions`.
+            Its age is independent of the expiration ``older_than`` argument.
+
+        policy: CleanupPolicy, optional
+            Ordered retention rules, as in :meth:`cleanup_old_versions`.
+            Cannot be combined with ``older_than`` or ``keep_one``.
         """
-        if older_than is None and retain_versions is None and versions is None:
-            older_than = timedelta(days=14)
+        if policy is not None and (older_than is not None or keep_one is not None):
+            raise ValueError("policy cannot be combined with older_than or keep_one")
+        if (
+            older_than is None
+            and retain_versions is None
+            and versions is None
+            and keep_one is None
+            and policy is None
+        ):
+            policy = CleanupPolicy()
         if max_files <= 0:
             raise ValueError("max_files must be positive")
 
         return self._ds.explain_cleanup_old_versions(
-            td_to_micros(older_than) if older_than else None,
+            td_to_micros(older_than) if older_than is not None else None,
             retain_versions,
             delete_unverified,
             error_if_tagged_old_versions,
@@ -3560,6 +3094,13 @@ class LanceDataset(pa.dataset.Dataset):
             versions,
             include_files,
             max_files,
+            (
+                td_to_micros(keep_one.per_interval),
+                td_to_micros(keep_one.older_than),
+            )
+            if keep_one is not None
+            else None,
+            _cleanup_policy_to_json(policy) if policy is not None else None,
         )
 
     def _prepare_scalar_index_request(
@@ -3931,8 +3472,11 @@ class LanceDataset(pa.dataset.Dataset):
             This is for the ``INVERTED`` index. The language for stemming
             and stop words. This is only used when `stem` or `remove_stop_words` is true
         max_token_length: Optional[int], default 40
-            This is for the ``INVERTED`` index. The maximum token length.
-            Any token longer than this will be removed.
+            This is for the ``INVERTED`` index. The exclusive token length limit
+            in UTF-8 bytes, not characters. Tokens of this length or longer are
+            removed. For example, the default removes both 40 ASCII characters
+            and 20 repetitions of ``é`` (40 UTF-8 bytes). Set to ``None`` to
+            disable the limit.
         lower_case: bool, default True
             This is for the ``INVERTED`` index. If True, the index will convert all
             text to lowercase.
@@ -5097,10 +4641,11 @@ class LanceDataset(pa.dataset.Dataset):
             A message to associate with this commit. This message will be stored in the
             dataset's metadata and can be retrieved using read_transaction().
         enable_stable_row_ids: bool, optional
-            If True, enables stable row IDs when creating a new dataset.  Stable
-            row IDs assign each row a monotonically increasing id that persists
-            across compaction and other maintenance operations.  This option is
-            ignored for existing datasets.
+            If True, enables stable row IDs when creating a new dataset.  Each new
+            row is assigned the next id in increasing order and keeps that id for
+            its lifetime: compaction, update and merge insert relocate or rewrite
+            the row without changing its id.  This option is ignored for existing
+            datasets.
         namespace_client : LanceNamespace, optional
             A namespace client. Must be provided together with table_id.
             Use lance.namespace.connect() to create a namespace.
@@ -5555,6 +5100,10 @@ class LanceDataset(pa.dataset.Dataset):
         current version against a specific older version) or both ``begin_version``
         and ``end_version`` for an explicit range.
 
+        Reading row changes requires stable row IDs at both nonzero endpoints.
+        Enable them when creating the dataset with ``enable_stable_row_ids=True``.
+        Transaction listing is available without stable row IDs.
+
         Parameters
         ----------
         compared_against : int, optional
@@ -5589,24 +5138,21 @@ class LanceDataset(pa.dataset.Dataset):
             # Write initial data (v1)
             ds = lance.write_dataset(
                 pa.table({"id": [1, 2], "val": ["a", "b"]}),
-                "memory://delta_demo"
+                "memory://delta_demo",
+                enable_stable_row_ids=True,
             )
 
             # Append some data to create v2
-            ds_append = lance.write_dataset(
-                pa.table({"id": [3], "val": ["c"]}),
-                "memory://delta_demo",
-                mode="append"
-            )
+            ds.insert(pa.table({"id": [3], "val": ["c"]}))
 
             # Compute inserted rows from v1 -> v2 (shorthand)
-            delta = ds_append.delta(compared_against=1)
+            delta = ds.delta(compared_against=1)
             reader = delta.get_inserted_rows()
             for batch in reader:
                 print(batch)
 
             # Or using explicit version range
-            delta = ds_append.delta(begin_version=1, end_version=2)
+            delta = ds.delta(begin_version=1, end_version=2)
         """
         builder = _DatasetDeltaBuilder(self._ds.delta())
 
@@ -5822,8 +5368,10 @@ class LanceDataset(pa.dataset.Dataset):
         -------
         dict or None
             A dict with ``num_shards``, ``maintained_indexes``,
-            ``writer_config_defaults``, and ``sharding_specs``, or ``None`` when
-            MemWAL has not been initialized on this dataset.
+            ``writer_config_defaults``, ``sharding_specs``, and ``dir_id``, or
+            ``None`` when MemWAL has not been initialized on this dataset.
+            ``dir_id`` names the MemWAL that commits recording compaction
+            progress must carry.
         """
         return self._ds.mem_wal_index_details()
 
@@ -5993,2292 +5541,7 @@ class LanceDataset(pa.dataset.Dataset):
         return self._ds.all_files()
 
 
-class SqlQuery:
-    """
-    An executable SQL query.
-
-    This is created by calling :meth:`SqlQueryBuilder.build`.
-    """
-
-    def __init__(self, query):
-        self._query = query
-
-    def to_batch_records(self) -> list[pa.RecordBatch]:
-        """
-        Execute the query and return a list of RecordBatches.
-
-        This is an eager operation that will load all results into memory.
-
-        Returns
-        -------
-        list[pyarrow.RecordBatch]
-        """
-        return self._query.to_batch_records()
-
-    def to_stream_reader(self) -> pa.RecordBatchReader:
-        """
-        Execute the query and return a RecordBatchReader.
-
-        This is a lazy operation that will stream results.
-
-        Returns
-        -------
-        pyarrow.RecordBatchReader
-        """
-        return self._query.to_stream_reader()
-
-
-class SqlQueryBuilder:
-    """
-    A builder for SQL queries on a Lance dataset.
-
-    This builder allows for chaining of options to configure the SQL query.
-    It is returned by :meth:`LanceDataset.sql`.
-    """
-
-    def __init__(self, builder):
-        self._builder = builder
-
-    def table_name(self, table_name: str) -> "SqlQueryBuilder":
-        """
-        Set the table name for the query.
-
-        Parameters
-        ----------
-        table_name: str
-            The name of the table to query.
-        """
-        self._builder = self._builder.table_name(table_name)
-        return self
-
-    def with_row_id(self, with_row_id: bool = True) -> "SqlQueryBuilder":
-        """
-        Include the row ID in the query result.
-
-        Parameters
-        ----------
-        with_row_id: bool, default True
-            Whether to include the row ID column (`_rowid`).
-        """
-        self._builder = self._builder.with_row_id(with_row_id)
-        return self
-
-    def with_row_addr(self, with_row_addr: bool = True) -> "SqlQueryBuilder":
-        """
-        Include the row address in the query result.
-
-        Parameters
-        ----------
-        with_row_addr: bool, default True
-            Whether to include the row address column (`_rowaddr`).
-        """
-        self._builder = self._builder.with_row_addr(with_row_addr)
-        return self
-
-    def blob_handling(
-        self,
-        blob_handling: Literal["all_binary", "blobs_descriptions", "all_descriptions"],
-    ) -> "SqlQueryBuilder":
-        """
-        Control how blob columns are returned by this SQL query.
-
-        - ``"all_binary"`` materializes blob columns as binary values.
-        - ``"blobs_descriptions"`` returns blob descriptors (the default).
-        - ``"all_descriptions"`` returns descriptions for all binary-like
-          columns.
-        """
-        self._builder = self._builder.blob_handling(blob_handling)
-        return self
-
-    def batch_size(self, batch_size: int) -> "SqlQueryBuilder":
-        """
-        Set the maximum number of rows produced by each query batch.
-
-        If :meth:`batch_size_bytes` is also set, both limits apply and the one
-        reached first determines the scan batch size.
-        """
-        self._builder = self._builder.batch_size(batch_size)
-        return self
-
-    def batch_size_bytes(self, batch_size_bytes: int) -> "SqlQueryBuilder":
-        """
-        Set the approximate maximum bytes produced by each scan batch.
-
-        If :meth:`batch_size` is also set, both limits apply and the one
-        reached first determines the scan batch size.
-        """
-        self._builder = self._builder.batch_size_bytes(batch_size_bytes)
-        return self
-
-    def build(self) -> SqlQuery:
-        """
-        Build the query.
-
-        Returns
-        -------
-        SqlQuery
-            An executable query object.
-        """
-        return SqlQuery(self._builder.build())
-
-
-class DatasetDelta:
-    """
-    A view of differences between two versions.
-
-    Created by :meth:`LanceDataset.delta`.
-    Provides convenient methods to stream inserted/updated rows or list transactions.
-    """
-
-    def __init__(self, delta):
-        self._delta = delta
-
-    def list_transactions(self) -> List[Transaction]:
-        """
-        List transactions in the range from begin_version + 1 to end_version.
-        """
-        return self._delta.list_transactions()
-
-    def get_inserted_rows(self) -> pa.RecordBatchReader:
-        """
-        Return a streaming RecordBatchReader for inserted rows.
-        """
-        return self._delta.get_inserted_rows()
-
-    def get_updated_rows(self) -> pa.RecordBatchReader:
-        """
-        Return a streaming RecordBatchReader for updated rows.
-        """
-        return self._delta.get_updated_rows()
-
-    def get_deleted_row_ids(self) -> pa.RecordBatchReader:
-        """
-        Return a streaming RecordBatchReader of the row ids deleted in the range.
-
-        The batches carry a single ``_rowid`` column. Requires stable row ids.
-        """
-        return self._delta.get_deleted_row_ids()
-
-
-class _DatasetDeltaBuilder:
-    """Internal builder for :class:`DatasetDelta`.
-
-    This class is not part of the public API. Use :meth:`LanceDataset.delta` instead.
-    """
-
-    def __init__(self, builder):
-        self._builder = builder
-
-    def compared_against_version(self, version: int) -> "_DatasetDeltaBuilder":
-        self._builder = self._builder.compared_against_version(version)
-        return self
-
-    def with_begin_version(self, version: int) -> "_DatasetDeltaBuilder":
-        self._builder = self._builder.with_begin_version(version)
-        return self
-
-    def with_end_version(self, version: int) -> "_DatasetDeltaBuilder":
-        self._builder = self._builder.with_end_version(version)
-        return self
-
-    def build(self) -> DatasetDelta:
-        return DatasetDelta(self._builder.build())
-
-
-class BulkCommitResult(TypedDict):
-    dataset: LanceDataset
-    merged: Transaction
-
-
-@dataclass
-class Transaction:
-    """A dataset change based on one read version.
-
-    Attributes
-    ----------
-    tag: str, optional
-        Optional label stored with the transaction and returned by
-        :meth:`LanceDataset.read_transaction`.
-    """
-
-    read_version: int
-    operation: LanceOperation.BaseOperation
-    uuid: str = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
-    transaction_properties: Optional[Dict[str, str]] = dataclasses.field(
-        default_factory=dict
-    )
-    tag: Optional[str] = None
-
-
-class Tag(TypedDict):
-    branch: Optional[str]
-    version: int
-    created_at: Optional[datetime]
-    updated_at: Optional[datetime]
-    manifest_size: int
-    metadata: Dict[str, str]
-
-
-class Branch(TypedDict):
-    parent_branch: Optional[str]
-    branch_identifier: List[Tuple[int, str]]
-    parent_version: int
-    create_at: int
-    manifest_size: int
-    metadata: Dict[str, str]
-
-
-class Version(TypedDict):
-    version: int
-    timestamp: int | datetime
-    metadata: Dict[str, str]
-
-
-def _convert_version_timestamp(version: Version) -> Version:
-    # TODO: python datetime supports only microsecond precision. When a
-    # separate Version object is implemented, expose the precise timestamp
-    # (ns) to python.
-    ts_nanos = version["timestamp"]
-    version["timestamp"] = datetime.fromtimestamp(ts_nanos // 1e9) + timedelta(
-        microseconds=(ts_nanos % 1e9) // 1e3
-    )
-    return version
-
-
-class VersionRef(TypedDict):
-    version: int
-
-
-class UpdateResult(TypedDict):
-    num_rows_updated: int
-
-
-class DeleteResult(TypedDict):
-    num_deleted_rows: int
-
-
-class AlterColumn(TypedDict):
-    path: str
-    name: Optional[str]
-    nullable: Optional[bool]
-    data_type: Optional[pa.DataType]
-
-
-class ExecuteResult(TypedDict):
-    num_inserted_rows: int
-    num_updated_rows: int
-    num_deleted_rows: int
-
-
-@dataclass
-class IndexFile:
-    """Metadata about a file in an index segment."""
-
-    path: str
-    size_bytes: int
-
-
-@dataclass
-class Index:
-    """Represents an index in the dataset."""
-
-    uuid: str
-    name: str
-    fields: List[int]
-    dataset_version: int
-    fragment_ids: Bitmap
-    """The fragments covered by this index. A ``Set[int]``/``List[int]`` is
-    also accepted when constructing an ``Index``."""
-    index_version: int
-    created_at: Optional[datetime] = None
-    base_id: Optional[int] = None
-    files: Optional[List["IndexFile"]] = None
-    index_details: Optional[Tuple[str, bytes]] = None
-    covering_fields: List[int] = dataclasses.field(default_factory=list)
-
-
-class IndexInformation(TypedDict):
-    """Information about a single index segment, as returned by
-    :meth:`LanceDataset.list_indices`."""
-
-    name: str
-    type: str
-    uuid: str
-    fields: List[str]
-    version: int
-    fragment_ids: Bitmap
-    base_id: Optional[int]
-
-
-class AutoCleanupConfig(TypedDict):
-    interval: int
-    older_than_seconds: int
-
-
 # LanceOperation is a namespace for operations that can be applied to a dataset.
-class LanceOperation:
-    @staticmethod
-    def _validate_fragments(fragments):
-        if not isinstance(fragments, list):
-            raise TypeError(
-                f"fragments must be list[FragmentMetadata], got {type(fragments)}"
-            )
-        if len(fragments) > 0 and not all(
-            isinstance(f, FragmentMetadata) for f in fragments
-        ):
-            raise TypeError(
-                f"fragments must be list[FragmentMetadata], got {type(fragments[0])}"
-            )
-
-    class BaseOperation(ABC):
-        """
-        Base class for operations that can be applied to a dataset.
-
-        See available operations under :class:`LanceOperation`.
-        """
-
-    @dataclass
-    class Overwrite(BaseOperation):
-        """
-        Overwrite or create a new dataset.
-
-        Attributes
-        ----------
-        new_schema: pyarrow.Schema
-            The schema of the new dataset.
-        fragments: list[FragmentMetadata]
-            The newly written fragments that make up the new dataset. They are
-            assigned fresh ids when the operation is committed, continuing from
-            the highest id the dataset has ever used, so any id they carry is
-            ignored. Since we reassign fragment ids, a fragment with a deletion
-            file is rejected: use :class:`LanceOperation.Delete` to commit
-            deletions, or :class:`LanceOperation.Merge` to change the schema of
-            existing fragments.
-        initial_bases: list[DatasetBasePath], optional
-            Base paths to register when creating a new dataset (CREATE mode only).
-            **Only valid in CREATE mode**. Will raise an error if used with
-            OVERWRITE on existing dataset.
-
-        Warning
-        -------
-        This is an advanced API for distributed operations. To overwrite or
-        create new dataset on a single machine, use :func:`lance.write_dataset`.
-
-        Examples
-        --------
-
-        To create or overwrite a dataset, first use
-        :meth:`lance.fragment.LanceFragment.create` to create fragments. Then
-        collect the fragment metadata into a list and pass it along with the
-        schema to this class. Finally, pass the operation to the
-        :meth:`LanceDataset.commit` method to create the new dataset.
-
-        >>> import lance
-        >>> import pyarrow as pa
-        >>> tab1 = pa.table({"a": [1, 2], "b": ["a", "b"]})
-        >>> tab2 = pa.table({"a": [3, 4], "b": ["c", "d"]})
-        >>> fragment1 = lance.fragment.LanceFragment.create("example", tab1)
-        >>> fragment2 = lance.fragment.LanceFragment.create("example", tab2)
-        >>> fragments = [fragment1, fragment2]
-        >>> operation = lance.LanceOperation.Overwrite(tab1.schema, fragments)
-        >>> dataset = lance.LanceDataset.commit("example", operation)
-        >>> dataset.to_table().to_pandas()
-           a  b
-        0  1  a
-        1  2  b
-        2  3  c
-        3  4  d
-        """
-
-        new_schema: LanceSchema | pa.Schema
-        fragments: Iterable[FragmentMetadata]
-        initial_bases: Optional[List[DatasetBasePath]] = None
-
-        def __post_init__(self):
-            LanceOperation._validate_fragments(self.fragments)
-
-    @dataclass
-    class Append(BaseOperation):
-        """
-        Append new rows to the dataset.
-
-        Attributes
-        ----------
-        fragments: list[FragmentMetadata]
-            The fragments that contain the new rows.
-
-        Warning
-        -------
-        This is an advanced API for distributed operations. To append to a
-        dataset on a single machine, use :func:`lance.write_dataset`.
-
-        Examples
-        --------
-
-        To append new rows to a dataset, first use
-        :meth:`lance.fragment.LanceFragment.create` to create fragments. Then
-        collect the fragment metadata into a list and pass it to this class.
-        Finally, pass the operation to the :meth:`LanceDataset.commit`
-        method to create the new dataset.
-
-        >>> import lance
-        >>> import pyarrow as pa
-        >>> tab1 = pa.table({"a": [1, 2], "b": ["a", "b"]})
-        >>> dataset = lance.write_dataset(tab1, "example")
-        >>> tab2 = pa.table({"a": [3, 4], "b": ["c", "d"]})
-        >>> fragment = lance.fragment.LanceFragment.create("example", tab2)
-        >>> operation = lance.LanceOperation.Append([fragment])
-        >>> dataset = lance.LanceDataset.commit("example", operation,
-        ...                                     read_version=dataset.version)
-        >>> dataset.to_table().to_pandas()
-           a  b
-        0  1  a
-        1  2  b
-        2  3  c
-        3  4  d
-        """
-
-        fragments: Iterable[FragmentMetadata]
-
-        def __post_init__(self):
-            LanceOperation._validate_fragments(self.fragments)
-
-    @dataclass
-    class Delete(BaseOperation):
-        """
-        Remove fragments or rows from the dataset.
-
-        Attributes
-        ----------
-        updated_fragments: list[FragmentMetadata]
-            The fragments that have been updated with new deletion vectors.
-        deleted_fragment_ids: list[int]
-            The ids of the fragments that have been deleted entirely. These are
-            the fragments where :meth:`LanceFragment.delete()` returned None.
-        predicate: str
-            The original SQL predicate used to select the rows to delete.
-
-        Warning
-        -------
-        This is an advanced API for distributed operations. To delete rows from
-        dataset on a single machine, use :meth:`lance.LanceDataset.delete`.
-
-        Examples
-        --------
-
-        To delete rows from a dataset, call :meth:`lance.fragment.LanceFragment.delete`
-        on each of the fragments. If that returns a new fragment, add that to
-        the ``updated_fragments`` list. If it returns None, that means the whole
-        fragment was deleted, so add the fragment id to the ``deleted_fragment_ids``.
-        Finally, pass the operation to the :meth:`LanceDataset.commit` method to
-        complete the deletion operation.
-
-        >>> import lance
-        >>> import pyarrow as pa
-        >>> table = pa.table({"a": [1, 2], "b": ["a", "b"]})
-        >>> dataset = lance.write_dataset(table, "example")
-        >>> table = pa.table({"a": [3, 4], "b": ["c", "d"]})
-        >>> dataset = lance.write_dataset(table, "example", mode="append")
-        >>> dataset.to_table().to_pandas()
-           a  b
-        0  1  a
-        1  2  b
-        2  3  c
-        3  4  d
-        >>> predicate = "a >= 2"
-        >>> updated_fragments = []
-        >>> deleted_fragment_ids = []
-        >>> for fragment in dataset.get_fragments():
-        ...     new_fragment = fragment.delete(predicate)
-        ...     if new_fragment is not None:
-        ...         updated_fragments.append(new_fragment)
-        ...     else:
-        ...         deleted_fragment_ids.append(fragment.fragment_id)
-        >>> operation = lance.LanceOperation.Delete(updated_fragments,
-        ...                                         deleted_fragment_ids,
-        ...                                         predicate)
-        >>> dataset = lance.LanceDataset.commit("example", operation,
-        ...                                     read_version=dataset.version)
-        >>> dataset.to_table().to_pandas()
-           a  b
-        0  1  a
-        """
-
-        updated_fragments: Iterable[FragmentMetadata]
-        deleted_fragment_ids: Iterable[int]
-        predicate: str
-
-        def __post_init__(self):
-            LanceOperation._validate_fragments(self.updated_fragments)
-
-    @dataclass
-    class Update(BaseOperation):
-        """
-        Operation that updates rows in the dataset.
-
-        Attributes
-        ----------
-        removed_fragment_ids: list[int]
-            The ids of the fragments that have been removed entirely.
-        updated_fragments: list[FragmentMetadata]
-            The fragments that have been updated with new deletion vectors.
-            These are used as given, so pass back the metadata read from the
-            dataset rather than a freshly constructed object, or the fragment
-            loses its row id and version metadata.
-        new_fragments: list[FragmentMetadata]
-            The fragments that contain the new rows. On a dataset that uses
-            stable row ids, set ``row_id_meta`` on these to carry the ids of
-            rewritten rows over; see :class:`lance.fragment.RowIdSequence`. The
-            created-at and last-updated-at version metadata are derived during
-            the commit and should be left as None.
-        fields_modified: list[int]
-            If any fields are modified in updated_fragments, then they must be
-            listed here so those fragments can be removed from indices covering
-            those fields.
-        fields_for_preserving_frag_bitmap: list[int]
-            The fields that used to judge whether to preserve the new frag's id into
-            the frag bitmap of the specified indices.
-        updated_fragment_offsets: dict[int, bytes], optional
-            Physical row offsets that matched the update, keyed by fragment id,
-            each serialized in the portable RoaringBitmap format. Set on
-            ``rewrite_columns`` updates over stable row ids so the commit
-            refreshes row-level version metadata for the matched rows only.
-        compacted_sstables: list[lance.mem_wal.CompactedSsTable]
-            MemWAL SSTables to record as compacted. An empty list changes
-            nothing. A non-empty list requires a MemWAL index on the table.
-        """
-
-        removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
-        updated_fragments: List[FragmentMetadata] = dataclasses.field(
-            default_factory=list
-        )
-        new_fragments: List[FragmentMetadata] = dataclasses.field(default_factory=list)
-        fields_modified: List[int] = dataclasses.field(default_factory=list)
-        fields_for_preserving_frag_bitmap: List[int] = dataclasses.field(
-            default_factory=list
-        )
-        update_mode: str = ""
-        updated_fragment_offsets: Optional[Dict[int, bytes]] = None
-        compacted_sstables: List["mem_wal.CompactedSsTable"] = dataclasses.field(
-            default_factory=list
-        )
-
-        def __post_init__(self):
-            LanceOperation._validate_fragments(self.updated_fragments)
-            LanceOperation._validate_fragments(self.new_fragments)
-
-    @dataclass
-    class Merge(BaseOperation):
-        """
-        Operation that adds columns. Unlike Overwrite, this should not change
-        the structure of the fragments, allowing existing indices to be kept.
-
-        Attributes
-        ----------
-        fragments: iterable of FragmentMetadata
-            The fragments that make up the new dataset.
-        schema: LanceSchema or pyarrow.Schema
-            The schema of the new dataset. Passing a LanceSchema is preferred,
-            and passing a pyarrow.Schema is deprecated.
-        preserves_nullability: bool
-            True when this merge makes no nullability-affecting schema change:
-            it introduces no field that data staged against an earlier schema
-            could not safely omit. Without the assertion (the default) the
-            merge conservatively conflicts with concurrent appends, whose
-            fragments would omit new columns and read as null; that can only
-            cause a retry. Pass True when every column this merge introduces
-            is nullable to let concurrent appends commit without conflict.
-
-        Warning
-        -------
-        This is an advanced API for distributed operations. To overwrite or
-        create new dataset on a single machine, use :func:`lance.write_dataset`.
-
-        Examples
-        --------
-
-        To add new columns to a dataset, first define a method that will create
-        the new columns based on the existing columns. Then use
-        :meth:`lance.fragment.LanceFragment.add_columns`
-
-        >>> import lance
-        >>> import pyarrow as pa
-        >>> import pyarrow.compute as pc
-        >>> table = pa.table({"a": [1, 2, 3, 4], "b": ["a", "b", "c", "d"]})
-        >>> dataset = lance.write_dataset(table, "example")
-        >>> dataset.to_table().to_pandas()
-           a  b
-        0  1  a
-        1  2  b
-        2  3  c
-        3  4  d
-        >>> def double_a(batch: pa.RecordBatch) -> pa.RecordBatch:
-        ...     doubled = pc.multiply(batch["a"], 2)
-        ...     return pa.record_batch([doubled], ["a_doubled"])
-        >>> fragments = []
-        >>> for fragment in dataset.get_fragments():
-        ...     new_fragment, new_schema = fragment.merge_columns(double_a,
-        ...                                                       columns=['a'])
-        ...     fragments.append(new_fragment)
-        >>> operation = lance.LanceOperation.Merge(fragments, new_schema)
-        >>> dataset = lance.LanceDataset.commit("example", operation,
-        ...                                     read_version=dataset.version)
-        >>> dataset.to_table().to_pandas()
-           a  b  a_doubled
-        0  1  a          2
-        1  2  b          4
-        2  3  c          6
-        3  4  d          8
-        """
-
-        fragments: Iterable[FragmentMetadata]
-        schema: LanceSchema | pa.Schema
-        preserves_nullability: bool = False
-
-        def __post_init__(self):
-            if isinstance(self.schema, pa.Schema):
-                warnings.warn(
-                    "Passing a pyarrow.Schema to Merge is deprecated. "
-                    "Please use a LanceSchema instead.",
-                    DeprecationWarning,
-                )
-            LanceOperation._validate_fragments(self.fragments)
-
-    @dataclass
-    class Restore(BaseOperation):
-        """
-        Operation that restores a previous version of the dataset.
-        """
-
-        version: int
-
-    @dataclass
-    class Clone(BaseOperation):
-        """Operation that creates a clone or branch from a dataset reference.
-
-        This operation is created internally by clone and branch APIs. It is
-        exposed so transactions returned by :meth:`LanceDataset.get_transactions`
-        can represent clone metadata without losing information.
-
-        Only a shallow clone can be committed directly. A deep clone must copy
-        the source files first, so committing one raises ``OSError``; use
-        :meth:`LanceDataset.deep_clone` instead.
-
-        Attributes
-        ----------
-        is_shallow: bool
-            Whether data files are shared with the source dataset.
-        ref_name: str, optional
-            Source branch name, or ``None`` for the main branch.
-        ref_version: int
-            Source dataset version.
-        ref_path: str
-            Source dataset URI.
-        branch_name: str, optional
-            Destination branch name, when the clone creates a branch.
-        """
-
-        is_shallow: bool
-        ref_name: Optional[str]
-        ref_version: int
-        ref_path: str
-        branch_name: Optional[str]
-
-    @dataclass
-    class RewriteGroup:
-        """
-        Collection of rewritten files
-        """
-
-        old_fragments: Iterable[FragmentMetadata]
-        new_fragments: Iterable[FragmentMetadata]
-
-    @dataclass
-    class RewrittenIndex:
-        """
-        An index that has been rewritten
-        """
-
-        old_id: str
-        new_id: str
-        new_details_type_url: str
-        new_details_value: bytes
-        new_index_version: int
-
-    @dataclass
-    class Rewrite(BaseOperation):
-        """
-        Operation that rewrites one or more files and indices into one
-        or more files and indices.
-
-        Attributes
-        ----------
-        groups: list[RewriteGroup]
-            Groups of files that have been rewritten.
-        rewritten_indices: list[RewrittenIndex]
-            Indices that have been rewritten.
-        frag_reuse_index: Index, optional
-            Fragment reuse index entry to install with this rewrite. ``None``
-            leaves the existing entry unchanged.
-
-        Warning
-        -------
-        This is an advanced API not intended for general use.
-        """
-
-        groups: Iterable[LanceOperation.RewriteGroup]
-        rewritten_indices: Iterable[LanceOperation.RewrittenIndex]
-        frag_reuse_index: Optional[Index] = None
-
-        def __post_init__(self):
-            all_frags = [old for group in self.groups for old in group.old_fragments]
-            all_frags += [new for group in self.groups for new in group.new_fragments]
-            LanceOperation._validate_fragments(all_frags)
-
-    @dataclass
-    class CreateIndex(BaseOperation):
-        """
-        Operation that creates an index on the dataset.
-        """
-
-        new_indices: List[Index]
-        removed_indices: List[Index]
-
-    @dataclass
-    class DataReplacementGroup:
-        """
-        Group of data replacements
-        """
-
-        fragment_id: int
-        new_file: DataFile
-
-    @dataclass
-    class DataReplacement(BaseOperation):
-        """
-        Operation that replaces existing datafiles in the dataset.
-        """
-
-        replacements: List[LanceOperation.DataReplacementGroup]
-
-    @dataclass
-    class DataOverlayFile:
-        """
-        An overlay file supplying new values for a subset of
-        ``(physical offset, field)`` cells of a fragment, resolved on read and
-        layered over the base data without rewriting the base files.
-
-        The overlay is dense or sparse depending on the shape of ``offsets``:
-        pass a single iterable of ints (e.g. a :class:`~lance.bitmap.Bitmap`
-        or a ``List[int]``) for a dense overlay (one offset set shared by
-        every field in ``data_file``), or a list of int iterables for a
-        sparse overlay (one offset set per field, in the order of the file's
-        fields). Offsets are **physical** row offsets (positions in the base
-        files, counting deleted rows), like deletion vectors.
-
-        Attributes
-        ----------
-        data_file : DataFile
-            The Lance data file storing the overlay's new cell values — one
-            value column per covered field. The value at each covered offset is
-            stored at the rank (0-based count of covered offsets below it) of
-            that offset in the field's coverage.
-        offsets : Iterable[int] | List[Iterable[int]]
-            The covered physical row offsets. A single int iterable is dense
-            coverage (shared by every field); a list of int iterables is
-            sparse coverage (in field order). Offsets are always resolved in
-            ascending order — the smallest covered offset maps to row 0 of
-            ``data_file``, the next-smallest to row 1, and so on — regardless
-            of the order values are given in, so a plain ``List[int]`` need
-            not be pre-sorted. A repeated offset raises ``ValueError``: it
-            would shift every later offset onto the wrong row.
-        committed_version : Optional[int]
-            The dataset version at which this overlay became effective. Leave as
-            ``None`` when creating an overlay to commit — the commit stamps it.
-            It is populated when reading an existing fragment's overlays so they
-            round-trip through :class:`FragmentMetadata`.
-        """
-
-        data_file: DataFile
-        offsets: Union[Iterable[int], List[Iterable[int]]]
-        committed_version: Optional[int] = None
-
-    @dataclass
-    class DataOverlayGroup:
-        """
-        Overlay files to append to a single fragment.
-
-        Attributes
-        ----------
-        fragment_id : int
-            The id of the fragment the overlays apply to.
-        overlays : List[LanceOperation.DataOverlayFile]
-            The overlay files to append, ordered oldest-first (a later entry is
-            newer and wins where coverage overlaps).
-        """
-
-        fragment_id: int
-        overlays: List[LanceOperation.DataOverlayFile]
-
-    @dataclass
-    class DataOverlay(BaseOperation):
-        """
-        Operation that appends data overlay files to fragments.
-
-        Overlays are appended to each fragment's existing overlays (overlays
-        written by concurrent commits are preserved) and resolved on read
-        over the base data without rewriting it.
-
-        If multiple groups target the same data then the values in the
-        latest group take precedence.
-        """
-
-        groups: List[LanceOperation.DataOverlayGroup]
-
-    @dataclass
-    class Project(BaseOperation):
-        """
-        Operation that project columns.
-        Use this operator for drop column or rename/swap column.
-
-        Attributes
-        ----------
-        schema: LanceSchema
-            The lance schema of the new dataset.
-        preserves_nullability: bool
-            True when this projection makes no nullability-affecting schema
-            change, as a rename or a drop does not. Without the assertion
-            (the default) the projection conservatively conflicts with
-            concurrent writes, which can only cause a retry.
-
-        Examples
-        --------
-        Use the projece operator to swap column:
-
-        >>> import lance
-        >>> import pyarrow as pa
-        >>> import pyarrow.compute as pc
-        >>> from lance.schema import LanceSchema
-        >>> table = pa.table({"a": [1, 2], "b": ["a", "b"], "b1": ["c", "d"]})
-        >>> dataset = lance.write_dataset(table, "example")
-        >>> dataset.to_table().to_pandas()
-           a  b b1
-        0  1  a  c
-        1  2  b  d
-        >>>
-        >>> ## rename column `b` into `b0` and rename b1 into `b`
-        >>> table = pa.table({"a": [3, 4], "b0": ["a", "b"], "b": ["c", "d"]})
-        >>> lance_schema = LanceSchema.from_pyarrow(table.schema)
-        >>> operation = lance.LanceOperation.Project(lance_schema)
-        >>> dataset = lance.LanceDataset.commit("example", operation, read_version=1)
-        >>> dataset.to_table().to_pandas()
-           a b0  b
-        0  1  a  c
-        1  2  b  d
-        """
-
-        schema: LanceSchema
-        preserves_nullability: bool = False
-
-    @dataclass
-    class UpdateMap:
-        """
-        Represents updates to a metadata map.
-
-        Attributes
-        ----------
-        updates : Dict[str, Optional[str]]
-            Dictionary of key-value pairs to update. None values mean delete the key.
-        replace : bool
-            If True, replace the entire map with the new entries.
-            If False, merge the new entries with the existing map.
-        """
-
-        updates: Dict[str, Optional[str]]
-        replace: bool = False
-
-    @dataclass
-    class UpdateConfig(BaseOperation):
-        """
-        Operation that updates dataset metadata.
-
-        This operation can update various metadata levels:
-        - Dataset configuration
-        - Table metadata
-        - Schema metadata
-        - Field-specific metadata
-
-        Attributes
-        ----------
-        config_updates : Optional[UpdateMap]
-            Updates to the dataset configuration.
-        table_metadata_updates : Optional[UpdateMap]
-            Updates to the table metadata.
-        schema_metadata_updates : Optional[UpdateMap]
-            Updates to the schema metadata.
-        field_metadata_updates : Optional[Dict[int, UpdateMap]]
-            Updates to field metadata, keyed by field ID.
-        """
-
-        config_updates: Optional[LanceOperation.UpdateMap] = None
-        table_metadata_updates: Optional[LanceOperation.UpdateMap] = None
-        schema_metadata_updates: Optional[LanceOperation.UpdateMap] = None
-        field_metadata_updates: Optional[Dict[int, LanceOperation.UpdateMap]] = None
-
-    @dataclass
-    class UpdateMemWalState(BaseOperation):
-        """Record MemWAL SSTables compacted into the base table.
-
-        An empty list commits as a no-op. A non-empty list requires a MemWAL
-        index (``__lance_mem_wal``) and updates that index's compaction record.
-
-        Attributes
-        ----------
-        compacted_sstables: list[lance.mem_wal.CompactedSsTable]
-            SSTables to mark compacted, one entry per shard.
-        """
-
-        compacted_sstables: List["mem_wal.CompactedSsTable"] = dataclasses.field(
-            default_factory=list
-        )
-
-
-@dataclass
-class ColumnOrdering:
-    """
-    This class is used to define the column ordering rules for the `sort` operator.
-    It allows users to specify the sorting order (ascending or descending)
-    and the position of null values (first or last).
-    """
-
-    column_name: str
-    ascending: bool = True
-    nulls_first: bool = False
-
-
-def _needs_substrait_placeholder(t: pa.DataType) -> bool:
-    """Return True if *t* contains a type that PyArrow's substrait serializer
-    cannot handle at any nesting depth.
-
-    Three cases require a placeholder:
-
-    * ``fixed_size_list`` — substrait has no equivalent type.
-    * Arrow extension types (e.g. ``fixed_shape_tensor``) — substrait cannot
-      represent them.
-    * A struct whose fields carry non-``None`` metadata — substrait rejects
-      such structs.  Extension types leave ``metadata={}`` on struct fields
-      after a lance round-trip; ``{}`` is non-``None``.
-    """
-    if pa.types.is_fixed_size_list(t):
-        return True
-    if isinstance(t, pa.lib.BaseExtensionType):
-        return True
-    if pa.types.is_struct(t):
-        for i in range(t.num_fields):
-            f = t.field(i)
-            if f.metadata is not None:
-                return True
-            if _needs_substrait_placeholder(f.type):
-                return True
-    if pa.types.is_list(t) or pa.types.is_large_list(t):
-        return _needs_substrait_placeholder(t.value_type)
-    return False
-
-
-def _serialize_expression(
-    expression: pa.compute.Expression, schema: pa.Schema
-) -> bytes:
-    from pyarrow.substrait import serialize_expressions
-
-    # Keep each field's position so Substrait references still resolve against
-    # the stored schema when PyArrow cannot serialize an unrelated field's type.
-    scalar_schema = pa.schema(
-        [
-            (
-                pa.field(f"__unlikely_name_placeholder_{i}", pa.int8())
-                if _needs_substrait_placeholder(field.type)
-                else field
-            )
-            for i, field in enumerate(schema)
-        ]
-    )
-    serialized = serialize_expressions([expression], ["my_filter"], scalar_schema)
-    if isinstance(serialized, memoryview):
-        return serialized.tobytes()
-    try:
-        return serialized.to_pybytes()
-    except AttributeError:
-        raise TypeError(
-            f"serialize_expressions returned unexpected type {type(serialized)}"
-        )
-
-
-def serialize_row_addrs(addrs: Iterable[int]) -> bytes:
-    """Encode row addresses for ``row_addr_allowlist`` / ``row_addr_blocklist``.
-
-    Those parameters take a serialized roaring treemap over ``_rowid``; this is
-    the way to produce one from Python.
-
-    >>> blob = serialize_row_addrs([0, 2, 4])                    # doctest: +SKIP
-    >>> ds.scanner(row_addr_allowlist=blob).to_table()           # doctest: +SKIP
-    """
-    return _serialize_row_addrs(list(addrs))
-
-
-class ScannerBuilder:
-    def __init__(self, ds: LanceDataset):
-        self.ds = ds
-        self._limit = None
-        self._filter = None
-        self._search_filter = None
-        self._substrait_filter = None
-        self._prefilter = False
-        self._row_addr_allowlist: Optional[bytes] = None
-        self._row_addr_blocklist: Optional[bytes] = None
-        self._late_materialization = None
-        self._blob_handling = None
-        self._offset = None
-        self._columns = None
-        self._columns_with_transform = None
-        self._nearest = None
-        self._minhash_query: Optional[Dict[str, str]] = None
-        self._batch_size: Optional[int] = None
-        self._batch_size_bytes: Optional[int] = None
-        self._io_buffer_size: Optional[int] = None
-        self._batch_readahead: Optional[int] = None
-        self._fragment_readahead: Optional[int] = None
-        self._scan_in_order = True
-        self._fragments = None
-        self._index_segments = None
-        self._with_row_id = False
-        self._with_row_address = False
-        self._use_stats = True
-        self._fast_search = False
-        self._full_text_query = None
-        self._use_scalar_index = None
-        self._include_deleted_rows = None
-        self._scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None
-        self._strict_batch_size = False
-        self._orderings = None
-        self._disable_scoring_autoprojection = False
-        self._substrait_aggregate = None
-
-    def apply_defaults(self, default_opts: Dict[str, Any]) -> ScannerBuilder:
-        for key, value in default_opts.items():
-            setter = getattr(self, key, None)
-            if setter is None:
-                raise ValueError(f"Unknown option {key}")
-            if isinstance(value, dict):
-                setter(**value)
-            else:
-                setter(value)
-        return self
-
-    def batch_size(self, batch_size: int) -> ScannerBuilder:
-        """Set the maximum number of rows per batch.
-
-        If a byte limit is also configured, both limits apply and the one
-        reached first determines the batch size.
-        """
-        self._batch_size = batch_size
-        return self
-
-    def batch_size_bytes(self, batch_size_bytes: int) -> ScannerBuilder:
-        """Set the target batch size in bytes.
-
-        When set, the scanner will produce batches whose total size in bytes
-        is approximately this value. If ``batch_size`` is also set, both
-        limits apply and the one reached first determines the batch size.
-
-        This can also be configured at the dataset level via
-        ``FileReaderOptions``.  A scanner-level setting takes precedence
-        over the dataset-level default.
-        """
-        self._batch_size_bytes = batch_size_bytes
-        return self
-
-    def io_buffer_size(self, io_buffer_size: int) -> ScannerBuilder:
-        """
-        Set the I/O buffer size for the Scanner
-
-        This is the amount of RAM that will be reserved for holding I/O received from
-        storage before it is processed.  This is used to control the amount of memory
-        used by the scanner.  If the buffer is full then the scanner will block until
-        the buffer is processed.
-
-        Generally this should scale with the number of concurrent I/O threads.  If
-        unset, v2 scans choose a default based on the object store and
-        ``LANCE_DEFAULT_IO_BUFFER_SIZE`` can override that default.
-
-        This value is not a hard cap on the amount of RAM the scanner will use.  Some
-        space is used for the compute (which can be controlled by the batch size) and
-        Lance does not keep track of memory after it is returned to the user.
-
-        This parameter is only used when reading v2 files
-        """
-        self._io_buffer_size = io_buffer_size
-        return self
-
-    def batch_readahead(self, nbatches: Optional[int] = None) -> ScannerBuilder:
-        """
-        Set the maximum number of batches to decode concurrently.
-
-        This parameter must be greater than zero.
-        """
-        if nbatches is not None and int(nbatches) <= 0:
-            raise ValueError("batch_readahead must be greater than 0")
-        self._batch_readahead = nbatches
-        return self
-
-    def fragment_readahead(self, nfragments: Optional[int] = None) -> ScannerBuilder:
-        if nfragments is not None and int(nfragments) < 0:
-            raise ValueError("fragment_readahead must be non-negative")
-        self._fragment_readahead = nfragments
-        return self
-
-    def scan_in_order(self, scan_in_order: bool = True) -> ScannerBuilder:
-        """
-        Whether to scan the dataset in order of fragments and batches.
-
-        If set to False, the scanner may read fragments concurrently and yield
-        batches out of order. This may improve performance since it allows more
-        concurrency in the scan, but can also use more memory.
-
-        This parameter is ignored when using v2 files.  In the v2 file format
-        there is no penalty to scanning in order and so all scans will scan in
-        order.
-        """
-        self._scan_in_order = scan_in_order
-        return self
-
-    def limit(self, n: Optional[int] = None) -> ScannerBuilder:
-        if n is not None and int(n) < 0:
-            raise ValueError("Limit must be non-negative")
-        self._limit = n
-        return self
-
-    def offset(self, n: Optional[int] = None) -> ScannerBuilder:
-        if n is not None and int(n) < 0:
-            raise ValueError("Offset must be non-negative")
-        self._offset = n
-        return self
-
-    def columns(
-        self, cols: Optional[Union[List[str], Dict[str, str]]] = None
-    ) -> ScannerBuilder:
-        if cols is None:
-            self._columns = None
-        elif isinstance(cols, dict):
-            self._columns_with_transform = list(cols.items())
-        elif isinstance(cols, list):
-            self._columns = cols
-        else:
-            raise TypeError(
-                f"columns must be a list or dict[name, expression], got {type(cols)}"
-            )
-        return self
-
-    def filter(
-        self,
-        filter: Union[
-            str, pa.compute.Expression, FullTextQuery, VectorSearchQuery, dict
-        ],
-    ) -> ScannerBuilder:
-        """
-        Add a filter to the scanner.
-
-        :param filter: The filter to apply.  This can be a string, a pyarrow compute
-            expression, a FullTextQuery, a VectorSearchQuery, or a dictionary.
-
-        :return: The scanner builder.
-        """
-        if isinstance(filter, FullTextQuery):
-            self._search_filter = PySearchFilter.from_full_text_query(filter.inner)
-        elif isinstance(filter, VectorSearchQuery):
-            self._search_filter = PySearchFilter.from_vector_search_query(
-                filter.inner()
-            )
-        elif isinstance(filter, str):
-            self._filter = filter
-        elif isinstance(filter, pa.compute.Expression):
-            self._substrait_filter = _serialize_expression(filter, self.ds._ds.schema)
-        else:
-            expr_filter = filter.get("expr_filter")
-            if expr_filter is not None:
-                self.filter(expr_filter)
-
-            search_filter = filter.get("search_filter")
-            if search_filter is not None:
-                self.filter(search_filter)
-
-        return self
-
-    def row_addr_prefilter(
-        self,
-        allowlist: Optional[bytes] = None,
-        blocklist: Optional[bytes] = None,
-    ) -> ScannerBuilder:
-        """Restrict the scan to an externally supplied set of row addresses.
-
-        allowlist / blocklist are serialized roaring treemaps over ``_rowid``
-        (``RowAddrTreeMap::serialize_into`` output); passing neither clears the
-        mask. Applied before KNN / BM25 ranking, so top-k is computed over the
-        surviving rows rather than filtered afterwards.
-
-        Bytes rather than an object so the mask can be produced by a different
-        extension module -- nothing Rust-typed crosses the boundary.
-        """
-        self._row_addr_allowlist = allowlist
-        self._row_addr_blocklist = blocklist
-        return self
-
-    def prefilter(self, prefilter: bool) -> ScannerBuilder:
-        self._prefilter = prefilter
-        return self
-
-    def with_row_id(self, with_row_id: bool = True) -> ScannerBuilder:
-        """Enable returns with row IDs."""
-        self._with_row_id = with_row_id
-        return self
-
-    def with_row_address(self, with_row_address: bool = True) -> ScannerBuilder:
-        """
-        Enables returns with row addresses.
-
-        Row addresses are a unique but unstable identifier for each row in the
-        dataset that consists of the fragment id (upper 32 bits) and the row
-        offset in the fragment (lower 32 bits).  Row IDs are generally preferred
-        since they do not change when a row is modified or compacted.  However,
-        row addresses may be useful in some advanced use cases.
-        """
-        self._with_row_address = with_row_address
-        return self
-
-    def late_materialization(
-        self, late_materialization: bool | List[str]
-    ) -> ScannerBuilder:
-        self._late_materialization = late_materialization
-        return self
-
-    def blob_handling(self, blob_handling: Optional[str]) -> ScannerBuilder:
-        if blob_handling is None:
-            self._blob_handling = None
-            return self
-
-        allowed = {"all_binary", "blobs_descriptions", "all_descriptions"}
-        if blob_handling not in allowed:
-            raise ValueError(
-                f"Invalid blob_handling: {blob_handling}. Expected one of: "
-                + ", ".join(sorted(allowed))
-            )
-        self._blob_handling = blob_handling
-        return self
-
-    def use_stats(self, use_stats: bool = True) -> ScannerBuilder:
-        """
-        Enable use of statistics for query planning.
-
-        Disabling statistics is used for debugging and benchmarking purposes.
-        This should be left on for normal use.
-        """
-        self._use_stats = use_stats
-        return self
-
-    def use_scalar_index(self, use_scalar_index: bool = True) -> ScannerBuilder:
-        """
-        Set whether scalar indices should be used in a query
-
-        Scans will use scalar indices, when available, to optimize queries with filters.
-        However, in some corner cases, scalar indices may make performance worse.  This
-        parameter allows users to disable scalar indices in these cases.
-        """
-        self._use_scalar_index = use_scalar_index
-        return self
-
-    def with_fragments(
-        self, fragments: Optional[Iterable[LanceFragment]]
-    ) -> ScannerBuilder:
-        if fragments is not None:
-            inner_fragments = []
-            for f in fragments:
-                if isinstance(f, LanceFragment):
-                    inner_fragments.append(f._fragment)
-                else:
-                    raise TypeError(
-                        f"fragments must be an iterable of LanceFragment. "
-                        f"Got {type(f)} instead."
-                    )
-            fragments = inner_fragments
-
-        self._fragments = fragments
-        return self
-
-    def with_index_segments(
-        self, index_segments: Optional[Iterable[Union[str, uuid.UUID]]]
-    ) -> ScannerBuilder:
-        self._index_segments = _normalize_index_segment_ids(index_segments)
-        return self
-
-    def nearest(
-        self,
-        column: str,
-        q: QueryVectorLike,
-        k: Optional[int] = None,
-        metric: Optional[str] = None,
-        nprobes: Optional[int] = None,
-        minimum_nprobes: Optional[int] = None,
-        maximum_nprobes: Optional[int] = None,
-        refine_factor: Optional[int] = None,
-        use_index: bool = True,
-        ef: Optional[int] = None,
-        query_parallelism: Optional[int] = None,
-        approx_mode: Literal["fast", "normal", "accurate"] = "normal",
-        distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
-        search_effort: Optional[float] = None,
-    ) -> ScannerBuilder:
-        """Configure nearest neighbor search.
-
-        Parameters
-        ----------
-        q: QueryVectorLike
-            A single query vector or, for fixed-size vector columns, a 2-D array-like
-            or list-shaped batch of query vectors. Batch queries return up to ``k`` rows
-            per query and include Int32 non-null ``query_index`` as the first output
-            column. Flattened 1-D inputs whose length is a multiple of the vector
-            dimension are rejected. Datasets with an existing ``query_index`` column
-            cannot be used for batch search.
-            When ``use_index`` is true and a vector index is available, each query
-            vector is searched through the index path; otherwise the flat batch path
-            is used.
-        ef: int, optional
-            Beam width for HNSW search. Defaults to ``1.5 * k * refine_factor``,
-            floored at 256.
-        query_parallelism: int, optional
-            Maximum partition-search concurrency for a single vector query.
-            The default is 0. Value 0 uses the automatic policy, which
-            currently maps to the single-worker sequential path. Value -1 uses
-            the CPU pool size. Value 1 uses the single-worker sequential path.
-            Values >= 2 use the partition-parallel path and are clamped to the
-            CPU pool size.
-        search_effort: float, optional
-            Initial IVF search budget, a finite value in [0, 1]. None resolves
-            to 0.5, preserving Auto. Zero starts at the caller minimum (at least one
-            available partition); one starts at all available partitions, subject
-            to maximum_nprobes. Intermediate values interpolate geometrically.
-            Later expansion to find enough candidates is unchanged. This is
-            independent of approx_mode, ef and refinement, and is not a recall
-            guarantee. When supplied, effort ignores nprobes, including an explicit
-            0.5. With None, an explicitly supplied nprobes remains effective.
-        approx_mode: {"fast", "normal", "accurate"}, default "normal"
-            Controls the speed / accuracy tradeoff for approximate vector search
-            when supported by the selected index. This currently only affects
-            RQ-quantized indexes, such as IVF_RQ. Other index types ignore this
-            setting. ``fast`` favors lower latency and may reduce recall,
-            ``normal`` uses the default balance, and ``accurate`` favors higher
-            recall and may increase latency.
-        """
-        self._nearest = _build_vector_search_query(
-            column,
-            q,
-            dataset=self.ds,
-            k=k,
-            metric=metric,
-            nprobes=nprobes,
-            minimum_nprobes=minimum_nprobes,
-            maximum_nprobes=maximum_nprobes,
-            refine_factor=refine_factor,
-            use_index=use_index,
-            ef=ef,
-            query_parallelism=query_parallelism,
-            approx_mode=approx_mode,
-            search_effort=search_effort,
-            distance_range=distance_range,
-        )
-        return self
-
-    def fast_search(self, flag: bool) -> ScannerBuilder:
-        """Enable fast search, which only performs search on indexed fragments.
-
-        Users can use `Table::optimize()` or `create_index()` to include new data
-        in an index, thus making new data searchable.
-        """
-        self._fast_search = flag
-        return self
-
-    def include_deleted_rows(self, flag: bool) -> ScannerBuilder:
-        """Include deleted rows
-
-        Rows which have been deleted, but are still present in the fragment, will be
-        returned.  These rows will have all columns (except _rowaddr) set to null
-        """
-        self._include_deleted_rows = flag
-        return self
-
-    def full_text_search(
-        self,
-        query: str | FullTextQuery,
-        columns: Optional[List[str]] = None,
-    ) -> ScannerBuilder:
-        """
-        Filter rows by full text searching. *Experimental API*,
-        may remove it after we support to do this within `filter` SQL-like expression
-
-        Must create inverted index on the given column before searching,
-
-        Parameters
-        ----------
-        query : str | Query
-            If str, the query string to search for, a match query would be performed.
-            If Query, the query object to search for,
-            and the `columns` parameter will be ignored.
-        columns : list of str, optional
-            The columns to search in. If None, search in all indexed columns.
-        """
-        if isinstance(query, FullTextQuery):
-            self._full_text_query = query.inner
-        else:
-            self._full_text_query = {
-                "query": query,
-                "columns": columns,
-            }
-        return self
-
-    def minhash_search(self, query: MinHashQuery) -> ScannerBuilder:
-        """
-        Find the rows most similar to ``query.text`` using the MinHash LSH index
-        on ``query.column``.
-
-        The number of rows comes from :meth:`limit` (default 10). Results carry
-        a ``_distance`` column equal to ``1 - estimated Jaccard similarity`` and
-        are ordered by ascending distance. Cannot be combined with
-        :meth:`nearest` or :meth:`full_text_search`.
-
-        Rows the index does not cover (fragments appended after the index was
-        built, or rows changed by a data overlay) are scored on the fly, which
-        costs a scan of those rows per query; run ``optimize_indices`` to index
-        them, or enable :meth:`fast_search` to search only the indexed rows.
-
-        Parameters
-        ----------
-        query : MinHashQuery
-            The query text and the column to search.
-        """
-        if not isinstance(query, MinHashQuery):
-            raise TypeError(
-                f"minhash_search expects a MinHashQuery, got {type(query).__name__}"
-            )
-        self._minhash_query = {"column": query.column, "text": query.text}
-        return self
-
-    def scan_stats_callback(
-        self, callback: Callable[[ScanStatistics], None]
-    ) -> ScannerBuilder:
-        """
-        Set a callback function that will be called with the scan statistics after the
-        scan is complete.  Errors raised by the callback will be logged but not
-        re-raised.
-        """
-        self._scan_stats_callback = callback
-        return self
-
-    def strict_batch_size(self, strict_batch_size: bool = False) -> ScannerBuilder:
-        """
-        If True, then all batches except the last batch will have exactly
-        `batch_size` rows.
-        By default, it is false.
-        If this is true then small batches will need to be merged together
-        which will require a data copy and incur a (typically very small)
-        performance penalty.
-
-        This cannot be combined with ``batch_size_bytes`` because merging
-        batches to the strict row count can exceed the byte limit.
-        """
-        self._strict_batch_size = strict_batch_size
-        return self
-
-    def order_by(self, orderings: Optional[list[ColumnOrdering]]) -> ScannerBuilder:
-        if orderings is not None:
-            inner_orderings = []
-            for order in orderings:
-                if isinstance(order, ColumnOrdering):
-                    inner_orderings.append(order)
-                else:
-                    raise TypeError(
-                        f"orderings must be a list of ColumnOrdering. "
-                        f"Got {type(order)} instead."
-                    )
-            orderings = inner_orderings
-        self._orderings = orderings
-        return self
-
-    def disable_scoring_autoprojection(self, disable: bool = True) -> ScannerBuilder:
-        self._disable_scoring_autoprojection = disable
-        return self
-
-    def substrait_aggregate(self, aggregate: bytes) -> ScannerBuilder:
-        """
-        Set a Substrait aggregate expression for the scanner.
-
-        Parameters
-        ----------
-        aggregate : bytes
-            The serialized Substrait Aggregate plan bytes.
-
-        Returns
-        -------
-        ScannerBuilder
-            This builder for method chaining.
-        """
-        self._substrait_aggregate = aggregate
-        return self
-
-    def to_scanner(self) -> LanceScanner:
-        scanner = self.ds._ds.scanner(
-            self._columns,
-            self._columns_with_transform,
-            self._filter,
-            self._search_filter,
-            self._prefilter,
-            self._limit,
-            self._offset,
-            self._nearest,
-            self._batch_size,
-            self._batch_size_bytes,
-            self._io_buffer_size,
-            self._batch_readahead,
-            self._fragment_readahead,
-            self._scan_in_order,
-            self._fragments,
-            self._index_segments,
-            self._with_row_id,
-            self._with_row_address,
-            self._use_stats,
-            self._substrait_filter,
-            self._fast_search,
-            self._full_text_query,
-            self._late_materialization,
-            self._blob_handling,
-            self._use_scalar_index,
-            self._include_deleted_rows,
-            self._scan_stats_callback,
-            self._strict_batch_size,
-            self._orderings,
-            self._disable_scoring_autoprojection,
-            self._substrait_aggregate,
-            self._row_addr_allowlist,
-            self._row_addr_blocklist,
-            self._minhash_query,
-        )
-        return LanceScanner(scanner, self.ds, _snapshot_scanner_builder(self))
-
-
-class LanceScanner(pa.dataset.Scanner):
-    def __init__(
-        self,
-        scanner: _Scanner,
-        dataset: LanceDataset,
-        snapshot: Optional[Dict[str, Any]] = None,
-    ):
-        self._scanner = scanner
-        self._ds = dataset
-        self._snapshot = snapshot
-
-    def to_table(self) -> pa.Table:
-        """
-        Read the data into memory and return a pyarrow Table.
-        """
-        return self.to_reader().read_all()
-
-    def to_reader(self) -> pa.RecordBatchReader:
-        return self._scanner.to_pyarrow()
-
-    def to_batches(self) -> Iterator[RecordBatch]:
-        yield from self.to_reader()
-
-    def to_pandas(
-        self, *, blob_mode: str = _BLOB_PANDAS_MODE_LAZY, **kwargs: Any
-    ) -> "pd.DataFrame":
-        """Read the scan results into a :py:class:`pandas.DataFrame`.
-
-        ``blob_mode`` is pandas-specific and does not replace Arrow's
-        ``blob_handling`` setting used by :meth:`to_table`.
-        """
-        blob_mode = _normalize_blob_pandas_mode(blob_mode)
-        schema = self.projected_schema
-        blob_paths = _blob_paths_in_schema(schema)
-        if not blob_paths or blob_mode == _BLOB_PANDAS_MODE_DESCRIPTIONS:
-            return self.to_table().to_pandas(**kwargs)
-
-        if self._snapshot is None:
-            raise NotImplementedError(
-                "blob-aware to_pandas requires a scanner created from the Python API"
-            )
-
-        snapshot = dict(self._snapshot)
-        if blob_mode == _BLOB_PANDAS_MODE_BYTES:
-            snapshot["_blob_handling"] = "all_binary"
-            return (
-                _scanner_from_snapshot(self._ds, snapshot)
-                .to_table()
-                .to_pandas(**kwargs)
-            )
-
-        blob_sources = _blob_column_sources(schema, self._snapshot, self._ds.schema)
-        snapshot["_with_row_address"] = True
-        snapshot["_blob_handling"] = "blobs_descriptions"
-        table = _scanner_from_snapshot(self._ds, snapshot).to_table()
-
-        requested_rowaddr = bool(self._snapshot.get("_with_row_address", False))
-        if _BLOB_ROW_ADDR_COLUMN not in table.schema.names:
-            raise RuntimeError("blob-aware to_pandas expected _rowaddr in scan results")
-
-        row_addrs = table.column(_BLOB_ROW_ADDR_COLUMN).to_pylist()
-        blob_files = _fetch_blob_files_for_paths(
-            self._ds, table, blob_paths, blob_sources, row_addrs
-        )
-
-        columns_to_drop = []
-        for path in blob_files:
-            segments = _parse_field_path(path)
-            if len(segments) == 1 and segments[0] in table.schema.names:
-                columns_to_drop.append(segments[0])
-        if not requested_rowaddr:
-            columns_to_drop.append(_BLOB_ROW_ADDR_COLUMN)
-        non_blob_table = (
-            table.drop_columns(columns_to_drop) if columns_to_drop else table
-        )
-        if non_blob_table.num_columns == 0:
-            dataframe = pd.DataFrame(index=range(table.num_rows))
-        else:
-            dataframe = non_blob_table.to_pandas(**kwargs)
-
-        _place_blob_files(dataframe, blob_files, schema)
-        return dataframe
-
-    @property
-    def projected_schema(self) -> Schema:
-        return self._scanner.schema
-
-    @staticmethod
-    def from_dataset(*args, **kwargs):
-        """
-        Not implemented
-        """
-        raise NotImplementedError("from dataset")
-
-    @staticmethod
-    def from_fragment(*args, **kwargs):
-        """
-        Not implemented
-        """
-        raise NotImplementedError("from fragment")
-
-    @staticmethod
-    def from_batches(*args, **kwargs):
-        """
-        Not implemented
-        """
-        raise NotImplementedError("from batches")
-
-    @property
-    def dataset_schema(self) -> Schema:
-        """The schema with which batches will be read from fragments."""
-        return self._ds.schema
-
-    def scan_batches(self):
-        """
-        Consume a Scanner in record batches with corresponding fragments.
-
-        Returns
-        -------
-        record_batches : iterator of TaggedRecordBatch
-        """
-        lst = []
-        reader = self.to_reader()
-        while True:
-            batch = reader.read_next_batch()
-            if batch is None:
-                reader.close()
-                break
-            lst.append(batch)
-        return lst
-
-    def take(self, indices):
-        """Select rows of data by their position in the scan results.
-
-        ``indices`` are 0-based positions within this scanner's output — the
-        rows that survive the scanner's filter, in scan order. This matches
-        ``pyarrow.dataset.Scanner.take()`` and is different from
-        :meth:`LanceDataset.take`, which ignores the scanner filter and takes
-        rows by absolute dataset row number.
-
-        Parameters
-        ----------
-        indices : int or array-like
-            Positions of the matching rows to select. A large index requires
-            scanning through the matching rows up to it, so the cost is
-            proportional to the largest index, not to the number of indices.
-
-        Returns
-        -------
-        Table
-        """
-        if isinstance(indices, int):
-            indices = [indices]
-        elif isinstance(indices, pa.Array):
-            # pyarrow Scanner.take() also accepts pa.Array; list() on one
-            # yields pyarrow Scalars, so normalize to python ints.
-            indices = indices.to_pylist()
-        indices = list(indices)
-        if not indices:
-            raise ValueError("take requires at least one index")
-        if any(not isinstance(i, (int, np.integer)) or i < 0 for i in indices):
-            raise ValueError(f"indices must be non-negative integers, got {indices}")
-
-        # Collect the rows at the requested filtered-relative positions. Rows
-        # are gathered in scan order first and re-ordered to the caller's
-        # index order at the end, so repeated and unsorted indices work.
-        max_index = max(indices)
-        sorted_unique = sorted(set(indices))
-        batches = []
-        matched = 0  # number of matching rows consumed so far
-        exhausted = False
-        for batch in self.to_batches():
-            batch_end = matched + batch.num_rows
-            positions = [i - matched for i in sorted_unique if matched <= i < batch_end]
-            if positions:
-                batches.append(batch.take(positions))
-            matched = batch_end
-            if matched > max_index:
-                exhausted = True
-                break
-        if not exhausted:
-            # The stream ended before covering max_index, so matched is the
-            # full row count of the scan output. (count_rows is unavailable
-            # here anyway when the scanner has a limit/offset.)
-            raise IndexError(
-                f"index {max_index} is out of bounds for a scan with {matched} rows"
-            )
-
-        # Reaching here means max_index was covered by the scan, so at least
-        # one row was collected.
-        table = pa.Table.from_batches(batches)
-        # rows are in sorted-unique index order; map back to the caller's order.
-        row_lookup = {idx: i for i, idx in enumerate(sorted_unique)}
-        take_order = [row_lookup[i] for i in indices]
-        return table.take(take_order)
-
-    def head(self, num_rows):
-        """
-        Load the first N rows of the dataset.
-
-        Parameters
-        ----------
-        num_rows : int
-            The number of rows to load.
-
-        Returns
-        -------
-        Table
-        """
-        return self.to_table()[:num_rows]
-
-    def count_rows(self) -> int:
-        """Count rows matching the scanner filter.
-
-        Returns
-        -------
-        count : int
-
-        """
-        return self._scanner.count_rows()
-
-    def explain_plan(self, verbose=False) -> str:
-        """Return the execution plan for this scanner.
-
-        Parameters
-        ----------
-        verbose : bool, default False
-            Use a verbose output format.
-
-        Returns
-        -------
-        plan : str
-        """
-
-        return self._scanner.explain_plan(verbose=verbose)
-
-    def analyze_plan(self, count_rows: bool = False) -> str:
-        """Execute the plan for this scanner and display with runtime metrics.
-
-        Full-text-search nodes include the execution-time ``tokenized_query``
-        text and positions.
-
-        Parameters
-        ----------
-        count_rows : bool, default False
-            If True, auto-apply a ``COUNT(*)`` aggregate before analyzing so
-            the returned plan reflects what :py:meth:`count_rows` would
-            execute (including the optimizer's count-pushdown decisions).
-
-        Returns
-        -------
-        plan : str
-        """
-
-        return self._scanner.analyze_plan(count_rows=count_rows)
-
-
-class DatasetOptimizer:
-    def __init__(self, dataset: LanceDataset):
-        self._dataset = dataset
-
-    def compact_files(
-        self,
-        *,
-        target_rows_per_fragment: Optional[int] = None,
-        max_rows_per_group: Optional[int] = None,
-        max_bytes_per_file: Optional[int] = None,
-        materialize_deletions: Optional[bool] = None,
-        materialize_deletions_threshold: Optional[float] = None,
-        defer_index_remap: Optional[bool] = None,
-        num_threads: Optional[int] = None,
-        batch_size: Optional[int] = None,
-        compaction_mode: Optional[
-            Literal["reencode", "try_binary_copy", "force_binary_copy"]
-        ] = None,
-        binary_copy_read_batch_bytes: Optional[int] = None,
-        max_source_fragments: Optional[int] = None,
-        max_source_rows: Optional[int] = None,
-        max_source_bytes: Optional[int] = None,
-        excluded_fragment_ids: Optional[list[int]] = None,
-        data_storage_version: Optional[str] = None,
-    ) -> CompactionMetrics:
-        """Compacts small files in the dataset, reducing total number of files.
-
-        This does a few things:
-         * Removes deleted rows from fragments
-         * Removes dropped columns from fragments
-         * Merges small fragments into larger ones
-
-        This method preserves the insertion order of the dataset. This may mean
-        it leaves small fragments in the dataset if they are not adjacent to
-        other fragments that need compaction. For example, if you have fragments
-        with row counts 5 million, 100, and 5 million, the middle fragment will
-        not be compacted because the fragments it is adjacent to do not need
-        compaction.
-
-        Default values for these options can be stored in the dataset manifest
-        config using keys prefixed with ``lance.compaction.``. For example,
-        setting the config key ``lance.compaction.target_rows_per_fragment`` to
-        ``"500000"`` will use 500,000 as the default target rows per fragment.
-        Explicitly provided parameters take precedence over manifest config
-        values, which in turn take precedence over hardcoded defaults.
-
-        Supported config keys: ``lance.compaction.target_rows_per_fragment``,
-        ``lance.compaction.max_rows_per_group``,
-        ``lance.compaction.max_bytes_per_file``,
-        ``lance.compaction.materialize_deletions``,
-        ``lance.compaction.materialize_deletions_threshold``,
-        ``lance.compaction.defer_index_remap``,
-        ``lance.compaction.batch_size``,
-        ``lance.compaction.compaction_mode``,
-        ``lance.compaction.binary_copy_read_batch_bytes``,
-        ``lance.compaction.max_source_fragments``,
-        ``lance.compaction.max_source_rows``,
-        ``lance.compaction.max_source_bytes``,
-        ``lance.compaction.data_storage_version``.
-
-        Parameters
-        ----------
-        target_rows_per_fragment: int, optional
-            The target number of rows per fragment. This is the number of rows
-            that will be in each fragment after compaction. If not specified,
-            uses the manifest config value, or 1024*1024.
-        max_rows_per_group: int, optional
-            Max number of rows per group. This does not affect which fragments
-            need compaction, but does affect how they are re-written if selected.
-            If not specified, uses the manifest config value, or 1024.
-
-            This setting only affects datasets using the legacy storage format.
-            The newer format does not require row groups.
-        max_bytes_per_file: Optional[int], default None
-            Max number of bytes in a single file.  This does not affect which
-            fragments need compaction, but does affect how they are re-written if
-            selected.  If this value is too small you may end up with fragments
-            that are smaller than `target_rows_per_fragment`.
-
-            The default will use the default from ``write_dataset``.
-        materialize_deletions: bool, optional
-            Whether to compact fragments with soft deleted rows so they are no
-            longer present in the file. If not specified, uses the manifest
-            config value, or True.
-        materialize_deletions_threshold: float, optional
-            The fraction of original rows that are soft deleted in a fragment
-            before the fragment is a candidate for compaction. If not specified,
-            uses the manifest config value, or 0.1.
-        defer_index_remap: bool, optional
-            Whether to defer index remapping during compaction. If not specified,
-            uses the manifest config value, or False.
-        num_threads: int, optional
-            The number of threads to use when performing compaction. If not
-            specified, defaults to the number of cores on the machine.
-        batch_size: int, optional
-            The batch size to use when scanning input fragments.  You may want
-            to reduce this if you are running out of memory during compaction.
-
-            The default will use the same default from ``scanner``.
-        compaction_mode: str, optional
-            The compaction mode. Valid values:
-
-            - ``"reencode"``: Decode and re-encode data (default).
-            - ``"try_binary_copy"``: Try binary copy if fragments are
-              compatible, fall back to reencode otherwise.
-            - ``"force_binary_copy"``: Use binary copy or fail if fragments
-              are not compatible.
-        binary_copy_read_batch_bytes: int, optional
-            The batch size in bytes for reading during binary copy operations.
-            Controls how much data is read at once when performing binary copy.
-            Defaults to 16MB.
-        max_source_fragments: int, optional
-            Maximum number of source fragments to compact in a single run.
-            Compaction tasks are included until adding the next task would
-            exceed this limit, allowing compaction to proceed incrementally.
-            Fragments are processed oldest first. If not specified, uses the
-            manifest config value, or applies no limit.
-        max_source_rows: int, optional
-            Maximum number of source rows to compact in a single run. Rows are
-            counted as live rows (physical rows minus soft-deleted rows).
-            Tasks are included until adding the next task would exceed this
-            limit.
-        max_source_bytes: int, optional
-            Maximum number of source bytes to compact in a single run,
-            measured as the total size of the source fragments' data and
-            overlay files. Tasks are included until adding the next task
-            would exceed this limit. Blob v2 payloads live in separate
-            blob files and are not counted, so this is not a cap on total
-            compaction I/O for datasets with blob columns.
-        excluded_fragment_ids: list[int], optional
-            Fragment IDs to exclude from compaction planning. Excluded
-            fragments remain unchanged and act as boundaries, so fragments
-            on opposite sides are not combined into the same compaction task.
-            Duplicate and unknown IDs are ignored.
-        data_storage_version: str, optional
-            Output data file version, such as "2.2", "stable", or "next".
-            Uses the compaction config target when set, otherwise the dataset's
-            default write version. Does not change that default or the versions
-            of unselected files. V1/V2 cross-family targets are rejected.
-
-        Returns
-        -------
-        CompactionMetrics
-            Metrics about the compaction process
-
-        See Also
-        --------
-        lance.optimize.Compaction
-        """
-        opts = {
-            k: v
-            for k, v in dict(
-                target_rows_per_fragment=target_rows_per_fragment,
-                max_rows_per_group=max_rows_per_group,
-                max_bytes_per_file=max_bytes_per_file,
-                materialize_deletions=materialize_deletions,
-                materialize_deletions_threshold=materialize_deletions_threshold,
-                defer_index_remap=defer_index_remap,
-                num_threads=num_threads,
-                batch_size=batch_size,
-                compaction_mode=compaction_mode,
-                binary_copy_read_batch_bytes=binary_copy_read_batch_bytes,
-                max_source_fragments=max_source_fragments,
-                max_source_rows=max_source_rows,
-                max_source_bytes=max_source_bytes,
-                excluded_fragment_ids=excluded_fragment_ids,
-                data_storage_version=data_storage_version,
-            ).items()
-            if v is not None
-        }
-        return Compaction.execute(self._dataset, opts)
-
-    def optimize_indices(self, **kwargs) -> None:
-        """Optimizes index performance.
-
-        As new data arrives it is not added to existing indexes automatically.
-        When searching we need to perform an indexed search of the old data plus
-        an expensive unindexed search on the new data.  As the amount of new
-        unindexed data grows this can have an impact on search latency.
-        This function will add the new data to existing indexes, restoring the
-        performance. By default, this function does not retrain the index, it only
-        assigns the new data to existing partitions. This means an update is much
-        quicker than retraining the entire index but may have less accuracy
-        (especially if the new data exhibits new patterns, concepts, or trends)
-
-        Parameters
-        ----------
-        num_indices_to_merge: optional, int, default None
-            The number of indices to merge.
-            If set to 0, new delta index will be created.
-        index_names: List[str], default None
-            The names of the indices to optimize.
-            If None, all indices will be optimized.
-        retrain: bool, default False
-            Whether to retrain the whole index.
-            If true, the index will be retrained based on the current data,
-            `num_indices_to_merge` will be ignored,
-            and all indices will be merged into one.
-
-            This is useful when the data distribution has changed significantly,
-            and we want to retrain the index to improve the search quality.
-            This rebuilds the index from the source data and may be expensive.
-        """
-        self._dataset._ds.optimize_indices(**kwargs)
-
-    def enable_auto_cleanup(self, auto_cleanup_config: AutoCleanupConfig, **kwargs):
-        """Enable autocleaning for an existing dataset.
-
-        Parameters
-        ----------
-        auto_cleanup_config: AutoCleanupConfig
-            Config options for automatic cleanup of the dataset.
-            If set, dataset's old versions will be automatically
-            cleaned up according to this parameter.
-        """
-        self._dataset._ds.update_config(
-            {
-                "lance.auto_cleanup.interval": str(auto_cleanup_config["interval"]),
-                "lance.auto_cleanup.older_than": f"{auto_cleanup_config['older_than_seconds']}s",  # noqa E501
-            }
-        )
-
-    def disable_auto_cleanup(self, **kwargs):
-        """Disable autocleaning via delete related keys."""
-        self._dataset._ds.delete_config_keys(
-            ["lance.auto_cleanup.interval", "lance.auto_cleanup.older_than"]
-        )
-
-
-class Tags:
-    """
-    Dataset tag manager.
-    """
-
-    def __init__(self, dataset: _Dataset):
-        self._ds = dataset
-
-    def list(self) -> dict[str, Tag]:
-        """
-        List all dataset tags.
-
-        Returns
-        -------
-        dict[str, Tag]
-            A dictionary mapping tag names to tag metadata, including the
-            referenced branch, version, timestamps, manifest size, and any
-            attached metadata.
-        """
-        return self._ds.tags()
-
-    def get_version(self, tag: str) -> int:
-        """
-        Get the version of a specific tag by name.
-
-        Parameters
-        ----------
-        tag: str
-            The name of the tag to retrieve.
-
-        Returns
-        -------
-        int
-            The version number of the tag.
-
-        Raises
-        ------
-        ValueError
-            If the tag does not exist. Use :meth:`list` to check for presence.
-        """
-        return self._ds.get_version(tag)
-
-    def list_ordered(self, order: Optional[str] = None) -> List[Tuple[str, Tag]]:
-        """
-        List all dataset tags.
-
-        Parameters
-        ----------
-        order: str, optional
-            The order in which to return the tags.
-            "asc" or "desc" can be used to specify the order explicitly.
-            default 'desc'.
-
-        Returns
-        -------
-        List[Tuple[str, Tag]]
-            An ordered list of tuples mapping tag names to its `Tag` metadata.
-        """
-        return self._ds.tags_ordered(order)
-
-    def create(
-        self,
-        tag: str,
-        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
-    ) -> None:
-        """
-        Create a tag for a given dataset version.
-
-        Parameters
-        ----------
-        tag: str,
-            The name of the tag to create. This name must be unique among all tag
-            names for the dataset.
-        reference : int, str or Tuple[Optional[str], Optional[int]]
-            An integer specifies a version number in the current branch; a string
-            specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
-            a version number in a specified branch. (None, None) means the latest
-            version_number on the default branch. ``("main", version)`` is an
-            explicit alias for the default branch in this reference context.
-        """
-        self._ds.create_tag(tag, reference)
-
-    def delete(self, tag: str) -> None:
-        """
-        Delete tag from the dataset.
-
-        Parameters
-        ----------
-        tag: str,
-            The name of the tag to delete.
-
-        """
-        self._ds.delete_tag(tag)
-
-    def update(
-        self,
-        tag: str,
-        reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
-    ) -> None:
-        """
-        Update tag to a new version.
-
-        Parameters
-        ----------
-        tag: str,
-            The name of the tag to update.
-        reference : int, str or Tuple[Optional[str], Optional[int]]
-            An integer specifies a version number in the current branch; a string
-            specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
-            a version number in a specified branch. (None, None) means the latest
-            version_number on the default branch. ``("main", version)`` is an
-            explicit alias for the default branch in this reference context.
-        """
-        self._ds.update_tag(tag, reference)
-
-    def replace_metadata(self, tag: str, metadata: Dict[str, str]) -> None:
-        """
-        Replace metadata for an existing tag.
-
-        This replaces the entire metadata map instead of merging with existing
-        keys. It does not change the tag reference, and it does not update
-        `updated_at`. `updated_at` only changes when `update()` moves the tag
-        to a different reference.
-        """
-        self._ds.replace_tag_metadata(tag, metadata)
-
-
-class Branches:
-    """
-    Dataset branch manager.
-    """
-
-    def __init__(self, dataset: _Dataset):
-        self._ds = dataset
-
-    def list(self) -> dict[str, Branch]:
-        """
-        List all dataset branches.
-
-        Returns
-        -------
-        dict[str, Branch]
-            A dictionary mapping branch names to branch metadata.
-        """
-        return self._ds.branches()
-
-    def list_ordered(self, order: Optional[str] = None) -> List[Tuple[str, Branch]]:
-        """
-        List all dataset branches ordered by parent version.
-        """
-        return self._ds.branches_ordered(order)
-
-    def delete(self, branch: str) -> None:
-        """
-        Delete a branch.
-        """
-        self._ds.delete_branch(branch)
-
-    def replace_metadata(self, branch: str, metadata: Dict[str, str]) -> None:
-        """
-        Replace metadata for a branch.
-        """
-        self._ds.replace_branch_metadata(branch, metadata)
-
-
-@dataclass
-class FieldStatistics:
-    """Statistics about a field in the dataset"""
-
-    id: int  #: id of the field
-    bytes_on_disk: int  #: (possibly compressed) bytes on disk used to store the field
-
-
-@dataclass
-class DataStatistics:
-    """Statistics about the data in the dataset"""
-
-    fields: FieldStatistics  #: Statistics about the fields in the dataset
-
-
-class DatasetStats(TypedDict):
-    num_deleted_rows: int
-    num_fragments: int
-    num_small_files: int
-
-
-class LanceStats:
-    """
-    Statistics about a LanceDataset.
-    """
-
-    def __init__(self, dataset: _Dataset):
-        self._ds = dataset
-
-    def dataset_stats(self, max_rows_per_group: int = 1024) -> DatasetStats:
-        """
-        Statistics about the dataset.
-        """
-        return {
-            "num_deleted_rows": self._ds.count_deleted_rows(),
-            "num_fragments": self._ds.count_fragments(),
-            "num_small_files": self._ds.num_small_files(max_rows_per_group),
-        }
-
-    def index_stats(self, index_name: str) -> Dict[str, Any]:
-        """
-        Statistics about an index.
-
-        Parameters
-        ----------
-        index_name: str
-            The name of the index to get statistics for.
-        """
-        index_stats = json.loads(self._ds.index_statistics(index_name))
-        return index_stats
-
-    def data_stats(self) -> DataStatistics:
-        """
-        Statistics about the data in the dataset.
-        """
-        return self._ds.data_stats()
 
 
 def write_dataset(
@@ -8390,9 +5653,10 @@ def write_dataset(
         :meth:`LanceDataset.migrate_manifest_paths_v2` method. Default is True.
     enable_stable_row_ids : bool, optional
         Experimental parameter: if set to true, the writer will use stable row ids.
-        These row ids are stable after compaction operations, but not after updates.
-        This makes compaction more efficient, since with stable row ids no
-        secondary indices need to be updated to point to new row ids.
+        A row then keeps the same id for its lifetime: compaction, update and merge
+        insert relocate or rewrite the row without changing its id. This only
+        applies to new datasets; a write to an existing dataset keeps that
+        dataset's own setting.
     auto_cleanup_options: optional, AutoCleanupConfig
         Config options for automatic cleanup of the dataset.
         If set, and this is a new dataset, old dataset versions will be automatically
@@ -8627,226 +5891,6 @@ def write_dataset(
     return ds
 
 
-def _coerce_query_vector(query: QueryVectorLike) -> tuple[pa.Array, int]:
-    # if the query is a multivector, convert it to pa.ListArray
-    if hasattr(query, "__getitem__") and isinstance(
-        query[0], (list, tuple, np.ndarray, pa.Array)
-    ):
-        dim = len(query[0])
-        multivector_query = []
-        for q in query:
-            if len(q) != dim:
-                raise ValueError(
-                    "All query vectors must have the same length, "
-                    f"but got {dim} and {len(q)}"
-                )
-            multivector_query.append(_coerce_query_vector(q)[0])
-        query = pa.array(multivector_query, type=pa.list_(pa.float32()))
-        return (query, dim)
-
-    if isinstance(query, pa.Scalar):
-        if isinstance(query, pa.ExtensionScalar):
-            # If it's an extension scalar then convert to storage
-            query = query.value
-        if isinstance(query.type, pa.FixedSizeListType):
-            query = query.values
-    elif isinstance(query, (list, tuple)) or (
-        _check_for_numpy(query) and isinstance(query, np.ndarray)
-    ):
-        query = np.array(query).astype("float64")  # workaround for GH-608
-        query = pa.FloatingPointArray.from_pandas(query, type=pa.float32())
-    elif not isinstance(query, pa.Array):
-        try:
-            query = pa.array(query)
-        except:  # noqa: E722
-            raise TypeError(
-                "Query vectors should be an array of floats, "
-                f"got {type(query)} which we cannot coerce to a "
-                "float array"
-            )
-
-    # At this point `query` should be an arrow array
-    if not isinstance(query, pa.FloatingPointArray):
-        if pa.types.is_integer(query.type):
-            query = query.cast(pa.float32())
-        else:
-            raise TypeError(
-                "query vector must be list-like or pa.FloatingPointArray "
-                f"but received {query.type}"
-            )
-
-    return (query, len(query))
-
-
-def _build_vector_search_query(
-    column: str,
-    q,
-    *,
-    dataset: Optional["LanceDataset"] = None,
-    k: Optional[int] = None,
-    metric: Optional[str] = None,
-    nprobes: Optional[int] = None,
-    minimum_nprobes: Optional[int] = None,
-    maximum_nprobes: Optional[int] = None,
-    refine_factor: Optional[int] = None,
-    use_index: bool = True,
-    ef: Optional[int] = None,
-    query_parallelism: Optional[int] = None,
-    approx_mode: Literal["fast", "normal", "accurate"] = "normal",
-    distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
-    search_effort: Optional[float] = None,
-) -> dict:
-    """Configure nearest neighbor search.
-
-    Parameters
-    ----------
-    column: str
-        The name of the vector column to search.
-    q: QueryVectorLike
-        The query vector. For fixed-size vector columns, this may be a 2-D
-        array-like or list-shaped batch of query vectors. Batch queries return up to
-        ``k`` rows per query vector and include Int32 non-null ``query_index`` as
-        the first output column.
-        Flattened 1-D inputs whose length is a multiple of the vector dimension are
-        rejected. Datasets with an existing ``query_index`` column cannot be used for
-        batch search. When ``use_index`` is true and a vector index is available,
-        each query vector is searched through the index path; otherwise the flat batch
-        path is used.
-    k: int, optional
-        The number of nearest neighbors to return.
-    metric: str, optional
-        The distance metric to use (e.g., "L2", "cosine", "dot", "hamming").
-    nprobes: int, optional
-        The number of partitions to search, setting both the minimum and maximum.
-    minimum_nprobes: int, optional
-        The minimum number of partitions to search.
-    maximum_nprobes: int, optional
-        The maximum number of partitions to search per index segment. This bounds
-        both initial and later probing without disabling Auto probing.
-    refine_factor: int, optional
-        The refine factor for the search.
-    use_index: bool, default True
-        Whether to use the index for the search.
-    ef: int, optional
-        Beam width for HNSW search. Defaults to ``1.5 * k * refine_factor``,
-        floored at 256.
-    query_parallelism: int, optional
-        Maximum partition-search concurrency for a single vector query.
-        The default is 0. Value 0 uses the automatic policy, which currently
-        maps to the single-worker sequential path. Value -1 uses the CPU pool
-        size. Value 1 uses the single-worker sequential path. Values >= 2 use
-        the partition-parallel path and are clamped to the CPU pool size.
-    search_effort: float, optional
-        Initial IVF search budget, a finite value in [0, 1]. None resolves
-        to 0.5, preserving Auto. Zero starts at the caller minimum (at least one
-        available partition); one starts at all available partitions, subject
-        to maximum_nprobes. Intermediate values interpolate geometrically.
-        Later expansion to find enough candidates is unchanged. This is
-        independent of approx_mode, ef and refinement, and is not a recall
-        guarantee. When supplied, effort ignores nprobes, including an explicit
-        0.5. With None, an explicitly supplied nprobes remains effective.
-    approx_mode: {"fast", "normal", "accurate"}, default "normal"
-        Controls the speed / accuracy tradeoff for approximate vector search
-        when supported by the selected index. This currently only affects
-        RQ-quantized indexes, such as IVF_RQ. Other index types ignore this
-        setting. ``fast`` favors lower latency and may reduce recall,
-        ``normal`` uses the default balance, and ``accurate`` favors higher
-        recall and may increase latency.
-    distance_range: tuple[Optional[float], Optional[float]], optional
-        A tuple of (lower_bound, upper_bound) to filter results by distance.
-        Both bounds are optional. The lower bound is inclusive and the upper
-        bound is exclusive, so (0.0, 1.0) keeps distances d where
-        0.0 <= d < 1.0, (None, 0.5) keeps d < 0.5, and (0.5, None) keeps d >= 0.5.
-
-    Returns
-    -------
-    ScannerBuilder
-        The scanner builder for method chaining.
-    """
-    q, q_dim = _coerce_query_vector(q)
-
-    if dataset is not None:
-        lance_field = dataset._ds.lance_schema.field_case_insensitive(column)
-        if lance_field is None:
-            raise ValueError(f"Embedding column {column} is not in the dataset")
-
-        column_field = lance_field.to_arrow()
-        column_type = column_field.type
-        if hasattr(column_type, "storage_type"):
-            column_type = column_type.storage_type
-        if pa.types.is_fixed_size_list(column_type):
-            dim = column_type.list_size
-        elif pa.types.is_list(column_type) and pa.types.is_fixed_size_list(
-            column_type.value_type
-        ):
-            dim = column_type.value_type.list_size
-        else:
-            raise TypeError(
-                f"Query column {column} must be a vector. Got {column_field.type}."
-            )
-
-        if q_dim != dim:
-            raise ValueError(
-                f"Query vector size {len(q)} does not match index column size {dim}"
-            )
-
-    if k is not None and int(k) <= 0:
-        raise ValueError(f"Nearest-K must be > 0 but got {k}")
-    if search_effort is None and nprobes is not None and int(nprobes) <= 0:
-        raise ValueError(f"Nprobes must be > 0 but got {nprobes}")
-    if minimum_nprobes is not None and int(minimum_nprobes) < 0:
-        raise ValueError(f"Minimum nprobes must be >= 0 but got {minimum_nprobes}")
-    if maximum_nprobes is not None and int(maximum_nprobes) < 0:
-        raise ValueError(f"Maximum nprobes must be >= 0 but got {maximum_nprobes}")
-
-    if (
-        minimum_nprobes is not None
-        and maximum_nprobes is not None
-        and minimum_nprobes > maximum_nprobes
-    ):
-        raise ValueError("minimum_nprobes must be <= maximum_nprobes")
-    if refine_factor is not None and int(refine_factor) < 1:
-        raise ValueError(f"Refine factor must be 1 or more got {refine_factor}")
-    if ef is not None and int(ef) <= 0:
-        # `ef` should be >= `k`, but `k` could be None so we can't check it here
-        # the rust code will check it
-        raise ValueError(f"ef must be > 0 but got {ef}")
-    if query_parallelism is not None:
-        query_parallelism = operator.index(query_parallelism)
-
-    if query_parallelism is not None and query_parallelism < -1:
-        raise ValueError("query_parallelism must be >= -1")
-
-    if approx_mode not in {"fast", "normal", "accurate"}:
-        raise ValueError(
-            "approx_mode must be one of 'fast', 'normal', or 'accurate', "
-            f"got {approx_mode!r}"
-        )
-
-    if distance_range is not None:
-        if len(distance_range) != 2:
-            raise ValueError(
-                "distance_range must be a tuple of (lower_bound, upper_bound)"
-            )
-
-    return {
-        "column": column,
-        "q": q,
-        "k": k,
-        "metric": metric,
-        "nprobes": nprobes,
-        "minimum_nprobes": minimum_nprobes,
-        "maximum_nprobes": maximum_nprobes,
-        "refine_factor": refine_factor,
-        "use_index": use_index,
-        "ef": ef,
-        "query_parallelism": query_parallelism,
-        "approx_mode": approx_mode,
-        "search_effort": search_effort,
-        "distance_range": distance_range,
-    }
-
-
 def _validate_schema(schema: pa.Schema):
     """
     Make sure the metadata is valid utf8
@@ -8891,139 +5935,7 @@ def _merge_message_to_properties(
     return merged_properties
 
 
-class VectorIndexReader:
-    """
-    This class allows you to initialize a reader for a specific vector index,
-    retrieve the number of partitions,
-    and read specific partitions of the index.
-
-    Parameters
-    ----------
-    dataset: LanceDataset
-        The dataset containing the index.
-    index_name: str
-        The name of the vector index to read.
-
-    Examples
-    --------
-    .. code-block:: python
-
-        import lance
-        from lance.dataset import VectorIndexReader
-        import numpy as np
-        import pyarrow as pa
-        vectors = np.random.rand(256, 2)
-        data = pa.table({"vector": pa.array(vectors.tolist(),
-            type=pa.list_(pa.float32(), 2))})
-        dataset = lance.write_dataset(data, "/tmp/index_reader_demo")
-        dataset.create_index("vector", index_type="IVF_PQ",
-            num_partitions=4, num_sub_vectors=2)
-        reader = VectorIndexReader(dataset, "vector_idx")
-        assert reader.num_partitions() == 4
-        partition = reader.read_partition(0)
-        assert "_rowid" in partition.column_names
-
-    Exceptions
-    ----------
-    ValueError
-        If the specified index is not a vector index.
-    """
-
-    def __init__(self, dataset: LanceDataset, index_name: str):
-        stats = dataset.stats.index_stats(index_name)
-        self.dataset = dataset
-        self.index_name = index_name
-        self.stats = stats
-        try:
-            self.num_partitions()
-        except KeyError:
-            raise ValueError(f"Index {index_name} is not vector index")
-
-    def num_partitions(self) -> int:
-        """
-        Returns the number of partitions in the dataset.
-
-        Returns
-        -------
-        int
-            The number of partitions.
-        """
-
-        return self.stats["indices"][0]["num_partitions"]
-
-    def read_partition(
-        self, partition_id: int, *, with_vector: bool = False
-    ) -> pa.Table:
-        """
-        Returns a pyarrow table for the given IVF partition
-
-        Parameters
-        ----------
-        partition_id: int
-            The id of the partition to read
-        with_vector: bool, default False
-            Whether to include the vector column in the reader,
-            for IVF_PQ, the vector column is PQ codes
-
-        Returns
-        -------
-        pa.Table
-            A pyarrow table for the given partition,
-            containing the row IDs, and quantized vectors (if with_vector is True).
-        """
-
-        if partition_id < 0 or partition_id >= self.num_partitions():
-            raise IndexError(
-                f"Partition id {partition_id} is out of range, "
-                f"expected 0 <= partition_id < {self.num_partitions()}"
-            )
-
-        return self.dataset._ds.read_index_partition(
-            self.index_name, partition_id, with_vector
-        ).read_all()
-
-
-class VectorSearchQuery:
-    """Vector search parameters, including continuous ``search_effort`` in [0, 1].
-
-    Effort defaults to None, which resolves to 0.5 (Auto). Explicit effort
-    ignores nprobes. See :meth:`ScannerBuilder.nearest` for probe bounds and
-    other search parameters.
-    """
-
-    _inner: dict
-
-    def __init__(
-        self,
-        column: str,
-        q: QueryVectorLike,
-        k: Optional[int] = None,
-        metric: Optional[str] = None,
-        nprobes: Optional[int] = None,
-        minimum_nprobes: Optional[int] = None,
-        maximum_nprobes: Optional[int] = None,
-        refine_factor: Optional[int] = None,
-        use_index: bool = True,
-        ef: Optional[int] = None,
-        query_parallelism: Optional[int] = None,
-        approx_mode: Literal["fast", "normal", "accurate"] = "normal",
-        search_effort: Optional[float] = None,
-    ):
-        self._inner = _build_vector_search_query(
-            column,
-            q,
-            k=k,
-            metric=metric,
-            nprobes=nprobes,
-            minimum_nprobes=minimum_nprobes,
-            maximum_nprobes=maximum_nprobes,
-            refine_factor=refine_factor,
-            use_index=use_index,
-            ef=ef,
-            query_parallelism=query_parallelism,
-            approx_mode=approx_mode,
-            search_effort=search_effort,
-        )
-
-    def inner(self):
-        return self._inner
+@_coerce_source.register(LanceDataset)
+def _lance_dataset_source(data_obj: LanceDataset, schema=None) -> _WriteSource:
+    # Capture the native dataset version and all default scan options once.
+    return _coerce_source(data_obj.scanner(), schema)

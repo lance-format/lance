@@ -53,6 +53,7 @@ use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::replace_children_if_necessary;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::{ExecutionPlan, Partitioning};
@@ -253,9 +254,7 @@ impl TopKLateMaterialization {
         let names = original.fields().iter().map(|f| f.name().as_str());
         let mut output = project(Arc::new(take), names)?;
         for node in chain.iter().rev().filter(|node| rewrites_metadata(node)) {
-            output = node
-                .clone()
-                .with_new_children(vec![output])
+            output = replace_children_if_necessary(node.clone(), vec![output])
                 .map_err(|e| e.to_string())?;
         }
         if output.schema() != original {
@@ -380,9 +379,7 @@ fn rebuild(
             .collect::<Vec<_>>();
         return project(input, kept);
     }
-    node.clone()
-        .with_new_children(vec![input])
-        .map_err(|e| e.to_string())
+    replace_children_if_necessary(node.clone(), vec![input]).map_err(|e| e.to_string())
 }
 
 /// Select `names` from `input`, in that order.
