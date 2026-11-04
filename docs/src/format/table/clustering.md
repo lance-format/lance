@@ -30,6 +30,18 @@ Every definition's ID must be at most this value; `2^32 - 1` exhausts the ID spa
 Providers may store extra information in `Manifest.table_metadata`, using keys
 such as `<provider>.<clustering_id>.<key>`. Each provider defines its keys and values.
 
+### Restore
+
+A restored manifest uses the target snapshot's `Manifest.clustering` list.
+Definitions created in later snapshots are not merged into it. This keeps the
+restored fragments and index segments with the definitions they reference.
+
+Restore does not rewind `Manifest.max_clustering_id`: it becomes the greater of the
+target snapshot's value and the pre-restore manifest's value, including when a
+detached handle older than the target performs the restore. The restored list can
+therefore end below the watermark. Allocate the next new definition at
+`max_clustering_id + 1`.
+
 ### Fragment and Index Segment Information
 
 Each fragment and index segment may set `clustering_id` to a definition in the
