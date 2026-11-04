@@ -3101,11 +3101,8 @@ mod tests {
         );
     }
 
-    // Pins the deep-size semantics: the reported size is exactly the serialized
-    // filter payload (`Sbbf::size_bytes()`, identical to `to_bytes().len()`),
-    // computed per zone without materializing it. The no-big-allocation proof
-    // for this property lives in tests/bloomfilter_alloc_tracking.rs, in its
-    // own test binary (the lib test binary already defines a global allocator).
+    // The deep size must stay the serialized filter payload per zone, the
+    // number `to_bytes().len()` used to report.
     #[test]
     fn test_bloomfilter_deep_size_equals_serialized_payload() {
         use lance_core::deepsize::DeepSizeOf;
