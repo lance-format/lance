@@ -10,6 +10,8 @@ mod read;
 mod refs;
 mod schema;
 
+pub(crate) use index::optimize_options_from_java;
+
 use lance::dataset::Dataset;
 
 pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
