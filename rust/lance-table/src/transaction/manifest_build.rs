@@ -13,8 +13,9 @@
 use crate::feature_flags::{
     FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_MANAGED_BLOBS,
     FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
-    apply_index_object_metadata_flag, ensure_can_read_manifest, ensure_can_write_manifest,
-    inherit_sticky_feature_flags, managed_blobs_enabled, validate_non_reusable_field_id_flags,
+    apply_index_object_metadata_flag, apply_row_addr_index_feature_flag, ensure_can_read_manifest,
+    ensure_can_write_manifest, inherit_sticky_feature_flags, managed_blobs_enabled,
+    validate_auto_cleanup_config, validate_non_reusable_field_id_flags,
 };
 use crate::format::clustering::{ChangedReferences, validate_clustering_of};
 
@@ -31,8 +32,7 @@ use crate::format::{
     overlay::DataOverlayFile,
 };
 use crate::format::{
-    apply_complete_clustering_definitions, merge_clustering_definitions,
-    refuse_key_fields_that_changed_identity,
+    apply_complete_clustering_definitions, refuse_key_fields_that_changed_identity,
 };
 use crate::io::{
     commit::CommitHandler,
@@ -44,8 +44,8 @@ use crate::system_index::frag_reuse::metadata::{is_tagged, validate_flags};
 use crate::system_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, is_frag_reuse_index_entry};
 use crate::system_index::is_system_index;
 use crate::system_index::mem_wal::{
-    CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, load_mem_wal_index_details,
-    new_mem_wal_index_meta, update_mem_wal_index_compacted_sstables,
+    CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, check_mem_wal_dir_id,
+    load_mem_wal_index_details, new_mem_wal_index_meta, update_mem_wal_index_compacted_sstables,
 };
 use crate::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::transaction::prepare::{FragReuseUpdate, PreparedIndices};
@@ -62,7 +62,7 @@ use lance_core::datatypes::{
 };
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::{Error, Result};
-use lance_file::version::ConcreteFileVersion;
+use lance_file::version::{ConcreteFileVersion, warn_if_legacy_storage_version};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
@@ -92,6 +92,27 @@ fn range_segments_enabled(manifest: &Manifest) -> bool {
         .config
         .get(RANGE_SEGMENTS_CONFIG_KEY)
         .is_some_and(|value| str_is_truthy(value))
+}
+
+fn changes_auto_cleanup_config(operation: &Operation) -> bool {
+    let is_auto_cleanup_key = |key: &str| key.starts_with("lance.auto_cleanup.");
+    match operation {
+        Operation::Overwrite {
+            config_upsert_values: Some(values),
+            ..
+        } => values.keys().any(|key| is_auto_cleanup_key(key)),
+        Operation::UpdateConfig {
+            config_updates: Some(update),
+            ..
+        } => {
+            update.replace
+                || update
+                    .update_entries
+                    .iter()
+                    .any(|entry| is_auto_cleanup_key(&entry.key))
+        }
+        _ => false,
+    }
 }
 
 /// Re-encode inline row id sequences in their smallest wire form when the
@@ -233,19 +254,18 @@ impl Transaction {
         manifest.next_row_id = manifest.next_row_id.max(current_manifest.next_row_id);
         // So are clustering ids: rewinding would hand an old id to a new definition
         // while objects on other versions still mean the old one by it. The
-        // restored objects reference the historical definitions; the current ones
-        // are kept too, so every id this lineage has handed out stays defined.
+        // definitions themselves are the target's: a restore brings back that
+        // snapshot's definitions, specs, fragments and index segments as they
+        // were. A detached restore can use a handle older than the target,
+        // so neither counter alone necessarily covers the other's history.
+        // Keep their maximum; a mark above every present definition is the
+        // normal state after a restore and is never read as a selection.
         manifest.max_clustering_id = manifest
             .max_clustering_id
             .max(current_manifest.max_clustering_id);
-        merge_clustering_definitions(&mut manifest.clustering, &current_manifest.clustering)
-            .map_err(|error| {
-                Error::invalid_input(format!("Cannot restore version {version}: {error}"))
-            })?;
         // A restore republishes objects that already existed, so their labels
         // are not new writes: an old label may outlive its definition and must
-        // not make the restore fail. The definition set itself is still merged
-        // and checked above.
+        // not make the restore fail.
         // Turning stable row ids off would revert `_rowid` to row addresses, whose
         // namespace overlaps the ids this table has already handed out.
         if current_manifest.uses_stable_row_ids() && !manifest.uses_stable_row_ids() {
@@ -279,6 +299,34 @@ impl Transaction {
             segments.sort_unstable_by_key(|segment| segment.uuid);
         }
         by_name
+    }
+
+    /// Checks a `CreateIndex` writing the MemWAL index: a rewrite must keep the
+    /// current `dir_id`; an initialization must find no MemWAL index.
+    fn check_mem_wal_create_index(
+        indices: &[IndexMetadata],
+        new_indices: &[IndexMetadata],
+        removed_indices: &[IndexMetadata],
+    ) -> Result<()> {
+        let Some(new_mem_wal) = new_indices
+            .iter()
+            .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+        else {
+            return Ok(());
+        };
+        if removed_indices
+            .iter()
+            .any(|idx| idx.name == MEM_WAL_INDEX_NAME)
+        {
+            let dir_id = load_mem_wal_index_details(new_mem_wal.clone())?.dir_id;
+            return check_mem_wal_dir_id(indices, &dir_id);
+        }
+        if indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME) {
+            return Err(Error::invalid_input(
+                "MemWAL is already initialized on this dataset.",
+            ));
+        }
+        Ok(())
     }
 
     /// Apply MemWAL index-coverage rules once the final index list is known.
@@ -558,7 +606,11 @@ impl Transaction {
                     for (fragment, fields) in &rewrites {
                         if fields.iter().any(|field| {
                             i32::try_from(*field).is_ok_and(|field| {
-                                field_affects_index(field, &index.fields, &manifest.schema)
+                                field_affects_index(
+                                    field,
+                                    &index.dependency_fields(),
+                                    &manifest.schema,
+                                )
                             })
                         }) {
                             return Err(Error::invalid_input(format!(
@@ -901,6 +953,7 @@ impl Transaction {
                 new_fragments,
                 fields_modified,
                 compacted_sstables,
+                mem_wal_dir_id,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 updated_fragment_offsets,
@@ -1114,7 +1167,18 @@ impl Transaction {
                 final_fragments.extend(new_fragments);
                 Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments);
 
+                // Checked even without progress: only a compaction's last chunk
+                // records any, and earlier chunks must be refused too.
+                if let Some(dir_id) = mem_wal_dir_id {
+                    check_mem_wal_dir_id(&final_indices, dir_id)?;
+                }
                 if !compacted_sstables.is_empty() {
+                    if mem_wal_dir_id.is_none() {
+                        return Err(Error::invalid_input(
+                            "an Update recording MemWAL compaction progress must name \
+                             the MemWAL it belongs to (mem_wal_dir_id)",
+                        ));
+                    }
                     update_mem_wal_index_compacted_sstables(
                         &mut final_indices,
                         new_version,
@@ -1301,6 +1365,7 @@ impl Transaction {
                 removed_indices,
                 ..
             } => {
+                Self::check_mem_wal_create_index(&final_indices, new_indices, removed_indices)?;
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let removed_uuids = removed_indices
                     .iter()
@@ -1770,8 +1835,12 @@ impl Transaction {
                 }
             }
             Operation::UpdateMemWalState {
-                compacted_sstables, ..
+                compacted_sstables,
+                dir_id,
             } => {
+                // Checked even when empty: an empty update is the fence that
+                // proves the MemWAL is still present.
+                check_mem_wal_dir_id(&final_indices, dir_id)?;
                 // Updates the MemWAL index only; the fragments are unchanged.
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 update_mem_wal_index_compacted_sstables(
@@ -1822,7 +1891,11 @@ impl Transaction {
         final_fragments.sort_by_key(|frag| frag.id);
 
         // Clean up data files that only contain tombstoned fields
-        Self::remove_tombstoned_data_files(&mut final_fragments);
+        let cleaned_fragment_ids = Self::remove_tombstoned_data_files(&mut final_fragments);
+        let changed_fragment_ids = self.changed_fragment_ids().map(|mut ids| {
+            ids.extend(cleaned_fragment_ids);
+            ids
+        });
 
         // Enforce the newest-last overlay ordering invariant at the write
         // boundary. Load normalizes with a sort; this rejects any commit path
@@ -1908,6 +1981,11 @@ impl Transaction {
             // So we always use new_from_previous which preserves base_paths
             let mut prev_manifest =
                 Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments));
+            // A later `Arc::make_mut` of the fragment list (range segment
+            // re-encoding) moves it and so drops what is carried over here.
+            if let Some(changed_fragment_ids) = &changed_fragment_ids {
+                prev_manifest.reuse_encoded_fragments(current_manifest, changed_fragment_ids);
+            }
 
             if let (Some(user_requested_version), Operation::Overwrite { .. }) =
                 (user_requested_version, &self.operation)
@@ -1922,6 +2000,7 @@ impl Transaction {
         } else {
             let data_storage_format =
                 Self::data_storage_format_from_files(&final_fragments, user_requested_version)?;
+            warn_if_legacy_storage_version(data_storage_format.lance_file_format());
             Manifest::new(
                 schema,
                 Arc::new(final_fragments),
@@ -1977,6 +2056,7 @@ impl Transaction {
             manifest.reader_feature_flags |= FLAG_COVERED_INDEX_METADATA;
             manifest.writer_feature_flags |= FLAG_COVERED_INDEX_METADATA;
         }
+        apply_row_addr_index_feature_flag(&mut manifest, &final_indices);
 
         if let Some(current_manifest) = current_manifest {
             inherit_sticky_feature_flags(&mut manifest, current_manifest)?;
@@ -2015,6 +2095,7 @@ impl Transaction {
                             &state.manifest.schema,
                             &manifest,
                             desired,
+                            state.manifest.max_clustering_id,
                             commit_version,
                         )?;
                     }
@@ -2157,6 +2238,10 @@ impl Transaction {
             _ => {}
         }
 
+        if changes_auto_cleanup_config(&self.operation) {
+            validate_auto_cleanup_config(&manifest)?;
+        }
+
         apply_range_segments(&mut manifest, current_manifest)?;
 
         // Handle UpdateBases operation to update manifest base_paths
@@ -2267,14 +2352,96 @@ impl Transaction {
         None
     }
 
-    /// Remove data files that only contain tombstoned fields (-2)
-    /// These files no longer contain any live data and can be safely dropped
-    fn remove_tombstoned_data_files(fragments: &mut [Fragment]) {
+    /// Remove data files whose fields are all tombstoned (-2); they hold no
+    /// live data. Returns the ids of the fragments that lost a file.
+    fn remove_tombstoned_data_files(fragments: &mut [Fragment]) -> Vec<u64> {
+        let mut cleaned_fragment_ids = Vec::new();
         for fragment in fragments {
+            let num_files = fragment.files.len();
             fragment.files.retain(|file| {
                 // Keep file if it has at least one non-tombstoned field
                 file.fields.iter().any(|&field_id| field_id != -2)
             });
+            if fragment.files.len() != num_files {
+                cleaned_fragment_ids.push(fragment.id);
+            }
+        }
+        cleaned_fragment_ids
+    }
+
+    /// Ids of every fragment whose content [`Self::build_manifest`] may change
+    /// relative to the manifest it builds on: fragments the operation adds,
+    /// replaces, modifies or removes. Every other fragment is carried over
+    /// unchanged, so its encoded bytes can be reused.
+    ///
+    /// New fragments with id 0 are left out: they are assigned fresh ids,
+    /// which no fragment of the previous manifest has.
+    ///
+    /// `None` for operations that may rewrite any fragment; those re-encode
+    /// every fragment.
+    fn changed_fragment_ids(&self) -> Option<Vec<u64>> {
+        let ids = |fragments: &[Fragment]| {
+            fragments
+                .iter()
+                .map(|f| f.id)
+                .filter(|&id| id != 0)
+                .collect::<Vec<_>>()
+        };
+        match &self.operation {
+            Operation::Append { fragments } => Some(ids(fragments)),
+            Operation::Delete {
+                updated_fragments,
+                deleted_fragment_ids,
+                ..
+            } => {
+                let mut changed: Vec<u64> = updated_fragments.iter().map(|f| f.id).collect();
+                changed.extend(deleted_fragment_ids);
+                Some(changed)
+            }
+            Operation::Update {
+                removed_fragment_ids,
+                updated_fragments,
+                new_fragments,
+                updated_fragment_offsets,
+                ..
+            } => {
+                let mut changed: Vec<u64> = updated_fragments.iter().map(|f| f.id).collect();
+                changed.extend(removed_fragment_ids);
+                changed.extend(ids(new_fragments));
+                if let Some(UpdatedFragmentOffsets(offsets)) = updated_fragment_offsets {
+                    changed.extend(offsets.keys());
+                }
+                Some(changed)
+            }
+            Operation::Rewrite { groups, .. } => Some(
+                groups
+                    .iter()
+                    .flat_map(|group| {
+                        let old = group.old_fragments.iter().map(|f| f.id);
+                        old.chain(ids(&group.new_fragments))
+                    })
+                    .collect(),
+            ),
+            Operation::DataReplacement { replacements } => Some(
+                replacements
+                    .iter()
+                    .map(|DataReplacementGroup(fragment_id, _)| *fragment_id)
+                    .collect(),
+            ),
+            Operation::DataOverlay { groups } => {
+                Some(groups.iter().map(|group| group.fragment_id).collect())
+            }
+            Operation::CreateIndex { .. }
+            | Operation::ReserveFragments { .. }
+            | Operation::UpdateConfig { .. }
+            | Operation::UpdateBases { .. }
+            | Operation::UpdateMemWalState { .. } => Some(vec![]),
+            Operation::Overwrite { .. }
+            | Operation::Merge { .. }
+            | Operation::Project { .. }
+            | Operation::Restore { .. }
+            | Operation::Clone { .. }
+            | Operation::Unknown { .. } => None,
         }
     }
 
@@ -3024,6 +3191,7 @@ mod tests {
         let transaction = Transaction::new(
             manifest.version,
             Operation::UpdateMemWalState {
+                dir_id: String::new(),
                 compacted_sstables: vec![CompactedSsTable::new(shard, 3)],
             },
             None,
@@ -3829,6 +3997,98 @@ mod tests {
     }
 
     #[rstest]
+    #[case::btree("BTreeIndexDetails", 1, true, true)]
+    #[case::newer_btree("BTreeIndexDetails", 2, true, true)]
+    #[case::legacy_btree("BTreeIndexDetails", 0, true, false)]
+    #[case::without_stable_ids("BTreeIndexDetails", 1, false, false)]
+    #[case::bitmap("BitmapIndexDetails", 1, true, true)]
+    #[case::legacy_bitmap("BitmapIndexDetails", 0, true, false)]
+    #[case::label_list("LabelListIndexDetails", 2, true, true)]
+    #[case::legacy_label_list("LabelListIndexDetails", 1, true, false)]
+    #[case::row_id_index("InvertedIndexDetails", 0, true, false)]
+    fn row_addr_index_writer_fence_follows_final_indices(
+        #[case] details_type: &str,
+        #[case] index_version: i32,
+        #[case] stable_row_ids: bool,
+        #[case] needs_fence: bool,
+        #[values(false, true)] has_object_metadata: bool,
+    ) {
+        let mut manifest = sample_manifest_with_fragments(0..2);
+        if stable_row_ids {
+            for fragment in Arc::make_mut(&mut manifest.fragments) {
+                fragment.row_id_meta = Some(RowIdMeta::Inline(
+                    write_row_ids(&RowIdSequence::from(fragment.id..fragment.id + 1)).into(),
+                ));
+            }
+            apply_feature_flags(&mut manifest, true, false).unwrap();
+            manifest.next_row_id = 2;
+        }
+        let mut index = sample_index_metadata("id_idx");
+        index.index_version = index_version;
+        index.fragment_bitmap = Some(RoaringBitmap::from_iter([0, 1]));
+        index.index_details = Some(Arc::new(prost_types::Any {
+            type_url: format!("type.googleapis.com/lance.index.pb.{details_type}"),
+            value: vec![],
+        }));
+        if has_object_metadata {
+            index
+                .metadata
+                .insert("org.example.test".into(), "opaque".into());
+        }
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index.clone()],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let (manifest, indices) = transaction
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+        let flag = crate::feature_flags::FLAG_ROW_ADDR_INDICES;
+        assert_eq!(manifest.reader_feature_flags & flag, 0);
+        assert_eq!(manifest.writer_feature_flags & flag != 0, needs_fence);
+        assert_eq!(manifest.reader_feature_flags & FLAG_OBJECT_METADATA, 0);
+        assert_eq!(
+            manifest.writer_feature_flags & FLAG_OBJECT_METADATA != 0,
+            has_object_metadata
+        );
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::Append { fragments: vec![] },
+            None,
+        );
+        let (mut manifest, indices) = transaction
+            .build_manifest(Some(&manifest), indices, "txn", &default_build_config())
+            .unwrap();
+        // The final manifest write applies flags a second time.
+        apply_feature_flags(&mut manifest, stable_row_ids, false).unwrap();
+        assert_eq!(manifest.writer_feature_flags & flag != 0, needs_fence);
+        assert_eq!(manifest.reader_feature_flags & FLAG_OBJECT_METADATA, 0);
+        assert_eq!(
+            manifest.writer_feature_flags & FLAG_OBJECT_METADATA != 0,
+            has_object_metadata
+        );
+
+        let transaction = Transaction::new(
+            manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![],
+                removed_indices: vec![index],
+            },
+            None,
+        );
+        let (manifest, indices) = transaction
+            .build_manifest(Some(&manifest), indices, "txn", &default_build_config())
+            .unwrap();
+        assert!(indices.is_empty());
+        assert_eq!(manifest.writer_feature_flags & flag, 0);
+        assert_eq!(manifest.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
+    }
+
+    #[rstest]
     #[case::project(false)]
     #[case::merge(true)]
     fn test_schema_change_prunes_irrelevant_overlays(#[case] is_merge: bool) {
@@ -4015,6 +4275,7 @@ mod tests {
                 updated_fragments: vec![updated2, updated4, Fragment::new(99)],
                 new_fragments: vec![],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: vec![],
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: None,
@@ -4140,6 +4401,7 @@ mod tests {
                 updated_fragments: vec![updated],
                 new_fragments: vec![inserted],
                 fields_modified: vec![1],
+                mem_wal_dir_id: None,
                 compacted_sstables: vec![],
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode,
@@ -4189,6 +4451,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(1),
             base_id: None,
+            inline: None,
         };
         updated2.deletion_file = Some(deletion_file.clone());
 
@@ -4418,6 +4681,7 @@ mod tests {
                 updated_fragments: vec![fragment],
                 new_fragments: vec![],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: vec![],
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(UpdateMode::RewriteColumns),
@@ -4478,6 +4742,7 @@ mod tests {
                 updated_fragments: vec![fragment],
                 new_fragments: vec![],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: vec![],
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(UpdateMode::RewriteColumns),
@@ -4537,6 +4802,7 @@ mod tests {
                 updated_fragments: vec![fragment],
                 new_fragments: vec![],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: vec![],
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(UpdateMode::RewriteColumns),
@@ -4596,6 +4862,7 @@ mod tests {
                 updated_fragments: vec![fragment],
                 new_fragments: vec![],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: vec![],
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(UpdateMode::RewriteColumns),
@@ -4649,6 +4916,7 @@ mod tests {
             updated_fragments: vec![frag_a],
             new_fragments: vec![],
             fields_modified: vec![],
+            mem_wal_dir_id: None,
             compacted_sstables: vec![],
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: Some(UpdateMode::RewriteColumns),
@@ -4676,6 +4944,7 @@ mod tests {
                 updated_fragments: vec![],
                 new_fragments: vec![],
                 fields_modified: vec![],
+                mem_wal_dir_id: None,
                 compacted_sstables: vec![],
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(UpdateMode::RewriteColumns),
@@ -4726,6 +4995,7 @@ mod tests {
                     updated_fragments: vec![],
                     new_fragments: vec![],
                     fields_modified: vec![],
+                    mem_wal_dir_id: None,
                     compacted_sstables: vec![],
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: 1,
@@ -4775,6 +5045,7 @@ mod tests {
                     updated_fragments: vec![],
                     new_fragments: vec![],
                     fields_modified: vec![],
+                    mem_wal_dir_id: None,
                     compacted_sstables: vec![],
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode: 1,
@@ -6799,6 +7070,7 @@ mod tests {
                     file_type: DeletionFileType::Array,
                     num_deleted_rows: Some(1),
                     base_id: None,
+                    inline: None,
                 });
                 Operation::Delete {
                     updated_fragments: vec![deleted],
@@ -6811,6 +7083,7 @@ mod tests {
                 updated_fragments: vec![staged],
                 new_fragments: vec![],
                 fields_modified: vec![0],
+                mem_wal_dir_id: None,
                 compacted_sstables: vec![],
                 fields_for_preserving_frag_bitmap: vec![],
                 update_mode: Some(UpdateMode::RewriteColumns),
@@ -7227,63 +7500,111 @@ mod tests {
         );
     }
 
-    /// On the real build path, a rebased allocation whose key field now names
-    /// another column is refused, and one whose field kept its identity lands.
+    /// On the build path a rebased submission is checked against the landing
+    /// schema from its read schema: an allocation whose key was retyped is
+    /// refused, one whose key was renamed lands, an unchanged list carried
+    /// over a retained key's rename or retype lands too, and of several
+    /// allocations in one submission a retyped key on any refuses them all.
     #[test]
-    fn a_rebased_allocation_is_refused_when_its_key_field_changed_identity() {
+    fn a_rebased_submission_is_refused_only_when_an_allocated_key_changed_type() {
         let definition = crate::format::ClusteringDefinition {
             id: 1,
             columns: vec![0],
             provider: "org.example.cluster".into(),
             version: 1,
         };
-        let schema_named = |name: &str| {
+        let schema_of = |name: &str, data_type: DataType| {
             LanceSchema::try_from(&ArrowSchema::new(vec![ArrowField::new(
-                name,
-                DataType::Int32,
-                false,
+                name, data_type, false,
             )]))
             .unwrap()
         };
         let mut read = sample_manifest();
-        read.schema = schema_named("region");
+        read.schema = schema_of("region", DataType::Int32);
         let mut landing = sample_manifest();
-        landing.schema = schema_named("user_id");
         landing.version = read.version + 1;
-
-        let (transaction, config) = definitions_update(&read, vec![definition.clone()]);
-        let error = transaction
-            .build_manifest_with_read_version(
-                Some(&landing),
+        let build = |transaction: &Transaction,
+                     config: &ManifestBuildConfig,
+                     read: &Manifest,
+                     landing: &Manifest| {
+            transaction.build_manifest_with_read_version(
+                Some(landing),
                 vec![],
                 "txn",
-                &config,
+                config,
                 Some(ReadVersionState {
-                    manifest: &read,
+                    manifest: read,
                     indices: &[],
                 }),
             )
-            .unwrap_err();
+        };
+
+        // A new allocation over a retyped key is refused; over a rename it lands.
+        landing.schema = schema_of("region", DataType::Int64);
+        let (transaction, config) = definitions_update(&read, vec![definition.clone()]);
+        let error = build(&transaction, &config, &read, &landing).unwrap_err();
         assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
         assert!(
-            error.to_string().contains("names \"user_id\" now"),
+            error.to_string().contains("changed type or shape"),
             "{error}"
         );
+        landing.schema = schema_of("user_id", DataType::Int32);
+        let (result, _) = build(&transaction, &config, &read, &landing).unwrap();
+        assert_eq!(result.clustering, vec![definition.clone()]);
 
-        landing.schema = schema_named("region");
-        let (result, _) = transaction
-            .build_manifest_with_read_version(
-                Some(&landing),
-                vec![],
-                "txn",
-                &config,
-                Some(ReadVersionState {
-                    manifest: &read,
-                    indices: &[],
-                }),
-            )
-            .unwrap();
-        assert_eq!(result.clustering, vec![definition]);
+        // An unchanged list carried over a retained key's rename or retype
+        // lands: the retained definition is not this submission's dependency.
+        read.clustering = vec![definition.clone()];
+        read.max_clustering_id = 1;
+        landing.clustering = vec![definition.clone()];
+        landing.max_clustering_id = 1;
+        let (transaction, config) = definitions_update(&read, vec![definition.clone()]);
+        for schema in [
+            schema_of("user_id", DataType::Int32),
+            schema_of("region", DataType::Int64),
+        ] {
+            landing.schema = schema;
+            let (result, _) = build(&transaction, &config, &read, &landing).unwrap();
+            assert_eq!(result.clustering, vec![definition.clone()]);
+        }
+
+        // Two allocations at once over the retyped key: the lower one is
+        // keyed on it, and its conflict refuses the whole submission even
+        // though the higher one's key is untouched.
+        let two_fields = |region: DataType| {
+            LanceSchema::try_from(&ArrowSchema::new(vec![
+                ArrowField::new("region", region, false),
+                ArrowField::new("amount", DataType::Int32, false),
+            ]))
+            .unwrap()
+        };
+        read.schema = two_fields(DataType::Int32);
+        landing.schema = two_fields(DataType::Int64);
+        let on_amount = crate::format::ClusteringDefinition {
+            id: 3,
+            columns: vec![1],
+            ..definition.clone()
+        };
+        let (transaction, config) = definitions_update(
+            &read,
+            vec![
+                definition.clone(),
+                crate::format::ClusteringDefinition {
+                    id: 2,
+                    ..definition.clone()
+                },
+                on_amount,
+            ],
+        );
+        let error = build(&transaction, &config, &read, &landing).unwrap_err();
+        assert!(matches!(error, Error::CommitConflict { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("definition 2 is keyed on field id 0"),
+            "{error}"
+        );
+        assert_eq!(landing.clustering, vec![definition], "nothing landed");
     }
 
     /// The non-contiguous path appends its outputs instead of splicing them;
@@ -7407,5 +7728,242 @@ mod tests {
         .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
         .unwrap();
         assert_eq!(plain.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
+    }
+
+    /// A fragment with two data files of known size, as current writers produce.
+    fn sized_fragment(id: u64) -> Fragment {
+        let mut fragment = Fragment::new(id).with_physical_rows(100);
+        for field_id in 0..2 {
+            fragment.add_file(
+                format!("{id}-{field_id}.lance"),
+                vec![field_id],
+                vec![field_id],
+                ConcreteFileVersion::V2_0,
+                std::num::NonZero::new(1000 + id),
+            );
+        }
+        fragment
+    }
+
+    fn manifest_with_sized_fragments(ids: std::ops::Range<u64>) -> Manifest {
+        let schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, false),
+        ]);
+        Manifest::new(
+            LanceSchema::try_from(&schema).unwrap(),
+            Arc::new(ids.map(sized_fragment).collect()),
+            DataStorageFormat::new(ConcreteFileVersion::V2_0),
+            HashMap::new(),
+        )
+    }
+
+    /// Write `manifest` as a manifest file and return the manifest message in
+    /// it, without its length prefix.
+    async fn write_manifest_message(manifest: &mut Manifest) -> Vec<u8> {
+        use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
+        use lance_io::object_store::ObjectStore;
+        use lance_io::traits::{WriteExt, Writer};
+        use object_store::path::Path;
+
+        let store = ObjectStore::memory();
+        let path = Path::from("manifest");
+        let mut writer = store.create(&path).await.unwrap();
+        let pos = crate::io::manifest::write_manifest(writer.as_mut(), manifest, None, None)
+            .await
+            .unwrap();
+        writer
+            .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, crate::format::MAGIC)
+            .await
+            .unwrap();
+        Writer::shutdown(writer.as_mut()).await.unwrap();
+
+        let file = store.read_one_all(&path).await.unwrap();
+        let footer = file.len() - 16;
+        let len = u32::from_le_bytes(file[pos..pos + 4].try_into().unwrap()) as usize;
+        assert_eq!(pos + 4 + len, footer);
+        file[pos + 4..footer].to_vec()
+    }
+
+    /// Ids of the fragments of `manifest` that carry reusable encoded bytes.
+    fn cached_fragment_ids(manifest: &Manifest) -> Vec<u64> {
+        let Some(encoded) = manifest.encoded_fragments() else {
+            return vec![];
+        };
+        manifest
+            .fragments
+            .iter()
+            .zip(encoded)
+            .filter(|(_, encoded)| encoded.is_some())
+            .map(|(fragment, _)| fragment.id)
+            .collect()
+    }
+
+    /// Build the next manifest, check which fragments it reuses encoded bytes
+    /// for, and check that the message written for it is byte-identical to
+    /// encoding the whole manifest from scratch.
+    async fn apply_and_check(
+        manifest: &Manifest,
+        operation: Operation,
+        expected_reused: &[u64],
+    ) -> Manifest {
+        use prost::Message;
+
+        let transaction = Transaction::new(manifest.version, operation, None);
+        let (mut next, _) = transaction
+            .build_manifest(Some(manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+        assert_eq!(cached_fragment_ids(&next), expected_reused);
+
+        let written = write_manifest_message(&mut next).await;
+        assert_eq!(written, pb::Manifest::from(&next).encode_to_vec());
+        next
+    }
+
+    fn deletion_file(read_version: u64, id: u64) -> DeletionFile {
+        DeletionFile {
+            read_version,
+            id,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(10),
+            base_id: None,
+            inline: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_manifest_reuses_encoded_bytes_of_unchanged_fragments() {
+        use prost::Message;
+
+        // Cold start: nothing is cached, so every fragment is encoded.
+        let mut manifest = manifest_with_sized_fragments(0..6);
+        assert!(manifest.encoded_fragments().is_none());
+        assert_eq!(
+            write_manifest_message(&mut manifest).await,
+            pb::Manifest::from(&manifest).encode_to_vec()
+        );
+        assert_eq!(cached_fragment_ids(&manifest), (0..6).collect::<Vec<_>>());
+
+        // Append: every existing fragment is reused; the new one (id 6) is not.
+        let manifest = apply_and_check(
+            &manifest,
+            Operation::Append {
+                fragments: vec![sized_fragment(0)],
+            },
+            &[0, 1, 2, 3, 4, 5],
+        )
+        .await;
+        assert_eq!(cached_fragment_ids(&manifest), (0..7).collect::<Vec<_>>());
+
+        // Update: fragment 1 removed, fragment 2 updated, fragment 7 added.
+        let mut updated = manifest.fragments[2].clone();
+        updated.deletion_file = Some(deletion_file(manifest.version, 1));
+        let manifest = apply_and_check(
+            &manifest,
+            Operation::Update {
+                removed_fragment_ids: vec![1],
+                updated_fragments: vec![updated],
+                new_fragments: vec![sized_fragment(0)],
+                fields_modified: vec![],
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(UpdateMode::RewriteRows),
+                inserted_rows_filter: None,
+                updated_fragment_offsets: None,
+                mem_wal_dir_id: None,
+            },
+            &[0, 3, 4, 5, 6],
+        )
+        .await;
+        assert_eq!(cached_fragment_ids(&manifest), vec![0, 2, 3, 4, 5, 6, 7]);
+
+        // Delete: fragment 3 deleted, fragment 4 updated.
+        let mut updated = manifest.fragments[3].clone();
+        assert_eq!(updated.id, 4);
+        updated.deletion_file = Some(deletion_file(manifest.version, 2));
+        let manifest = apply_and_check(
+            &manifest,
+            Operation::Delete {
+                updated_fragments: vec![updated],
+                deleted_fragment_ids: vec![3],
+                predicate: "a < 0".to_string(),
+            },
+            &[0, 2, 5, 6, 7],
+        )
+        .await;
+        assert_eq!(cached_fragment_ids(&manifest), vec![0, 2, 4, 5, 6, 7]);
+
+        // Rewrite: fragments 5 and 6 compacted into a new fragment (id 8).
+        let manifest = apply_and_check(
+            &manifest,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: manifest.fragments[3..5].to_vec(),
+                    new_fragments: vec![sized_fragment(0)],
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: None,
+            },
+            &[0, 2, 4, 7],
+        )
+        .await;
+        assert_eq!(cached_fragment_ids(&manifest), vec![0, 2, 4, 7, 8]);
+
+        // A fragment with a file of unknown size is encoded on every write,
+        // since the size may be filled in later without the list changing.
+        let mut unsized_fragment = Fragment::new(0).with_physical_rows(100);
+        unsized_fragment.add_file(
+            "unsized.lance",
+            vec![0, 1],
+            vec![0, 1],
+            ConcreteFileVersion::V2_0,
+            None,
+        );
+        let manifest = apply_and_check(
+            &manifest,
+            Operation::Append {
+                fragments: vec![unsized_fragment],
+            },
+            &[0, 2, 4, 7, 8],
+        )
+        .await;
+        assert_eq!(cached_fragment_ids(&manifest), vec![0, 2, 4, 7, 8]);
+
+        // Operations that can rewrite any fragment carry nothing over.
+        let project_schema = manifest.schema.project(&["a"]).unwrap();
+        apply_and_check(
+            &manifest,
+            Operation::Project {
+                schema: project_schema,
+                preserves_nullability: true,
+            },
+            &[],
+        )
+        .await;
+    }
+
+    /// A fragment that loses a data file to tombstone cleanup is re-encoded
+    /// even when the operation did not name it.
+    #[tokio::test]
+    async fn test_build_manifest_reencodes_fragments_cleaned_of_tombstoned_files() {
+        let mut manifest = manifest_with_sized_fragments(0..3);
+        let mut fragments = manifest.fragments.as_ref().clone();
+        fragments[1].files[1].fields = vec![-2].into();
+        manifest.fragments = Arc::new(fragments);
+        write_manifest_message(&mut manifest).await;
+        assert_eq!(cached_fragment_ids(&manifest), vec![0, 1, 2]);
+
+        let next = apply_and_check(
+            &manifest,
+            Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            &[0, 2],
+        )
+        .await;
+        assert_eq!(next.fragments[1].files.len(), 1);
     }
 }

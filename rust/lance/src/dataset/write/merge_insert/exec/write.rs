@@ -313,18 +313,7 @@ impl FullSchemaMergeInsertExec {
         ));
 
         // Check if ON columns match the schema's unenforced primary key
-        let field_ids: Vec<i32> = params
-            .on
-            .iter()
-            .filter_map(|name| dataset.schema().field(name).map(|f| f.id))
-            .collect();
-        let pk_field_ids: Vec<i32> = dataset
-            .schema()
-            .unenforced_primary_key()
-            .iter()
-            .map(|f| f.id)
-            .collect();
-        let is_primary_key = !pk_field_ids.is_empty() && field_ids == pk_field_ids;
+        let is_primary_key = params.primary_key_field_ids(dataset.schema()).is_some();
 
         Ok(Self {
             input,
@@ -753,7 +742,9 @@ impl FullSchemaMergeInsertExec {
                         None,
                         None,
                         false,
+                        false,
                         Some(created_blob_payloads.clone()),
+                        None,
                     )
                     .await?;
                     Ok(fragments)
@@ -1242,7 +1233,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let input_stream = if has_blob_v2_columns {
             let input_schema = input_stream.schema();
             let rewrite_plan = Arc::new(
-                crate::dataset::optimize::BlobV2BatchRewritePlan::try_new(
+                crate::dataset::blob::BlobV2BatchRewritePlan::try_new(
                     self.dataset.schema(),
                     input_schema.as_ref(),
                     true,
@@ -1306,6 +1297,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let affected_rows_holder = self.affected_rows.clone();
         let inserted_rows_filter_holder = self.inserted_rows_filter.clone();
         let compacted_sstables = self.params.compacted_sstables.clone();
+        let mem_wal_dir_id = self.params.mem_wal_dir_id.clone();
         let source_skipped_duplicates = self.source_skipped_duplicates.clone();
         let source_blob_columns = self.source_blob_columns.clone();
         let created_blob_payloads = self.created_blob_payloads.clone();
@@ -1424,6 +1416,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 new_fragments,
                 fields_modified: vec![], // No fields are modified in schema for upsert
                 compacted_sstables,
+                mem_wal_dir_id,
                 // Use the full pre-order field list (not just top-level `fields`) so
                 // that nested leaf field ids are included. A merge_insert rewrites whole
                 // rows, so every field is potentially modified; omitting nested ids would

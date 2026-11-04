@@ -48,7 +48,7 @@ use crate::dataset::transaction::{DataOverlayGroup, Operation};
 use crate::dataset::{WriteDestination, WriteParams};
 use crate::index::frag_reuse_reader::tests::persist_fixture;
 use crate::index::vector::VectorIndexParams;
-use crate::index::{CreateIndexBuilder, DatasetIndexExt, DatasetIndexInternalExt};
+use crate::index::{CreateIndexBuilder, DatasetIndexExt, loading::DatasetIndexInternalExt};
 use crate::io::exec::filtered_read::FilteredReadExec;
 use crate::io::exec::fts::FlatMatchQueryExec;
 
@@ -1499,7 +1499,9 @@ async fn test_remapping_merge_rescans_overlay_on_tagged_compaction_destination(
 
     // A drained tagged table retains this flag even without an FRI entry. Its
     // next deferred compaction must write tagged history and preserve provenance.
-    let indices = crate::index::load_all_indices(&dataset).await.unwrap();
+    let indices = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     {
         let manifest = Arc::make_mut(&mut dataset.manifest);
         manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
@@ -1519,7 +1521,9 @@ async fn test_remapping_merge_rescans_overlay_on_tagged_compaction_destination(
     assert_eq!(dataset.fragments().len(), 1);
     let destination_id = dataset.fragments()[0].id as u32;
     assert!(destination_id > 1);
-    let stored = crate::index::load_all_indices(&dataset).await.unwrap();
+    let stored = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     assert!(
         stored
             .iter()
@@ -3103,13 +3107,14 @@ async fn test_fts_combined_fields_overlay_routes_only_stale_rows(
         .full_text_search(combined_fields_query("mango", &["text"]))
         .unwrap();
     let plan = scan.analyze_plan().await.unwrap();
-    let flat_read = plan
+    // The corpus owner rebuilds its children for each execution and reports
+    // their runtime I/O metrics; the displayed children are plan templates.
+    let corpus = plan
         .lines()
-        .skip_while(|line| !line.contains("FlatCombinedFields"))
-        .find(|line| line.contains("LanceRead"))
-        .unwrap_or_else(|| panic!("no flat read in the plan:\n{plan}"));
+        .find(|line| line.trim_start().starts_with("CombinedFieldsCorpus,"))
+        .unwrap_or_else(|| panic!("no combined-fields corpus in the plan:\n{plan}"));
     assert!(
-        flat_read.contains("rows_scanned=1,"),
+        corpus.contains("rows_scanned=1,"),
         "the flat side must read only the stale row:\n{plan}"
     );
 }
@@ -3696,13 +3701,20 @@ async fn append_age_fragment(dataset: &mut Dataset, ids: std::ops::Range<i32>) {
 #[case::bitmap(IndexType::Bitmap)]
 #[case::zonemap(IndexType::ZoneMap)]
 #[tokio::test]
-async fn test_optimize_preserves_scalar_overlay_masking(#[case] index_type: IndexType) {
-    let mut dataset = create_base_dataset().await;
+async fn test_optimize_preserves_scalar_overlay_masking(
+    #[case] index_type: IndexType,
+    #[values(false, true)] has_deletions: bool,
+    #[values(false, true)] has_stable_row_ids: bool,
+) {
+    let mut dataset = create_base_dataset_with(has_stable_row_ids).await;
     dataset
         .create_index(&["age"], index_type, None, &scalar_params(index_type), true)
         .await
         .unwrap();
     let source = dataset.load_indices_by_name("age_idx").await.unwrap()[0].clone();
+    if has_deletions {
+        dataset.delete("id = 0").await.unwrap();
+    }
 
     // Overlay fragment 0, offset 1 (id=1): age 10 -> 999, committed after the index.
     let mut dataset = commit_overlay(
@@ -3745,6 +3757,34 @@ async fn test_optimize_preserves_scalar_overlay_masking(#[case] index_type: Inde
     );
     // A row untouched by the overlay is unaffected.
     assert_eq!(ids_matching(&dataset, "age = 20").await, vec![2]);
+    assert_eq!(
+        ids_matching(&dataset, "age = 0").await,
+        if has_deletions { vec![] } else { vec![0] }
+    );
+
+    let indexed = dataset
+        .scan()
+        .filter("age >= 0")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let scanned = dataset
+        .scan()
+        .filter("age >= 0")
+        .unwrap()
+        .use_scalar_index(false)
+        .try_into_batch()
+        .await
+        .unwrap();
+    let rows = |batch: &RecordBatch| {
+        let ids = batch["id"].as_primitive::<Int32Type>();
+        let ages = batch["age"].as_primitive::<Int32Type>();
+        let mut rows = ids.iter().zip(ages.iter()).collect::<Vec<_>>();
+        rows.sort_unstable();
+        rows
+    };
+    assert_eq!(rows(&indexed), rows(&scanned));
 
     let merged = dataset.load_indices_by_name("age_idx").await.unwrap();
     assert_eq!(merged.len(), 1);

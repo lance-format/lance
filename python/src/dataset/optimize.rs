@@ -104,18 +104,16 @@ fn parse_compaction_options(
     Ok(opts)
 }
 
-fn unwrap_dataset(dataset: Bound<PyAny>) -> PyResult<Bound<Dataset>> {
+pub(crate) fn unwrap_dataset(dataset: Bound<PyAny>) -> PyResult<Bound<Dataset>> {
     let ds = dataset.getattr("_ds")?;
     Ok(ds.cast::<Dataset>()?.clone())
 }
 
 fn wrap_fragment<'py>(py: Python<'py>, fragment: &Fragment) -> PyResult<Bound<'py, PyAny>> {
-    let fragment_metadata = PyModule::import(py, "lance.fragment")?.getattr("FragmentMetadata")?;
-    let fragment_json = serde_json::to_string(&fragment).map_err(|x| {
-        PyValueError::new_err(format!("failed to serialize fragment metadata: {}", x))
-    })?;
-
-    fragment_metadata.call_method1("from_json", (fragment_json,))
+    // Build the dataclass directly. The JSON form of a fragment describes
+    // overlay coverage differently from the Python dataclass, so a round-trip
+    // fails on any fragment that carries overlays.
+    PyLance(fragment).into_pyobject(py)
 }
 
 #[pyclass(name = "CompactionMetrics", module = "lance.optimize")]

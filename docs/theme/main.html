@@ -1,24 +1,67 @@
 {% extends "base.html" %}
 
-{#- Render one nav section as sidenav groups: its direct pages/links under the
-    section's own label, then each child section as a further group. -#}
-{%- macro sidenav_section(sec, label) -%}
-  {%- set direct = sec.children | selectattr("is_section", "ne", true) | list -%}
-  {%- if direct -%}
+{#- Render leaf links and collapsible nested subsections inside a group. -#}
+{%- macro sidenav_item(item) -%}
+  {%- if item.is_section %}
+    <details class="ld-sidenav__sub"{% if item.active %} open="open"{% endif %}>
+      <summary class="ld-sidenav__sub-toggle">
+        <span>{{ item.title | e }}</span>
+        <svg class="ld-sidenav__chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+      </summary>
+      <div class="ld-sidenav__sub-items">
+        {%- for sub in item.children %}
+        {{ sidenav_item(sub) }}
+        {%- endfor %}
+      </div>
+    </details>
+  {%- elif item.is_link %}
+    <a href="{{ item.url | e }}" target="_blank" rel="noopener">{{ item.title | e }} <span class="ext">↗</span></a>
+  {%- else %}
+    <a{% if item == page %} class="active"{% endif %} href="{{ item.url | url }}">{{ item.title | e }}</a>
+  {%- endif %}
+{%- endmacro -%}
+
+{%- macro sidenav_group(children, label=none) -%}
   <div class="ld-sidenav__group">
-    <div class="ld-sidenav__label">{{ label }}</div>
-    {%- for child in direct %}
-    {%- if child.is_link %}
-    <a href="{{ child.url }}" target="_blank" rel="noopener">{{ child.title }} <span class="ext">↗</span></a>
-    {%- else %}
-    <a{% if child == page %} class="active"{% endif %} href="{{ child.url | url }}">{{ child.title }}</a>
+    {%- if label %}
+    <div class="ld-sidenav__label">{{ label | e }}</div>
     {%- endif %}
+    {%- for child in children %}
+      {{ sidenav_item(child) }}
     {%- endfor %}
   </div>
-  {%- endif -%}
-  {%- for child in sec.children if child.is_section -%}
-    {{ sidenav_section(child, child.title) }}
-  {%- endfor -%}
+{%- endmacro -%}
+
+{%- macro render_section_groups(children, root_label=none) -%}
+  {%- set shape = namespace(seen_section=false, leaf_after_section=false) -%}
+  {%- for item in children %}
+    {%- if item.is_section %}
+      {%- set shape.seen_section = true -%}
+    {%- elif shape.seen_section %}
+      {%- set shape.leaf_after_section = true -%}
+    {%- endif %}
+  {%- endfor %}
+  {%- if shape.leaf_after_section %}
+    {{ sidenav_group(children, root_label) }}
+  {%- else %}
+    {%- set direct = namespace(items=[], used_root=false) -%}
+    {%- for item in children %}
+      {%- if item.is_section %}
+        {%- if direct.items %}
+          {{ sidenav_group(direct.items, root_label if not direct.used_root else none) }}
+          {%- set direct.items = [] -%}
+          {%- set direct.used_root = true -%}
+        {%- endif %}
+        {{ sidenav_group(item.children, item.title) }}
+        {%- set direct.used_root = true -%}
+      {%- else %}
+        {%- set direct.items = direct.items + [item] -%}
+      {%- endif %}
+    {%- endfor %}
+    {%- if direct.items %}
+      {{ sidenav_group(direct.items, root_label if not direct.used_root else none) }}
+    {%- endif %}
+  {%- endif %}
 {%- endmacro -%}
 
 {% block container %}
@@ -27,16 +70,16 @@
 
   <main class="ld-docs">
     <button class="ld-sidenav-toggle" type="button" aria-expanded="false" aria-controls="ld-sidenav">
-      {{ active_section.item.title if active_section.item else "Menu" }}
+      {{ (active_section.item.title | e) if active_section.item else "Menu" }}
       <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
     </button>
     <aside class="ld-sidenav" id="ld-sidenav" aria-label="Section pages">
       {%- if active_section.item and active_section.item.is_section %}
-        {{ sidenav_section(active_section.item, active_section.item.title) }}
+        {{ render_section_groups(active_section.item.children, active_section.item.title) }}
       {%- elif active_section.item %}
       <div class="ld-sidenav__group">
-        <div class="ld-sidenav__label">{{ active_section.item.title }}</div>
-        <a class="active" href="{{ active_section.item.url | url }}">{{ active_section.item.title }}</a>
+        <div class="ld-sidenav__label ld-sidenav__label--root">{{ active_section.item.title | e }}</div>
+        <a class="active" href="{{ active_section.item.url | url }}">{{ active_section.item.title | e }}</a>
       </div>
       {%- endif %}
     </aside>
@@ -45,9 +88,9 @@
       <div class="ld-crumbs">
         <span>Docs</span>
         {%- for crumb in page.ancestors | reverse %}
-        <span>/</span><span>{{ crumb.title }}</span>
+        <span>/</span><span>{{ crumb.title | e }}</span>
         {%- endfor %}
-        <span>/</span><b>{{ page.title }}</b>
+        <span>/</span><b>{{ page.title | e }}</b>
       </div>
 
       <article class="ld-article">

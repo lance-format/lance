@@ -81,15 +81,13 @@ NAMESPACE_0_13_DEPENDENCY = "lance-namespace>=0.13.0,<0.14"
 
 
 def _lance_namespace_dependency(pylance_version: str) -> str:
-    # 12.0.0b5 is the last release published while pylance still pinned
-    # lance-namespace <0.9; releases cut after that carry the 0.11 range.
-    if Version(pylance_version) >= Version("14.0.0b10"):
+    if Version(pylance_version) >= Version("14.0.0"):
         return NAMESPACE_0_13_DEPENDENCY
-    if Version(pylance_version) > Version("12.0.0b5"):
+    if Version(pylance_version) >= Version("12.0.0"):
         return NAMESPACE_0_11_DEPENDENCY
-    if Version(pylance_version) >= Version("7.2.0b5"):
+    if Version(pylance_version) >= Version("7.2.0"):
         return NAMESPACE_0_8_DEPENDENCY
-    if Version(pylance_version) >= Version("6.0.0b0"):
+    if Version(pylance_version) >= Version("6.0.0"):
         return NAMESPACE_0_7_DEPENDENCY
     return NAMESPACE_0_6_DEPENDENCY
 
