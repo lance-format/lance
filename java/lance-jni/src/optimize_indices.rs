@@ -93,8 +93,9 @@ fn inner_commit(env: &mut JNIEnv, java_dataset: JObject, java_results: JObject) 
     let results = results_from_java(env, &java_results)?;
     let mut dataset =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    // The commit reads only `transaction_properties` from the options, which Java
-    // does not expose.
+    // Java does not expose commit options. Defaults leave transaction_properties
+    // unset and max_rows_to_consolidate disabled. If max_rows_to_consolidate is
+    // exposed later, the plan and commit paths must use the same value.
     block_on(commit_optimize_indices(
         &mut dataset.inner,
         results,

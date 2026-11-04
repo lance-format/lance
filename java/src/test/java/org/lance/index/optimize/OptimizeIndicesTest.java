@@ -94,15 +94,24 @@ public class OptimizeIndicesTest {
         appendFragments(allocator, path, driver.version(), 100, 4, 50); // fragments 1..4
         driver.checkoutLatest();
 
-        // Four unindexed fragments of 50 rows pack into segments of 100: two tasks, two merges.
-        OptimizeOptions options = OptimizeOptions.builder().maxRowsPerSegment(100).build();
+        // The 50-row fragments exceed the 40-row task target, so each is a task of its own.
+        // The 100-row segment target still packs pairs of task results into two output segments.
+        OptimizeOptions options =
+            OptimizeOptions.builder().maxRowsPerTask(40).maxRowsPerSegment(100).build();
         OptimizeIndicesPlan plan = OptimizeIndices.plan(driver, options);
         assertEquals(
-            Arrays.asList(Arrays.asList(1, 2), Arrays.asList(3, 4)),
+            Arrays.asList(
+                Collections.singletonList(1),
+                Collections.singletonList(2),
+                Collections.singletonList(3),
+                Collections.singletonList(4)),
             plan.getTasks().stream()
                 .map(OptimizeIndexTask::getFragments)
                 .collect(Collectors.toList()));
         assertEquals(2, plan.getMerges().size());
+        assertEquals(
+            Arrays.asList(0, 0, 1, 1),
+            plan.getTasks().stream().map(OptimizeIndexTask::getGroup).collect(Collectors.toList()));
 
         List<IndexSegmentResult> built = new ArrayList<>();
         for (OptimizeIndexTask task : plan.getTasks()) {
