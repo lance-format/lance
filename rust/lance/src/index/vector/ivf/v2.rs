@@ -960,6 +960,11 @@ pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
 
 impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
     pub(super) fn new(index: S, storage: Q::Storage) -> Self {
+        let storage = if S::name() == HNSW::name() {
+            storage.for_graph_search()
+        } else {
+            storage
+        };
         Self {
             index,
             storage,
@@ -1274,7 +1279,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         ivf: &IvfModel,
         storage: &IvfQuantizationStorage<Q>,
     ) -> Result<Option<Arc<RabitSearchCache>>> {
-        if Q::quantization_type() != QuantizationType::Rabit {
+        // HNSW walks its graph without the flat raw-query scan state.
+        if Q::quantization_type() != QuantizationType::Rabit || S::name() == HNSW::name() {
             return Ok(None);
         }
         let Quantizer::Rabit(rq) = storage.quantizer()? else {
@@ -1313,7 +1319,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         &self,
         query: &ArrayRef,
     ) -> Result<Option<Arc<RabitRawQueryContext>>> {
-        if Q::quantization_type() != QuantizationType::Rabit || self.use_query_residual {
+        if Q::quantization_type() != QuantizationType::Rabit
+            || self.use_query_residual
+            || S::name() == HNSW::name()
+        {
             return Ok(None);
         }
         let Quantizer::Rabit(rq) = self.storage.quantizer()? else {
@@ -1661,7 +1670,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         ivf: &IvfModel,
         storage: &IvfQuantizationStorage<Q>,
     ) -> QueryScratchCapacity {
-        if Q::quantization_type() != QuantizationType::Rabit {
+        // Only the flat RaBitQ scan reads the per-row scratch; HNSW walks without it.
+        if Q::quantization_type() != QuantizationType::Rabit
+            || S::name() != <FlatIndex as IvfSubIndex>::name()
+        {
             return QueryScratchCapacity::default();
         }
 
@@ -1804,7 +1816,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             context.file_cache.as_ref(),
             context.resident_columns,
         )?;
-        let rabit_scan = if storage.supports_rabit_planes() {
+        // A graph walks whole partitions, so it stays off the plane scan.
+        let rabit_scan = if S::name() != HNSW::name() && storage.supports_rabit_planes() {
             context
                 .rabit_scan_factory
                 .as_ref()
@@ -1981,7 +1994,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         file_cache: Option<&LanceCache>,
         session: ResidentColumnsSetting,
     ) -> Result<bool> {
-        if !storage.supports_rabit_planes() {
+        if S::name() == HNSW::name() || !storage.supports_rabit_planes() {
             return Ok(false);
         }
         resident_lifetime_setting()?;
@@ -2735,13 +2748,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
             (SubIndexType::Hnsw, QuantizationType::Flat)
             | (SubIndexType::Hnsw, QuantizationType::FlatBin) => IndexType::IvfHnswFlat,
-            (sub_index_type, quantization_type) => {
-                unimplemented!(
-                    "unsupported index type: {}, {}",
-                    sub_index_type,
-                    quantization_type
-                )
-            }
+            (SubIndexType::Hnsw, QuantizationType::Rabit) => IndexType::IvfHnswRq,
         }
     }
 
@@ -3945,7 +3952,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
         context.resident_columns,
     )?;
     let io_stats = context.io_stats.clone();
-    let rabit_scan = if storage.supports_rabit_planes() {
+    let rabit_scan = if S::name() != HNSW::name() && storage.supports_rabit_planes() {
         context
             .rabit_scan_factory
             .as_ref()

@@ -341,8 +341,7 @@ pub(crate) fn column_values<'a, T: ArrowPrimitiveType>(
     batch: &'a RecordBatch,
     name: &str,
 ) -> Result<&'a [T::Native]> {
-    Ok(batch
-        .column_by_name(name)
+    Ok(column(batch, name)
         .and_then(|column| column.as_primitive_opt::<T>())
         .ok_or_else(|| {
             Error::internal(format!(
@@ -358,8 +357,7 @@ pub(crate) fn list_values<'a, T: ArrowPrimitiveType>(
     batch: &'a RecordBatch,
     name: &str,
 ) -> Result<&'a [T::Native]> {
-    Ok(batch
-        .column_by_name(name)
+    Ok(column(batch, name)
         .and_then(|column| column.as_fixed_size_list_opt())
         .and_then(|list| list.values().as_primitive_opt::<T>())
         .ok_or_else(|| {
@@ -369,6 +367,13 @@ pub(crate) fn list_values<'a, T: ArrowPrimitiveType>(
             ))
         })?
         .values())
+}
+
+/// [`RecordBatch::column_by_name`] without cloning the schema `Arc`, whose
+/// refcount traffic serializes multi-threaded HNSW builds.
+fn column<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a ArrayRef> {
+    let index = batch.schema_ref().index_of(name).ok()?;
+    Some(batch.column(index))
 }
 
 pub(crate) enum EncodedPartition {
