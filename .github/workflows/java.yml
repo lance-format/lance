@@ -10,6 +10,7 @@ on:
       - main
       - release/**
     paths:
+      - .cargo/**
       - java/**
       - rust/**
       - .github/workflows/java.yml

@@ -20,6 +20,7 @@ on:
       - main
       - release/**
     paths:
+      - ".cargo/**"
       - ".github/workflows/pypi-publish.yml"
       - ".github/workflows/build_linux_wheel/**"
       - ".github/workflows/build_mac_wheel/**"
@@ -133,16 +134,16 @@ jobs:
       - uses: ./.github/workflows/build_mac_wheel
         with:
           python-minor-version: ${{ matrix.python-minor-version }}
-          args: "--release ${{ (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && !inputs.debug)) && '--strip' || '' }} --target ${{ matrix.config.target }} --features fp16kernels"
+          args: "--release ${{ (github.event_name == 'release' || github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && !inputs.debug)) && '--strip' || '' }} --target ${{ matrix.config.target }} --features fp16kernels"
       - name: Upload wheels as artifacts
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pylance-debug-macosx_arm64
           path: python/target/wheels/*.whl
           retention-days: 90
       - name: Verify macOS arm64 release wheel
-        if: github.event_name == 'workflow_dispatch' && inputs.debug == false
+        if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.debug == false)
         run: |
           WHEEL=$(find python/target/wheels -maxdepth 1 -name 'pylance-*.whl' -print -quit)
           if [[ -z "$WHEEL" ]]; then
@@ -154,7 +155,7 @@ jobs:
             echo "Unexpected wheel platform: $WHEEL_NAME" >&2
             exit 1
           fi
-          python3 -m pip install "$WHEEL"
+          python3 -m pip install --force-reinstall "$WHEEL"
           WHEEL_NAME="$WHEEL_NAME" python3 - <<'PY'
           import os
           import re
@@ -175,7 +176,7 @@ jobs:
           )
           assert "__text" in sections
           assert "__mod_init_func" in sections
-          assert "__text_startup" not in sections
+          assert "__text_startup" in sections
           print(
               f"imported lance from {os.environ['WHEEL_NAME']}: "
               f"{lance.lance.__file__}"

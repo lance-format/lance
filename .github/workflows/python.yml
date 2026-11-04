@@ -11,7 +11,7 @@ on:
       - release/**
     paths:
       - Cargo.*
-      - .cargo/config.toml
+      - .cargo/**
       - clippy.toml
       - python/**
       - rust/**

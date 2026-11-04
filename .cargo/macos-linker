@@ -1,0 +1,20 @@
+#!/bin/bash
+set -euo pipefail
+
+if [ -n "${SDKROOT:-}" ]; then
+    # An explicit SDK may live outside the active Xcode installation.
+    sdk_version=$(plutil -extract Version raw -o - "$SDKROOT/SDKSettings.json")
+else
+    sdk_version=$(xcrun --sdk macosx --show-sdk-version)
+fi
+
+# Rust 1.98's LLD cannot parse SDK 27's arm64e.x1 TAPI entries. The Apple
+# linker supplied with that SDK handles far calls from startup sections.
+if [ "${sdk_version%%.*}" -ge 27 ]; then
+    exec xcrun clang "$@"
+fi
+
+# Older Apple linkers fail to extend these cross-section ARM64 branches.
+# Keep the compiler driver responsible for SDK and deployment arguments.
+linker_dir=$(cd "$(dirname "$0")" && pwd)
+exec xcrun clang "--ld-path=$linker_dir/ld64.lld" "$@"

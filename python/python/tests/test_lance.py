@@ -29,11 +29,11 @@ def test_macos_arm64_startup_section():
         ["otool", "-arch", "arm64", "-l", lance.lance.__file__], text=True
     )
     sections = set(re.findall(r"^\s*sectname\s+(\S+)$", load_commands, re.MULTILINE))
-    # Constructors must remain registered, but their code must share __text's
-    # branch islands even when the extension grows beyond 128 MiB.
+    # Preserve constructor registration and source-defined startup text. The
+    # linker must extend distant calls without a section-renaming override.
     assert "__mod_init_func" in sections
     assert "__text" in sections
-    assert "__text_startup" not in sections
+    assert "__text_startup" in sections
 
 
 def test_table_roundtrip(tmp_path, provide_pandas):

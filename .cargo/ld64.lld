@@ -1,0 +1,9 @@
+#!/bin/bash
+set -euo pipefail
+
+# Apple's compiler driver strips DYLD_LIBRARY_PATH. Restore the path here
+# so the linker can load the LLVM library from the active Rust toolchain.
+rust_sysroot=$(rustc --print sysroot)
+rust_host=$(rustc -vV | sed -n 's/^host: //p')
+export DYLD_LIBRARY_PATH="$rust_sysroot/lib"
+exec "$rust_sysroot/lib/rustlib/$rust_host/bin/rust-lld" -flavor darwin "$@"
