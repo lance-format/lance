@@ -14,6 +14,7 @@
 
 use crate::blob::{PyDedicatedBlobWriter, PyManagedBlobWriter, PyPackedBlobWriter};
 use crate::namespace::extract_namespace_arc;
+use crate::session::Session;
 use crate::{error::PythonErrorExt, rt};
 use arrow::pyarrow::PyArrowType;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt32Array};
@@ -467,6 +468,7 @@ pub async fn object_store_from_uri_or_path_with_provider(
 pub struct LanceFileSession {
     object_store: Arc<ObjectStore>,
     base_path: Path,
+    session: Option<Session>,
 }
 
 impl LanceFileSession {
@@ -474,6 +476,7 @@ impl LanceFileSession {
         uri_or_path: String,
         storage_options: Option<HashMap<String, String>>,
         storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
+        session: Option<Session>,
     ) -> PyResult<Self> {
         let (object_store, base_path) = object_store_from_uri_or_path_with_provider(
             uri_or_path,
@@ -484,6 +487,7 @@ impl LanceFileSession {
         Ok(Self {
             object_store,
             base_path,
+            session,
         })
     }
 }
@@ -491,12 +495,13 @@ impl LanceFileSession {
 #[pymethods]
 impl LanceFileSession {
     #[new]
-    #[pyo3(signature=(uri_or_path, storage_options=None, namespace_client=None, table_id=None))]
+    #[pyo3(signature=(uri_or_path, storage_options=None, namespace_client=None, table_id=None, session=None))]
     pub fn new(
         uri_or_path: String,
         storage_options: Option<HashMap<String, String>>,
         namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
+        session: Option<Session>,
     ) -> PyResult<Self> {
         // Create storage options provider from namespace_client and table_id if both are provided
         let provider = if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
@@ -509,7 +514,10 @@ impl LanceFileSession {
         } else {
             None
         };
-        rt().block_on(None, Self::try_new(uri_or_path, storage_options, provider))?
+        rt().block_on(
+            None,
+            Self::try_new(uri_or_path, storage_options, provider, session),
+        )?
     }
 
     #[pyo3(signature=(path, columns=None))]
@@ -521,7 +529,12 @@ impl LanceFileSession {
         let path = self.base_path.child_path(&Path::from(path));
         rt().block_on(
             None,
-            LanceFileReader::open_with_store(self.object_store.clone(), path, columns),
+            LanceFileReader::open_with_store(
+                self.object_store.clone(),
+                path,
+                columns,
+                self.session.clone(),
+            ),
         )?
     }
 
@@ -841,6 +854,7 @@ impl LanceFileReader {
         storage_options: Option<HashMap<String, String>>,
         storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
         columns: Option<Vec<String>>,
+        session: Option<Session>,
     ) -> PyResult<Self> {
         let (object_store, path) = object_store_from_uri_or_path_with_provider(
             uri_or_path,
@@ -848,13 +862,14 @@ impl LanceFileReader {
             storage_options_provider,
         )
         .await?;
-        Self::open_with_store(object_store, path, columns).await
+        Self::open_with_store(object_store, path, columns, session).await
     }
 
     async fn open_with_store(
         object_store: Arc<ObjectStore>,
         path: Path,
         columns: Option<Vec<String>>,
+        session: Option<Session>,
     ) -> PyResult<Self> {
         let scheduler =
             ScanScheduler::new(object_store, SchedulerConfig::new(2 * 1024 * 1024 * 1024));
@@ -878,13 +893,22 @@ impl LanceFileReader {
             );
         }
 
+        let no_cache;
+        let cache = match &session {
+            Some(session) => session.inner.file_metadata_cache(),
+            None => {
+                no_cache = LanceCache::no_cache();
+                &no_cache
+            }
+        };
+
         let inner = FileReader::try_open_with_file_metadata(
             Arc::new(LanceEncodingsIo::new(file.clone())),
             path,
             base_projection,
             Arc::<DecoderPlugins>::default(),
             Arc::new(file_metadata),
-            &LanceCache::no_cache(),
+            cache,
             FileReaderOptions::default(),
         )
         .await
@@ -938,13 +962,14 @@ impl LanceFileReader {
 #[pymethods]
 impl LanceFileReader {
     #[new]
-    #[pyo3(signature=(path, storage_options=None, namespace_client=None, table_id=None, columns=None))]
+    #[pyo3(signature=(path, storage_options=None, namespace_client=None, table_id=None, columns=None, session=None))]
     pub fn new(
         path: String,
         storage_options: Option<HashMap<String, String>>,
         namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
         columns: Option<Vec<String>>,
+        session: Option<Session>,
     ) -> PyResult<Self> {
         // Create storage options provider from namespace_client and table_id if both are provided
         let provider = if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
@@ -957,7 +982,10 @@ impl LanceFileReader {
         } else {
             None
         };
-        rt().block_on(None, Self::open(path, storage_options, provider, columns))?
+        rt().block_on(
+            None,
+            Self::open(path, storage_options, provider, columns, session),
+        )?
     }
 
     pub fn read_all(

@@ -27,6 +27,7 @@ from .lance import (
 
 if TYPE_CHECKING:
     from .blob import DedicatedBlobWriter, ManagedBlobWriter, PackedBlobWriter
+    from .dataset import Session
     from .namespace import LanceNamespace
 
 
@@ -73,6 +74,7 @@ class LanceFileReader:
         *,
         namespace_client: Optional["LanceNamespace"] = None,
         table_id: Optional[List[str]] = None,
+        session: Optional["Session"] = None,
         _inner_reader: Optional[_LanceFileReader] = None,
     ):
         """
@@ -96,6 +98,9 @@ class LanceFileReader:
         columns: list of str, default None
             List of column names to be fetched.
             All columns are fetched if None or unspecified.
+        session : optional, lance.Session
+            A session whose metadata cache is used to cache page metadata and file
+            metadata for this reader. When omitted, no metadata cache is used.
         """
         if _inner_reader is not None:
             self._reader = _inner_reader
@@ -108,6 +113,7 @@ class LanceFileReader:
                 namespace_client=namespace_client,
                 table_id=table_id,
                 columns=columns,
+                session=session,
             )
 
     def read_all(self, *, batch_size: int = 1024, batch_readahead=16) -> ReaderResults:
@@ -244,6 +250,8 @@ class LanceFileSession:
         storage_options: Optional[Dict[str, str]] = None,
         namespace_client: Optional["LanceNamespace"] = None,
         table_id: Optional[List[str]] = None,
+        *,
+        session: Optional["Session"] = None,
     ):
         """
         Creates a new file session
@@ -263,6 +271,9 @@ class LanceFileSession:
         table_id : optional, List[str]
             The table identifier within the namespace.
             Must be provided together with namespace_client.
+        session : optional, lance.Session
+            A session whose metadata cache is shared by every reader opened from
+            this file session. When omitted, readers use no metadata cache.
         """
         if isinstance(base_path, Path):
             base_path = str(base_path)
@@ -271,6 +282,7 @@ class LanceFileSession:
             storage_options=storage_options,
             namespace_client=namespace_client,
             table_id=table_id,
+            session=session,
         )
 
     def open_reader(

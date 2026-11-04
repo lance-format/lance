@@ -9,6 +9,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
+from lance import Session
 from lance.file import LanceFileReader, LanceFileSession, LanceFileWriter
 
 
@@ -131,6 +132,44 @@ def test_size_bytes_with_session(tmp_path):
     with session.open_writer("foo.lance") as writer:
         writer.write_batch(pa.table({"a": [1, 2, 3]}))
     assert writer.size_bytes == os.path.getsize(tmp_path / "foo.lance")
+
+
+def test_file_reader_uses_session_metadata_cache(tmp_path):
+    path = tmp_path / "foo.lance"
+    with LanceFileWriter(str(path)) as writer:
+        writer.write_batch(pa.table({"a": [1, 2, 3]}))
+
+    session = Session(metadata_cache_size_bytes=1 << 20)
+    before = session.size_bytes()
+    reader = LanceFileReader(str(path), session=session)
+    assert reader.read_all().to_table() == pa.table({"a": [1, 2, 3]})
+    # Reading through the session populates its metadata cache.
+    assert session.size_bytes() > before
+
+
+def test_file_session_uses_session_metadata_cache(tmp_path):
+    path = tmp_path / "foo.lance"
+    with LanceFileWriter(str(path)) as writer:
+        writer.write_batch(pa.table({"a": [1, 2, 3]}))
+
+    session = Session(metadata_cache_size_bytes=1 << 20)
+    before = session.size_bytes()
+    file_session = LanceFileSession(tmp_path, session=session)
+    reader = file_session.open_reader("foo.lance")
+    assert reader.read_all().to_table() == pa.table({"a": [1, 2, 3]})
+    assert session.size_bytes() > before
+
+
+def test_file_reader_without_session_does_not_touch_cache(tmp_path):
+    path = tmp_path / "foo.lance"
+    with LanceFileWriter(str(path)) as writer:
+        writer.write_batch(pa.table({"a": [1, 2, 3]}))
+
+    session = Session(metadata_cache_size_bytes=1 << 20)
+    before = session.size_bytes()
+    reader = LanceFileReader(str(path))
+    assert reader.read_all().to_table() == pa.table({"a": [1, 2, 3]})
+    assert session.size_bytes() == before
 
 
 def test_version(tmp_path):
