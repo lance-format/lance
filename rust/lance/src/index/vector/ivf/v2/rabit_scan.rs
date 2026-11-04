@@ -38,6 +38,7 @@ use lance_index::vector::{
     ApproxMode, PartitionSearchControl, Query, VECTOR_RESULT_SCHEMA, VectorIndex,
 };
 
+use super::partition_search::PreparedPartition;
 use super::{
     IVFIndex, PartitionEntry, PreparedPartitionGuard, PreparedPartitionSearch,
     global_heap_to_batch, rotated_partition_centroid_slice,
@@ -366,13 +367,14 @@ impl RabitScanContext {
         let mut query = self.query.clone();
         query.dist_q_c = dist_q_c;
         self.index
-            .prepare_partition_without_prefilter_wait(
+            .prepare_partition(
                 partition_id,
                 Arc::new(query),
                 dist_q_c,
                 self.pre_filter.clone(),
                 self.metrics.as_ref(),
                 self.raw_query.clone(),
+                false,
             )
             .await
             .map(|prepared| RabitPreparedPartition(PreparedRabitPartition::Ordinary(prepared)))
@@ -547,14 +549,7 @@ impl RabitScanContext {
         match prepared.0 {
             PreparedRabitPartition::Ordinary(prepared) => {
                 self.index.scratch_pool.with_scratch(|scratch| {
-                    RabitIndex::accumulate_prepared_partition_search(
-                        self.index.use_query_residual,
-                        self.index.use_residual_scratch,
-                        prepared,
-                        heap,
-                        scratch,
-                        self.metrics.as_ref(),
-                    )
+                    Box::new(prepared).accumulate_topk(heap, scratch, self.metrics.as_ref())
                 })
             }
             PreparedRabitPartition::Planes { sign, ex } => {
