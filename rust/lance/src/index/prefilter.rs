@@ -22,7 +22,7 @@ use futures::future::BoxFuture;
 use futures::stream;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::spawn_cpu;
-use lance_select::{RowAddrMask, RowAddrTreeMap};
+use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 use lance_table::format::Fragment;
 use lance_table::format::IndexMetadata;
 use lance_table::rowids::RowIdSequence;
@@ -303,6 +303,21 @@ impl DatasetPreFilter {
             .await
     }
 
+    /// True when the only rows this prefilter removes are deleted rows and rows
+    /// outside the indexed fragments: no query filter, no FTS fragment pruning and
+    /// no overlay block. `self` is destructured so that a new filter field fails to
+    /// compile here until it is accounted for.
+    pub(crate) fn only_deletions(&self) -> bool {
+        let Self {
+            deleted_ids: _,
+            filtered_ids,
+            deleted_fragments,
+            overlay_block,
+            final_mask: _,
+        } = self;
+        filtered_ids.is_none() && deleted_fragments.is_none() && overlay_block.is_none()
+    }
+
     /// Sets the deleted fragment IDs to block during search.
     ///
     /// Used by FTS indices which track fragments that have been removed from the
@@ -457,6 +472,37 @@ impl DatasetPreFilter {
     }
 }
 
+/// Whether `mask` is known to pass no row: an empty allow list. Block lists
+/// never prove this, whatever they hold.
+pub(crate) fn mask_selects_nothing(mask: &RowAddrMask) -> bool {
+    matches!(mask, RowAddrMask::AllowList(rows) if rows.is_empty())
+}
+
+/// Whether a prefilter `mask` can select any row of one index segment.
+///
+/// `segment_rows`, when it is an allow list of the rows the segment may
+/// answer for (the live rows of its covered fragments, in the mask's own
+/// domain), decides alone. Otherwise, for address-domain masks, the
+/// segment's fragment `coverage` decides by fragment key. With neither (a
+/// row-id mask of a segment whose rows are unknown, or unknown coverage)
+/// only a globally empty allow list proves emptiness. Emptiness is never
+/// claimed where it cannot be proven, so a segment that is kept may still
+/// turn out to hold no selectable row; one that is dropped never does.
+pub fn prefilter_may_match_segment(
+    mask: &RowAddrMask,
+    segment_rows: Option<&RowAddrMask>,
+    coverage: Option<&RoaringBitmap>,
+    address_domain: bool,
+) -> bool {
+    if let Some(RowAddrMask::AllowList(rows)) = segment_rows {
+        return mask.may_select_any(rows);
+    }
+    if address_domain && let Some(coverage) = coverage {
+        return mask.may_select_fragments(coverage);
+    }
+    !matches!(mask, RowAddrMask::AllowList(rows) if rows.is_empty())
+}
+
 #[async_trait]
 impl PreFilter for DatasetPreFilter {
     /// Waits for the prefilter to be fully loaded
@@ -475,6 +521,13 @@ impl PreFilter for DatasetPreFilter {
         }
         let final_mask = self.final_mask.lock().unwrap();
         final_mask.get_or_init(|| {
+            // Deletions only: `RowAddrMask::default()` selects every row, so the
+            // combined mask is the deletion mask itself. Share it instead of copying.
+            if self.only_deletions()
+                && let Some(deleted_ids) = &self.deleted_ids
+            {
+                return deleted_ids.get_ready();
+            }
             let mut combined = RowAddrMask::default();
             if let Some(filtered_ids) = &self.filtered_ids {
                 combined = combined & filtered_ids.get_ready().as_ref().clone();
@@ -515,6 +568,14 @@ impl PreFilter for DatasetPreFilter {
             .clone()
     }
 
+    fn selects_nothing(&self) -> bool {
+        self.final_mask
+            .lock()
+            .unwrap()
+            .get()
+            .is_some_and(|mask| mask_selects_nothing(mask))
+    }
+
     /// Check whether a slice of row ids should be included in a query.
     ///
     /// Returns a vector of indices into the input slice that should be included,
@@ -530,6 +591,82 @@ impl PreFilter for DatasetPreFilter {
 #[cfg(test)]
 mod test {
     use lance_select::RowSetOps;
+
+    /// Only an empty allow list selects nothing; a block list, even of
+    /// every row the caller knows about, never proves it.
+    #[test]
+    fn selects_nothing_needs_an_empty_allow_list() {
+        use super::mask_selects_nothing;
+        use lance_select::{RowAddrMask, RowAddrTreeMap};
+        let mut rows = RowAddrTreeMap::new();
+        rows.insert_fragment(0);
+        assert!(mask_selects_nothing(&RowAddrMask::allow_nothing()));
+        assert!(!mask_selects_nothing(&RowAddrMask::from_allowed(
+            rows.clone()
+        )));
+        assert!(!mask_selects_nothing(&RowAddrMask::from_block(rows)));
+        assert!(!mask_selects_nothing(&RowAddrMask::all_rows()));
+    }
+
+    /// Emptiness is proven only from the mask and a known row set or, in
+    /// the address domain, known coverage; unknown coverage, a row-id mask
+    /// without a row set, or a block list keep the segment.
+    #[test]
+    fn segment_match_proof_is_conservative() {
+        use super::prefilter_may_match_segment;
+        use lance_select::{RowAddrMask, RowAddrTreeMap};
+        use roaring::RoaringBitmap;
+        let mut allow = RowAddrTreeMap::new();
+        allow.insert((3u64 << 32) | 4);
+        let allow = RowAddrMask::from_allowed(allow);
+        let others = RoaringBitmap::from_iter([0u32, 1]);
+        let here = RoaringBitmap::from_iter([1u32, 3]);
+        assert!(!prefilter_may_match_segment(
+            &allow,
+            None,
+            Some(&others),
+            true
+        ));
+        assert!(prefilter_may_match_segment(&allow, None, Some(&here), true));
+        assert!(prefilter_may_match_segment(&allow, None, None, true));
+        assert!(prefilter_may_match_segment(
+            &allow,
+            None,
+            Some(&others),
+            false
+        ));
+        let mut rows = RowAddrTreeMap::new();
+        rows.insert((3u64 << 32) | 9);
+        let rows = RowAddrMask::from_allowed(rows);
+        assert!(!prefilter_may_match_segment(
+            &allow,
+            Some(&rows),
+            Some(&here),
+            false
+        ));
+        let mut rows = RowAddrTreeMap::new();
+        rows.insert((3u64 << 32) | 4);
+        let rows = RowAddrMask::from_allowed(rows);
+        assert!(prefilter_may_match_segment(
+            &allow,
+            Some(&rows),
+            Some(&others),
+            false
+        ));
+        let block = RowAddrMask::all_rows();
+        assert!(prefilter_may_match_segment(
+            &block,
+            None,
+            Some(&others),
+            true
+        ));
+        assert!(!prefilter_may_match_segment(
+            &RowAddrMask::allow_nothing(),
+            None,
+            None,
+            false
+        ));
+    }
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use rstest::rstest;
 
@@ -663,6 +800,8 @@ mod test {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let prefilter = DatasetPreFilter::new(Arc::new(dataset), &[index], None);
 
@@ -941,6 +1080,21 @@ mod test {
         .await
         .unwrap();
         assert!(!newer.selected(1 << 32));
+    }
+
+    #[tokio::test]
+    async fn test_deletions_only_prefilter_shares_mask() {
+        let datasets = test_datasets(false).await;
+        let prefilter = DatasetPreFilter::new_restricted_to_fragments(
+            datasets.deletions_no_missing_frags.clone(),
+            RoaringBitmap::from_iter(0..3),
+            None,
+        );
+        assert!(prefilter.only_deletions());
+        prefilter.wait_for_ready().await.unwrap();
+        let deleted = prefilter.deleted_ids.as_ref().unwrap().get_ready();
+        assert!(Arc::ptr_eq(&prefilter.mask(), &deleted));
+        assert!(!prefilter.mask().selected((2 << 32) + 2));
     }
 
     // Regression test for issue #6877.

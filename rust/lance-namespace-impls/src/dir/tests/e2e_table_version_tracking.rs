@@ -1041,6 +1041,310 @@ async fn test_query_table_vector_search() {
     let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 2);
+    assert!(batches[0].column_by_name("query_index").is_none());
+}
+
+#[tokio::test]
+async fn test_query_table_multi_vector_batch_search() {
+    use arrow::array::{Array, AsArray};
+    use arrow::datatypes::Int32Type;
+
+    let (namespace, _temp_dir, table_id) = create_ns_with_vector_table().await;
+    let request = QueryTableRequest {
+        id: Some(table_id),
+        k: 2,
+        vector: Box::new(lance_namespace::models::QueryTableRequestVector {
+            single_vector: None,
+            multi_vector: Some(vec![
+                vec![1.0, 0.0, 0.0, 0.0],
+                vec![0.0, 0.0, 1.0, 0.0],
+                vec![0.0, 1.0, 0.0, 0.0],
+            ]),
+        }),
+        ..Default::default()
+    };
+
+    let bytes = namespace.query_table(request).await.unwrap();
+    let reader = FileReader::try_new(Cursor::new(bytes.to_vec()), None).unwrap();
+    let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+    let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter()).unwrap();
+
+    assert_eq!(batch.num_rows(), 6);
+    let schema = batch.schema();
+    let query_index_field = schema.field(0);
+    assert_eq!(query_index_field.name(), "query_index");
+    assert!(!query_index_field.is_nullable());
+    let query_index = batch["query_index"].as_primitive::<Int32Type>();
+    assert_eq!(query_index.null_count(), 0);
+    assert_eq!(query_index.values().as_ref(), &[0, 0, 1, 1, 2, 2]);
+
+    let ids = batch["id"].as_primitive::<Int32Type>();
+    assert_eq!(ids.value(0), 1);
+    assert_eq!(ids.value(2), 3);
+    assert_eq!(ids.value(4), 2);
+}
+
+#[tokio::test]
+async fn test_query_table_multi_vector_offset_boundary() {
+    let (namespace, _temp_dir, table_id) = create_ns_with_vector_table().await;
+    let vector = || {
+        Box::new(lance_namespace::models::QueryTableRequestVector {
+            single_vector: None,
+            multi_vector: Some(vec![
+                vec![1.0, 0.0, 0.0, 0.0],
+                vec![0.0, 0.0, 1.0, 0.0],
+                vec![0.0, 1.0, 0.0, 0.0],
+            ]),
+        })
+    };
+
+    let request = QueryTableRequest {
+        id: Some(table_id.clone()),
+        k: 2,
+        vector: vector(),
+        offset: Some(0),
+        ..Default::default()
+    };
+    let bytes = namespace.query_table(request).await.unwrap();
+    let reader = FileReader::try_new(Cursor::new(bytes.to_vec()), None).unwrap();
+    let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+    let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter()).unwrap();
+    assert_eq!(batch.num_rows(), 6);
+
+    let request = QueryTableRequest {
+        id: Some(table_id),
+        k: 2,
+        vector: vector(),
+        offset: Some(1),
+        ..Default::default()
+    };
+    let err = namespace.query_table(request).await.unwrap_err();
+    let lance_core::Error::Namespace { source, .. } = &err else {
+        panic!("expected a Namespace error, got: {}", err);
+    };
+    let ns_err = source
+        .downcast_ref::<NamespaceError>()
+        .expect("expected a NamespaceError source");
+    assert_eq!(ns_err.code(), ErrorCode::InvalidInput);
+    assert!(
+        err.to_string()
+            .contains("multi_vector batch search does not support offset > 0"),
+        "unexpected error: {}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn test_query_table_multi_vector_batch_search_with_filter_and_prefilter() {
+    use arrow::array::AsArray;
+    use arrow::datatypes::Int32Type;
+
+    let (namespace, _temp_dir, table_id) = create_ns_with_vector_table().await;
+    let request = QueryTableRequest {
+        id: Some(table_id),
+        k: 1,
+        vector: Box::new(lance_namespace::models::QueryTableRequestVector {
+            single_vector: None,
+            multi_vector: Some(vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]]),
+        }),
+        filter: Some("id = 3".to_string()),
+        prefilter: Some(true),
+        ..Default::default()
+    };
+
+    let bytes = namespace.query_table(request).await.unwrap();
+    let reader = FileReader::try_new(Cursor::new(bytes.to_vec()), None).unwrap();
+    let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+    let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter()).unwrap();
+
+    assert_eq!(batch.num_rows(), 2);
+    let ids = batch["id"].as_primitive::<Int32Type>();
+    assert_eq!(ids.values().as_ref(), &[3, 3]);
+    let query_index = batch["query_index"].as_primitive::<Int32Type>();
+    assert_eq!(query_index.values().as_ref(), &[0, 1]);
+}
+
+#[tokio::test]
+async fn test_query_table_multi_vector_empty_result_keeps_query_index_schema() {
+    let (namespace, _temp_dir, table_id) = create_ns_with_vector_table().await;
+    let request = QueryTableRequest {
+        id: Some(table_id),
+        k: 2,
+        vector: Box::new(lance_namespace::models::QueryTableRequestVector {
+            single_vector: None,
+            multi_vector: Some(vec![vec![1.0, 0.0, 0.0, 0.0]]),
+        }),
+        filter: Some("id > 99".to_string()),
+        prefilter: Some(true),
+        ..Default::default()
+    };
+
+    let bytes = namespace.query_table(request).await.unwrap();
+    let reader = FileReader::try_new(Cursor::new(bytes.to_vec()), None).unwrap();
+    let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+    let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter()).unwrap();
+
+    assert_eq!(batch.num_rows(), 0);
+    let schema = batch.schema();
+    let query_index_field = schema.field(0);
+    assert_eq!(query_index_field.name(), "query_index");
+    assert!(!query_index_field.is_nullable());
+}
+
+#[tokio::test]
+async fn test_query_table_multi_vector_on_multivector_column() {
+    use arrow::array::{Array, FixedSizeListBuilder, Float32Builder, Int32Array, ListBuilder};
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+
+    let (namespace, temp_dir) = create_test_namespace().await;
+
+    let mut builder = ListBuilder::new(FixedSizeListBuilder::new(Float32Builder::new(), 2));
+    for row in [
+        vec![[1.0, 0.0], [0.0, 1.0]],
+        vec![[5.0, 5.0]],
+        vec![[-1.0, 0.0], [0.0, -1.0]],
+    ] {
+        for vector in row {
+            builder.values().values().append_slice(&vector);
+            builder.values().append(true);
+        }
+        builder.append(true);
+    }
+    let vectors = builder.finish();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("vector", vectors.data_type().clone(), true),
+    ]));
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3])), Arc::new(vectors)],
+    )
+    .unwrap();
+    let table_uri = format!("{}/multivec.lance", temp_dir.to_str().unwrap());
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    Dataset::write(reader, &table_uri, None).await.unwrap();
+
+    let request = QueryTableRequest {
+        id: Some(vec!["multivec".to_string()]),
+        k: 1,
+        vector: Box::new(lance_namespace::models::QueryTableRequestVector {
+            single_vector: None,
+            multi_vector: Some(vec![vec![1.0, 0.0], vec![0.0, 1.0]]),
+        }),
+        distance_type: Some("cosine".to_string()),
+        ..Default::default()
+    };
+
+    let bytes = namespace.query_table(request).await.unwrap();
+    let reader = FileReader::try_new(Cursor::new(bytes.to_vec()), None).unwrap();
+    let batches: Vec<_> = reader.into_iter().map(|b| b.unwrap()).collect();
+    let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter()).unwrap();
+
+    assert!(batch.column_by_name("query_index").is_none());
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        batch["id"]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0),
+        1
+    );
+}
+
+#[rstest]
+#[case::ragged_rows(
+    None,
+    Some(vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0]]),
+    "row 0 has 4 values but row 1 has 2"
+)]
+#[case::empty_row(
+    None,
+    Some(vec![vec![1.0, 0.0, 0.0, 0.0], vec![]]),
+    "multi_vector row 1 is empty"
+)]
+#[case::empty_first_row(
+    None,
+    Some(vec![vec![], vec![1.0, 0.0, 0.0, 0.0]]),
+    "multi_vector row 0 is empty"
+)]
+#[case::single_and_multi(
+    Some(vec![1.0, 0.0, 0.0, 0.0]),
+    Some(vec![vec![1.0, 0.0, 0.0, 0.0]]),
+    "provide either single_vector or multi_vector, not both"
+)]
+#[tokio::test]
+async fn test_query_table_rejects_invalid_query_vectors(
+    #[case] single_vector: Option<Vec<f32>>,
+    #[case] multi_vector: Option<Vec<Vec<f32>>>,
+    #[case] expected: &str,
+) {
+    let (namespace, _temp_dir, table_id) = create_ns_with_vector_table().await;
+    let request = QueryTableRequest {
+        id: Some(table_id),
+        k: 2,
+        vector: Box::new(lance_namespace::models::QueryTableRequestVector {
+            single_vector,
+            multi_vector,
+        }),
+        ..Default::default()
+    };
+
+    let err = namespace.query_table(request).await.unwrap_err();
+    let lance_core::Error::Namespace { source, .. } = &err else {
+        panic!("expected a Namespace error, got: {}", err);
+    };
+    let ns_err = source
+        .downcast_ref::<NamespaceError>()
+        .expect("expected a NamespaceError source");
+    assert_eq!(ns_err.code(), ErrorCode::InvalidInput);
+    assert!(
+        err.to_string().contains(expected),
+        "unexpected error: {}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn test_explain_table_query_plan_multi_vector() {
+    use lance_namespace::models::ExplainTableQueryPlanRequest;
+
+    let (namespace, _temp_dir, table_id) = create_ns_with_vector_table().await;
+    let query = QueryTableRequest {
+        k: 2,
+        vector: Box::new(lance_namespace::models::QueryTableRequestVector {
+            single_vector: None,
+            multi_vector: Some(vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]]),
+        }),
+        ..Default::default()
+    };
+    let mut request = ExplainTableQueryPlanRequest::new(query);
+    request.id = Some(table_id);
+
+    let plan = namespace.explain_table_query_plan(request).await.unwrap();
+    assert!(plan.contains("query_index"), "unexpected plan: {}", plan);
+
+    let query = QueryTableRequest {
+        k: 2,
+        vector: Box::new(lance_namespace::models::QueryTableRequestVector {
+            single_vector: None,
+            multi_vector: Some(vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]]),
+        }),
+        offset: Some(1),
+        ..Default::default()
+    };
+    let mut request = ExplainTableQueryPlanRequest::new(query);
+    request.id = Some(vec!["vector_table".to_string()]);
+    let err = namespace
+        .explain_table_query_plan(request)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("multi_vector batch search does not support offset > 0"),
+        "unexpected error: {}",
+        err
+    );
 }
 
 #[tokio::test]
