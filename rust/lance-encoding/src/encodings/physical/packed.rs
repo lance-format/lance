@@ -1151,6 +1151,7 @@ mod tests {
         let DataBlock::Struct(decoded_struct) = decoded else {
             panic!("expected struct datablock after decode");
         };
+        assert_eq!(decoded_struct.children.len(), 2);
 
         let decoded_id = decoded_struct.children[0].as_fixed_width_ref().unwrap();
         assert_eq!(decoded_id.bits_per_value, 32);
@@ -1521,6 +1522,63 @@ mod tests {
             )?;
         let decoded = decompressor.decompress(zipped, 4)?;
 
+        let DataBlock::Struct(decoded_struct) = decoded else {
+            panic!("expected struct datablock after decode");
+        };
+
+        let decoded_id = decoded_struct.children[0].as_fixed_width_ref().unwrap();
+        assert_eq!(decoded_id.bits_per_value, 32);
+        assert_eq!(decoded_id.data.as_ref(), id_block.data.as_ref());
+
+        let decoded_value = decoded_struct.children[1].as_fixed_width_ref().unwrap();
+        assert_eq!(decoded_value.bits_per_value, 64);
+        assert_eq!(decoded_value.data.as_ref(), value_block.data.as_ref());
+
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_packed_struct_miniblock_round_trip() -> Result<()> {
+        let id_block = fixed_i32_block_from_array(Int32Array::from(vec![1, 2, 3]));
+        let value_block = fixed_block_from_array(Int64Array::from(vec![10, 20, 30]));
+
+        let mut struct_block = DataBlock::Struct(StructDataBlock {
+            children: vec![
+                DataBlock::FixedWidth(id_block.clone()),
+                DataBlock::FixedWidth(value_block.clone()),
+            ],
+            block_info: BlockInfo::new(),
+            validity: None,
+        });
+        struct_block.compute_stat();
+
+        let compressor = PackedStructFixedWidthMiniBlockEncoder::default();
+        let (compressed, encoding) = compressor.compress(
+            MiniBlockCompressionContext::new(0, false, true),
+            struct_block,
+        )?;
+
+        let Compression::PackedStruct(packed) = encoding.compression.as_ref().unwrap() else {
+            panic!("expected packed struct mini-block encoding");
+        };
+        assert_eq!(packed.bits_per_value, vec![32, 64]);
+
+        let mut expected = Vec::new();
+        for row in 0..3 {
+            let id_start = row * 4;
+            expected.extend_from_slice(&id_block.data.as_ref()[id_start..id_start + 4]);
+            let value_start = row * 8;
+            expected.extend_from_slice(&value_block.data.as_ref()[value_start..value_start + 8]);
+        }
+        assert_eq!(compressed.data.len(), 1);
+        assert_eq!(compressed.data[0].as_ref(), expected.as_slice());
+
+        let decompressor = PackedStructFixedWidthMiniBlockDecompressor::try_new(packed)?;
+        let decoded = MiniBlockDecompressor::decompress(
+            &decompressor,
+            compressed.data,
+            compressed.num_values,
+        )?;
         let DataBlock::Struct(decoded_struct) = decoded else {
             panic!("expected struct datablock after decode");
         };
