@@ -924,8 +924,7 @@ impl Dataset {
             io_stats: metrics.io_stats(),
         };
         let resolved =
-            frag_reuse::open_row_id_remapping_with_plan(self, index_meta, staged, purpose, metrics)
-                .await?;
+            frag_reuse::open_row_id_remapping_with_plan(self, index_meta, staged, purpose).await?;
         // The index state (paths, model, quantizer metadata) and a legacy
         // whole-index entry embed no translated rows: they live in the plain
         // per-index namespace and stay warm across appends and unrelated

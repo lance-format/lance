@@ -213,6 +213,11 @@ fn is_caught_up_with_version(
 }
 
 impl LegacyHistory {
+    fn translation(&self) -> &Arc<LegacyRemapper> {
+        self.1
+            .get_or_init(|| Arc::new(LegacyRemapper::new(self.versions())))
+    }
+
     fn versions(&self) -> impl Iterator<Item = &pb::Version> {
         self.0
             .stored
@@ -373,10 +378,11 @@ impl FriImpl for LegacyHistory {
     /// it moves addresses through every compaction version and ignores the
     /// plan's coverage, as released readers did. It never reads mappings.
     fn bind(&self, _plan: TranslationPlan, _mappings: Arc<dyn MappingSource>) -> Remapper {
-        let translation = self
-            .1
-            .get_or_init(|| Arc::new(LegacyRemapper::new(self.versions())));
-        Remapper::from_backing(translation.clone())
+        Remapper::from_backing(self.translation().clone())
+    }
+
+    fn legacy_compact_index(&self) -> Option<Result<Arc<CompactFragReuseIndex>>> {
+        Some(self.translation().compact_index())
     }
 }
 

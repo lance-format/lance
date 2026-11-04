@@ -1255,14 +1255,10 @@ mod tests {
                 .contains("Refusing to apply the fragment reuse index to index `category_idx`"),
             "{error}"
         );
-        let error = crate::index::frag_reuse::open_row_id_remapping(
-            &dataset,
-            &hidden("vec_idx"),
-            &NoOpMetricsCollector,
-        )
-        .await
-        .err()
-        .unwrap();
+        let error = crate::index::frag_reuse::open_row_id_remapping(&dataset, &hidden("vec_idx"))
+            .await
+            .err()
+            .unwrap();
         assert!(
             error
                 .to_string()

@@ -18,6 +18,7 @@ use lance_select::Remapper;
 use roaring::RoaringBitmap;
 
 use super::{FriImpl, Records};
+use crate::system_index::frag_reuse::CompactFragReuseIndex;
 use crate::system_index::frag_reuse::history::{HistoryFormat, RewriteRecord};
 use crate::system_index::frag_reuse::mapping::MappingSource;
 use crate::system_index::frag_reuse::plan::{
@@ -109,5 +110,9 @@ impl FriImpl for LegacySridHistory {
 
     fn bind(&self, plan: TranslationPlan, mappings: Arc<dyn MappingSource>) -> Remapper {
         self.0.bind(plan, mappings)
+    }
+
+    fn legacy_compact_index(&self) -> Option<Result<Arc<CompactFragReuseIndex>>> {
+        self.0.legacy_compact_index()
     }
 }

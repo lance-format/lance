@@ -11,7 +11,6 @@ pub(crate) use entry::{
 use entry::{fri_external_location, read_fri_external_file};
 
 use crate::Dataset;
-use crate::index::loading::DatasetIndexInternalExt;
 use crate::session::index_caches::FragReuseDetailsKey;
 use lance_core::Error;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
@@ -20,7 +19,7 @@ use lance_index::frag_reuse::{
     CompactFragReuseIndex, CompactFragReuseIndexHandle, FRAG_REUSE_INDEX_NAME, FragReuseGroup,
     FragReuseIndexDetails, FragReuseVersion,
 };
-use lance_index::scalar::{MetricsCollector, Remapper, RowIdRemapper};
+use lance_index::scalar::{Remapper, RowIdRemapper};
 use lance_io::object_store::{ObjectStore, ObjectStoreRegistry};
 use lance_table::format::pb::FragmentReuseIndexDetails;
 use lance_table::format::pb::fragment_reuse_index_details::{
@@ -46,14 +45,24 @@ use uuid::Uuid;
 /// The remapper resolved for one index open.
 ///
 /// The FRI version picks the interface and the segment's need picks the
-/// behavior: `V0` feeds the pre-existing synchronous consumers exactly as
-/// before tagged histories existed; `V1Identity` carries no remapper at all
-/// (the segment's rows are untouched, so the plugin's original load path
+/// behavior: `V0` carries the version 0 history, which plugins with a
+/// remapping loader bind a [`Remapper`] from and the rest apply as the
+/// synchronous remapper; `V1Identity` carries no remapper at all (the
+/// segment's rows are untouched, so the plugin's original load path
 /// applies); `V1Translate` carries the plan a [`Remapper`] is bound from.
 #[derive(Clone)]
 pub(crate) enum ResolvedRemapping {
-    /// A v0 FRI mapping served by the compact in-memory handle.
-    V0(Arc<dyn RowIdRemapper>),
+    /// A version 0 history, as decoded: invalid versions an older writer
+    /// left are dropped. Its synchronous remap (see
+    /// [`Self::legacy_row_id_remapper`]) reaches only plugins without a
+    /// remapping loader, which a query listing leaves out whenever the
+    /// history still moves their rows, so in practice segments opened by
+    /// uuid.
+    V0 {
+        history: FragReuseHistory,
+        /// The `dataset_version` of the FRI entry holding `history`.
+        entry_version: u64,
+    },
     /// A tagged history under which this segment's rows are unchanged.
     V1Identity,
     /// A tagged-history mapping whose payload may need asynchronous reads.
@@ -70,7 +79,7 @@ pub(crate) enum ResolvedRemapping {
 impl std::fmt::Debug for ResolvedRemapping {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::V0(_) => f.debug_tuple("V0").finish_non_exhaustive(),
+            Self::V0 { .. } => f.debug_tuple("V0").finish_non_exhaustive(),
             Self::V1Identity => f.debug_tuple("V1Identity").finish(),
             Self::V1Translate { fingerprint, .. } => {
                 f.debug_tuple("V1Translate").field(fingerprint).finish()
@@ -120,7 +129,7 @@ pub(crate) fn v0_cache_identity(dataset: &Dataset, entry: &IndexMetadata) -> Uui
 /// identity.
 pub(crate) fn fri_cache_id(resolved: &Option<(Uuid, ResolvedRemapping)>) -> Option<&Uuid> {
     match resolved {
-        Some((uuid, ResolvedRemapping::V0(_))) => Some(uuid),
+        Some((uuid, ResolvedRemapping::V0 { .. })) => Some(uuid),
         _ => None,
     }
 }
@@ -569,9 +578,8 @@ pub(crate) async fn plan_staged_segments(
 pub(super) async fn open_row_id_remapping(
     dataset: &Dataset,
     index: &IndexMetadata,
-    metrics: &dyn MetricsCollector,
 ) -> lance_core::Result<Option<(Uuid, ResolvedRemapping)>> {
-    open_row_id_remapping_with_plan(dataset, index, None, OpenPurpose::Query, metrics).await
+    open_row_id_remapping_with_plan(dataset, index, None, OpenPurpose::Query).await
 }
 
 /// [`open_row_id_remapping`] for a segment whose plan the caller supplies
@@ -582,7 +590,6 @@ pub(super) async fn open_row_id_remapping_with_plan(
     index: &IndexMetadata,
     staged: Option<&ReadPlan>,
     purpose: OpenPurpose,
-    metrics: &dyn MetricsCollector,
 ) -> lance_core::Result<Option<(Uuid, ResolvedRemapping)>> {
     // The cheap cached stored listing decides the generation; the per-segment
     // planning is only done inside the once-per-snapshot plan build.
@@ -599,12 +606,17 @@ pub(super) async fn open_row_id_remapping_with_plan(
         index,
     )?;
     if fri.index_version == 0 {
-        return Ok(dataset.open_frag_reuse_index(metrics).await?.map(|legacy| {
-            (
-                v0_cache_identity(dataset, fri),
-                ResolvedRemapping::V0(Arc::new(CompactFragReuseIndexHandle(legacy))),
-            )
-        }));
+        // The decoded history, not the stored details: the details still hold
+        // any invalid version an older writer left, which every other reader
+        // drops.
+        let history = cached_frag_reuse_history(dataset, fri).await?;
+        return Ok(Some((
+            v0_cache_identity(dataset, fri),
+            ResolvedRemapping::V0 {
+                history: history.as_ref().clone(),
+                entry_version: fri.dataset_version,
+            },
+        )));
     }
     if fri.index_version != 1 {
         return Err(Error::not_supported(format!(
@@ -692,7 +704,27 @@ pub(crate) async fn segment_remapper(
             mappings,
             ..
         }) => Ok(Some(translation.clone().bind(mappings.clone()))),
-        Some(ResolvedRemapping::V0(_)) => legacy_segment_remapper(dataset, index).await,
+        Some(ResolvedRemapping::V0 {
+            history,
+            entry_version,
+        }) => legacy_segment_remapper(dataset, *entry_version, history, index).await,
+    }
+}
+
+impl ResolvedRemapping {
+    /// The synchronous remapper the deprecated loaders of a plugin without
+    /// a remapping loader are handed: `None` unless this is a version 0
+    /// history, the only one such a plugin can apply.
+    pub(crate) fn legacy_row_id_remapper(
+        &self,
+    ) -> lance_core::Result<Option<Arc<dyn RowIdRemapper>>> {
+        let Self::V0 { history, .. } = self else {
+            return Ok(None);
+        };
+        let index = history.legacy_compact_index().ok_or_else(|| {
+            Error::internal("a version 0 fragment reuse history has no version 0 remap")
+        })??;
+        Ok(Some(Arc::new(CompactFragReuseIndexHandle(index))))
     }
 }
 
@@ -701,13 +733,13 @@ pub(crate) async fn segment_remapper(
 /// history, whatever its siblings cover.
 fn legacy_segment_plan(
     dataset: &Dataset,
-    fri: &IndexMetadata,
+    entry_version: u64,
     history: &FragReuseHistory,
     index: &IndexMetadata,
     translation: TranslationSupport,
 ) -> ReadPlan {
     let context = ReadContext {
-        entry_version: fri.dataset_version,
+        entry_version,
         live_fragments: &dataset.fragment_bitmap,
     };
     let summary = SegmentSummary {
@@ -728,25 +760,26 @@ fn legacy_segment_plan(
 
 async fn legacy_segment_remapper(
     dataset: &Dataset,
+    entry_version: u64,
+    history: &FragReuseHistory,
     index: &IndexMetadata,
 ) -> lance_core::Result<Option<Remapper>> {
-    let stored = super::loading::load_all_indices(dataset).await?;
-    let Some(fri) = stored
-        .iter()
-        .find(|entry| entry.name == FRAG_REUSE_INDEX_NAME)
-    else {
-        return Ok(None);
-    };
-    let history = cached_frag_reuse_history(dataset, fri).await?;
-    match legacy_segment_plan(dataset, fri, &history, index, TranslationSupport::Supported) {
+    match legacy_segment_plan(
+        dataset,
+        entry_version,
+        history,
+        index,
+        TranslationSupport::Supported,
+    ) {
         ReadPlan::Direct => Ok(None),
         ReadPlan::Translate(translation) => {
             let mappings =
-                super::frag_reuse_remapping::frag_reuse_mapping_source(dataset, &history).await?;
+                super::frag_reuse_remapping::frag_reuse_mapping_source(dataset, history).await?;
             Ok(Some(translation.bind(mappings)))
         }
-        ReadPlan::Excluded => Err(Error::not_supported(format!(
-            "segment {} cannot be translated through the version 0 fragment reuse history",
+        // The version 0 plan excludes only segments that cannot translate.
+        ReadPlan::Excluded => Err(Error::internal(format!(
+            "the version 0 fragment reuse history excluded segment {}, which translates",
             index.uuid
         ))),
     }
@@ -779,7 +812,7 @@ pub(crate) async fn exclude_untranslatable_v0_segments(
                 !untranslatable(index)
                     || legacy_segment_plan(
                         dataset,
-                        fri,
+                        fri.dataset_version,
                         &history,
                         index,
                         TranslationSupport::Unsupported,

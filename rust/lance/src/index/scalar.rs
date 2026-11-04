@@ -892,10 +892,8 @@ pub(crate) async fn open_scalar_index_with_plan(
     let index_details = fetch_index_details(dataset, column, index).await?;
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
 
-    let resolved = super::frag_reuse::open_row_id_remapping_with_plan(
-        dataset, index, staged, purpose, metrics,
-    )
-    .await?;
+    let resolved =
+        super::frag_reuse::open_row_id_remapping_with_plan(dataset, index, staged, purpose).await?;
     let cache_id = super::frag_reuse::fri_cache_id(&resolved);
     let index_cache =
         super::frag_reuse::scoped_index_cache(dataset, &resolved).for_index(&index.uuid, cache_id);
@@ -911,7 +909,9 @@ pub(crate) async fn open_scalar_index_with_plan(
         // its deprecated loader is handed the legacy remapper, as before; a
         // tagged history has no remapper such a plugin can apply.
         None => match resolved.as_ref().map(|(_, remapping)| remapping) {
-            Some(ResolvedRemapping::V0(remapper)) => (None, Some(remapper.clone())),
+            Some(remapping @ ResolvedRemapping::V0 { .. }) => {
+                (None, remapping.legacy_row_id_remapper()?)
+            }
             Some(ResolvedRemapping::V1Identity) | None => (None, None),
             Some(ResolvedRemapping::V1Translate { .. }) => {
                 return Err(Error::not_supported(format!(
@@ -997,7 +997,7 @@ pub(crate) async fn cached_scalar_index_container(
 ) -> Option<Arc<dyn ScalarIndex>> {
     let metadata = dataset.load_indices().await.ok()?;
     let index = metadata.iter().find(|idx| idx.uuid == *uuid)?;
-    let resolved = super::frag_reuse::open_row_id_remapping(dataset, index, &NoOpMetricsCollector)
+    let resolved = super::frag_reuse::open_row_id_remapping(dataset, index)
         .await
         .ok()?;
     let cache_id = super::frag_reuse::fri_cache_id(&resolved);

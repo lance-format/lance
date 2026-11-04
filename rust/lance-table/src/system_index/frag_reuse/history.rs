@@ -43,7 +43,7 @@ use super::ledger::{
     verify_external_content,
 };
 use super::plan::{ReadContext, ReadPlan, SegmentSummary};
-use super::{FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME};
+use super::{CompactFragReuseIndex, FRAG_REUSE_DETAILS_FILE_NAME, FRAG_REUSE_INDEX_NAME};
 use crate::format::pb::ExternalFile;
 use crate::format::pb::fragment_reuse_index_details as pb;
 use crate::format::{Fragment, IndexMetadata};
@@ -521,6 +521,20 @@ impl FragReuseHistory {
     #[cfg(test)]
     pub(crate) fn is_caught_up(&self, entry_version: u64, segment: &SegmentSummary) -> bool {
         self.0.is_caught_up(entry_version, segment)
+    }
+
+    /// The synchronous remap of a version 0 history, as decoded (so after
+    /// [`Self::decode`] dropped any invalid version), for index plugins that
+    /// implement only the deprecated loaders. It is the remap a bound
+    /// version 0 translation applies, built once per history. `None` for a
+    /// tagged history, which such plugins cannot translate through. Fails
+    /// when the history's mappings cannot be decoded.
+    ///
+    /// Used by `lance`'s deprecated index load path; not part of the stable
+    /// interface.
+    #[doc(hidden)]
+    pub fn legacy_compact_index(&self) -> Option<Result<Arc<CompactFragReuseIndex>>> {
+        self.0.legacy_compact_index()
     }
 
     /// Whether [`Self::plan`] consults `segment.translation`. Computing it can

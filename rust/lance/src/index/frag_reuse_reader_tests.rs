@@ -1077,10 +1077,9 @@ async fn assert_legacy_metadata(dataset: &Dataset) -> Option<IndexMetadata> {
         .iter()
         .filter(|index| index.name != FRAG_REUSE_INDEX_NAME)
     {
-        let resolved =
-            super::super::frag_reuse::open_row_id_remapping(dataset, index, &NoOpMetricsCollector)
-                .await
-                .unwrap();
+        let resolved = super::super::frag_reuse::open_row_id_remapping(dataset, index)
+            .await
+            .unwrap();
         if let Some(fri) = fri {
             assert_eq!(fri.index_version, 0);
             let (uuid, remapping) = resolved.unwrap();
@@ -1088,9 +1087,10 @@ async fn assert_legacy_metadata(dataset: &Dataset) -> Option<IndexMetadata> {
                 uuid,
                 super::super::frag_reuse::v0_cache_identity(dataset, fri)
             );
-            let super::super::frag_reuse::ResolvedRemapping::V0(remapper) = remapping else {
-                panic!("V1 must use the synchronous remapper");
-            };
+            let remapper = remapping
+                .legacy_row_id_remapper()
+                .unwrap()
+                .expect("a version 0 history hands loaders the synchronous remapper");
             let legacy = dataset
                 .open_frag_reuse_index(&NoOpMetricsCollector)
                 .await
@@ -1115,6 +1115,147 @@ async fn assert_legacy_metadata(dataset: &Dataset) -> Option<IndexMetadata> {
         }
     }
     fri.cloned()
+}
+
+/// A stored version 0 history an older writer left invalid is read repaired
+/// on every path: the synchronous remapper a plugin without a remapping
+/// loader is handed answers exactly as the remapper a built-in index binds,
+/// not as the stored details would.
+#[tokio::test]
+async fn legacy_synchronous_remapper_reads_the_repaired_history() {
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
+    use crate::dataset::transaction::{Operation, Transaction};
+    use lance_core::utils::address::RowAddress;
+    use lance_index::frag_reuse::{FragDigest, FragReuseGroup, FragReuseIndexDetails};
+
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .into_ram_dataset(FragmentCount::from(4), FragmentRowCount::from(10))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["i"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 20,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let produced = dataset.fragments()[0].id;
+    assert_eq!(dataset.fragments()[0].physical_rows, Some(20));
+
+    // Plant a version that reads half of a fragment the first one produced
+    // with 20 rows: it does not fit the lineage, so decoding drops it, but
+    // the compact remap of the stored details applies it.
+    let entry = dataset
+        .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut versions = crate::index::frag_reuse::load_frag_reuse_index_details(&dataset, &entry)
+        .await
+        .unwrap()
+        .versions
+        .clone();
+    let digest = |id: u64| FragDigest {
+        id,
+        physical_rows: 10,
+        num_deleted_rows: 0,
+    };
+    let mut rows = roaring::RoaringTreemap::new();
+    rows.insert_range(
+        u64::from(RowAddress::new_from_parts(produced as u32, 0))
+            ..u64::from(RowAddress::new_from_parts(produced as u32, 10)),
+    );
+    let mut changed_row_addrs = Vec::new();
+    rows.serialize_into(&mut changed_row_addrs).unwrap();
+    versions.push(lance_index::frag_reuse::FragReuseVersion {
+        dataset_version: dataset.manifest.version,
+        groups: vec![FragReuseGroup {
+            changed_row_addrs,
+            old_frags: vec![digest(produced)],
+            new_frags: vec![digest(100)],
+        }],
+    });
+    let details = FragReuseIndexDetails { versions };
+    let bitmap = details.new_frag_bitmap();
+    let planted = crate::utils::test::legacy_frag_reuse_entry(&dataset, details, bitmap)
+        .await
+        .unwrap();
+    dataset
+        .apply_commit(
+            Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![planted],
+                    removed_indices: vec![entry],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+    let segment = dataset
+        .load_indices_by_name("i_idx")
+        .await
+        .unwrap()
+        .remove(0);
+    let (_, resolved) = crate::index::frag_reuse::open_row_id_remapping(&dataset, &segment)
+        .await
+        .unwrap()
+        .unwrap();
+    let synchronous = resolved.legacy_row_id_remapper().unwrap().unwrap();
+    let bound = crate::index::frag_reuse::segment_remapper(
+        &dataset,
+        &segment,
+        &Some((Uuid::nil(), resolved)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let stored = dataset
+        .open_frag_reuse_index(&NoOpMetricsCollector)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let addresses: Vec<u64> = (0..4)
+        .chain([produced as u32])
+        .flat_map(|fragment| {
+            (0..10).map(move |offset| RowAddress::new_from_parts(fragment, offset).into())
+        })
+        .collect();
+    let mut translated: Vec<Option<u64>> = addresses.iter().copied().map(Some).collect();
+    bound.translate_in_place(&mut translated).await.unwrap();
+    let synchronous: Vec<Option<u64>> = addresses
+        .iter()
+        .map(|&address| synchronous.remap_row_id(address))
+        .collect();
+    assert_eq!(synchronous, translated);
+    let unrepaired: Vec<Option<u64>> = addresses
+        .iter()
+        .map(|&address| stored.remap_row_id(address))
+        .collect();
+    assert_ne!(
+        synchronous, unrepaired,
+        "the planted version must change the stored remap"
+    );
 }
 
 // Exercise external history with the exact InlineContent bytes emitted by
@@ -2004,9 +2145,7 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
         "no plan may exist before the first tagged open"
     );
 
-    let first = open_row_id_remapping(&dataset, &siblings[0], &NoOpMetricsCollector)
-        .await
-        .unwrap();
+    let first = open_row_id_remapping(&dataset, &siblings[0]).await.unwrap();
     assert!(matches!(
         first,
         Some((_, ResolvedRemapping::V1Translate { .. }))
@@ -2052,24 +2191,15 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
     assert_ne!(planned, no_coverage);
     // The pruned plan derives nothing for the sibling: a query opens it as
     // contributing nothing, its fragments being scanned.
-    match open_row_id_remapping(&dataset, &siblings[1], &NoOpMetricsCollector)
-        .await
-        .unwrap()
-    {
+    match open_row_id_remapping(&dataset, &siblings[1]).await.unwrap() {
         Some((_, ResolvedRemapping::V1Translate { fingerprint, .. })) => {
             assert_eq!(fingerprint, no_coverage);
         }
         other => panic!("expected an empty translation, got {other:?}"),
     }
-    match open_row_id_remapping_with_plan(
-        &dataset,
-        &siblings[1],
-        None,
-        OpenPurpose::Maintenance,
-        &NoOpMetricsCollector,
-    )
-    .await
-    .unwrap()
+    match open_row_id_remapping_with_plan(&dataset, &siblings[1], None, OpenPurpose::Maintenance)
+        .await
+        .unwrap()
     {
         Some((_, ResolvedRemapping::V1Translate { fingerprint, .. })) => {
             assert_eq!(fingerprint, no_coverage, "the pruned plan was recomputed");
@@ -2080,9 +2210,7 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
     // With the real plan restored, the sibling opens as a cache hit on the
     // same plan entry; nothing is recomputed or re-published.
     plan_cache.insert_with_key(&key, plan.clone()).await;
-    let second = open_row_id_remapping(&dataset, &siblings[1], &NoOpMetricsCollector)
-        .await
-        .unwrap();
+    let second = open_row_id_remapping(&dataset, &siblings[1]).await.unwrap();
     assert!(matches!(
         second,
         Some((_, ResolvedRemapping::V1Translate { .. }))
@@ -2115,9 +2243,7 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
         .index_cache
         .insert_with_key(&metadata_key, Arc::new(vec![fri.clone()]))
         .await;
-    let warm = open_row_id_remapping(&dataset, &siblings[1], &NoOpMetricsCollector)
-        .await
-        .unwrap();
+    let warm = open_row_id_remapping(&dataset, &siblings[1]).await.unwrap();
     assert!(
         matches!(warm, Some((_, ResolvedRemapping::V1Translate { .. }))),
         "a warm open must resolve purely from the cached plan"
@@ -2132,7 +2258,7 @@ async fn resolver_dispatch_follows_fri_version_and_segment_need() {
     let mut dataset = fixture().await;
     let segment = dataset.load_index_by_name("i_idx").await.unwrap().unwrap();
     assert!(
-        open_row_id_remapping(&dataset, &segment, &NoOpMetricsCollector)
+        open_row_id_remapping(&dataset, &segment)
             .await
             .unwrap()
             .is_none()
@@ -2185,18 +2311,14 @@ async fn resolver_dispatch_follows_fri_version_and_segment_need() {
     // The committed segment covers rewritten fragments: it needs translation.
     let indices = dataset.load_indices().await.unwrap();
     let segment = indices.iter().find(|index| index.name == "i_idx").unwrap();
-    let resolved = open_row_id_remapping(&dataset, segment, &NoOpMetricsCollector)
-        .await
-        .unwrap();
+    let resolved = open_row_id_remapping(&dataset, segment).await.unwrap();
     assert!(
         matches!(resolved, Some((_, ResolvedRemapping::V1Translate { .. }))),
         "{resolved:?}"
     );
 
     // The untouched segment resolves to identity and carries no remapper.
-    let resolved = open_row_id_remapping(&dataset, &untouched, &NoOpMetricsCollector)
-        .await
-        .unwrap();
+    let resolved = open_row_id_remapping(&dataset, &untouched).await.unwrap();
     assert!(
         matches!(resolved, Some((_, ResolvedRemapping::V1Identity))),
         "{resolved:?}"
@@ -2205,9 +2327,7 @@ async fn resolver_dispatch_follows_fri_version_and_segment_need() {
     // A segment absent from the committed listing cannot be resolved.
     let mut unknown = untouched.clone();
     unknown.uuid = Uuid::new_v4();
-    let error = open_row_id_remapping(&dataset, &unknown, &NoOpMetricsCollector)
-        .await
-        .unwrap_err();
+    let error = open_row_id_remapping(&dataset, &unknown).await.unwrap_err();
     assert!(
         error
             .to_string()
@@ -2316,13 +2436,9 @@ async fn legacy_traffic_guard_rejects_batch_entry_points() {
         .clone();
     lance_index::scalar::LEGACY_TRAFFIC_ONLY
         .scope((), async {
-            let error = crate::index::frag_reuse::open_row_id_remapping(
-                &dataset,
-                &segment,
-                &NoOpMetricsCollector,
-            )
-            .await
-            .unwrap_err();
+            let error = crate::index::frag_reuse::open_row_id_remapping(&dataset, &segment)
+                .await
+                .unwrap_err();
             assert!(
                 error.to_string().contains("entered batch row-ID remapping"),
                 "{error}"
@@ -3509,9 +3625,7 @@ async fn identity_segment_survives_two_appends() {
         .clone();
     all.push(untouched.clone());
     persist_fixture(&mut dataset, all).await;
-    let resolved = open_row_id_remapping(&dataset, &untouched, &NoOpMetricsCollector)
-        .await
-        .unwrap();
+    let resolved = open_row_id_remapping(&dataset, &untouched).await.unwrap();
     assert!(matches!(resolved, Some((_, ResolvedRemapping::V1Identity))));
 
     let (loads, before) = open_segment(&dataset, &untouched).await;
@@ -4324,7 +4438,7 @@ async fn segment_state_matrix_at_the_open_layer() {
         let dataset = dataset.clone();
         let segment = segment.clone();
         async move {
-            match open_row_id_remapping(&dataset, &segment, &NoOpMetricsCollector).await {
+            match open_row_id_remapping(&dataset, &segment).await {
                 Ok(_) => Cell::Serves,
                 Err(_) => Cell::Error,
             }
@@ -4339,7 +4453,6 @@ async fn segment_state_matrix_at_the_open_layer() {
                 &segment,
                 None,
                 OpenPurpose::Maintenance,
-                &NoOpMetricsCollector,
             )
             .await
             {
