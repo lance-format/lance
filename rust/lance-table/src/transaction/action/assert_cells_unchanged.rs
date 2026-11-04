@@ -272,21 +272,28 @@ mod tests {
                     )])),
                     true,
                 ),
+                ArrowField::new(
+                    "tags",
+                    DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+                    true,
+                ),
             ]))
             .unwrap();
         manifest
     }
 
     /// What an assertion names is checked against the version it lands on.
-    /// `nested_manifest` holds fragment 0, a top-level `id` (0), and an
-    /// unpacked struct `s` (1) with child `x` (2).
+    /// `nested_manifest` holds fragment 0, a top-level `id` (0), an unpacked
+    /// struct `s` (1) with child `x` (2), and a list `tags` (3) with item (4).
     #[rstest]
     #[case::a_top_level_column(read(&[0], &[0]), None)]
     #[case::no_cells(read(&[], &[]), None)]
     #[case::a_field_beyond_the_read_version(read(&[9], &[0]), Some("names field 9 by a Committed ref"))]
     #[case::a_fragment_beyond_the_read_version(read(&[0], &[7]), Some("fragment 7 by a Committed ref"))]
-    #[case::an_unpacked_struct(read(&[1], &[0]), Some("names field 1 ('s'), which is a struct or inside one"))]
-    #[case::a_struct_child(read(&[2], &[0]), Some("names field 2 ('x'), which is a struct or inside one"))]
+    #[case::an_unpacked_struct(read(&[1], &[0]), Some("names field 1 ('s'), which is nested or holds nested fields"))]
+    #[case::a_struct_child(read(&[2], &[0]), Some("names field 2 ('x'), which is nested or holds nested fields"))]
+    #[case::a_list(read(&[3], &[0]), Some("names field 3 ('tags'), which is nested or holds nested fields"))]
+    #[case::a_list_item(read(&[4], &[0]), Some("names field 4 ('item'), which is nested or holds nested fields"))]
     #[case::a_reserved_id(read(&[-3], &[0]), Some("names reserved field id -3"))]
     #[case::a_field_minted_in_the_operation(
         Action::AssertCellsUnchanged(AssertCellsUnchanged {

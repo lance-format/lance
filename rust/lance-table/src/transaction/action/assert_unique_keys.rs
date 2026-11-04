@@ -219,6 +219,72 @@ mod tests {
         );
     }
 
+    /// Conflict detection matches key fields to written field ids exactly, but
+    /// a write to a nested value is recorded under its descendants' ids -- a
+    /// list overlay under its item's -- so only a top-level leaf column (or a
+    /// packed struct) can be a key. Fields: `id` (0), unpacked struct `s` (1)
+    /// with child `x` (2), list `tags` (3) with item (4).
+    #[rstest::rstest]
+    #[case::a_top_level_column(0, None)]
+    #[case::an_unpacked_struct(
+        1,
+        Some("names field 1 ('s'), which is nested or holds nested fields")
+    )]
+    #[case::a_struct_child(2, Some("names field 2 ('x'), which is nested or holds nested fields"))]
+    #[case::a_list(
+        3,
+        Some("names field 3 ('tags'), which is nested or holds nested fields")
+    )]
+    #[case::a_list_item(
+        4,
+        Some("names field 4 ('item'), which is nested or holds nested fields")
+    )]
+    fn test_asserting_over_a_nested_key_is_rejected(
+        #[case] key_field: i32,
+        #[case] expected_error: Option<&str>,
+    ) {
+        use arrow_schema::{DataType, Field as ArrowField, Fields};
+        let mut manifest = backed_manifest();
+        manifest.schema =
+            lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
+                ArrowField::new("id", DataType::Int32, false),
+                ArrowField::new(
+                    "s",
+                    DataType::Struct(Fields::from(vec![ArrowField::new(
+                        "x",
+                        DataType::Int32,
+                        true,
+                    )])),
+                    true,
+                ),
+                ArrowField::new(
+                    "tags",
+                    DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+                    true,
+                ),
+            ]))
+            .unwrap();
+
+        let result = apply(
+            &manifest,
+            vec![assertion(vec![FieldRef::Committed(key_field)], &[99])],
+        );
+
+        match expected_error {
+            None => {
+                result.unwrap();
+            }
+            Some(message) => {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+                assert!(
+                    error.to_string().contains(message),
+                    "unexpected error: {error}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_inserts_with_disjoint_keys_do_not_conflict() {
         let ours = footprint(vec![
