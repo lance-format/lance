@@ -778,3 +778,135 @@ async fn fragment_reuse_scans_rows_of_plugins_that_cannot_translate(#[case] tagg
         );
     }
 }
+
+/// Under either fragment reuse history format, a segment of a plugin without
+/// a remapping loader stays listed, and answers queries, when the history
+/// moves none of its rows: it covers only fragments no rewrite touched, or it
+/// was built after the rewrite.
+#[rstest]
+#[case::v0(false)]
+#[case::tagged(true)]
+#[tokio::test]
+async fn fragment_reuse_keeps_listing_plugins_that_need_no_translation(#[case] tagged: bool) {
+    LazyLock::force(&REGISTRATION);
+    let directory = tempdir().unwrap();
+    let batch = record_batch!(
+        ("value", Int64, [1, 2, 3, 4]),
+        ("other", Int64, [10, 20, 30, 40]),
+        ("third", Int64, [100, 200, 300, 400])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let write_params = WriteParams {
+        max_rows_per_file: 2,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema.clone()),
+        directory.path().to_str().unwrap(),
+        Some(write_params.clone()),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["other"],
+            IndexType::Scalar,
+            Some("untouched_index".to_string()),
+            &ScalarIndexParams::new("stale".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+    let appended = record_batch!(
+        ("value", Int64, [5, 6]),
+        ("other", Int64, [50, 60]),
+        ("third", Int64, [500, 600])
+    )
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(appended)], schema),
+            Some(write_params),
+        )
+        .await
+        .unwrap();
+    // A built-in index over the appended fragment makes the compaction
+    // record a history.
+    dataset
+        .create_index(
+            &["third"],
+            IndexType::Scalar,
+            Some("btree_index".to_string()),
+            &ScalarIndexParams::new("btree".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset.delete("value = 5").await.unwrap();
+    if tagged {
+        // The sticky flag makes the compaction record a tagged history.
+        let manifest = Arc::make_mut(&mut dataset.manifest);
+        manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+        manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+    }
+    let untouched: Vec<u64> = dataset.fragments()[..2].iter().map(|f| f.id).collect();
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 2,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    // Only the appended fragment, with its deletion, was rewritten.
+    let fragments: Vec<u64> = dataset.fragments().iter().map(|f| f.id).collect();
+    assert_eq!(fragments.len(), 3, "{fragments:?}");
+    assert_eq!(fragments[..2], untouched);
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::Scalar,
+            Some("built_after_index".to_string()),
+            &ScalarIndexParams::new("stale".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let indices = dataset.load_indices().await.unwrap();
+    let fri = indices
+        .iter()
+        .find(|index| index.name == "__lance_frag_reuse")
+        .map(|index| index.index_version);
+    assert_eq!(fri, Some(i32::from(tagged)));
+    for (column, name) in [("other", "untouched_index"), ("value", "built_after_index")] {
+        let segment = indices
+            .iter()
+            .find(|index| index.name == name)
+            .unwrap_or_else(|| panic!("{name} is listed: {indices:?}"));
+        dataset
+            .open_scalar_index(column, &segment.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+    }
+
+    for filter in ["other = 30", "value = 6"] {
+        let mut full_scan = dataset.scan();
+        full_scan.filter(filter).unwrap().use_scalar_index(false);
+        let expected = full_scan.try_into_batch().await.unwrap();
+        assert_eq!(expected.num_rows(), 1, "{filter}");
+        let mut indexed_scan = dataset.scan();
+        indexed_scan.filter(filter).unwrap();
+        let plan = indexed_scan.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ScalarIndexQuery"), "{filter}: {plan}");
+        assert_eq!(
+            indexed_scan.try_into_batch().await.unwrap(),
+            expected,
+            "{filter}"
+        );
+    }
+}
