@@ -3,13 +3,13 @@
 
 //! Fixtures shared by the per-action test modules.
 
-use super::{Action, CompositeOperation, Footprint, UserStep};
+use super::{Action, CompositeOperation, FieldRef, Footprint, Ref, UserStep};
 use crate::format::{BasePath, DataFile, Fragment, IndexMetadata, Manifest};
 use crate::transaction::test_support::{default_build_config, sample_manifest};
 use crate::transaction::{Operation, ReadVersionState, Transaction};
-use arrow_schema::{DataType, Field as ArrowField};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use lance_core::Result;
-use lance_core::datatypes::Field;
+use lance_core::datatypes::{Field, Schema};
 use lance_file::version::ConcreteFileVersion;
 use std::sync::Arc;
 
@@ -109,6 +109,48 @@ pub(super) fn manifest_with_base() -> Manifest {
         BasePath::new(1, "s3://bucket/other".into(), Some("other".into()), false),
     );
     manifest
+}
+
+/// `id`, then a struct `s` holding `x` and `y`: field ids 0, 1, 2, 3. For
+/// tests relating a field to the fields it is nested in or contains.
+pub(super) fn nested_schema() -> Schema {
+    let schema = Schema::try_from(&ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new(
+            "s",
+            DataType::Struct(
+                vec![
+                    ArrowField::new("x", DataType::Int32, true),
+                    ArrowField::new("y", DataType::Int32, true),
+                ]
+                .into(),
+            ),
+            true,
+        ),
+    ]))
+    .unwrap();
+    assert_eq!(schema.field_ids(), vec![0, 1, 2, 3]);
+    schema
+}
+
+/// Tombstone `field` in `fragment` and bind a new file for it, both carrying
+/// `data_change`: a rewrite when true, a re-encode when false.
+pub(super) fn replace_field_data(fragment: u64, field: i32, data_change: bool) -> Vec<Action> {
+    let field_ids = vec![FieldRef::Committed(field)];
+    vec![
+        Action::TombstoneFieldData(super::TombstoneFieldData {
+            fragment: Ref::Committed(fragment),
+            field_ids: field_ids.clone(),
+            data_change,
+        }),
+        Action::AddDataFile(super::AddDataFile {
+            fragment: Ref::Committed(fragment),
+            file: DataFile::new_unstarted("data/replaced.lance", ConcreteFileVersion::V2_0),
+            field_ids,
+            data_change,
+            base: None,
+        }),
+    ]
 }
 
 /// An action minting base token 0 at a location no fixture uses.

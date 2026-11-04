@@ -3966,6 +3966,98 @@ mod composite {
         );
     }
 
+    /// Two fragments of a packed `s.x`, and a BTree on `s.x` staged over
+    /// fragment 0 but not committed. The segment records the child's field id.
+    async fn packed_table_with_staged_child_index() -> (Dataset, IndexMetadata) {
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            })
+            .execute(vec![packed_batch(vec![1, 2, 3, 4])])
+            .await
+            .unwrap();
+        let staged = dataset
+            .create_index_builder(&["s.x"], IndexType::BTree, &ScalarIndexParams::default())
+            .name("by_x".into())
+            .fragments(vec![0])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        assert_eq!(staged.fields, vec![1]);
+        (dataset, staged)
+    }
+
+    /// Rewrite fragment 0's `s` with new values. A packed struct is written
+    /// under the parent's field id alone.
+    async fn rewrite_packed_parent(dataset: &Dataset) -> Vec<Action> {
+        let (fragment_id, file) = dataset
+            .get_fragments()
+            .remove(0)
+            .write_columns(
+                stream::iter(vec![Ok(packed_batch(vec![9, 10]))]),
+                dataset.schema(),
+            )
+            .await
+            .map(|group| (group.0, group.1))
+            .unwrap();
+        assert_eq!(file.fields.as_ref(), &[0]);
+        vec![
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(fragment_id),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment_id),
+                file: without_fields(file),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: true,
+                base: None,
+            }),
+        ]
+    }
+
+    /// The segment was built from the child values the parent rewrite
+    /// replaced, and requires only the child's id, which the rewrite does not
+    /// name. Committed after the rewrite, it would answer `s.x = 9` from the
+    /// old values.
+    #[tokio::test]
+    async fn test_a_child_index_staged_before_a_packed_parent_rewrite_conflicts_with_it() {
+        let (dataset, staged) = packed_table_with_staged_child_index().await;
+        let stale = Arc::new(dataset.clone());
+        let rewrite = rewrite_packed_parent(&dataset).await;
+        commit(dataset, rewrite).await;
+
+        let error = commit_from_stale(stale, vec![add_built_segment(staged)])
+            .await
+            .expect_err("the segment describes child values the parent rewrite replaced");
+
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
+    }
+
+    /// The other order: the rewrite lands on the published segment and prunes
+    /// fragment 0 from it, so the indexed predicate falls back to a scan there.
+    #[tokio::test]
+    async fn test_a_packed_parent_rewrite_after_a_child_index_prunes_it() {
+        let (dataset, staged) = packed_table_with_staged_child_index().await;
+        let stale = Arc::new(dataset.clone());
+        let rewrite = rewrite_packed_parent(&dataset).await;
+        commit(dataset, vec![add_built_segment(staged)]).await;
+
+        let rewritten = commit_from_stale(stale, rewrite).await.unwrap();
+
+        let coverage = index_coverage_opt(&rewritten, "by_x").await;
+        assert!(!coverage.unwrap_or_default().contains(&0));
+        assert_eq!(
+            rewritten.count_rows(Some("s.x = 9".into())).await.unwrap(),
+            1
+        );
+    }
+
     /// An index segment naming `covered`, with no files of its own -- these
     /// tests inspect the manifest's index section rather than opening the index.
     fn index_segment(name: &str, covered: Vec<Ref>) -> AddIndexSegment {

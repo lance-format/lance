@@ -19,6 +19,7 @@
 use super::query_contract::QueryContract;
 use super::{Action, CompositeOperation, FieldRef, Ref};
 use crate::transaction::UpdateMap;
+use lance_core::datatypes::Schema;
 use roaring::RoaringTreemap;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -375,6 +376,11 @@ impl IndexClaim {
 }
 
 impl Footprint {
+    /// Relate this set's index dependencies to the nesting in `schema`.
+    pub fn with_field_ancestry(self, _schema: &Schema) -> Self {
+        self
+    }
+
     /// Whether this set can still commit on top of `committed`, a set that
     /// landed after this one read.
     ///

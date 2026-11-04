@@ -226,7 +226,7 @@ mod tests {
     use super::*;
     use crate::format::{DataFile, IndexMetadata, Manifest};
     use crate::transaction::action::test_support::{
-        apply_with_indices, backed_manifest, footprint,
+        apply_with_indices, backed_manifest, footprint, nested_schema,
     };
     use crate::transaction::action::{
         Action, AddDataFile, AddFragment, AddIndexSegment, FieldRef, RemoveFragment,
@@ -578,6 +578,20 @@ mod tests {
             rewrite.conflicts_with(&widen)
         };
         assert_eq!(conflicts, expected);
+    }
+
+    /// A widening over a child depends on its parent's data too, since a
+    /// packed struct is rewritten under the parent's id. In `nested_schema`,
+    /// `s` is 1 and holds `x` (2).
+    #[test]
+    fn test_widening_over_a_child_loses_to_a_committed_rewrite_of_its_parent() {
+        let schema = nested_schema();
+        let widen =
+            footprint(vec![widen_declaring(vec![2], Vec::new(), 7)]).with_field_ancestry(&schema);
+        let rewrite = footprint(rewrite(7, 1)).with_field_ancestry(&schema);
+
+        assert!(widen.conflicts_with(&rewrite));
+        assert!(!rewrite.conflicts_with(&widen));
     }
 
     /// The order the footprint lets through: the rewrite lands on a version

@@ -432,7 +432,8 @@ mod tests {
     use crate::format::{BasePath, DataFile};
     use crate::transaction::action::query_contract::tests::{DOT, L2, vector_details};
     use crate::transaction::action::test_support::{
-        added_field, apply_with_indices, backed_manifest, footprint,
+        added_field, apply_with_indices, backed_manifest, footprint, nested_schema,
+        replace_field_data,
     };
     use crate::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AdjustIndexCoverage,
@@ -1547,6 +1548,68 @@ mod tests {
         ]);
 
         assert!(build.conflicts_with(&write));
+    }
+
+    /// A packed struct is stored, and rewritten, under the parent's id while an
+    /// index on a child records the child's, so a build depends on the data of
+    /// every field its keyed or carried fields are nested in or contain. In
+    /// `nested_schema`, `s` is 1 and holds `x` (2) and `y` (3); `id` is 0.
+    ///
+    /// Landing second, the rewrite prunes the segment's coverage as it applies,
+    /// walking the same nesting, so that order needs no conflict.
+    #[rstest]
+    #[case::keyed_child_under_a_rewritten_parent(vec![2], vec![], 1, true)]
+    #[case::keyed_parent_over_a_rewritten_child(vec![1], vec![], 2, true)]
+    #[case::carried_child_under_a_rewritten_parent(vec![0], vec![2], 1, true)]
+    #[case::carried_parent_over_a_rewritten_child(vec![0], vec![1], 3, true)]
+    #[case::keyed_child_beside_a_rewritten_sibling(vec![2], vec![], 3, false)]
+    #[case::keyed_child_beside_an_unrelated_rewrite(vec![2], vec![], 0, false)]
+    fn test_a_build_loses_to_a_committed_rewrite_of_a_containing_or_nested_field(
+        #[case] fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+        #[case] rewritten: i32,
+        #[case] expected: bool,
+    ) {
+        let schema = nested_schema();
+        let build = index_footprint(AddIndexSegment {
+            fields: fields.into_iter().map(FieldRef::Committed).collect(),
+            covering_fields: covering_fields
+                .into_iter()
+                .map(FieldRef::Committed)
+                .collect(),
+            ..covering("by_a", Some(vec![0]))
+        })
+        .with_field_ancestry(&schema);
+        let rewrite =
+            footprint(replace_field_data(0, rewritten, true)).with_field_ancestry(&schema);
+
+        assert_eq!(build.conflicts_with(&rewrite), expected);
+        assert!(!rewrite.conflicts_with(&build));
+    }
+
+    /// Relating a build to the parent of its field does not make it collide
+    /// with what it tolerates on its own field: a re-encode of the parent
+    /// leaves every value where the segment found it, and a removal of the
+    /// fragment is visible in the metadata.
+    #[rstest]
+    #[case::reencode_of_the_parent(replace_field_data(0, 1, false))]
+    #[case::removal_of_the_fragment(vec![Action::RemoveFragment(RemoveFragment {
+        fragment: Ref::Committed(0),
+        data_change: true,
+    })])]
+    fn test_a_build_over_a_child_tolerates_moving_its_parent_or_removing_the_fragment(
+        #[case] other: Vec<Action>,
+    ) {
+        let schema = nested_schema();
+        let build = index_footprint(AddIndexSegment {
+            fields: vec![FieldRef::Committed(2)],
+            ..covering("by_a", Some(vec![0]))
+        })
+        .with_field_ancestry(&schema);
+        let other = footprint(other).with_field_ancestry(&schema);
+
+        assert!(!build.conflicts_with(&other));
+        assert!(!other.conflicts_with(&build));
     }
 
     fn index_footprint(action: AddIndexSegment) -> Footprint {
