@@ -7818,8 +7818,8 @@ async fn test_json_btree_index_statistics() {
 
 /// A JSON-wrapped ngram target always needs a recheck. On legacy (V1) datasets
 /// the legacy scanner rechecks by re-materializing the index expression via
-/// `JsonQuery::to_expr`, so a filtered contains-scan must plan and return the
-/// matching rows instead of panicking.
+/// `JsonQuery::to_expr`, so a filtered contains-scan must plan instead of
+/// panicking, and the recheck must drop the ngram false positive.
 #[rstest]
 #[case::legacy(LanceFileVersion::Legacy)]
 #[case::stable(LanceFileVersion::Stable)]
@@ -7829,6 +7829,9 @@ async fn test_json_ngram_recheck_scan(#[case] data_storage_version: LanceFileVer
     let batch = json_batch(vec![
         r#"{"tag": "unique-bravo"}"#,
         r#"{"tag": "alpha-charlie"}"#,
+        // Holds every trigram of "bravo" but not the word, so only the
+        // recheck removes it.
+        r#"{"tag": "brazil ravioli avocado"}"#,
     ]);
     let schema = batch.schema();
     let mut dataset = Dataset::write(

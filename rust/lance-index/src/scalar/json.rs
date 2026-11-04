@@ -538,10 +538,10 @@ impl JsonQuery {
             Some(DataType::Float64) => json_get_float_udf(),
             Some(DataType::Boolean) => json_get_bool_udf(),
             // String-typed targets, and queries with no recoverable value type
-            // (`IS NULL`), recheck through the string accessor: string is the
-            // default JSON target type, and every typed accessor is null on
-            // exactly the rows the index treats as null (path missing or JSON
-            // null), so an `IS NULL` recheck stays correct regardless.
+            // (`IS NULL`), recheck through the string accessor. Training
+            // rejects values whose JSON type does not match the target type
+            // (`validate_json_types`), so on the rows the index returns the
+            // string accessor is null exactly where the typed one is.
             _ => json_get_string_udf(),
         };
         Expr::ScalarFunction(ScalarFunction {
