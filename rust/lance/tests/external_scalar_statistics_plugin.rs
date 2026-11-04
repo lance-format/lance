@@ -135,6 +135,10 @@ impl BasicTrainer for ExampleIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for ExampleIndexPlugin {
+    fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
+        Ok(false)
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -216,9 +220,6 @@ impl ScalarIndex for ExampleIndex {
     ) -> Result<SearchResult> {
         Err(Error::not_supported("statistics do not answer predicates"))
     }
-    fn can_remap(&self) -> bool {
-        false
-    }
     async fn remap(
         &self,
         _mapping: &RowAddrRemap,
@@ -270,6 +271,33 @@ async fn assert_external_index(dataset: &Dataset, rows: u64, coverage: RoaringBi
         .await
         .unwrap();
     assert!(Arc::ptr_eq(&first, &second));
+    let segment_statistics = dataset
+        .index_segment_statistics(&metadata.name, &[metadata.uuid])
+        .await
+        .unwrap();
+    assert_eq!(segment_statistics.len(), 1);
+    assert_eq!(
+        segment_statistics[0].read_version,
+        dataset.version().version
+    );
+    assert_eq!(
+        segment_statistics[0].index_type_uri,
+        ExampleIndexDetails::type_url()
+    );
+    assert_eq!(
+        segment_statistics[0].statistics,
+        serde_json::json!({ "rows": rows })
+    );
+    let expected: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics(&metadata.name).await.unwrap()).unwrap();
+    let actual: serde_json::Value = serde_json::from_str(
+        &dataset
+            .index_statistics_from_segments(&metadata.name, segment_statistics)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
 }
 
 #[test]
@@ -381,7 +409,20 @@ async fn commit_and_reopen_external_segment(#[case] empty_coverage: bool) {
         .unwrap();
     let reopened = Dataset::open(dataset.uri()).await.unwrap();
     assert_eq!(reopened.load_indices().await.unwrap()[0].uuid, uuid);
-    assert_external_index(&reopened, 4, coverage).await;
+    assert_external_index(&reopened, 4, coverage.clone()).await;
+    let descriptions = reopened.describe_indices(None).await.unwrap();
+    assert_eq!(descriptions.len(), 1);
+    if empty_coverage {
+        assert!(
+            descriptions[0].fragment_coverage().is_none(),
+            "an externally maintained empty bitmap does not establish coverage"
+        );
+    } else {
+        assert!(
+            descriptions[0].fragment_coverage().is_some(),
+            "a populated external bitmap remains authoritative coverage"
+        );
+    }
 }
 
 #[tokio::test]
@@ -573,7 +614,11 @@ async fn empty_coverage_survives_compaction(
         .open_scalar_index(columns[0], &before[0].uuid, &NoOpMetricsCollector)
         .await
         .unwrap();
-    assert!(!index.can_remap());
+    assert!(
+        !ExampleIndexPlugin
+            .can_remap(before[0].index_details.as_ref().unwrap())
+            .unwrap()
+    );
     assert_eq!(index.statistics().unwrap()["rows"], 4);
 }
 
@@ -690,6 +735,19 @@ async fn multi_field_scope_preserves_order_on_reopen_rename_and_replace() {
         serde_json::from_str(&dataset.index_statistics("profile").await.unwrap()).unwrap();
     assert_eq!(statistics["indices"][0]["rows"], 4);
     assert_eq!(statistics["num_indexed_rows"], 0);
+    let segment_statistics = dataset
+        .index_segment_statistics("profile", &[before[0].uuid])
+        .await
+        .unwrap();
+    assert_eq!(segment_statistics[0].statistics["rows"], 4);
+    let aggregated: serde_json::Value = serde_json::from_str(
+        &dataset
+            .index_statistics_from_segments("profile", segment_statistics)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(aggregated, statistics);
     let info = dataset.scalar_index_info().await.unwrap();
     assert!(info.get_index("other").is_none());
     assert!(info.get_index("value").is_none());

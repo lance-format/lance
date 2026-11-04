@@ -5,7 +5,7 @@
 
 use crate::Dataset;
 use crate::index::vector::ivf::compaction_vector_segment_merge_groups;
-use crate::index::{DatasetIndexInternalExt, LogicalVectorIndex};
+use crate::index::{LogicalVectorIndex, loading::DatasetIndexInternalExt};
 use futures::{StreamExt, stream};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pb::{VectorIndexDetails, vector_index_details::Compression};

@@ -10,7 +10,7 @@ use crate::dataset::WriteParams;
 use crate::index::create::CreateIndexBuilder;
 use crate::index::frag_reuse_remapping::vector_supports_batch_remapping;
 use crate::index::vector::dedup::{DuplicatePairsOptions, find_duplicate_pairs_with_options};
-use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
+use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
 use crate::session::index_caches::IndexMetadataKey;
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 use arrow_array::types::Int32Type;
@@ -218,7 +218,7 @@ async fn vector_fragment_search_requires_every_contributor(
             .execute_uncommitted()
             .await
             .unwrap();
-        let mut indices = crate::index::load_all_indices(&dataset)
+        let mut indices = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .as_ref()
@@ -458,7 +458,7 @@ async fn destination_coverage_requires_every_contributing_segment(#[case] scenar
     }
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
-    let mut indices = crate::index::load_all_indices(&dataset)
+    let mut indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -486,7 +486,7 @@ async fn destination_coverage_requires_every_contributing_segment(#[case] scenar
             indices[second].index_details = Some(Arc::new(
                 prost_types::Any::from_msg(&lance_index::pb::FmIndexDetails::default()).unwrap(),
             ));
-            assert!(crate::index::index_is_usable(&indices[second]));
+            assert!(crate::index::segment::index_is_usable(&indices[second]));
         }
         "complete" => {}
         _ => unreachable!(),
@@ -566,7 +566,7 @@ async fn direct_destination_coverage_preserves_partial_index_queries(#[case] bot
         .execute_uncommitted()
         .await
         .unwrap();
-    let mut indices = crate::index::load_all_indices(&dataset)
+    let mut indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -606,7 +606,7 @@ async fn projected_coverage_does_not_skip_address_translation() {
     }
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
-    let mut indices = crate::index::load_all_indices(&dataset)
+    let mut indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -853,7 +853,7 @@ async fn translated_fts_preserves_cached_state_after_request_end(#[case] prewarm
     }
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
-    let indices = crate::index::load_all_indices(&dataset)
+    let indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -1076,7 +1076,9 @@ async fn assert_legacy_metadata(dataset: &Dataset) -> Option<IndexMetadata> {
     let flag = lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
     assert_eq!(dataset.manifest.reader_feature_flags & flag, 0);
     assert_eq!(dataset.manifest.writer_feature_flags & flag, 0);
-    let indices = crate::index::load_all_indices(dataset).await.unwrap();
+    let indices = crate::index::loading::load_all_indices(dataset)
+        .await
+        .unwrap();
     let fri = indices
         .iter()
         .find(|index| index.name == FRAG_REUSE_INDEX_NAME);
@@ -1091,7 +1093,10 @@ async fn assert_legacy_metadata(dataset: &Dataset) -> Option<IndexMetadata> {
         if let Some(fri) = fri {
             assert_eq!(fri.index_version, 0);
             let (uuid, remapping) = resolved.unwrap();
-            assert_eq!(uuid, fri.uuid);
+            assert_eq!(
+                uuid,
+                super::super::frag_reuse::v0_cache_identity(dataset, fri)
+            );
             let super::super::frag_reuse::ResolvedRemapping::V0(remapper) = remapping else {
                 panic!("V1 must use the synchronous remapper");
             };
@@ -1124,7 +1129,7 @@ async fn assert_legacy_metadata(dataset: &Dataset) -> Option<IndexMetadata> {
 // Exercise external history with the exact InlineContent bytes emitted by
 // the legacy writer, without manufacturing a 200-KB history in every test.
 async fn externalize_legacy_history(dataset: &mut Dataset) {
-    let mut indices = crate::index::load_all_indices(dataset)
+    let mut indices = crate::index::loading::load_all_indices(dataset)
         .await
         .unwrap()
         .as_ref()
@@ -1398,7 +1403,7 @@ async fn released_v1_dataset_uses_legacy_reader(#[case] external: bool) {
                 externalize_legacy_history(&mut dataset).await;
             }
             for _ in 0..2 {
-                let index = crate::index::load_all_indices(&dataset)
+                let index = crate::index::loading::load_all_indices(&dataset)
                     .await
                     .unwrap()
                     .iter()
@@ -1626,7 +1631,9 @@ async fn released_legacy_fri_keeps_version_zero_on_append() {
             .unwrap();
     let uri = dir.std_path().to_str().unwrap();
     let mut dataset = Dataset::open(uri).await.unwrap();
-    let indices = crate::index::load_all_indices(&dataset).await.unwrap();
+    let indices = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     let fri = indices
         .iter()
         .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
@@ -1677,7 +1684,9 @@ async fn released_legacy_fri_keeps_version_zero_on_append() {
         .unwrap();
     let reopened = Dataset::open(uri).await.unwrap();
     assert_eq!(reopened.count_rows(None).await.unwrap(), original_rows + 1);
-    let indices = crate::index::load_all_indices(&reopened).await.unwrap();
+    let indices = crate::index::loading::load_all_indices(&reopened)
+        .await
+        .unwrap();
     let fri = indices
         .iter()
         .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
@@ -1694,7 +1703,9 @@ async fn legacy_vector_format_is_excluded_from_rewritten_coverage() {
     let mut dataset = Dataset::open(dir.std_path().to_str().unwrap())
         .await
         .unwrap();
-    let indices = crate::index::load_all_indices(&dataset).await.unwrap();
+    let indices = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     let vector = indices
         .iter()
         .find(|index| !index.fields.is_empty())
@@ -1804,7 +1815,7 @@ async fn vector_partition_uses_shared_remapping_and_cached_reconstruction(#[case
     }
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
-    let indices = crate::index::load_all_indices(&dataset)
+    let indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -1926,7 +1937,7 @@ async fn tagged_coverage_filtering_bypasses_system_indexes() {
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
 
-    let mut indices = crate::index::load_all_indices(&dataset)
+    let mut indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -1979,7 +1990,7 @@ async fn tagged_coverage_filtering_bypasses_system_indexes() {
 async fn tagged_remapping_plans_coverage_once_per_snapshot() {
     use crate::index::frag_reuse::{
         FriQueryPlanKey, OpenPurpose, ResolvedRemapping, open_row_id_remapping,
-        open_row_id_remapping_with_plan,
+        open_row_id_remapping_with_plan, resolve_query_segment_coverages,
     };
 
     let mut dataset = fixture().await;
@@ -2049,6 +2060,12 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
         .await
         .expect("the first tagged open must publish the snapshot plan");
     assert!(plan.segments.contains_key(&siblings[1].uuid));
+    let resolved = resolve_query_segment_coverages(&dataset, &siblings.iter().collect::<Vec<_>>())
+        .await
+        .unwrap();
+    for (metadata, coverage) in siblings.iter().zip(resolved) {
+        assert_eq!(Some(coverage), metadata.fragment_bitmap);
+    }
 
     // Later opens must resolve from the published plan instead of re-running
     // the whole-dataset sibling scan: with the sibling dropped from the cached
@@ -2059,6 +2076,15 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
     let mut pruned = plan.as_ref().clone();
     pruned.segments.remove(&siblings[1].uuid);
     plan_cache.insert_with_key(&key, Arc::new(pruned)).await;
+    let no_sibling_coverage = resolve_query_segment_coverages(&dataset, &[&siblings[1]])
+        .await
+        .unwrap_err();
+    assert!(
+        no_sibling_coverage
+            .to_string()
+            .contains("FRI query coverage is unavailable"),
+        "{no_sibling_coverage}"
+    );
     let mapping = FragmentReuseIndex::open(&dataset, fri).await.unwrap();
     let empty = RoaringBitmap::new();
     let no_coverage = mapping.translation_fingerprint(&empty, &empty, &[]);
@@ -2191,7 +2217,7 @@ async fn resolver_dispatch_follows_fri_version_and_segment_need() {
     }
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
-    let mut all = crate::index::load_all_indices(&dataset)
+    let mut all = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -2341,7 +2367,7 @@ async fn legacy_api_plugin_keeps_untouched_segments_available() {
     // The untouched FM segment resolves to identity, loads through the
     // plugin's original entry point, and serves queries: the availability win
     // for legacy-API-only plugins.
-    let mut all = crate::index::load_all_indices(&dataset)
+    let mut all = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -2427,7 +2453,7 @@ async fn tagged_append_preserves_stored_segment_provenance() {
     }
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
-    let indices = crate::index::load_all_indices(&dataset)
+    let indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -2441,7 +2467,7 @@ async fn tagged_append_preserves_stored_segment_provenance() {
             bytes
         })
     };
-    let before: Vec<_> = crate::index::load_all_indices(&dataset)
+    let before: Vec<_> = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .iter()
@@ -2463,7 +2489,9 @@ async fn tagged_append_preserves_stored_segment_provenance() {
 
     // Snapshot-derived coverage must never be persisted back to a manifest:
     // every stored segment keeps byte-identical provenance.
-    let after = crate::index::load_all_indices(&dataset).await.unwrap();
+    let after = crate::index::loading::load_all_indices(&dataset)
+        .await
+        .unwrap();
     for (uuid, bitmap) in &before {
         let stored = after.iter().find(|index| index.uuid == *uuid).unwrap();
         assert_eq!(&serialize(&stored.fragment_bitmap), bitmap, "{uuid}");
@@ -2612,7 +2640,7 @@ async fn fragment_scope_prunes_on_fri_effective_coverage() {
         .execute_uncommitted()
         .await
         .unwrap();
-    let mut indices = crate::index::load_all_indices(&dataset)
+    let mut indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -2908,7 +2936,7 @@ async fn projected_bitmap_with_dropped_transition_scans_not_drops() {
     // Project the index coverage onto the live destination fragments while its
     // stored addresses remain the retired sources. This is the identity-eligible
     // "direct coverage of live fragments" shape the guard must reject.
-    let mut indices = crate::index::load_all_indices(&dataset)
+    let mut indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -3023,7 +3051,7 @@ where
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
     let direct = build(&mut dataset).await;
-    let mut indices = crate::index::load_all_indices(&dataset)
+    let mut indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -3239,7 +3267,7 @@ async fn persisted_translating_fixture() -> Dataset {
     }
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
-    let indices = crate::index::load_all_indices(&dataset)
+    let indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -3354,7 +3382,7 @@ async fn compact_fragment(
 /// Persist a snapshot over exactly the `live` fragments with every index
 /// entry, the FRI included, left as it is.
 async fn persist_live(dataset: &mut Dataset, live: Vec<lance_table::format::Fragment>) {
-    let indices = crate::index::load_all_indices(dataset)
+    let indices = crate::index::loading::load_all_indices(dataset)
         .await
         .unwrap()
         .as_ref()
@@ -3372,7 +3400,7 @@ async fn install_history(
     transitions: Vec<Transition>,
     live: Vec<lance_table::format::Fragment>,
 ) -> IndexMetadata {
-    let mut indices = crate::index::load_all_indices(dataset)
+    let mut indices = crate::index::loading::load_all_indices(dataset)
         .await
         .unwrap()
         .as_ref()
@@ -3432,7 +3460,12 @@ async fn coverage_change_misses_without_new_fri() {
     let mut dataset = persisted_translating_fixture().await;
     let (loads, _) = open_i_idx(&dataset).await;
     assert_eq!(loads, 1);
-    let fri_before = fri_entry(&crate::index::load_all_indices(&dataset).await.unwrap()).uuid;
+    let fri_before = fri_entry(
+        &crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap(),
+    )
+    .uuid;
 
     // F10 holds the even values. Drop it from the manifest (what deleting all
     // of its rows does once tagged maintenance lands) with the FRI entry left
@@ -3449,7 +3482,12 @@ async fn coverage_change_misses_without_new_fri() {
         "{:?}",
         dataset.fragment_bitmap
     );
-    let fri_after = fri_entry(&crate::index::load_all_indices(&dataset).await.unwrap()).uuid;
+    let fri_after = fri_entry(
+        &crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap(),
+    )
+    .uuid;
     assert_eq!(fri_before, fri_after);
 
     let (loads, _) = open_i_idx(&dataset).await;
@@ -3499,7 +3537,12 @@ async fn unrelated_transition_keeps_translated_entries_warm() {
     let mut dataset = persisted_translating_fixture().await;
     let (loads, before) = open_i_idx(&dataset).await;
     assert_eq!(loads, 1);
-    let fri_before = fri_entry(&crate::index::load_all_indices(&dataset).await.unwrap()).uuid;
+    let fri_before = fri_entry(
+        &crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap(),
+    )
+    .uuid;
     let first = decode_transitions(&dataset).await;
 
     let appended = append_rows(&mut dataset, &[100, 101]).await;
@@ -3531,7 +3574,9 @@ async fn unrelated_transition_keeps_translated_entries_warm() {
 
 /// The transitions of the dataset's current (inline) FRI history.
 async fn decode_transitions(dataset: &Dataset) -> Vec<Transition> {
-    let indices = crate::index::load_all_indices(dataset).await.unwrap();
+    let indices = crate::index::loading::load_all_indices(dataset)
+        .await
+        .unwrap();
     let fri = fri_entry(&indices);
     let details = fri.index_details.as_ref().unwrap();
     let details = pb::FragmentReuseIndexDetails::decode(details.value.as_slice()).unwrap();
@@ -3569,7 +3614,7 @@ async fn identity_segment_survives_two_appends() {
     }
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
-    let mut all = crate::index::load_all_indices(&dataset)
+    let mut all = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -3778,7 +3823,7 @@ async fn vector_merge_keeps_translated_coverage_on_tagged_tables() {
     }
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
-    let indices = crate::index::load_all_indices(&dataset)
+    let indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -3835,7 +3880,7 @@ async fn vector_merge_keeps_translated_coverage_on_tagged_tables() {
 
     // One merged segment whose stored bitmap keeps the retired provenance and
     // adds the appended fragment.
-    let stored: Vec<_> = crate::index::load_all_indices(&dataset)
+    let stored: Vec<_> = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .iter()
@@ -3931,7 +3976,7 @@ async fn vector_rebalance_keeps_translated_coverage_on_tagged_tables() {
     }
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
-    let indices = crate::index::load_all_indices(&dataset)
+    let indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -4035,7 +4080,7 @@ async fn inverted_merge_keeps_translated_coverage_on_tagged_tables() {
     }
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
-    let indices = crate::index::load_all_indices(&dataset)
+    let indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -4095,7 +4140,7 @@ async fn inverted_merge_keeps_translated_coverage_on_tagged_tables() {
         .optimize_indices(&OptimizeOptions::merge(2))
         .await
         .unwrap();
-    let stored: Vec<_> = crate::index::load_all_indices(&dataset)
+    let stored: Vec<_> = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .iter()
@@ -4130,14 +4175,14 @@ async fn optimize_is_a_no_op_under_an_unsupported_history() {
     let mut raw = transition.encode_to_vec();
     raw.extend(field(17, b"future mapping"));
     install(&mut dataset, field(2, &raw), destinations, false).await;
-    let indices = crate::index::load_all_indices(&dataset)
+    let indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
         .clone();
     persist_fixture(&mut dataset, indices).await;
     let version = dataset.manifest.version;
-    let before: Vec<Uuid> = crate::index::load_all_indices(&dataset)
+    let before: Vec<Uuid> = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .iter()
@@ -4157,7 +4202,7 @@ async fn optimize_is_a_no_op_under_an_unsupported_history() {
             .await
             .unwrap();
         assert_eq!(dataset.manifest.version, version, "nothing committed");
-        let after: Vec<Uuid> = crate::index::load_all_indices(&dataset)
+        let after: Vec<Uuid> = crate::index::loading::load_all_indices(&dataset)
             .await
             .unwrap()
             .iter()
@@ -4213,7 +4258,7 @@ async fn retrain_rebuilds_a_tagged_index_with_nothing_unindexed() {
     }
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
-    let indices = crate::index::load_all_indices(&dataset)
+    let indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -4227,7 +4272,11 @@ async fn retrain_rebuilds_a_tagged_index_with_nothing_unindexed() {
             .cloned()
             .collect::<Vec<_>>()
     };
-    let before = vector_segments(&crate::index::load_all_indices(&dataset).await.unwrap());
+    let before = vector_segments(
+        &crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap(),
+    );
     assert!(
         dataset
             .unindexed_fragments("vector_idx")
@@ -4245,7 +4294,11 @@ async fn retrain_rebuilds_a_tagged_index_with_nothing_unindexed() {
         .optimize_indices(&OptimizeOptions::retrain())
         .await
         .unwrap();
-    let after = vector_segments(&crate::index::load_all_indices(&dataset).await.unwrap());
+    let after = vector_segments(
+        &crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap(),
+    );
     assert!(
         !after.is_empty()
             && after
@@ -4309,7 +4362,7 @@ async fn segment_state_matrix_at_the_open_layer() {
         .map(|f| f.id as u32)
         .find(|id| !matches!(id, 10 | 11))
         .unwrap();
-    let mut indices = crate::index::load_all_indices(&dataset)
+    let mut indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()
@@ -4615,7 +4668,7 @@ async fn row_map_reads_follow_index_cache_capacity() {
     }
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
-    let indices = crate::index::load_all_indices(&dataset)
+    let indices = crate::index::loading::load_all_indices(&dataset)
         .await
         .unwrap()
         .as_ref()

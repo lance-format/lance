@@ -30,8 +30,8 @@ use geoarrow_array::{
 };
 use geoarrow_schema::{Dimension, LineStringType, PointType, PolygonType};
 use lance_arrow::RecordBatchExt;
-use lance_core::ROW_ID;
 use lance_core::utils::tempfile::TempStrDir;
+use lance_core::{ROW_ADDR, ROW_ID};
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::ScalarIndexParams;
@@ -246,6 +246,95 @@ async fn test_geo_rtree_index() {
 }
 
 #[rstest]
+#[case::without_crs(None, false)]
+#[case::crs_at_build(Some(r#"{"crs":"OGC:CRS84"}"#), true)]
+#[case::crs_added_before_refresh(Some(r#"{"crs":"OGC:CRS84"}"#), false)]
+#[tokio::test]
+async fn test_rtree_crs(#[case] crs_metadata: Option<&str>, #[case] has_crs_at_build: bool) {
+    let point_type = PointType::new(Dimension::XY, Default::default());
+    let mut points = PointBuilder::new(point_type.clone());
+    for x in [Some(1.0), None, Some(10.0), None, Some(2.0), None] {
+        points.push_point(x.map(|x| geo_types::point!(x: x, y: x)).as_ref());
+    }
+    let mut point_field = point_type.to_field("point", true);
+    if has_crs_at_build {
+        point_field.metadata_mut().insert(
+            "ARROW:extension:metadata".to_string(),
+            crs_metadata.unwrap().to_string(),
+        );
+    }
+    let batch = record_batch!(("id", Int32, [0, 1, 2, 3, 4, 5]))
+        .unwrap()
+        .try_with_column(point_field, points.finish().to_array_ref())
+        .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.slice(0, 4))], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    dataset
+        .create_index(
+            &["point"],
+            IndexType::RTree,
+            Some("point_idx".to_string()),
+            &ScalarIndexParams::new("RTree".to_string()),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(batch.slice(4, 2))], batch.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+    if let Some(metadata) = crs_metadata {
+        dataset
+            .update_field_metadata()
+            .update("point", [("ARROW:extension:metadata", metadata)])
+            .unwrap()
+            .await
+            .unwrap();
+    }
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(1))
+        .await
+        .unwrap();
+    let stats: serde_json::Value =
+        serde_json::from_str(&dataset.index_statistics("point_idx").await.unwrap()).unwrap();
+    assert_eq!(stats["num_unindexed_rows"], 0);
+    if let Some(metadata) = crs_metadata {
+        assert_eq!(
+            dataset.schema().field("point").unwrap().metadata["ARROW:extension:metadata"],
+            metadata
+        );
+    }
+    for (predicate, expected) in [
+        (
+            "ST_Intersects(point, ST_GeomFromText('POLYGON ((0 0, 3 0, 3 3, 0 3, 0 0))'))",
+            vec![0, 4],
+        ),
+        ("point IS NULL", vec![1, 3, 5]),
+    ] {
+        let mut scan = dataset.scan();
+        scan.project(&["id"]).unwrap().filter(predicate).unwrap();
+        assert_contains!(scan.explain_plan(false).await.unwrap(), "ScalarIndexQuery");
+        let result = scan.try_into_batch().await.unwrap();
+        let mut ids = result["id"].as_primitive::<Int32Type>().values().to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, expected, "predicate: {predicate}");
+    }
+}
+
+#[rstest]
 #[case::stale_unspecified(false, None)]
 #[case::latest_unspecified(true, None)]
 #[case::stale_rewrite_columns(false, Some(UpdateMode::RewriteColumns))]
@@ -254,6 +343,7 @@ async fn test_geo_rtree_index() {
 async fn test_staged_rtree_after_rewrite_columns(
     #[case] checkout_latest: bool,
     #[case] update_mode: Option<UpdateMode>,
+    #[values(false, true)] from_stream: bool,
 ) {
     let point_type = PointType::new(Dimension::XY, Default::default());
     let mut points = PointBuilder::new(point_type.clone());
@@ -296,26 +386,41 @@ async fn test_staged_rtree_after_rewrite_columns(
         .await
         .unwrap();
 
+    // Row 0 moves to (10 10). The stream form supplies every live row of the
+    // fragment, so row 1 is written back unchanged.
     let mut points = PointBuilder::new(point_type.clone());
     points.push_point(Some(&geo_types::point!(x: 10.0, y: 10.0)));
-    let update = record_batch!((ROW_ID, UInt64, [0]))
-        .unwrap()
-        .try_with_column(
-            point_type.to_field("point", true),
-            points.finish().to_array_ref(),
-        )
-        .unwrap();
-    let update_schema = update.schema();
-    let (fragment, fields_modified) = dataset
-        .get_fragment(0)
-        .unwrap()
-        .update_columns(
-            RecordBatchIterator::new([Ok(update)], update_schema),
-            ROW_ID,
-            ROW_ID,
-        )
-        .await
-        .unwrap();
+    if from_stream {
+        points.push_point(Some(&geo_types::point!(x: 1.0, y: 1.0)));
+    }
+    let points = points.finish().to_array_ref();
+    let mut fragment = dataset.get_fragment(0).unwrap();
+    let (fragment, fields_modified) = if from_stream {
+        let update = record_batch!((ROW_ADDR, UInt64, [0, 1]))
+            .unwrap()
+            .try_with_column(point_type.to_field("point", true), points)
+            .unwrap();
+        let update_schema = update.schema();
+        let result = fragment
+            .update_columns_from_stream(RecordBatchIterator::new([Ok(update)], update_schema), None)
+            .await
+            .unwrap();
+        (result.fragment, result.fields_modified)
+    } else {
+        let update = record_batch!((ROW_ID, UInt64, [0]))
+            .unwrap()
+            .try_with_column(point_type.to_field("point", true), points)
+            .unwrap();
+        let update_schema = update.schema();
+        fragment
+            .update_columns(
+                RecordBatchIterator::new([Ok(update)], update_schema),
+                ROW_ID,
+                ROW_ID,
+            )
+            .await
+            .unwrap()
+    };
     let point_field_id = dataset.schema().field("point").unwrap().id as u32;
     let id_field_id = dataset.schema().field("id").unwrap().id as u32;
     assert!(fields_modified.contains(&point_field_id));
@@ -330,6 +435,7 @@ async fn test_staged_rtree_after_rewrite_columns(
                     fields_modified,
                     removed_fragment_ids: vec![],
                     new_fragments: vec![],
+                    mem_wal_dir_id: None,
                     compacted_sstables: vec![],
                     fields_for_preserving_frag_bitmap: vec![],
                     update_mode,
