@@ -637,9 +637,11 @@ async fn resolve_target_bases(
         base_store_params: dataset.base_store_params.as_deref().cloned(),
         ..Default::default()
     };
+    let effective_base_paths = dataset.effective_base_paths();
     validate_and_resolve_target_bases_with_primary(
         &mut write_params,
         Some(&dataset.manifest.base_paths),
+        Some(&effective_base_paths),
         &dataset.object_store,
         &dataset.base,
         dataset.uri(),

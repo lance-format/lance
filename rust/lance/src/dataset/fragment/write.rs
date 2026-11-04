@@ -230,6 +230,9 @@ impl<'a> FragmentCreateBuilder<'a> {
         let existing_base_paths = existing_dataset
             .as_ref()
             .map(|dataset| &dataset.manifest.base_paths);
+        let effective_base_paths = existing_dataset
+            .as_ref()
+            .map(|dataset| dataset.effective_base_paths());
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
             params.store_registry(),
             self.dataset_uri,
@@ -240,6 +243,7 @@ impl<'a> FragmentCreateBuilder<'a> {
             validate_and_resolve_target_bases_with_primary(
                 &mut params,
                 existing_base_paths,
+                effective_base_paths.as_ref(),
                 &object_store,
                 &base_path,
                 self.dataset_uri,

@@ -140,7 +140,7 @@ use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::statistics::DatasetStatistics;
 use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
 use self::write::cleanup_data_fragments;
-use crate::dataset::branch_location::BranchLocation;
+use crate::dataset::branch_location::{BRANCH_DIR, BranchLocation};
 use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuilder};
 use crate::dataset::refs::{BranchContents, BranchIdentifier, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
@@ -264,6 +264,13 @@ pub struct Dataset {
     pub(crate) manifest_location: ManifestLocation,
     pub(crate) session: Arc<Session>,
     pub refs: Refs,
+
+    /// Names of this branch's ancestors, including the branch itself.
+    ///
+    /// Empty for main or when branch metadata is unavailable. Used to
+    /// distinguish a same-dataset branch base from an external base whose path
+    /// happens to look like one.
+    pub(crate) branch_ancestors: Arc<HashSet<String>>,
 
     // Bitmap of fragment ids in this dataset.
     pub(crate) fragment_bitmap: Arc<RoaringBitmap>,
@@ -690,7 +697,9 @@ impl Dataset {
             .with_object_store(Arc::new(self.object_store.as_ref().clone()))
             .with_commit_handler(self.commit_handler.clone())
             .with_exact_storage_format(self.manifest.data_storage_format.lance_file_format());
-        builder.execute(transaction).await
+        let mut dataset = builder.execute(transaction).await?;
+        dataset.load_branch_ancestors().await?;
+        Ok(dataset)
     }
 
     /// Deletes a branch and removes its directory when safe.
@@ -785,7 +794,7 @@ impl Dataset {
             )));
         }
 
-        Self::checkout_manifest(
+        let mut dataset = Self::checkout_manifest(
             self.object_store.clone(),
             new_location.path,
             new_location.uri,
@@ -796,7 +805,9 @@ impl Dataset {
             self.file_reader_options.clone(),
             self.store_params.as_deref().cloned(),
             self.base_store_params.clone(),
-        )
+        )?;
+        dataset.load_branch_ancestors().await?;
+        Ok(dataset)
     }
 
     pub(crate) async fn load_manifest(
@@ -1024,6 +1035,7 @@ impl Dataset {
             commit_handler,
             session,
             refs,
+            branch_ancestors: Arc::new(HashSet::new()),
             fragment_bitmap,
             metadata_cache,
             index_cache,
@@ -1032,6 +1044,38 @@ impl Dataset {
             base_store_params,
             base_object_stores: Default::default(),
         })
+    }
+
+    /// Populate [`Self::branch_ancestors`] from the branch metadata chain.
+    ///
+    /// Resolution treats a base as a same-dataset branch base only when its
+    /// name is in this chain. If the metadata cannot be read, the set stays
+    /// empty and bases keep their recorded absolute paths.
+    async fn load_branch_ancestors(&mut self) -> Result<()> {
+        let mut ancestors = HashSet::new();
+        let Some(branch) = self.manifest.branch.clone() else {
+            self.branch_ancestors = Arc::new(ancestors);
+            return Ok(());
+        };
+        if self.manifest.base_paths.is_empty() {
+            self.branch_ancestors = Arc::new(ancestors);
+            return Ok(());
+        }
+        ancestors.insert(branch.clone());
+        let mut current = Some(branch);
+        while let Some(name) = current {
+            let Ok(contents) = self.refs.branches().get(&name).await else {
+                break;
+            };
+            current = contents.parent_branch;
+            if let Some(parent) = current.clone()
+                && !ancestors.insert(parent)
+            {
+                break;
+            }
+        }
+        self.branch_ancestors = Arc::new(ancestors);
+        Ok(())
     }
 
     /// Write to or Create a [Dataset] with a stream of [RecordBatch]s.
@@ -2727,6 +2771,81 @@ impl Dataset {
         ))
     }
 
+    /// Resolve a base that names an ancestor branch of this dataset.
+    ///
+    /// `create_branch` records the source branch's absolute URI in
+    /// `base_paths`. When the dataset root is copied, that URI still names the
+    /// original dataset even though the copy holds the source branch's files.
+    /// Resolve the base against the opened dataset when its name is in this
+    /// branch's [`Self::branch_ancestors`] chain.
+    ///
+    /// A named source additionally has to look like the ancestor's
+    /// `tree/<name>` location. External bases, including shallow-clone sources
+    /// whose paths happen to end in `tree/<name>`, are not ancestors and keep
+    /// their absolute path. Main has no branch name, so it is resolved only
+    /// when it is the sole unnamed dataset-root base.
+    fn local_branch_base(&self, base: &lance_table::format::BasePath) -> Option<BranchLocation> {
+        if !base.is_dataset_root || self.manifest.branch.is_none() {
+            return None;
+        }
+
+        let source_branch = match base.name.as_deref() {
+            Some(name) => {
+                if !self.branch_ancestors.contains(name) {
+                    return None;
+                }
+                // A URI may carry a query string; the branch suffix is in the
+                // path part, before the query.
+                let path = base
+                    .path
+                    .split_once('?')
+                    .map_or(base.path.as_str(), |(path, _)| path);
+                if !path.ends_with(&format!("{BRANCH_DIR}/{name}")) {
+                    return None;
+                }
+                Some(name)
+            }
+            None => {
+                let unnamed_roots = self
+                    .manifest
+                    .base_paths
+                    .values()
+                    .filter(|other| other.is_dataset_root && other.name.is_none())
+                    .count();
+                if unnamed_roots != 1 {
+                    return None;
+                }
+                None
+            }
+        };
+
+        self.branch_location()
+            .find_main()
+            .ok()?
+            .find_branch(source_branch)
+            .ok()
+    }
+
+    /// The base bindings used for writes, with relocated same-dataset branch
+    /// bases resolved under this dataset.
+    ///
+    /// Writers must use the same effective location as readers; otherwise a
+    /// successful commit can reference a file the reader looks for somewhere
+    /// else.
+    pub(crate) fn effective_base_paths(&self) -> HashMap<u32, lance_table::format::BasePath> {
+        self.manifest
+            .base_paths
+            .iter()
+            .map(|(id, base)| {
+                let mut effective = base.clone();
+                if let Some(location) = self.local_branch_base(base) {
+                    effective.path = location.uri;
+                }
+                (*id, effective)
+            })
+            .collect()
+    }
+
     /// Resolve the data directory for a given base_id.
     ///
     /// If `base_id` is `None`, returns the default data directory.
@@ -2736,7 +2855,10 @@ impl Dataset {
                 let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
                     Error::invalid_input(format!("base_path id {} not found", base_id))
                 })?;
-                let path = base_path.extract_path(self.session.store_registry())?;
+                let path = self
+                    .local_branch_base(base_path)
+                    .map(|location| location.path)
+                    .unwrap_or(base_path.extract_path(self.session.store_registry())?);
                 if base_path.is_dataset_root {
                     Ok(path.join(DATA_DIR))
                 } else {
@@ -2749,14 +2871,15 @@ impl Dataset {
 
     pub(crate) fn blob_base_path(&self, base_id: Option<u32>) -> Result<Path> {
         match base_id {
-            Some(id) => self
-                .manifest
-                .base_paths
-                .get(&id)
-                .ok_or_else(|| {
+            Some(id) => {
+                let base_path = self.manifest.base_paths.get(&id).ok_or_else(|| {
                     Error::invalid_input(format!("Managed blob references unknown base_id {id}"))
-                })?
-                .extract_path(self.session.store_registry()),
+                })?;
+                match self.local_branch_base(base_path) {
+                    Some(location) => Ok(location.path),
+                    None => base_path.extract_path(self.session.store_registry()),
+                }
+            }
             None => Ok(self.base.clone()),
         }
     }
@@ -2765,6 +2888,9 @@ impl Dataset {
         let base_path = self.manifest.base_paths.get(&base_id).ok_or_else(|| {
             Error::invalid_input(format!("Dataset base path with ID {} not found", base_id))
         })?;
+        if self.local_branch_base(base_path).is_some() {
+            return Ok(self.object_store.clone());
+        }
         if base_path.path == self.uri
             && !self
                 .base_store_params
@@ -2882,7 +3008,10 @@ impl Dataset {
                         base_id, deletion_file
                     )));
                 }
-                base_path.extract_path(self.session.store_registry())
+                match self.local_branch_base(base_path) {
+                    Some(location) => Ok(location.path),
+                    None => base_path.extract_path(self.session.store_registry()),
+                }
             }
             None => Ok(self.base.clone()),
         }
@@ -2899,7 +3028,10 @@ impl Dataset {
                         base_id, index.uuid
                     ))
                 })?;
-                let path = base_path.extract_path(self.session.store_registry())?;
+                let path = self
+                    .local_branch_base(base_path)
+                    .map(|location| location.path)
+                    .unwrap_or(base_path.extract_path(self.session.store_registry())?);
                 if base_path.is_dataset_root {
                     Ok(path.join(INDICES_DIR))
                 } else {
@@ -3903,7 +4035,9 @@ impl Dataset {
                         self.manifest.base_paths.get(&base_id).ok_or_else(|| {
                             Error::internal(format!("base_id {} not found", base_id))
                         })?;
-                    Path::parse(base_path.path.as_str())?
+                    self.local_branch_base(base_path)
+                        .map(|location| location.path)
+                        .unwrap_or(Path::parse(base_path.path.as_str())?)
                 } else {
                     self.base.clone()
                 };
@@ -3950,7 +4084,9 @@ impl Dataset {
                         self.manifest.base_paths.get(&base_id).ok_or_else(|| {
                             Error::internal(format!("base_id {} not found", base_id))
                         })?;
-                    Path::parse(base_path.path.as_str())?
+                    self.local_branch_base(base_path)
+                        .map(|location| location.path)
+                        .unwrap_or(Path::parse(base_path.path.as_str())?)
                 } else {
                     self.base.clone()
                 };
@@ -3985,7 +4121,9 @@ impl Dataset {
                     .base_paths
                     .get(&base_id)
                     .ok_or_else(|| Error::internal(format!("base_id {} not found", base_id)))?;
-                Path::parse(base_path.path.as_str())?
+                self.local_branch_base(base_path)
+                    .map(|location| location.path)
+                    .unwrap_or(Path::parse(base_path.path.as_str())?)
             } else {
                 self.base.clone()
             };

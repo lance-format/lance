@@ -939,7 +939,7 @@ impl DatasetBuilder {
             (manifest, manifest_location)
         };
 
-        Dataset::checkout_manifest(
+        let mut dataset = Dataset::checkout_manifest(
             object_store,
             base_path,
             table_uri,
@@ -950,7 +950,9 @@ impl DatasetBuilder {
             file_reader_options,
             store_params,
             base_store_params,
-        )
+        )?;
+        dataset.load_branch_ancestors().await?;
+        Ok(dataset)
     }
 }
 

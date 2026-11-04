@@ -1372,6 +1372,14 @@ pub async fn validate_and_resolve_target_bases(
     params: &mut WriteParams,
     existing_base_paths: Option<&HashMap<u32, BasePath>>,
 ) -> Result<Option<Vec<TargetBaseInfo>>> {
+    validate_and_resolve_target_bases_impl(params, existing_base_paths, None).await
+}
+
+async fn validate_and_resolve_target_bases_impl(
+    params: &mut WriteParams,
+    existing_base_paths: Option<&HashMap<u32, BasePath>>,
+    effective_base_paths: Option<&HashMap<u32, BasePath>>,
+) -> Result<Option<Vec<TargetBaseInfo>>> {
     // Step 1: Validations
     if !matches!(params.mode, WriteMode::Create) && params.initial_bases.is_some() {
         return Err(Error::invalid_input(format!(
@@ -1461,11 +1469,14 @@ pub async fn validate_and_resolve_target_bases(
                     target_base_id
                 ))
             })?;
+            let store_base = effective_base_paths
+                .and_then(|bases| bases.get(&target_base_id))
+                .unwrap_or(base_path);
 
             let store_params = write_store_params_for_base(params, base_path);
             let (target_object_store, extracted_path) = ObjectStore::from_uri_and_params(
                 store_registry.clone(),
-                &base_path.path,
+                &store_base.path,
                 &store_params,
             )
             .await?;
@@ -1492,6 +1503,7 @@ pub async fn validate_and_resolve_target_bases(
 pub(crate) async fn validate_and_resolve_target_bases_with_primary(
     params: &mut WriteParams,
     existing_base_paths: Option<&HashMap<u32, BasePath>>,
+    effective_base_paths: Option<&HashMap<u32, BasePath>>,
     primary_object_store: &Arc<ObjectStore>,
     primary_base_dir: &Path,
     primary_uri: &str,
@@ -1544,7 +1556,12 @@ pub(crate) async fn validate_and_resolve_target_bases_with_primary(
         .as_ref()
         .is_some_and(|refs| refs.iter().any(|r| r == primary_uri));
     if !has_primary_ids && !has_primary_refs {
-        return validate_and_resolve_target_bases(params, existing_base_paths).await;
+        return validate_and_resolve_target_bases_impl(
+            params,
+            existing_base_paths,
+            effective_base_paths,
+        )
+        .await;
     }
 
     // The delegate below may be skipped when only primary slots remain, so
@@ -1590,7 +1607,12 @@ pub(crate) async fn validate_and_resolve_target_bases_with_primary(
         shim.target_base_names_or_paths = if rest.is_empty() { None } else { Some(rest) };
     }
 
-    let resolved_rest = validate_and_resolve_target_bases(&mut shim, existing_base_paths).await?;
+    let resolved_rest = validate_and_resolve_target_bases_impl(
+        &mut shim,
+        existing_base_paths,
+        effective_base_paths,
+    )
+    .await?;
     // The delegate assigns ids to initial_bases in place; propagate that side
     // effect back so CREATE-mode transactions register properly assigned ids.
     params.initial_bases = shim.initial_bases;

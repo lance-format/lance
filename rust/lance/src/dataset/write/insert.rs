@@ -240,10 +240,12 @@ impl<'a> InsertBuilder<'a> {
 
         self.validate_write(&mut context, &schema)?;
 
+        let effective_base_paths = context.dest.dataset().map(|ds| ds.effective_base_paths());
         let existing_base_paths = context.dest.dataset().map(|ds| &ds.manifest.base_paths);
         let target_base_info = validate_and_resolve_target_bases_with_primary(
             &mut context.params,
             existing_base_paths,
+            effective_base_paths.as_ref(),
             &context.object_store,
             &context.base_path,
             &context.dest.uri(),

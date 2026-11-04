@@ -1218,6 +1218,218 @@ async fn test_create_branch_and_shallow_clone_from_other_branch() {
     );
 }
 
+/// Copying the whole dataset root must make branch bases resolve inside the
+/// copy, not at the absolute source URI recorded by `create_branch`.
+#[tokio::test]
+async fn test_copied_dataset_root_resolves_branch_bases_locally() {
+    let tempdir = TempDir::default();
+    let original = tempdir.std_path().join("original.lance");
+    let copy = tempdir.std_path().join("copy.lance");
+    let original_uri = original.to_str().unwrap().to_string();
+    let copy_uri = copy.to_str().unwrap().to_string();
+
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, &original_uri, None).await.unwrap();
+    let version = dataset.version().version;
+    dataset
+        .create_branch("feature", version, None)
+        .await
+        .unwrap();
+
+    copy_dir_all(&original, &copy);
+    std::fs::remove_dir_all(&original).unwrap();
+
+    let copied = DatasetBuilder::from_uri(&copy_uri)
+        .with_branch("feature", None)
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(copied.count_rows(None).await.unwrap(), 10);
+    let batch = copied.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 10);
+}
+
+/// A branch created from another branch records the parent branch's location.
+/// Copying the root must resolve both generations inside the copy.
+#[tokio::test]
+async fn test_copied_dataset_root_resolves_nested_branch_bases_locally() {
+    let tempdir = TempDir::default();
+    let original = tempdir.std_path().join("original.lance");
+    let copy = tempdir.std_path().join("copy.lance");
+    let original_uri = original.to_str().unwrap().to_string();
+    let copy_uri = copy.to_str().unwrap().to_string();
+
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, &original_uri, None).await.unwrap();
+    let version = dataset.version().version;
+    let mut feature = dataset
+        .create_branch("feature", version, None)
+        .await
+        .unwrap();
+    feature
+        .create_branch("experiment", feature.version().version, None)
+        .await
+        .unwrap();
+
+    copy_dir_all(&original, &copy);
+    std::fs::remove_dir_all(&original).unwrap();
+
+    let copied = DatasetBuilder::from_uri(&copy_uri)
+        .with_branch("experiment", None)
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(copied.count_rows(None).await.unwrap(), 10);
+}
+
+/// Inherited deletion files must resolve inside the copy too.
+#[tokio::test]
+async fn test_copied_dataset_root_resolves_branch_deletions_locally() {
+    let tempdir = TempDir::default();
+    let original = tempdir.std_path().join("original.lance");
+    let copy = tempdir.std_path().join("copy.lance");
+    let original_uri = original.to_str().unwrap().to_string();
+    let copy_uri = copy.to_str().unwrap().to_string();
+
+    let data = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(100), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, &original_uri, None).await.unwrap();
+    dataset.delete("id < 50").await.unwrap();
+    let version = dataset.version().version;
+    dataset
+        .create_branch("feature", version, None)
+        .await
+        .unwrap();
+
+    copy_dir_all(&original, &copy);
+    std::fs::remove_dir_all(&original).unwrap();
+
+    let copied = DatasetBuilder::from_uri(&copy_uri)
+        .with_branch("feature", None)
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(copied.count_rows(None).await.unwrap(), 50);
+}
+
+/// A shallow clone records an external source branch base whose path also ends
+/// in `tree/<name>`. Creating a branch inside the clone must not rebind that
+/// external base to the clone's tree.
+#[tokio::test]
+async fn external_named_branch_base_must_stay_external() {
+    let dir = TempDir::default();
+    let source_uri = dir
+        .std_path()
+        .join("source.lance")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let clone_uri = dir
+        .std_path()
+        .join("clone.lance")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let rows = || {
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1))
+    };
+
+    let mut source = Dataset::write(rows(), &source_uri, None).await.unwrap();
+    let version = source.version().version;
+    let mut feature = source
+        .create_branch("feature", version, None)
+        .await
+        .unwrap();
+    feature.append(rows(), None).await.unwrap();
+    let version = feature.version().version;
+    let mut cloned = feature
+        .shallow_clone(&clone_uri, version, None)
+        .await
+        .unwrap();
+    assert_eq!(cloned.scan().try_into_batch().await.unwrap().num_rows(), 20);
+
+    let version = cloned.version().version;
+    let child = cloned.create_branch("child", version, None).await.unwrap();
+    assert_eq!(child.scan().try_into_batch().await.unwrap().num_rows(), 20);
+}
+
+/// A write targeting an inherited base of a copied branch must land where the
+/// reader resolves that base, not under the source dataset.
+#[tokio::test]
+async fn copied_branch_append_to_registered_bases_must_be_readable() {
+    let dir = TempDir::default();
+    let original = dir.std_path().join("original.lance");
+    let copy = dir.std_path().join("copy.lance");
+    let original_uri = original.to_str().unwrap().to_string();
+    let copy_uri = copy.to_str().unwrap().to_string();
+    let rows = || {
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1))
+    };
+
+    let mut source = Dataset::write(rows(), &original_uri, None).await.unwrap();
+    let version = source.version().version;
+    let mut feature = source
+        .create_branch("feature", version, None)
+        .await
+        .unwrap();
+    feature.append(rows(), None).await.unwrap();
+    let version = feature.version().version;
+    feature.create_branch("child", version, None).await.unwrap();
+
+    copy_dir_all(&original, &copy);
+    let mut copied = DatasetBuilder::from_uri(&copy_uri)
+        .with_branch("child", None)
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(copied.scan().try_into_batch().await.unwrap().num_rows(), 20);
+
+    let feature_base_id = copied
+        .manifest()
+        .base_paths
+        .values()
+        .find(|base| base.name.as_deref() == Some("feature"))
+        .unwrap()
+        .id;
+    assert_ne!(feature_base_id, 0);
+
+    copied
+        .append(
+            rows(),
+            Some(WriteParams::default().with_target_bases(vec![feature_base_id])),
+        )
+        .await
+        .unwrap();
+
+    let file = &copied.manifest().fragments.last().unwrap().files[0];
+    assert_eq!(file.base_id, Some(feature_base_id));
+    assert!(copy.join("tree/feature/data").join(&file.path).exists());
+    assert!(!original.join("tree/feature/data").join(&file.path).exists());
+    assert_eq!(copied.scan().try_into_batch().await.unwrap().num_rows(), 30);
+}
+
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let target = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir_all(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_main_branch_management() {
     let tempdir = TempDir::default();

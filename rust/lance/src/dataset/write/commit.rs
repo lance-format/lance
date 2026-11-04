@@ -621,6 +621,7 @@ impl<'a> CommitBuilder<'a> {
                     session,
                     commit_handler,
                     refs,
+                    branch_ancestors: Default::default(),
                     index_cache,
                     fragment_bitmap,
                     metadata_cache,
