@@ -272,7 +272,7 @@ impl SeedCollector {
         let indices = if consult_indices {
             load_all_indices(dataset).await?
         } else {
-            Vec::new()
+            Default::default()
         };
         let manifest = dataset.manifest.as_ref();
         let writers = seed_writers_for(dataset, &indices, write_schema, SeedWriterPurpose::Collect)
