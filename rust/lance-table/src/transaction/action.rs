@@ -70,6 +70,8 @@ macro_rules! for_each_action {
             RemoveIndexSegment,
             AdjustIndexCoverage,
             DropIndex,
+            AppendFragReuseTransition,
+            TrimFragReuse,
             ReserveFragmentIds,
             ReserveRowIds,
             ResetTable,
@@ -88,6 +90,7 @@ mod add_index_segment;
 mod add_overlays;
 mod adjust_index_coverage;
 mod alter_field;
+mod append_frag_reuse_transition;
 mod apply;
 mod assert_cells_unchanged;
 mod assert_unique_keys;
@@ -105,6 +108,7 @@ mod reset_table;
 mod row_selection;
 mod set_deletion_file;
 mod tombstone_field_data;
+mod trim_frag_reuse;
 mod update_compacted_sstables;
 
 #[cfg(test)]
@@ -118,6 +122,7 @@ pub use add_index_segment::AddIndexSegment;
 pub use add_overlays::AddOverlays;
 pub use adjust_index_coverage::AdjustIndexCoverage;
 pub use alter_field::AlterField;
+pub use append_frag_reuse_transition::{AppendFragReuseTransition, FragReuseMapping};
 pub use assert_cells_unchanged::AssertCellsUnchanged;
 pub use assert_unique_keys::AssertUniqueKeys;
 pub use config_update::{ConfigUpdate, FieldMetadataUpdate};
@@ -132,6 +137,7 @@ pub use reset_table::ResetTable;
 pub use row_selection::{RowSelection, SelectedRows};
 pub use set_deletion_file::SetDeletionFile;
 pub use tombstone_field_data::TombstoneFieldData;
+pub use trim_frag_reuse::TrimFragReuse;
 pub use update_compacted_sstables::UpdateCompactedSsTables;
 
 use apply::ApplyState;
