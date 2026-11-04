@@ -46,8 +46,8 @@ use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::dataset::rowids::{load_row_id_sequences, translate_addr_treemap_to_row_ids};
 use crate::index::scalar::{
-    IndexDetails, TrainingRows, fetch_index_details, load_fts_training_data, load_training_data,
-    scan_training_data,
+    IndexDetails, TrainingRows, TrainingScanOptions, fetch_index_details, load_fts_training_data,
+    load_training_data, scan_training_data,
 };
 use crate::index::vector::details::vector_index_details_default;
 
@@ -752,8 +752,7 @@ async fn load_unindexed_training_data(
         field_path,
         &update_criteria.data_criteria,
         selection,
-        None,
-        None,
+        TrainingScanOptions::default(),
     )
     .await
 }
@@ -796,7 +795,7 @@ async fn rebuild_scalar_segment(
         None,
         true,
         Some(fragment_ids),
-        None,
+        TrainingScanOptions::default(),
     )
     .await?;
     super::scalar::build_scalar_index(
@@ -2062,6 +2061,12 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         )
                         .await?;
                     let update_criteria = reference_index.update_criteria();
+                    let reference_inverted_index = reference_index
+                        .as_any()
+                        .downcast_ref::<InvertedIndex>()
+                        .ok_or_else(|| {
+                            Error::index("expected inverted index training parameters")
+                        })?;
                     if update_criteria.requires_old_data {
                         let params = reference_index.derive_index_params()?;
                         let resolved = resolved_fts.as_ref().ok_or_else(|| {
@@ -2076,6 +2081,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                             None,
                             true,
                             None,
+                            reference_inverted_index.params(),
                         )
                         .await?;
                         let new_uuid = Uuid::new_v4();
@@ -2114,6 +2120,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         fragments,
                         true,
                         None,
+                        reference_inverted_index.params(),
                     )
                     .await?;
 
