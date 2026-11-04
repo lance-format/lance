@@ -350,6 +350,9 @@ enum BlobV2FieldRewritePlan {
         field_id: u32,
         field_name: String,
         output_field: Arc<ArrowField>,
+        /// The layout the column arrives in. A column already in logical layout is
+        /// in its final form, so transforming it hands the array back unchanged.
+        input_layout: Option<BlobV2Layout>,
     },
     Struct {
         field_name: String,
@@ -405,7 +408,8 @@ impl BlobV2FieldRewritePlan {
                     input_field.data_type()
                 )));
             };
-            let output_field = match BlobV2Layout::classify(input_children) {
+            let input_layout = BlobV2Layout::classify(input_children);
+            let output_field = match input_layout {
                 Some(BlobV2Layout::Logical) => Arc::new(input_field.clone()),
                 Some(BlobV2Layout::Descriptor) => transformed_arrow_field(
                     field,
@@ -433,6 +437,7 @@ impl BlobV2FieldRewritePlan {
                 field_id,
                 field_name: field.name.clone(),
                 output_field,
+                input_layout,
             });
         }
 
@@ -516,6 +521,18 @@ impl BlobV2FieldRewritePlan {
         }
     }
 
+    /// Whether transforming this field does anything beyond handing the array back.
+    fn rewrites_anything(&self) -> bool {
+        match self {
+            Self::Passthrough { .. } => false,
+            // Mirrors the Blob arm of `transform`, which returns a logical-layout
+            // array untouched.
+            Self::Blob { input_layout, .. } => *input_layout != Some(BlobV2Layout::Logical),
+            Self::Struct { children, .. } => children.iter().any(|child| child.rewrites_anything()),
+            Self::List { child, .. } | Self::LargeList { child, .. } => child.rewrites_anything(),
+        }
+    }
+
     fn transform<'a>(
         &'a self,
         dataset: &'a Arc<Dataset>,
@@ -530,6 +547,7 @@ impl BlobV2FieldRewritePlan {
                     field_id,
                     field_name,
                     output_field,
+                    ..
                 } => {
                     let struct_arr = array.as_struct();
                     match BlobV2Layout::classify(struct_arr.fields()) {
@@ -774,6 +792,13 @@ impl BlobV2BatchRewritePlan {
 
     pub(crate) fn output_schema(&self) -> &SchemaRef {
         &self.output_schema
+    }
+
+    /// Whether any column of this plan rewrites a Blob v2 value, at any nesting depth.
+    pub(crate) fn rewrites_anything(&self) -> bool {
+        self.columns
+            .iter()
+            .any(|(_, column)| column.rewrites_anything())
     }
 
     pub(crate) async fn transform_batch(

@@ -18,35 +18,16 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema, SchemaRef};
+use arrow_schema::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef,
+};
 use lance_core::ROW_ADDR;
-use lance_core::datatypes::BlobV2Layout;
 use lance_file::version::ConcreteFileVersion;
 use lance_table::feature_flags::managed_blobs_enabled;
 
-use super::rewrite::{BlobV2BatchRewritePlan, field_contains_blob_v2};
+use super::rewrite::BlobV2BatchRewritePlan;
 use crate::dataset::Dataset;
 use crate::{Error, Result};
-
-/// Whether a column arrives in a layout a Blob v2 rewrite has to act on.
-///
-/// Only the descriptor layout needs rewriting: it names a payload the new
-/// fragment must either reference again or materialize. A column already in
-/// logical layout is in its final form, and one that is not a Blob v2 struct at
-/// all — a caller that materialized the column itself, or reused the name for
-/// something else — is not this rewrite's business. Nested blobs are reached
-/// through the struct children.
-fn arrives_as_descriptor(data_type: &ArrowDataType) -> bool {
-    let ArrowDataType::Struct(fields) = data_type else {
-        return false;
-    };
-    if BlobV2Layout::classify(fields) == Some(BlobV2Layout::Descriptor) {
-        return true;
-    }
-    fields
-        .iter()
-        .any(|field| arrives_as_descriptor(field.data_type()))
-}
 
 /// What a plan does to each batch.
 enum Rewrite {
@@ -151,16 +132,33 @@ impl BlobRewritePlan {
         retain_row_addresses: bool,
     ) -> Result<Self> {
         let input_schema = Arc::new(input_schema.clone());
-        let rewrites_blobs = dataset
-            .schema()
-            .fields
-            .iter()
-            .filter(|field| field_contains_blob_v2(field))
-            .any(|field| {
-                input_schema
-                    .column_with_name(&field.name)
-                    .is_some_and(|(_, input)| arrives_as_descriptor(input.data_type()))
-            });
+        let preserve_managed = Self::can_preserve_managed(&dataset)?;
+
+        // Only the plan itself knows which columns it would touch, and it refuses to
+        // be built without a row address column. So ask it on a schema that is the
+        // caller's with a row address column added when missing: one schema clone and
+        // one plan construction, no I/O.
+        let probe_schema = if input_schema.column_with_name(ROW_ADDR).is_none() {
+            let mut fields = input_schema.fields().to_vec();
+            fields.push(Arc::new(ArrowField::new(
+                ROW_ADDR,
+                ArrowDataType::UInt64,
+                false,
+            )));
+            Arc::new(ArrowSchema::new_with_metadata(
+                fields,
+                input_schema.metadata().clone(),
+            ))
+        } else {
+            input_schema.clone()
+        };
+        let rewrites_blobs = BlobV2BatchRewritePlan::try_new(
+            dataset.schema(),
+            probe_schema.as_ref(),
+            retain_row_addresses,
+            preserve_managed,
+        )?
+        .rewrites_anything();
 
         if !rewrites_blobs {
             let drop_row_addresses = !retain_row_addresses;
@@ -198,7 +196,6 @@ impl BlobRewritePlan {
             )));
         }
 
-        let preserve_managed = Self::can_preserve_managed(&dataset)?;
         let inner = BlobV2BatchRewritePlan::try_new(
             dataset.schema(),
             input_schema.as_ref(),
@@ -283,9 +280,12 @@ mod tests {
     use crate::blob::BlobArrayBuilder;
     use crate::blob_field;
     use crate::dataset::WriteParams;
+    use arrow_array::Array;
     use arrow_array::{
-        LargeBinaryArray, RecordBatchIterator, StringArray, StructArray, UInt32Array, UInt64Array,
+        ArrayRef, LargeBinaryArray, LargeListArray, ListArray, RecordBatchIterator, StringArray,
+        StructArray, UInt32Array, UInt64Array,
     };
+    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields, Schema};
     use futures::TryStreamExt;
     use lance_core::datatypes::{BLOB_V2_LOGICAL_TYPE, BlobV2Layout};
@@ -547,5 +547,232 @@ mod tests {
             BlobV2Layout::classify(&blob_output_fields(plan.output_schema(), "blob")),
             Some(BlobV2Layout::Logical)
         );
+    }
+
+    /// A Blob v2 array of `rows` payloads, each 16 bytes of the row index.
+    fn blob_values(rows: usize) -> ArrayRef {
+        let mut blobs = BlobArrayBuilder::new(rows);
+        for row in 0..rows {
+            blobs.push_bytes(vec![row as u8; 16]).unwrap();
+        }
+        blobs.finish().unwrap()
+    }
+
+    /// Write a single-column dataset at V2_2, so its blob payloads are stored
+    /// out of line and the column scans back in descriptor layout.
+    async fn nested_dataset(dir: &TempStrDir, field: Field, array: ArrayRef) -> Arc<Dataset> {
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+        Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(batch)], schema),
+                dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
+    /// The blob struct reached through a list column, by descending `path` from the
+    /// named column through list items and struct children.
+    fn nested_blob_fields(schema: &ArrowSchema, column: &str, path: &[&str]) -> Fields {
+        let mut data_type = schema.field_with_name(column).unwrap().data_type().clone();
+        for step in path {
+            data_type = match (&data_type, *step) {
+                (DataType::List(item), "item") | (DataType::LargeList(item), "item") => {
+                    item.data_type().clone()
+                }
+                (DataType::Struct(children), name) => children
+                    .find(name)
+                    .map(|(_, child)| child.data_type().clone())
+                    .unwrap_or_else(|| panic!("struct has no child '{name}'")),
+                (other, step) => panic!("cannot descend '{step}' into {other:?}"),
+            };
+        }
+        let DataType::Struct(fields) = data_type else {
+            panic!("the path {path:?} should end at the blob struct, got {data_type:?}");
+        };
+        fields
+    }
+
+    /// Assert that a nested descriptor column is found: without row addresses the
+    /// plan is refused, and with them the blob struct is rewritten to logical layout.
+    ///
+    /// Returns the batches scanned with row addresses, so the caller can transform them.
+    async fn assert_nested_blob_is_rewritten(
+        dataset: &Arc<Dataset>,
+        column: &str,
+        path: &[&str],
+    ) -> Vec<RecordBatch> {
+        // (a) The nested descriptor is found, so row addresses are now required.
+        let without = scan_without_row_addresses(dataset).await;
+        let error = BlobRewritePlan::try_new(dataset.clone(), without.schema().as_ref(), false)
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "unexpected error variant: {error:?}"
+        );
+        assert!(error.to_string().contains(ROW_ADDR), "{error}");
+
+        // (b) With row addresses the plan builds, and the nested blob struct changes
+        // from descriptor layout to logical layout.
+        let batches = scan_with_row_addresses(dataset).await;
+        let input_schema = batches[0].schema();
+        assert_eq!(
+            BlobV2Layout::classify(&nested_blob_fields(&input_schema, column, path)),
+            Some(BlobV2Layout::Descriptor),
+            "this test only pins the fix if the column really arrives in descriptor layout"
+        );
+
+        let plan = BlobRewritePlan::try_new(dataset.clone(), input_schema.as_ref(), false).unwrap();
+        let output_schema = plan.output_schema().clone();
+        assert_ne!(
+            output_schema.field_with_name(column).unwrap().data_type(),
+            input_schema.field_with_name(column).unwrap().data_type(),
+            "a rewritten column must not keep its descriptor type"
+        );
+        assert_eq!(
+            BlobV2Layout::classify(&nested_blob_fields(&output_schema, column, path)),
+            Some(BlobV2Layout::Logical)
+        );
+        batches
+    }
+
+    /// Every blob payload reachable under a list column, in row order.
+    fn list_blob_payloads<O: arrow_array::OffsetSizeTrait>(
+        batch: &RecordBatch,
+        column: &str,
+        struct_child: Option<&str>,
+    ) -> Vec<Vec<u8>> {
+        let list = batch
+            .column_by_name(column)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::GenericListArray<O>>()
+            .unwrap();
+        let values = list.values();
+        let blobs = match struct_child {
+            None => values.clone(),
+            Some(name) => values
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap()
+                .column_by_name(name)
+                .unwrap()
+                .clone(),
+        };
+        let blobs = blobs.as_any().downcast_ref::<StructArray>().unwrap();
+        let data = blobs
+            .column_by_name("data")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        (0..data.len())
+            .map(|row| data.value(row).to_vec())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_list_of_descriptor_blobs_is_rewritten_not_passed_through() {
+        let dir = TempStrDir::default();
+        let item = blob_field("item", true);
+        let values = blob_values(2);
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2]));
+        let list: ArrayRef =
+            Arc::new(ListArray::try_new(Arc::new(item.clone()), offsets, values, None).unwrap());
+        let dataset = nested_dataset(
+            &dir,
+            Field::new("blobs", DataType::List(Arc::new(item)), true),
+            list,
+        )
+        .await;
+
+        let batches = assert_nested_blob_is_rewritten(&dataset, "blobs", &["item"]).await;
+
+        // (c) The payloads survive the rewrite and are readable inline.
+        let plan =
+            BlobRewritePlan::try_new(dataset.clone(), batches[0].schema().as_ref(), false).unwrap();
+        let mut payloads = Vec::new();
+        for batch in batches {
+            let rewritten = plan.transform(batch).await.unwrap();
+            assert_eq!(rewritten.schema(), *plan.output_schema());
+            payloads.extend(list_blob_payloads::<i32>(&rewritten, "blobs", None));
+        }
+        assert_eq!(payloads, vec![vec![0u8; 16], vec![1u8; 16]]);
+    }
+
+    #[tokio::test]
+    async fn a_large_list_of_descriptor_blobs_is_rewritten_not_passed_through() {
+        let dir = TempStrDir::default();
+        let item = blob_field("item", true);
+        let values = blob_values(2);
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i64, 1, 2]));
+        let list: ArrayRef = Arc::new(
+            LargeListArray::try_new(Arc::new(item.clone()), offsets, values, None).unwrap(),
+        );
+        let dataset = nested_dataset(
+            &dir,
+            Field::new("blobs", DataType::LargeList(Arc::new(item)), true),
+            list,
+        )
+        .await;
+
+        let batches = assert_nested_blob_is_rewritten(&dataset, "blobs", &["item"]).await;
+
+        // (c) The payloads survive the rewrite and are readable inline.
+        let plan =
+            BlobRewritePlan::try_new(dataset.clone(), batches[0].schema().as_ref(), false).unwrap();
+        let mut payloads = Vec::new();
+        for batch in batches {
+            let rewritten = plan.transform(batch).await.unwrap();
+            assert_eq!(rewritten.schema(), *plan.output_schema());
+            payloads.extend(list_blob_payloads::<i64>(&rewritten, "blobs", None));
+        }
+        assert_eq!(payloads, vec![vec![0u8; 16], vec![1u8; 16]]);
+    }
+
+    #[tokio::test]
+    async fn a_list_of_structs_containing_a_blob_is_rewritten_not_passed_through() {
+        let dir = TempStrDir::default();
+        let item_fields: Fields = vec![
+            Field::new("name", DataType::Utf8, false),
+            blob_field("blob", true),
+        ]
+        .into();
+        let values: ArrayRef = Arc::new(
+            StructArray::try_new(
+                item_fields.clone(),
+                vec![
+                    Arc::new(StringArray::from_iter_values(["zero", "one"])) as ArrayRef,
+                    blob_values(2),
+                ],
+                None,
+            )
+            .unwrap(),
+        );
+        let item = Arc::new(Field::new("item", DataType::Struct(item_fields), true));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2]));
+        let list: ArrayRef =
+            Arc::new(ListArray::try_new(item.clone(), offsets, values, None).unwrap());
+        let dataset =
+            nested_dataset(&dir, Field::new("items", DataType::List(item), true), list).await;
+
+        let batches = assert_nested_blob_is_rewritten(&dataset, "items", &["item", "blob"]).await;
+
+        // (c) The payloads survive the rewrite and are readable inline.
+        let plan =
+            BlobRewritePlan::try_new(dataset.clone(), batches[0].schema().as_ref(), false).unwrap();
+        let mut payloads = Vec::new();
+        for batch in batches {
+            let rewritten = plan.transform(batch).await.unwrap();
+            assert_eq!(rewritten.schema(), *plan.output_schema());
+            payloads.extend(list_blob_payloads::<i32>(&rewritten, "items", Some("blob")));
+        }
+        assert_eq!(payloads, vec![vec![0u8; 16], vec![1u8; 16]]);
     }
 }
