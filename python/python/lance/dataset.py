@@ -5060,7 +5060,14 @@ class LanceDataset(pa.dataset.Dataset):
     def get_transactions(self, recent_transactions=10) -> List[Optional[Transaction]]:
         return self._ds.get_transactions(recent_transactions)
 
-    def sql(self, sql: str) -> "SqlQueryBuilder":
+    def sql(
+        self,
+        sql: str,
+        *,
+        parameters: Optional[
+            Union[Sequence[Any], Dict[str, Any], pa.RecordBatch]
+        ] = None,
+    ) -> "SqlQueryBuilder":
         """Execute SQL query on the dataset.
 
         Parameters
@@ -5068,6 +5075,9 @@ class LanceDataset(pa.dataset.Dataset):
         sql : str
             SQL SELECT statement to execute. The query must reference the dataset
             as the FROM clause or omit the FROM clause to query the current dataset.
+        parameters : sequence, dict, or pyarrow.RecordBatch, optional
+            Values to bind to SQL placeholders. See
+            :meth:`SqlQueryBuilder.parameters` for supported forms.
 
         Returns
         -------
@@ -5084,7 +5094,10 @@ class LanceDataset(pa.dataset.Dataset):
             query.to_batch_records()
 
         """
-        return SqlQueryBuilder(self._ds.sql(sql))
+        builder = SqlQueryBuilder(self._ds.sql(sql))
+        if parameters is not None:
+            builder.parameters(parameters)
+        return builder
 
     def delta(
         self,
