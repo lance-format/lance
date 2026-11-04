@@ -40,7 +40,7 @@ pub(super) fn scalar_plugin_translates(details: &prost_types::Any) -> Option<boo
 ///
 /// Every base a row map lives under is resolved now, so the source holds the
 /// stores but not the dataset: remappers bound to it live in cached indices.
-pub(super) async fn frag_reuse_mapping_source(
+pub async fn frag_reuse_mapping_source(
     dataset: &Dataset,
     history: &FragReuseHistory,
 ) -> Result<Arc<dyn MappingSource>> {

@@ -22,6 +22,7 @@ use roaring::RoaringBitmap;
 
 use crate::metrics::MetricsCollector;
 use crate::scalar::lance_format::LanceIndexStore;
+#[allow(deprecated)]
 use crate::scalar::{
     AnyQuery, BatchRowIdRemapper, CreatedIndex, IndexStore, RemapUnavailable, RowAddrTranslator,
     ScalarIndex, ScalarIndexParams, SearchResult, UpdateCriteria,
@@ -118,6 +119,7 @@ struct Hops {
 }
 
 #[async_trait]
+#[allow(deprecated)]
 impl BatchRowIdRemapper for Hops {
     async fn remap_row_ids(&self, ids: &[u64]) -> Result<Vec<Option<u64>>> {
         self.translations.fetch_add(1, Ordering::Relaxed);
@@ -188,6 +190,7 @@ async fn legacy_only_index_gets_a_synchronous_map_as_it_is() {
 }
 
 #[tokio::test]
+#[allow(deprecated)]
 async fn legacy_only_index_gets_a_complete_materialized_map_once() {
     let (_dir, store) = temp_store();
     let index = LegacyOnlyIndex::new(Some(vec![1, 3]));
@@ -222,6 +225,7 @@ async fn legacy_only_index_gets_a_complete_materialized_map_once() {
 }
 
 #[tokio::test]
+#[allow(deprecated)]
 async fn legacy_only_index_is_left_alone_when_the_fallback_cannot_be_proven() {
     let (_dir, store) = temp_store();
     // Unknown stored fragments.

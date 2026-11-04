@@ -24,6 +24,7 @@ use lance_datafusion_exec::udf::CONTAINS_TOKENS_UDF;
 
 use crate::IndexParams;
 pub use crate::metrics::MetricsCollector;
+#[allow(deprecated)]
 pub use lance_index_core::remapping::{
     BatchRowIdRemapper, DEFAULT_MATERIALIZATION_BUDGET_BYTES, LEGACY_TRAFFIC_ONLY,
     RemapUnavailable, Remapper, RowAddrTranslator, RowAddrTranslatorRef,

@@ -25,8 +25,15 @@ use crate::scalar::RowIdRemapper;
 
 /// Translates a bounded batch of row IDs, allowing encodings to read external data.
 ///
-/// Index rewrites (`remap_streaming`, [`materialize_remap`]) take it; an
-/// index load translates through a [`Remapper`] instead.
+/// Deprecated for loading indices: a plugin translates through the
+/// [`Remapper`] its `RemappingIndexLoader` is handed, and
+/// `ScalarIndexPlugin::load_index_with_remapping`, which took this trait, is
+/// deprecated, and index rewrites translate through
+/// [`RowAddrTranslator::Remapper`].
+#[deprecated(
+    since = "15.0.0",
+    note = "translate through a `Remapper`; a fragment reuse history composes one for index rewrites (`FragReuseHistory::compose`)"
+)]
 #[async_trait]
 pub trait BatchRowIdRemapper: Send + Sync + std::fmt::Debug {
     /// Results correspond to input positions, including duplicates. `None` removes a row.
@@ -49,10 +56,8 @@ pub trait BatchRowIdRemapper: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// The default [`BatchRowIdRemapper::materialization_budget_bytes`]: 256 MiB.
-pub const DEFAULT_MATERIALIZATION_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
-
 pub use lance_select::Remapper;
+pub use lance_select::remapper::{DEFAULT_MATERIALIZATION_BUDGET_BYTES, RemapUnavailable};
 
 /// The translation of every row address in `addrs` through `remapper`,
 /// without the ones that translate to `None`.
@@ -143,103 +148,6 @@ pub async fn translate_record_batch(
     Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
-/// Bytes hashbrown allocates for the `HashMap<u64, Option<u64>>` that
-/// `HashMap::with_capacity(entries)` reserves.
-///
-/// hashbrown's `capacity_to_buckets` rounds the capacity up to
-/// `next_power_of_two(ceil(entries * 8 / 7))` buckets (4 below four entries, 8
-/// below eight) and lays the table out as one slot of
-/// `size_of::<(u64, Option<u64>)>()` (24) bytes plus one control byte per
-/// bucket, followed by one group width (16) of trailing control bytes. The
-/// rounding is what a flat per-entry charge misses: 7,350,000 entries adjust
-/// to 8,400,000 and round to 16,777,216 buckets, 419,430,416 bytes, where 32
-/// bytes per entry would have charged 235,200,000.
-fn hash_map_bytes(entries: u64) -> u64 {
-    const SLOT_BYTES: u64 = std::mem::size_of::<(u64, Option<u64>)>() as u64;
-    const CTRL_BYTES_PER_BUCKET: u64 = 1;
-    const GROUP_WIDTH: u64 = 16;
-    let buckets = if entries < 4 {
-        4
-    } else if entries < 8 {
-        8
-    } else {
-        entries
-            .saturating_mul(8)
-            .div_ceil(7)
-            .checked_next_power_of_two()
-            .unwrap_or(u64::MAX)
-    };
-    buckets
-        .saturating_mul(SLOT_BYTES + CTRL_BYTES_PER_BUCKET)
-        .saturating_add(GROUP_WIDTH)
-}
-
-/// Why an index could not be rewritten through a batch translator by the
-/// in-memory fallback of `remap_streaming`, as opposed to an I/O or data
-/// error: nothing is wrong with the index or the history, this build simply
-/// cannot prove a complete mapping within its means. A maintenance job
-/// leaves such a segment as it is (its files and the history it translates
-/// through stay) and moves on; the reason travels inside
-/// [`lance_core::Error::NotSupported`], see [`Self::from_error`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum RemapUnavailable {
-    /// The index does not report which fragments its files hold addresses
-    /// for, so a complete mapping cannot be proven.
-    StoredFragmentsUnknown,
-    /// The translator cannot size a fragment the index holds.
-    FragmentRowsUnknown { fragment: u32 },
-    /// Materializing the mapping would exceed the translator's budget.
-    OverBudget {
-        estimated_bytes: u64,
-        budget_bytes: u64,
-    },
-}
-
-impl std::fmt::Display for RemapUnavailable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::StoredFragmentsUnknown => write!(
-                f,
-                "the index does not report the fragments its files hold addresses for, so a \
-                 complete in-memory mapping cannot be built for its legacy remap"
-            ),
-            Self::FragmentRowsUnknown { fragment } => write!(
-                f,
-                "the translator cannot size fragment {fragment}, which the index holds addresses \
-                 for, so a complete in-memory mapping cannot be built for its legacy remap"
-            ),
-            Self::OverBudget {
-                estimated_bytes,
-                budget_bytes,
-            } => write!(
-                f,
-                "materializing the mapping for the index's legacy remap needs about \
-                 {estimated_bytes} bytes, above the {budget_bytes} byte budget"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for RemapUnavailable {}
-
-impl RemapUnavailable {
-    /// This reason as the error `remap_streaming` returns.
-    pub fn into_error(self) -> Error {
-        Error::not_supported_source(Box::new(self))
-    }
-
-    /// The reason carried by an error `remap_streaming` returned, if it
-    /// declined for one; `None` for any other error (I/O, corrupt data, a
-    /// translation failure), which a caller must not treat as a skip.
-    pub fn from_error(error: &Error) -> Option<&Self> {
-        match error {
-            Error::NotSupported { source, .. } => source.downcast_ref::<Self>(),
-            _ => None,
-        }
-    }
-}
-
 /// The complete in-memory mapping an index whose `remap` predates batch
 /// translation needs: every address of every fragment in `stored_fragments`
 /// translated through `remapper`, with a row the translator drops mapped
@@ -258,6 +166,11 @@ impl RemapUnavailable {
 /// declines with a [`RemapUnavailable`] when the fragments are unknown, a
 /// fragment cannot be sized or the estimate is over budget; translation
 /// errors propagate as they are.
+#[deprecated(
+    since = "15.0.0",
+    note = "translate through a `Remapper`; a fragment reuse history composes one for index rewrites (`FragReuseHistory::compose`)"
+)]
+#[allow(deprecated)]
 pub async fn materialize_remap(
     remapper: &dyn BatchRowIdRemapper,
     stored_fragments: Option<&RoaringBitmap>,
@@ -275,7 +188,8 @@ pub async fn materialize_remap(
         sized.push((fragment, rows));
     }
     let budget_bytes = remapper.materialization_budget_bytes();
-    let estimated_bytes = hash_map_bytes(total_rows).saturating_add((BATCH_SIZE as u64) * (8 + 16));
+    let estimated_bytes = lance_select::remapper::hash_map_bytes(total_rows)
+        .saturating_add((BATCH_SIZE as u64) * (8 + 16));
     if estimated_bytes > budget_bytes {
         return Err(RemapUnavailable::OverBudget {
             estimated_bytes,
@@ -348,13 +262,26 @@ pub fn check_batch_remapping_entry() -> Result<()> {
 /// the source rows built for it. Both variants are shared handles, cheap to
 /// clone into per-page tasks; [`Self::as_ref`] is the borrowed form the
 /// legacy `remap` entry points reach without copying their map.
+#[allow(deprecated)]
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum RowAddrTranslator {
     Sync(Arc<RowAddrRemap>),
+    #[deprecated(since = "15.0.0", note = "use `RowAddrTranslator::Remapper`")]
     Batch(Arc<dyn BatchRowIdRemapper>),
+    /// A fragment reuse history's translation, bound from the plan
+    /// `FragReuseHistory::compose` made. Whether it is ever held in memory
+    /// is the history's decision ([`Remapper::materialize`]).
+    Remapper(Remapper),
 }
 
+impl From<Remapper> for RowAddrTranslator {
+    fn from(remapper: Remapper) -> Self {
+        Self::Remapper(remapper)
+    }
+}
+
+#[allow(deprecated)]
 impl RowAddrTranslator {
     /// A synchronous translator over an owned map.
     pub fn sync(remap: RowAddrRemap) -> Self {
@@ -362,6 +289,7 @@ impl RowAddrTranslator {
     }
 
     /// A batch translator.
+    #[deprecated(since = "15.0.0", note = "use `RowAddrTranslator::from(remapper)`")]
     pub fn batch(remapper: Arc<dyn BatchRowIdRemapper>) -> Self {
         Self::Batch(remapper)
     }
@@ -371,6 +299,7 @@ impl RowAddrTranslator {
         match self {
             Self::Sync(remap) => RowAddrTranslatorRef::Sync(remap.as_ref()),
             Self::Batch(remapper) => RowAddrTranslatorRef::Batch(remapper.as_ref()),
+            Self::Remapper(remapper) => RowAddrTranslatorRef::Remapper(remapper),
         }
     }
 
@@ -398,11 +327,14 @@ impl RowAddrTranslator {
 /// The legacy `remap(&RowAddrRemap, ..)` entry points wrap their map in
 /// [`Self::Sync`] and share one implementation with `remap_streaming`, so
 /// neither copies the map nor delegates to the other.
+#[allow(deprecated)]
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub enum RowAddrTranslatorRef<'a> {
     Sync(&'a RowAddrRemap),
+    #[deprecated(since = "15.0.0", note = "use `RowAddrTranslatorRef::Remapper`")]
     Batch(&'a dyn BatchRowIdRemapper),
+    Remapper(&'a Remapper),
 }
 
 impl<'a> From<&'a RowAddrRemap> for RowAddrTranslatorRef<'a> {
@@ -411,13 +343,14 @@ impl<'a> From<&'a RowAddrRemap> for RowAddrTranslatorRef<'a> {
     }
 }
 
+#[allow(deprecated)]
 impl<'a> RowAddrTranslatorRef<'a> {
     /// Whether the translator is known to move no address at all. A batch
     /// translator is never known to be empty.
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Sync(remap) => remap.is_empty(),
-            Self::Batch(_) => false,
+            Self::Batch(_) | Self::Remapper(_) => false,
         }
     }
 
@@ -432,6 +365,14 @@ impl<'a> RowAddrTranslatorRef<'a> {
                 .map(|&addr| remap.get(addr).unwrap_or(Some(addr)))
                 .collect()),
             Self::Batch(remapper) => remap_row_ids_async(*remapper, addrs).await,
+            Self::Remapper(remapper) => {
+                check_batch_remapping_entry()?;
+                let mut translated: Vec<Option<u64>> = addrs.iter().copied().map(Some).collect();
+                for batch in translated.chunks_mut(BATCH_SIZE) {
+                    remapper.translate_in_place(batch).await?;
+                }
+                Ok(translated)
+            }
         }
     }
 
@@ -446,11 +387,11 @@ impl<'a> RowAddrTranslatorRef<'a> {
     ) -> Result<Cow<'a, RowAddrRemap>> {
         match self {
             Self::Sync(remap) => Ok(Cow::Borrowed(remap)),
-            Self::Batch(remapper) => {
+            Self::Batch(_) | Self::Remapper(_) => {
                 let mut addrs: Vec<u64> = addrs.into_iter().collect();
                 addrs.sort_unstable();
                 addrs.dedup();
-                let translated = remap_row_ids_async(*remapper, &addrs).await?;
+                let translated = self.remap_row_addrs(&addrs).await?;
                 let map: HashMap<u64, Option<u64>> = addrs.into_iter().zip(translated).collect();
                 Ok(Cow::Owned(RowAddrRemap::direct(map)))
             }
@@ -459,6 +400,11 @@ impl<'a> RowAddrTranslatorRef<'a> {
 }
 
 /// Translate row IDs in input order, preserving duplicates and deleted positions.
+#[deprecated(
+    since = "15.0.0",
+    note = "translate through a `Remapper`; a fragment reuse history composes one for index rewrites (`FragReuseHistory::compose`)"
+)]
+#[allow(deprecated)]
 pub async fn remap_row_ids_async(
     remapper: &dyn BatchRowIdRemapper,
     row_ids: &[u64],
@@ -483,6 +429,11 @@ pub async fn remap_row_ids_async(
 ///
 /// The returned synchronous remapper removes tombstone slots during the
 /// consumer's layout-aware decoding. No per-row lookup table is retained.
+#[deprecated(
+    since = "15.0.0",
+    note = "translate through a `Remapper`; a fragment reuse history composes one for index rewrites (`FragReuseHistory::compose`)"
+)]
+#[allow(deprecated)]
 pub async fn remap_row_ids_preserving_layout_async(
     remapper: &dyn BatchRowIdRemapper,
     batch: RecordBatch,
@@ -525,6 +476,11 @@ pub async fn remap_row_ids_preserving_layout_async(
 }
 
 /// Translate a row-ID column and remove deleted rows from every column.
+#[deprecated(
+    since = "15.0.0",
+    note = "translate through a `Remapper`; a fragment reuse history composes one for index rewrites (`FragReuseHistory::compose`)"
+)]
+#[allow(deprecated)]
 pub async fn remap_record_batch_async(
     remapper: &dyn BatchRowIdRemapper,
     batch: RecordBatch,
@@ -537,6 +493,11 @@ pub async fn remap_record_batch_async(
 }
 
 /// Translate an explicit physical row selection, dropping deleted addresses.
+#[deprecated(
+    since = "15.0.0",
+    note = "translate through a `Remapper`; a fragment reuse history composes one for index rewrites (`FragReuseHistory::compose`)"
+)]
+#[allow(deprecated)]
 pub async fn remap_row_addrs_tree_map_async(
     remapper: &dyn BatchRowIdRemapper,
     rows: &RowAddrTreeMap,
@@ -549,6 +510,11 @@ pub async fn remap_row_addrs_tree_map_async(
 }
 
 /// Translate a bitmap of row IDs, dropping deleted rows.
+#[deprecated(
+    since = "15.0.0",
+    note = "translate through a `Remapper`; a fragment reuse history composes one for index rewrites (`FragReuseHistory::compose`)"
+)]
+#[allow(deprecated)]
 pub async fn remap_row_ids_roaring_tree_map_async(
     remapper: &dyn BatchRowIdRemapper,
     rows: &RoaringTreemap,
@@ -557,6 +523,7 @@ pub async fn remap_row_ids_roaring_tree_map_async(
     remap_iter(remapper, rows.iter()).await
 }
 
+#[allow(deprecated)]
 async fn remap_iter<C: Default + Extend<u64>>(
     remapper: &dyn BatchRowIdRemapper,
     mut ids: impl Iterator<Item = u64>,
@@ -629,6 +596,7 @@ impl RowIdRemapper for TombstoneRowIdRemapper {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use arrow_array::record_batch;
@@ -748,9 +716,6 @@ mod tests {
     fn materialize_remap_charges_the_rounded_hash_table() {
         // 7,350,000 entries adjust to 8,400,000 and round to 16,777,216
         // buckets of 25 bytes: 419,430,416 bytes, not 32 bytes per entry.
-        assert_eq!(hash_map_bytes(7_350_000), 419_430_416);
-        assert!(hash_map_bytes(7_350_000) >= 400 << 20);
-        assert_eq!(hash_map_bytes(0), 4 * 25 + 16);
         // Under the default budget that many stored rows are declined before
         // any translation; the flat charge (235,200,000 plus the slice
         // buffers) would have fit.

@@ -17,7 +17,7 @@ pub(crate) mod append;
 mod create;
 pub mod frag_reuse;
 pub mod frag_reuse_reader;
-mod frag_reuse_remapping;
+pub(crate) mod frag_reuse_remapping;
 pub(crate) mod frag_reuse_with_stable_row_ids;
 mod lifecycle;
 pub(crate) mod loading;

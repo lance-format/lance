@@ -195,6 +195,30 @@ impl TranslationPlan {
         Self::nothing(history.imp().clone())
     }
 
+    /// A plan under `history` following every address through the recorded
+    /// transitions until it reaches a fragment of `live_fragments`; an
+    /// address whose path ends anywhere else translates to nothing. This is
+    /// the translation of no particular segment, for callers that translate
+    /// addresses outside an index.
+    #[doc(hidden)]
+    pub fn following(history: &FragReuseHistory, live_fragments: &RoaringBitmap) -> Self {
+        let stops = history
+            .ledger()
+            .transitions()
+            .iter()
+            .flat_map(|transition| transition.sources())
+            .map(|source| source.id as u32)
+            .filter(|&fragment| live_fragments.contains(fragment))
+            .collect();
+        Self::new(
+            history.imp().clone(),
+            live_fragments.clone(),
+            RoaringBitmap::new(),
+            stops,
+            &[],
+        )
+    }
+
     pub(super) fn nothing(history: Arc<dyn FriImpl>) -> Self {
         let empty = RoaringBitmap::new();
         Self::new(history, empty.clone(), empty.clone(), empty, &[])

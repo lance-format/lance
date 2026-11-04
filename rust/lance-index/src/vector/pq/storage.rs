@@ -2164,6 +2164,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn test_async_remap_preserves_transposed_codes() {
         #[derive(Debug)]
         struct Mapping(RowAddrRemap);
